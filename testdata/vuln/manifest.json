@@ -237,6 +237,16 @@
    "expected": [],
    "min_severity": "medium",
    "detectable": false
+  },
+  "bob_pool": {
+   "address": "0x9f34693C1057b9645e3e7e809df927fd383965cF",
+   "chain": "classic",
+   "year": 2023,
+   "bug": "BOB_POOL (Ethereum Classic): remove_liqudity sends ETC to msg.sender before the stake bookkeeping; the receive hook re-enters and drains the pool",
+   "expected": [
+    "reentrancy"
+   ],
+   "min_severity": "medium"
   }
  }
 }

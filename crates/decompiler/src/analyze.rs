@@ -448,12 +448,19 @@ pub fn is_auth_cond(cond: ExprId) -> bool {
 }
 
 /// Does the function check `msg.sender` (owner/role/constant) before `node`?
+/// Conditions a node tests: its branch condition and the inlined guards (`require`) it holds.
+fn node_conds(nd: &lift::LNode) -> Vec<ExprId> {
+    let mut v: Vec<ExprId> = nd.stmts.iter().filter_map(|s| if let Stmt::Require { cond, .. } = s { Some(*cond) } else { None }).collect();
+    if let Term::Branch { cond, .. } = &nd.term {
+        v.push(*cond);
+    }
+    v
+}
+
 fn has_caller_check(l: &Lifted, before: Option<usize>) -> bool {
     for nd in &l.nodes {
-        if let Term::Branch { cond, .. } = &nd.term {
-            if is_auth_cond(*cond) && before.map_or(true, |b| reaches(l, nd.id, b)) {
-                return true;
-            }
+        if node_conds(nd).into_iter().any(is_auth_cond) && before.map_or(true, |b| reaches(l, nd.id, b)) {
+            return true;
         }
     }
     false
@@ -490,9 +497,9 @@ fn auth_slots(ctx: &Ctx) -> HashSet<ExprId> {
     for f in &ctx.c.functions {
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
-            if let Term::Branch { cond, .. } = &nd.term {
-                if is_auth_cond(*cond) {
-                    collect_sload_keys(*cond, &mut slots);
+            for cond in node_conds(nd) {
+                if is_auth_cond(cond) {
+                    collect_sload_keys(cond, &mut slots);
                 }
             }
         }

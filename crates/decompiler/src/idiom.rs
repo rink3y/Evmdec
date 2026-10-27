@@ -23,7 +23,7 @@ fn unversioned(e: ExprId) -> ExprId {
 }
 
 /// Flatten an addition tree into its non-constant addends (sorted, unversioned) and its constant.
-fn addends(e: ExprId) -> (Vec<ExprId>, U256) {
+pub(crate) fn addends(e: ExprId) -> (Vec<ExprId>, U256) {
     let mut terms = Vec::new();
     let mut c = U256::ZERO;
     let mut stack = vec![unversioned(e)];

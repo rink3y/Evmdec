@@ -27,6 +27,8 @@ pub struct Names {
     pub vars: RefCell<HashMap<u32, u32>>,
     /// Vyper-style mapping layout (slot first, then key).
     pub vyper: bool,
+    /// solc >= 0.8: the compiler's own overflow / division-by-zero panics are not printed.
+    pub hide_checked: bool,
     /// Large shared sub-expressions are hoisted into temporaries: pending definitions.
     pub temps: RefCell<Vec<(String, String)>>,
     pub temp_of: RefCell<HashMap<ExprId, String>>,
@@ -187,6 +189,55 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     }
     n.memo.borrow_mut().insert(e, (s.clone(), p));
     paren(s, p, outer)
+}
+
+/// solc's ABI decoder validators on a calldata word: `x == address(x)` (the word is a clean
+/// address) and `x == bool(x)`. The parameter type already says so.
+fn is_abi_validator(cond: ExprId) -> bool {
+    let Node::Op(op::EQ, v) = expr::node(cond) else { return false };
+    let is_param = |e: ExprId| matches!(expr::node(e), Node::CallDataLoad(_));
+    let cleaned = |x: ExprId, y: ExprId| -> bool {
+        match expr::node(y) {
+            Node::Op(op::AND, w) => (w[0] == x && expr::as_const(w[1]) == Some(expr::mask_bits(160))) || (w[1] == x && expr::as_const(w[0]) == Some(expr::mask_bits(160))),
+            Node::Op(op::ISZERO, w) => matches!(expr::node(w[0]), Node::Op(op::ISZERO, z) if z[0] == x),
+            _ => false,
+        }
+    };
+    (is_param(v[0]) && cleaned(v[0], v[1])) || (is_param(v[1]) && cleaned(v[1], v[0]))
+}
+
+/// A condition as a boolean: `x` when boolean-valued, `x != 0` otherwise.
+pub fn fmt_cond(cond: ExprId, n: &Names) -> String {
+    if expr::is_boolean(cond) {
+        fmt_expr(cond, n)
+    } else {
+        format!("{} != 0", fmt_prec(cond, P_EQ + 1, n))
+    }
+}
+
+/// Name of an event whose signature is unknown: `Event_<first four bytes of topic0>`.
+pub fn event_placeholder_name(topic0: U256) -> String {
+    let b = topic0.to_be_bytes();
+    format!("Event_{:08x}", u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// `slt(sub(calldatasize, c), k)` and friends: solc's ABI-size checks are signed compares on a
+/// value that cannot be negative. Printed as the unsigned comparison with the constants folded.
+fn size_compare(o: u8, a: ExprId, b: ExprId, n: &Names) -> Option<String> {
+    let k = expr::as_const(b)?;
+    let (base, c) = expr::split_offset(a);
+    let base = base?;
+    let name = fmt_expr(base, n);
+    if name != "msg.data.length" && name != "returndatasize()" {
+        return None;
+    }
+    // a = base + c (c may be a wrapped negative constant): base <op> k - c
+    let bound = k.wrapping_sub(c);
+    if bound.bits() > 64 {
+        return None;
+    }
+    let sym = if o == op::SLT { "<" } else { ">" };
+    Some(format!("{} {} {}", name, sym, bound.low_u64()))
 }
 
 fn is_signed_op(o: u8) -> bool {
@@ -442,6 +493,10 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                     op::EQ => return (format!("{} != {}", fmt_prec(iv[0], P_EQ + 1, n), fmt_eq_rhs(iv[0], iv[1], P_EQ + 1, n)), P_EQ),
                     op::LT => return (format!("{} >= {}", fmt_prec(iv[0], P_CMP + 1, n), fmt_prec(iv[1], P_CMP + 1, n)), P_CMP),
                     op::GT => return (format!("{} <= {}", fmt_prec(iv[0], P_CMP + 1, n), fmt_prec(iv[1], P_CMP + 1, n)), P_CMP),
+                    op::SLT | op::SGT if size_compare(io, iv[0], iv[1], n).is_some() => {
+                        let s = size_compare(io, iv[0], iv[1], n).unwrap();
+                        return (s.replacen(if io == op::SLT { " < " } else { " > " }, if io == op::SLT { " >= " } else { " <= " }, 1), P_CMP);
+                    }
                     op::SLT => return (format!("{} >= {}", fmt_signed(iv[0], n), fmt_signed(iv[1], n)), P_CMP),
                     op::SGT => return (format!("{} <= {}", fmt_signed(iv[0], n), fmt_signed(iv[1], n)), P_CMP),
                     _ => {}
@@ -474,6 +529,7 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
         (op::EXP, 2) => (format!("{} ** {}", fmt_prec(v[0], P_EXP + 1, n), fmt_prec(v[1], P_EXP, n)), P_EXP),
         (op::LT, 2) => (format!("{} < {}", fmt_prec(v[0], P_CMP + 1, n), fmt_prec(v[1], P_CMP + 1, n)), P_CMP),
         (op::GT, 2) => (format!("{} > {}", fmt_prec(v[0], P_CMP + 1, n), fmt_prec(v[1], P_CMP + 1, n)), P_CMP),
+        (op::SLT, 2) | (op::SGT, 2) if size_compare(o, v[0], v[1], n).is_some() => (size_compare(o, v[0], v[1], n).unwrap(), P_CMP),
         (op::SLT, 2) => (format!("{} < {}", fmt_signed(v[0], n), fmt_signed(v[1], n)), P_CMP),
         (op::SGT, 2) => (format!("{} > {}", fmt_signed(v[0], n), fmt_signed(v[1], n)), P_CMP),
         (op::EQ, 2) => (format!("{} == {}", fmt_prec(v[0], P_EQ + 1, n), fmt_eq_rhs(v[0], v[1], P_EQ + 1, n)), P_EQ),
@@ -790,7 +846,10 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             }
             match name {
                 Some(nm) => format!("emit {}({});", nm, args.join(", ")),
-                None => format!("log{}({});", topics.len(), args.join(", ")),
+                None => match topics.first().and_then(|t| expr::as_const(*t)) {
+                    Some(t0) => format!("emit {}({});", event_placeholder_name(t0), args[1..].join(", ")),
+                    None => format!("log{}({});", topics.len(), args.join(", ")),
+                },
             }
         }
         Stmt::Call { kind, gas, addr, value, in_off, in_len, out_len, input, result, .. } => {
@@ -868,7 +927,10 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
         }
         Stmt::Drop(e) => format!("// ignored: {}", fmt_expr(*e, n)),
         Stmt::Require { cond, data, invalid } => {
-            let c = if expr::is_boolean(*cond) { fmt_expr(*cond, n) } else { format!("{} != 0", fmt_prec(*cond, P_EQ + 1, n)) };
+            if is_abi_validator(*cond) {
+                return String::new();
+            }
+            let c = fmt_cond(*cond, n);
             if *invalid {
                 return format!("assert({});", c);
             }
@@ -877,6 +939,9 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     // Selector payloads (Error(string), Panic(code), custom errors) are 4 + 32n bytes.
                     let len = leading_selector(words[0], None).map(|_| U256::from_u64(4 + 32 * (words.len() as u64 - 1)));
                     let p = fmt_payload(words, len, n, true);
+                    if n.hide_checked && (p == "Panic(arithmetic overflow)" || p == "Panic(division by zero)") {
+                        return String::new();
+                    }
                     if p == "Panic(assert failed)" {
                         format!("assert({});", c)
                     } else if p.starts_with('"') || p.starts_with("Panic(") {

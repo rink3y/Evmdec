@@ -37,6 +37,12 @@ oracle, so the accuracy claim below is measured, not asserted.
   typed `string`, the dynamic-bytes return encoder (copy loop plus padding) becomes `return x;`,
   `success = to.call{value: v, gas: 2300}(""); require(success)` prints as
   `payable(to).transfer(v)`, and functions that only ever return the constants 0/1 return `bool`.
+  Revert reasons are decoded even when several `require`s share one `revert(ptr, sub(end, ptr))`
+  tail (solc 0.8 output), solc 0.8's checked arithmetic prints as the plain operation (the
+  compiler's own overflow / division-by-zero panics are not shown), the ABI size checks print as
+  `require(msg.data.length >= 36)`, events whose signature is unknown are declared and emitted
+  as `Event_<topic prefix>(...)`, and the simultaneous copies on a loop's back edge are printed
+  in an order that preserves their meaning.
   Packed storage slots are split into their fields (`uint112 stor_8_0; uint112 stor_8_14;
   uint32 stor_8_28;` for a Uniswap V2 pair's reserves, `address` + `bool` owner/paused pairs,
   signed fields via `signextend`), and reads and writes of a field print as the field.
@@ -190,17 +196,17 @@ Vyper) were run through `corpus/run_sample.sh`:
 
 ### 4. Analyzer recall on known-exploited contracts
 
-`testdata/vuln` holds the unmodified runtime bytecode of 23 contracts whose exploits are public
+`testdata/vuln` holds the unmodified runtime bytecode of 24 contracts whose exploits are public
 (The DAO, Rubixi, King of the Ether, GovernMental, Fomo3D, BEC, SMT, PoWH, SpankChain, Lendf.me,
 Bancor 2020, Opyn, Pickle, Furucombo, MISO, Cream crAMP, Visor, Umbrella, Revest, Anyswap 2022,
-Poly Network, Curve pETH/Vyper lock bug, Nomad). `testdata/vuln/manifest.json` names, for each,
+Poly Network, Curve pETH/Vyper lock bug, Nomad, BOB_POOL on Ethereum Classic). `testdata/vuln/manifest.json` names, for each,
 the rule ids any of which must fire at or above a minimum severity for the bug to count as
 found, and `corpus/vuln_bench.py` runs the analyzer over the set and over the 22 audited
 mainnet contracts above:
 
 | | |
 |---|---|
-| known bugs found | **22 / 22** (Nomad's bug is an upgrade-time state error outside bytecode patterns and is listed but not counted) |
+| known bugs found | **23 / 23** (Nomad's bug is an upgrade-time state error outside bytecode patterns and is listed but not counted) |
 | high/critical findings on the 22 audited contracts | 34, almost all on contracts whose purpose is to execute caller-supplied calls (Multicall3, 1inch, Gnosis Safe, Seaport) |
 
 The analyzer is heuristic: findings are leads with a confidence level, and the audited corpus is

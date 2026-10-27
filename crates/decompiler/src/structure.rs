@@ -276,6 +276,11 @@ struct Printer<'a> {
     gotos: usize,
     /// Nodes currently being emitted as a structured region (to avoid re-entering).
     active: HashSet<usize>,
+    /// Fresh variable ids for the temporaries of cyclic parallel copies.
+    next_tmp: u32,
+    /// Every expression a non-`Drop` statement or terminator mentions (a dropped value that is
+    /// used elsewhere - a call result tested later - is not "ignored").
+    used: Vec<ExprId>,
     /// Boolean facts known on the current path: (condition, value).
     facts: Vec<(ExprId, bool)>,
 }
@@ -284,6 +289,9 @@ const DUP_LIMIT: usize = 6;
 
 impl<'a> Printer<'a> {
     fn line(&mut self, depth: usize, s: &str) {
+        if s.is_empty() {
+            return;
+        }
         for (name, def) in self.names.take_temps() {
             for _ in 0..depth {
                 self.out.push_str("    ");
@@ -322,6 +330,7 @@ impl<'a> Printer<'a> {
     /// Is `n` a plain revert (possibly with a reason) with no other side effects?
     fn revert_reason(&self, mut n: usize) -> Option<Option<String>> {
         let mut seen = HashSet::new();
+        let mut stores: Vec<(ExprId, ExprId)> = Vec::new();
         loop {
             if !seen.insert(n) {
                 return None;
@@ -330,9 +339,14 @@ impl<'a> Printer<'a> {
             if !nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. })) {
                 return None;
             }
+            for s in &nd.stmts {
+                if let Stmt::MStore { off, val, width: 32 } = s {
+                    stores.push((*off, *val));
+                }
+            }
             match &nd.term {
                 Term::Jump(t) => n = *t,
-                Term::Revert { data, len, .. } => {
+                Term::Revert { data, len, off } => {
                     return Some(match data {
                         Some(words) if !words.is_empty() => {
                             let p = emit::fmt_payload(words, expr::as_const(*len), self.names, true);
@@ -342,6 +356,15 @@ impl<'a> Printer<'a> {
                         None => {
                             if expr::as_const(*len) == Some(U256::ZERO) {
                                 None
+                            } else if let Some((words, l)) = payload_from_stores(&stores, *off) {
+                                // A revert tail shared by several sites: the lifter saw merged
+                                // memory, but the stores on this path spell the payload out.
+                                let p = emit::fmt_payload(&words, Some(U256::from_u64(l)), self.names, true);
+                                if p.starts_with('"') || p.starts_with("Panic(") || p.contains('(') {
+                                    Some(p)
+                                } else {
+                                    return None;
+                                }
                             } else {
                                 return None;
                             }
@@ -357,10 +380,8 @@ impl<'a> Printer<'a> {
 
     fn edge_assigns(&mut self, from: usize, to: usize, depth: usize) {
         if let Some(assigns) = self.l.edge_assigns.get(&(from, to)) {
-            for (var, val) in assigns.clone() {
-                let s = format!("{} = {};", emit::fmt_expr(var, self.names), emit::fmt_expr(val, self.names));
-                self.line(depth, &s);
-            }
+            let assigns = assigns.clone();
+            self.assign_lines(&assigns, depth);
         }
     }
 
@@ -410,8 +431,46 @@ impl<'a> Printer<'a> {
                     continue;
                 }
             }
+            if let Stmt::Drop(e) = s {
+                let target = expr::node(*e);
+                if self.used.iter().any(|u| expr::contains(*u, &|nd| *nd == target)) {
+                    continue;
+                }
+            }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
+        }
+    }
+
+    /// Edge copies are simultaneous: print them in an order where no right-hand side reads a
+    /// variable assigned above it, saving a variable's old value in a temporary when the copies
+    /// form a cycle (`a = b; b = a`).
+    fn assign_lines(&mut self, assigns: &[(ExprId, ExprId)], depth: usize) {
+        let mut rem: Vec<(ExprId, ExprId)> = assigns.iter().copied().filter(|(a, b)| a != b).collect();
+        while !rem.is_empty() {
+            let reads = |rhs: ExprId, var: ExprId| {
+                let target = expr::node(var);
+                expr::contains(rhs, &|nd| *nd == target)
+            };
+            let pick = rem.iter().position(|(var, _)| !rem.iter().any(|(v2, rhs)| v2 != var && reads(*rhs, *var)));
+            match pick {
+                Some(i) => {
+                    let (var, val) = rem.remove(i);
+                    let s = format!("{} = {};", emit::fmt_expr(var, self.names), emit::fmt_expr(val, self.names));
+                    self.line(depth, &s);
+                }
+                None => {
+                    let (var, _) = rem[0];
+                    let tmp = expr::intern(Node::Var(self.next_tmp));
+                    self.next_tmp += 1;
+                    let s = format!("{} = {};", emit::fmt_expr(tmp, self.names), emit::fmt_expr(var, self.names));
+                    self.line(depth, &s);
+                    let target = expr::node(var);
+                    for (_, rhs) in rem.iter_mut() {
+                        *rhs = expr::substitute(*rhs, &|nd| if *nd == target { Some(tmp) } else { None }, &mut HashMap::new());
+                    }
+                }
+            }
         }
     }
 
@@ -548,25 +607,48 @@ impl<'a> Printer<'a> {
             }
         };
         let nd = &self.l.nodes[header];
-        // `while (cond)` form: header has no statements and branches to an exit.
+        // `while (cond)` form: header has no statements and branches between the body and a
+        // node outside it (that node is the loop's continuation, whatever other exits -
+        // reverts inside the body - the loop has).
         let mut while_cond: Option<(String, usize)> = None;
+        let mut exit = exit;
+        // The condition may sit in an empty node the (empty) header jumps to.
+        let mut cond_node = header;
         if nd.stmts.is_empty() {
-            if let Term::Branch { cond, t, f } = &nd.term {
+            if let Term::Jump(j) = &nd.term {
+                let jn = &self.l.nodes[*j];
+                if body.contains(j) && jn.stmts.is_empty() && jn.preds.len() == 1 && !self.l.edge_assigns.contains_key(&(header, *j)) && matches!(jn.term, Term::Branch { .. }) {
+                    cond_node = *j;
+                }
+            }
+        }
+        let cn = &self.l.nodes[cond_node];
+        if cn.stmts.is_empty() {
+            if let Term::Branch { cond, t, f } = &cn.term {
                 if let Some(t) = t {
-                    if exit == Some(*f) && body.contains(t) {
+                    if body.contains(t) && !body.contains(f) {
                         while_cond = Some((emit::fmt_expr(*cond, self.names), *t));
-                    } else if exit == Some(*t) && body.contains(f) {
+                        exit = Some(*f);
+                    } else if body.contains(f) && !body.contains(t) {
                         while_cond = Some((emit::fmt_expr(expr::op1(op::ISZERO, *cond), self.names), *f));
+                        exit = Some(*t);
                     }
                 }
             }
+        }
+        if while_cond.is_some() && cond_node != header {
+            self.emitted.insert(cond_node);
+        }
+        if std::env::var("EVMDEC_DEBUG_LOOP").is_ok() {
+            let tf = match &nd.term { Term::Branch { t, f, .. } => format!("branch t={:?} (in body {:?}) f={} (in body {})", t, t.map(|t| body.contains(&t)), f, body.contains(f)), Term::Jump(j) => format!("jump {}", j), Term::Switch { .. } => "switch".into(), _ => "other".into() };
+            eprintln!("loop header {} pc={:#x} stmts={} {} body={:?} exits={:?} while={}", header, self.node_pc(header), nd.stmts.len(), tf, body.iter().collect::<Vec<_>>(), exits, while_cond.is_some());
         }
         self.loop_stack.push((header, exit, depth + 1));
         match while_cond {
             Some((c, first)) => {
                 self.line(depth, &format!("while ({}) {{", c));
                 self.active.insert(header);
-                self.edge_assigns(header, first, depth + 1);
+                self.edge_assigns(cond_node, first, depth + 1);
                 self.go(first, None, depth + 1);
                 self.active.remove(&header);
                 self.line(depth, "}");
@@ -595,10 +677,8 @@ impl<'a> Printer<'a> {
             // for the `while (cond)` form the header->exit edge assignments go here.
             if let Some(a) = self.l.edge_assigns.get(&(header, e)) {
                 if while_cond_exit_from_header(&self.l.nodes[header].term, e) {
-                    for (var, val) in a.clone() {
-                        let s = format!("{} = {};", emit::fmt_expr(var, self.names), emit::fmt_expr(val, self.names));
-                        self.line(depth, &s);
-                    }
+                    let a = a.clone();
+                    self.assign_lines(&a, depth);
                 }
             }
             self.go(e, stop, depth);
@@ -642,7 +722,7 @@ impl<'a> Printer<'a> {
             if t.is_some() && t_rev.is_none() {
                 // if (!cond) revert  =>  require(cond)
                 let t = t.unwrap();
-                self.line(depth, &format!("require({}{});", emit::fmt_expr(cond, self.names), reason_suffix(&reason)));
+                self.line(depth, &format!("require({}{});", emit::fmt_cond(cond, self.names), reason_suffix(&reason)));
                 self.facts.push((cond, true));
                 self.transfer(n, t, stop, depth);
                 self.facts.pop();
@@ -652,7 +732,7 @@ impl<'a> Printer<'a> {
         if let Some(reason) = t_rev.clone() {
             if f_rev.is_none() {
                 let ncond = expr::op1(op::ISZERO, cond);
-                self.line(depth, &format!("require({}{});", emit::fmt_expr(ncond, self.names), reason_suffix(&reason)));
+                self.line(depth, &format!("require({}{});", emit::fmt_cond(ncond, self.names), reason_suffix(&reason)));
                 self.facts.push((cond, false));
                 self.transfer(n, f, stop, depth);
                 self.facts.pop();
@@ -834,7 +914,14 @@ pub struct Structured {
 pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     let g = Graph::new(l);
     let loops = find_loops(&g);
-    let mut p = Printer { l, g, loops, names, out: String::new(), emitted: HashSet::new(), labels: HashSet::new(), loop_stack: Vec::new(), gotos: 0, active: HashSet::new(), facts: Vec::new() };
+    let mut used: Vec<ExprId> = Vec::new();
+    for nd in &l.nodes {
+        let mut probe = nd.clone();
+        probe.stmts.retain(|s| !matches!(s, Stmt::Drop(_)));
+        used.extend(crate::lift::node_exprs(&probe));
+    }
+    used.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
+    let mut p = Printer { l, g, loops, names, out: String::new(), emitted: HashSet::new(), labels: HashSet::new(), loop_stack: Vec::new(), gotos: 0, active: HashSet::new(), next_tmp: 1 << 30, used, facts: Vec::new() };
     p.go(l.entry, None, base_depth);
     // Emit any reachable nodes that were targeted by gotos but never emitted (irreducible parts).
     let mut pending: Vec<usize> = p.labels.iter().copied().filter(|n| !p.emitted.contains(n)).collect();
@@ -854,7 +941,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     let text = if p.labels.iter().any(|n| p.emitted.contains(n)) {
         let g2 = Graph::new(l);
         let loops2 = find_loops(&g2);
-        let mut p2 = Printer { l, g: g2, loops: loops2, names, out: String::new(), emitted: HashSet::new(), labels: p.labels.clone(), loop_stack: Vec::new(), gotos: 0, active: HashSet::new(), facts: Vec::new() };
+        let mut p2 = Printer { l, g: g2, loops: loops2, names, out: String::new(), next_tmp: p.next_tmp, used: p.used.clone(), emitted: HashSet::new(), labels: p.labels.clone(), loop_stack: Vec::new(), gotos: 0, active: HashSet::new(), facts: Vec::new() };
         p2.go(l.entry, None, base_depth);
         let mut pending: Vec<usize> = p2.labels.iter().copied().filter(|n| !p2.emitted.contains(n)).collect();
         let mut rounds = 0;
@@ -936,3 +1023,50 @@ mod tests {
     }
 }
 
+
+/// The memory image at `ptr` written by constant word stores, as 32-byte words plus its length.
+fn payload_from_stores(stores: &[(ExprId, ExprId)], ptr: ExprId) -> Option<(Vec<ExprId>, u64)> {
+    let (pt, pc) = crate::idiom::addends(ptr);
+    let mut image: Vec<u8> = Vec::new();
+    let mut any = false;
+    for (off, val) in stores {
+        let (t, c) = crate::idiom::addends(*off);
+        if t != pt || c < pc {
+            continue;
+        }
+        let rel = (c - pc).low_u64();
+        if rel > 4096 {
+            return None;
+        }
+        let v = expr::as_const(*val)?;
+        let end = (rel + 32) as usize;
+        if image.len() < end {
+            image.resize(end, 0);
+        }
+        image[rel as usize..end].copy_from_slice(&v.to_be_bytes());
+        any = true;
+    }
+    if !any || image.len() < 4 {
+        return None;
+    }
+    // An `Error(string)` image is 4 + 32 + 32 + ceil32(len) bytes; trim the padding of the last
+    // store to that.
+    let mut len = image.len() as u64;
+    if image[..4] == [0x08, 0xc3, 0x79, 0xa0] && image.len() >= 68 {
+        let n = U256::from_be_bytes(&image[36..68]);
+        if n.fits_u64() {
+            len = len.min(68 + n.low_u64().div_ceil(32) * 32);
+        }
+    }
+    let mut words = Vec::new();
+    let mut i = 0usize;
+    while i < image.len() {
+        let mut w = [0u8; 32];
+        let k = (image.len() - i).min(32);
+        // A partial last word is right-aligned, as the lifter's region reads are.
+        w[32 - k..].copy_from_slice(&image[i..i + k]);
+        words.push(expr::konst(U256::from_be_bytes(&w)));
+        i += 32;
+    }
+    Some((words, len))
+}

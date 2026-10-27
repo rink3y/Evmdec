@@ -149,3 +149,39 @@ fn short_circuit_and_is_not_inverted() {
     assert!(c.source.contains(" && "), "expected a conjunction:\n{}", c.source);
     assert!(!c.source.contains(" || "), "no disjunction in this function:\n{}", c.source);
 }
+
+/// A solc 0.8 contract whose revert reasons go through a shared `revert(ptr, sub(end, ptr))`
+/// tail, whose arithmetic is the compiler's checked helpers, and whose loop carries several
+/// variables at once (BOB_POOL on Ethereum Classic).
+#[test]
+fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vuln/bob_pool.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
+    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    let src = &c.source;
+    // Revert reasons decoded through the shared tail, including 31- and 34-byte strings.
+    for s in ["\"No stake in game\"", "\"Input ETC must be larger then 0\"", "\"Cant remove more then total staked\"", "\"Input Token amount must be larger then 100\""] {
+        assert!(src.contains(s), "missing {s}");
+    }
+    assert!(!src.contains("0x8c379a0"), "raw Error(string) selector left in the output");
+    // Checked arithmetic helpers are inlined and their panics are not printed on solc 0.8.
+    assert!(!src.contains("Panic(arithmetic overflow)"), "compiler panic printed");
+    assert!(src.contains("stor_7 - stor_8[msg.sender]"), "checked_sub not inlined");
+    // The balanceOf helper returns the call's return data, not a raw memory read.
+    assert!(src.contains("return (returndata_1[0]);"), "return data not resolved");
+    // ABI size checks print unsigned; address validators are not printed.
+    assert!(src.contains("require(msg.data.length >= 36);"));
+    assert!(!src.contains("int256(msg.data.length"));
+    assert!(!src.contains("address(arg0))"), "ABI validator printed");
+    // Unknown events are named by their topic, and the loop is a `while (cond)` whose parallel
+    // copies are ordered so that no copy reads a variable already overwritten above it.
+    assert!(src.contains("emit Event_22e25c6d("));
+    assert!(src.contains("while (v8 < v3) {"));
+    let body = src.split("while (v8 < v3) {").nth(1).unwrap().split('}').next().unwrap();
+    let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 4, "loop body: {body}");
+    let pos = |needle: &str| lines.iter().position(|l| l.starts_with(needle)).unwrap_or_else(|| panic!("no {needle} in {body}"));
+    assert!(pos("v7 = ") < pos("v5 = ") && pos("v5 = ") < pos("v4 = "), "parallel copies out of order: {body}");
+    // No string piece in the inventory.
+    assert!(!c.strings.iter().any(|s| s == "C balance" || s == "r then 100" || s == "NH{q"), "{:?}", c.strings);
+}

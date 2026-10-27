@@ -460,6 +460,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
 
     // Inventories.
     let string_slots: HashSet<U256> = loaders.values().copied().collect();
+    let solc08 = info.metadata.as_ref().and_then(|m| if m.compiler == "solc" { m.version_tuple() } else { None }).map_or(false, |v| v >= (0, 8, 0));
     let (storage, events, errors, mut strings, selectors_called) = inventories(&functions, vyper, &string_slots);
     for st in scan_strings(code, code_end) {
         if !strings.iter().any(|x| x.contains(&st)) {
@@ -468,11 +469,16 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     }
     strings.sort();
     strings.dedup();
+    // Pieces of a longer string (32-byte halves of a revert reason) are not strings of their own.
+    strings.retain(|s| s.len() >= 5 && s.chars().filter(|c| c.is_ascii_alphabetic()).count() * 2 >= s.len());
+    let snap = strings.clone();
+    strings.retain(|s| !snap.iter().any(|o| o.len() > s.len() && o.contains(s.as_str())));
 
     tick("discover+inventories", &mut tt);
     // Render code for each function.
     for f in functions.iter_mut() {
-        let names = make_names(f, &storage, vyper, &loaders);
+        let mut names = make_names(f, &storage, vyper, &loaders);
+        names.hide_checked = solc08;
         let l = f.lifted.as_ref().unwrap();
         let t1 = std::time::Instant::now();
         let body = if opts.flat { emit::fmt_flat(l, &names, "        ") } else { crate::structure::fmt_structured(l, &names, "        ") };
@@ -642,11 +648,20 @@ fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>
                             fields.entry(k).or_default().entry((off, bits)).or_default().push(expr::as_const(value));
                         }
                     }
-                    Stmt::Log { topics, .. } => {
+                    Stmt::Log { topics, data, .. } => {
                         if let Some(t0) = topics.first().and_then(|t| expr::as_const(*t)) {
                             match sigs::event(&t0.to_be_bytes()) {
                                 Some(sig) => events.insert(with_indexed(sig, topics.len() - 1)),
-                                None => events.insert(format!("{} (unknown, {} indexed)", t0.to_hex_padded(32), topics.len() - 1)),
+                                None => {
+                                    // Unknown signature: named by the hash's first four bytes, with
+                                    // one indexed parameter per extra topic and one per data word.
+                                    let mut tys: Vec<String> = vec!["uint256 indexed".to_string(); topics.len() - 1];
+                                    match data {
+                                        Some(w) => tys.extend(w.iter().map(|_| "uint256".to_string())),
+                                        None => tys.push("bytes".to_string()),
+                                    }
+                                    events.insert(format!("{}({}); // topic0 {}", emit::event_placeholder_name(t0), tys.join(", "), t0.to_hex_padded(32)))
+                                }
                             };
                         } else if topics.is_empty() {
                             events.insert("<anonymous log0>".into());
@@ -884,7 +899,19 @@ fn scan_strings(code: &[u8], code_end: usize) -> Vec<String> {
     let insns = crate::disasm::disassemble(&code[..end]);
     for (idx, insn) in insns.iter().enumerate() {
         let Some(imm) = insn.imm else { continue };
-        let size = insn.opcode as usize - 0x5f;
+        let mut size = insn.opcode as usize - 0x5f;
+        // `PUSHn x; PUSH1 k; SHL`: the optimizer's form of a left-aligned short piece.
+        let mut imm = imm;
+        if let (Some(a), Some(b)) = (insns.get(idx + 1), insns.get(idx + 2)) {
+            if a.opcode == 0x60 && b.opcode == crate::opcode::SHL {
+                if let Some(k) = a.imm.and_then(|k| k.as_usize()) {
+                    if k < 256 {
+                        imm = imm.shl(k as u32);
+                        size = 32;
+                    }
+                }
+            }
+        }
         if size < 4 {
             continue;
         }
@@ -926,7 +953,14 @@ fn scan_strings(code: &[u8], code_end: usize) -> Vec<String> {
         let letters = s.chars().filter(|c| c.is_ascii_alphabetic()).count();
         s.len() >= 6 && letters * 2 >= s.len()
     });
-    out.iter().map(|s| s.trim().to_string()).collect()
+    let mut out: Vec<String> = out.iter().map(|s| s.trim().to_string()).collect();
+    // One entry per string: no duplicates, and no 32-byte piece of a longer string that was
+    // also joined.
+    out.sort();
+    out.dedup();
+    let snap = out.clone();
+    out.retain(|s| !snap.iter().any(|o| o.len() > s.len() && o.contains(s.as_str())));
+    out
 }
 
 fn collect_strings(e: expr::ExprId, out: &mut BTreeSet<String>) {
@@ -988,7 +1022,11 @@ pub fn render(c: &Contract, name: &str) -> String {
     }
     if !c.events.is_empty() {
         for e in &c.events {
-            out.push_str(&format!("    event {};\n", e));
+            if e.contains("; //") {
+                out.push_str(&format!("    event {}\n", e));
+            } else {
+                out.push_str(&format!("    event {};\n", e));
+            }
         }
         out.push('\n');
     }

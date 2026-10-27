@@ -129,7 +129,8 @@ def main():
                 abi_ev.add(keccak256(sig(it).encode()).hex())
         got_ev = set()
         for e in c['events']:
-            if e.startswith('0x') and ' ' in e: got_ev.add(e.split()[0][2:])
+            if '// topic0 0x' in e: got_ev.add(e.split('// topic0 0x')[1].strip())
+            elif e.startswith('0x') and ' ' in e: got_ev.add(e.split()[0][2:])
             else:
                 # Declarations carry `indexed` markers; the topic hash uses the bare signature.
                 bare = e.replace(' indexed', '').replace(', ', ',')

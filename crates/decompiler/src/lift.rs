@@ -636,9 +636,9 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
         for s in &nd.stmts {
             match s {
                 Stmt::MStore { off, val, width: 32 } => sum.mstores.push((*off, *val)),
-                Stmt::MStore { .. } => return None,
+                Stmt::MStore { .. } => return fail_summary(201),
                 Stmt::Copy { kind: op::MCOPY, dest, src, len, .. } => sum.copies.push((*dest, *src, *len)),
-                Stmt::Copy { .. } | Stmt::Internal { .. } | Stmt::Call { .. } | Stmt::Create { .. } => return None,
+                Stmt::Copy { .. } | Stmt::Internal { .. } | Stmt::Call { .. } | Stmt::Create { .. } => return fail_summary(202),
                 Stmt::SStore { .. } | Stmt::Log { .. } => sum.side_effects = true,
                 Stmt::Require { cond, data, invalid } => sum.guards.push((*cond, data.clone(), *invalid)),
                 Stmt::Assign { .. } | Stmt::Drop(_) => {}
@@ -713,11 +713,30 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                 }
                 // Follow the non-reverting side if the other only reverts, and remember the
                 // condition that side needs as a guard.
-                let rev = |x: usize| matches!(l.nodes[x].term, Term::Revert { .. } | Term::Invalid | Term::Infeasible) && l.nodes[x].stmts.iter().all(|s| matches!(s, Stmt::MStore { .. }));
+                // The reverting side may reach its revert through a chain of store-only nodes
+                // (a shared `revert(ptr, sub(end, ptr))` tail).
+                let follow = |mut x: usize| -> Option<usize> {
+                    let mut hops = 0;
+                    loop {
+                        let nd = &l.nodes[x];
+                        if !nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. })) {
+                            return None;
+                        }
+                        match &nd.term {
+                            Term::Revert { .. } | Term::Invalid | Term::Infeasible => return Some(x),
+                            Term::Jump(j) if hops < 4 => {
+                                x = *j;
+                                hops += 1;
+                            }
+                            _ => return None,
+                        }
+                    }
+                };
+                let rev = |x: usize| follow(x).is_some();
                 let payload = |x: usize| -> (Option<Vec<ExprId>>, bool) {
-                    match &l.nodes[x].term {
-                        Term::Revert { data, .. } => (data.clone(), false),
-                        Term::Invalid => (None, true),
+                    match follow(x).map(|y| &l.nodes[y].term) {
+                        Some(Term::Revert { data, .. }) => (data.clone(), false),
+                        Some(Term::Invalid) => (None, true),
                         _ => (None, false),
                     }
                 };
@@ -736,10 +755,10 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                         sum.guards.push((expr::op1(op::ISZERO, *cond), None, true));
                         n = *f;
                     }
-                    _ => return None,
+                    _ => return fail_summary(204),
                 }
             }
-            _ => return None,
+            _ => return fail_summary(205),
         }
     }
 }
@@ -748,7 +767,21 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
 /// was decoded: they are dropped from the output as encoding noise.
 #[derive(Default)]
 struct Hidden {
-    set: std::cell::RefCell<HashSet<(usize, usize)>>,
+    /// Per consuming node (cleared each time that node is re-run, so that a decode that only
+    /// succeeded on an early, single-predecessor run does not hide stores for good).
+    by_node: std::cell::RefCell<HashMap<usize, HashSet<(usize, usize)>>>,
+}
+
+impl Hidden {
+    fn begin(&self, consumer: usize) {
+        self.by_node.borrow_mut().remove(&consumer);
+    }
+    fn add(&self, consumer: usize, origins: Vec<(usize, usize)>) {
+        self.by_node.borrow_mut().entry(consumer).or_default().extend(origins);
+    }
+    fn all(&self) -> HashSet<(usize, usize)> {
+        self.by_node.borrow().values().flatten().copied().collect()
+    }
 }
 
 #[derive(Clone)]
@@ -882,7 +915,7 @@ impl<'a> Lifter<'a> {
         }
 
         // Finalise: edge assignments and node list.
-        let hidden_set = hidden.set.borrow().clone();
+        let hidden_set = hidden.all();
         let mut nodes: Vec<LNode> = Vec::new();
         let mut map: HashMap<usize, usize> = HashMap::new();
         for (i, ln) in lnodes.iter().enumerate() {
@@ -1075,6 +1108,7 @@ impl<'a> Lifter<'a> {
         let prog = self.prog;
         let un = &unit.nodes[nid];
         let blk = &prog.blocks[un.block];
+        hidden.begin(nid);
         let mut st = entry.clone();
         st.version = st.mem.gen;
         let mut stmts: Vec<Stmt> = Vec::new();
@@ -1162,7 +1196,7 @@ impl<'a> Lifter<'a> {
                     let v = match expr::as_const(len).and_then(|l| l.as_usize()) {
                         Some(l) if l <= 8192 => match st.mem.read_region(off, l as u64, st.version) {
                             Some((words, tail)) => {
-                                hidden.set.borrow_mut().extend(st.mem.consumers(off, l as u64));
+                                hidden.add(nid, st.mem.consumers(off, l as u64));
                                 match fold_keccak(&words, tail) {
                                     Some(h) => konst(h),
                                     None => expr::intern(Node::Keccak(words, tail)),
@@ -1178,6 +1212,12 @@ impl<'a> Lifter<'a> {
                 op::MLOAD => {
                     let off = pop!();
                     let v = st.mem.load_word(off, st.version);
+                    if std::env::var("EVMDEC_DEBUG_LOAD").map_or(false, |w| w == ins.pc.to_string()) {
+                        eprintln!("MLOAD pc={} off={:?} norm={:?} -> {:?}", ins.pc, expr::node(off), norm_offset(off), expr::node(v));
+                        for w in &st.mem.writes {
+                            eprintln!("  write base={:?} off={} len={:?} val={} gen={}", w.base.map(|b| expr::node(b)), w.off, w.len, match &w.val { MVal::Word(_) => "word", MVal::Byte(_) => "byte", MVal::Copy(..) => "copy", MVal::CallOut(_) => "callout", MVal::Unknown => "unknown" }, w.gen);
+                        }
+                    }
                     st.stack.push(v);
                 }
                 op::MSTORE | op::MSTORE8 => {
@@ -1353,7 +1393,7 @@ impl<'a> Lifter<'a> {
                     }
                     let data = expr::as_const(len).and_then(|l| l.as_usize()).and_then(|l| st.mem.read_region(off, l as u64, st.version)).map(|(w, _)| w);
                     if data.is_some() {
-                        hidden.set.borrow_mut().extend(st.mem.consumers(off, expr::as_const(len).unwrap().low_u64()));
+                        hidden.add(nid, st.mem.consumers(off, expr::as_const(len).unwrap().low_u64()));
                     }
                     stmts.push(Stmt::Log { off, len, topics, data });
                 }
@@ -1369,7 +1409,7 @@ impl<'a> Lifter<'a> {
                     seq_ctr += 1;
                     let input = expr::as_const(in_len).and_then(|l| l.as_usize()).and_then(|l| st.mem.read_region(in_off, l as u64, st.version)).map(|(w, _)| w);
                     if input.is_some() {
-                        hidden.set.borrow_mut().extend(st.mem.consumers(in_off, expr::as_const(in_len).unwrap().low_u64()));
+                        hidden.add(nid, st.mem.consumers(in_off, expr::as_const(in_len).unwrap().low_u64()));
                     }
                     let result = expr::intern(Node::CallResult(seq));
                     // The first payload words, read before the output region (which usually
@@ -1425,7 +1465,7 @@ impl<'a> Lifter<'a> {
                     let len = pop!();
                     let mut data = expr::as_const(len).and_then(|l| l.as_usize()).and_then(|l| st.mem.read_region(off, l as u64, st.version)).map(|(w, _)| w);
                     if data.is_some() {
-                        hidden.set.borrow_mut().extend(st.mem.consumers(off, expr::as_const(len).unwrap().low_u64()));
+                        hidden.add(nid, st.mem.consumers(off, expr::as_const(len).unwrap().low_u64()));
                     } else if o == op::RETURN && !self.oracle {
                         data = expr::as_const(len).and_then(|l| l.as_usize()).and_then(|l| st.mem.read_region_lossy(off, l as u64, st.version));
                     }
@@ -1509,7 +1549,16 @@ impl<'a> Lifter<'a> {
         // returns one of its arguments leaves a `Slot` push, which still counts as a return), or
         // one per unknown push.
         let by_position = summary.map_or(false, |s| s.returns.len() == call.pushed.len());
-        let direct_returns: Option<Vec<ExprId>> = summary.filter(|s| by_position || s.returns.len() == unknown_pushed).map(|s| s.returns.iter().map(|e| subst(*e)).collect());
+        // A helper that returns `mload(p)` for a pointer argument reads the caller's memory:
+        // resolve such loads here (the pointer may hold a call's return data).
+        let resolve = |e: ExprId| -> ExprId {
+            let mut memo = HashMap::new();
+            expr::substitute(e, &|n| if let Node::MLoad(a, _) = n { Some(st.mem.load_word(*a, st.version)) } else { None }, &mut memo)
+        };
+        // (Only for a callee that writes no memory itself: its reads then see the caller's memory
+        // as it is at the call.)
+        let reads_caller = summary.map_or(false, |s| s.mstores.is_empty() && s.copies.is_empty() && s.maybe_mstores.is_empty());
+        let direct_returns: Option<Vec<ExprId>> = summary.filter(|s| by_position || s.returns.len() == unknown_pushed).map(|s| s.returns.iter().map(|e| if reads_caller { resolve(subst(*e)) } else { subst(*e) }).collect());
         let mut results = Vec::new();
         let mut j = 0u16;
         let mut pushed_vals = Vec::new();

@@ -1,0 +1,6 @@
+/target
+/cache
+corpus/*.hex
+corpus/*.json
+!corpus/addrs.txt
+*.swp

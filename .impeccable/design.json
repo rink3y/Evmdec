@@ -1,0 +1,855 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-27T22:37:49Z",
+  "title": "Design System: evmdec",
+  "source": {
+    "artifact": "crates/server/static/index.html",
+    "world": "Drawing set",
+    "seed": "seed:67b4e9518045227d",
+    "reviewDisposition": "ship"
+  },
+  "extensions": {
+    "colorMeta": {
+      "sheet-white": {
+        "role": "neutral",
+        "displayName": "Sheet White",
+        "canonical": "oklch(100.0% 0.000 90)",
+        "theme": "light",
+        "cssVariable": "--bg",
+        "tonalRamp": [
+          "oklch(15% 0.000 90)",
+          "oklch(25% 0.000 90)",
+          "oklch(37% 0.000 90)",
+          "oklch(50% 0.000 90)",
+          "oklch(62% 0.000 90)",
+          "oklch(75% 0.000 90)",
+          "oklch(86% 0.000 90)",
+          "oklch(95% 0.000 90)"
+        ]
+      },
+      "iron-black": {
+        "role": "neutral",
+        "displayName": "Iron Black",
+        "canonical": "oklch(22.9% 0.009 256)",
+        "theme": "light",
+        "cssVariable": "--fg",
+        "tonalRamp": [
+          "oklch(15% 0.009 256)",
+          "oklch(25% 0.009 256)",
+          "oklch(37% 0.009 256)",
+          "oklch(50% 0.009 256)",
+          "oklch(62% 0.009 256)",
+          "oklch(75% 0.009 256)",
+          "oklch(86% 0.009 256)",
+          "oklch(95% 0.009 256)"
+        ]
+      },
+      "graphite-muted": {
+        "role": "neutral",
+        "displayName": "Graphite Muted",
+        "canonical": "oklch(48.7% 0.016 258)",
+        "theme": "light",
+        "cssVariable": "--muted",
+        "tonalRamp": [
+          "oklch(15% 0.016 258)",
+          "oklch(25% 0.016 258)",
+          "oklch(37% 0.016 258)",
+          "oklch(50% 0.016 258)",
+          "oklch(62% 0.016 258)",
+          "oklch(75% 0.016 258)",
+          "oklch(86% 0.016 258)",
+          "oklch(95% 0.016 258)"
+        ]
+      },
+      "rule-line": {
+        "role": "neutral",
+        "displayName": "Rule Line",
+        "canonical": "oklch(80.0% 0.011 257)",
+        "theme": "light",
+        "cssVariable": "--line",
+        "tonalRamp": [
+          "oklch(15% 0.011 257)",
+          "oklch(25% 0.011 257)",
+          "oklch(37% 0.011 257)",
+          "oklch(50% 0.011 257)",
+          "oklch(62% 0.011 257)",
+          "oklch(75% 0.011 257)",
+          "oklch(86% 0.011 257)",
+          "oklch(95% 0.011 257)"
+        ]
+      },
+      "rule-hair": {
+        "role": "neutral",
+        "displayName": "Rule Hair",
+        "canonical": "oklch(90.2% 0.006 255)",
+        "theme": "light",
+        "cssVariable": "--hair",
+        "tonalRamp": [
+          "oklch(15% 0.006 255)",
+          "oklch(25% 0.006 255)",
+          "oklch(37% 0.006 255)",
+          "oklch(50% 0.006 255)",
+          "oklch(62% 0.006 255)",
+          "oklch(75% 0.006 255)",
+          "oklch(86% 0.006 255)",
+          "oklch(95% 0.006 255)"
+        ]
+      },
+      "well-grey": {
+        "role": "neutral",
+        "displayName": "Well Grey",
+        "canonical": "oklch(97.3% 0.002 248)",
+        "theme": "light",
+        "cssVariable": "--well",
+        "tonalRamp": [
+          "oklch(15% 0.002 248)",
+          "oklch(25% 0.002 248)",
+          "oklch(37% 0.002 248)",
+          "oklch(50% 0.002 248)",
+          "oklch(62% 0.002 248)",
+          "oklch(75% 0.002 248)",
+          "oklch(86% 0.002 248)",
+          "oklch(95% 0.002 248)"
+        ]
+      },
+      "vermilion-rubric": {
+        "role": "primary",
+        "displayName": "Vermilion Rubric",
+        "canonical": "oklch(50.1% 0.178 29)",
+        "theme": "light",
+        "cssVariable": "--rubric",
+        "tonalRamp": [
+          "oklch(15% 0.178 29)",
+          "oklch(25% 0.178 29)",
+          "oklch(37% 0.178 29)",
+          "oklch(50% 0.178 29)",
+          "oklch(62% 0.178 29)",
+          "oklch(75% 0.178 29)",
+          "oklch(86% 0.178 29)",
+          "oklch(95% 0.178 29)"
+        ]
+      },
+      "on-rubric-light": {
+        "role": "primary",
+        "displayName": "On Rubric (light)",
+        "canonical": "oklch(100.0% 0.000 90)",
+        "theme": "light",
+        "cssVariable": "--on-rubric",
+        "tonalRamp": [
+          "oklch(15% 0.000 90)",
+          "oklch(25% 0.000 90)",
+          "oklch(37% 0.000 90)",
+          "oklch(50% 0.000 90)",
+          "oklch(62% 0.000 90)",
+          "oklch(75% 0.000 90)",
+          "oklch(86% 0.000 90)",
+          "oklch(95% 0.000 90)"
+        ]
+      },
+      "focus-blue": {
+        "role": "primary",
+        "displayName": "Focus Blue",
+        "canonical": "oklch(49.5% 0.199 261)",
+        "theme": "light",
+        "cssVariable": "--focus",
+        "tonalRamp": [
+          "oklch(15% 0.199 261)",
+          "oklch(25% 0.199 261)",
+          "oklch(37% 0.199 261)",
+          "oklch(50% 0.199 261)",
+          "oklch(62% 0.199 261)",
+          "oklch(75% 0.199 261)",
+          "oklch(86% 0.199 261)",
+          "oklch(95% 0.199 261)"
+        ]
+      },
+      "selection-blue": {
+        "role": "neutral",
+        "displayName": "Selection Blue",
+        "canonical": "oklch(92.8% 0.034 262)",
+        "theme": "light",
+        "cssVariable": "--sel",
+        "tonalRamp": [
+          "oklch(15% 0.034 262)",
+          "oklch(25% 0.034 262)",
+          "oklch(37% 0.034 262)",
+          "oklch(50% 0.034 262)",
+          "oklch(62% 0.034 262)",
+          "oklch(75% 0.034 262)",
+          "oklch(86% 0.034 262)",
+          "oklch(95% 0.034 262)"
+        ]
+      },
+      "lit-straw": {
+        "role": "neutral",
+        "displayName": "Lit Straw",
+        "canonical": "oklch(95.8% 0.062 93)",
+        "theme": "light",
+        "cssVariable": "--lit",
+        "tonalRamp": [
+          "oklch(15% 0.062 93)",
+          "oklch(25% 0.062 93)",
+          "oklch(37% 0.062 93)",
+          "oklch(50% 0.062 93)",
+          "oklch(62% 0.062 93)",
+          "oklch(75% 0.062 93)",
+          "oklch(86% 0.062 93)",
+          "oklch(95% 0.062 93)"
+        ]
+      },
+      "severity-critical": {
+        "role": "severity",
+        "displayName": "Severity Critical",
+        "canonical": "oklch(42.3% 0.153 29)",
+        "theme": "light",
+        "cssVariable": "--critical",
+        "tonalRamp": [
+          "oklch(15% 0.153 29)",
+          "oklch(25% 0.153 29)",
+          "oklch(37% 0.153 29)",
+          "oklch(50% 0.153 29)",
+          "oklch(62% 0.153 29)",
+          "oklch(75% 0.153 29)",
+          "oklch(86% 0.153 29)",
+          "oklch(95% 0.153 29)"
+        ]
+      },
+      "severity-high": {
+        "role": "severity",
+        "displayName": "Severity High",
+        "canonical": "oklch(50.1% 0.178 29)",
+        "theme": "light",
+        "cssVariable": "--high",
+        "tonalRamp": [
+          "oklch(15% 0.178 29)",
+          "oklch(25% 0.178 29)",
+          "oklch(37% 0.178 29)",
+          "oklch(50% 0.178 29)",
+          "oklch(62% 0.178 29)",
+          "oklch(75% 0.178 29)",
+          "oklch(86% 0.178 29)",
+          "oklch(95% 0.178 29)"
+        ]
+      },
+      "severity-medium": {
+        "role": "severity",
+        "displayName": "Severity Medium",
+        "canonical": "oklch(50.8% 0.108 73)",
+        "theme": "light",
+        "cssVariable": "--medium",
+        "tonalRamp": [
+          "oklch(15% 0.108 73)",
+          "oklch(25% 0.108 73)",
+          "oklch(37% 0.108 73)",
+          "oklch(50% 0.108 73)",
+          "oklch(62% 0.108 73)",
+          "oklch(75% 0.108 73)",
+          "oklch(86% 0.108 73)",
+          "oklch(95% 0.108 73)"
+        ]
+      },
+      "severity-low": {
+        "role": "severity",
+        "displayName": "Severity Low",
+        "canonical": "oklch(49.2% 0.151 256)",
+        "theme": "light",
+        "cssVariable": "--low",
+        "tonalRamp": [
+          "oklch(15% 0.151 256)",
+          "oklch(25% 0.151 256)",
+          "oklch(37% 0.151 256)",
+          "oklch(50% 0.151 256)",
+          "oklch(62% 0.151 256)",
+          "oklch(75% 0.151 256)",
+          "oklch(86% 0.151 256)",
+          "oklch(95% 0.151 256)"
+        ]
+      },
+      "severity-info": {
+        "role": "severity",
+        "displayName": "Severity Info",
+        "canonical": "oklch(48.7% 0.016 258)",
+        "theme": "light",
+        "cssVariable": "--info",
+        "tonalRamp": [
+          "oklch(15% 0.016 258)",
+          "oklch(25% 0.016 258)",
+          "oklch(37% 0.016 258)",
+          "oklch(50% 0.016 258)",
+          "oklch(62% 0.016 258)",
+          "oklch(75% 0.016 258)",
+          "oklch(86% 0.016 258)",
+          "oklch(95% 0.016 258)"
+        ]
+      },
+      "code-string-green": {
+        "role": "code",
+        "displayName": "Code String Green",
+        "canonical": "oklch(42.9% 0.099 135)",
+        "theme": "light",
+        "cssVariable": "--str",
+        "tonalRamp": [
+          "oklch(15% 0.099 135)",
+          "oklch(25% 0.099 135)",
+          "oklch(37% 0.099 135)",
+          "oklch(50% 0.099 135)",
+          "oklch(62% 0.099 135)",
+          "oklch(75% 0.099 135)",
+          "oklch(86% 0.099 135)",
+          "oklch(95% 0.099 135)"
+        ]
+      },
+      "prussian-ground": {
+        "role": "neutral",
+        "displayName": "Prussian Ground",
+        "canonical": "oklch(25.7% 0.061 258)",
+        "theme": "dark",
+        "cssVariable": "--bg",
+        "tonalRamp": [
+          "oklch(15% 0.061 258)",
+          "oklch(25% 0.061 258)",
+          "oklch(37% 0.061 258)",
+          "oklch(50% 0.061 258)",
+          "oklch(62% 0.061 258)",
+          "oklch(75% 0.061 258)",
+          "oklch(86% 0.061 258)",
+          "oklch(95% 0.061 258)"
+        ]
+      },
+      "pale-line": {
+        "role": "neutral",
+        "displayName": "Pale Line",
+        "canonical": "oklch(94.6% 0.016 254)",
+        "theme": "dark",
+        "cssVariable": "--fg",
+        "tonalRamp": [
+          "oklch(15% 0.016 254)",
+          "oklch(25% 0.016 254)",
+          "oklch(37% 0.016 254)",
+          "oklch(50% 0.016 254)",
+          "oklch(62% 0.016 254)",
+          "oklch(75% 0.016 254)",
+          "oklch(86% 0.016 254)",
+          "oklch(95% 0.016 254)"
+        ]
+      },
+      "dusk-muted": {
+        "role": "neutral",
+        "displayName": "Dusk Muted",
+        "canonical": "oklch(78.6% 0.040 256)",
+        "theme": "dark",
+        "cssVariable": "--muted",
+        "tonalRamp": [
+          "oklch(15% 0.040 256)",
+          "oklch(25% 0.040 256)",
+          "oklch(37% 0.040 256)",
+          "oklch(50% 0.040 256)",
+          "oklch(62% 0.040 256)",
+          "oklch(75% 0.040 256)",
+          "oklch(86% 0.040 256)",
+          "oklch(95% 0.040 256)"
+        ]
+      },
+      "blueprint-line": {
+        "role": "neutral",
+        "displayName": "Blueprint Line",
+        "canonical": "oklch(53.5% 0.076 256)",
+        "theme": "dark",
+        "cssVariable": "--line",
+        "tonalRamp": [
+          "oklch(15% 0.076 256)",
+          "oklch(25% 0.076 256)",
+          "oklch(37% 0.076 256)",
+          "oklch(50% 0.076 256)",
+          "oklch(62% 0.076 256)",
+          "oklch(75% 0.076 256)",
+          "oklch(86% 0.076 256)",
+          "oklch(95% 0.076 256)"
+        ]
+      },
+      "blueprint-hair": {
+        "role": "neutral",
+        "displayName": "Blueprint Hair",
+        "canonical": "oklch(38.1% 0.075 258)",
+        "theme": "dark",
+        "cssVariable": "--hair",
+        "tonalRamp": [
+          "oklch(15% 0.075 258)",
+          "oklch(25% 0.075 258)",
+          "oklch(37% 0.075 258)",
+          "oklch(50% 0.075 258)",
+          "oklch(62% 0.075 258)",
+          "oklch(75% 0.075 258)",
+          "oklch(86% 0.075 258)",
+          "oklch(95% 0.075 258)"
+        ]
+      },
+      "blueprint-well": {
+        "role": "neutral",
+        "displayName": "Blueprint Well",
+        "canonical": "oklch(30.7% 0.070 255)",
+        "theme": "dark",
+        "cssVariable": "--well",
+        "tonalRamp": [
+          "oklch(15% 0.070 255)",
+          "oklch(25% 0.070 255)",
+          "oklch(37% 0.070 255)",
+          "oklch(50% 0.070 255)",
+          "oklch(62% 0.070 255)",
+          "oklch(75% 0.070 255)",
+          "oklch(86% 0.070 255)",
+          "oklch(95% 0.070 255)"
+        ]
+      },
+      "amber-rubric": {
+        "role": "primary",
+        "displayName": "Amber Rubric",
+        "canonical": "oklch(88.5% 0.118 83)",
+        "theme": "dark",
+        "cssVariable": "--rubric",
+        "tonalRamp": [
+          "oklch(15% 0.118 83)",
+          "oklch(25% 0.118 83)",
+          "oklch(37% 0.118 83)",
+          "oklch(50% 0.118 83)",
+          "oklch(62% 0.118 83)",
+          "oklch(75% 0.118 83)",
+          "oklch(86% 0.118 83)",
+          "oklch(95% 0.118 83)"
+        ]
+      },
+      "on-rubric-dark": {
+        "role": "primary",
+        "displayName": "On Rubric (dark)",
+        "canonical": "oklch(25.7% 0.061 258)",
+        "theme": "dark",
+        "cssVariable": "--on-rubric",
+        "tonalRamp": [
+          "oklch(15% 0.061 258)",
+          "oklch(25% 0.061 258)",
+          "oklch(37% 0.061 258)",
+          "oklch(50% 0.061 258)",
+          "oklch(62% 0.061 258)",
+          "oklch(75% 0.061 258)",
+          "oklch(86% 0.061 258)",
+          "oklch(95% 0.061 258)"
+        ]
+      },
+      "blueprint-selection": {
+        "role": "neutral",
+        "displayName": "Blueprint Selection",
+        "canonical": "oklch(42.5% 0.088 257)",
+        "theme": "dark",
+        "cssVariable": "--sel",
+        "tonalRamp": [
+          "oklch(15% 0.088 257)",
+          "oklch(25% 0.088 257)",
+          "oklch(37% 0.088 257)",
+          "oklch(50% 0.088 257)",
+          "oklch(62% 0.088 257)",
+          "oklch(75% 0.088 257)",
+          "oklch(86% 0.088 257)",
+          "oklch(95% 0.088 257)"
+        ]
+      },
+      "lit-umber": {
+        "role": "neutral",
+        "displayName": "Lit Umber",
+        "canonical": "oklch(35.5% 0.052 98)",
+        "theme": "dark",
+        "cssVariable": "--lit",
+        "tonalRamp": [
+          "oklch(15% 0.052 98)",
+          "oklch(25% 0.052 98)",
+          "oklch(37% 0.052 98)",
+          "oklch(50% 0.052 98)",
+          "oklch(62% 0.052 98)",
+          "oklch(75% 0.052 98)",
+          "oklch(86% 0.052 98)",
+          "oklch(95% 0.052 98)"
+        ]
+      },
+      "severity-critical-dark": {
+        "role": "severity",
+        "displayName": "Severity Critical (dark)",
+        "canonical": "oklch(76.7% 0.138 25)",
+        "theme": "dark",
+        "cssVariable": "--critical",
+        "tonalRamp": [
+          "oklch(15% 0.138 25)",
+          "oklch(25% 0.138 25)",
+          "oklch(37% 0.138 25)",
+          "oklch(50% 0.138 25)",
+          "oklch(62% 0.138 25)",
+          "oklch(75% 0.138 25)",
+          "oklch(86% 0.138 25)",
+          "oklch(95% 0.138 25)"
+        ]
+      },
+      "severity-high-dark": {
+        "role": "severity",
+        "displayName": "Severity High (dark)",
+        "canonical": "oklch(79.4% 0.119 26)",
+        "theme": "dark",
+        "cssVariable": "--high",
+        "tonalRamp": [
+          "oklch(15% 0.119 26)",
+          "oklch(25% 0.119 26)",
+          "oklch(37% 0.119 26)",
+          "oklch(50% 0.119 26)",
+          "oklch(62% 0.119 26)",
+          "oklch(75% 0.119 26)",
+          "oklch(86% 0.119 26)",
+          "oklch(95% 0.119 26)"
+        ]
+      },
+      "severity-medium-dark": {
+        "role": "severity",
+        "displayName": "Severity Medium (dark)",
+        "canonical": "oklch(88.5% 0.118 83)",
+        "theme": "dark",
+        "cssVariable": "--medium",
+        "tonalRamp": [
+          "oklch(15% 0.118 83)",
+          "oklch(25% 0.118 83)",
+          "oklch(37% 0.118 83)",
+          "oklch(50% 0.118 83)",
+          "oklch(62% 0.118 83)",
+          "oklch(75% 0.118 83)",
+          "oklch(86% 0.118 83)",
+          "oklch(95% 0.118 83)"
+        ]
+      },
+      "severity-low-dark": {
+        "role": "severity",
+        "displayName": "Severity Low (dark)",
+        "canonical": "oklch(80.7% 0.101 250)",
+        "theme": "dark",
+        "cssVariable": "--low",
+        "tonalRamp": [
+          "oklch(15% 0.101 250)",
+          "oklch(25% 0.101 250)",
+          "oklch(37% 0.101 250)",
+          "oklch(50% 0.101 250)",
+          "oklch(62% 0.101 250)",
+          "oklch(75% 0.101 250)",
+          "oklch(86% 0.101 250)",
+          "oklch(95% 0.101 250)"
+        ]
+      },
+      "severity-info-dark": {
+        "role": "severity",
+        "displayName": "Severity Info (dark)",
+        "canonical": "oklch(78.6% 0.040 256)",
+        "theme": "dark",
+        "cssVariable": "--info",
+        "tonalRamp": [
+          "oklch(15% 0.040 256)",
+          "oklch(25% 0.040 256)",
+          "oklch(37% 0.040 256)",
+          "oklch(50% 0.040 256)",
+          "oklch(62% 0.040 256)",
+          "oklch(75% 0.040 256)",
+          "oklch(86% 0.040 256)",
+          "oklch(95% 0.040 256)"
+        ]
+      },
+      "code-string-green-dark": {
+        "role": "code",
+        "displayName": "Code String Green (dark)",
+        "canonical": "oklch(86.8% 0.101 135)",
+        "theme": "dark",
+        "cssVariable": "--str",
+        "tonalRamp": [
+          "oklch(15% 0.101 135)",
+          "oklch(25% 0.101 135)",
+          "oklch(37% 0.101 135)",
+          "oklch(50% 0.101 135)",
+          "oklch(62% 0.101 135)",
+          "oklch(75% 0.101 135)",
+          "oklch(86% 0.101 135)",
+          "oklch(95% 0.101 135)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Landing headline only, inside the empty drawing area; balanced wrap."
+      },
+      "wordmark": {
+        "displayName": "Wordmark",
+        "purpose": "evmdec, lowercase, one word, first header cell; no logo exists."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Report section headings; also the weight of the primary button and scale-line emphasis at body size."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "UI text, finding titles and bodies (70ch), landing copy (70ch), report prose (90ch)."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Tracked uppercase cell labels, column headings (600) and index group headings; muted ink above a 500-weight tabular value."
+      },
+      "severity": {
+        "displayName": "Severity word",
+        "purpose": "CRITICAL / HIGH / MEDIUM / LOW / INFO in a finding row; colour only tints the word."
+      },
+      "code": {
+        "displayName": "Code",
+        "purpose": "The drawing, pre blocks and the address field; tab-size 4; function names at 600."
+      },
+      "code-small": {
+        "displayName": "Code small",
+        "purpose": "Function index rows, evidence wells, finding meta code; report code is 12.5px."
+      }
+    },
+    "themes": [
+      {
+        "name": "whiteprint",
+        "scheme": "light",
+        "selector": ":root, :root[data-theme=\"light\"]",
+        "ground": "{colors.sheet-white}",
+        "ink": "{colors.iron-black}",
+        "rubric": "{colors.vermilion-rubric}",
+        "focus": "{colors.focus-blue}",
+        "lit": "{colors.lit-straw}"
+      },
+      {
+        "name": "blueprint",
+        "scheme": "dark",
+        "selector": ":root[data-theme=\"dark\"], @media (prefers-color-scheme: dark) :root:not([data-theme=\"light\"])",
+        "ground": "{colors.prussian-ground}",
+        "ink": "{colors.pale-line}",
+        "rubric": "{colors.amber-rubric}",
+        "focus": "{colors.amber-rubric}",
+        "lit": "{colors.lit-umber}"
+      }
+    ],
+    "shadows": [
+      {
+        "name": "tab-underline",
+        "value": "inset 0 -2px 0 var(--fg)",
+        "purpose": "The selected tab's 2px rule, drawn inset; the only box-shadow in the system and not an elevation."
+      }
+    ],
+    "borders": [
+      {
+        "name": "line",
+        "value": "1px solid var(--line)",
+        "purpose": "Heavy rule between regions: header, title block, the three columns, tab strip, outline buttons, error (rubric)."
+      },
+      {
+        "name": "hair",
+        "value": "1px solid var(--hair)",
+        "purpose": "Light rule inside a region: cells, rows, tab dividers, scale line, evidence wells, report tables."
+      },
+      {
+        "name": "callout-stroke",
+        "value": "1.5px solid var(--rubric)",
+        "purpose": "The callout circle."
+      },
+      {
+        "name": "revision-cloud",
+        "value": "border: 6px solid transparent; border-image: var(--cloud) 6 round",
+        "purpose": "Scalloped outline on a flagged code line; --cloud is an inline 18x18 SVG of eight 3px arcs stroked in the sheet rubric (vermilion in light, amber in dark). Positioned absolutely from calc(12em - 7px) to 4px from the right edge."
+      }
+    ],
+    "focus": [
+      {
+        "name": "focus-visible",
+        "value": "outline: 2px solid var(--focus); outline-offset: 2px",
+        "purpose": "Every control; blue in light, amber in dark; no border change or glow."
+      }
+    ],
+    "motion": [
+      {
+        "name": "lit-settle",
+        "value": "background .2s ease-out",
+        "purpose": "The only transition: the lit background on code lines and findings, declared under prefers-reduced-motion: no-preference only."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "two-column",
+        "value": "1100px",
+        "purpose": "max-width: index 240px, details drop below full width with a top rule, title block 4 per row."
+      },
+      {
+        "name": "stacked",
+        "value": "720px",
+        "purpose": "max-width: frame unfixes, header wraps, title block 2 per row, columns stack (index list 40vh, drawing panel 70vh)."
+      }
+    ],
+    "layout": {
+      "frame": "body grid-template-rows: auto auto minmax(0,1fr); 100% height; columns scroll independently",
+      "columns": "280px minmax(0,1fr) 380px",
+      "titleBlock": "repeat(8, minmax(0,1fr)); cells 6px 12px",
+      "codeLine": "3.4em 8.6em minmax(0,1fr)",
+      "indexRow": "3.2em minmax(0,1fr) auto; gap 8px",
+      "findingRow": "30px auto minmax(0,1fr); gap 2px 8px; body inset 50px",
+      "targets": "button min-height/min-width 24px; line links 24px"
+    },
+    "accessibility": [
+      "WCAG 2.2 AA contrast on both themes including code highlighting and severity colours",
+      "Severity and confidence printed as words; colour never carries severity alone",
+      "Minimum 24x24 targets on every button and line link",
+      "ARIA tablist with roving tabindex, aria-selected, aria-controls; aria-expanded findings; aria-current index rows; aria-pressed theme toggle",
+      "Polite role=status live region announces theme changes and chosen findings",
+      "Theme follows prefers-color-scheme with data-theme override persisted to localStorage",
+      "prefers-reduced-motion removes the only transition"
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button (Decompile)",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one filled button; ink on the sheet, in the header strip.",
+      "html": "<div class=\"ds\"><button class=\"ds-btn-primary\" type=\"button\">Decompile</button></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-btn-primary{border:0;background:var(--fg);color:var(--bg);padding:0 18px;min-height:40px;min-width:24px;font:600 14px/1.45 var(--sans);border-radius:0;cursor:pointer}.ds-btn-primary:disabled{cursor:progress;opacity:.6}"
+    },
+    {
+      "name": "Outline Button (example)",
+      "kind": "button",
+      "refersTo": "button-outline",
+      "description": "Line-drawn square button used for the three example addresses on the landing sheet.",
+      "html": "<div class=\"ds\"><button class=\"ds-btn-outline\" type=\"button\">WETH</button> <button class=\"ds-btn-outline\" type=\"button\">USDC (proxy)</button></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-btn-outline{border:1px solid var(--line);background:transparent;color:var(--fg);padding:6px 12px;font:600 14px/1.45 var(--sans);border-radius:0;cursor:pointer;min-height:24px}"
+    },
+    {
+      "name": "Query Field",
+      "kind": "input",
+      "refersTo": "input-query",
+      "description": "Address or bytecode field: mono, borderless, bounded by the cell rule.",
+      "html": "<div class=\"ds\"><div class=\"ds-cell\"><input class=\"ds-input-query\" type=\"text\" placeholder=\"Contract address (0x…) or raw bytecode hex\" aria-label=\"Contract address or raw bytecode hex\"></div></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-cell{display:flex;border-bottom:1px solid var(--line);background:var(--bg)}.ds-input-query{flex:1;min-width:0;border:0;border-right:1px solid var(--line);background:transparent;color:var(--fg);padding:10px 14px;font:13px/1.5 var(--mono);border-radius:0}"
+    },
+    {
+      "name": "View Tabs",
+      "kind": "nav",
+      "refersTo": "tab",
+      "description": "ARIA tablist over the drawing; selected tab is ink with a 2px inset underline.",
+      "html": "<div class=\"ds\"><div class=\"ds-tabs\" role=\"tablist\"><button role=\"tab\" class=\"ds-tab\" aria-selected=\"true\">Code</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">Report</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">Storage &amp; events</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">Disassembly</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">JSON</button><button class=\"ds-tab-dl\" type=\"button\">Download .sol</button></div></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-tabs{display:flex;border-bottom:1px solid var(--line);background:var(--bg);font:14px/1.45 var(--sans);color:var(--fg)}.ds-tab{flex:none;border:0;background:transparent;padding:9px 14px;border-right:1px solid var(--hair);color:var(--muted);white-space:nowrap;font:inherit;cursor:pointer;border-radius:0}.ds-tab[aria-selected=\"true\"]{color:var(--fg);box-shadow:inset 0 -2px 0 var(--fg)}.ds-tab-dl{flex:none;margin-left:auto;border:0;border-left:1px solid var(--hair);background:transparent;color:var(--fg);padding:0 14px;font:inherit;cursor:pointer}"
+    },
+    {
+      "name": "Title Block",
+      "kind": "card",
+      "refersTo": "title-block-cell",
+      "description": "Labelled cells divided by hairlines; tracked label over a tabular value; risk in rubric.",
+      "html": "<div class=\"ds\"><div class=\"ds-tb\"><div><span class=\"ds-lbl\">Sheet</span><b>Runtime code</b></div><div><span class=\"ds-lbl\">Coverage</span><b>288/288 blocks · 0 unresolved · 9 ms</b></div><div><span class=\"ds-lbl\">Findings</span><b>1 high, 5 medium, 11 low, 2 info</b></div><div class=\"ds-risk\"><span class=\"ds-lbl\">Risk</span><b>76/100 · High</b></div></div></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds-tb{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-bottom:1px solid var(--line);background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans)}.ds-tb>div{padding:6px 12px;border-right:1px solid var(--hair);min-width:0}.ds-tb>div:last-child{border-right:0}.ds-lbl{display:block;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.ds-tb b{display:block;font-weight:500;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;min-height:1.45em}.ds-risk b{color:var(--rubric);font-weight:700}"
+    },
+    {
+      "name": "Function Index Row",
+      "kind": "custom",
+      "refersTo": "index-row",
+      "description": "Fixed-cell sheet row: F-nn, mono name, mutability; the current sheet stays lit.",
+      "html": "<div class=\"ds\"><ul class=\"ds-fns\"><li class=\"ds-grp\">External · 10</li><li><button type=\"button\" class=\"ds-fn\" aria-current=\"true\"><span class=\"ds-sheet\">F-01</span><span class=\"ds-name\">func_143a1f99(uint256)</span><span class=\"ds-mut\">nonpayable</span></button></li><li><button type=\"button\" class=\"ds-fn\" aria-current=\"false\"><span class=\"ds-sheet\">F-02</span><span class=\"ds-name\">func_1bddf355()</span><span class=\"ds-mut\">payable</span></button></li></ul></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-fns{list-style:none;margin:0;padding:0;width:280px;border-right:1px solid var(--line);background:var(--bg);color:var(--fg)}.ds-grp{padding:6px 12px;font:11px/1.45 var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--hair);background:var(--well)}.ds-fn{display:grid;grid-template-columns:3.2em minmax(0,1fr) auto;gap:8px;width:100%;text-align:left;padding:5px 12px;border:0;border-bottom:1px solid var(--hair);background:transparent;color:inherit;font:12px/1.5 var(--mono);align-items:baseline;cursor:pointer;border-radius:0;transition:none}.ds-fn:hover{background:var(--well)}.ds-fn[aria-current=\"true\"]{background:var(--lit)}.ds-fn[aria-current=\"true\"] .ds-name{font-weight:700}.ds-sheet{color:var(--muted)}.ds-mut{font:11px/1.5 var(--sans);color:var(--muted)}"
+    },
+    {
+      "name": "Callout",
+      "kind": "chip",
+      "refersTo": "callout",
+      "description": "The 24px rubric circle keying a code line to its finding; hover inverts it.",
+      "html": "<div class=\"ds\"><span class=\"ds-co-cell\"><a class=\"ds-co\" href=\"#F2\" aria-label=\"Finding 2: Amount paid out derives from a spot balance\">2</a><a class=\"ds-co\" href=\"#F8\" aria-label=\"Finding 8: Division before multiplication\">8</a></span></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-co-cell{display:inline-flex;gap:2px;padding-left:2px}.ds-co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 11px/1 var(--sans);text-decoration:none}.ds-co:hover{background:var(--rubric);color:var(--on-rubric)}"
+    },
+    {
+      "name": "Flagged Code Line (revision cloud)",
+      "kind": "custom",
+      "refersTo": "callout",
+      "description": "A drawing line with callouts and the scalloped revision cloud drawn as an SVG border-image; the chosen line is lit.",
+      "html": "<div class=\"ds\"><ol class=\"ds-code\"><li><code>    // selector 0x143a1f99 (unknown signature)</code></li><li class=\"ds-flagged\"><span class=\"ds-co-cell\"><a class=\"ds-co\" href=\"#F2\" aria-label=\"Finding 2\">2</a><a class=\"ds-co\" href=\"#F8\" aria-label=\"Finding 8\">8</a></span><code>    function <span class=\"ds-fnname\">func_143a1f99</span>(uint256 arg0) external {</code></li><li class=\"ds-lit\"><code>        require(msg.value == 0);</code></li></ol></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-code{list-style:none;margin:0;padding:10px 0;font:13px/1.5 var(--mono);tab-size:4;counter-reset:ln;background:var(--bg);color:var(--fg)}.ds-code li{display:grid;grid-template-columns:3.4em 8.6em minmax(0,1fr);min-height:1.5em;align-items:start;position:relative}.ds-code li::before{counter-increment:ln;content:counter(ln);grid-column:1;grid-row:1;text-align:right;padding-right:.4em;color:var(--muted);font-variant-numeric:tabular-nums}.ds-code code{grid-column:3;grid-row:1;white-space:pre;display:block;padding-right:1.5em}.ds-co-cell{grid-column:2;grid-row:1;display:flex;gap:2px;padding-left:2px;align-self:center}.ds-co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 11px/1 var(--sans);text-decoration:none}.ds-co:hover{background:var(--rubric);color:var(--on-rubric)}.ds-flagged{background:var(--well);padding:6px 0}.ds-flagged::after{content:\"\";position:absolute;top:0;bottom:0;left:calc(12em - 7px);right:4px;border:6px solid transparent;border-image:var(--cloud) 6 round;pointer-events:none}.ds-lit{background:var(--lit)}.ds-fnname{font-weight:600}@media (prefers-reduced-motion:no-preference){.ds-code li{transition:background .2s ease-out}}"
+    },
+    {
+      "name": "Finding Row",
+      "kind": "card",
+      "refersTo": "finding-row",
+      "description": "A keyed finding: callout, severity word in its colour, title, meta; the open body holds prose, an evidence well and line links.",
+      "html": "<div class=\"ds\"><ol class=\"ds-findings\"><li class=\"ds-finding ds-lit\"><button type=\"button\" aria-expanded=\"true\"><span class=\"ds-co ds-fnum\">1</span><span class=\"ds-sev ds-sev-high\">High</span><span class=\"ds-ftitle\">State written after an external call (reentrancy)</span><span class=\"ds-fmeta\"><code>func_143a1f99</code> · medium confidence · 2 sites</span></button><div class=\"ds-fbody\"><p>`func_143a1f99` performs an external call to `msg.sender` and writes storage afterwards.</p><div class=\"ds-ev\">success_1 = msg.sender.call{value: address(this).balance}(\"\")</div><p><b>Recommendation.</b> Apply the checks-effects-interactions pattern or use a reentrancy guard.</p><p class=\"ds-goto\">Lines <a href=\"#L110\">110</a></p></div></li><li class=\"ds-finding\"><button type=\"button\" aria-expanded=\"false\"><span class=\"ds-co ds-fnum\">2</span><span class=\"ds-sev ds-sev-medium\">Medium</span><span class=\"ds-ftitle\">Amount paid out derives from a spot balance</span><span class=\"ds-fmeta\"><code>func_143a1f99</code> · low confidence</span></button></li></ol></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-findings{list-style:none;margin:0;padding:0;width:380px;border-left:1px solid var(--line);background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans)}.ds-finding{border-bottom:1px solid var(--hair)}.ds-finding>button{display:grid;grid-template-columns:30px auto minmax(0,1fr);grid-template-areas:\"n s t\" \"n s m\";gap:2px 8px;width:100%;text-align:left;border:0;background:transparent;color:inherit;padding:8px 12px;align-items:baseline;font:inherit;cursor:pointer;border-radius:0}.ds-fnum{grid-area:n;align-self:start}.ds-co{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 11px/1 var(--sans)}.ds-sev{grid-area:s;font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase}.ds-sev-high{color:var(--high)}.ds-sev-medium{color:var(--medium)}.ds-ftitle{grid-area:t;overflow-wrap:anywhere}.ds-fmeta{grid-area:m;color:var(--muted);font-size:12px}.ds-fmeta code{font:12px/1.5 var(--mono)}.ds-fbody{padding:0 12px 14px 50px}.ds-fbody p{margin:6px 0;max-width:70ch}.ds-ev{margin:6px 0;padding:6px 10px;background:var(--well);border:1px solid var(--hair);font:12px/1.5 var(--mono);white-space:pre;overflow-x:auto}.ds-goto{font-size:12px;color:var(--muted)}.ds-goto a{display:inline-block;min-width:24px;min-height:24px;line-height:24px;text-align:center;padding:0 2px;color:inherit}.ds-lit{background:var(--lit)}@media (prefers-reduced-motion:no-preference){.ds-finding{transition:background .2s ease-out}}"
+    },
+    {
+      "name": "Error Notice",
+      "kind": "card",
+      "refersTo": "evidence-well",
+      "description": "Rubric-bordered square notice with a rubric lead word; errors never recolour a field.",
+      "html": "<div class=\"ds\"><div class=\"ds-err\"><b>Error.</b> Address not found on mainnet (1).</div></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds-err{margin:16px;padding:12px 14px;border:1px solid var(--rubric);color:var(--fg);background:var(--bg);font:14px/1.45 var(--sans)}.ds-err b{color:var(--rubric)}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Drawing Set",
+    "overview": "**Creative North Star: \"The Drawing Set\"**\n\nThe contract is a built structure and the page is its drawing set. Metadata lives in a title block of eight labelled cells across the top; functions are an indexed sheet list (F-01, F-02, ...) down the left; the decompiled code is the drawing in the middle; every finding is a numbered callout in the code gutter keyed to a detail at the right. The world refuses the category's console (side nav, dark slate, badges) and the report-PDF arrangement. Everything is drawn in line: one-pixel rules divide every region, nothing has a shadow, nothing has a radius except the callout circles, and nothing is labelled twice.\n\nTwo sheets exist. In light the page is a whiteprint: a white sheet, iron-black line and type, one vermilion rubric reserved for callouts, the risk figure and the error border. In dark it is a blueprint: Prussian-blue ground, pale line and type, an amber rubric in the same reserved role. The theme follows the system and can be overridden by the header toggle; both sheets meet WCAG 2.2 AA including the code highlighting and the severity colours.\n\nDensity is that of a drawing, not a dashboard: 14px body on a 1.45 line, 13px mono code on a 1.5 line, tracked 11px uppercase labels over tabular values, 12px meta. The interface stays out of the way so the code, the findings and the layout are read at reading quality. The only motion is the lit background settling in over 200ms; nothing else moves, and reduced motion removes even that.",
+    "keyCharacteristics": [
+      "Hairline rules at 1px divide every region; no shadows, no fills for structure.",
+      "One rubric colour per sheet (vermilion / amber), used only for callouts, the risk figure and errors.",
+      "Zero radius everywhere except the 24px circular callout.",
+      "Tracked uppercase 11px labels over 500-weight tabular values.",
+      "System sans for UI, system mono for code, selectors and evidence; no external fonts or scripts.",
+      "Fixed-cell lists whose columns never move; the chosen line or finding stays lit until another is chosen.",
+      "A scalloped revision cloud outlines every flagged line of the drawing."
+    ],
+    "rules": [
+      {
+        "name": "The One Rubric Rule",
+        "body": "Each sheet has exactly one accent and it marks only what a reviewer would mark in red: the callout, the cloud, the risk figure, an error. Nothing decorative, no links, no buttons wear it.",
+        "section": "colors"
+      },
+      {
+        "name": "The Words First Rule",
+        "body": "Severity and risk are read from the printed word (HIGH, 76/100 · High); the colour tints the word and never stands alone. A risk score under 8 drops the rubric and prints in ink at weight 500.",
+        "section": "colors"
+      },
+      {
+        "name": "The Two Sheets Rule",
+        "body": "Every token has a whiteprint and a blueprint value, and every pair meets AA contrast on its ground. Add a colour to both sheets or to neither.",
+        "section": "colors"
+      },
+      {
+        "name": "The Tracked Label Rule",
+        "body": "Anything that names a cell is 11px uppercase tracked 0.08em in muted ink, set above its value, and never repeated as a heading elsewhere.",
+        "section": "typography"
+      },
+      {
+        "name": "The Ink Code Rule",
+        "body": "Code is set in ink: keywords, types, numbers and function names share the text colour; only comments drop to muted and strings take green. Emphasis in code is weight (600 function names), not colour.",
+        "section": "typography"
+      },
+      {
+        "name": "The Fixed Cell Rule",
+        "body": "Index rows, title-block cells, code lines and finding rows are grids with fixed first columns; content never shifts a column. Long names break at `(` and `,` via soft wraps, long addresses break anywhere, but the grid does not move.",
+        "section": "layout"
+      },
+      {
+        "name": "The Flat Sheet Rule",
+        "body": "Nothing lifts off the sheet. Hierarchy is drawn with rules, fills and weight; a shadow, a glow or a blur is a foreign material.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do divide regions with 1px rules: `line` between regions, `hair` within them; a region's boundary is a rule, never a fill or a shadow.",
+      "Do set every label at 11px uppercase tracked 0.08em in muted ink above a 500-weight tabular value, and label each thing once.",
+      "Do keep the rubric for callouts, the revision cloud, the risk figure at 8 or above, and error borders; the light sheet uses vermilion, the dark sheet amber.",
+      "Do print severity and confidence as words beside each other; colour only tints the severity word.",
+      "Do give every control at least a 24x24 target and the 2px offset focus outline; use `aria-current`, `aria-expanded`, `aria-selected` and the polite `role=status` region for every state change.",
+      "Do define any new colour on both sheets and verify AA contrast on each ground.",
+      "Do use the lit fill (straw / umber) for exactly the chosen item: one index row, one code line, one finding."
+    ],
+    "donts": [
+      "Don't add border-radius to anything but the 24px callout circle; buttons, inputs, tabs, wells and notices stay square.",
+      "Don't add box-shadows, glows, blurs or gradients; the only inset shadow is the 2px selected-tab underline used as a rule.",
+      "Don't load external fonts, icon fonts or scripts; type is the system sans and system mono stacks, and icons are inline SVG at 16px.",
+      "Don't colour code tokens beyond ink, muted comments and green strings, or convey emphasis in code with colour instead of weight.",
+      "Don't let a column move: fixed first cells (3.4em line numbers, 8.6em callout cell, 3.2em sheet number, 30px finding number) hold their width regardless of content.",
+      "Don't animate anything but the lit background (200ms ease-out), and never under reduced motion.",
+      "Don't introduce badges, pills, side navigation or a dark-slate console; the dark sheet is Prussian blue, not grey."
+    ]
+  }
+}

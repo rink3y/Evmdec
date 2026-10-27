@@ -464,7 +464,16 @@ pub fn analyze(c: &Contract) -> Report {
                         // Ether to caller without auth or balance accounting
                         if value_nonzero && from_caller(*addr) && !caller_checked && f.kind == FnKind::External {
                             let v = value.unwrap();
-                            if !from_caller(v) && !from_calldata(v) || (from_calldata(v) && !from_caller(v)) {
+                            // Per-caller accounting before the transfer: a store to a caller-keyed
+                            // slot, or a check against a caller-keyed balance (`balanceOf[msg.sender] >= wad`).
+                            let caller_slot = |e: ExprId| mentions(e, &|n| matches!(n, Node::SLoad(k, ..) if from_caller(*k)));
+                            let accounted = events[..i].iter().any(|e| match (&e.stmt, &e.term) {
+                                (Some(Stmt::SStore { key, .. }), _) => from_caller(*key),
+                                (Some(Stmt::Require { cond, .. }), _) => caller_slot(*cond),
+                                (_, Some(Term::Branch { cond, .. })) => caller_slot(*cond),
+                                _ => false,
+                            });
+                            if !from_caller(v) && !accounted {
                                 push(&mut findings, "unprotected-ether-withdrawal", "Ether sent to msg.sender without per-caller accounting", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                     format!("`{}` sends `{}` wei to msg.sender; the amount is not derived from a msg.sender-keyed balance and the function has no access control.", f.name, emit::fmt_expr(v, &names)),
                                     vec![line.clone()], "Verify the amount is bounded by what the caller is owed.");

@@ -110,9 +110,13 @@ deployer, UNI). Everything is reproducible with `corpus/bench.py` and `corpus/ve
 | parameter count | 512 / 515 = **99.4 %** |
 | return count | 512 / 515 = **99.4 %** |
 | events | 118 / 121 = **97.5 %** |
-| code blocks covered by some function | 11,859 / 11,999 = **98.8 %** |
-| unresolved jumps | 1 (in 22 contracts) |
-| total time | 1.2 s for the whole corpus |
+| code blocks covered by some function | 10,810 / 10,810 = **100 %** |
+| unresolved jumps | 1 (in 22 contracts: one return inside Uniswap V3 factory's `createPool`) |
+| total time | 1.0 s for the whole corpus |
+
+"Code blocks" are blocks the EVM can actually enter (the entry, `JUMPDEST`-started blocks and
+`JUMPI` fall-throughs); bytes after a terminator without a `JUMPDEST` are data or dead by
+construction, and embedded creation code (`CREATE2` payloads) and metadata are excluded.
 
 The six mutability misses are `view` functions that make external calls on a pre-0.5 compiler
 (no `STATICCALL`) or `view` getters of transparent proxies that fall through to `delegatecall`;
@@ -137,7 +141,23 @@ the control decision are compared.
 A mismatch is a decompiler bug by definition; there are none. The 46 unverified blocks never
 produced a conclusive run (they consume stack values as huge memory offsets in every drawn state).
 
-### 3. What the numbers do not cover
+### 3. Random sample: any contract people actually use
+
+To check the "any contract" claim beyond the hand-picked set, `corpus/harvest.py` collects the
+`to` address of every transaction in random recent mainnet blocks and fetches the runtime code
+(no ABI needed). 120 distinct contracts from 12 blocks (`corpus/sample_ids.txt`; tokens,
+routers, MEV bots with hand-written calldata-indexed jump tables, proxies, 0.4 → 0.8 solc,
+Vyper) were run through `corpus/run_sample.sh`:
+
+| | |
+|---|---|
+| contracts decompiled | **120 / 120** (0 failures, 0 timeouts; largest 24.5 KB in 0.4 s) |
+| code blocks covered | 53,720 / 53,810 = 99.8 % |
+| unresolved jumps | 0 |
+| block oracle (3 states per block): mismatches | **0** in 592,999 instructions |
+| instructions in verified blocks | 575,971 / 592,999 = 97.1 % |
+
+### 4. What the numbers do not cover
 
 The oracle checks blocks in isolation, so it validates the lifter and the simplifier on the whole
 program but not the inter-block merging of values (phi placement) or the structuring. Those are

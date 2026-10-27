@@ -576,12 +576,10 @@ fn inventories(functions: &[Function], vyper: bool) -> (Vec<StorageVar>, Vec<Str
                     }
                     Stmt::Call { input, in_len, .. } => {
                         if let Some(words) = input {
-                            if let Some(c0) = words.first().and_then(|w| expr::as_const(*w)) {
+                            if let Some(w0) = words.first() {
                                 let in_len_c = expr::as_const(*in_len).and_then(|l| l.as_usize());
-                                let first_bytes = in_len_c.map(|l| l.min(32)).unwrap_or(32) as u32;
-                                if in_len_c.map_or((c0 & expr::mask_bits(224)).is_zero(), |l| l >= 4 && (l - 4) % 32 == 0) {
-                                    let sel = c0.shr(8 * (first_bytes - 4)).low_u64() as u32;
-                                    if in_len_c.map_or(true, |l| l >= 4) {
+                                if let Some(sel) = emit::leading_selector(*w0, in_len_c) {
+                                    if in_len_c.map_or(true, |l| l >= 4 && (l - 4) % 32 == 0) {
                                         selectors.insert(match sigs::function(sel) {
                                             Some(sig) => format!("{:#010x} {}", sel, sig),
                                             None => format!("{:#010x}", sel),

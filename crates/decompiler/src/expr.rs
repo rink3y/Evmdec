@@ -420,6 +420,14 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             if a == b {
                 return a;
             }
+            // OR(AND(x, m1), AND(x, m2)) -> AND(x, m1 | m2)  (complementary masks reassemble x)
+            if let (Node::Op(op::AND, v), Node::Op(op::AND, w)) = (node(a), node(b)) {
+                if v[0] == w[0] {
+                    if let (Some(m1), Some(m2)) = (as_const(v[1]), as_const(w[1])) {
+                        return op2(op::AND, v[0], konst(m1 | m2));
+                    }
+                }
+            }
         }
         op::XOR => {
             if cb == Some(U256::ZERO) {
@@ -438,6 +446,23 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                 if s >= U256::from_u64(256) {
                     return konst(U256::ZERO);
                 }
+                // SHL(k, SHL(j, x)) -> SHL(k+j, x)
+                if let Node::Op(op::SHL, v) = node(b) {
+                    if let Some(j) = as_const(v[0]) {
+                        return op2(op::SHL, konst(s.wrapping_add(j)), v[1]);
+                    }
+                }
+                // Distribute over OR when one side vanishes (packed ABI words).
+                if let Node::Op(op::OR, v) = node(b) {
+                    let l = op2(op::SHL, a, v[0]);
+                    let r = op2(op::SHL, a, v[1]);
+                    if as_const(l) == Some(U256::ZERO) {
+                        return r;
+                    }
+                    if as_const(r) == Some(U256::ZERO) {
+                        return l;
+                    }
+                }
                 // SHL(k, SHR(k, x)) -> AND(x, ~mask)
                 if let Node::Op(op::SHR, v) = node(b) {
                     if as_const(v[0]) == Some(s) {
@@ -454,6 +479,23 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                 if s >= U256::from_u64(256) {
                     return konst(U256::ZERO);
                 }
+                // SHR(k, SHR(j, x)) -> SHR(k+j, x)
+                if let Node::Op(op::SHR, v) = node(b) {
+                    if let Some(j) = as_const(v[0]) {
+                        return op2(op::SHR, konst(s.wrapping_add(j)), v[1]);
+                    }
+                }
+                if let Node::Op(op::OR, v) = node(b) {
+                    let l = op2(op::SHR, a, v[0]);
+                    let r = op2(op::SHR, a, v[1]);
+                    if as_const(l) == Some(U256::ZERO) {
+                        return r;
+                    }
+                    if as_const(r) == Some(U256::ZERO) {
+                        return l;
+                    }
+                }
+                // SHR(k, AND(x, m)) with m's low k bits clear and x narrower than 256: keep.
                 // SHR(k, SHL(k, x)) -> AND(x, mask(256-k))
                 if let Node::Op(op::SHL, v) = node(b) {
                     if as_const(v[0]) == Some(s) {

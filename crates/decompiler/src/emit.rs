@@ -415,21 +415,49 @@ fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
 // ------------------------------------------------------------------------------------------
 
 /// Decode a revert/return payload into a readable form.
+/// The 4-byte selector at the start of a payload word, if the word is `sel << 224 | rest` where
+/// `rest` is anything with its top 32 bits clear (constant, or an OR with such a constant), or a
+/// short right-aligned word.
+pub fn leading_selector(word0: ExprId, len: Option<usize>) -> Option<u32> {
+    let first_bytes = len.map(|l| l.min(32)).unwrap_or(32) as u32;
+    if first_bytes < 4 {
+        return None;
+    }
+    let from_const = |c: U256| -> Option<u32> {
+        let sel = c.shr(8 * (first_bytes - 4)).low_u64() as u32;
+        if sel == 0 { None } else { Some(sel) }
+    };
+    if let Some(c) = expr::as_const(word0) {
+        return from_const(c);
+    }
+    if first_bytes == 32 {
+        if let Node::Op(op::OR, v) = expr::node(word0) {
+            for (x, y) in [(v[0], v[1]), (v[1], v[0])] {
+                if let Some(c) = expr::as_const(x) {
+                    if (c & expr::mask_bits(224)).is_zero() && expr::value_bits(y) <= 224 {
+                        return from_const(c);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, revert: bool) -> String {
     if words.is_empty() {
         return String::new();
     }
     // Error(string) / Panic / custom error: first word's top 4 bytes
-    if let Some(c0) = expr::as_const(words[0]) {
-        let sel = (c0.shr(224)).low_u64() as u32;
-        let top4_only = (c0 & expr::mask_bits(224)).is_zero();
+    let lenu = len.and_then(|l| l.as_usize());
+    if let Some(sel) = leading_selector(words[0], lenu) {
+        let top4_only = lenu.map_or(expr::as_const(words[0]).map_or(true, |c| (c & expr::mask_bits(224)).is_zero()), |l| l >= 4 && (l - 4) % 32 == 0);
         if revert && top4_only {
             if sel == 0x08c379a0 {
                 if let Some(s) = decode_string_payload(words) {
                     return format!("\"{}\"", s);
                 }
             }
-            let lenu = len.and_then(|l| l.as_usize());
             if sel == 0x4e487b71 && words.len() >= 2 {
                 if let Some(code) = expr::as_const(shifted_word_len(words, 0, lenu)) {
                     return format!("Panic({})", panic_name(code.low_u64()));
@@ -556,12 +584,9 @@ pub fn fmt_call_input(words: &[ExprId], in_len: Option<U256>, n: &Names) -> (Opt
         return (None, vec![]);
     }
     let in_len = in_len.and_then(|l| l.as_usize());
-    if let Some(c0) = expr::as_const(words[0]) {
-        // The first word holds min(len, 32) bytes, right-aligned when shorter than a word.
-        let first_bytes = in_len.map(|l| l.min(32)).unwrap_or(32);
-        let looks_like_selector = in_len.map_or((c0 & expr::mask_bits(224)).is_zero(), |l| l >= 4 && (l - 4) % 32 == 0);
-        if looks_like_selector && first_bytes >= 4 {
-            let sel = c0.shr(8 * (first_bytes as u32 - 4)).low_u64() as u32;
+    if let Some(sel) = leading_selector(words[0], in_len) {
+        let looks_like_selector = in_len.map_or(expr::as_const(words[0]).map_or(true, |c| (c & expr::mask_bits(224)).is_zero()), |l| l >= 4 && (l - 4) % 32 == 0);
+        if looks_like_selector {
             let nargs = in_len.map(|l| l.saturating_sub(4) / 32).unwrap_or(words.len().saturating_sub(1));
             let args: Vec<String> = (0..nargs.min(words.len())).map(|i| fmt_expr(shifted_word_len(words, i, in_len), n)).collect();
             let name = match sigs::function(sel) {

@@ -276,6 +276,8 @@ struct Printer<'a> {
     gotos: usize,
     /// Nodes currently being emitted as a structured region (to avoid re-entering).
     active: HashSet<usize>,
+    /// Boolean facts known on the current path: (condition, value).
+    facts: Vec<(ExprId, bool)>,
 }
 
 const DUP_LIMIT: usize = 6;
@@ -555,7 +557,35 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// Is `cond` known true/false on the current path?
+    fn known(&self, cond: ExprId) -> Option<bool> {
+        let ncond = expr::op1(op::ISZERO, cond);
+        for (c, v) in self.facts.iter().rev() {
+            if *c == cond {
+                return Some(*v);
+            }
+            if *c == ncond {
+                return Some(!*v);
+            }
+        }
+        None
+    }
+
     fn emit_branch(&mut self, n: usize, cond: ExprId, t: Option<usize>, f: usize, stop: Option<usize>, depth: usize) {
+        // A condition already decided on this path: only one side can execute.
+        if let Some(v) = self.known(cond) {
+            match (v, t) {
+                (true, Some(t)) => {
+                    self.transfer(n, t, stop, depth);
+                    return;
+                }
+                (false, _) => {
+                    self.transfer(n, f, stop, depth);
+                    return;
+                }
+                _ => {}
+            }
+        }
         // require(): one side is a plain revert.
         let t_rev = t.map_or(Some(None), |t| self.revert_reason(t));
         let f_rev = self.revert_reason(f);
@@ -565,7 +595,9 @@ impl<'a> Printer<'a> {
                 // if (!cond) revert  =>  require(cond)
                 let t = t.unwrap();
                 self.line(depth, &format!("require({}{});", emit::fmt_expr(cond, self.names), reason_suffix(&reason)));
+                self.facts.push((cond, true));
                 self.transfer(n, t, stop, depth);
+                self.facts.pop();
                 return;
             }
         }
@@ -573,7 +605,9 @@ impl<'a> Printer<'a> {
             if f_rev.is_none() {
                 let ncond = expr::op1(op::ISZERO, cond);
                 self.line(depth, &format!("require({}{});", emit::fmt_expr(ncond, self.names), reason_suffix(&reason)));
+                self.facts.push((cond, false));
                 self.transfer(n, f, stop, depth);
+                self.facts.pop();
                 return;
             }
         }
@@ -612,12 +646,17 @@ impl<'a> Printer<'a> {
                 (cond, t, f, false)
             }
         };
+        let first_is_true_side = first == t && first_cond == cond;
         self.line(depth, &format!("if ({}) {{", emit::fmt_expr(first_cond, self.names)));
         self.active.insert(n);
+        self.facts.push((cond, first_is_true_side));
         self.transfer(n, first, join, depth + 1);
+        self.facts.pop();
         if first_terminal {
             self.line(depth, "}");
+            self.facts.push((cond, !first_is_true_side));
             self.transfer(n, second, stop, depth);
+            self.facts.pop();
         } else if Some(second) == join {
             // The direct edge may carry phi copies: they belong in an else branch.
             if self.l.edge_assigns.contains_key(&(n, second)) {
@@ -628,7 +667,9 @@ impl<'a> Printer<'a> {
             self.go(second, stop, depth);
         } else {
             self.line(depth, "} else {");
+            self.facts.push((cond, !first_is_true_side));
             self.transfer(n, second, join, depth + 1);
+            self.facts.pop();
             self.line(depth, "}");
             if let Some(j) = join {
                 if Some(j) != stop {
@@ -739,7 +780,7 @@ pub struct Structured {
 pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     let g = Graph::new(l);
     let loops = find_loops(&g);
-    let mut p = Printer { l, g, loops, names, out: String::new(), emitted: HashSet::new(), labels: HashSet::new(), loop_stack: Vec::new(), gotos: 0, active: HashSet::new() };
+    let mut p = Printer { l, g, loops, names, out: String::new(), emitted: HashSet::new(), labels: HashSet::new(), loop_stack: Vec::new(), gotos: 0, active: HashSet::new(), facts: Vec::new() };
     p.go(l.entry, None, base_depth);
     // Emit any reachable nodes that were targeted by gotos but never emitted (irreducible parts).
     let mut pending: Vec<usize> = p.labels.iter().copied().filter(|n| !p.emitted.contains(n)).collect();
@@ -759,7 +800,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     let text = if p.labels.iter().any(|n| p.emitted.contains(n)) {
         let g2 = Graph::new(l);
         let loops2 = find_loops(&g2);
-        let mut p2 = Printer { l, g: g2, loops: loops2, names, out: String::new(), emitted: HashSet::new(), labels: p.labels.clone(), loop_stack: Vec::new(), gotos: 0, active: HashSet::new() };
+        let mut p2 = Printer { l, g: g2, loops: loops2, names, out: String::new(), emitted: HashSet::new(), labels: p.labels.clone(), loop_stack: Vec::new(), gotos: 0, active: HashSet::new(), facts: Vec::new() };
         p2.go(l.entry, None, base_depth);
         let mut pending: Vec<usize> = p2.labels.iter().copied().filter(|n| !p2.emitted.contains(n)).collect();
         let mut rounds = 0;
@@ -778,7 +819,47 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     } else {
         p.out
     };
-    Structured { text, gotos: p.gotos }
+    Structured { text: drop_empty_else(&text), gotos: p.gotos }
+}
+
+/// Empty branches: `} else {` directly followed by `}` loses the else; `if (...) {` directly
+/// followed by `}` (and no else) disappears entirely (conditions are pure). Repeated until stable,
+/// since removing an else can expose an empty if and vice versa.
+fn drop_empty_else(text: &str) -> String {
+    let mut cur = text.to_string();
+    for _ in 0..16 {
+        let next = drop_empty_once(&cur);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+fn drop_empty_once(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        if l.trim() == "} else {" && i + 1 < lines.len() && lines[i + 1].trim() == "}" && indent(lines[i + 1]) == indent(l) {
+            out.push(lines[i + 1]);
+            i += 2;
+            continue;
+        }
+        let t = l.trim();
+        if t.starts_with("if (") && t.ends_with(") {") && i + 1 < lines.len() && lines[i + 1].trim() == "}" && indent(lines[i + 1]) == indent(l) && !(i + 2 < lines.len() && lines[i + 2].trim().starts_with("else")) {
+            i += 2;
+            continue;
+        }
+        out.push(l);
+        i += 1;
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
 }
 
 pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
@@ -790,3 +871,14 @@ pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
 fn unused(_: &Node) {}
 #[allow(dead_code)]
 fn unused2(_: &dyn Fn(&lift::LNode)) {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn empty_branches_are_dropped() {
+        let t = "            } else {\n                if (32 > returndatasize()) {\n                }\n                log1(x);\n            }\n";
+        let out = super::drop_empty_else(t);
+        assert!(!out.contains("if (32"), "{}", out);
+    }
+}
+

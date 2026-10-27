@@ -206,7 +206,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     // Computed jumps (hand-written dispatchers): derive candidate targets from the target
     // expression's shape and recover again with them.
     if !rec.unresolved_jumps.is_empty() {
-        let oracle = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: true };
+        let oracle = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: true, copy_loops: Default::default() };
         let mut computed: HashMap<usize, Vec<usize>> = HashMap::new();
         for b in &prog.blocks {
             if !matches!(b.terminator, op::JUMP | op::JUMPI) || !rec.unresolved_jumps.contains(&b.end) || in_embedded(b.start) || b.end > code_end {
@@ -258,19 +258,26 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     tick("recover", &mut tt);
     // Internal function units first: simple ones (ABI decoders/encoders, getters) are summarised
     // and seen through at their call sites.
-    let mut int_lifter = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: false };
+    let mut int_lifter = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: false, copy_loops: Default::default() };
     let mut internals: BTreeMap<usize, Lifted> = BTreeMap::new();
     let mut by_block: Vec<(usize, Lifted)> = Vec::new();
     // Callees before callers where possible: iterate until the summary set stabilises.
     for _round in 0..8 {
         by_block.clear();
         for (b, unit) in &rec.functions {
-            let l = int_lifter.lift(unit, None);
+            let l = int_lifter.lift_summarizing(unit, None);
             by_block.push((*b, l));
         }
         let mut sums = HashMap::new();
+        let debug_sum = std::env::var("EVMDEC_DEBUG_SUMMARY").is_ok();
         for (b, l) in &by_block {
+            if debug_sum {
+                eprintln!("[summary] round {} function {:#x}:", _round, prog.blocks[*b].start);
+            }
             if let Some(sm) = lift::summarize(l) {
+                if debug_sum {
+                    eprintln!("[summary]   ok: returns {} mstores {} copies {} maybe {} guards {}", sm.returns.len(), sm.mstores.len(), sm.copies.len(), sm.maybe_mstores.len(), sm.guards.len());
+                }
                 sums.insert(*b, sm);
             }
         }
@@ -286,8 +293,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     tick("lift internals", &mut tt);
     // Helpers that load a storage string: their result prints as the storage variable.
     let loaders: HashMap<usize, U256> = internals.iter().filter_map(|(pc, l)| crate::idiom::storage_string_loader(l).map(|k| (*pc, k))).collect();
-    let lifter = Lifter { prog: &prog, root: true, summaries: int_lifter.summaries.clone(), oracle: false };
-    let main = lifter.lift(&rec.main, None);
+    let lifter = Lifter { prog: &prog, root: true, summaries: int_lifter.summaries.clone(), oracle: false, copy_loops: Default::default() };
+    let main = lifter.lift_summarizing(&rec.main, None);
     let dispatch = function::discover(&main);
     let contract_nonpayable = function::dispatcher_nonpayable(&main, &dispatch.dispatcher);
     tick("lift main", &mut tt);
@@ -388,7 +395,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         if let Some(un) = unit_node_of(entry) {
             if let Some(state) = Lifter::entry_state_of(&main, un) {
                 let (sub, _) = rec.main.slice(un);
-                return lifter.lift_from(&sub, state);
+                return lifter.lift_from_summarizing(&sub, state);
             }
         }
         function::slice(&main, entry)

@@ -1,0 +1,242 @@
+{
+ "_comment": "Known-exploited contracts (runtime bytecode fetched from chain). `expected` lists rule ids any of which must fire at or above `min_severity` for the contract to count as detected. `detectable: false` marks bugs outside what bytecode-level pattern rules can see; they are reported but not counted against recall.",
+ "contracts": {
+  "thedao": {
+   "address": "0xBB9bc244D798123fDe783fCc1C72d3Bb8C189413",
+   "chain": "mainnet",
+   "year": 2016,
+   "bug": "reentrancy in splitDAO/withdrawRewardFor: ETH sent before balances update",
+   "expected": [
+    "reentrancy"
+   ],
+   "min_severity": "medium"
+  },
+  "rubixi": {
+   "address": "0xe82719202e5965Cf5D9B6673B7503a3b92DE20be",
+   "chain": "mainnet",
+   "year": 2016,
+   "bug": "constructor renamed to DynamicPyramid(): anyone can become creator",
+   "expected": [
+    "unprotected-owner-write"
+   ],
+   "min_severity": "high"
+  },
+  "kotet": {
+   "address": "0xb336a86e2feb1e87a328fcb7dd4d04de3df254d0",
+   "chain": "mainnet",
+   "year": 2016,
+   "bug": "King of the Ether: send() result ignored, compensation lost",
+   "expected": [
+    "unchecked-call"
+   ],
+   "min_severity": "medium"
+  },
+  "governmental": {
+   "address": "0xF45717552f12Ef7cb65e95476F217Ea008167Ae3",
+   "chain": "mainnet",
+   "year": 2016,
+   "bug": "unbounded storage array iteration / clearing exceeds the block gas limit (DoS)",
+   "expected": [
+    "storage-bounded-loop",
+    "call-in-loop"
+   ],
+   "min_severity": "low"
+  },
+  "fomo3d": {
+   "address": "0xA62142888ABa8370742bE823c1782D17A0389Da1",
+   "chain": "mainnet",
+   "year": 2018,
+   "bug": "airdrop() randomness from block attributes, predictable by contracts",
+   "expected": [
+    "weak-randomness"
+   ],
+   "min_severity": "medium"
+  },
+  "bec_token": {
+   "address": "0xC5d105E63711398aF9bbff092d4B6769C82F793D",
+   "chain": "mainnet",
+   "year": 2018,
+   "bug": "batchTransfer: cnt * _value overflows, balance check passes",
+   "expected": [
+    "unchecked-arithmetic"
+   ],
+   "min_severity": "medium"
+  },
+  "smt_token": {
+   "address": "0x55F93985431Fc9304077687a35A1BA103dC1e081",
+   "chain": "mainnet",
+   "year": 2018,
+   "bug": "transferProxy: _value + _feeSmt overflow",
+   "expected": [
+    "unchecked-arithmetic"
+   ],
+   "min_severity": "medium"
+  },
+  "powh": {
+   "address": "0xa7ca36f7273d4d38fc2aec5a454c497f86728a7a",
+   "chain": "mainnet",
+   "year": 2018,
+   "bug": "Proof of Weak Hands: underflow in transferFrom allowance handling",
+   "expected": [
+    "unchecked-arithmetic"
+   ],
+   "min_severity": "medium"
+  },
+  "spankchain": {
+   "address": "0xf91546835f756DA0c10cFa0CDA95b15577b84aA7",
+   "chain": "mainnet",
+   "year": 2018,
+   "bug": "payment channel: token transfer (malicious ERC20) before state update, reentrancy",
+   "expected": [
+    "reentrancy"
+   ],
+   "min_severity": "medium"
+  },
+  "lendfme": {
+   "address": "0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea",
+   "chain": "mainnet",
+   "year": 2020,
+   "bug": "supply(): imBTC (ERC777) transfer hook re-enters withdraw before balance is written",
+   "expected": [
+    "reentrancy"
+   ],
+   "min_severity": "medium"
+  },
+  "bancor_network": {
+   "address": "0x5f58058C0eC971492166763c8C22632B583F667f",
+   "chain": "mainnet",
+   "year": 2020,
+   "bug": "safeTransferFrom(token, from, to, value) left public: anyone can move approved balances",
+   "expected": [
+    "arbitrary-transferfrom"
+   ],
+   "min_severity": "high"
+  },
+  "opyn_options": {
+   "address": "0x951D51bAeFb72319d9FBE941E1615938d89ABfe2",
+   "chain": "mainnet",
+   "year": 2020,
+   "bug": "exercise() checks msg.value once per vault inside a loop: one payment exercises many",
+   "expected": [
+    "msg-value-in-loop",
+    "msg-value-multicall"
+   ],
+   "min_severity": "medium"
+  },
+  "pickle_controller": {
+   "address": "0x6847259b2B3A4c17e7c43C54409810aF48bA5210",
+   "chain": "mainnet",
+   "year": 2020,
+   "bug": "swapExactJarForJar accepts arbitrary jar/target addresses; delegatecall to attacker code",
+   "expected": [
+    "arbitrary-delegatecall",
+    "delegatecall-user-target",
+    "arbitrary-call"
+   ],
+   "min_severity": "high"
+  },
+  "furucombo_proxy": {
+   "address": "0x17e8Ca1b4798B97602895f63206afCd1Fc90Ca5f",
+   "chain": "mainnet",
+   "year": 2021,
+   "bug": "batchExec delegatecalls to caller-chosen handlers; registry allowed an uninitialised Aave proxy",
+   "expected": [
+    "delegatecall-dynamic-target",
+    "delegatecall-user-target",
+    "arbitrary-delegatecall"
+   ],
+   "min_severity": "medium"
+  },
+  "miso_batch_impl": {
+   "address": "0x364b7e2d5b11b9d2016d232fa271d89d5e6065f1",
+   "chain": "mainnet",
+   "year": 2021,
+   "bug": "SushiSwap MISO BatchAuction: payable batch() reuses msg.value in each delegatecall",
+   "expected": [
+    "msg-value-multicall"
+   ],
+   "min_severity": "medium"
+  },
+  "cream_cramp_impl": {
+   "address": "0x96cc0f947b6c8f4675159ea03144f8c17d5a2fc8",
+   "chain": "mainnet",
+   "year": 2021,
+   "bug": "crAMP borrow(): AMP token hook re-enters before borrow balance is written",
+   "expected": [
+    "reentrancy"
+   ],
+   "min_severity": "medium"
+  },
+  "visor_vvisr": {
+   "address": "0xc9f27a50f82571c1c8423a42970613b8dbda14ef",
+   "chain": "mainnet",
+   "year": 2021,
+   "bug": "deposit(): trusts owner() and delegatedTransferERC20() answers of a caller-supplied contract, then mints",
+   "expected": [
+    "untrusted-return-data",
+    "untrusted-callee"
+   ],
+   "min_severity": "medium"
+  },
+  "umbrella_staking": {
+   "address": "0xB3FB1D01B07A706736Ca175f827e4F56021b85dE",
+   "chain": "mainnet",
+   "year": 2022,
+   "bug": "withdraw(): balance - amount underflows on solc 0.7 without SafeMath",
+   "expected": [
+    "unchecked-arithmetic"
+   ],
+   "min_severity": "medium"
+  },
+  "revest": {
+   "address": "0x2320A28f52334d62622cc2EaFa15DE55F9987eD9",
+   "chain": "mainnet",
+   "year": 2022,
+   "bug": "ERC1155 mint callback re-enters depositAdditionalToFNFT before supply bookkeeping",
+   "expected": [
+    "reentrancy"
+   ],
+   "min_severity": "medium"
+  },
+  "anyswap_router": {
+   "address": "0x6b7a87899490EcE95443e979cA9485CBE7E71522",
+   "chain": "mainnet",
+   "year": 2022,
+   "bug": "anySwapOutUnderlyingWithPermit: transferFrom(from, ...) with caller-chosen token and from",
+   "expected": [
+    "arbitrary-transferfrom"
+   ],
+   "min_severity": "high"
+  },
+  "poly_eccm": {
+   "address": "0x838bf9E95CB12Dd76a54C9f9D2E3082EAF928270",
+   "chain": "mainnet",
+   "year": 2021,
+   "bug": "verifyHeaderAndExecuteTx executes a call whose target and selector come from the (attacker-forged) cross-chain payload",
+   "expected": [
+    "arbitrary-call",
+    "dynamic-call"
+   ],
+   "min_severity": "high"
+  },
+  "curve_peth_impl": {
+   "address": "0x6326debbaa15bcfe603d831e7d75f4fc10d9b43e",
+   "chain": "mainnet",
+   "year": 2023,
+   "bug": "Vyper 0.2.15 codegen gave every @nonreentrant function its own lock slot, so the locks never excluded each other",
+   "expected": [
+    "vyper-reentrancy-lock-bug"
+   ],
+   "min_severity": "high"
+  },
+  "nomad_replica_impl": {
+   "address": "0xB92336759618F55bd0F8313bd843604592E27bd8",
+   "chain": "mainnet",
+   "year": 2022,
+   "bug": "process(): acceptableRoot(0) became true after an upgrade initialised confirmAt[0]; any message passes",
+   "expected": [],
+   "min_severity": "medium",
+   "detectable": false
+  }
+ }
+}

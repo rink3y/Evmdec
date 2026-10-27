@@ -598,6 +598,29 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, revert: bool)
             return format!("CustomError_{:08x}({})", sel, args.join(", "));
         }
     }
+    // A single dynamic value `(32, len, data…)` returned in place: show the text when it is one.
+    if !revert && words.len() >= 3 && expr::as_const(words[0]) == Some(U256::from_u64(32)) {
+        if let Some(len) = expr::as_const(words[1]).and_then(|l| l.as_usize()) {
+            if len > 0 && len <= 32 * (words.len() - 2) && lenu.map_or(true, |l| l == 64 + len.div_ceil(32) * 32) {
+                let mut bytes = Vec::new();
+                for w in &words[2..] {
+                    match expr::as_const(*w) {
+                        Some(c) => bytes.extend_from_slice(&c.to_be_bytes()),
+                        None => {
+                            bytes.clear();
+                            break;
+                        }
+                    }
+                }
+                if bytes.len() >= len {
+                    bytes.truncate(len);
+                    if bytes.iter().all(|b| (0x20..0x7f).contains(b)) {
+                        return format!("\"{}\"", escape(&String::from_utf8_lossy(&bytes)));
+                    }
+                }
+            }
+        }
+    }
     let parts: Vec<String> = words.iter().map(|w| fmt_expr(*w, n)).collect();
     parts.join(", ")
 }
@@ -605,7 +628,7 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, revert: bool)
 /// ABI word `i` of a payload that starts with a 4-byte selector: bytes `4 + 32*i .. 36 + 32*i`,
 /// which straddle memory words `i` and `i + 1`. The last word of a payload whose length is not a
 /// multiple of 32 holds its `len % 32` bytes right-aligned and is left-aligned here first.
-fn shifted_word_len(words: &[ExprId], i: usize, len: Option<usize>) -> ExprId {
+pub fn shifted_word_len(words: &[ExprId], i: usize, len: Option<usize>) -> ExprId {
     let align = |j: usize| -> ExprId {
         let w = words.get(j).copied().unwrap_or_else(|| expr::konst(U256::ZERO));
         match len {

@@ -275,6 +275,33 @@ pub fn mark_boolean(var: ExprId) {
     }
 }
 
+/// Bits of `e` that may be set (a superset): constants exactly, masks, shifts and ors
+/// structurally, everything else from its width.
+pub fn may_bits(e: ExprId) -> U256 {
+    fn go(e: ExprId, depth: u32) -> U256 {
+        if depth > 12 {
+            return mask_bits(value_bits(e));
+        }
+        match node(e) {
+            Node::Const(c) => c,
+            Node::Op(op::AND, v) => go(v[0], depth + 1) & go(v[1], depth + 1),
+            Node::Op(op::OR, v) | Node::Op(op::XOR, v) => go(v[0], depth + 1) | go(v[1], depth + 1),
+            Node::Op(op::SHL, v) => match as_const(v[0]) {
+                Some(s) if s.fits_u64() && s.low_u64() < 256 => go(v[1], depth + 1).shl(s.low_u64() as u32),
+                Some(_) => U256::ZERO,
+                None => U256::MAX,
+            },
+            Node::Op(op::SHR, v) => match as_const(v[0]) {
+                Some(s) if s.fits_u64() && s.low_u64() < 256 => go(v[1], depth + 1).shr(s.low_u64() as u32),
+                Some(_) => U256::ZERO,
+                None => U256::MAX,
+            },
+            _ => mask_bits(value_bits(e)),
+        }
+    }
+    go(e, 0)
+}
+
 /// Build a binary op with constant folding and algebraic normalisation.
 /// Operand order follows the EVM: `op2(SUB, a, b)` is `a - b` where `a` was the top of stack.
 pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
@@ -419,6 +446,23 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                 // Masking a boolean or a value already narrower than the mask is a no-op.
                 if m.is_low_mask() && m.bits() >= value_bits(a) {
                     return a;
+                }
+                // Bits that can never be set need no mask; a mask that keeps none of them is zero.
+                let may = may_bits(a);
+                if (may & !m).is_zero() {
+                    return a;
+                }
+                if (may & m).is_zero() {
+                    return konst(U256::ZERO);
+                }
+                // AND(OR(x, y), m) where one side has no bits under the mask -> AND(other, m)
+                if let Node::Op(op::OR, v) = node(a) {
+                    if (may_bits(v[0]) & m).is_zero() {
+                        return op2(op::AND, v[1], konst(m));
+                    }
+                    if (may_bits(v[1]) & m).is_zero() {
+                        return op2(op::AND, v[0], konst(m));
+                    }
                 }
             }
         }

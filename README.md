@@ -43,21 +43,31 @@ oracle, so the accuracy claim below is measured, not asserted.
   A dictionary of ~1,250 function, event and error
   signatures (selectors computed with the built-in keccak, so every entry is correct) names what
   it can; everything else is named by selector.
-* **Security report.** Reentrancy (a guard is recognised only when a slot is tested before the
-  call, set on entry and restored to a constant afterwards, storage or transient), ignored call
-  return values, ERC20 `transfer`/`transferFrom` results never decoded, arbitrary calls (the
-  selector itself must be caller-controlled) and delegatecalls (always-reverting simulation
-  helpers are only noted), selfdestruct exposure, authority slots writable
-  without access control, `tx.origin` auth, weak randomness, unchecked arithmetic on pre-0.8
-  compilers, storage-bounded loops, calls in loops, `msg.value` reuse in payable multicalls,
-  ecrecover misuse, unprotected upgrades, proxy detection (EIP-1967 / beacon / ZeppelinOS /
-  EIP-1167 / storage-slot) with on-chain implementation resolution, known compiler bugs for the
-  detected solc version, revert strings, privileged functions, selectors called on other
-  contracts. Rules look through internal helpers (a call in a shared `_safeTransfer` is
-  attributed to every external function that reaches it), and findings are folded per defect:
-  one entry per rule and function, with the number of sites, and one entry for a helper shared
-  by several functions. Each finding carries severity, confidence, the function and program
-  counter, evidence lines and a recommendation. Markdown and JSON.
+* **Security report.** 40+ rules over the lifted IR (not opcode patterns): reentrancy (ETH or
+  token hook before a storage write; a guard counts only when a slot is tested before the call,
+  set on entry and restored to a constant afterwards, storage or transient; ERC721/1155/777 hook
+  selectors raise confidence), ignored call results, ERC20 `transfer`/`transferFrom` results
+  never decoded, arbitrary `call`/`delegatecall` with caller-controlled target and selector,
+  run-time-dispatched calls (relayers, cross-chain executors), `transferFrom(from, …)` moving
+  someone else's approved tokens on the caller's say-so, decisions trusted to the answers of a
+  caller-supplied contract, Chainlink answers used without staleness/positivity checks,
+  fee-on-transfer assumptions, spot balances used as a price, division before multiplication,
+  `ecrecover` zero-address and malleability, signatures without a domain or without a nonce,
+  weak randomness, `msg.value` reused in loops and payable multicalls, unchecked arithmetic on
+  pre-0.8 compilers and inside `unchecked {}` blocks, authority slots and initializers writable
+  without access control, ether withdrawable by anyone (caller-keyed accounting is recognised),
+  state-changing functions callable by anyone, storage-bounded loops, calls in loops, `tx.origin`,
+  `selfdestruct`, the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked ether, unprotected upgrades,
+  proxy detection (EIP-1967 / beacon / ZeppelinOS / EIP-1167 / storage-slot) with on-chain
+  implementation resolution, known compiler bugs for the detected solc version. Rules look
+  through internal helpers (a call in a shared `_safeTransfer` is attributed to every external
+  function that reaches it, with the helper's arguments substituted and its memory replayed, so
+  `transferFrom(arg1, …)` is seen with the caller's actual `from`), and findings are folded per
+  defect: one entry per rule and function, with the number of sites, and one entry for a helper
+  shared by several functions. Each finding carries severity, confidence, the function and
+  program counter, evidence lines and a recommendation; the risk score weighs the worst finding
+  by its confidence. Markdown and JSON. Recall is measured on 22 known-exploited contracts
+  (see *Accuracy*).
 * **Verified.** A concrete EVM interpreter executes every basic block from random states and the
   result is compared with the lifted statements (stack, memory, storage, logs, calls, control
   decision). See *Accuracy*.
@@ -114,11 +124,11 @@ storage, events, source), `report`, `report_markdown`, `disassembly` and, for pr
 ## Accuracy: how it is measured
 
 "Decompiles 100 % of any contract with ≥ 90 % accuracy" needs definitions, so `evmdec` measures
-three things on 22 unmodified mainnet contracts (solc 0.4.18–0.8.17, Vyper 0.2.4 and 0.3.9;
+four things, three of them on 22 unmodified mainnet contracts (solc 0.4.18–0.8.17, Vyper 0.2.4 and 0.3.9;
 WETH, USDT, USDC proxy + implementation, Uniswap V2 router/pair, Uniswap V3 factory, Permit2,
 Universal Router, 1inch v5, Seaport 1.5, Gnosis Safe, Compound cETH, MakerDAO Vat, Aave v3 pool
 proxy, ENS registry, Lido stETH proxy, Multicall3, Curve 3pool and TriCrypto-NG, the CREATE2
-deployer, UNI). Everything is reproducible with `corpus/bench.py` and `corpus/verify_all.sh`
+deployer, UNI). Everything is reproducible with `corpus/bench.py`, `corpus/verify_all.sh` and `corpus/vuln_bench.py`
 (details and definitions in [docs/verification.md](docs/verification.md)).
 
 ### 1. Interface recovery vs. verified ABIs (signature dictionary disabled)
@@ -178,7 +188,25 @@ Vyper) were run through `corpus/run_sample.sh`:
 | block oracle (3 states per block): mismatches | **0** in 592,999 instructions |
 | instructions in verified blocks | 575,971 / 592,999 = 97.1 % |
 
-### 4. What the numbers do not cover
+### 4. Analyzer recall on known-exploited contracts
+
+`testdata/vuln` holds the unmodified runtime bytecode of 23 contracts whose exploits are public
+(The DAO, Rubixi, King of the Ether, GovernMental, Fomo3D, BEC, SMT, PoWH, SpankChain, Lendf.me,
+Bancor 2020, Opyn, Pickle, Furucombo, MISO, Cream crAMP, Visor, Umbrella, Revest, Anyswap 2022,
+Poly Network, Curve pETH/Vyper lock bug, Nomad). `testdata/vuln/manifest.json` names, for each,
+the rule ids any of which must fire at or above a minimum severity for the bug to count as
+found, and `corpus/vuln_bench.py` runs the analyzer over the set and over the 22 audited
+mainnet contracts above:
+
+| | |
+|---|---|
+| known bugs found | **22 / 22** (Nomad's bug is an upgrade-time state error outside bytecode patterns and is listed but not counted) |
+| high/critical findings on the 22 audited contracts | 34, almost all on contracts whose purpose is to execute caller-supplied calls (Multicall3, 1inch, Gnosis Safe, Seaport) |
+
+The analyzer is heuristic: findings are leads with a confidence level, and the audited corpus is
+the running false-positive budget for every rule change.
+
+### 5. What the numbers do not cover
 
 The oracle checks blocks in isolation, so it validates the lifter and the simplifier on the whole
 program but not the inter-block merging of values (phi placement) or the structuring. Those are
@@ -193,8 +221,13 @@ functions; it does not influence recovery.
   output; a hand-written contract that relies on aliasing will decompile imprecisely — the
   oracle reports such states as inconclusive rather than hiding them).
 * Internal functions are named `func_<pc>`; their parameter types are shown as `uint256`.
-* Dynamic-type ABI encoding (`string` returns, `bytes` arguments) is shown as the memory
-  operations the compiler emitted rather than as `abi.encode`.
+* Dynamic-type ABI encoding is folded where the compiler's idiom is recognised (`string`
+  literals and storage strings print as `return "…"` / `return name;`, copy loops become
+  `mem[a:+n] = mem[b:+n]`); other dynamic encodings are shown as the memory operations the
+  compiler emitted rather than as `abi.encode`.
+* Vyper internal calls pass arguments through fixed memory slots; the lifter forgets memory
+  across such calls, so some values in Vyper output print as `mem[0x…]` reads where the
+  analyzer (which replays the callee) sees the value.
 * The analyzer is heuristic: findings carry a confidence level and should be read as leads.
 
 ## License

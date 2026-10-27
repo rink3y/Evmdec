@@ -4,3 +4,5 @@ corpus/*.hex
 corpus/*.json
 !corpus/addrs.txt
 *.swp
+/sample
+__pycache__/

@@ -586,8 +586,9 @@ impl<'a> Machine<'a> {
                 let il = in_len.as_usize().filter(|l| *l < (1 << 24)).ok_or("call input too large")?;
                 let input = self.mread(in_off, il)?;
                 let idx = self.calls.len();
-                self.calls.push(CallRecord { kind: o, gas, addr, value, input, out_off, out_len });
-                let (success, data) = self.host.call_result(idx);
+                self.calls.push(CallRecord { kind: o, gas, addr, value, input: input.clone(), out_off, out_len });
+                // The identity precompile echoes its input; every other call is opaque.
+                let (success, data) = if addr == U256::from_u64(4) { (true, input) } else { self.host.call_result(idx) };
                 let ol = out_len.as_usize().filter(|l| *l < (1 << 24)).ok_or("call output too large")?;
                 if ol > 0 {
                     let mut buf = data.clone();

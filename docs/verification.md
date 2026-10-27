@@ -53,7 +53,32 @@ and fetches the runtime code of every distinct transaction target with code; `co
 decompiles each one with a 120 s limit and runs the block oracle. The addresses of the sample
 reported in the README are in `corpus/sample_ids.txt`. Nothing about the sample was chosen by hand.
 
-## 4. Coverage and control flow
+## 4. Analyzer recall (`corpus/vuln_bench.py`)
+
+`testdata/vuln/*.hex` is the unmodified runtime bytecode of contracts whose exploits are public,
+fetched from the chain they were deployed on (mostly mainnet; the Vyper lock-bug pool from its
+mainnet address at the time of the incident). `testdata/vuln/manifest.json` records, per contract,
+the year, the bug in one line, the rule ids that constitute "finding it" (any one suffices) and
+the minimum severity. A contract counts as detected when one of its expected rules fires at or
+above that severity in the analyzer's JSON report. `detectable: false` marks bugs that are not
+visible as a bytecode pattern (an upgrade that initialised a storage slot to a value a check
+treated as "trusted"); they are listed so the limitation is explicit, and excluded from recall.
+
+The same script analyses the audited corpus of §1 and prints its high/critical findings. That
+number is the false-positive budget: a rule change that raises recall but adds findings on
+WETH, USDC, Uniswap, Permit2, Maker or ENS is a regression. Findings on Multicall3, the Gnosis
+Safe, 1inch and Seaport are expected, as executing caller-supplied calls is what those contracts
+do.
+
+The analyzer works on the lifted IR, not on opcode sequences: every external function's
+statements are collected together with those of the internal helpers it reaches (five levels
+deep), with the helper's arguments replaced by the caller's actual values and the helper's
+memory reads resolved against a replay of the writes seen so far. Rules are predicates over
+that stream (an external call whose payload word 0 is `transferFrom` and whose `from` word
+comes from calldata and is not `msg.sender`, in a function without a caller check, is
+`arbitrary-transferfrom`).
+
+## 5. Coverage and control flow
 
 Each contract reports the number of *potential code* blocks covered by some function (external,
 internal, fallback, orphan) and the number of jumps whose target could not be resolved. A
@@ -74,5 +99,6 @@ python3 corpus/bench.py            # interface recovery (add --sigs to use the d
 RUNS=8 ./corpus/verify_all.sh      # block oracle over the corpus
 python3 corpus/harvest.py --out sample --blocks 12 --max 120   # random mainnet sample
 DIR=sample RUNS=3 ./corpus/run_sample.sh                        # decompile + oracle on it
+python3 corpus/vuln_bench.py       # analyzer recall on known exploits + false-positive load
 cargo test -p evmdec               # unit + integration tests (corpus, oracle, analyzer)
 ```

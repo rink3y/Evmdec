@@ -19,7 +19,9 @@ pub enum Stmt {
     MStore { off: ExprId, val: ExprId, width: u8 },
     SStore { key: ExprId, val: ExprId, transient: bool },
     Log { off: ExprId, len: ExprId, topics: Vec<ExprId>, data: Option<Vec<ExprId>> },
-    Call { seq: u32, kind: u8, gas: ExprId, addr: ExprId, value: Option<ExprId>, in_off: ExprId, in_len: ExprId, out_off: ExprId, out_len: ExprId, input: Option<Vec<ExprId>>, result: ExprId },
+    /// `input_head` holds the first memory words of the payload (the selector lives in the top
+    /// four bytes of the first) even when the whole payload could not be decoded into `input`.
+    Call { seq: u32, kind: u8, gas: ExprId, addr: ExprId, value: Option<ExprId>, in_off: ExprId, in_len: ExprId, out_off: ExprId, out_len: ExprId, input: Option<Vec<ExprId>>, input_head: Vec<ExprId>, result: ExprId },
     Create { seq: u32, kind: u8, value: ExprId, off: ExprId, len: ExprId, salt: Option<ExprId>, result: ExprId, init: Option<Vec<ExprId>> },
     /// CALLDATACOPY / CODECOPY / RETURNDATACOPY / EXTCODECOPY / MCOPY.
     Copy { kind: u8, dest: ExprId, src: ExprId, len: ExprId, addr: Option<ExprId> },
@@ -159,14 +161,59 @@ fn wild_base(b: ExprId) -> bool {
 fn may_alias(wb: Option<ExprId>, woff: u64, wlen: Option<u64>, rb: Option<ExprId>, roff: u64, rlen: u64) -> bool {
     let w_wild = wb.map_or(false, wild_base);
     let r_wild = rb.map_or(false, wild_base);
+    // `p + v + k` with `v` unknown but unsigned lies at or above `p + k`: a region write that
+    // starts past the end of a read on the same `p` cannot touch it.
+    // Returns the constant part `k` of the sum when `wild` has the shape `fixed + k + <unknowns>`.
+    let above = |wild: ExprId, fixed: ExprId| -> Option<u64> {
+        let mut terms = Vec::new();
+        let mut stack = vec![wild];
+        while let Some(x) = stack.pop() {
+            match expr::node(x) {
+                Node::Op(o, v) if o == op::ADD => {
+                    stack.push(v[0]);
+                    stack.push(v[1]);
+                }
+                _ => terms.push(x),
+            }
+        }
+        let same = |a: ExprId, b: ExprId| a == b || matches!((expr::node(a), expr::node(b)), (Node::MLoad(x, _), Node::MLoad(y, _)) if x == y);
+        if !terms.iter().any(|t| same(*t, fixed)) {
+            return None;
+        }
+        let mut k: u64 = 0;
+        let mut seen_fixed = false;
+        for t in terms {
+            if !seen_fixed && same(t, fixed) {
+                seen_fixed = true;
+                continue;
+            }
+            if let Some(c) = expr::as_const(t) {
+                if !c.fits_u64() || c.low_u64() >= BIG {
+                    return None;
+                }
+                k = k.saturating_add(c.low_u64());
+            } else if !wild_base(t) {
+                return None;
+            }
+        }
+        Some(k)
+    };
     if w_wild {
-        if rb.is_some() {
+        if let Some(rbase) = rb {
+            if !r_wild {
+                if let Some(k) = above(wb.unwrap(), rbase) {
+                    return roff + rlen > woff + k;
+                }
+            }
             return true;
         }
         return roff >= 0x80 && roff + rlen > woff;
     }
     if r_wild {
-        if wb.is_some() {
+        if let Some(wbase) = wb {
+            if let Some(k) = above(rb.unwrap(), wbase) {
+                return wlen.map_or(true, |l| woff + l > roff + k);
+            }
             return true;
         }
         return woff >= 0x80 && wlen.map_or(true, |l| woff + l > roff);
@@ -323,13 +370,21 @@ impl Mem {
             let word = expr::intern(Node::CopiedWord(k, expr::add_const(src, U256::from(delta)), wgen));
             return Some(if n == 32 { word } else { op2(op::SHR, konst_u64(8 * (32 - n)), word) });
         }
+        // Bytes nothing wrote: zero in a fresh frame at an address whose writes we would have
+        // seen (a constant, or free-memory-pointer arithmetic); otherwise they come from the
+        // unknown word at `off`, masked to those byte positions, if at least one byte is known.
+        let mut unknown_mask = U256::ZERO;
         if covered < n as usize {
-            // Untouched bytes are zero only in a fresh frame, and only when the address is one
-            // whose writes we would have seen: a constant, or free-memory-pointer arithmetic. A
-            // base holding a loop variable, argument or other unknown may equal any written
-            // address, so the read is unknown.
-            if !self.fresh || base.map_or(false, wild_base) {
-                return None;
+            let zero_ok = self.fresh && !base.map_or(false, wild_base);
+            if !zero_ok {
+                if covered == 0 {
+                    return None;
+                }
+                for (j, p) in pieces.iter().enumerate() {
+                    if p.is_none() {
+                        unknown_mask = unknown_mask | expr::mask_bits(8).shl(8 * (n as u32 - 1 - j as u32));
+                    }
+                }
             }
         }
         // Fast path: a single word write exactly aligned.
@@ -376,7 +431,13 @@ impl Mem {
                 }
             }
         }
-        Some(acc.unwrap_or_else(|| konst(U256::ZERO)))
+        let known = acc.unwrap_or_else(|| konst(U256::ZERO));
+        if unknown_mask.is_zero() {
+            return Some(known);
+        }
+        let word = expr::intern(Node::MLoad(off, self.version_for(off, n)));
+        let unknown = if n == 32 { word } else { op2(op::SHR, konst_u64(8 * (32 - n)), word) };
+        Some(op2(op::OR, op2(op::AND, unknown, konst(unknown_mask)), known))
     }
 
     fn load_word(&self, off: ExprId, version: u32) -> ExprId {
@@ -504,6 +565,34 @@ pub struct Lifter<'a> {
     pub summaries: HashMap<usize, CalleeSummary>,
     /// Oracle mode: keep jump target/condition expressions instead of resolving successors.
     pub oracle: bool,
+    /// Word-copy loops recognised on a first lift, keyed by (unit entry block, unit header node):
+    /// on the next lift of that unit the loop is replaced by one memory copy.
+    pub copy_loops: std::cell::RefCell<HashMap<(usize, usize), CopyLoop>>,
+}
+
+/// A loop that copies memory word by word, summarised as one copy (unit node ids).
+#[derive(Clone, Debug)]
+pub struct CopyLoop {
+    /// Node the pre-header enters (the condition node for a while-loop, the body for a rotated
+    /// do-while loop).
+    pub entry: usize,
+    /// Node holding the condition (`latch`) and the node holding the copying store (`body`);
+    /// equal for a self-looping body.
+    pub latch: usize,
+    pub body: usize,
+    pub exit: usize,
+    pub shape: CopyShape,
+}
+
+#[derive(Clone, Debug)]
+pub enum CopyShape {
+    /// `mem[dst + i] = mem[src + i]` with `i += 32`: the counter is stack slot `slot` (from the
+    /// top of the stack entering `entry`). `rotated`: the body runs first and the test
+    /// `i + 32 < len` follows, so the counter leaves the loop at the last index copied.
+    Index { slot: usize, rotated: bool },
+    /// `while (n >= 32) { mem[d] = mem[s]; n -= 32; d += 32; s += 32 }` with the three
+    /// variables in stack slots (from the top) `n`, `d`, `s` entering the condition node.
+    Countdown { n: usize, d: usize, s: usize },
 }
 
 /// What a *simple* internal function does, in terms of its entry-stack arguments `Arg(i)`:
@@ -521,22 +610,34 @@ pub struct CalleeSummary {
     /// Conditions that must hold on the summarised path (the other side of each branch reverts),
     /// with the revert payload of the failing side and whether it is an INVALID (assert).
     pub guards: Vec<(ExprId, Option<Vec<ExprId>>, bool)>,
+    /// Memory-to-memory copies `(dest, src, len)` in order (from summarised copy loops).
+    pub copies: Vec<(ExprId, ExprId, ExprId)>,
+    /// Word offsets written on only some paths (padding stores): unknown after the call.
+    pub maybe_mstores: Vec<ExprId>,
 }
 
 /// Compute a summary from a lifted internal function, if it is simple enough.
+fn fail_summary(code: u32) -> Option<CalleeSummary> {
+    if std::env::var("EVMDEC_DEBUG_SUMMARY").is_ok() {
+        eprintln!("[summary] not summarisable (reason {})", code);
+    }
+    None
+}
+
 pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
     let mut n = l.entry;
     let mut seen = HashSet::new();
     let mut sum = CalleeSummary::default();
     loop {
         if !seen.insert(n) || seen.len() > 64 {
-            return None;
+            return fail_summary(1);
         }
         let nd = &l.nodes[n];
         for s in &nd.stmts {
             match s {
                 Stmt::MStore { off, val, width: 32 } => sum.mstores.push((*off, *val)),
                 Stmt::MStore { .. } => return None,
+                Stmt::Copy { kind: op::MCOPY, dest, src, len, .. } => sum.copies.push((*dest, *src, *len)),
                 Stmt::Copy { .. } | Stmt::Internal { .. } | Stmt::Call { .. } | Stmt::Create { .. } => return None,
                 Stmt::SStore { .. } | Stmt::Log { .. } => sum.side_effects = true,
                 Stmt::Require { cond, data, invalid } => sum.guards.push((*cond, data.clone(), *invalid)),
@@ -553,11 +654,63 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                 sum.returns = vals.clone();
                 // Expressions must not depend on the callee's own memory versions in complex ways.
                 let simple = |e: &ExprId| expr::size(*e) <= 64 && !expr::contains(*e, &|x| matches!(x, Node::Var(_) | Node::IntRet(..) | Node::CallResult(_) | Node::Unknown(_)));
-                let ok = sum.returns.iter().chain(sum.mstores.iter().flat_map(|(a, b)| [a, b])).all(simple) && sum.guards.iter().all(|(c, d, _)| simple(c) && d.as_ref().map_or(true, |d| d.iter().all(simple)));
-                return if ok { Some(sum) } else { None };
+                let ok = sum.returns.iter().chain(sum.mstores.iter().flat_map(|(a, b)| [a, b])).chain(sum.copies.iter().flat_map(|(a, b, c)| [a, b, c])).all(simple) && sum.guards.iter().all(|(c, d, _)| simple(c) && d.as_ref().map_or(true, |d| d.iter().all(simple)));
+                return if ok { Some(sum) } else { fail_summary(100) };
             }
             Term::Jump(t) => n = *t,
             Term::Branch { cond, t, f } => {
+                // Both sides the same node (a loop summarised away): no branch at all.
+                if *t == Some(*f) {
+                    n = *f;
+                    continue;
+                }
+                // A diamond of store-only arms joining again (padding of a copied region):
+                // the arms' writes become "maybe" writes and the walk continues at the join.
+                if let Some(t) = t {
+                    // Where does a store-only arm lead: a join node, or a return of these values?
+                    #[derive(PartialEq)]
+                    enum ArmEnd {
+                        Join(usize),
+                        Ret(Vec<ExprId>),
+                    }
+                    let arm = |x: usize| -> Option<(Vec<ExprId>, ArmEnd)> {
+                        let nd = &l.nodes[x];
+                        let mut offs = Vec::new();
+                        for s in &nd.stmts {
+                            match s {
+                                Stmt::MStore { off, width: 32, .. } => offs.push(*off),
+                                _ => return None,
+                            }
+                        }
+                        match &nd.term {
+                            Term::Jump(j) => Some((offs, ArmEnd::Join(*j))),
+                            Term::InternalReturn(vals) if offs.len() <= 2 => Some((offs, ArmEnd::Ret(vals.clone()))),
+                            _ => None,
+                        }
+                    };
+                    let end_of = |x: usize| -> (Vec<ExprId>, ArmEnd) { arm(x).unwrap_or((Vec::new(), ArmEnd::Join(x))) };
+                    let (ot, et) = end_of(*t);
+                    let (of, ef) = end_of(*f);
+                    if et == ef && (ot.len() + of.len()) <= 4 {
+                        match et {
+                            ArmEnd::Join(j) if j != *t || j != *f => {
+                                sum.maybe_mstores.extend(ot);
+                                sum.maybe_mstores.extend(of);
+                                n = j;
+                                continue;
+                            }
+                            ArmEnd::Ret(vals) => {
+                                sum.maybe_mstores.extend(ot);
+                                sum.maybe_mstores.extend(of);
+                                sum.returns = vals;
+                                let simple = |e: &ExprId| expr::size(*e) <= 64 && !expr::contains(*e, &|x| matches!(x, Node::Var(_) | Node::IntRet(..) | Node::CallResult(_) | Node::Unknown(_)));
+                                let ok = sum.returns.iter().chain(sum.mstores.iter().flat_map(|(a, b)| [a, b])).chain(sum.copies.iter().flat_map(|(a, b, c)| [a, b, c])).chain(sum.maybe_mstores.iter()).all(simple) && sum.guards.iter().all(|(c, d, _)| simple(c) && d.as_ref().map_or(true, |d| d.iter().all(simple)));
+                                return if ok { Some(sum) } else { fail_summary(100) };
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 // Follow the non-reverting side if the other only reverts, and remember the
                 // condition that side needs as a guard.
                 let rev = |x: usize| matches!(l.nodes[x].term, Term::Revert { .. } | Term::Invalid | Term::Infeasible) && l.nodes[x].stmts.iter().all(|s| matches!(s, Stmt::MStore { .. }));
@@ -612,6 +765,34 @@ impl<'a> Lifter<'a> {
         self.lift_from(unit, state)
     }
 
+    /// Lift, then lift again with every word-copy loop of the unit summarised as one copy.
+    pub fn lift_summarizing(&self, unit: &Unit, initial: Option<(Vec<ExprId>, bool)>) -> Lifted {
+        let l = self.lift(unit, initial.clone());
+        let loops = crate::idiom::copy_loops(&l);
+        if std::env::var("EVMDEC_DEBUG_LOOPS").is_ok() {
+            eprintln!("[loops] unit entry block {} ({:#x}): {} copy loop(s) {:?}", unit.entry_block, self.prog.blocks[unit.entry_block].start, loops.len(), loops.iter().map(|c| (c.entry, c.latch, c.body, c.exit)).collect::<Vec<_>>());
+        }
+        if loops.is_empty() || self.oracle {
+            return l;
+        }
+        for cl in loops {
+            self.copy_loops.borrow_mut().insert((unit.entry_block, cl.entry), cl);
+        }
+        self.lift(unit, initial)
+    }
+
+    pub fn lift_from_summarizing(&self, unit: &Unit, init: State) -> Lifted {
+        let l = self.lift_from(unit, init.clone());
+        let loops = crate::idiom::copy_loops(&l);
+        if loops.is_empty() || self.oracle {
+            return l;
+        }
+        for cl in loops {
+            self.copy_loops.borrow_mut().insert((unit.entry_block, cl.entry), cl);
+        }
+        self.lift_from(unit, init)
+    }
+
     /// Entry state of a lifted node, to lift a sub-region starting there separately.
     pub fn entry_state_of(l: &Lifted, unit_node: usize) -> Option<State> {
         l.entry_states.get(unit_node).cloned().flatten()
@@ -646,12 +827,37 @@ impl<'a> Lifter<'a> {
                 reprocess_count += 1;
             }
             let entry = entries[nid].clone().unwrap();
-            let (lnode, exit) = self.run_node(unit, nid, &entry.state, &hidden);
+            let (mut lnode, exit) = self.run_node(unit, nid, &entry.state, &hidden);
             max_args = max_args.max(exit.args_used);
+            // A recognised word-copy loop entered from here becomes one memory copy and the edge
+            // goes straight to the loop's exit.
+            let loops = self.copy_loops.borrow();
+            let mut redirect: Vec<(usize, usize)> = Vec::new();
+            // The state handed to a redirected successor (the loop's exit) differs from `exit`.
+            let mut succ_state: HashMap<usize, State> = HashMap::new();
+            for s in lnode.succs.clone() {
+                if let Some(cl) = loops.get(&(unit.entry_block, s)) {
+                    if nid != cl.body && nid != cl.latch {
+                        if let Some((stmt, after)) = self.summarize_copy_loop(unit, cl, &exit, &hidden) {
+                            lnode.stmts.push(stmt);
+                            redirect.push((s, cl.exit));
+                            succ_state.insert(cl.exit, after);
+                        }
+                    }
+                }
+            }
+            drop(loops);
+            if !redirect.is_empty() {
+                let m: HashMap<usize, usize> = redirect.iter().copied().collect();
+                lnode.succs = lnode.succs.iter().map(|s| *m.get(s).unwrap_or(s)).collect();
+                lnode.term = remap_term(&lnode.term, &m);
+            }
             let succs: Vec<usize> = lnode.succs.clone();
             lnodes[nid] = Some(lnode);
             exit_states[nid] = Some(exit.clone());
+            let exit_all = exit;
             for s in succs {
+                let exit = succ_state.get(&s).unwrap_or(&exit_all).clone();
                 let single_pred = unit.nodes[s].preds.len() <= 1;
                 let changed = match &mut entries[s] {
                     None => {
@@ -686,7 +892,7 @@ impl<'a> Lifter<'a> {
                 ln.entry_stack = entries[i].as_ref().map(|e| e.state.stack.clone()).unwrap_or_default();
                 // Drop encoding-only memory writes and free-memory-pointer bookkeeping (display
                 // only; the oracle keeps every statement).
-                if !self.oracle {
+                if !self.oracle && std::env::var("EVMDEC_SHOW_HIDDEN").is_err() {
                     let mut idx = 0usize;
                     ln.stmts.retain(|s| {
                         let keep = match s {
@@ -793,6 +999,78 @@ impl<'a> Lifter<'a> {
     }
 
     /// Execute one node from its entry state.
+    /// Replace a recognised copy loop entered with state `entering` by one memory copy: returns
+    /// the statement to show and the state that reaches the loop's exit.
+    fn summarize_copy_loop(&self, unit: &Unit, cl: &CopyLoop, entering: &State, hidden: &Hidden) -> Option<(Stmt, State)> {
+        let top = entering.stack.len();
+        let at = |st: &State, slot: usize| -> Option<ExprId> { if slot < st.stack.len() { Some(st.stack[st.stack.len() - 1 - slot]) } else { None } };
+        let round_up = |e: ExprId| op2(op::AND, expr::add_const(e, U256::from_u64(31)), konst(!U256::from_u64(31)));
+        match &cl.shape {
+            CopyShape::Index { slot, rotated } => {
+                let i0 = at(entering, *slot)?;
+                // Run the loop nodes once with a placeholder counter (so that a constant start
+                // does not fold the condition away) to learn the copied addresses and the bound
+                // in the current state's terms; then put the real start value back.
+                let marker = expr::intern(Node::Unknown(expr::next_seq()));
+                let mut probe = entering.clone();
+                probe.stack[top - 1 - *slot] = marker;
+                let (off, src, cond) = if *rotated {
+                    let (bn, after_body) = self.run_node(unit, cl.body, &probe, hidden);
+                    let Some(Stmt::MStore { off, val, width: 32 }) = bn.stmts.iter().find(|s| matches!(s, Stmt::MStore { .. })) else { return None };
+                    let Node::MLoad(src, _) = expr::node(*val) else { return None };
+                    let (ln, _) = if cl.latch == cl.body { (bn.clone(), after_body.clone()) } else { self.run_node(unit, cl.latch, &after_body, hidden) };
+                    let Term::Branch { cond, .. } = &ln.term else { return None };
+                    (*off, src, *cond)
+                } else {
+                    let (xn, after_x) = self.run_node(unit, cl.latch, &probe, hidden);
+                    let Term::Branch { cond, .. } = &xn.term else { return None };
+                    let (bn, _) = self.run_node(unit, cl.body, &after_x, hidden);
+                    let Some(Stmt::MStore { off, val, width: 32 }) = bn.stmts.iter().find(|s| matches!(s, Stmt::MStore { .. })) else { return None };
+                    let Node::MLoad(src, _) = expr::node(*val) else { return None };
+                    (*off, src, *cond)
+                };
+                let mut memo = HashMap::new();
+                let unmark = |e: ExprId, memo: &mut HashMap<ExprId, ExprId>| expr::substitute(e, &|n| if matches!(n, Node::Unknown(_)) && expr::intern(n.clone()) == marker { Some(i0) } else { None }, memo);
+                let len = loop_bound(cond)?;
+                if expr::contains(len, &|n| matches!(n, Node::Unknown(_))) {
+                    return None;
+                }
+                let (dst0, src0) = (unmark(off, &mut memo), unmark(src, &mut memo));
+                let count = if expr::as_const(i0) == Some(U256::ZERO) { round_up(len) } else { round_up(op2(op::SUB, len, i0)) };
+                let mut st = entering.clone();
+                apply_mcopy(&mut st, dst0, src0, count);
+                let stmt = Stmt::Copy { kind: op::MCOPY, dest: dst0, src: src0, len: count, addr: None };
+                // Leave the loop: the counter at its final value, then one pass over the loop
+                // nodes gives the exit stack layout (and leaves the already-copied memory alone).
+                let last = op2(op::SUB, op2(op::ADD, i0, count), konst_u64(32));
+                let final_i = if *rotated { last } else { op2(op::ADD, i0, count) };
+                st.stack[top - 1 - *slot] = final_i;
+                let after = if *rotated {
+                    let (_, s1) = self.run_node(unit, cl.body, &st, hidden);
+                    if cl.latch == cl.body {
+                        s1
+                    } else {
+                        self.run_node(unit, cl.latch, &s1, hidden).1
+                    }
+                } else {
+                    self.run_node(unit, cl.latch, &st, hidden).1
+                };
+                Some((stmt, after))
+            }
+            CopyShape::Countdown { n, d, s } => {
+                let (len, dst, src) = (at(entering, *n)?, at(entering, *d)?, at(entering, *s)?);
+                let whole = op2(op::AND, len, konst(!U256::from_u64(31)));
+                let mut st = entering.clone();
+                apply_mcopy(&mut st, dst, src, whole);
+                st.stack[top - 1 - *n] = op2(op::AND, len, konst_u64(31));
+                st.stack[top - 1 - *d] = op2(op::ADD, dst, whole);
+                st.stack[top - 1 - *s] = op2(op::ADD, src, whole);
+                let after = self.run_node(unit, cl.latch, &st, hidden).1;
+                Some((Stmt::Copy { kind: op::MCOPY, dest: dst, src, len: whole, addr: None }, after))
+            }
+        }
+    }
+
     fn run_node(&self, unit: &Unit, nid: usize, entry: &State, hidden: &Hidden) -> (LNode, State) {
         let prog = self.prog;
         let un = &unit.nodes[nid];
@@ -885,7 +1163,10 @@ impl<'a> Lifter<'a> {
                         Some(l) if l <= 8192 => match st.mem.read_region(off, l as u64, st.version) {
                             Some((words, tail)) => {
                                 hidden.set.borrow_mut().extend(st.mem.consumers(off, l as u64));
-                                expr::intern(Node::Keccak(words, tail))
+                                match fold_keccak(&words, tail) {
+                                    Some(h) => konst(h),
+                                    None => expr::intern(Node::Keccak(words, tail)),
+                                }
                             }
                             None => expr::intern(Node::KeccakMem(off, len, st.mem.version_for(off, l as u64))),
                         },
@@ -1091,9 +1372,26 @@ impl<'a> Lifter<'a> {
                         hidden.set.borrow_mut().extend(st.mem.consumers(in_off, expr::as_const(in_len).unwrap().low_u64()));
                     }
                     let result = expr::intern(Node::CallResult(seq));
-                    // Output region: known to be return data of this call.
+                    // The first payload words, read before the output region (which usually
+                    // overlaps the input buffer) is written.
+                    if let Ok(want) = std::env::var("EVMDEC_DEBUG_HEAD") {
+                        if want == "all" || want == ins.pc.to_string() {
+                            eprintln!("CALL pc={} in_off={:?} norm={:?} version={} gen={} clobber={}", ins.pc, expr::node(in_off), norm_offset(in_off), st.version, st.mem.gen, st.mem.clobber_gen);
+                            for w in &st.mem.writes {
+                                eprintln!("  write base={:?} off={} len={:?} val={} gen={}", w.base.map(|b| expr::node(b)), w.off, w.len, match &w.val { MVal::Word(_) => "word", MVal::Byte(_) => "byte", MVal::Copy(..) => "copy", MVal::CallOut(_) => "callout", MVal::Unknown => "unknown" }, w.gen);
+                            }
+                        }
+                    }
+                    let input_head: Vec<ExprId> = if expr::as_const(in_len) == Some(U256::ZERO) { Vec::new() } else { (0..4).map(|i| st.mem.load_word(expr::add_const(in_off, U256::from_u64(32 * i)), st.version)).collect() };
+                    // Output region: known to be return data of this call. The identity
+                    // precompile (address 4, Vyper's memory copy) returns its input, so the
+                    // output region holds the input words when both lengths are constant.
                     let ol = expr::as_const(out_len).and_then(|v| v.as_usize()).map(|v| v as u64);
-                    if ol != Some(0) {
+                    let il = expr::as_const(in_len).and_then(|v| v.as_usize()).map(|v| v as u64);
+                    let identity = expr::as_const(addr) == Some(U256::from_u64(4)) && (o == op::STATICCALL || o == op::CALL);
+                    if identity && ol.is_some() && il.is_some() && ol.unwrap() <= il.unwrap() {
+                        apply_mcopy(&mut st, out_off, in_off, out_len);
+                    } else if ol != Some(0) {
                         st.mem.store(out_off, ol, MVal::CallOut(seq));
                     }
                     next_version(&mut st);
@@ -1102,7 +1400,7 @@ impl<'a> Lifter<'a> {
                         st.storage.clear();
                         st.sgen += 1;
                     }
-                    stmts.push(Stmt::Call { seq, kind: o, gas, addr, value, in_off, in_len, out_off, out_len, input, result });
+                    stmts.push(Stmt::Call { seq, kind: o, gas, addr, value, in_off, in_len, out_off, out_len, input, input_head, result });
                     st.stack.push(result);
                     st.called = true;
                 }
@@ -1253,6 +1551,16 @@ impl<'a> Lifter<'a> {
                         st.mem.store(o, Some(32), MVal::Word(v));
                     }
                 }
+                for (dest, src, len) in &sum.copies {
+                    let (d, s2, l2) = (subst(*dest), subst(*src), subst(*len));
+                    if transparent {
+                        stmts.push(Stmt::Copy { kind: op::MCOPY, dest: d, src: s2, len: l2, addr: None });
+                    }
+                    apply_mcopy(st, d, s2, l2);
+                }
+                for off in &sum.maybe_mstores {
+                    st.mem.store(subst(*off), Some(32), MVal::Unknown);
+                }
                 if transparent && !sum.mstores.is_empty() {
                     st.mem.tick();
                     st.version = st.mem.gen;
@@ -1397,6 +1705,110 @@ fn merge_into(e: &mut Entry, exit: &State, node: usize, phi_ids: &mut HashMap<(u
 }
 
 /// All expressions referenced by a node's statements and terminator (for analyses).
+/// Split a loop condition into the bound: `LT(i, len)` / `GT(len, i)` and `ISZERO` of either.
+fn loop_bound(cond: ExprId) -> Option<ExprId> {
+    match expr::node(cond) {
+        Node::Op(op::LT, v) => Some(v[1]),
+        Node::Op(op::GT, v) => Some(v[0]),
+        Node::Op(op::ISZERO, v) => loop_bound(v[0]),
+        _ => None,
+    }
+}
+
+/// A sequential memory model for analyses that replay statements in order.
+pub struct MemView {
+    mem: Mem,
+    version: u32,
+}
+
+impl Default for MemView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemView {
+    pub fn new() -> MemView {
+        MemView { mem: Mem::new(false), version: 0 }
+    }
+    /// A view of the memory of a freshly entered call frame: never-written bytes read as zero.
+    pub fn new_fresh() -> MemView {
+        MemView { mem: Mem::new(true), version: 0 }
+    }
+    /// Stop treating unwritten bytes as zero (unknown writes may have happened).
+    pub fn unfresh(&mut self) {
+        self.mem.fresh = false;
+    }
+    /// `len` bytes at `off` (symbolic length when `None`) now hold unknown values.
+    pub fn unknown(&mut self, off: ExprId, len: Option<u64>) {
+        self.mem.store(off, len, MVal::Unknown);
+        self.mem.tick();
+        self.version = self.mem.gen;
+    }
+    pub fn store(&mut self, off: ExprId, val: ExprId) {
+        self.mem.store(off, Some(32), MVal::Word(val));
+        self.mem.tick();
+        self.version = self.mem.gen;
+    }
+    pub fn copy(&mut self, dest: ExprId, src: ExprId, len: ExprId) {
+        let mut st = State { stack: Vec::new(), args_used: 0, mem: std::mem::replace(&mut self.mem, Mem::new(false)), storage: Vec::new(), version: self.version, sgen: 0, called: false };
+        apply_mcopy(&mut st, dest, src, len);
+        self.mem = st.mem;
+        self.version = st.version;
+    }
+    /// The word at `off` if every byte of it is known.
+    pub fn load(&self, off: ExprId) -> Option<ExprId> {
+        let w = self.mem.load_bytes(off, 32, self.version)?;
+        if expr::contains(w, &|n| matches!(n, Node::MLoad(..))) {
+            None
+        } else {
+            Some(w)
+        }
+    }
+}
+
+/// keccak256 of a region whose words are all constants (the last `tail` bytes right-aligned).
+fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
+    let mut bytes = Vec::with_capacity(words.len() * 32);
+    for (i, w) in words.iter().enumerate() {
+        let c = expr::as_const(*w)?;
+        let b = c.to_be_bytes();
+        if tail > 0 && i == words.len() - 1 {
+            bytes.extend_from_slice(&b[32 - tail as usize..]);
+        } else {
+            bytes.extend_from_slice(&b);
+        }
+    }
+    Some(U256::from_be_bytes(&crate::keccak::keccak256(&bytes)))
+}
+
+/// Copy `len` bytes of memory from `src` to `dest` in `st`: known words are copied as words,
+/// the rest as an opaque copy.
+fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
+    let l = expr::as_const(len).and_then(|v| v.as_usize()).map(|v| v as u64);
+    if let Some(l) = l {
+        if let Some((words, tail)) = st.mem.read_region(src, l, st.version) {
+            let mut i = 0u64;
+            for (k, w) in words.iter().enumerate() {
+                let is_tail = tail > 0 && k == words.len() - 1;
+                if !is_tail {
+                    st.mem.store(expr::add_const(dest, U256::from(i)), Some(32), MVal::Word(*w));
+                    i += 32;
+                }
+            }
+            if tail > 0 {
+                st.mem.store(expr::add_const(dest, U256::from(i)), Some(tail as u64), MVal::Copy(op::MCOPY, src, None));
+            }
+        } else {
+            st.mem.store(dest, Some(l), MVal::Copy(op::MCOPY, src, None));
+        }
+    } else {
+        st.mem.store(dest, None, MVal::Copy(op::MCOPY, src, None));
+    }
+    st.mem.tick();
+    st.version = st.mem.gen;
+}
+
 /// Apply `f` to every expression of a statement.
 pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
     let fv = |v: &Vec<ExprId>| v.iter().map(|e| f(*e)).collect::<Vec<_>>();
@@ -1406,7 +1818,7 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
         Stmt::MStore { off, val, width } => Stmt::MStore { off: f(*off), val: f(*val), width: *width },
         Stmt::SStore { key, val, transient } => Stmt::SStore { key: f(*key), val: f(*val), transient: *transient },
         Stmt::Log { off, len, topics, data } => Stmt::Log { off: f(*off), len: f(*len), topics: fv(topics), data: fo(data) },
-        Stmt::Call { seq, kind, gas, addr, value, in_off, in_len, out_off, out_len, input, result } => Stmt::Call { seq: *seq, kind: *kind, gas: f(*gas), addr: f(*addr), value: value.map(|v| f(v)), in_off: f(*in_off), in_len: f(*in_len), out_off: f(*out_off), out_len: f(*out_len), input: fo(input), result: f(*result) },
+        Stmt::Call { seq, kind, gas, addr, value, in_off, in_len, out_off, out_len, input, input_head, result } => Stmt::Call { seq: *seq, kind: *kind, gas: f(*gas), addr: f(*addr), value: value.map(|v| f(v)), in_off: f(*in_off), in_len: f(*in_len), out_off: f(*out_off), out_len: f(*out_len), input: fo(input), input_head: fv(input_head), result: f(*result) },
         Stmt::Create { seq, kind, value, off, len, salt, result, init } => Stmt::Create { seq: *seq, kind: *kind, value: f(*value), off: f(*off), len: f(*len), salt: salt.map(|v| f(v)), result: f(*result), init: fo(init) },
         Stmt::Copy { kind, dest, src, len, addr } => Stmt::Copy { kind: *kind, dest: f(*dest), src: f(*src), len: f(*len), addr: addr.map(|v| f(v)) },
         Stmt::Internal { seq, callee, args, results } => Stmt::Internal { seq: *seq, callee: *callee, args: fv(args), results: fv(results) },

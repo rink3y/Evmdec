@@ -510,6 +510,7 @@ impl<'a> Printer<'a> {
         let term = self.l.nodes[n].term.clone();
         match term {
             Term::Jump(t) => self.transfer(n, t, stop, depth),
+            Term::Branch { t: Some(t), f, .. } if t == f => self.transfer(n, f, stop, depth),
             Term::Branch { cond, t, f } => self.emit_branch(n, cond, t, f, stop, depth),
             Term::Switch { target, cases } => {
                 let tgt = emit::fmt_expr(target, self.names);

@@ -403,7 +403,7 @@ pub struct VerifyOptions {
 
 pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
     let prog = Program::new(code.to_vec());
-    let lifter = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: true };
+    let lifter = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: true, copy_loops: Default::default() };
     let mut stats = VerifyStats::default();
     let mut rng = Rng::new(opts.seed);
     for b in &prog.blocks {
@@ -559,8 +559,8 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         acc.note(*out_off, oo, ol);
                         expand_mem(&mut mem, io, il);
                         let idx = calls.len();
-                        calls.push(crate::interp::CallRecord { kind: *kind, gas: g, addr: a, value: v, input: input_bytes, out_off: oo, out_len: olv });
-                        let (ok, data) = host.call_result(idx);
+                        calls.push(crate::interp::CallRecord { kind: *kind, gas: g, addr: a, value: v, input: input_bytes.clone(), out_off: oo, out_len: olv });
+                        let (ok, data) = if a == U256::from_u64(4) { (true, input_bytes) } else { host.call_result(idx) };
                         ev.calls.push((ok, data.clone()));
                         if ol > 0 {
                             let mut buf = data.clone();

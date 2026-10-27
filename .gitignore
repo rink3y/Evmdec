@@ -6,3 +6,5 @@ corpus/*.json
 *.swp
 /sample
 __pycache__/
+.impeccable/review/
+.impeccable/mocks/

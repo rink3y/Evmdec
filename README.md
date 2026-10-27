@@ -79,9 +79,15 @@ oracle, so the accuracy claim below is measured, not asserted.
   decision). See *Accuracy*.
 * **CLI and web app.** `evmdec decompile <address|file|hex>` (with `--lookup` to resolve
   unknown selectors through openchain.xyz / 4byte.directory), `analyze`, `verify`, `disasm`,
-  `info`, `cfg`; an axum server with a single-page UI (paste an address or bytecode, browse
-  functions, read the report, download `.sol`). The CLI never fails on an input: if the
-  decompiler hits an internal error it prints the disassembly instead.
+  `info`, `cfg`; an axum server with a single-page UI laid out as a drawing set: a title block
+  (chain, address, compiler, code size, coverage, findings, risk), an indexed function list, the
+  code as the drawing with numbered callouts keyed to the findings beside it, and tabs for the
+  report, storage and events, disassembly and JSON. Results are linkable
+  (`/?chain=mainnet&address=0x…`), the page follows the system colour scheme with a manual
+  override, and it meets WCAG 2.2 AA (contrast on both themes, keyboard operation of every
+  control, visible focus, live status messages, severity always in words). No external fonts or
+  scripts. The CLI never fails on an input: if the decompiler hits an internal error it prints
+  the disassembly instead.
 
 ## Layout
 

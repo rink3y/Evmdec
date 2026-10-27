@@ -129,3 +129,25 @@ fn safemath_guard_in_inlined_helper_is_kept() {
     let r = analyze(&c);
     assert!(r.findings.iter().any(|f| f.id == "unchecked-arithmetic"), "unguarded addition must be flagged:\n{}", c.source);
 }
+
+#[test]
+fn reentrancy_guard_is_recognised_only_when_it_locks() {
+    // lock: require(slot1 == 1); slot1 = 0; call; slot1 = 1; slot_caller = 0
+    let locked = dispatcher("PUSH1 0x01 SLOAD PUSH1 0x01 EQ PUSH2 @go JUMPI PUSH1 0x00 DUP1 REVERT :go JUMPDEST PUSH1 0x00 PUSH1 0x01 SSTORE CALLER SLOAD DUP1 PUSH1 0x00 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP PUSH1 0x01 PUSH1 0x01 SSTORE PUSH1 0x00 CALLER SSTORE STOP");
+    let r = analyze(&decompile(&locked, &Options::default()));
+    let f = r.findings.iter().find(|f| f.id == "reentrancy").expect("reentrancy finding");
+    assert_eq!(f.severity, Severity::Info, "a lock written before and after the call is a guard");
+    // No lock, but the function still writes two slots twice after the call: not a guard.
+    let unlocked = dispatcher("CALLER SLOAD DUP1 PUSH1 0x00 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP PUSH1 0x05 PUSH1 0x07 SSTORE PUSH1 0x00 CALLER SSTORE PUSH1 0x06 PUSH1 0x07 SSTORE STOP");
+    let r = analyze(&decompile(&unlocked, &Options::default()));
+    let f = r.findings.iter().find(|f| f.id == "reentrancy").expect("reentrancy finding");
+    assert!(matches!(f.severity, Severity::High | Severity::Medium), "writes after the call without a tested lock are not a guard: {:?}", f.severity);
+}
+
+#[test]
+fn erc20_transfer_result_ignored_is_reported() {
+    // token.transfer(caller, 1) with out_len 0 and only the success flag checked.
+    let body = "PUSH4 0xa9059cbb PUSH1 0xe0 SHL PUSH1 0x00 MSTORE CALLER PUSH1 0x04 MSTORE PUSH1 0x01 PUSH1 0x24 MSTORE PUSH1 0x00 PUSH1 0x00 PUSH1 0x44 PUSH1 0x00 PUSH1 0x00 PUSH1 0x04 CALLDATALOAD GAS CALL PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST STOP";
+    let r = analyze(&decompile(&dispatcher(body), &Options::default()));
+    assert!(r.findings.iter().any(|f| f.id == "erc20-return-ignored"), "{:?}", r.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>());
+}

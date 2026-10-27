@@ -458,6 +458,39 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
     for e in exprs {
         visit(*e);
     }
+    // `iszero(iszero(x))` is both the bool cleanup and `x != 0`: a word is a bool only when it
+    // is never used raw anywhere else (arithmetic, comparison, call argument, hash input).
+    {
+        let bool_words: Vec<u32> = types.iter().filter(|(_, t)| *t == "bool").map(|(i, _)| *i).collect();
+        if !bool_words.is_empty() {
+            let mut raw: HashSet<u32> = HashSet::new();
+            let mut seen = HashSet::new();
+            let mut stack: Vec<ExprId> = exprs.to_vec();
+            while let Some(x) = stack.pop() {
+                if !seen.insert(x) || seen.len() > 200_000 {
+                    continue;
+                }
+                let kids = expr::children(x);
+                let is_cleanup = matches!(expr::node(x), Node::Op(op::ISZERO, ref v) if matches!(expr::node(v[0]), Node::Op(op::ISZERO, _)));
+                let is_validator = matches!(expr::node(x), Node::Op(op::EQ, ref v) if v.iter().any(|y| matches!(expr::node(*y), Node::Op(op::ISZERO, _))));
+                if !is_cleanup && !is_validator && !matches!(expr::node(x), Node::Op(op::ISZERO, _)) {
+                    for k in &kids {
+                        if let Node::CallDataLoad(off) = expr::node(*k) {
+                            if let Some(i) = calldata_word_index(off) {
+                                raw.insert(i);
+                            }
+                        }
+                    }
+                }
+                stack.extend(kids);
+            }
+            for i in bool_words {
+                if raw.contains(&i) {
+                    types.remove(&i);
+                }
+            }
+        }
+    }
     // The ABI head-size check (solc >= 0.5) gives the exact head word count; otherwise fall back
     // to the highest calldata word read. Reads beyond a present check are not parameters (e.g.
     // `LogNote`-style modifiers logging raw calldata words).

@@ -1397,6 +1397,44 @@ fn merge_into(e: &mut Entry, exit: &State, node: usize, phi_ids: &mut HashMap<(u
 }
 
 /// All expressions referenced by a node's statements and terminator (for analyses).
+/// Apply `f` to every expression of a statement.
+pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
+    let fv = |v: &Vec<ExprId>| v.iter().map(|e| f(*e)).collect::<Vec<_>>();
+    let fo = |v: &Option<Vec<ExprId>>| v.as_ref().map(|v| fv(v));
+    match s {
+        Stmt::Assign { var, value } => Stmt::Assign { var: f(*var), value: f(*value) },
+        Stmt::MStore { off, val, width } => Stmt::MStore { off: f(*off), val: f(*val), width: *width },
+        Stmt::SStore { key, val, transient } => Stmt::SStore { key: f(*key), val: f(*val), transient: *transient },
+        Stmt::Log { off, len, topics, data } => Stmt::Log { off: f(*off), len: f(*len), topics: fv(topics), data: fo(data) },
+        Stmt::Call { seq, kind, gas, addr, value, in_off, in_len, out_off, out_len, input, result } => Stmt::Call { seq: *seq, kind: *kind, gas: f(*gas), addr: f(*addr), value: value.map(|v| f(v)), in_off: f(*in_off), in_len: f(*in_len), out_off: f(*out_off), out_len: f(*out_len), input: fo(input), result: f(*result) },
+        Stmt::Create { seq, kind, value, off, len, salt, result, init } => Stmt::Create { seq: *seq, kind: *kind, value: f(*value), off: f(*off), len: f(*len), salt: salt.map(|v| f(v)), result: f(*result), init: fo(init) },
+        Stmt::Copy { kind, dest, src, len, addr } => Stmt::Copy { kind: *kind, dest: f(*dest), src: f(*src), len: f(*len), addr: addr.map(|v| f(v)) },
+        Stmt::Internal { seq, callee, args, results } => Stmt::Internal { seq: *seq, callee: *callee, args: fv(args), results: fv(results) },
+        Stmt::Drop(e) => Stmt::Drop(f(*e)),
+        Stmt::Require { cond, data, invalid } => Stmt::Require { cond: f(*cond), data: fo(data), invalid: *invalid },
+    }
+}
+
+/// Apply `f` to every expression of a terminator.
+pub fn map_term(t: &Term, f: &dyn Fn(ExprId) -> ExprId) -> Term {
+    let fv = |v: &Vec<ExprId>| v.iter().map(|e| f(*e)).collect::<Vec<_>>();
+    match t {
+        Term::Jump(x) => Term::Jump(*x),
+        Term::Branch { cond, t, f: fl } => Term::Branch { cond: f(*cond), t: *t, f: *fl },
+        Term::Switch { target, cases } => Term::Switch { target: f(*target), cases: cases.clone() },
+        Term::Return { off, len, data } => Term::Return { off: f(*off), len: f(*len), data: data.as_ref().map(|d| fv(d)) },
+        Term::ReturnDyn { ptr } => Term::ReturnDyn { ptr: f(*ptr) },
+        Term::Revert { off, len, data } => Term::Revert { off: f(*off), len: f(*len), data: data.as_ref().map(|d| fv(d)) },
+        Term::Stop => Term::Stop,
+        Term::Invalid => Term::Invalid,
+        Term::SelfDestruct(a) => Term::SelfDestruct(f(*a)),
+        Term::InternalReturn(vals) => Term::InternalReturn(fv(vals)),
+        Term::Unresolved(x) => Term::Unresolved(f(*x)),
+        Term::CondJump { cond, target } => Term::CondJump { cond: f(*cond), target: f(*target) },
+        Term::Infeasible => Term::Infeasible,
+    }
+}
+
 pub fn node_exprs(n: &LNode) -> Vec<ExprId> {
     let mut v = Vec::new();
     for s in &n.stmts {

@@ -115,3 +115,37 @@ fn creation_code_is_split_and_minimal_proxy_detected() {
     assert_eq!(info.kind, evmdec::metadata::CodeKind::Creation);
     assert_eq!(info.runtime, rt);
 }
+
+/// `a && b` compiles to `v = a; if (a) { v = b }`; the structurer must print `&&`, not `||`.
+#[test]
+fn short_circuit_and_is_not_inverted() {
+    fn asm(src: &str) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut labels = std::collections::HashMap::new();
+        let mut fixups: Vec<(usize, String)> = Vec::new();
+        let opcodes: std::collections::HashMap<&str, u8> = (0u8..=255).filter_map(|o| evmdec::opcode::info(o).map(|i| (i.name, o))).collect();
+        for tok in src.split_whitespace() {
+            if let Some(l) = tok.strip_prefix(':') {
+                labels.insert(l.to_string(), out.len());
+            } else if let Some(l) = tok.strip_prefix('@') {
+                fixups.push((out.len(), l.to_string()));
+                out.extend_from_slice(&[0, 0]);
+            } else if let Some(h) = tok.strip_prefix("0x") {
+                out.extend_from_slice(&evmdec::hex::decode(h).unwrap());
+            } else {
+                out.push(*opcodes.get(tok).unwrap_or_else(|| panic!("unknown mnemonic {tok}")));
+            }
+        }
+        for (pos, l) in fixups {
+            let t = labels[&l] as u16;
+            out[pos] = (t >> 8) as u8;
+            out[pos + 1] = t as u8;
+        }
+        out
+    }
+    // require(arg0 > 0 && arg0 <= 100)
+    let code = asm("PUSH1 0x80 PUSH1 0x40 MSTORE PUSH1 0x00 CALLDATALOAD PUSH1 0xe0 SHR PUSH4 0xaaaaaaaa EQ PUSH2 @f JUMPI PUSH1 0x00 DUP1 REVERT :f JUMPDEST PUSH1 0x04 CALLDATALOAD PUSH1 0x00 DUP2 GT DUP1 ISZERO PUSH2 @end JUMPI POP PUSH1 0x65 DUP2 LT :end JUMPDEST SWAP1 POP PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST STOP");
+    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    assert!(c.source.contains(" && "), "expected a conjunction:\n{}", c.source);
+    assert!(!c.source.contains(" || "), "no disjunction in this function:\n{}", c.source);
+}

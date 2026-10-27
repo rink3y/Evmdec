@@ -761,18 +761,24 @@ impl<'a> Printer<'a> {
             self.emitted.insert(f);
         }
         let ncond = expr::op1(op::ISZERO, cond);
-        // Short-circuit forms: v = cond ? X : cond  ==> v = cond && X ; v = cond ? cond : Y ==> cond || Y
-        let txt = if y == cond || (expr::is_boolean(y) && y == ncond && false) {
-            format!("{} = {} && {};", emit::fmt_expr(var, self.names), emit::fmt_expr(cond, self.names), emit::fmt_expr(x, self.names))
+        // `v = c ? x : y` with one side equal to the condition (or its negation) is a
+        // short-circuit:  c ? x : c  = c && x      c ? c : y  = c || y
+        //                 c ? !c : y = !c && y     c ? x : !c = !c || x
+        let (var_s, c_s, nc_s) = (emit::fmt_expr(var, self.names), emit::fmt_expr(cond, self.names), emit::fmt_expr(ncond, self.names));
+        let txt = if y == cond {
+            format!("{} = {} && {};", var_s, c_s, emit::fmt_expr(x, self.names))
         } else if x == cond {
-            format!("{} = {} || {};", emit::fmt_expr(var, self.names), emit::fmt_expr(cond, self.names), emit::fmt_expr(y, self.names))
-        } else if y == ncond {
-            format!("{} = {} && {};", emit::fmt_expr(var, self.names), emit::fmt_expr(cond, self.names), emit::fmt_expr(x, self.names))
+            format!("{} = {} || {};", var_s, c_s, emit::fmt_expr(y, self.names))
         } else if x == ncond {
-            format!("{} = {} || {};", emit::fmt_expr(var, self.names), emit::fmt_expr(ncond, self.names), emit::fmt_expr(y, self.names))
+            format!("{} = {} && {};", var_s, nc_s, emit::fmt_expr(y, self.names))
+        } else if y == ncond {
+            format!("{} = {} || {};", var_s, nc_s, emit::fmt_expr(x, self.names))
         } else {
-            format!("{} = {} ? {} : {};", emit::fmt_expr(var, self.names), emit::fmt_expr(cond, self.names), emit::fmt_expr(x, self.names), emit::fmt_expr(y, self.names))
+            format!("{} = {} ? {} : {};", var_s, c_s, emit::fmt_expr(x, self.names), emit::fmt_expr(y, self.names))
         };
+        if expr::is_boolean(x) && expr::is_boolean(y) {
+            expr::mark_boolean(var);
+        }
         Some(txt)
     }
 

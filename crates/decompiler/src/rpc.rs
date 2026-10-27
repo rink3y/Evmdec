@@ -27,6 +27,7 @@ pub const CHAINS: &[Chain] = &[
     Chain { name: "scroll", id: 534352, endpoints: &["https://scroll-rpc.publicnode.com", "https://rpc.scroll.io"] },
     Chain { name: "blast", id: 81457, endpoints: &["https://blast-rpc.publicnode.com", "https://rpc.blast.io"] },
     Chain { name: "zksync", id: 324, endpoints: &["https://mainnet.era.zksync.io"] },
+    Chain { name: "classic", id: 61, endpoints: &["https://etc.etcdesktop.com", "https://etc.rivet.link", "https://besu-at.etc-network.info"] },
 ];
 
 pub fn chain_by_name(name: &str) -> Option<&'static Chain> {

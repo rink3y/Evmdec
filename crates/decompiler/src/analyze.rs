@@ -72,6 +72,7 @@ struct Event {
     /// Program counter of the node that holds the statement (inside the callee when inlined).
     pc: usize,
     /// Entry pc of the internal function whose body holds the statement, when inlined.
+    #[allow(dead_code)]
     callee: Option<usize>,
     stmt: Option<Stmt>,
     term: Option<Term>,
@@ -129,10 +130,19 @@ fn loop_nodes(l: &Lifted) -> HashSet<usize> {
 }
 
 fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Event> {
-    events_of_in(ctx, l, depth, in_loop_outer, None, None)
+    events_of_in(ctx, l, depth, in_loop_outer, None, None, &HashMap::new())
 }
 
-fn events_of_in(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool, outer_node: Option<usize>, callee: Option<usize>) -> Vec<Event> {
+/// `subst` maps the helper's `Arg(i)` to the caller's actual values, so inlined statements read
+/// in the caller's terms (`msg.sender` rather than `arg1`).
+fn events_of_in(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool, outer_node: Option<usize>, callee: Option<usize>, subst: &HashMap<u32, ExprId>) -> Vec<Event> {
+    let apply = |e: ExprId| -> ExprId {
+        if subst.is_empty() {
+            return e;
+        }
+        let mut memo = HashMap::new();
+        expr::substitute(e, &|n| if let Node::Arg(i) = n { subst.get(i).copied() } else { None }, &mut memo)
+    };
     let loops = loop_nodes(l);
     let mut out = Vec::new();
     // RPO order
@@ -154,18 +164,32 @@ fn events_of_in(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool, outer_
         let in_loop = in_loop_outer || loops.contains(&nid);
         let anchor = outer_node.unwrap_or(nid);
         for s in &nd.stmts {
-            out.push(Event { node: anchor, pc: nd.pc, callee, stmt: Some(s.clone()), term: None, in_loop });
-            if let Stmt::Internal { callee: target, .. } = s {
+            let s = if subst.is_empty() { s.clone() } else { lift::map_stmt(s, &apply) };
+            if let Stmt::Internal { callee: target, args, .. } = &s {
                 if depth > 0 {
                     if let Some(f) = ctx.internals.get(target) {
                         if let Some(cl) = &f.lifted {
-                            out.extend(events_of_in(ctx, cl, depth - 1, in_loop, Some(anchor), Some(*target)));
+                            // Arg(i) (i < k) of the callee is argument k-1-i in natural order.
+                            let k = cl.ret_slot.map(|k| k as usize).unwrap_or(usize::MAX);
+                            let mut inner: HashMap<u32, ExprId> = HashMap::new();
+                            if k != usize::MAX {
+                                for (j, a) in args.iter().enumerate() {
+                                    if j < k {
+                                        inner.insert((k - 1 - j) as u32, *a);
+                                    }
+                                }
+                            }
+                            out.push(Event { node: anchor, pc: nd.pc, callee, stmt: Some(s.clone()), term: None, in_loop });
+                            out.extend(events_of_in(ctx, cl, depth - 1, in_loop, Some(anchor), Some(*target), &inner));
+                            continue;
                         }
                     }
                 }
             }
+            out.push(Event { node: anchor, pc: nd.pc, callee, stmt: Some(s), term: None, in_loop });
         }
-        out.push(Event { node: anchor, pc: nd.pc, callee, stmt: None, term: Some(nd.term.clone()), in_loop });
+        let term = if subst.is_empty() { nd.term.clone() } else { lift::map_term(&nd.term, &apply) };
+        out.push(Event { node: anchor, pc: nd.pc, callee, stmt: None, term: Some(term), in_loop });
     }
     out
 }
@@ -269,16 +293,7 @@ fn any_caller_check(ctx: &Ctx, f: &Function) -> bool {
     if has_caller_check(l, None) {
         return true;
     }
-    for c in &f.calls {
-        if let Some(cf) = ctx.internals.get(c) {
-            if let Some(cl) = &cf.lifted {
-                if has_caller_check(cl, None) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    transitive_callees(ctx, f).iter().any(|cf| cf.lifted.as_ref().map_or(false, |cl| has_caller_check(cl, None)))
 }
 
 /// Storage slots compared against msg.sender anywhere (owner/admin/role slots).
@@ -368,33 +383,66 @@ pub fn analyze(c: &Contract) -> Report {
         if caller_checked && (f.effects.writes_storage || f.effects.calls || f.effects.selfdestruct || f.effects.creates) {
             privileged.push(fname(f));
         }
+        // A function with no successful exit (simulation helpers such as Safe's
+        // `simulateAndRevert`) leaves nothing behind: what it calls cannot change state.
+        let always_reverts = !l.nodes.iter().any(|nd| matches!(nd.term, Term::Return { .. } | Term::ReturnDyn { .. } | Term::Stop | Term::SelfDestruct(_)));
 
-        // Reentrancy guard heuristic: a storage slot written twice (lock/unlock) around a call.
-        let sstore_slots: Vec<ExprId> = events.iter().filter_map(|e| if let Some(Stmt::SStore { key, .. }) = &e.stmt { Some(*key) } else { None }).collect();
-        let mut guard = false;
-        {
-            let mut counts: HashMap<ExprId, usize> = HashMap::new();
-            for k in &sstore_slots {
-                if expr::is_const(*k) {
-                    *counts.entry(*k).or_default() += 1;
+        // Reentrancy guard: a constant slot that is tested before the call, set to a constant
+        // before it and set to a constant again after it (`require(lock == 1); lock = 2; …;
+        // lock = 1`, OpenZeppelin/Uniswap/Seaport style, storage or transient).
+        let const_sloads = |e: ExprId| -> Vec<ExprId> {
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            let mut stack = vec![e];
+            while let Some(x) = stack.pop() {
+                if !seen.insert(x) || seen.len() > 2000 {
+                    continue;
+                }
+                if let Node::SLoad(k, _, _) = expr::node(x) {
+                    if expr::is_const(k) {
+                        out.push(k);
+                    }
+                }
+                stack.extend(expr::children(x));
+            }
+            out
+        };
+        let guarded = |i: usize| -> bool {
+            let mut tested: HashSet<ExprId> = HashSet::new();
+            let mut before: HashSet<ExprId> = HashSet::new();
+            let mut after: HashSet<ExprId> = HashSet::new();
+            for (j, e) in events.iter().enumerate() {
+                if let Some(Stmt::SStore { key, val, .. }) = &e.stmt {
+                    if expr::is_const(*key) {
+                        // Entering may store a caller-dependent marker (`lockedBy = msg.sender`,
+                        // `guard = accepting ? A : B`); leaving restores a constant.
+                        if j < i {
+                            before.insert(*key);
+                        } else if j > i && expr::is_const(*val) {
+                            after.insert(*key);
+                        }
+                    }
+                }
+                if j < i {
+                    if let Some(Stmt::Require { cond, .. }) = &e.stmt {
+                        tested.extend(const_sloads(*cond));
+                    }
+                    if let Some(Term::Branch { cond, .. }) = &e.term {
+                        tested.extend(const_sloads(*cond));
+                    }
                 }
             }
-            for (k, n) in counts {
-                let tested = |cond: ExprId| mentions(cond, &|x| matches!(x, Node::SLoad(kk, false, _) if *kk == k));
-                if n >= 2 && events.iter().any(|e| matches!(&e.term, Some(Term::Branch { cond, .. }) if tested(*cond)) || matches!(&e.stmt, Some(Stmt::Require { cond, .. }) if tested(*cond))) {
-                    guard = true;
-                }
-            }
-        }
+            before.iter().any(|k| after.contains(k) && tested.contains(k))
+        };
 
         // Walk events for call-related rules.
         for (i, ev) in events.iter().enumerate() {
             let Some(stmt) = &ev.stmt else { continue };
-            // Evidence from an inlined helper is rendered with that helper's own names.
-            let helper_names = ev.callee.and_then(|pc| ctx.internals.get(&pc)).map(|cf| names_for(cf));
-            let names = helper_names.as_ref().unwrap_or(&names);
+            // Inlined helper statements carry the caller's actual arguments (see `events_of_in`),
+            // so they print with the caller's names.
+            let names = &names;
             match stmt {
-                Stmt::Call { kind, addr, value, input, in_len, result, gas, seq, .. } => {
+                Stmt::Call { kind, addr, value, input, in_off, in_len, out_len, result, gas, seq, .. } => {
                     let target = emit::fmt_expr(*addr, names);
                     let line = emit::fmt_stmt(stmt, names);
                     external_calls.insert(format!("{}: {}", fname(f), line.trim_end_matches(';')));
@@ -413,7 +461,11 @@ pub fn analyze(c: &Contract) -> Report {
                         if storage_target {
                             delegatecall_targets_storage = true;
                         }
-                        if from_calldata(*addr) && !caller_checked {
+                        if from_calldata(*addr) && !caller_checked && always_reverts {
+                            push(&mut findings, "delegatecall-simulation", "Delegatecall to a caller-controlled address in an always-reverting function", Severity::Info, Confidence::Medium, Some(f), Some(ev.pc),
+                                format!("`{}` delegatecalls to `{}` from calldata, but every path of the function reverts, so the call's effects are rolled back (simulation helper).", f.name, target),
+                                vec![line.clone()], "Make sure no path can return successfully.");
+                        } else if from_calldata(*addr) && !caller_checked {
                             push(&mut findings, "arbitrary-delegatecall", "Delegatecall to a caller-controlled address", Severity::Critical, Confidence::High, Some(f), Some(ev.pc),
                                 format!("`{}` delegatecalls to `{}`, which is derived from calldata, without any msg.sender check. Anyone can execute arbitrary code in this contract's storage context (take over storage, selfdestruct).", f.name, target),
                                 vec![line.clone()], "Restrict the target to a whitelist or trusted storage slot and gate the function with access control.");
@@ -430,7 +482,7 @@ pub fn analyze(c: &Contract) -> Report {
                     if *kind == op::CALL || *kind == op::CALLCODE {
                         let later_write = events[i + 1..].iter().any(|e2| matches!(&e2.stmt, Some(Stmt::SStore { .. })) && (reaches(l, ev.node, e2.node)));
                         if later_write && !precompile {
-                            let (sev, conf, extra) = if guard {
+                            let (sev, conf, extra) = if guarded(i) {
                                 (Severity::Info, Confidence::Medium, " A storage lock written before and after the call looks like a reentrancy guard, so this is reported for awareness only.")
                             } else if gas_stipend {
                                 (Severity::Low, Confidence::Medium, " The call forwards only a 2300 gas stipend (`transfer`/`send`), which limits what a reentrant callee can do.")
@@ -459,9 +511,38 @@ pub fn analyze(c: &Contract) -> Report {
                                 format!("`{}` ignores the success flag of a low-level call to `{}`. If the call fails (reverting callee, out of gas, non-contract address) execution continues as if it succeeded{}.", f.name, target, if value_nonzero { ", and the ether is kept by this contract while state may assume it was sent" } else { "" }),
                                 vec![line.clone()], "Check the returned boolean (`require(success)`) or use a high-level call that reverts on failure.");
                         }
+                        // ERC20 transfer/transferFrom/approve whose returned bool is never read: a
+                        // token that returns false instead of reverting is treated as a success.
+                        if let Some(words) = input {
+                            let in_len_c = expr::as_const(*in_len).and_then(|l| l.as_usize());
+                            if let Some(sel) = words.first().and_then(|w0| emit::leading_selector(*w0, in_len_c)) {
+                                if matches!(sel, 0xa9059cbb | 0x23b872dd | 0x095ea7b3) {
+                                    let ret_read = |e: ExprId| mentions(e, &|n| matches!(n, Node::ReturnData(s, _) if *s == *seq));
+                                    let out_zero = expr::as_const(*out_len) == Some(U256::ZERO);
+                                    let decoded = events.iter().any(|e2| {
+                                        e2.stmt.as_ref().map_or(false, |s2| lift::node_exprs(&lift::LNode { id: 0, block: 0, pc: 0, stmts: vec![s2.clone()], term: Term::Stop, preds: vec![], succs: vec![], entry_stack: vec![], exit_stack: vec![] }).iter().any(|e| ret_read(*e)))
+                                            || e2.term.as_ref().map_or(false, |t| lift::node_exprs(&lift::LNode { id: 0, block: 0, pc: 0, stmts: vec![], term: t.clone(), preds: vec![], succs: vec![], entry_stack: vec![], exit_stack: vec![] }).iter().any(|e| ret_read(*e)))
+                                    }) || l.edge_assigns.values().flatten().any(|(_, v)| ret_read(*v));
+                                    if out_zero && !decoded && !matches!(expr::node(*addr), Node::Const(_)) {
+                                        let name = sigs::function(sel).map(sigs::name_of).unwrap_or("transfer");
+                                        push(&mut findings, "erc20-return-ignored", "ERC20 call result not checked", Severity::Low, Confidence::Medium, Some(f), Some(ev.pc),
+                                            format!("`{}` calls `{}` on `{}` and never reads the returned boolean. Tokens that return `false` instead of reverting (and tokens that return nothing) are treated as if the transfer succeeded.", f.name, name, target),
+                                            vec![line.clone()], "Use a SafeERC20-style wrapper: require the call to succeed and, when return data is present, require it to decode to true.");
+                                    }
+                                }
+                            }
+                        }
                         // Arbitrary call
-                        let input_from_calldata = input.as_ref().map_or(false, |w| w.iter().any(|x| from_calldata(*x))) || expr::as_const(*in_len).is_none();
-                        if from_calldata(*addr) && input_from_calldata && !caller_checked && f.kind == FnKind::External {
+                        // The payload counts as caller-controlled when its selector word comes from
+                        // calldata, or when an undecoded payload starts with a CALLDATACOPY (the whole
+                        // call data is the caller's). A fixed selector with calldata arguments
+                        // (`token.transferFrom(from, to, amount)`) is an ordinary call.
+                        let same_addr = |a: ExprId, b: ExprId| strip_versions(a, &mut HashMap::new()) == strip_versions(b, &mut HashMap::new());
+                        let input_from_calldata = match input {
+                            Some(w) => w.first().map_or(false, |w0| !expr::is_const(*w0) && from_calldata(*w0)),
+                            None => events[..i].iter().any(|e| matches!(&e.stmt, Some(Stmt::Copy { kind: op::CALLDATACOPY, dest, .. }) if same_addr(*dest, *in_off))),
+                        };
+                        if from_calldata(*addr) && input_from_calldata && !caller_checked && !always_reverts && f.kind == FnKind::External {
                             push(&mut findings, "arbitrary-call", "Arbitrary external call with caller-controlled target and data", Severity::High, Confidence::Medium, Some(f), Some(ev.pc),
                                 format!("`{}` calls `{}` with calldata-derived payload and no access control. If this contract holds token approvals or ether, anyone can drain them through it (e.g. calling `transferFrom` on an approved token).", f.name, target),
                                 vec![line.clone()], "Restrict callable targets/selectors, or make sure the contract never holds funds or approvals.");
@@ -876,7 +957,13 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
     if !c.storage.is_empty() {
         out.push_str("## Storage layout\n\n| slot | name | type | reads | writes |\n|---|---|---|---|---|\n");
         for s in &c.storage {
-            out.push_str(&format!("| {} | {} | {} | {} | {} |\n", s.slot, s.name, s.ty.replace('|', "\\|"), s.reads, s.writes));
+            if s.fields.is_empty() {
+                out.push_str(&format!("| {} | {} | {} | {} | {} |\n", s.slot, s.name, s.ty.replace('|', "\\|"), s.reads, s.writes));
+            } else {
+                for fld in &s.fields {
+                    out.push_str(&format!("| {} bytes {}..{} | {} | {} | {} | {} |\n", s.slot, fld.offset, fld.offset + fld.bits.div_ceil(8), fld.name, fld.ty, s.reads, s.writes));
+                }
+            }
         }
         out.push('\n');
     }

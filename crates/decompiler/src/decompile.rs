@@ -61,6 +61,18 @@ pub struct StorageVar {
     pub ty: String,
     pub reads: usize,
     pub writes: usize,
+    /// Fields of a packed slot (several variables share the 32 bytes).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<StorageField>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StorageField {
+    /// Byte offset within the slot (0 = least significant).
+    pub offset: u32,
+    pub bits: u32,
+    pub name: String,
+    pub ty: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -583,6 +595,9 @@ pub fn make_names(f: &Function, storage: &[StorageVar], vyper: bool, loaders: &H
     for s in storage {
         if let Some(slot) = U256::from_hex_str(&s.slot).or_else(|| U256::from_dec_str(&s.slot)) {
             n.storage.insert(slot, s.name.clone());
+            for fld in &s.fields {
+                n.fields.insert((slot, fld.offset, fld.bits), fld.name.clone());
+            }
         }
     }
     if let Some(l) = &f.lifted {
@@ -607,6 +622,8 @@ fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>
     let mut strings: BTreeSet<String> = BTreeSet::new();
     let mut selectors: BTreeSet<String> = BTreeSet::new();
     let names = Names { vyper, ..Default::default() };
+    // Packed fields: slot -> (offset, bits) -> constant values written (for bool typing).
+    let mut fields: BTreeMap<U256, BTreeMap<(u32, u32), Vec<Option<U256>>>> = BTreeMap::new();
     for f in functions {
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
@@ -614,6 +631,9 @@ fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>
                 match s {
                     Stmt::SStore { key, val, transient: false } => {
                         note_slot(*key, &mut slots, false, Some(*val), vyper);
+                        if let Some((k, off, bits, value)) = emit::packed_write(*key, *val) {
+                            fields.entry(k).or_default().entry((off, bits)).or_default().push(expr::as_const(value));
+                        }
                     }
                     Stmt::Log { topics, .. } => {
                         if let Some(t0) = topics.first().and_then(|t| expr::as_const(*t)) {
@@ -643,12 +663,12 @@ fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>
                     _ => {}
                 }
             }
-            if let Term::Revert { data: Some(words), .. } = &nd.term {
+            if let Term::Revert { data: Some(words), len, .. } = &nd.term {
                 if let Some(c0) = words.first().and_then(|w| expr::as_const(*w)) {
                     if (c0 & expr::mask_bits(224)).is_zero() {
                         let sel = c0.shr(224).low_u64() as u32;
                         if sel == 0x08c379a0 {
-                            if let Some(s) = emit::decode_string_payload(words) {
+                            if let Some(s) = emit::decode_string_payload(words, expr::as_const(*len).and_then(|l| l.as_usize())) {
                                 strings.insert(s);
                             }
                         } else if sel != 0x4e487b71 {
@@ -663,6 +683,7 @@ fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>
             for e in lift::node_exprs(nd) {
                 collect_sloads(e, &mut slots, vyper);
                 collect_strings(e, &mut strings);
+                collect_fields(e, &mut fields);
             }
         }
     }
@@ -677,7 +698,31 @@ fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>
                 v[0].clone()
             };
             let name = if slot.bits() <= 32 { format!("stor_{}", slot.to_decimal()) } else { format!("stor_{}", slot.to_hex()) };
-            StorageVar { slot: slot.to_hex(), name, ty, reads, writes }
+            // A slot is packed when a field starts past byte 0 or several fields share it.
+            let mut fs: Vec<StorageField> = Vec::new();
+            // (a string slot is read with `& 1` and `>> 8`, which is its length encoding, not packing)
+            if let (Some(acc), false) = (fields.get(&slot), string_slots.contains(&slot)) {
+                let keys: Vec<(u32, u32)> = acc.keys().copied().filter(|(off, bits)| *bits < 256 && off * 8 + bits <= 256).collect();
+                let packed = keys.iter().any(|(off, _)| *off > 0) || keys.len() > 1;
+                if packed {
+                    // Drop a field that is the union of others (`slot >> 8` read as one word over two fields).
+                    let mut sorted = keys.clone();
+                    sorted.sort();
+                    for (off, bits) in sorted {
+                        let covered = keys.iter().any(|(o2, b2)| (*o2, *b2) != (off, bits) && *o2 >= off && o2 * 8 + b2 <= off * 8 + bits) && keys.iter().filter(|(o2, _)| *o2 >= off && o2 * 8 < off * 8 + bits).count() > 1;
+                        if covered {
+                            continue;
+                        }
+                        let writes = &acc[&(off, bits)];
+                        let signed = writes.iter().any(|w| *w == Some(U256::MAX));
+                        let boolish = bits == 8 && !writes.is_empty() && writes.iter().all(|w| matches!(w, Some(c) if c.is_zero() || *c == U256::ONE));
+                        let ty = if signed { format!("int{}", bits) } else if bits == 160 { "address".to_string() } else if bits == 1 || boolish { "bool".to_string() } else if bits % 8 == 0 { format!("uint{}", bits) } else { format!("uint{}", bits.div_ceil(8) * 8) };
+                        fs.push(StorageField { offset: off, bits, name: format!("{}_{}", name, off), ty });
+                    }
+                }
+            }
+            let ty = if fs.is_empty() { ty } else { "packed".to_string() };
+            StorageVar { slot: slot.to_hex(), name, ty, reads, writes, fields: fs }
         })
         .collect();
     (storage, events.into_iter().collect(), errors.into_iter().collect(), strings.into_iter().collect(), selectors.into_iter().collect())
@@ -766,6 +811,27 @@ fn slot_root(key: expr::ExprId, vyper: bool) -> (Option<U256>, Option<String>) {
     }
 }
 
+/// Packed-field reads anywhere in `e` (see `emit::packed_read`).
+fn collect_fields(e: expr::ExprId, fields: &mut BTreeMap<U256, BTreeMap<(u32, u32), Vec<Option<U256>>>>) {
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 50_000 {
+            continue;
+        }
+        if let Some((k, off, bits)) = emit::packed_read(x) {
+            if off > 0 || bits < 256 {
+                let entry = fields.entry(k).or_default().entry((off, bits)).or_default();
+                if matches!(expr::node(x), Node::Op(op::SIGNEXTEND, _)) {
+                    // Marker for a signed field (never a written constant otherwise).
+                    entry.push(Some(U256::MAX));
+                }
+            }
+        }
+        stack.extend(expr::children(x));
+    }
+}
+
 fn collect_sloads(e: expr::ExprId, slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>, vyper: bool) {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
@@ -800,22 +866,60 @@ fn collect_sloads(e: expr::ExprId, slots: &mut BTreeMap<U256, (usize, usize, BTr
 
 /// Printable ASCII runs in the code's data area (strings longer than 32 bytes are stored as data
 /// and loaded with CODECOPY by older compilers).
+/// Printable `PUSH` immediates (string constants a compiler placed in code), whole immediates
+/// only, so that fragments straddling instruction boundaries are not reported.
 fn scan_strings(code: &[u8], code_end: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut i = 0;
+    let mut out: Vec<String> = Vec::new();
     let end = code_end.min(code.len());
-    while i < end {
-        let start = i;
-        while i < end && (0x20..0x7f).contains(&code[i]) {
-            i += 1;
+    // A string longer than 32 bytes is pushed in 32-byte pieces a few instructions apart: a
+    // full printable PUSH32 is held back and joined with the piece that follows it.
+    let mut pending: Option<(String, usize)> = None;
+    let insns = crate::disasm::disassemble(&code[..end]);
+    for (idx, insn) in insns.iter().enumerate() {
+        let Some(imm) = insn.imm else { continue };
+        let size = insn.opcode as usize - 0x5f;
+        if size < 4 {
+            continue;
         }
-        let run = &code[start..i];
-        if run.len() >= 12 && run.iter().filter(|b| b.is_ascii_alphabetic() || **b == b' ').count() * 3 >= run.len() * 2 && run.contains(&b' ') {
-            out.push(String::from_utf8_lossy(run).trim().to_string());
+        let bytes = imm.to_be_bytes();
+        let b = &bytes[32 - size..];
+        let text_end = b.iter().position(|x| *x == 0).unwrap_or(b.len());
+        let run = &b[..text_end];
+        let printable = !run.is_empty() && run.iter().all(|x| (0x20..0x7f).contains(x)) && b[text_end..].iter().all(|x| *x == 0);
+        if !printable {
+            continue;
         }
-        i += 1;
+        let text = String::from_utf8_lossy(run).into_owned();
+        let full = size == 32 && text_end == 32;
+        match pending.take() {
+            Some((mut acc, at)) if idx - at <= 16 => {
+                acc.push_str(&text);
+                if full {
+                    pending = Some((acc, idx));
+                } else {
+                    out.push(acc);
+                }
+            }
+            other => {
+                if let Some((acc, _)) = other {
+                    out.push(acc);
+                }
+                if full {
+                    pending = Some((text, idx));
+                } else {
+                    out.push(text);
+                }
+            }
+        }
     }
-    out
+    if let Some((acc, _)) = pending {
+        out.push(acc);
+    }
+    out.retain(|s| {
+        let letters = s.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        s.len() >= 6 && letters * 2 >= s.len()
+    });
+    out.iter().map(|s| s.trim().to_string()).collect()
 }
 
 fn collect_strings(e: expr::ExprId, out: &mut BTreeSet<String>) {
@@ -864,7 +968,14 @@ pub fn render(c: &Contract, name: &str) -> String {
     if !c.storage.is_empty() {
         out.push_str("    // ---- storage layout ----\n");
         for s in &c.storage {
-            out.push_str(&format!("    {} {}; // slot {}, {} reads, {} writes\n", s.ty, s.name, s.slot, s.reads, s.writes));
+            if s.fields.is_empty() {
+                out.push_str(&format!("    {} {}; // slot {}, {} reads, {} writes\n", s.ty, s.name, s.slot, s.reads, s.writes));
+            } else {
+                out.push_str(&format!("    // slot {} is packed ({} reads, {} writes):\n", s.slot, s.reads, s.writes));
+                for fld in &s.fields {
+                    out.push_str(&format!("    {} {}; // slot {} bytes {}..{}\n", fld.ty, fld.name, s.slot, fld.offset, fld.offset + fld.bits.div_ceil(8)));
+                }
+            }
         }
         out.push('\n');
     }

@@ -37,11 +37,17 @@ oracle, so the accuracy claim below is measured, not asserted.
   typed `string`, the dynamic-bytes return encoder (copy loop plus padding) becomes `return x;`,
   `success = to.call{value: v, gas: 2300}(""); require(success)` prints as
   `payable(to).transfer(v)`, and functions that only ever return the constants 0/1 return `bool`.
+  Packed storage slots are split into their fields (`uint112 stor_8_0; uint112 stor_8_14;
+  uint32 stor_8_28;` for a Uniswap V2 pair's reserves, `address` + `bool` owner/paused pairs,
+  signed fields via `signextend`), and reads and writes of a field print as the field.
   A dictionary of ~1,250 function, event and error
   signatures (selectors computed with the built-in keccak, so every entry is correct) names what
   it can; everything else is named by selector.
-* **Security report.** Reentrancy (with guard and gas-stipend awareness), ignored call return
-  values, arbitrary calls and delegatecalls, selfdestruct exposure, authority slots writable
+* **Security report.** Reentrancy (a guard is recognised only when a slot is tested before the
+  call, set on entry and restored to a constant afterwards, storage or transient), ignored call
+  return values, ERC20 `transfer`/`transferFrom` results never decoded, arbitrary calls (the
+  selector itself must be caller-controlled) and delegatecalls (always-reverting simulation
+  helpers are only noted), selfdestruct exposure, authority slots writable
   without access control, `tx.origin` auth, weak randomness, unchecked arithmetic on pre-0.8
   compilers, storage-bounded loops, calls in loops, `msg.value` reuse in payable multicalls,
   ecrecover misuse, unprotected upgrades, proxy detection (EIP-1967 / beacon / ZeppelinOS /

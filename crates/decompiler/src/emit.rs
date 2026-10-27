@@ -16,6 +16,8 @@ pub struct Names {
     /// Expressions printed under a fixed name (e.g. the pointer returned by a storage-string
     /// loader prints as the storage variable).
     pub aliases: HashMap<ExprId, String>,
+    /// Packed storage fields: (slot, byte offset, bits) -> name.
+    pub fields: HashMap<(U256, u32, u32), String>,
     /// internal-unit argument index -> name
     pub args: HashMap<u32, String>,
     /// storage slot (constant) -> name
@@ -211,6 +213,115 @@ fn fmt_signed(e: ExprId, n: &Names) -> String {
 }
 
 /// Storage location rendering: `stor_5`, `stor_3[key]`, `stor_7[k1][k2]`, `stor_9[i]`.
+/// A read of a packed storage field: `(slot, byte offset, bits)` for `slot & mask`,
+/// `(slot >> 8k) & mask`, `(slot / 2^8k) & mask` and the top field `slot >> 8k`.
+pub fn packed_read(e: ExprId) -> Option<(U256, u32, u32)> {
+    fn shifted_slot(e: ExprId) -> Option<(U256, u32)> {
+        match expr::node(e) {
+            Node::SLoad(k, false, _) => Some((expr::as_const(k)?, 0)),
+            Node::Op(op::SHR, w) => {
+                let s = expr::as_const(w[0])?;
+                if let Node::SLoad(k, false, _) = expr::node(w[1]) {
+                    if s.fits_u64() && s.low_u64() % 8 == 0 && s.low_u64() < 256 {
+                        return Some((expr::as_const(k)?, s.low_u64() as u32));
+                    }
+                }
+                None
+            }
+            Node::Op(op::DIV, w) => {
+                let d = expr::as_const(w[1])?;
+                if let Node::SLoad(k, false, _) = expr::node(w[0]) {
+                    if d.is_power_of_two() && d.trailing_zeros() % 8 == 0 && d.trailing_zeros() > 0 {
+                        return Some((expr::as_const(k)?, d.trailing_zeros()));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    match expr::node(e) {
+        Node::Op(op::AND, v) => {
+            let m = expr::as_const(v[1])?;
+            if !m.is_low_mask() {
+                return None;
+            }
+            let (k, s) = shifted_slot(v[0])?;
+            let bits = m.bits();
+            if s + bits <= 256 {
+                Some((k, s / 8, bits))
+            } else {
+                None
+            }
+        }
+        // signextend(n, slot >> 8k): a signed field of 8(n+1) bits.
+        Node::Op(op::SIGNEXTEND, v) => {
+            let nb = expr::as_const(v[0])?;
+            if !nb.fits_u64() || nb.low_u64() >= 31 {
+                return None;
+            }
+            let (k, s) = shifted_slot(v[1])?;
+            let bits = 8 * (nb.low_u64() as u32 + 1);
+            if s + bits <= 256 {
+                Some((k, s / 8, bits))
+            } else {
+                None
+            }
+        }
+        Node::Op(op::SHR, _) | Node::Op(op::DIV, _) => {
+            let (k, s) = shifted_slot(e)?;
+            if s > 0 {
+                Some((k, s / 8, 256 - s))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A write of a packed storage field: `slot = slot & ~(mask << 8k) | (value << 8k)` gives
+/// `(slot, byte offset, bits, value)`.
+pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)> {
+    let k = expr::as_const(key)?;
+    let Node::Op(op::OR, v) = expr::node(val) else { return None };
+    for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+        let Node::Op(op::AND, w) = expr::node(a) else { continue };
+        let (Node::SLoad(kk, false, _), Some(keep)) = (expr::node(w[0]), expr::as_const(w[1])) else { continue };
+        if expr::as_const(kk) != Some(k) {
+            continue;
+        }
+        let field = !keep;
+        if field.is_zero() {
+            continue;
+        }
+        let s = field.trailing_zeros();
+        let shifted = field.shr(s);
+        if !shifted.is_low_mask() || s % 8 != 0 {
+            continue;
+        }
+        let bits = shifted.bits();
+        // Undo the placement: value << s, value * 2^s, or a constant.
+        let mut value = if s == 0 {
+            b
+        } else {
+            match expr::node(b) {
+                Node::Op(op::SHL, x) if expr::as_const(x[0]) == Some(U256::from_u64(s as u64)) => x[1],
+                Node::Op(op::MUL, x) if expr::as_const(x[1]).map_or(false, |c| c.is_power_of_two() && c.trailing_zeros() == s) => x[0],
+                Node::Const(c) => expr::konst(c.shr(s)),
+                _ => expr::op2(op::SHR, expr::konst_u64(s as u64), b),
+            }
+        };
+        if let Node::Op(op::AND, x) = expr::node(value) {
+            if expr::as_const(x[1]) == Some(expr::mask_bits(bits)) {
+                value = x[0];
+            }
+        }
+        return Some((k, s / 8, bits, value));
+    }
+    None
+}
+
 pub fn fmt_slot(e: ExprId, n: &Names, transient: bool) -> String {
     let prefix = if transient { "tstor" } else { "stor" };
     if let Some(c) = expr::as_const(e) {
@@ -276,6 +387,13 @@ fn copy_source(kind: u8) -> &'static str {
 }
 
 fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
+    if !n.fields.is_empty() {
+        if let Some((k, off, bits)) = packed_read(e) {
+            if let Some(name) = n.fields.get(&(k, off, bits)) {
+                return (name.clone(), P_PRIMARY);
+            }
+        }
+    }
     match expr::node(e) {
         Node::Const(c) => (fmt_const(c), P_PRIMARY),
         Node::Env(o, seq) => (env_name(o, seq, n), P_PRIMARY),
@@ -359,6 +477,8 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
         (op::SLT, 2) => (format!("{} < {}", fmt_signed(v[0], n), fmt_signed(v[1], n)), P_CMP),
         (op::SGT, 2) => (format!("{} > {}", fmt_signed(v[0], n), fmt_signed(v[1], n)), P_CMP),
         (op::EQ, 2) => (format!("{} == {}", fmt_prec(v[0], P_EQ + 1, n), fmt_eq_rhs(v[0], v[1], P_EQ + 1, n)), P_EQ),
+        (op::AND, 2) if expr::is_boolean(v[0]) && expr::is_boolean(v[1]) => (format!("{} && {}", fmt_prec(v[0], P_AND, n), fmt_prec(v[1], P_AND + 1, n)), P_AND),
+        (op::OR, 2) if expr::is_boolean(v[0]) && expr::is_boolean(v[1]) => (format!("{} || {}", fmt_prec(v[0], P_OR, n), fmt_prec(v[1], P_OR + 1, n)), P_OR),
         (op::AND, 2) => {
             if let Some(m) = expr::as_const(v[1]) {
                 if m.is_low_mask() {
@@ -460,7 +580,7 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, revert: bool)
         let top4_only = lenu.map_or(expr::as_const(words[0]).map_or(true, |c| (c & expr::mask_bits(224)).is_zero()), |l| l >= 4 && (l - 4) % 32 == 0);
         if revert && top4_only {
             if sel == 0x08c379a0 {
-                if let Some(s) = decode_string_payload(words) {
+                if let Some(s) = decode_string_payload(words, lenu) {
                     return format!("\"{}\"", s);
                 }
             }
@@ -499,10 +619,6 @@ fn shifted_word_len(words: &[ExprId], i: usize, len: Option<usize>) -> ExprId {
     expr::op2(op::OR, expr::op2(op::SHL, expr::konst_u64(32), hi), expr::op2(op::SHR, expr::konst_u64(224), lo))
 }
 
-fn shifted_word(words: &[ExprId], i: usize) -> ExprId {
-    shifted_word_len(words, i, None)
-}
-
 fn panic_name(code: u64) -> String {
     match code {
         0x00 => "generic".into(),
@@ -520,20 +636,20 @@ fn panic_name(code: u64) -> String {
 }
 
 /// Decode `Error(string)` payload words (selector-shifted) into the string.
-pub fn decode_string_payload(words: &[ExprId]) -> Option<String> {
+pub fn decode_string_payload(words: &[ExprId], payload_len: Option<usize>) -> Option<String> {
     // ABI words after the selector: [offset (0x20), length, data...]
-    let offset = expr::as_const(shifted_word(words, 0))?;
+    let offset = expr::as_const(shifted_word_len(words, 0, payload_len))?;
     if offset != U256::from_u64(0x20) {
         return None;
     }
-    let len = expr::as_const(shifted_word(words, 1))?.as_usize()?;
+    let len = expr::as_const(shifted_word_len(words, 1, payload_len))?.as_usize()?;
     if len > 1024 {
         return None;
     }
     let mut bytes = Vec::new();
     let mut i = 2;
     while bytes.len() < len {
-        let w = expr::as_const(shifted_word(words, i))?;
+        let w = expr::as_const(shifted_word_len(words, i, payload_len))?;
         bytes.extend_from_slice(&w.to_be_bytes());
         i += 1;
         if i > words.len() + 1 {
@@ -615,7 +731,16 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 format!("mem[{}] = {};", fmt_mem_off(*off, n), fmt_expr(*val, n))
             }
         }
-        Stmt::SStore { key, val, transient } => format!("{} = {};", fmt_slot(*key, n, *transient), fmt_expr(*val, n)),
+        Stmt::SStore { key, val, transient } => {
+            if !n.fields.is_empty() && !*transient {
+                if let Some((k, off, bits, value)) = packed_write(*key, *val) {
+                    if let Some(name) = n.fields.get(&(k, off, bits)) {
+                        return format!("{} = {};", name, fmt_expr(value, n));
+                    }
+                }
+            }
+            format!("{} = {};", fmt_slot(*key, n, *transient), fmt_expr(*val, n))
+        }
         Stmt::Log { off, len, topics, data } => {
             let mut args: Vec<String> = Vec::new();
             let mut name = None;
@@ -720,19 +845,21 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
         }
         Stmt::Drop(e) => format!("// ignored: {}", fmt_expr(*e, n)),
         Stmt::Require { cond, data, invalid } => {
-            let c = fmt_expr(*cond, n);
+            let c = if expr::is_boolean(*cond) { fmt_expr(*cond, n) } else { format!("{} != 0", fmt_prec(*cond, P_EQ + 1, n)) };
             if *invalid {
                 return format!("assert({});", c);
             }
             match data {
                 Some(words) if !words.is_empty() => {
-                    let p = fmt_payload(words, None, n, true);
-                    if p.starts_with('"') {
-                        format!("require({}, {});", c, p)
-                    } else if p.starts_with("Panic(0x1)") || p == "Panic(0x01)" {
+                    // Selector payloads (Error(string), Panic(code), custom errors) are 4 + 32n bytes.
+                    let len = leading_selector(words[0], None).map(|_| U256::from_u64(4 + 32 * (words.len() as u64 - 1)));
+                    let p = fmt_payload(words, len, n, true);
+                    if p == "Panic(assert failed)" {
                         format!("assert({});", c)
+                    } else if p.starts_with('"') || p.starts_with("Panic(") {
+                        format!("require({}, {});", c, p)
                     } else {
-                        format!("if (!({})) revert {};", c, p)
+                        format!("if ({}) revert {};", fmt_expr(expr::op1(op::ISZERO, *cond), n), p)
                     }
                 }
                 _ => format!("require({});", c),

@@ -259,7 +259,19 @@ pub fn is_boolean(e: ExprId) -> bool {
         Node::Op(o, _) => matches!(o, op::LT | op::GT | op::SLT | op::SGT | op::EQ | op::ISZERO),
         Node::Const(c) => c.is_zero() || c == U256::ONE,
         Node::CallResult(_) => true,
+        Node::Var(_) => BOOL_VARS.with(|b| b.borrow().contains(&e)),
         _ => false,
+    }
+}
+
+thread_local! {
+    static BOOL_VARS: std::cell::RefCell<std::collections::HashSet<ExprId>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Record that a phi variable only ever holds boolean values (found while printing).
+pub fn mark_boolean(var: ExprId) {
+    if matches!(node(var), Node::Var(_)) {
+        BOOL_VARS.with(|b| b.borrow_mut().insert(var));
     }
 }
 

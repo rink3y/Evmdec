@@ -56,7 +56,7 @@ A from-scratch Rust decompiler whose lifted semantics are verified block by bloc
 2. Evidence before verdict: every finding links to the line it is about; a score is never shown without what produced it.
 3. Honest numbers: coverage, unresolved jumps, confidence and what was not analysed are always visible.
 4. One tool for four readers: the deep-reading auditor and the phone-holding visitor use the same surface, which adapts structurally rather than hiding things.
-5. Fast and self-contained: no external fonts or scripts on the hosted page; a result renders in the time the decompiler takes.
+5. Fast and self-contained: no third-party scripts on the hosted page (the three typefaces load from Google Fonts with system fallbacks, nothing else is external); a result renders in the time the decompiler takes.
 
 ## Accessibility & Inclusion
 

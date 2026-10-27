@@ -85,8 +85,8 @@ oracle, so the accuracy claim below is measured, not asserted.
   report, storage and events, disassembly and JSON. Results are linkable
   (`/?chain=mainnet&address=0x…`), the page follows the system colour scheme with a manual
   override, and it meets WCAG 2.2 AA (contrast on both themes, keyboard operation of every
-  control, visible focus, live status messages, severity always in words). No external fonts or
-  scripts. The CLI never fails on an input: if the decompiler hits an internal error it prints
+  control, visible focus, live status messages, severity always in words). No third-party
+  scripts; the typefaces come from Google Fonts with system fallbacks. The CLI never fails on an input: if the decompiler hits an internal error it prints
   the disassembly instead.
 
 ## Layout

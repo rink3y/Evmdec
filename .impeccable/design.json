@@ -1,12 +1,13 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-27T22:37:49Z",
+  "generatedAt": "2026-10-27T22:57:26Z",
   "title": "Design System: evmdec",
   "source": {
     "artifact": "crates/server/static/index.html",
     "world": "Drawing set",
     "seed": "seed:67b4e9518045227d",
-    "reviewDisposition": "ship"
+    "reviewDisposition": "ship",
+    "refreshedAfter": "ink band and Barlow revision"
   },
   "extensions": {
     "colorMeta": {
@@ -98,18 +99,18 @@
       "well-grey": {
         "role": "neutral",
         "displayName": "Well Grey",
-        "canonical": "oklch(97.3% 0.002 248)",
+        "canonical": "oklch(97.0% 0.003 265)",
         "theme": "light",
         "cssVariable": "--well",
         "tonalRamp": [
-          "oklch(15% 0.002 248)",
-          "oklch(25% 0.002 248)",
-          "oklch(37% 0.002 248)",
-          "oklch(50% 0.002 248)",
-          "oklch(62% 0.002 248)",
-          "oklch(75% 0.002 248)",
-          "oklch(86% 0.002 248)",
-          "oklch(95% 0.002 248)"
+          "oklch(15% 0.003 265)",
+          "oklch(25% 0.003 265)",
+          "oklch(37% 0.003 265)",
+          "oklch(50% 0.003 265)",
+          "oklch(62% 0.003 265)",
+          "oklch(75% 0.003 265)",
+          "oklch(86% 0.003 265)",
+          "oklch(95% 0.003 265)"
         ]
       },
       "vermilion-rubric": {
@@ -195,6 +196,108 @@
           "oklch(75% 0.062 93)",
           "oklch(86% 0.062 93)",
           "oklch(95% 0.062 93)"
+        ]
+      },
+      "band-ink": {
+        "role": "neutral",
+        "displayName": "Band Ink",
+        "canonical": "oklch(29.9% 0.069 255)",
+        "theme": "light",
+        "cssVariable": "--band",
+        "tonalRamp": [
+          "oklch(15% 0.069 255)",
+          "oklch(25% 0.069 255)",
+          "oklch(37% 0.069 255)",
+          "oklch(50% 0.069 255)",
+          "oklch(62% 0.069 255)",
+          "oklch(75% 0.069 255)",
+          "oklch(86% 0.069 255)",
+          "oklch(95% 0.069 255)"
+        ]
+      },
+      "band-pale": {
+        "role": "neutral",
+        "displayName": "Band Pale",
+        "canonical": "oklch(94.6% 0.016 254)",
+        "theme": "light",
+        "cssVariable": "--band-fg",
+        "tonalRamp": [
+          "oklch(15% 0.016 254)",
+          "oklch(25% 0.016 254)",
+          "oklch(37% 0.016 254)",
+          "oklch(50% 0.016 254)",
+          "oklch(62% 0.016 254)",
+          "oklch(75% 0.016 254)",
+          "oklch(86% 0.016 254)",
+          "oklch(95% 0.016 254)"
+        ]
+      },
+      "band-muted": {
+        "role": "neutral",
+        "displayName": "Band Muted",
+        "canonical": "oklch(78.6% 0.040 256)",
+        "theme": "light",
+        "cssVariable": "--band-muted",
+        "tonalRamp": [
+          "oklch(15% 0.040 256)",
+          "oklch(25% 0.040 256)",
+          "oklch(37% 0.040 256)",
+          "oklch(50% 0.040 256)",
+          "oklch(62% 0.040 256)",
+          "oklch(75% 0.040 256)",
+          "oklch(86% 0.040 256)",
+          "oklch(95% 0.040 256)"
+        ]
+      },
+      "band-rule": {
+        "role": "neutral",
+        "displayName": "Band Rule",
+        "canonical": "oklch(40.6% 0.081 256)",
+        "theme": "light",
+        "cssVariable": "--band-line",
+        "tonalRamp": [
+          "oklch(15% 0.081 256)",
+          "oklch(25% 0.081 256)",
+          "oklch(37% 0.081 256)",
+          "oklch(50% 0.081 256)",
+          "oklch(62% 0.081 256)",
+          "oklch(75% 0.081 256)",
+          "oklch(86% 0.081 256)",
+          "oklch(95% 0.081 256)"
+        ]
+      },
+      "band-amber": {
+        "role": "primary",
+        "displayName": "Band Amber",
+        "canonical": "oklch(88.5% 0.118 83)",
+        "theme": "light",
+        "cssVariable": "--band-rubric",
+        "tonalRamp": [
+          "oklch(15% 0.118 83)",
+          "oklch(25% 0.118 83)",
+          "oklch(37% 0.118 83)",
+          "oklch(50% 0.118 83)",
+          "oklch(62% 0.118 83)",
+          "oklch(75% 0.118 83)",
+          "oklch(86% 0.118 83)",
+          "oklch(95% 0.118 83)"
+        ]
+      },
+      "field-ink": {
+        "role": "neutral",
+        "displayName": "Field Ink",
+        "canonical": "oklch(25.9% 0.060 256)",
+        "theme": "light",
+        "cssVariable": "--field",
+        "tonalRamp": [
+          "oklch(15% 0.060 256)",
+          "oklch(25% 0.060 256)",
+          "oklch(37% 0.060 256)",
+          "oklch(50% 0.060 256)",
+          "oklch(62% 0.060 256)",
+          "oklch(75% 0.060 256)",
+          "oklch(86% 0.060 256)",
+          "oklch(95% 0.060 256)"
         ]
       },
       "severity-critical": {
@@ -469,6 +572,57 @@
           "oklch(95% 0.052 98)"
         ]
       },
+      "band-ink-dark": {
+        "role": "neutral",
+        "displayName": "Band Ink (dark)",
+        "canonical": "oklch(20.5% 0.041 252)",
+        "theme": "dark",
+        "cssVariable": "--band",
+        "tonalRamp": [
+          "oklch(15% 0.041 252)",
+          "oklch(25% 0.041 252)",
+          "oklch(37% 0.041 252)",
+          "oklch(50% 0.041 252)",
+          "oklch(62% 0.041 252)",
+          "oklch(75% 0.041 252)",
+          "oklch(86% 0.041 252)",
+          "oklch(95% 0.041 252)"
+        ]
+      },
+      "band-rule-dark": {
+        "role": "neutral",
+        "displayName": "Band Rule (dark)",
+        "canonical": "oklch(37.6% 0.078 259)",
+        "theme": "dark",
+        "cssVariable": "--band-line",
+        "tonalRamp": [
+          "oklch(15% 0.078 259)",
+          "oklch(25% 0.078 259)",
+          "oklch(37% 0.078 259)",
+          "oklch(50% 0.078 259)",
+          "oklch(62% 0.078 259)",
+          "oklch(75% 0.078 259)",
+          "oklch(86% 0.078 259)",
+          "oklch(95% 0.078 259)"
+        ]
+      },
+      "field-ink-dark": {
+        "role": "neutral",
+        "displayName": "Field Ink (dark)",
+        "canonical": "oklch(23.8% 0.054 256)",
+        "theme": "dark",
+        "cssVariable": "--field",
+        "tonalRamp": [
+          "oklch(15% 0.054 256)",
+          "oklch(25% 0.054 256)",
+          "oklch(37% 0.054 256)",
+          "oklch(50% 0.054 256)",
+          "oklch(62% 0.054 256)",
+          "oklch(75% 0.054 256)",
+          "oklch(86% 0.054 256)",
+          "oklch(95% 0.054 256)"
+        ]
+      },
       "severity-critical-dark": {
         "role": "severity",
         "displayName": "Severity Critical (dark)",
@@ -575,37 +729,83 @@
     "typographyMeta": {
       "display": {
         "displayName": "Display",
-        "purpose": "Landing headline only, inside the empty drawing area; balanced wrap."
+        "purpose": "Landing headline only, inside the framed empty sheet; condensed uppercase, balanced wrap, second clause in the rubric; 28px under 720px."
       },
       "wordmark": {
         "displayName": "Wordmark",
-        "purpose": "evmdec, lowercase, one word, first header cell; no logo exists."
+        "purpose": "evmdec, lowercase, one word, first band cell; no logo exists."
       },
-      "title": {
-        "displayName": "Title",
-        "purpose": "Report section headings; also the weight of the primary button and scale-line emphasis at body size."
+      "risk": {
+        "displayName": "Risk figure",
+        "purpose": "The title-block risk value in band amber when the score is 8 or above; otherwise Barlow 500 14px in band pale."
+      },
+      "action": {
+        "displayName": "Action",
+        "purpose": "The Decompile button; the chain select (500 14px .04em) and theme toggle (500 13px .06em) are its quieter siblings."
       },
       "body": {
         "displayName": "Body",
-        "purpose": "UI text, finding titles and bodies (70ch), landing copy (70ch), report prose (90ch)."
+        "purpose": "UI text, finding titles (500) and bodies (70ch), landing paragraph (62ch), report prose (90ch), scale line (13px), title-block values (500, tabular)."
+      },
+      "heading": {
+        "displayName": "Heading",
+        "purpose": "Tabs (.1em), Download .sol (rubric), report section headings (.12em), outline example buttons (.08em); condensed tracked uppercase."
       },
       "label": {
         "displayName": "Label",
-        "purpose": "Tracked uppercase cell labels, column headings (600) and index group headings; muted ink above a 500-weight tabular value."
+        "purpose": "Title-block labels (500, band muted), column and group headings (600, muted), Try label and landing footer, report table headers (600, .08em)."
       },
       "severity": {
         "displayName": "Severity word",
-        "purpose": "CRITICAL / HIGH / MEDIUM / LOW / INFO in a finding row; colour only tints the word."
+        "purpose": "CRITICAL / HIGH / MEDIUM / LOW / INFO in a finding row and the callout number; colour only tints the word."
       },
       "code": {
         "displayName": "Code",
-        "purpose": "The drawing, pre blocks and the address field; tab-size 4; function names at 600."
+        "purpose": "The drawing and pre blocks (13px); the band query field (14px); tab-size 4; function names at 600."
       },
       "code-small": {
         "displayName": "Code small",
-        "purpose": "Function index rows, evidence wells, finding meta code; report code is 12.5px."
+        "purpose": "Function index rows (12.5px), evidence wells and finding meta code (12px), report code (12.5px)."
       }
     },
+    "fonts": [
+      {
+        "family": "Barlow",
+        "weights": [
+          400,
+          500,
+          600,
+          700
+        ],
+        "role": "interface and prose",
+        "source": "Google Fonts (display=swap)",
+        "fallback": "ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif",
+        "cssVariable": "--sans"
+      },
+      {
+        "family": "Barlow Condensed",
+        "weights": [
+          500,
+          600,
+          700
+        ],
+        "role": "labels, headings, tabs, actions, wordmark, headline",
+        "source": "Google Fonts (display=swap)",
+        "fallback": "Barlow, ui-sans-serif, system-ui, sans-serif",
+        "cssVariable": "--cond"
+      },
+      {
+        "family": "Source Code Pro",
+        "weights": [
+          400,
+          600
+        ],
+        "role": "code, selectors, evidence, query field",
+        "source": "Google Fonts (display=swap)",
+        "fallback": "ui-monospace, SF Mono, Menlo, Consolas, Liberation Mono, monospace",
+        "cssVariable": "--mono"
+      }
+    ],
     "themes": [
       {
         "name": "whiteprint",
@@ -615,7 +815,10 @@
         "ink": "{colors.iron-black}",
         "rubric": "{colors.vermilion-rubric}",
         "focus": "{colors.focus-blue}",
-        "lit": "{colors.lit-straw}"
+        "lit": "{colors.lit-straw}",
+        "band": "{colors.band-ink}",
+        "bandRubric": "{colors.band-amber}",
+        "field": "{colors.field-ink}"
       },
       {
         "name": "blueprint",
@@ -625,26 +828,34 @@
         "ink": "{colors.pale-line}",
         "rubric": "{colors.amber-rubric}",
         "focus": "{colors.amber-rubric}",
-        "lit": "{colors.lit-umber}"
+        "lit": "{colors.lit-umber}",
+        "band": "{colors.band-ink-dark}",
+        "bandRubric": "{colors.band-amber}",
+        "field": "{colors.field-ink-dark}"
       }
     ],
     "shadows": [
       {
         "name": "tab-underline",
-        "value": "inset 0 -2px 0 var(--fg)",
-        "purpose": "The selected tab's 2px rule, drawn inset; the only box-shadow in the system and not an elevation."
+        "value": "inset 0 -2px 0 var(--rubric)",
+        "purpose": "The selected tab's 2px rubric rule, drawn inset; the only box-shadow in the system and not an elevation."
       }
     ],
     "borders": [
       {
+        "name": "band-line",
+        "value": "1px solid var(--band-line)",
+        "purpose": "Rules between band cells (header strip, title block); the title block closes with a 2px band rule."
+      },
+      {
         "name": "line",
         "value": "1px solid var(--line)",
-        "purpose": "Heavy rule between regions: header, title block, the three columns, tab strip, outline buttons, error (rubric)."
+        "purpose": "Heavy rule between sheet regions: the three columns, column headings, tab strip, the empty-sheet frame, outline buttons; error notices use the rubric."
       },
       {
         "name": "hair",
         "value": "1px solid var(--hair)",
-        "purpose": "Light rule inside a region: cells, rows, tab dividers, scale line, evidence wells, report tables."
+        "purpose": "Light rule inside a region: index rows, tab dividers, scale line, findings, evidence wells, report tables, the frame inset (6px) and landing footer."
       },
       {
         "name": "callout-stroke",
@@ -661,7 +872,12 @@
       {
         "name": "focus-visible",
         "value": "outline: 2px solid var(--focus); outline-offset: 2px",
-        "purpose": "Every control; blue in light, amber in dark; no border change or glow."
+        "purpose": "Sheet controls; blue in light, amber in dark; no border change or glow."
+      },
+      {
+        "name": "focus-visible-band",
+        "value": "outline: 2px solid var(--band-rubric); outline-offset: -3px",
+        "purpose": "Controls inside the header strip and title block: amber, inset so it stays within the 44px cell."
       }
     ],
     "motion": [
@@ -669,6 +885,11 @@
         "name": "lit-settle",
         "value": "background .2s ease-out",
         "purpose": "The only transition: the lit background on code lines and findings, declared under prefers-reduced-motion: no-preference only."
+      },
+      {
+        "name": "primary-hover",
+        "value": "filter: brightness(1.08)",
+        "purpose": "Instant hover step on the Decompile button; not a transition."
       }
     ],
     "breakpoints": [
@@ -680,24 +901,26 @@
       {
         "name": "stacked",
         "value": "720px",
-        "purpose": "max-width: frame unfixes, header wraps, title block 2 per row, columns stack (index list 40vh, drawing panel 70vh)."
+        "purpose": "max-width: frame unfixes, band wraps (wordmark, field, select+Decompile, toggle), title block 2 per row, columns stack (index list 40vh, drawing panel 70vh), empty sheet 24px 20px with a 28px headline."
       }
     ],
     "layout": {
-      "frame": "body grid-template-rows: auto auto minmax(0,1fr); 100% height; columns scroll independently",
+      "frame": "body grid-template-rows: auto auto minmax(0,1fr); 100% height; columns scroll independently; body[data-state=empty] collapses to auto minmax(0,1fr) and shows only the band and #landing",
+      "band": "header cells 44px tall; brand 0 18px; field 0 14px; select 0 32px 0 14px with 12x8 chevron at right 12px; primary 0 22px; toggle 0 16px",
+      "emptySheet": ".sheet width min(100%,760px), padding 36px 40px 32px, inset hairline at 6px; #landing padding 48px 24px 64px",
       "columns": "280px minmax(0,1fr) 380px",
-      "titleBlock": "repeat(8, minmax(0,1fr)); cells 6px 12px",
+      "titleBlock": "repeat(8, minmax(0,1fr)); cells 7px 14px 9px on the band; 2px band rule below",
       "codeLine": "3.4em 8.6em minmax(0,1fr)",
       "indexRow": "3.2em minmax(0,1fr) auto; gap 8px",
       "findingRow": "30px auto minmax(0,1fr); gap 2px 8px; body inset 50px",
-      "targets": "button min-height/min-width 24px; line links 24px"
+      "targets": "button min-height/min-width 24px; band controls 44px; line links 24px"
     },
     "accessibility": [
       "WCAG 2.2 AA contrast on both themes including code highlighting and severity colours",
       "Severity and confidence printed as words; colour never carries severity alone",
       "Minimum 24x24 targets on every button and line link",
-      "ARIA tablist with roving tabindex, aria-selected, aria-controls; aria-expanded findings; aria-current index rows; aria-pressed theme toggle",
-      "Polite role=status live region announces theme changes and chosen findings",
+      "ARIA tablist with roving tabindex, aria-selected, aria-controls; aria-expanded findings; aria-current index rows; aria-pressed theme toggle; aria-busy on body while decompiling; error notices use role=alert",
+      "Polite role=status live region announces theme changes, decompile start and result, chosen findings and lines",
       "Theme follows prefers-color-scheme with data-theme override persisted to localStorage",
       "prefers-reduced-motion removes the only transition"
     ]
@@ -707,49 +930,57 @@
       "name": "Primary Button (Decompile)",
       "kind": "button",
       "refersTo": "button-primary",
-      "description": "The one filled button; ink on the sheet, in the header strip.",
-      "html": "<div class=\"ds\"><button class=\"ds-btn-primary\" type=\"button\">Decompile</button></div>",
-      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-btn-primary{border:0;background:var(--fg);color:var(--bg);padding:0 18px;min-height:40px;min-width:24px;font:600 14px/1.45 var(--sans);border-radius:0;cursor:pointer}.ds-btn-primary:disabled{cursor:progress;opacity:.6}"
+      "description": "The one filled button: rubric fill, condensed tracked uppercase, 44px tall in the band; hover brightens 8%.",
+      "html": "<div class=\"ds ds-band\"><div class=\"ds-bandrow\"><button class=\"ds-btn-primary\" type=\"button\">Decompile</button></div></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-band :focus-visible{outline-color:var(--band-rubric);outline-offset:-3px} .ds-bandrow{display:flex;background:var(--band);color:var(--band-fg)}.ds-btn-primary{height:44px;border:0;background:var(--rubric);color:var(--on-rubric);padding:0 22px;font:600 15px/1 var(--cond);letter-spacing:.14em;text-transform:uppercase;border-radius:0;cursor:pointer}.ds-btn-primary:hover{filter:brightness(1.08)}.ds-btn-primary:disabled{cursor:progress;opacity:.6}"
     },
     {
       "name": "Outline Button (example)",
       "kind": "button",
       "refersTo": "button-outline",
-      "description": "Line-drawn square button used for the three example addresses on the landing sheet.",
-      "html": "<div class=\"ds\"><button class=\"ds-btn-outline\" type=\"button\">WETH</button> <button class=\"ds-btn-outline\" type=\"button\">USDC (proxy)</button></div>",
-      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-btn-outline{border:1px solid var(--line);background:transparent;color:var(--fg);padding:6px 12px;font:600 14px/1.45 var(--sans);border-radius:0;cursor:pointer;min-height:24px}"
+      "description": "Line-drawn square button in condensed tracked uppercase, used for the example addresses on the empty sheet.",
+      "html": "<div class=\"ds\"><button class=\"ds-btn-outline\" type=\"button\">WETH</button> <button class=\"ds-btn-outline\" type=\"button\">USDC proxy</button></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-band :focus-visible{outline-color:var(--band-rubric);outline-offset:-3px} .ds-btn-outline{border:1px solid var(--line);background:transparent;color:var(--fg);padding:7px 14px;font:600 13px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;border-radius:0;cursor:pointer;min-height:24px}.ds-btn-outline:hover{background:var(--well)}"
     },
     {
-      "name": "Query Field",
-      "kind": "input",
-      "refersTo": "input-query",
-      "description": "Address or bytecode field: mono, borderless, bounded by the cell rule.",
-      "html": "<div class=\"ds\"><div class=\"ds-cell\"><input class=\"ds-input-query\" type=\"text\" placeholder=\"Contract address (0x…) or raw bytecode hex\" aria-label=\"Contract address or raw bytecode hex\"></div></div>",
-      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-cell{display:flex;border-bottom:1px solid var(--line);background:var(--bg)}.ds-input-query{flex:1;min-width:0;border:0;border-right:1px solid var(--line);background:transparent;color:var(--fg);padding:10px 14px;font:13px/1.5 var(--mono);border-radius:0}"
-    },
-    {
-      "name": "View Tabs",
+      "name": "Band Header (field, chain select, toggle)",
       "kind": "nav",
-      "refersTo": "tab",
-      "description": "ARIA tablist over the drawing; selected tab is ink with a 2px inset underline.",
-      "html": "<div class=\"ds\"><div class=\"ds-tabs\" role=\"tablist\"><button role=\"tab\" class=\"ds-tab\" aria-selected=\"true\">Code</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">Report</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">Storage &amp; events</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">Disassembly</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">JSON</button><button class=\"ds-tab-dl\" type=\"button\">Download .sol</button></div></div>",
-      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-tabs{display:flex;border-bottom:1px solid var(--line);background:var(--bg);font:14px/1.45 var(--sans);color:var(--fg)}.ds-tab{flex:none;border:0;background:transparent;padding:9px 14px;border-right:1px solid var(--hair);color:var(--muted);white-space:nowrap;font:inherit;cursor:pointer;border-radius:0}.ds-tab[aria-selected=\"true\"]{color:var(--fg);box-shadow:inset 0 -2px 0 var(--fg)}.ds-tab-dl{flex:none;margin-left:auto;border:0;border-left:1px solid var(--hair);background:transparent;color:var(--fg);padding:0 14px;font:inherit;cursor:pointer}"
+      "refersTo": "input-query",
+      "description": "The 44px ink band: wordmark, mono query field on field ink, appearance-none chain select with SVG chevron, Decompile, theme toggle; cells divided by band rules.",
+      "html": "<div class=\"ds ds-band\"><div class=\"ds-header\"><div class=\"ds-brand\">evmdec</div><div class=\"ds-query\"><input class=\"ds-input-query\" type=\"text\" placeholder=\"Contract address (0x…) or raw bytecode hex\" aria-label=\"Contract address or raw bytecode hex\"><span class=\"ds-chainwrap\"><select class=\"ds-select\" aria-label=\"Chain\"><option>mainnet (1)</option></select></span><button class=\"ds-btn-primary\" type=\"button\">Decompile</button></div><button class=\"ds-theme\" type=\"button\" aria-pressed=\"false\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" aria-hidden=\"true\"><circle cx=\"8\" cy=\"8\" r=\"6.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"/><path d=\"M8 1.5v13A6.5 6.5 0 0 0 8 1.5z\" fill=\"currentColor\"/></svg><span>Light theme</span></button></div></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-band :focus-visible{outline-color:var(--band-rubric);outline-offset:-3px} .ds-header{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:stretch;background:var(--band);color:var(--band-fg);border-bottom:1px solid var(--band-line);font:14px/1.45 var(--sans)}.ds-brand{display:flex;align-items:center;padding:0 18px;border-right:1px solid var(--band-line);font:700 20px/1 var(--cond);letter-spacing:.02em;text-transform:lowercase}.ds-query{display:flex;min-width:0;align-items:stretch}.ds-input-query{flex:1;min-width:0;height:44px;border:0;border-right:1px solid var(--band-line);background:var(--field);color:var(--field-fg);padding:0 14px;font:14px/1.5 var(--mono);border-radius:0}.ds-input-query::placeholder{color:var(--band-muted);opacity:1}.ds-chainwrap{position:relative;display:flex;border-right:1px solid var(--band-line)}.ds-chainwrap::after{content:\"\";position:absolute;right:12px;top:50%;width:12px;height:8px;margin-top:-4px;background:var(--chev) no-repeat center;pointer-events:none}.ds-select{appearance:none;-webkit-appearance:none;height:44px;border:0;background:var(--band);color:var(--band-fg);padding:0 32px 0 14px;font:500 14px/1 var(--cond);letter-spacing:.04em;text-transform:uppercase;cursor:pointer;border-radius:0}.ds-btn-primary{height:44px;border:0;background:var(--rubric);color:var(--on-rubric);padding:0 22px;font:600 15px/1 var(--cond);letter-spacing:.14em;text-transform:uppercase;border-radius:0;cursor:pointer}.ds-btn-primary:hover{filter:brightness(1.08)}.ds-theme{border:0;border-left:1px solid var(--band-line);background:transparent;color:var(--band-fg);padding:0 16px;display:flex;gap:8px;align-items:center;white-space:nowrap;font:500 13px/1 var(--cond);letter-spacing:.06em;text-transform:uppercase;cursor:pointer;border-radius:0}.ds-theme:hover{background:var(--field)}"
     },
     {
       "name": "Title Block",
       "kind": "card",
       "refersTo": "title-block-cell",
-      "description": "Labelled cells divided by hairlines; tracked label over a tabular value; risk in rubric.",
-      "html": "<div class=\"ds\"><div class=\"ds-tb\"><div><span class=\"ds-lbl\">Sheet</span><b>Runtime code</b></div><div><span class=\"ds-lbl\">Coverage</span><b>288/288 blocks · 0 unresolved · 9 ms</b></div><div><span class=\"ds-lbl\">Findings</span><b>1 high, 5 medium, 11 low, 2 info</b></div><div class=\"ds-risk\"><span class=\"ds-lbl\">Risk</span><b>76/100 · High</b></div></div></div>",
-      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds-tb{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-bottom:1px solid var(--line);background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans)}.ds-tb>div{padding:6px 12px;border-right:1px solid var(--hair);min-width:0}.ds-tb>div:last-child{border-right:0}.ds-lbl{display:block;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}.ds-tb b{display:block;font-weight:500;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;min-height:1.45em}.ds-risk b{color:var(--rubric);font-weight:700}"
+      "description": "Labelled band cells divided by band rules; condensed tracked label over a tabular value; risk in band amber.",
+      "html": "<div class=\"ds ds-band\"><div class=\"ds-tb\"><div><span class=\"ds-lbl\">Sheet</span><b>Runtime code</b></div><div><span class=\"ds-lbl\">Coverage</span><b>288/288 blocks · 0 unresolved · 10 ms</b></div><div><span class=\"ds-lbl\">Findings</span><b>1 high, 5 medium, 11 low, 2 info</b></div><div class=\"ds-risk\"><span class=\"ds-lbl\">Risk</span><b>76/100 · High</b></div></div></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds-tb{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));background:var(--band);color:var(--band-fg);border-bottom:2px solid var(--band-line);font:14px/1.45 var(--sans)}.ds-tb>div{padding:7px 14px 9px;border-right:1px solid var(--band-line);min-width:0}.ds-tb>div:last-child{border-right:0}.ds-lbl{display:block;font:500 12px/1.3 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--band-muted)}.ds-tb b{display:block;font-weight:500;font-size:14px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;min-height:1.45em}.ds-risk b{color:var(--band-rubric);font:600 18px/1.2 var(--cond);letter-spacing:.02em}"
+    },
+    {
+      "name": "View Tabs",
+      "kind": "nav",
+      "refersTo": "tab",
+      "description": "ARIA tablist over the drawing in condensed tracked uppercase; selected tab is ink with a 2px inset rubric underline; Download .sol in the rubric at the right.",
+      "html": "<div class=\"ds\"><div class=\"ds-tabs\" role=\"tablist\"><button role=\"tab\" class=\"ds-tab\" aria-selected=\"true\">Code</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">Report</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">Storage &amp; events</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">Disassembly</button><button role=\"tab\" class=\"ds-tab\" aria-selected=\"false\">JSON</button><button class=\"ds-tab-dl\" type=\"button\">Download .sol</button></div></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-band :focus-visible{outline-color:var(--band-rubric);outline-offset:-3px} .ds-tabs{display:flex;border-bottom:1px solid var(--line);background:var(--bg);color:var(--fg)}.ds-tab{flex:none;border:0;background:transparent;padding:10px 16px;border-right:1px solid var(--hair);color:var(--muted);white-space:nowrap;font:600 13px/1.2 var(--cond);letter-spacing:.1em;text-transform:uppercase;cursor:pointer;border-radius:0}.ds-tab:hover{color:var(--fg)}.ds-tab[aria-selected=\"true\"]{color:var(--fg);box-shadow:inset 0 -2px 0 var(--rubric)}.ds-tab-dl{flex:none;margin-left:auto;border:0;border-left:1px solid var(--hair);background:transparent;color:var(--rubric);padding:0 16px;font:600 13px/1.2 var(--cond);letter-spacing:.1em;text-transform:uppercase;cursor:pointer}"
+    },
+    {
+      "name": "Empty Sheet (landing frame)",
+      "kind": "card",
+      "refersTo": "sheet-frame",
+      "description": "The empty-state sheet: 1px line frame with a hairline inset 6px, condensed uppercase headline with a rubric clause, one paragraph, Try row, tracked footer.",
+      "html": "<div class=\"ds\"><div class=\"ds-sheet\"><h1 class=\"ds-h1\">Decompile any EVM contract.<br>Then <em>read what it really does.</em></h1><p class=\"ds-p\">Paste an address and pick its chain, or paste the bytecode of a contract you are about to deploy.</p><ul class=\"ds-examples\"><li>Try</li><li><button class=\"ds-btn-outline\" type=\"button\">WETH</button></li><li><button class=\"ds-btn-outline\" type=\"button\">USDT</button></li></ul><div class=\"ds-foot\"><span>Proxies followed to their implementation</span><span>Findings carry a confidence</span></div></div></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-band :focus-visible{outline-color:var(--band-rubric);outline-offset:-3px} .ds-sheet{width:min(100%,760px);border:1px solid var(--line);padding:36px 40px 32px;position:relative;background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans)}.ds-sheet::before{content:\"\";position:absolute;inset:6px;border:1px solid var(--hair);pointer-events:none}.ds-h1{font:600 34px/1.1 var(--cond);letter-spacing:.01em;text-transform:uppercase;margin:0 0 14px;text-wrap:balance}.ds-h1 em{font-style:normal;color:var(--rubric)}.ds-p{margin:0 0 10px;max-width:62ch;color:var(--muted)}.ds-examples{margin:22px 0 0;padding:0;list-style:none;display:flex;gap:8px;flex-wrap:wrap;align-items:center}.ds-examples li:first-child{font:500 12px/1 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-right:6px}.ds-btn-outline{border:1px solid var(--line);background:transparent;color:var(--fg);padding:7px 14px;font:600 13px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;border-radius:0;cursor:pointer}.ds-btn-outline:hover{background:var(--well)}.ds-foot{margin:28px 0 0;padding-top:10px;border-top:1px solid var(--hair);font:500 12px/1.4 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);display:flex;gap:18px;flex-wrap:wrap}"
     },
     {
       "name": "Function Index Row",
       "kind": "custom",
       "refersTo": "index-row",
-      "description": "Fixed-cell sheet row: F-nn, mono name, mutability; the current sheet stays lit.",
-      "html": "<div class=\"ds\"><ul class=\"ds-fns\"><li class=\"ds-grp\">External · 10</li><li><button type=\"button\" class=\"ds-fn\" aria-current=\"true\"><span class=\"ds-sheet\">F-01</span><span class=\"ds-name\">func_143a1f99(uint256)</span><span class=\"ds-mut\">nonpayable</span></button></li><li><button type=\"button\" class=\"ds-fn\" aria-current=\"false\"><span class=\"ds-sheet\">F-02</span><span class=\"ds-name\">func_1bddf355()</span><span class=\"ds-mut\">payable</span></button></li></ul></div>",
-      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-fns{list-style:none;margin:0;padding:0;width:280px;border-right:1px solid var(--line);background:var(--bg);color:var(--fg)}.ds-grp{padding:6px 12px;font:11px/1.45 var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--hair);background:var(--well)}.ds-fn{display:grid;grid-template-columns:3.2em minmax(0,1fr) auto;gap:8px;width:100%;text-align:left;padding:5px 12px;border:0;border-bottom:1px solid var(--hair);background:transparent;color:inherit;font:12px/1.5 var(--mono);align-items:baseline;cursor:pointer;border-radius:0;transition:none}.ds-fn:hover{background:var(--well)}.ds-fn[aria-current=\"true\"]{background:var(--lit)}.ds-fn[aria-current=\"true\"] .ds-name{font-weight:700}.ds-sheet{color:var(--muted)}.ds-mut{font:11px/1.5 var(--sans);color:var(--muted)}"
+      "description": "Fixed-cell sheet row on the well column: F-nn, mono name, condensed mutability; hover wells, the current sheet stays lit.",
+      "html": "<div class=\"ds\"><ul class=\"ds-fns\"><li class=\"ds-grp\">External · 10</li><li><button type=\"button\" class=\"ds-fn\" aria-current=\"true\"><span class=\"ds-sheet-no\">F-01</span><span class=\"ds-name\">func_143a1f99(uint256)</span><span class=\"ds-mut\">nonpayable</span></button></li><li><button type=\"button\" class=\"ds-fn\" aria-current=\"false\"><span class=\"ds-sheet-no\">F-02</span><span class=\"ds-name\">func_1bddf355()</span><span class=\"ds-mut\">payable</span></button></li></ul></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-band :focus-visible{outline-color:var(--band-rubric);outline-offset:-3px} .ds-fns{list-style:none;margin:0;padding:0;width:280px;border-right:1px solid var(--line);background:var(--well);color:var(--fg)}.ds-grp{padding:7px 12px 5px;font:600 12px/1.3 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--hair)}.ds-fn{display:grid;grid-template-columns:3.2em minmax(0,1fr) auto;gap:8px;width:100%;text-align:left;padding:5px 12px;border:0;border-bottom:1px solid var(--hair);background:var(--bg);color:inherit;font:12.5px/1.5 var(--mono);align-items:baseline;cursor:pointer;border-radius:0}.ds-fn:hover{background:var(--well)}.ds-fn[aria-current=\"true\"]{background:var(--lit)}.ds-fn[aria-current=\"true\"] .ds-name{font-weight:600}.ds-sheet-no{color:var(--muted);font:500 12px/1.5 var(--cond);letter-spacing:.06em}.ds-mut{font:500 11px/1.5 var(--cond);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}"
     },
     {
       "name": "Callout",
@@ -757,7 +988,7 @@
       "refersTo": "callout",
       "description": "The 24px rubric circle keying a code line to its finding; hover inverts it.",
       "html": "<div class=\"ds\"><span class=\"ds-co-cell\"><a class=\"ds-co\" href=\"#F2\" aria-label=\"Finding 2: Amount paid out derives from a spot balance\">2</a><a class=\"ds-co\" href=\"#F8\" aria-label=\"Finding 8: Division before multiplication\">8</a></span></div>",
-      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-co-cell{display:inline-flex;gap:2px;padding-left:2px}.ds-co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 11px/1 var(--sans);text-decoration:none}.ds-co:hover{background:var(--rubric);color:var(--on-rubric)}"
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-band :focus-visible{outline-color:var(--band-rubric);outline-offset:-3px} .ds-co-cell{display:inline-flex;gap:2px;padding-left:2px}.ds-co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 12px/1 var(--cond);text-decoration:none}.ds-co:hover{background:var(--rubric);color:var(--on-rubric)}"
     },
     {
       "name": "Flagged Code Line (revision cloud)",
@@ -765,56 +996,56 @@
       "refersTo": "callout",
       "description": "A drawing line with callouts and the scalloped revision cloud drawn as an SVG border-image; the chosen line is lit.",
       "html": "<div class=\"ds\"><ol class=\"ds-code\"><li><code>    // selector 0x143a1f99 (unknown signature)</code></li><li class=\"ds-flagged\"><span class=\"ds-co-cell\"><a class=\"ds-co\" href=\"#F2\" aria-label=\"Finding 2\">2</a><a class=\"ds-co\" href=\"#F8\" aria-label=\"Finding 8\">8</a></span><code>    function <span class=\"ds-fnname\">func_143a1f99</span>(uint256 arg0) external {</code></li><li class=\"ds-lit\"><code>        require(msg.value == 0);</code></li></ol></div>",
-      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-code{list-style:none;margin:0;padding:10px 0;font:13px/1.5 var(--mono);tab-size:4;counter-reset:ln;background:var(--bg);color:var(--fg)}.ds-code li{display:grid;grid-template-columns:3.4em 8.6em minmax(0,1fr);min-height:1.5em;align-items:start;position:relative}.ds-code li::before{counter-increment:ln;content:counter(ln);grid-column:1;grid-row:1;text-align:right;padding-right:.4em;color:var(--muted);font-variant-numeric:tabular-nums}.ds-code code{grid-column:3;grid-row:1;white-space:pre;display:block;padding-right:1.5em}.ds-co-cell{grid-column:2;grid-row:1;display:flex;gap:2px;padding-left:2px;align-self:center}.ds-co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 11px/1 var(--sans);text-decoration:none}.ds-co:hover{background:var(--rubric);color:var(--on-rubric)}.ds-flagged{background:var(--well);padding:6px 0}.ds-flagged::after{content:\"\";position:absolute;top:0;bottom:0;left:calc(12em - 7px);right:4px;border:6px solid transparent;border-image:var(--cloud) 6 round;pointer-events:none}.ds-lit{background:var(--lit)}.ds-fnname{font-weight:600}@media (prefers-reduced-motion:no-preference){.ds-code li{transition:background .2s ease-out}}"
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-band :focus-visible{outline-color:var(--band-rubric);outline-offset:-3px} .ds-code{list-style:none;margin:0;padding:10px 0;font:13px/1.5 var(--mono);tab-size:4;counter-reset:ln;background:var(--bg);color:var(--fg)}.ds-code li{display:grid;grid-template-columns:3.4em 8.6em minmax(0,1fr);min-height:1.5em;align-items:start;position:relative}.ds-code li::before{counter-increment:ln;content:counter(ln);grid-column:1;grid-row:1;text-align:right;padding-right:.4em;color:var(--muted);font-variant-numeric:tabular-nums}.ds-code code{grid-column:3;grid-row:1;white-space:pre;display:block;padding-right:1.5em}.ds-co-cell{grid-column:2;grid-row:1;display:flex;gap:2px;padding-left:2px;align-self:center}.ds-co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 12px/1 var(--cond);text-decoration:none}.ds-co:hover{background:var(--rubric);color:var(--on-rubric)}.ds-flagged{background:var(--well);padding:6px 0}.ds-flagged::after{content:\"\";position:absolute;top:0;bottom:0;left:calc(12em - 7px);right:4px;border:6px solid transparent;border-image:var(--cloud) 6 round;pointer-events:none}.ds-lit{background:var(--lit)}.ds-fnname{font-weight:600}@media (prefers-reduced-motion:no-preference){.ds-code li{transition:background .2s ease-out}}"
     },
     {
       "name": "Finding Row",
       "kind": "card",
       "refersTo": "finding-row",
-      "description": "A keyed finding: callout, severity word in its colour, title, meta; the open body holds prose, an evidence well and line links.",
+      "description": "A keyed finding: callout, condensed severity word in its colour, title, meta; hover wells; the open body holds prose, an evidence well and line links.",
       "html": "<div class=\"ds\"><ol class=\"ds-findings\"><li class=\"ds-finding ds-lit\"><button type=\"button\" aria-expanded=\"true\"><span class=\"ds-co ds-fnum\">1</span><span class=\"ds-sev ds-sev-high\">High</span><span class=\"ds-ftitle\">State written after an external call (reentrancy)</span><span class=\"ds-fmeta\"><code>func_143a1f99</code> · medium confidence · 2 sites</span></button><div class=\"ds-fbody\"><p>`func_143a1f99` performs an external call to `msg.sender` and writes storage afterwards.</p><div class=\"ds-ev\">success_1 = msg.sender.call{value: address(this).balance}(\"\")</div><p><b>Recommendation.</b> Apply the checks-effects-interactions pattern or use a reentrancy guard.</p><p class=\"ds-goto\">Lines <a href=\"#L110\">110</a></p></div></li><li class=\"ds-finding\"><button type=\"button\" aria-expanded=\"false\"><span class=\"ds-co ds-fnum\">2</span><span class=\"ds-sev ds-sev-medium\">Medium</span><span class=\"ds-ftitle\">Amount paid out derives from a spot balance</span><span class=\"ds-fmeta\"><code>func_143a1f99</code> · low confidence</span></button></li></ol></div>",
-      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-findings{list-style:none;margin:0;padding:0;width:380px;border-left:1px solid var(--line);background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans)}.ds-finding{border-bottom:1px solid var(--hair)}.ds-finding>button{display:grid;grid-template-columns:30px auto minmax(0,1fr);grid-template-areas:\"n s t\" \"n s m\";gap:2px 8px;width:100%;text-align:left;border:0;background:transparent;color:inherit;padding:8px 12px;align-items:baseline;font:inherit;cursor:pointer;border-radius:0}.ds-fnum{grid-area:n;align-self:start}.ds-co{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 11px/1 var(--sans)}.ds-sev{grid-area:s;font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase}.ds-sev-high{color:var(--high)}.ds-sev-medium{color:var(--medium)}.ds-ftitle{grid-area:t;overflow-wrap:anywhere}.ds-fmeta{grid-area:m;color:var(--muted);font-size:12px}.ds-fmeta code{font:12px/1.5 var(--mono)}.ds-fbody{padding:0 12px 14px 50px}.ds-fbody p{margin:6px 0;max-width:70ch}.ds-ev{margin:6px 0;padding:6px 10px;background:var(--well);border:1px solid var(--hair);font:12px/1.5 var(--mono);white-space:pre;overflow-x:auto}.ds-goto{font-size:12px;color:var(--muted)}.ds-goto a{display:inline-block;min-width:24px;min-height:24px;line-height:24px;text-align:center;padding:0 2px;color:inherit}.ds-lit{background:var(--lit)}@media (prefers-reduced-motion:no-preference){.ds-finding{transition:background .2s ease-out}}"
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds :focus-visible{outline:2px solid var(--focus);outline-offset:2px} .ds-band :focus-visible{outline-color:var(--band-rubric);outline-offset:-3px} .ds-findings{list-style:none;margin:0;padding:0;width:380px;border-left:1px solid var(--line);background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans)}.ds-finding{border-bottom:1px solid var(--hair)}.ds-finding>button{display:grid;grid-template-columns:30px auto minmax(0,1fr);grid-template-areas:\"n s t\" \"n s m\";gap:2px 8px;width:100%;text-align:left;border:0;background:transparent;color:inherit;padding:9px 12px;align-items:baseline;font:inherit;cursor:pointer;border-radius:0}.ds-finding>button:hover{background:var(--well)}.ds-fnum{grid-area:n;align-self:start}.ds-co{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 12px/1 var(--cond)}.ds-sev{grid-area:s;font:600 12px/1.5 var(--cond);letter-spacing:.1em;text-transform:uppercase}.ds-sev-high{color:var(--high)}.ds-sev-medium{color:var(--medium)}.ds-ftitle{grid-area:t;overflow-wrap:anywhere;font-weight:500}.ds-fmeta{grid-area:m;color:var(--muted);font-size:12.5px}.ds-fmeta code{font:12px/1.5 var(--mono)}.ds-fbody{padding:0 12px 14px 50px}.ds-fbody p{margin:6px 0;max-width:70ch}.ds-ev{margin:6px 0;padding:6px 10px;background:var(--well);border:1px solid var(--hair);font:12px/1.5 var(--mono);white-space:pre;overflow-x:auto}.ds-goto{font-size:12px;color:var(--muted)}.ds-goto a{display:inline-block;min-width:24px;min-height:24px;line-height:24px;text-align:center;padding:0 2px;color:inherit}.ds-lit{background:var(--lit)}@media (prefers-reduced-motion:no-preference){.ds-finding{transition:background .2s ease-out}}"
     },
     {
       "name": "Error Notice",
       "kind": "card",
       "refersTo": "evidence-well",
       "description": "Rubric-bordered square notice with a rubric lead word; errors never recolour a field.",
-      "html": "<div class=\"ds\"><div class=\"ds-err\"><b>Error.</b> Address not found on mainnet (1).</div></div>",
-      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--lit:#fff1c2;--on-rubric:#ffffff;--high:#b3261e;--medium:#8a5a00;--sans:ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\")} .ds-err{margin:16px;padding:12px 14px;border:1px solid var(--rubric);color:var(--fg);background:var(--bg);font:14px/1.45 var(--sans)}.ds-err b{color:var(--rubric)}"
+      "html": "<div class=\"ds\"><div class=\"ds-err\" role=\"alert\"><b>Could not decompile.</b> Address not found on mainnet (1). Check the address and chain, or paste the bytecode directly.</div></div>",
+      "css": ":host,.ds{--bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--lit:#fff1c2;--band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;--high:#b3261e;--medium:#8a5a00;--sans:'Barlow',ui-sans-serif,system-ui,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;--cond:'Barlow Condensed','Barlow',ui-sans-serif,system-ui,sans-serif;--mono:'Source Code Pro',ui-monospace,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;--cloud:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E\");--chev:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E\")} .ds-err{margin:16px;padding:12px 14px;border:1px solid var(--rubric);color:var(--fg);background:var(--bg);font:14px/1.45 var(--sans)}.ds-err b{color:var(--rubric)}"
     }
   ],
   "narrative": {
     "northStar": "The Drawing Set",
-    "overview": "**Creative North Star: \"The Drawing Set\"**\n\nThe contract is a built structure and the page is its drawing set. Metadata lives in a title block of eight labelled cells across the top; functions are an indexed sheet list (F-01, F-02, ...) down the left; the decompiled code is the drawing in the middle; every finding is a numbered callout in the code gutter keyed to a detail at the right. The world refuses the category's console (side nav, dark slate, badges) and the report-PDF arrangement. Everything is drawn in line: one-pixel rules divide every region, nothing has a shadow, nothing has a radius except the callout circles, and nothing is labelled twice.\n\nTwo sheets exist. In light the page is a whiteprint: a white sheet, iron-black line and type, one vermilion rubric reserved for callouts, the risk figure and the error border. In dark it is a blueprint: Prussian-blue ground, pale line and type, an amber rubric in the same reserved role. The theme follows the system and can be overridden by the header toggle; both sheets meet WCAG 2.2 AA including the code highlighting and the severity colours.\n\nDensity is that of a drawing, not a dashboard: 14px body on a 1.45 line, 13px mono code on a 1.5 line, tracked 11px uppercase labels over tabular values, 12px meta. The interface stays out of the way so the code, the findings and the layout are read at reading quality. The only motion is the lit background settling in over 200ms; nothing else moves, and reduced motion removes even that.",
+    "overview": "**Creative North Star: \"The Drawing Set\"**\n\nThe contract is a built structure and the page is its drawing set. A dark ink band across the top carries the header strip and the title block, the way a drawing's title block sits in its own ruled strip; below it the sheet is the drawing. Functions are an indexed sheet list (F-01, F-02, ...) down the left on a recessed well; the decompiled code is the drawing in the middle; every finding is a numbered callout in the code gutter keyed to a detail at the right. The world refuses the category's console (side nav, dark slate, badges) and the report-PDF arrangement. Everything is drawn in line: one-pixel rules divide every region, nothing has a shadow, nothing has a radius except the callout circles, and nothing is labelled twice.\n\nTwo sheets exist under one band. In light the sheet is a whiteprint: white ground, iron-black line and type, one vermilion rubric reserved for callouts, the revision cloud, the selected-tab rule, Download and the Decompile action. In dark the sheet is a blueprint: Prussian-blue ground, pale line and type, an amber rubric in the same roles. The band is ink in both themes (deeper in dark), with pale type, tracked condensed labels and an amber band-rubric that carries the risk figure and the band's focus ring. The theme follows the system and can be overridden by the header toggle; both sheets meet WCAG 2.2 AA including the code highlighting and the severity colours.\n\nLettering is draughting-room: Barlow for reading text, Barlow Condensed in tracked capitals for every label, heading, tab, action and the wordmark, Source Code Pro for code, selectors and evidence. The faces load from Google Fonts with the system stacks as fallbacks. Density is that of a drawing, not a dashboard: 14px body on a 1.45 line, 13px code on a 1.5 line, 12px tracked labels over tabular values. The only motion is the lit background settling in over 200ms; nothing else moves, and reduced motion removes even that.",
     "keyCharacteristics": [
-      "Hairline rules at 1px divide every region; no shadows, no fills for structure.",
-      "One rubric colour per sheet (vermilion / amber), used only for callouts, the risk figure and errors.",
+      "An ink band (header strip and title block) over a light or Prussian sheet; 44px header cells divided by band rules.",
+      "Hairline rules at 1px divide every region; no shadows, no fills for structure; the sheet frame on the empty state is a 1px line with an inset hairline.",
+      "One rubric per sheet (vermilion / amber) for callouts, the cloud, the selected tab, Download and Decompile; one band-rubric (amber) for the risk figure.",
       "Zero radius everywhere except the 24px circular callout.",
-      "Tracked uppercase 11px labels over 500-weight tabular values.",
-      "System sans for UI, system mono for code, selectors and evidence; no external fonts or scripts.",
+      "Barlow Condensed tracked uppercase for every label, heading, tab and action; Barlow for prose; Source Code Pro for code.",
       "Fixed-cell lists whose columns never move; the chosen line or finding stays lit until another is chosen.",
       "A scalloped revision cloud outlines every flagged line of the drawing."
     ],
     "rules": [
       {
         "name": "The One Rubric Rule",
-        "body": "Each sheet has exactly one accent and it marks only what a reviewer would mark in red: the callout, the cloud, the risk figure, an error. Nothing decorative, no links, no buttons wear it.",
+        "body": "Each sheet has exactly one accent and it marks only what a reviewer would mark in red: the callout, the cloud, the selected tab's rule, the download and decompile actions, an error. The band has its own single accent, amber, for the risk figure and band focus. Nothing decorative wears either.",
         "section": "colors"
       },
       {
         "name": "The Words First Rule",
-        "body": "Severity and risk are read from the printed word (HIGH, 76/100 · High); the colour tints the word and never stands alone. A risk score under 8 drops the rubric and prints in ink at weight 500.",
+        "body": "Severity and risk are read from the printed word (HIGH, 76/100 · High); the colour tints the word and never stands alone. A risk score under 8 drops the band rubric and prints in band pale at Barlow 500 14px.",
         "section": "colors"
       },
       {
         "name": "The Two Sheets Rule",
-        "body": "Every token has a whiteprint and a blueprint value, and every pair meets AA contrast on its ground. Add a colour to both sheets or to neither.",
+        "body": "Every sheet token has a whiteprint and a blueprint value, and every pair meets AA contrast on its ground; the band keeps the same pale type on both of its inks. Add a colour to both sheets or to neither.",
         "section": "colors"
       },
       {
         "name": "The Tracked Label Rule",
-        "body": "Anything that names a cell is 11px uppercase tracked 0.08em in muted ink, set above its value, and never repeated as a heading elsewhere.",
+        "body": "Anything that names a cell, a column, a group, a view or an action is Barlow Condensed in uppercase, tracked 0.08-0.14em, set above or beside its value, and never repeated as a heading elsewhere. Prose is never condensed.",
         "section": "typography"
       },
       {
@@ -829,27 +1060,28 @@
       },
       {
         "name": "The Flat Sheet Rule",
-        "body": "Nothing lifts off the sheet. Hierarchy is drawn with rules, fills and weight; a shadow, a glow or a blur is a foreign material.",
+        "body": "Nothing lifts off the sheet. Hierarchy is drawn with planes, rules, fills and weight; a shadow, a glow or a blur is a foreign material.",
         "section": "elevation"
       }
     ],
     "dos": [
-      "Do divide regions with 1px rules: `line` between regions, `hair` within them; a region's boundary is a rule, never a fill or a shadow.",
-      "Do set every label at 11px uppercase tracked 0.08em in muted ink above a 500-weight tabular value, and label each thing once.",
-      "Do keep the rubric for callouts, the revision cloud, the risk figure at 8 or above, and error borders; the light sheet uses vermilion, the dark sheet amber.",
+      "Do keep the header strip and title block on the band ink with pale type and band rules; the sheet below is the only place the theme ground changes.",
+      "Do divide regions with 1px rules: `line` between regions, `hair` within them, `band-rule` inside the band; a region's boundary is a rule, never a fill or a shadow.",
+      "Do set every label, heading, tab and action in Barlow Condensed uppercase tracked 0.08-0.14em, and label each thing once; set prose and values in Barlow, code in Source Code Pro.",
+      "Do keep the sheet rubric for callouts, the revision cloud, the selected-tab rule, Download, Decompile and error borders (vermilion on the light sheet, amber on the dark), and band amber for the risk figure and band focus.",
       "Do print severity and confidence as words beside each other; colour only tints the severity word.",
-      "Do give every control at least a 24x24 target and the 2px offset focus outline; use `aria-current`, `aria-expanded`, `aria-selected` and the polite `role=status` region for every state change.",
-      "Do define any new colour on both sheets and verify AA contrast on each ground.",
+      "Do give every control at least a 24x24 target (44px in the band) and a visible 2px focus outline; use `aria-current`, `aria-expanded`, `aria-selected`, `aria-pressed`, `aria-busy` and the polite `role=status` region for every state change.",
+      "Do define any new sheet colour on both sheets and verify AA contrast on each ground, and on the band ink for band colours.",
       "Do use the lit fill (straw / umber) for exactly the chosen item: one index row, one code line, one finding."
     ],
     "donts": [
-      "Don't add border-radius to anything but the 24px callout circle; buttons, inputs, tabs, wells and notices stay square.",
-      "Don't add box-shadows, glows, blurs or gradients; the only inset shadow is the 2px selected-tab underline used as a rule.",
-      "Don't load external fonts, icon fonts or scripts; type is the system sans and system mono stacks, and icons are inline SVG at 16px.",
+      "Don't add border-radius to anything but the 24px callout circle; buttons, fields, the select, tabs, wells, frames and notices stay square.",
+      "Don't add box-shadows, glows, blurs or gradients; the only inset shadow is the 2px selected-tab underline used as a rule, and the only hover filter is the primary's 8% brightness step.",
+      "Don't set prose, finding bodies or values in the condensed face, and don't set labels in Barlow regular; width and case carry the hierarchy.",
       "Don't colour code tokens beyond ink, muted comments and green strings, or convey emphasis in code with colour instead of weight.",
       "Don't let a column move: fixed first cells (3.4em line numbers, 8.6em callout cell, 3.2em sheet number, 30px finding number) hold their width regardless of content.",
       "Don't animate anything but the lit background (200ms ease-out), and never under reduced motion.",
-      "Don't introduce badges, pills, side navigation or a dark-slate console; the dark sheet is Prussian blue, not grey."
+      "Don't introduce badges, pills, side navigation or a grey-slate console; the band is navy ink and the dark sheet is Prussian blue, not grey."
     ]
   }
 }

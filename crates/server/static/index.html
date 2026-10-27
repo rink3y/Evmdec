@@ -11,17 +11,17 @@
 :root{
  --bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--sel:#dbe8ff;--lit:#fff1c2;--on-rubric:#ffffff;
  --critical:#8f1a12;--high:#b3261e;--medium:#8a5a00;--low:#1a5fb4;--info:#5a6069;
- --kw:#1a1d21;--ty:#1a1d21;--str:#365b1e;--num:#1a1d21;--cm:#5a6069;--fn:#1a1d21;
+ --kw:#1a1d21;--ty:#1a1d21;--str:#365b1e;--num:#1a1d21;--cm:#5a6069;--fn:#1a1d21;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E");
  --sans:ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
  color-scheme:light}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
- --bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--focus:#ffd27a;--sel:#2d4f7e;--lit:#2b4a1f;--on-rubric:#0f2340;
+ --bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--on-rubric:#0f2340;
  --critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;
- --kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;color-scheme:dark}}
+ --kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");color-scheme:dark}}
 :root[data-theme="dark"]{
- --bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--focus:#ffd27a;--sel:#2d4f7e;--lit:#2b4a1f;--on-rubric:#0f2340;
+ --bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--on-rubric:#0f2340;
  --critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;
- --kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;color-scheme:dark}
+ --kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");color-scheme:dark}
 
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -64,27 +64,27 @@ main>*{min-width:0;min-height:0;overflow:auto}
 #fns .grp{padding:6px 12px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--hair);background:var(--well)}
 #fns li button{display:grid;grid-template-columns:3.2em minmax(0,1fr) auto;gap:8px;width:100%;text-align:left;padding:5px 12px;border:0;border-bottom:1px solid var(--hair);background:transparent;font:12px/1.5 var(--mono);align-items:baseline}
 #fns li button .sheet{color:var(--muted)}
-#fns li button .name{overflow-wrap:anywhere}
+#fns li button .name{overflow-wrap:normal;word-break:normal}
 #fns li button .mut{font:11px/1.5 var(--sans);color:var(--muted)}
 #fns li button:hover{background:var(--well)}
-#fns li button[aria-current="true"]{background:var(--well);box-shadow:inset 3px 0 0 var(--rubric)}
+#fns li button[aria-current="true"]{background:var(--lit)}#fns li button[aria-current="true"] .name{font-weight:700}
 
 /* drawing */
 .tabs{display:flex;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:2;overflow-x:auto}
-.tabs [role=tab]{border:0;background:transparent;padding:9px 14px;border-right:1px solid var(--hair);color:var(--muted);white-space:nowrap}
+.tabs [role=tab]{flex:none;border:0;background:transparent;padding:9px 14px;border-right:1px solid var(--hair);color:var(--muted);white-space:nowrap}
 .tabs [role=tab][aria-selected="true"]{color:var(--fg);box-shadow:inset 0 -2px 0 var(--fg)}
-.tabs .dl{margin-left:auto;border:0;border-left:1px solid var(--hair);background:transparent;padding:0 14px;white-space:nowrap}
+.tabs .dl{flex:none;margin-left:auto;border:0;border-left:1px solid var(--hair);background:transparent;padding:0 14px;white-space:nowrap}
 .scale{display:flex;gap:16px;padding:7px 12px;border-bottom:1px solid var(--hair);font-size:12px;color:var(--muted);flex-wrap:wrap}
 .scale b{color:var(--fg);font-weight:600}
 .code{list-style:none;margin:0;padding:10px 0 32px;font:13px/1.5 var(--mono);tab-size:4;counter-reset:ln;overflow-x:auto}
-.code li{display:grid;grid-template-columns:6.4em minmax(0,1fr);position:relative;min-height:1.5em}
-.code li::before{counter-increment:ln;content:counter(ln);grid-column:1;grid-row:1;text-align:right;padding-right:.6em;color:var(--muted);font-variant-numeric:tabular-nums;user-select:none}
-.code code{grid-column:2;grid-row:1;white-space:pre;display:block;padding-right:1.5em;width:max-content;min-width:100%}
-.code .co-cell{position:absolute;left:4px;top:1px;display:flex;gap:3px}
-.co{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 11px/1 var(--sans);text-decoration:none}
+.code li{display:grid;grid-template-columns:3.4em 6.1em minmax(0,1fr);min-height:1.5em;align-items:start}
+.code li::before{counter-increment:ln;content:counter(ln);grid-column:1;grid-row:1;text-align:right;padding-right:.4em;color:var(--muted);font-variant-numeric:tabular-nums;user-select:none}
+.code code{grid-column:3;grid-row:1;white-space:pre;display:block;padding-right:1.5em;width:max-content;min-width:100%}
+.code .co-cell{grid-column:2;grid-row:1;display:flex;gap:2px;padding-left:2px;align-self:center}
+.co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 11px/1 var(--sans);text-decoration:none}
 .co:hover{background:var(--rubric);color:var(--on-rubric)}
 .code li.flagged{background:var(--well)}
-.code li.flagged code{outline:1px dashed var(--rubric);outline-offset:-1px;border-radius:12px 4px 12px 4px;margin-left:2.4em}
+.code li.flagged code{border:6px solid transparent;border-image:var(--cloud) 6 round;margin:-6px 0;padding-left:1px}
 .code li.lit,.finding.lit{background:var(--lit)}
 .kw{color:var(--kw)}.ty{color:var(--ty)}.st{color:var(--str)}.nu{color:var(--num)}.cm{color:var(--cm)}.fnname{color:var(--fn);font-weight:600}
 pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:auto;tab-size:4}
@@ -116,8 +116,8 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .report table{border-collapse:collapse;font-size:13px;width:100%}
 .report th,.report td{border:1px solid var(--hair);padding:4px 8px;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}
 .report th{color:var(--muted);font-weight:600}
-.report ul{margin:0;padding-left:20px}
-.report li{margin:2px 0}
+.report ul{margin:0;padding:0;list-style:none}
+.report li{margin:0;padding:3px 0;border-bottom:1px solid var(--hair)}
 .report code{font:12.5px/1.5 var(--mono)}
 .status{padding:0 12px;display:flex;align-items:center;color:var(--muted);font-size:12px;white-space:nowrap}
 
@@ -197,7 +197,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
   </section>
   <aside class="details" aria-label="Details">
     <h2 class="col-h" id="details-h">Details</h2>
-    <ol class="findings" id="findings"></ol>
+    <ol class="findings" id="findings"><li class="finding"><div class="fbody" style="padding:12px;color:var(--muted)">No findings yet. Decompile a contract and its findings are keyed here to the lines they are about.</div></li></ol>
   </aside>
 </main>
 <p id="status" class="sr" role="status" aria-live="polite"></p>
@@ -277,16 +277,18 @@ function renderFns(){if(!DATA)return;const q=$('#filter').value.toLowerCase();co
   const sig=x.kind==='external'?x.name+'('+x.params.map(p=>p.ty).join(',')+')':x.name+'('+Array.from({length:x.n_args},()=>'uint256').join(',')+')';
   const mut=x.kind==='external'?x.mutability.replace('_',''):x.kind;
   if(q&&!(sig.toLowerCase().includes(q)||(x.selector||'').includes(q)))return;
-  out+='<li><button type="button" data-pc="'+x.pc+'" aria-current="'+(CUR===x.pc?'true':'false')+'"><span class="sheet">F-'+String(sheet).padStart(2,'0')+'</span><span class="name">'+esc(sig)+'</span><span class="mut">'+esc(mut)+'</span></button></li>'});
+  out+='<li><button type="button" data-pc="'+x.pc+'" aria-current="'+(CUR===x.pc?'true':'false')+'"><span class="sheet">F-'+String(sheet).padStart(2,'0')+'</span><span class="name">'+esc(sig).replace(/([(,])/g,'$1<wbr>')+'</span><span class="mut">'+esc(mut)+'</span></button></li>'});
  $('#fns').innerHTML=out;document.querySelectorAll('#fns button').forEach(b=>b.addEventListener('click',()=>{CUR=CUR===+b.dataset.pc?null:+b.dataset.pc;renderFns();renderCode();selectTab($('#tab-code'));$('#panel-code').scrollTop=0}))}
 
 function fnRange(c,pc){const f=c.functions.find(x=>x.pc===pc);if(!f)return null;const head=f.kind==='external'?'function '+f.name+'(':f.kind==='fallback'?'fallback()':f.kind==='receive'?'receive()':'function '+f.name+'(';let s=SRC_LINES.findIndex(l=>l.trim().startsWith(head));if(s<0)return null;let e=s;for(let i=s;i<SRC_LINES.length;i++){if(SRC_LINES[i]==='    }'){e=i;break}}if(s>0&&SRC_LINES[s-1].trim().startsWith('//'))s--;return [s,e]}
-function renderCode(){const c=DATA.contract;const range=CUR!=null?fnRange(c,CUR):null;const from=range?range[0]:0,to=range?range[1]:SRC_LINES.length-1;let rows='';
- for(let i=from;i<=to;i++){const l=SRC_LINES[i];const co=CALLOUTS.get(i);const cls=co?' flagged':'';let bubbles='';if(co)bubbles='<span class="co-cell">'+co.map(n=>'<a class="co" href="#F'+n+'" aria-label="Finding '+n+': '+esc(FINDINGS[n-1].title)+'">'+n+'</a>').join('')+'</span>';
-  rows+='<li id="L'+(i+1)+'" class="ln'+cls+'">'+bubbles+'<code>'+(hl(l)||' ')+'</code></li>'}
- $('#panel-code').innerHTML='<ol class="code" aria-label="Decompiled code" style="counter-reset:ln '+from+'">'+rows+'</ol>';
- const f=range?c.functions.find(x=>x.pc===CUR):null;const scale=$('#scale');scale.hidden=false;
- scale.innerHTML='<span>'+(f?'Showing <b>'+esc(f.name)+'</b> (lines '+(from+1)+' to '+(to+1)+' of '+SRC_LINES.length+')':'Showing the <b>whole contract</b>, '+SRC_LINES.length+' lines')+'</span><span><b>'+CALLOUTS.size+'</b> flagged line'+(CALLOUTS.size===1?'':'s')+'</span><span>Callouts key to the details at right</span>'+(f?'<button type="button" id="showall" style="border:0;background:transparent;color:var(--fg);text-decoration:underline;padding:0">Show whole contract</button>':'');
+function helpersOf(c,pc){const out=[];const seen=new Set([pc]);const work=[pc];while(work.length){const f=c.functions.find(x=>x.pc===work.shift());if(!f)continue;(f.calls||[]).forEach(q=>{if(seen.has(q))return;seen.add(q);const g=c.functions.find(x=>x.pc===q);if(g&&!g.inlined){out.push(q);work.push(q)}})}return out}
+function renderCode(){const c=DATA.contract;let ranges=[];let helpers=[];
+ if(CUR!=null){const r=fnRange(c,CUR);if(r){ranges.push(r);helpersOf(c,CUR).forEach(q=>{const h=fnRange(c,q);if(h){ranges.push(h);helpers.push(c.functions.find(x=>x.pc===q).name)}})}}
+ if(!ranges.length)ranges=[[0,SRC_LINES.length-1]];
+ const block=([from,to])=>{let rows='';for(let i=from;i<=to;i++){const l=SRC_LINES[i];const co=CALLOUTS.get(i);const cls=co?' flagged':'';let bubbles='';if(co)bubbles='<span class="co-cell">'+co.map(n=>'<a class="co" href="#F'+n+'" aria-label="Finding '+n+': '+esc(FINDINGS[n-1].title)+'">'+n+'</a>').join('')+'</span>';rows+='<li id="L'+(i+1)+'" class="ln'+cls+'">'+bubbles+'<code>'+(hl(l)||' ')+'</code></li>'}return '<ol class="code" aria-label="Decompiled code, lines '+(from+1)+' to '+(to+1)+'" style="counter-reset:ln '+from+'">'+rows+'</ol>'};
+ $('#panel-code').innerHTML=ranges.map(block).join('');
+ const range=ranges[0],from=range[0],to=range[1];const f=CUR!=null?c.functions.find(x=>x.pc===CUR):null;const scale=$('#scale');scale.hidden=$('#tab-code').getAttribute('aria-selected')!=='true';
+ scale.innerHTML='<span>'+(f?'Showing <b>'+esc(f.name)+'</b>'+(helpers.length?' and its helper'+(helpers.length>1?'s ':' ')+helpers.map(h=>'<b>'+esc(h)+'</b>').join(', '):'')+' (lines '+(from+1)+' to '+(to+1)+' of '+SRC_LINES.length+')':'Showing the <b>whole contract</b>, '+SRC_LINES.length+' lines')+'</span><span><b>'+CALLOUTS.size+'</b> flagged line'+(CALLOUTS.size===1?'':'s')+'</span><span>Callouts key to the details at right</span>'+(f?'<button type="button" id="showall" style="border:0;background:transparent;color:var(--fg);text-decoration:underline;padding:0">Show whole contract</button>':'');
  const sa=$('#showall');if(sa)sa.addEventListener('click',()=>{CUR=null;renderFns();renderCode()})}
 
 function findingItem(n,f,open){const fn=f.function?f.function.split(' [')[0]:'contract';const lines=[];CALLOUTS.forEach((arr,k)=>{if(arr.includes(n))lines.push(k+1)});
@@ -308,7 +310,7 @@ function storagePanel(c){const rows=c.storage.flatMap(s=>(s.fields&&s.fields.len
  const list=(a,empty)=>a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>'+empty+'</p>';
  return '<div class="report"><h2>Storage layout</h2>'+(rows?'<table><thead><tr><th scope="col">Slot</th><th scope="col">Name</th><th scope="col">Type</th><th scope="col">Reads</th><th scope="col">Writes</th></tr></thead><tbody>'+rows+'</tbody></table>':'<p>No storage accessed.</p>')+'<h2>Events</h2>'+list(c.events,'No events emitted.')+'<h2>Custom errors</h2>'+list(c.errors,'None.')+'<h2>Strings</h2>'+(c.strings.length?'<ul>'+c.strings.map(e=>'<li>'+esc(e)+'</li>').join('')+'</ul>':'<p>None.</p>')+'<h2>Selectors called on other contracts</h2>'+list(c.selectors_called,'None.')+'</div>'}
 function reportPanel(rep,c){const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
- return '<div class="report"><h2>Summary</h2><p>Risk score <b class="'+(rep.risk_score>=8?'sev-high':'')+'">'+rep.risk_score+'/100</b> ('+riskWord(rep.risk_score).toLowerCase()+'). '+summaryText(rep.summary)+'. Kind: '+esc(rep.contract_kind||c.kind||'unclassified')+'. Findings are leads with a confidence level; coverage and unresolved jumps are in the title block.</p><h2>Privileged functions</h2>'+list(rep.privileged_functions)+'<h2>State-changing functions callable by anyone</h2>'+list(rep.unauthenticated_state_changers)+'<h2>External calls</h2>'+list(rep.external_calls)+'<h2>All findings</h2><ol class="findings">'+FINDINGS.map((f,i)=>findingItem(i+1,f,true).replace(' id="F'+(i+1)+'"',' id="R'+(i+1)+'"').replace('id="FB'+(i+1)+'"','id="RB'+(i+1)+'"').replace('aria-controls="FB'+(i+1)+'"','aria-controls="RB'+(i+1)+'"')).join('')+'</ol></div>'}
+ return '<div class="report"><h2>Summary</h2><p>Risk score <b class="'+(rep.risk_score>=8?'sev-high':'')+'">'+rep.risk_score+'/100</b> ('+riskWord(rep.risk_score).toLowerCase()+'). '+summaryText(rep.summary)+((typeof rep.contract_kind==='string'&&rep.contract_kind.trim()&&rep.contract_kind.trim()!=='unclassified')?'. Kind: '+esc(rep.contract_kind.trim()):'')+'. Findings are leads with a confidence level; coverage and unresolved jumps are in the title block.</p><h2>Privileged functions</h2>'+list(rep.privileged_functions)+'<h2>State-changing functions callable by anyone</h2>'+list(rep.unauthenticated_state_changers)+'<h2>External calls</h2>'+list(rep.external_calls)+'<h2>All findings</h2><ol class="findings">'+FINDINGS.map((f,i)=>findingItem(i+1,f,true).replace(' id="F'+(i+1)+'"',' id="R'+(i+1)+'"').replace('id="FB'+(i+1)+'"','id="RB'+(i+1)+'"').replace('aria-controls="FB'+(i+1)+'"','aria-controls="RB'+(i+1)+'"')).join('')+'</ol></div>'}
 function renderAll(){const c=DATA.contract;renderCode();renderFindings();$('#panel-report').innerHTML=reportPanel(DATA.report,c);
  $('#panel-impl').innerHTML=DATA.implementation?'<div class="report"><h2>Implementation '+esc(DATA.implementation.contract.address||'')+'</h2><p>'+summaryText(DATA.implementation.report.summary)+' · risk '+DATA.implementation.report.risk_score+'/100</p></div><pre>'+hl(DATA.implementation.contract.source)+'</pre>':'';
  $('#panel-storage').innerHTML=storagePanel(c);

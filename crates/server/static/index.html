@@ -6,105 +6,124 @@
 <title>evmdec: EVM decompiler and analyzer</title>
 <meta name="description" content="Decompile any EVM contract by address or bytecode into readable pseudo-Solidity and get a security report with evidence, before or after deployment.">
 <meta name="color-scheme" content="light dark">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@500;600;700&family=Source+Code+Pro:wght@400;600&display=swap">
 <style>
-/* Drawing set: a title block, an indexed sheet list, the code as the drawing, findings as keyed callouts. */
+/* Drawing set: an ink band holds the title block; the sheet below is the drawing; findings are keyed callouts. */
 :root{
- --bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f5f6f7;--rubric:#b3261e;--focus:#0b57d0;--sel:#dbe8ff;--lit:#fff1c2;--on-rubric:#ffffff;
+ --bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--sel:#dbe8ff;--lit:#fff1c2;
+ --band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;
  --critical:#8f1a12;--high:#b3261e;--medium:#8a5a00;--low:#1a5fb4;--info:#5a6069;
- --kw:#1a1d21;--ty:#1a1d21;--str:#365b1e;--num:#1a1d21;--cm:#5a6069;--fn:#1a1d21;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E");
- --sans:ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+ --kw:#1a1d21;--ty:#1a1d21;--str:#365b1e;--num:#1a1d21;--cm:#5a6069;--fn:#1a1d21;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");
+ --sans:"Barlow",ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;--cond:"Barlow Condensed","Barlow",ui-sans-serif,system-ui,sans-serif;--mono:"Source Code Pro",ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
  color-scheme:light}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
- --bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--on-rubric:#0f2340;
- --critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;
- --kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");color-scheme:dark}}
-:root[data-theme="dark"]{
- --bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--on-rubric:#0f2340;
- --critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;
- --kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");color-scheme:dark}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--on-rubric:#0f2340;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--band:#081829;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#27416a;--band-rubric:#ffd27a;--field:#0c1f38;--field-fg:#e6eef8;--critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;--kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--on-rubric:#0f2340;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--band:#081829;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#27416a;--band-rubric:#ffd27a;--field:#0c1f38;--field-fg:#e6eef8;--critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;--kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");color-scheme:dark}
 
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans);display:grid;grid-template-rows:auto auto minmax(0,1fr);grid-template-columns:minmax(0,1fr)}
+body[data-state="empty"]{grid-template-rows:auto minmax(0,1fr)}
+body[data-state="empty"] .tb,body[data-state="empty"] main{display:none}
+body[data-state="loaded"] #landing{display:none}
 button,input,select{font:inherit;color:inherit}
 button{cursor:pointer;min-height:24px;min-width:24px}
 button:disabled{cursor:progress;opacity:.6}
 a{color:inherit}
 :focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+header :focus-visible,.tb :focus-visible{outline-color:var(--band-rubric);outline-offset:-3px}
 ::selection{background:var(--sel);color:var(--fg)}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-.lbl{display:block;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.lbl{display:block;font:500 12px/1.3 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--band-muted)}
 
-/* header strip */
-header{display:grid;grid-template-columns:auto minmax(0,1fr) auto;border-bottom:1px solid var(--line)}
-.brand{display:flex;align-items:center;padding:0 16px;border-right:1px solid var(--line);font-weight:700;font-size:18px;letter-spacing:-.01em}
-.query{display:flex;min-width:0}
-.query input{flex:1;min-width:0;border:0;border-right:1px solid var(--line);background:transparent;padding:10px 14px;font:13px/1.5 var(--mono)}
-.query select{border:0;border-right:1px solid var(--line);background:transparent;padding:0 12px;max-width:40vw}
-.query .primary{border:0;background:var(--fg);color:var(--bg);padding:0 18px;font-weight:600}
-.theme{border:0;border-left:1px solid var(--line);background:transparent;padding:0 14px;display:flex;gap:8px;align-items:center;white-space:nowrap}
+/* ink band: header strip and title block */
+header{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:stretch;background:var(--band);color:var(--band-fg);border-bottom:1px solid var(--band-line)}
+.brand{display:flex;align-items:center;padding:0 18px;border-right:1px solid var(--band-line);font:700 20px/1 var(--cond);letter-spacing:.02em;text-transform:lowercase}
+.query{display:flex;min-width:0;align-items:stretch}
+.query input{flex:1;min-width:0;height:44px;border:0;border-right:1px solid var(--band-line);background:var(--field);color:var(--field-fg);padding:0 14px;font:14px/1.5 var(--mono)}
+.query input::placeholder{color:var(--band-muted);opacity:1}
+.chainwrap{position:relative;display:flex;border-right:1px solid var(--band-line)}
+.chainwrap::after{content:"";position:absolute;right:12px;top:50%;width:12px;height:8px;margin-top:-4px;background:var(--chev) no-repeat center;pointer-events:none}
+.query select{appearance:none;-webkit-appearance:none;height:44px;border:0;background:var(--band);color:var(--band-fg);padding:0 32px 0 14px;font:500 14px/1 var(--cond);letter-spacing:.04em;text-transform:uppercase;max-width:40vw;cursor:pointer}
+.query .primary{height:44px;border:0;background:var(--rubric);color:var(--on-rubric);padding:0 22px;font:600 15px/1 var(--cond);letter-spacing:.14em;text-transform:uppercase}
+.query .primary:hover{filter:brightness(1.08)}
+.theme{border:0;border-left:1px solid var(--band-line);background:transparent;color:var(--band-fg);padding:0 16px;display:flex;gap:8px;align-items:center;white-space:nowrap;font:500 13px/1 var(--cond);letter-spacing:.06em;text-transform:uppercase}
 .theme svg{flex:none}
+.theme:hover{background:var(--field)}
 
-/* title block */
-.tb{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));border-bottom:1px solid var(--line);background:var(--bg)}
-.tb>div{padding:6px 12px;border-right:1px solid var(--hair);min-width:0}
+.tb{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));background:var(--band);color:var(--band-fg);border-bottom:2px solid var(--band-line)}
+.tb>div{padding:7px 14px 9px;border-right:1px solid var(--band-line);min-width:0}
 .tb>div:last-child{border-right:0}
-.tb b{display:block;font-weight:500;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;min-height:1.45em}
-.tb .risk b{color:var(--rubric);font-weight:700}
-.tb .risk b.calm{color:var(--fg);font-weight:500}
+.tb b{display:block;font-weight:500;font-size:14px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;min-height:1.45em}
+.tb .risk b{color:var(--band-rubric);font:600 18px/1.2 var(--cond);letter-spacing:.02em}
+.tb .risk b.calm{color:var(--band-fg);font:500 14px/1.45 var(--sans)}
+
+/* the empty sheet */
+#landing{display:grid;place-content:start center;padding:48px 24px 64px;overflow:auto}
+.sheet{width:min(100%,760px);border:1px solid var(--line);padding:36px 40px 32px;position:relative}
+.sheet::before{content:"";position:absolute;inset:6px;border:1px solid var(--hair);pointer-events:none}
+.sheet h1{font:600 34px/1.1 var(--cond);letter-spacing:.01em;text-transform:uppercase;margin:0 0 14px;text-wrap:balance}
+.sheet h1 em{font-style:normal;color:var(--rubric)}
+.sheet p{margin:0 0 10px;max-width:62ch;color:var(--muted)}
+.sheet .examples{margin:22px 0 0;padding:0;list-style:none;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.sheet .examples li:first-child{font:500 12px/1 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-right:6px}
+.sheet .examples button{border:1px solid var(--line);background:transparent;padding:7px 14px;font:600 13px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase}
+.sheet .examples button:hover{background:var(--well)}
+.sheet .err{margin:18px 0 0}
+.sheet .foot{margin:28px 0 0;padding-top:10px;border-top:1px solid var(--hair);font:500 12px/1.4 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);display:flex;gap:18px;flex-wrap:wrap}
 
 /* three columns */
 main{display:grid;grid-template-columns:280px minmax(0,1fr) 380px;min-height:0;min-width:0}
 main>*{min-width:0;min-height:0;overflow:auto}
-.index{border-right:1px solid var(--line)}
+.index{border-right:1px solid var(--line);background:var(--well)}
 .details{border-left:1px solid var(--line)}
-.col-h{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0;padding:8px 12px;border-bottom:1px solid var(--hair);font-weight:600;position:sticky;top:0;background:var(--bg);z-index:1}
-.index input{width:100%;border:0;border-bottom:1px solid var(--hair);background:transparent;padding:8px 12px}
+.col-h{font:600 12px/1.3 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:0;padding:9px 12px;border-bottom:1px solid var(--line);position:sticky;top:0;background:inherit;z-index:1}
+.index .col-h{background:var(--well)}.details .col-h{background:var(--bg)}
+.index input{width:100%;border:0;border-bottom:1px solid var(--hair);background:var(--bg);padding:8px 12px;font:13px/1.5 var(--sans)}
 #fns{list-style:none;margin:0;padding:0}
-#fns .grp{padding:6px 12px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--hair);background:var(--well)}
-#fns li button{display:grid;grid-template-columns:3.2em minmax(0,1fr) auto;gap:8px;width:100%;text-align:left;padding:5px 12px;border:0;border-bottom:1px solid var(--hair);background:transparent;font:12px/1.5 var(--mono);align-items:baseline}
-#fns li button .sheet{color:var(--muted)}
+#fns .grp{padding:7px 12px 5px;font:600 12px/1.3 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--hair)}
+#fns li button{display:grid;grid-template-columns:3.2em minmax(0,1fr) auto;gap:8px;width:100%;text-align:left;padding:5px 12px;border:0;border-bottom:1px solid var(--hair);background:var(--bg);font:12.5px/1.5 var(--mono);align-items:baseline}
+#fns li button .sheet-no{color:var(--muted);font:500 12px/1.5 var(--cond);letter-spacing:.06em}
 #fns li button .name{overflow-wrap:normal;word-break:normal}
-#fns li button .mut{font:11px/1.5 var(--sans);color:var(--muted)}
+#fns li button .mut{font:500 11px/1.5 var(--cond);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
 #fns li button:hover{background:var(--well)}
-#fns li button[aria-current="true"]{background:var(--lit)}#fns li button[aria-current="true"] .name{font-weight:700}
+#fns li button[aria-current="true"]{background:var(--lit)}#fns li button[aria-current="true"] .name{font-weight:600}
 
 /* drawing */
 .tabs{display:flex;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:2;overflow-x:auto}
-.tabs [role=tab]{flex:none;border:0;background:transparent;padding:9px 14px;border-right:1px solid var(--hair);color:var(--muted);white-space:nowrap}
-.tabs [role=tab][aria-selected="true"]{color:var(--fg);box-shadow:inset 0 -2px 0 var(--fg)}
-.tabs .dl{flex:none;margin-left:auto;border:0;border-left:1px solid var(--hair);background:transparent;padding:0 14px;white-space:nowrap}
-.scale{display:flex;gap:16px;padding:7px 12px;border-bottom:1px solid var(--hair);font-size:12px;color:var(--muted);flex-wrap:wrap}
+.tabs [role=tab]{flex:none;border:0;background:transparent;padding:10px 16px;border-right:1px solid var(--hair);color:var(--muted);white-space:nowrap;font:600 13px/1.2 var(--cond);letter-spacing:.1em;text-transform:uppercase}
+.tabs [role=tab]:hover{color:var(--fg)}
+.tabs [role=tab][aria-selected="true"]{color:var(--fg);box-shadow:inset 0 -2px 0 var(--rubric)}
+.tabs .dl{flex:none;margin-left:auto;border:0;border-left:1px solid var(--hair);background:transparent;padding:0 16px;white-space:nowrap;font:600 13px/1.2 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--rubric)}
+.scale{display:flex;gap:16px;padding:7px 12px;border-bottom:1px solid var(--hair);font-size:13px;color:var(--muted);flex-wrap:wrap}
 .scale b{color:var(--fg);font-weight:600}
+.scale button{border:0;background:transparent;color:var(--fg);text-decoration:underline;padding:0;font:inherit}
 .code{list-style:none;margin:0;padding:10px 0 32px;font:13px/1.5 var(--mono);tab-size:4;counter-reset:ln;overflow-x:auto}
 .code li{display:grid;grid-template-columns:3.4em 8.6em minmax(0,1fr);min-height:1.5em;align-items:start;position:relative}
 .code li::before{counter-increment:ln;content:counter(ln);grid-column:1;grid-row:1;text-align:right;padding-right:.4em;color:var(--muted);font-variant-numeric:tabular-nums;user-select:none}
 .code code{grid-column:3;grid-row:1;white-space:pre;display:block;padding-right:1.5em;width:max-content;min-width:100%}
 .code .co-cell{grid-column:2;grid-row:1;display:flex;gap:2px;padding-left:2px;align-self:center}
-.co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 11px/1 var(--sans);text-decoration:none}
+.co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 12px/1 var(--cond);text-decoration:none}
 .co:hover{background:var(--rubric);color:var(--on-rubric)}
 .code li.flagged{background:var(--well);padding:6px 0}
 .code li.flagged::after{content:"";position:absolute;top:0;bottom:0;left:calc(12em - 7px);right:4px;border:6px solid transparent;border-image:var(--cloud) 6 round;pointer-events:none}
 .code li.lit,.finding.lit{background:var(--lit)}
 .kw{color:var(--kw)}.ty{color:var(--ty)}.st{color:var(--str)}.nu{color:var(--num)}.cm{color:var(--cm)}.fnname{color:var(--fn);font-weight:600}
 pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:auto;tab-size:4}
-.landing{padding:40px 32px 48px;max-width:70ch}
-.landing h1{font-size:24px;margin:0 0 12px;line-height:1.25;text-wrap:balance}
-.landing p{margin:0 0 12px;color:var(--muted)}
-.landing ul{margin:16px 0 0;padding:0;list-style:none;display:flex;gap:8px;flex-wrap:wrap}
-.landing ul button{border:1px solid var(--line);background:transparent;padding:6px 12px;font-weight:600}
 .err{margin:16px;padding:12px 14px;border:1px solid var(--rubric);color:var(--fg)}
 .err b{color:var(--rubric)}
 
 /* details */
 .findings{list-style:none;margin:0;padding:0}
 .finding{border-bottom:1px solid var(--hair)}
-.finding>button{display:grid;grid-template-columns:30px auto minmax(0,1fr);grid-template-areas:"n s t" "n s m";gap:2px 8px;width:100%;text-align:left;border:0;background:transparent;padding:8px 12px;align-items:baseline}
+.finding>button{display:grid;grid-template-columns:30px auto minmax(0,1fr);grid-template-areas:"n s t" "n s m";gap:2px 8px;width:100%;text-align:left;border:0;background:transparent;padding:9px 12px;align-items:baseline}
+.finding>button:hover{background:var(--well)}
 .finding .fnum{grid-area:n;align-self:start}
-.finding .sev{grid-area:s;font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase}
-.finding .ftitle{grid-area:t;overflow-wrap:anywhere}
-.finding .fmeta{grid-area:m;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.finding .sev{grid-area:s;font:600 12px/1.5 var(--cond);letter-spacing:.1em;text-transform:uppercase}
+.finding .ftitle{grid-area:t;overflow-wrap:anywhere;font-weight:500}
+.finding .fmeta{grid-area:m;color:var(--muted);font-size:12.5px;overflow-wrap:anywhere}
 .finding .fmeta code{font:12px/1.5 var(--mono)}
 .fbody{padding:0 12px 14px 50px}
 .fbody p{margin:6px 0;max-width:70ch}
@@ -112,46 +131,58 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .fbody .goto{font-size:12px;color:var(--muted)}.fbody .goto a{display:inline-block;min-width:24px;min-height:24px;line-height:24px;text-align:center;padding:0 2px}
 .sev-critical{color:var(--critical)}.sev-high{color:var(--high)}.sev-medium{color:var(--medium)}.sev-low{color:var(--low)}.sev-info{color:var(--info)}
 .report{padding:16px 24px 40px;max-width:90ch}
-.report h2{font-size:15px;margin:22px 0 8px;font-weight:600}
+.report h2{font:600 13px/1.3 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:24px 0 8px}
 .report h2:first-child{margin-top:0}
 .report table{border-collapse:collapse;font-size:13px;width:100%}
 .report th,.report td{border:1px solid var(--hair);padding:4px 8px;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}
-.report th{color:var(--muted);font-weight:600}
+.report th{color:var(--muted);font:600 12px/1.4 var(--cond);letter-spacing:.08em;text-transform:uppercase}
 .report ul{margin:0;padding:0;list-style:none}
 .report li{margin:0;padding:3px 0;border-bottom:1px solid var(--hair)}
 .report code{font:12.5px/1.5 var(--mono)}
-.status{padding:0 12px;display:flex;align-items:center;color:var(--muted);font-size:12px;white-space:nowrap}
 
 @media (prefers-reduced-motion:no-preference){.code li,.finding{transition:background .2s ease-out}}
 @media (max-width:1100px){main{grid-template-columns:240px minmax(0,1fr)}.details{grid-column:1/-1;border-left:0;border-top:1px solid var(--line)}.tb{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media (max-width:720px){
  html,body{height:auto}body{display:block}
- header{display:flex;flex-wrap:wrap}.brand{border:0;padding:10px 16px;width:100%;border-bottom:1px solid var(--line)}
- .query{flex:1 1 100%;flex-wrap:wrap}.query input{flex-basis:100%;border-right:0;border-bottom:1px solid var(--line)}.query select{flex:1;max-width:none}.query .primary{flex:1}
- .theme{flex:1 1 100%;justify-content:center;border:0;border-top:1px solid var(--line);padding:8px}
+ header{display:flex;flex-wrap:wrap}.brand{border:0;padding:12px 16px;width:100%;border-bottom:1px solid var(--band-line)}
+ .query{flex:1 1 100%;flex-wrap:wrap}.query input{flex-basis:100%;border-right:0;border-bottom:1px solid var(--band-line)}.chainwrap{flex:1;border-right:1px solid var(--band-line)}.query select{width:100%;max-width:none}.query .primary{flex:1}
+ .theme{flex:1 1 100%;justify-content:center;border:0;border-top:1px solid var(--band-line);padding:10px}
  .tb{grid-template-columns:repeat(2,minmax(0,1fr))}
  main{display:block}main>*{overflow:visible;max-height:none;height:auto;border:0}
  .drawing [role=tabpanel]{max-height:70vh;overflow:auto}.drawing .tabs{position:static}
  .index{border-bottom:1px solid var(--line)}.index #fns{max-height:40vh;overflow:auto}
  .details{border-top:1px solid var(--line)}
- .landing{padding:24px 16px}
+ #landing{padding:24px 16px 40px}.sheet{padding:24px 20px}.sheet h1{font-size:28px}
 }
 </style>
 </head>
-<body>
+<body data-state="empty">
 <header>
   <div class="brand">evmdec</div>
   <form class="query" id="form" role="search" aria-label="Decompile a contract">
     <label for="q" class="sr">Contract address or raw bytecode hex</label>
     <input id="q" name="q" type="text" placeholder="Contract address (0x…) or raw bytecode hex" autocomplete="off" spellcheck="false" autofocus>
     <label for="chain" class="sr">Chain</label>
-    <select id="chain" name="chain"><option value="mainnet">mainnet (1)</option></select>
+    <span class="chainwrap"><select id="chain" name="chain"><option value="mainnet">mainnet (1)</option></select></span>
     <button class="primary" id="go" type="submit">Decompile</button>
   </form>
   <button id="theme" type="button" class="theme" aria-pressed="false"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.5v13A6.5 6.5 0 0 0 8 1.5z" fill="currentColor"/></svg><span>Light theme</span></button>
 </header>
+<section id="landing" aria-label="Start">
+  <div class="sheet">
+    <h1>Decompile any EVM contract.<br>Then <em>read what it really does.</em></h1>
+    <p>Paste an address and pick its chain, or paste the bytecode of a contract you are about to deploy. You get structured pseudo-Solidity with the functions, storage, events and revert reasons recovered, and a security report whose findings are keyed to the lines they are about.</p>
+    <ul class="examples" aria-label="Examples"><li>Try</li>
+      <li><button type="button" data-try="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" data-chain="mainnet">WETH</button></li>
+      <li><button type="button" data-try="0xdAC17F958D2ee523a2206206994597C13D831ec7" data-chain="mainnet">USDT</button></li>
+      <li><button type="button" data-try="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" data-chain="mainnet">USDC proxy</button></li>
+    </ul>
+    <div id="landing-err"></div>
+    <div class="foot"><span>Proxies followed to their implementation</span><span>Every block checked against a concrete EVM</span><span>Findings carry a confidence</span></div>
+  </div>
+</section>
 <div class="tb" id="tb" aria-label="Title block">
-  <div><span class="lbl">Sheet</span><b id="tb-sheet">No sheet loaded</b></div>
+  <div><span class="lbl">Sheet</span><b id="tb-sheet"></b></div>
   <div><span class="lbl">Chain</span><b id="tb-chain"></b></div>
   <div><span class="lbl">Address</span><b id="tb-address"></b></div>
   <div><span class="lbl">Compiler</span><b id="tb-compiler"></b></div>
@@ -175,21 +206,10 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
       <button role="tab" id="tab-storage" aria-controls="panel-storage" aria-selected="false" tabindex="-1">Storage &amp; events</button>
       <button role="tab" id="tab-disasm" aria-controls="panel-disasm" aria-selected="false" tabindex="-1">Disassembly</button>
       <button role="tab" id="tab-json" aria-controls="panel-json" aria-selected="false" tabindex="-1">JSON</button>
-      <button id="dl" class="dl" type="button" hidden>Download .sol</button>
+      <button id="dl" class="dl" type="button">Download .sol</button>
     </div>
     <div class="scale" id="scale" hidden></div>
-    <div role="tabpanel" id="panel-code" aria-labelledby="tab-code">
-      <div class="landing" id="landing">
-        <h1>Decompile any EVM contract. Then read what it really does.</h1>
-        <p>evmdec turns deployed bytecode, fetched by address on any EVM chain, or freshly compiled bytecode into structured pseudo-Solidity: functions with selectors, parameters and mutability, storage layout, events, internal helpers, revert reasons. It then analyses the result for reentrancy, unchecked calls, delegatecall and selfdestruct exposure, missing access control, proxies, weak randomness and unchecked arithmetic, and reports each finding with the lines it is about.</p>
-        <p>Paste the creation or runtime bytecode of a contract you are about to deploy to review it the way an attacker would see it, or an address to inspect what is live. Proxies are followed to their implementation. Every basic block's lifted semantics are checked against a concrete EVM interpreter on random inputs; the measured numbers are in the README.</p>
-        <ul aria-label="Examples">
-          <li><button type="button" data-try="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" data-chain="mainnet">WETH</button></li>
-          <li><button type="button" data-try="0xdAC17F958D2ee523a2206206994597C13D831ec7" data-chain="mainnet">USDT</button></li>
-          <li><button type="button" data-try="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" data-chain="mainnet">USDC (proxy)</button></li>
-        </ul>
-      </div>
-    </div>
+    <div role="tabpanel" id="panel-code" aria-labelledby="tab-code"></div>
     <div role="tabpanel" id="panel-report" aria-labelledby="tab-report" hidden></div>
     <div role="tabpanel" id="panel-impl" aria-labelledby="tab-impl" hidden></div>
     <div role="tabpanel" id="panel-storage" aria-labelledby="tab-storage" hidden></div>
@@ -198,7 +218,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
   </section>
   <aside class="details" aria-label="Details">
     <h2 class="col-h" id="details-h">Details</h2>
-    <ol class="findings" id="findings"><li class="finding"><div class="fbody" style="padding:12px;color:var(--muted)">No findings yet. Decompile a contract and its findings are keyed here to the lines they are about.</div></li></ol>
+    <ol class="findings" id="findings"></ol>
   </aside>
 </main>
 <p id="status" class="sr" role="status" aria-live="polite"></p>
@@ -241,11 +261,11 @@ async function go(){const q=$('#q').value.trim();if(!q)return;const btn=$('#go')
   const isAddr=/^0x[0-9a-fA-F]{40}$/.test(q);const body=isAddr?{address:q,chain:$('#chain').value}:{bytecode:q};
   const r=await fetch('/api/decompile',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);
-  DATA=j;CUR=null;
+  DATA=j;CUR=null;document.body.dataset.state='loaded';$('#landing-err').innerHTML='';
   if(isAddr){history.replaceState(null,'','?chain='+encodeURIComponent($('#chain').value)+'&address='+q)}
   titleBlock();prepareFindings();renderFns();renderAll();selectTab($('#tab-code'));
   say('Decompiled: '+j.contract.stats.external_functions+' external functions, '+FINDINGS.length+' findings, risk '+j.report.risk_score+' of 100');
- }catch(e){$('#panel-code').innerHTML='<div class="err" role="alert"><b>Could not decompile.</b> '+esc(e.message||e)+' Check the address and chain, or paste the bytecode directly.</div>';say('Failed: '+(e.message||e))}
+ }catch(e){const msg='<div class="err" role="alert"><b>Could not decompile.</b> '+esc(e.message||e)+' Check the address and chain, or paste the bytecode directly.</div>';if(DATA)$('#panel-code').innerHTML=msg;else $('#landing-err').innerHTML=msg;say('Failed: '+(e.message||e))}
  finally{btn.disabled=false;btn.textContent='Decompile';document.body.removeAttribute('aria-busy')}}
 
 function riskWord(s){return s>=80?'Critical':s>=40?'High':s>=20?'Medium':s>=8?'Low':'Minimal'}
@@ -259,7 +279,7 @@ function titleBlock(){const c=DATA.contract,s=c.stats,rep=DATA.report;const meta
  $('#tb-coverage').textContent=s.covered_blocks+'/'+s.code_blocks+' blocks · '+s.unresolved_jumps+' unresolved · '+s.time_ms+' ms';
  $('#tb-findings').textContent=summaryText(rep.summary);
  const r=$('#tb-risk');r.textContent=rep.risk_score+'/100 · '+riskWord(rep.risk_score);r.classList.toggle('calm',rep.risk_score<8);
- $('#dl').hidden=false;$('#tab-impl').hidden=!DATA.implementation}
+ $('#tab-impl').hidden=!DATA.implementation}
 
 /* findings and callouts: evidence lines are matched to source lines */
 function prepareFindings(){const f=(DATA.report.findings||[]).slice();f.sort((a,b)=>(SEV[a.severity]-SEV[b.severity])||((a.function?0:1)-(b.function?0:1)));FINDINGS=f;
@@ -278,7 +298,7 @@ function renderFns(){if(!DATA)return;const q=$('#filter').value.toLowerCase();co
   const sig=x.kind==='external'?x.name+'('+x.params.map(p=>p.ty).join(',')+')':x.name+'('+Array.from({length:x.n_args},()=>'uint256').join(',')+')';
   const mut=x.kind==='external'?x.mutability.replace('_',''):x.kind;
   if(q&&!(sig.toLowerCase().includes(q)||(x.selector||'').includes(q)))return;
-  out+='<li><button type="button" data-pc="'+x.pc+'" aria-current="'+(CUR===x.pc?'true':'false')+'"><span class="sheet">F-'+String(sheet).padStart(2,'0')+'</span><span class="name">'+esc(sig).replace(/([(,])/g,'$1<wbr>')+'</span><span class="mut">'+esc(mut)+'</span></button></li>'});
+  out+='<li><button type="button" data-pc="'+x.pc+'" aria-current="'+(CUR===x.pc?'true':'false')+'"><span class="sheet-no">F-'+String(sheet).padStart(2,'0')+'</span><span class="name">'+esc(sig).replace(/([(,])/g,'$1<wbr>')+'</span><span class="mut">'+esc(mut)+'</span></button></li>'});
  $('#fns').innerHTML=out;document.querySelectorAll('#fns button').forEach(b=>b.addEventListener('click',()=>{CUR=CUR===+b.dataset.pc?null:+b.dataset.pc;renderFns();renderCode();selectTab($('#tab-code'));$('#panel-code').scrollTop=0}))}
 
 function fnRange(c,pc){const f=c.functions.find(x=>x.pc===pc);if(!f)return null;const head=f.kind==='external'?'function '+f.name+'(':f.kind==='fallback'?'fallback()':f.kind==='receive'?'receive()':'function '+f.name+'(';let s=SRC_LINES.findIndex(l=>l.trim().startsWith(head));if(s<0)return null;let e=s;for(let i=s;i<SRC_LINES.length;i++){if(SRC_LINES[i]==='    }'){e=i;break}}if(s>0&&SRC_LINES[s-1].trim().startsWith('//'))s--;return [s,e]}
@@ -289,7 +309,7 @@ function renderCode(){const c=DATA.contract;let ranges=[];let helpers=[];
  const block=([from,to])=>{let rows='';for(let i=from;i<=to;i++){const l=SRC_LINES[i];const co=CALLOUTS.get(i);const cls=co?' flagged':'';let bubbles='';if(co)bubbles='<span class="co-cell">'+co.map(n=>'<a class="co" href="#F'+n+'" aria-label="Finding '+n+': '+esc(FINDINGS[n-1].title)+'">'+n+'</a>').join('')+'</span>';rows+='<li id="L'+(i+1)+'" class="ln'+cls+'">'+bubbles+'<code>'+(hl(l)||' ')+'</code></li>'}return '<ol class="code" aria-label="Decompiled code, lines '+(from+1)+' to '+(to+1)+'" style="counter-reset:ln '+from+'">'+rows+'</ol>'};
  $('#panel-code').innerHTML=ranges.map(block).join('');
  const range=ranges[0],from=range[0],to=range[1];const f=CUR!=null?c.functions.find(x=>x.pc===CUR):null;const rangeText=ranges.map(([a,b])=>(a+1)+' to '+(b+1)).join(' and ');const scale=$('#scale');scale.hidden=$('#tab-code').getAttribute('aria-selected')!=='true';
- scale.innerHTML='<span>'+(f?'Showing <b>'+esc(f.name)+'</b>'+(helpers.length?' and its helper'+(helpers.length>1?'s ':' ')+helpers.map(h=>'<b>'+esc(h)+'</b>').join(', '):'')+' (lines '+rangeText+' of '+SRC_LINES.length+')':'Showing the <b>whole contract</b>, '+SRC_LINES.length+' lines')+'</span><span><b>'+CALLOUTS.size+'</b> flagged line'+(CALLOUTS.size===1?'':'s')+'</span><span>Callouts key to the details at right</span>'+(f?'<button type="button" id="showall" style="border:0;background:transparent;color:var(--fg);text-decoration:underline;padding:0">Show whole contract</button>':'');
+ scale.innerHTML='<span>'+(f?'Showing <b>'+esc(f.name)+'</b>'+(helpers.length?' and its helper'+(helpers.length>1?'s ':' ')+helpers.map(h=>'<b>'+esc(h)+'</b>').join(', '):'')+' (lines '+rangeText+' of '+SRC_LINES.length+')':'Showing the <b>whole contract</b>, '+SRC_LINES.length+' lines')+'</span><span><b>'+CALLOUTS.size+'</b> flagged line'+(CALLOUTS.size===1?'':'s')+'</span><span>Callouts key to the details at right</span>'+(f?'<button type="button" id="showall">Show whole contract</button>':'');
  const sa=$('#showall');if(sa)sa.addEventListener('click',()=>{CUR=null;renderFns();renderCode()})}
 
 function findingItem(n,f,open){const fn=f.function?f.function.split(' [')[0]:'contract';const lines=[];CALLOUTS.forEach((arr,k)=>{if(arr.includes(n))lines.push(k+1)});

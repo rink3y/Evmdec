@@ -3,8 +3,27 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>evmdec: EVM decompiler and analyzer</title>
-<meta name="description" content="Decompile any EVM contract by address or bytecode into readable pseudo-Solidity and get a security report with evidence, before or after deployment.">
+<title>evmdec: EVM bytecode decompiler and smart contract security analyzer</title>
+<meta name="description" content="Decompile any EVM smart contract from its address on any chain, or from raw bytecode, into readable pseudo-Solidity. Recovered functions, storage layout, events and revert reasons, plus a security report (reentrancy, unchecked calls, delegatecall, access control, proxies) with findings keyed to the exact lines.">
+<meta name="keywords" content="EVM decompiler, bytecode decompiler, smart contract decompiler, Solidity decompiler, smart contract security analyzer, reentrancy detection, Ethereum, bytecode analysis">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="__ORIGIN__/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/favicon.svg">
+<meta name="theme-color" content="#132e4f">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="evmdec">
+<meta property="og:title" content="evmdec: decompile any EVM contract, then read what it really does">
+<meta property="og:description" content="Readable pseudo-Solidity from any contract address or bytecode, with a security report whose findings point at the exact lines. Proxies followed, every block verified against a concrete EVM.">
+<meta property="og:url" content="__ORIGIN__/">
+<meta property="og:image" content="__ORIGIN__/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="evmdec: decompile any EVM contract, then read what it really does">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="evmdec: decompile any EVM contract, then read what it really does">
+<meta name="twitter:description" content="Readable pseudo-Solidity from any contract address or bytecode, with a security report whose findings point at the exact lines.">
+<meta name="twitter:image" content="__ORIGIN__/og.png">
 <meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -89,6 +108,7 @@ main>*{min-width:0;min-height:0;overflow:auto}
 #fns li button .name{overflow-wrap:normal;word-break:normal}
 #fns li button .mut{font:500 11px/1.5 var(--cond);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
 #fns li button:hover{background:var(--well)}
+#fns li:first-child button .name{font:500 13px/1.5 var(--sans)}
 #fns li button[aria-current="true"]{background:var(--lit)}#fns li button[aria-current="true"] .name{font-weight:600}
 
 /* drawing */
@@ -264,6 +284,7 @@ async function go(){const q=$('#q').value.trim();if(!q)return;const btn=$('#go')
   DATA=j;CUR=null;document.body.dataset.state='loaded';$('#landing-err').innerHTML='';
   if(isAddr){history.replaceState(null,'','?chain='+encodeURIComponent($('#chain').value)+'&address='+q)}
   titleBlock();prepareFindings();renderFns();renderAll();selectTab($('#tab-code'));
+  document.title=(isAddr?q.slice(0,10)+'…'+q.slice(-4)+' on '+$('#chain').value:'pasted bytecode')+' · evmdec: risk '+j.report.risk_score+'/100';
   say('Decompiled: '+j.contract.stats.external_functions+' external functions, '+FINDINGS.length+' findings, risk '+j.report.risk_score+' of 100');
  }catch(e){const msg='<div class="err" role="alert"><b>Could not decompile.</b> '+esc(e.message||e)+' Check the address and chain, or paste the bytecode directly.</div>';if(DATA)$('#panel-code').innerHTML=msg;else $('#landing-err').innerHTML=msg;say('Failed: '+(e.message||e))}
  finally{btn.disabled=false;btn.textContent='Decompile';document.body.removeAttribute('aria-busy')}}
@@ -293,13 +314,13 @@ function prepareFindings(){const f=(DATA.report.findings||[]).slice();f.sort((a,
 function hl(src){const KW=/^(function|contract|if|else|while|return|revert|require|assert|emit|event|error|external|internal|view|pure|payable|returns|mapping|fallback|receive|constructor|break|continue|switch|case|goto|true|false|unchecked|delete|new)$/,TY=/^(address|uint\d*|int\d*|bool|bytes\d*|string)$/;
  return esc(src).replace(/(\/\/[^\n]*)|(&quot;(?:[^\\\n]|\\.)*?&quot;)|\b(0x[0-9a-fA-F]+|\d+)\b|\b([A-Za-z_]\w*)\b/g,(m,cm,st,nu,id)=>{if(cm)return '<span class="cm">'+cm+'</span>';if(st)return '<span class="st">'+st+'</span>';if(nu)return '<span class="nu">'+nu+'</span>';if(KW.test(id))return '<span class="kw">'+id+'</span>';if(TY.test(id))return '<span class="ty">'+id+'</span>';return id}).replace(/(<span class="kw">function<\/span>) ([A-Za-z_]\w*)/g,'$1 <span class="fnname">$2</span>')}
 
-function renderFns(){if(!DATA)return;const q=$('#filter').value.toLowerCase();const fs=DATA.contract.functions.filter(x=>!x.inlined);let out='',sheet=0,lastKind='';
+function renderFns(){if(!DATA)return;const q=$('#filter').value.toLowerCase();const fs=DATA.contract.functions.filter(x=>!x.inlined);let out='<li><button type="button" data-pc="-1" aria-current="'+(CUR==null?'true':'false')+'"><span class="sheet-no">F-00</span><span class="name">Whole contract</span><span class="mut">'+SRC_LINES.length+' lines</span></button></li>',sheet=0,lastKind='';
  fs.forEach(x=>{sheet++;if(x.kind!==lastKind){lastKind=x.kind;const n=fs.filter(y=>y.kind===x.kind).length;out+='<li class="grp" role="presentation">'+esc(x.kind)+' · '+n+'</li>'}
   const sig=x.kind==='external'?x.name+'('+x.params.map(p=>p.ty).join(',')+')':x.name+'('+Array.from({length:x.n_args},()=>'uint256').join(',')+')';
   const mut=x.kind==='external'?x.mutability.replace('_',''):x.kind;
   if(q&&!(sig.toLowerCase().includes(q)||(x.selector||'').includes(q)))return;
   out+='<li><button type="button" data-pc="'+x.pc+'" aria-current="'+(CUR===x.pc?'true':'false')+'"><span class="sheet-no">F-'+String(sheet).padStart(2,'0')+'</span><span class="name">'+esc(sig).replace(/([(,])/g,'$1<wbr>')+'</span><span class="mut">'+esc(mut)+'</span></button></li>'});
- $('#fns').innerHTML=out;document.querySelectorAll('#fns button').forEach(b=>b.addEventListener('click',()=>{CUR=CUR===+b.dataset.pc?null:+b.dataset.pc;renderFns();renderCode();selectTab($('#tab-code'));$('#panel-code').scrollTop=0}))}
+ $('#fns').innerHTML=out;document.querySelectorAll('#fns button').forEach(b=>b.addEventListener('click',()=>{const pc=+b.dataset.pc;CUR=(pc<0||CUR===pc)?null:pc;renderFns();renderCode();selectTab($('#tab-code'));$('#panel-code').scrollTop=0}))}
 
 function fnRange(c,pc){const f=c.functions.find(x=>x.pc===pc);if(!f)return null;const head=f.kind==='external'?'function '+f.name+'(':f.kind==='fallback'?'fallback()':f.kind==='receive'?'receive()':'function '+f.name+'(';let s=SRC_LINES.findIndex(l=>l.trim().startsWith(head));if(s<0)return null;let e=s;for(let i=s;i<SRC_LINES.length;i++){if(SRC_LINES[i]==='    }'){e=i;break}}if(s>0&&SRC_LINES[s-1].trim().startsWith('//'))s--;return [s,e]}
 function helpersOf(c,pc){const out=[];const seen=new Set([pc]);const work=[pc];while(work.length){const f=c.functions.find(x=>x.pc===work.shift());if(!f)continue;(f.calls||[]).forEach(q=>{if(seen.has(q))return;seen.add(q);const g=c.functions.find(x=>x.pc===q);if(g&&!g.inlined){out.push(q);work.push(q)}})}return out}

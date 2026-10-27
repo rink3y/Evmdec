@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 const INDEX: &str = include_str!("../static/index.html");
+const OG_PNG: &[u8] = include_bytes!("../static/og.png");
+const FAVICON: &str = include_str!("../static/favicon.svg");
 
 #[derive(Clone, Default)]
 struct AppState {
@@ -133,8 +135,24 @@ async fn api_address(State(st): State<AppState>, Path((chain, address)): Path<(S
     api_decompile(State(st), Json(DecompileReq { address: Some(address), chain: Some(chain), ..Default::default() })).await
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX)
+/// The page, with `__ORIGIN__` (used by the Open Graph tags, which need absolute URLs) replaced
+/// by the scheme and host this request arrived on.
+async fn index(headers: header::HeaderMap) -> Html<String> {
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost:8080");
+    let proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()).unwrap_or(if host.starts_with("localhost") || host.starts_with("127.") { "http" } else { "https" });
+    Html(INDEX.replace("__ORIGIN__", &format!("{}://{}", proto, host)))
+}
+
+async fn og_image() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=86400")], OG_PNG)
+}
+
+async fn favicon() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, "public, max-age=86400")], FAVICON)
+}
+
+async fn robots() -> &'static str {
+    "User-agent: *\nAllow: /\nDisallow: /api/\n"
 }
 
 async fn healthz() -> &'static str {
@@ -151,6 +169,10 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
+        .route("/og.png", get(og_image))
+        .route("/favicon.svg", get(favicon))
+        .route("/favicon.ico", get(favicon))
+        .route("/robots.txt", get(robots))
         .route("/api/chains", get(chains))
         .route("/api/decompile", post(api_decompile))
         .route("/api/address/{chain}/{address}", get(api_address))
@@ -159,6 +181,5 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", port);
     eprintln!("evmdec-server listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
-    let _ = header::CONTENT_TYPE;
     axum::serve(listener, app).await.expect("serve");
 }

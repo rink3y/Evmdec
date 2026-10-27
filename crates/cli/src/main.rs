@@ -19,9 +19,18 @@ enum Cmd {
     Disasm { file: PathBuf },
     /// Control-flow recovery statistics.
     Cfg { file: PathBuf },
-    /// Decompile to pseudo-Solidity.
+    /// Decompile to pseudo-Solidity. INPUT is a file (binary or hex), a hex string, or a 0x address.
     Decompile {
-        file: PathBuf,
+        input: String,
+        /// JSON-RPC endpoint(s), comma-separated (default: public endpoints of --chain, or $EVMDEC_RPC_URL).
+        #[arg(long)]
+        rpc: Option<String>,
+        /// Chain name or id for address lookups.
+        #[arg(long, default_value = "mainnet")]
+        chain: String,
+        /// Do not resolve and decompile the implementation behind a proxy.
+        #[arg(long)]
+        no_follow_proxy: bool,
         /// Labels and gotos instead of structured code.
         #[arg(long)]
         flat: bool,
@@ -37,6 +46,19 @@ enum Cmd {
         /// Append the security report (markdown) after the code.
         #[arg(long)]
         report: bool,
+    },
+    /// Block-level oracle: execute every basic block concretely and through the lifted IR.
+    Verify {
+        file: PathBuf,
+        /// Random states per block.
+        #[arg(long, default_value_t = 8)]
+        runs: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long)]
+        verbose: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Security analysis report (markdown, or JSON with --json).
     Analyze {
@@ -56,6 +78,56 @@ fn load(file: &PathBuf) -> Result<Vec<u8>> {
         }
     }
     Ok(raw)
+}
+
+/// A file path, or a hex string given directly on the command line.
+fn load_input(input: &str) -> Result<Vec<u8>> {
+    let p = PathBuf::from(input);
+    if p.exists() {
+        return load(&p);
+    }
+    let t = input.trim();
+    if t.starts_with("0x") || (t.len() > 8 && t.chars().all(|c| c.is_ascii_hexdigit())) {
+        return evmdec::hex::decode(t).map_err(|e| anyhow::anyhow!(e));
+    }
+    anyhow::bail!("'{}' is neither a file, a hex string nor an address", input)
+}
+
+fn fetch_and_decompile(address: &str, rpc: Option<&str>, chain: &str, follow: bool, opts: &evmdec::decompile::Options) -> Result<evmdec::decompile::Contract> {
+    let client = evmdec::rpc::Client::new(rpc, chain).map_err(|e| anyhow::anyhow!(e))?;
+    eprintln!("fetching code of {} on {}...", address, chain);
+    let code = client.get_code(address).map_err(|e| anyhow::anyhow!(e))?;
+    if code.is_empty() {
+        anyhow::bail!("{} has no code on {} (not a contract, or wrong chain)", address, chain);
+    }
+    let mut c = evmdec::decompile::decompile(&code, opts);
+    c.address = Some(address.to_string());
+    c.chain = Some(chain.to_string());
+    if follow {
+        let slots: Vec<evmdec::U256> = c.delegatecall_slots.iter().filter_map(|s| evmdec::U256::from_hex_str(s)).collect();
+        let targets: Vec<evmdec::U256> = c.delegatecall_targets.iter().filter_map(|s| evmdec::U256::from_hex_str(s)).collect();
+        let is_proxy = !slots.is_empty() || !targets.is_empty() || code.len() < 100;
+        if is_proxy {
+            match evmdec::rpc::resolve_proxy(&client, address, &code, &slots, &targets) {
+                Ok(Some(p)) => {
+                    eprintln!("{}: implementation {} — fetching...", p.kind, p.implementation);
+                    let impl_code = client.get_code(&p.implementation).map_err(|e| anyhow::anyhow!(e))?;
+                    let ic = if impl_code.is_empty() { None } else {
+                        let mut ic = evmdec::decompile::decompile(&impl_code, opts);
+                        ic.address = Some(p.implementation.clone());
+                        ic.chain = Some(chain.to_string());
+                        ic.source = evmdec::decompile::render(&ic, "Implementation");
+                        Some(Box::new(ic))
+                    };
+                    c.proxy = Some(evmdec::decompile::ProxyRef { kind: p.kind, implementation: p.implementation, admin: p.admin, contract: ic });
+                    c.source = evmdec::decompile::render(&c, "Proxy");
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("proxy resolution failed: {}", e),
+            }
+        }
+    }
+    Ok(c)
 }
 
 fn main() -> Result<()> {
@@ -111,10 +183,15 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Decompile { file, flat, json, embedded, no_sigs, report } => {
-            let code = load(&file)?;
+        Cmd::Decompile { input, rpc, chain, no_follow_proxy, flat, json, embedded, no_sigs, report } => {
             let opts = evmdec::decompile::Options { flat, pcs: false, embedded, no_sigs };
-            let c = evmdec::decompile::decompile(&code, &opts);
+            let file = PathBuf::from(&input);
+            let c = if evmdec::rpc::is_address(&input) {
+                fetch_and_decompile(&input, rpc.as_deref(), &chain, !no_follow_proxy, &opts)?
+            } else {
+                let code = load_input(&input)?;
+                evmdec::decompile::decompile(&code, &opts)
+            };
             if json {
                 let r = evmdec::analyze::analyze(&c);
                 let mut v = serde_json::to_value(&c)?;
@@ -125,6 +202,31 @@ fn main() -> Result<()> {
                 if report {
                     let r = evmdec::analyze::analyze(&c);
                     println!("\n/*\n{}*/", evmdec::analyze::render_markdown(&c, &r, &file.display().to_string()));
+                    if let Some(p) = &c.proxy {
+                        if let Some(ic) = &p.contract {
+                            let r2 = evmdec::analyze::analyze(ic);
+                            println!("\n/*\n{}*/", evmdec::analyze::render_markdown(ic, &r2, &format!("implementation {}", p.implementation)));
+                        }
+                    }
+                }
+            }
+        }
+        Cmd::Verify { file, runs, seed, verbose, json } => {
+            let code = load(&file)?;
+            let info = evmdec::metadata::analyze(&code);
+            let st = evmdec::verify::verify(&info.runtime, &evmdec::verify::VerifyOptions { runs, seed, verbose });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&st)?);
+            } else {
+                println!("blocks={} runs={} agree={} mismatch={} inconclusive={}", st.blocks, st.runs, st.agree, st.mismatch, st.inconclusive);
+                println!("blocks verified={} mismatched={} inconclusive={}; instructions verified {}/{} ({:.3}%)", st.blocks_verified, st.blocks_mismatched, st.blocks_inconclusive, st.instructions_verified, st.instructions_total, 100.0 * st.instructions_verified as f64 / st.instructions_total.max(1) as f64);
+                let mut reasons: Vec<(&String, &usize)> = st.inconclusive_reasons.iter().collect();
+                reasons.sort_by(|a, b| b.1.cmp(a.1));
+                for (r, n) in reasons.iter().take(8) {
+                    println!("  inconclusive: {} x{}", r, n);
+                }
+                for m in st.mismatches.iter().take(20) {
+                    println!("  {}", m);
                 }
             }
         }

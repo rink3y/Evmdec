@@ -91,6 +91,30 @@ pub struct Contract {
     pub embedded: Vec<Contract>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub constructor: Option<Box<Contract>>,
+    /// Storage slots whose value is used as a DELEGATECALL target (proxy implementation slots).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub delegatecall_slots: Vec<String>,
+    /// Constant addresses used as DELEGATECALL targets.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub delegatecall_targets: Vec<String>,
+    /// Filled when the contract was fetched by address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+    /// Implementation behind this proxy, when resolved on-chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxyRef>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProxyRef {
+    pub kind: String,
+    pub implementation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract: Option<Box<Contract>>,
 }
 
 pub fn decompile(code: &[u8], opts: &Options) -> Contract {
@@ -139,8 +163,32 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         eprintln!("[timing] start runtime of {} bytes", code.len());
     }
     let prog = Program::new(code.to_vec());
-    let code_end = info.metadata.as_ref().map(|m| m.offset).unwrap_or(code.len());
-    let rec = cfg::recover(&prog, code_end);
+    let mut code_end = info.metadata.as_ref().map(|m| m.offset).unwrap_or(code.len());
+    let mut rec = cfg::recover(&prog, code_end);
+    if info.metadata.is_none() {
+        // Without a metadata trailer the end of the code is unknown: a trailing region that is
+        // reached by nothing and whose JUMPDESTs are referenced by no PUSH in reached code is data
+        // (Vyper constants, embedded payloads), not code.
+        let reached: BTreeSet<usize> = std::iter::once(&rec.main).chain(rec.functions.values()).flat_map(|u| u.nodes.iter().map(|n| n.block)).collect();
+        if let Some(last) = reached.iter().max() {
+            let last_end = prog.blocks[*last].end;
+            let referenced: HashSet<usize> = std::iter::once(&rec.main).chain(rec.functions.values()).flat_map(|u| u.nodes.iter()).flat_map(|n| prog.block_insns(&prog.blocks[n.block]).iter().filter_map(|i| i.imm.and_then(|v| v.as_usize()))).filter(|pc| *pc >= last_end && prog.jumpdests.contains(pc)).collect();
+            if referenced.is_empty() && last_end < code.len() {
+                code_end = last_end;
+                rec = cfg::recover(&prog, code_end);
+            }
+        }
+    }
+    // Embedded creation code (CODECOPY'd into memory and fed to CREATE/CREATE2) is data for the
+    // purposes of this contract: it is excluded from coverage and decompiled separately on request.
+    let embedded_ranges = embedded_regions(&prog, &rec);
+    let in_embedded = |pc: usize| embedded_ranges.iter().any(|(o, l)| pc >= *o && pc < *o + *l);
+    if !embedded_ranges.is_empty() {
+        // Re-run recovery so that orphan discovery skips the embedded bytes.
+        let keep: HashSet<usize> = prog.blocks.iter().filter(|b| !in_embedded(b.start)).map(|b| b.id).collect();
+        rec.orphans.retain(|b, _| keep.contains(b));
+        rec.unresolved_jumps.retain(|pc| !in_embedded(*pc));
+    }
     let language = detect_language(info, code);
     let vyper = language.starts_with("vyper");
 
@@ -154,7 +202,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     tick("recover", &mut tt);
     // Internal function units first: simple ones (ABI decoders/encoders, getters) are summarised
     // and seen through at their call sites.
-    let mut int_lifter = Lifter { prog: &prog, root: false, summaries: HashMap::new() };
+    let mut int_lifter = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: false };
     let mut internals: BTreeMap<usize, Lifted> = BTreeMap::new();
     let mut by_block: Vec<(usize, Lifted)> = Vec::new();
     // Callees before callers where possible: iterate until the summary set stabilises.
@@ -180,7 +228,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         internals.insert(prog.blocks[b].start, l);
     }
     tick("lift internals", &mut tt);
-    let lifter = Lifter { prog: &prog, root: true, summaries: int_lifter.summaries.clone() };
+    let lifter = Lifter { prog: &prog, root: true, summaries: int_lifter.summaries.clone(), oracle: false };
     let main = lifter.lift(&rec.main, None);
     let dispatch = function::discover(&main);
     let contract_nonpayable = function::dispatcher_nonpayable(&main, &dispatch.dispatcher);
@@ -278,17 +326,30 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         Function { kind, selector: selector.map(|s| format!("{:#010x}", s)), name, signature, mutability, params, returns, pc, code: String::new(), nodes: l.nodes.len(), effects: eff, lifted: Some(l), calls, n_args, n_rets }
     };
 
+    // Each external function is lifted again on its own from the state the dispatcher hands it,
+    // so that code shared between functions (ABI-encoding tails, reverts) is specialised per
+    // function instead of merged across all of them.
+    let unit_node_of = |lifted_node: usize| -> Option<usize> { main.node_map.iter().find(|(_, v)| **v == lifted_node).map(|(k, _)| *k) };
+    let relift = |entry: usize| -> Lifted {
+        if let Some(un) = unit_node_of(entry) {
+            if let Some(state) = Lifter::entry_state_of(&main, un) {
+                let (sub, _) = rec.main.slice(un);
+                return lifter.lift_from(&sub, state);
+            }
+        }
+        function::slice(&main, entry)
+    };
     for d in &dispatch.functions {
-        let sl = function::slice(&main, d.entry);
+        let sl = relift(d.entry);
         let pc = main.nodes[d.entry].pc;
         functions.push(make(FnKind::External, Some(d.selector), sl, pc, None, 0, 0));
     }
     if let Some(r) = dispatch.receive {
-        let sl = function::slice(&main, r);
+        let sl = relift(r);
         functions.push(make(FnKind::Receive, None, sl, main.nodes[r].pc, Some("receive".into()), 0, 0));
     }
     if let Some(f) = dispatch.fallback {
-        let sl = function::slice(&main, f);
+        let sl = relift(f);
         functions.push(make(FnKind::Fallback, None, sl, main.nodes[f].pc, Some("fallback".into()), 0, 0));
     }
     if dispatch.functions.is_empty() && dispatch.fallback.is_none() && dispatch.receive.is_none() {
@@ -333,13 +394,13 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     tick("render", &mut tt);
 
     let covered: BTreeSet<usize> = std::iter::once(&rec.main).chain(rec.functions.values()).chain(rec.orphans.values()).flat_map(|u| u.nodes.iter().map(|n| n.block)).collect();
-    let code_blocks = prog.blocks.iter().filter(|b| b.start < code_end).count();
+    let code_blocks = prog.blocks.iter().filter(|b| b.start < code_end && !in_embedded(b.start)).count();
     let stats = Stats {
         code_bytes: code.len(),
         instructions: prog.insns.len(),
         blocks: prog.blocks.len(),
         code_blocks,
-        covered_blocks: covered.iter().filter(|b| prog.blocks[**b].start < code_end).count(),
+        covered_blocks: covered.iter().filter(|b| prog.blocks[**b].start < code_end && !in_embedded(prog.blocks[**b].start)).count(),
         unresolved_jumps: rec.unresolved_jumps.len(),
         budget_exhausted: rec.budget_exhausted,
         external_functions: functions.iter().filter(|f| f.kind == FnKind::External).count(),
@@ -351,7 +412,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
 
     let mut embedded = Vec::new();
     if opts.embedded {
-        for region in embedded_regions(&prog, &rec) {
+        for region in embedded_ranges.iter().copied() {
             let sub = &code[region.0..region.0 + region.1];
             let sub_info = metadata::analyze(sub);
             if sub_info.kind == CodeKind::Creation || sub_info.metadata.is_some() {
@@ -362,7 +423,40 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     }
 
-    let mut c = Contract { info: info.clone(), kind: info.kind, language, functions, storage, events, errors, strings, selectors_called, stats, source: String::new(), embedded, constructor: None };
+    // Delegatecall targets (proxy resolution).
+    let mut dc_slots: Vec<String> = Vec::new();
+    let mut dc_targets: Vec<String> = Vec::new();
+    for f in &functions {
+        let Some(l) = &f.lifted else { continue };
+        for nd in &l.nodes {
+            for st in &nd.stmts {
+                if let Stmt::Call { kind: op::DELEGATECALL, addr, .. } = st {
+                    let a = match expr::node(*addr) {
+                        Node::Op(op::AND, v) => v[0],
+                        _ => *addr,
+                    };
+                    match expr::node(a) {
+                        Node::SLoad(k, false, _) => {
+                            if let Some(c) = expr::as_const(k) {
+                                let h = c.to_hex_padded(32);
+                                if !dc_slots.contains(&h) {
+                                    dc_slots.push(h);
+                                }
+                            }
+                        }
+                        Node::Const(c) => {
+                            let h = c.to_hex_padded(20);
+                            if !dc_targets.contains(&h) {
+                                dc_targets.push(h);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let mut c = Contract { info: info.clone(), kind: info.kind, language, functions, storage, events, errors, strings, selectors_called, stats, source: String::new(), embedded, constructor: None, delegatecall_slots: dc_slots, delegatecall_targets: dc_targets, address: None, chain: None, proxy: None };
     c.source = render(&c, "Contract");
     c
 }
@@ -451,8 +545,9 @@ fn inventories(functions: &[Function], vyper: bool) -> (Vec<StorageVar>, Vec<Str
                         if let Some(words) = input {
                             if let Some(c0) = words.first().and_then(|w| expr::as_const(*w)) {
                                 let in_len_c = expr::as_const(*in_len).and_then(|l| l.as_usize());
-                                if (c0 & expr::mask_bits(224)).is_zero() || in_len_c.map_or(false, |l| l % 32 == 4) {
-                                    let sel = c0.shr(224).low_u64() as u32;
+                                let first_bytes = in_len_c.map(|l| l.min(32)).unwrap_or(32) as u32;
+                                if in_len_c.map_or((c0 & expr::mask_bits(224)).is_zero(), |l| l >= 4 && (l - 4) % 32 == 0) {
+                                    let sel = c0.shr(8 * (first_bytes - 4)).low_u64() as u32;
                                     if in_len_c.map_or(true, |l| l >= 4) {
                                         selectors.insert(match sigs::function(sel) {
                                             Some(sig) => format!("{:#010x} {}", sel, sig),
@@ -675,6 +770,12 @@ pub fn render(c: &Contract, name: &str) -> String {
     if let Some(ctor) = &c.constructor {
         out.push_str("\n// ---- constructor (creation code) ----\n");
         out.push_str(&ctor.source);
+    }
+    if let Some(p) = &c.proxy {
+        out.push_str(&format!("\n// ---- {}: implementation {} ----\n", p.kind, p.implementation));
+        if let Some(ic) = &p.contract {
+            out.push_str(&ic.source);
+        }
     }
     out
 }

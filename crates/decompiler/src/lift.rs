@@ -44,6 +44,8 @@ pub enum Term {
     InternalReturn(Vec<ExprId>),
     /// Jump whose target could not be resolved.
     Unresolved(ExprId),
+    /// Oracle mode only: a JUMPI with its condition and target expressions.
+    CondJump { cond: ExprId, target: ExprId },
     /// A branch to an invalid jump destination, or stack underflow in a real frame.
     Infeasible,
 }
@@ -73,6 +75,11 @@ pub struct Lifted {
     pub reprocess_count: usize,
     /// Stack slot (from the top at entry) holding the return address, for internal units.
     pub ret_slot: Option<u32>,
+    /// Entry state of every node (indexed by the *unit* node id), for re-lifting sub-regions.
+    #[allow(dead_code)]
+    pub(crate) entry_states: Vec<Option<State>>,
+    /// Map from unit node id to lifted node id.
+    pub node_map: HashMap<usize, usize>,
 }
 
 // ------------------------------------------------------------------------------------------
@@ -98,6 +105,8 @@ struct MemWrite {
     val: MVal,
     /// Statement that produced this write: (unit node, statement index).
     origin: Option<(usize, usize)>,
+    /// Memory generation *after* the statement that made this write.
+    gen: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -105,9 +114,13 @@ struct Mem {
     writes: Vec<MemWrite>,
     /// Untouched bytes read as zero (true at the start of a call frame).
     fresh: bool,
-    /// Generation of "unknown" content: bumped by clobbers and symbolic-length writes, so that
-    /// two reads of an unknown word with nothing aliasing in between are the same expression.
+    /// Memory generation: advanced once per memory-writing statement. An unknown read is
+    /// stamped with the generation of the last write that may alias it, so `mem[x]` denotes the
+    /// memory at a precise program point (the oracle relies on this) while unrelated writes in
+    /// between do not change the expression.
     gen: u32,
+    /// Generation after the last event that may have changed arbitrary memory (clobber, forgotten writes).
+    clobber_gen: u32,
 }
 
 const BIG: u64 = 1 << 40;
@@ -127,7 +140,33 @@ fn norm_offset(e: ExprId) -> (Option<ExprId>, u64) {
 
 impl Mem {
     fn new(fresh: bool) -> Mem {
-        Mem { writes: Vec::new(), fresh, gen: 0 }
+        Mem { writes: Vec::new(), fresh, gen: 0, clobber_gen: 0 }
+    }
+
+    /// Advance the generation (once per memory-writing statement).
+    fn tick(&mut self) {
+        self.gen += 1;
+    }
+
+    /// Version stamp for an unknown read of `n` bytes at `off`: the generation of the latest
+    /// write that may alias it (same base and overlapping, or symbolic length on the same base),
+    /// else the last clobber.
+    fn version_for(&self, off: ExprId, n: u64) -> u32 {
+        let (base, d) = norm_offset(off);
+        let mut v = self.clobber_gen;
+        for w in &self.writes {
+            if w.base != base {
+                continue;
+            }
+            let hit = match w.len {
+                Some(wl) => w.off < d + n && d < w.off + wl,
+                None => d + n > w.off,
+            };
+            if hit {
+                v = v.max(w.gen);
+            }
+        }
+        v
     }
 
     fn store(&mut self, off: ExprId, len: Option<u64>, val: MVal) {
@@ -136,19 +175,17 @@ impl Mem {
 
     fn store_from(&mut self, off: ExprId, len: Option<u64>, val: MVal, origin: Option<(usize, usize)>) {
         let (base, d) = norm_offset(off);
-        match len {
-            Some(l) => {
-                // Remove writes fully covered by this one (same base).
-                self.writes.retain(|w| !(w.base == base && w.len.map_or(false, |wl| w.off >= d && w.off + wl <= d + l)));
-            }
-            None => self.gen += 1,
+        if let Some(l) = len {
+            // Remove writes fully covered by this one (same base).
+            self.writes.retain(|w| !(w.base == base && w.len.map_or(false, |wl| w.off >= d && w.off + wl <= d + l)));
         }
         if self.writes.len() > 256 {
+            // Forgotten writes: anything may have changed since this point.
             self.writes.drain(..64);
             self.fresh = false;
-            self.gen += 1;
+            self.clobber_gen = self.gen + 1;
         }
-        self.writes.push(MemWrite { base, off: d, len, val, origin });
+        self.writes.push(MemWrite { base, off: d, len, val, origin, gen: self.gen + 1 });
     }
 
     /// Origins of the word writes that a read of `n` bytes at `off` would consume.
@@ -174,6 +211,7 @@ impl Mem {
         self.writes.clear();
         self.fresh = false;
         self.gen += 1;
+        self.clobber_gen = self.gen;
     }
 
     /// Read `n` bytes (n <= 32) at `off` as a word (right-aligned), if known.
@@ -181,7 +219,7 @@ impl Mem {
         let (base, d) = norm_offset(off);
         // Collect per-byte sources.
         let mut pieces: Vec<Option<(ExprId, u64)>> = vec![None; n as usize]; // (word expr, byte index within word)
-        let mut copy_hit: Option<(u8, ExprId, Option<ExprId>, u64)> = None;
+        let mut copy_hit: Option<(u8, ExprId, Option<ExprId>, u64, u32)> = None;
         let mut covered = 0usize;
         for w in self.writes.iter().rev() {
             if covered == n as usize {
@@ -223,7 +261,7 @@ impl Mem {
                 MVal::Copy(k, src, addr) => {
                     // Whole read inside one copy and nothing newer overlapping: a copied word.
                     if lo == d && hi == d + n && covered == 0 {
-                        copy_hit = Some((*k, *src, *addr, d - w.off));
+                        copy_hit = Some((*k, *src, *addr, d - w.off, w.gen));
                         covered = n as usize;
                         break;
                     }
@@ -239,8 +277,9 @@ impl Mem {
                 }
             }
         }
-        if let Some((k, src, _addr, delta)) = copy_hit {
-            let word = expr::intern(Node::CopiedWord(k, expr::add_const(src, U256::from(delta)), version));
+        let _ = version;
+        if let Some((k, src, _addr, delta, wgen)) = copy_hit {
+            let word = expr::intern(Node::CopiedWord(k, expr::add_const(src, U256::from(delta)), wgen));
             return Some(if n == 32 { word } else { op2(op::SHR, konst_u64(8 * (32 - n)), word) });
         }
         if covered < n as usize {
@@ -298,7 +337,7 @@ impl Mem {
     fn load_word(&self, off: ExprId, version: u32) -> ExprId {
         match self.load_bytes(off, 32, version) {
             Some(v) => v,
-            None => expr::intern(Node::MLoad(off, version)),
+            None => expr::intern(Node::MLoad(off, self.version_for(off, 32))),
         }
     }
 
@@ -325,11 +364,13 @@ impl Mem {
         let before = self.writes.len();
         let fresh_before = self.fresh;
         let gen_before = self.gen;
-        self.writes.retain(|w| other.writes.contains(w));
+        // Same write = same base/offset/length/value (generation and origin may differ).
+        self.writes.retain(|w| other.writes.iter().any(|o| o.base == w.base && o.off == w.off && o.len == w.len && o.val == w.val));
         self.fresh &= other.fresh;
-        if other.gen != self.gen {
+        if other.gen != self.gen || other.clobber_gen != self.clobber_gen {
             // Different histories: unknown reads must not be conflated across predecessors.
             self.gen = self.gen.max(other.gen) + 1;
+            self.clobber_gen = self.gen;
         }
         before != self.writes.len() || fresh_before != self.fresh || gen_before != self.gen
     }
@@ -339,8 +380,8 @@ impl Mem {
 // Lifting
 // ------------------------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct State {
+#[derive(Clone, Debug)]
+pub struct State {
     stack: Vec<ExprId>,
     /// Lazily materialised entry arguments (`Arg(i)`), count.
     args_used: usize,
@@ -350,6 +391,8 @@ struct State {
     version: u32,
     /// Storage generation: bumped when storage may have changed in an unknown way.
     sgen: u32,
+    /// An external call or create has happened on this path (return data may be non-empty).
+    called: bool,
 }
 
 impl State {
@@ -385,6 +428,8 @@ pub struct Lifter<'a> {
     pub root: bool,
     /// Effect summaries of simple internal functions, by entry block.
     pub summaries: HashMap<usize, CalleeSummary>,
+    /// Oracle mode: keep jump target/condition expressions instead of resolving successors.
+    pub oracle: bool,
 }
 
 /// What a *simple* internal function does, in terms of its entry-stack arguments `Arg(i)`:
@@ -457,6 +502,17 @@ struct Entry {
 
 impl<'a> Lifter<'a> {
     pub fn lift(&self, unit: &Unit, initial: Option<(Vec<ExprId>, bool)>) -> Lifted {
+        let (init_stack, fresh) = initial.unwrap_or((Vec::new(), self.root));
+        let state = State { stack: init_stack, args_used: 0, mem: Mem::new(fresh), storage: Vec::new(), version: 0, sgen: 0, called: !fresh };
+        self.lift_from(unit, state)
+    }
+
+    /// Entry state of a lifted node, to lift a sub-region starting there separately.
+    pub fn entry_state_of(l: &Lifted, unit_node: usize) -> Option<State> {
+        l.entry_states.get(unit_node).cloned().flatten()
+    }
+
+    pub fn lift_from(&self, unit: &Unit, init: State) -> Lifted {
         let n = unit.nodes.len();
         let mut entries: Vec<Option<Entry>> = vec![None; n];
         let mut lnodes: Vec<Option<LNode>> = vec![None; n];
@@ -469,11 +525,8 @@ impl<'a> Lifter<'a> {
         let mut reprocess_count = 0usize;
 
         let hidden = Hidden::default();
-        let (init_stack, fresh) = initial.unwrap_or((Vec::new(), self.root));
-        entries[unit.entry] = Some(Entry {
-            state: State { stack: init_stack.clone(), args_used: 0, mem: Mem::new(fresh), storage: Vec::new(), version: 0, sgen: 0 },
-            phis: vec![false; init_stack.len()],
-        });
+        let init_len = init.stack.len();
+        entries[unit.entry] = Some(Entry { state: init, phis: vec![false; init_len] });
         work.push_back(unit.entry);
         queued[unit.entry] = true;
         let mut max_args = 0usize;
@@ -497,12 +550,12 @@ impl<'a> Lifter<'a> {
                 let single_pred = unit.nodes[s].preds.len() <= 1;
                 let changed = match &mut entries[s] {
                     None => {
-                        entries[s] = Some(Entry { phis: vec![false; exit.stack.len()], state: State { stack: exit.stack.clone(), args_used: exit.args_used, mem: exit.mem.clone(), storage: exit.storage.clone(), version: 0, sgen: exit.sgen } });
+                        entries[s] = Some(Entry { phis: vec![false; exit.stack.len()], state: State { stack: exit.stack.clone(), args_used: exit.args_used, mem: exit.mem.clone(), storage: exit.storage.clone(), version: 0, sgen: exit.sgen, called: exit.called } });
                         true
                     }
                     Some(e) if single_pred => {
                         // One predecessor: no phi, just take the latest state.
-                        let new_state = State { stack: exit.stack.clone(), args_used: exit.args_used.max(e.state.args_used), mem: exit.mem.clone(), storage: exit.storage.clone(), version: 0, sgen: exit.sgen };
+                        let new_state = State { stack: exit.stack.clone(), args_used: exit.args_used.max(e.state.args_used), mem: exit.mem.clone(), storage: exit.storage.clone(), version: 0, sgen: exit.sgen, called: exit.called };
                         let changed = e.state.stack != new_state.stack || e.state.mem.writes != new_state.mem.writes || e.state.mem.fresh != new_state.mem.fresh || e.state.mem.gen != new_state.mem.gen || e.state.storage != new_state.storage || e.state.sgen != new_state.sgen;
                         e.state = new_state;
                         e.phis = vec![false; e.state.stack.len()];
@@ -526,16 +579,19 @@ impl<'a> Lifter<'a> {
                 map.insert(i, nodes.len());
                 let mut ln = ln.clone();
                 ln.entry_stack = entries[i].as_ref().map(|e| e.state.stack.clone()).unwrap_or_default();
-                // Drop encoding-only memory writes and free-memory-pointer bookkeeping.
-                let mut idx = 0usize;
-                ln.stmts.retain(|s| {
-                    let keep = match s {
-                        Stmt::MStore { off, .. } => !(hidden_set.contains(&(i, idx)) || expr::as_const(*off) == Some(U256::from_u64(0x40))),
-                        _ => true,
-                    };
-                    idx += 1;
-                    keep
-                });
+                // Drop encoding-only memory writes and free-memory-pointer bookkeeping (display
+                // only; the oracle keeps every statement).
+                if !self.oracle {
+                    let mut idx = 0usize;
+                    ln.stmts.retain(|s| {
+                        let keep = match s {
+                            Stmt::MStore { off, .. } => !(hidden_set.contains(&(i, idx)) || expr::as_const(*off) == Some(U256::from_u64(0x40))),
+                            _ => true,
+                        };
+                        idx += 1;
+                        keep
+                    });
+                }
                 nodes.push(ln);
             }
         }
@@ -626,7 +682,8 @@ impl<'a> Lifter<'a> {
             Some(AVal::Slot(k)) => Some(k as u32),
             _ => None,
         });
-        Lifted { nodes, entry: map[&unit.entry], edge_assigns, n_args: max_args, reprocess_count, ret_slot }
+        let entry_states: Vec<Option<State>> = entries.iter().map(|e| e.as_ref().map(|e| e.state.clone())).collect();
+        Lifted { nodes, entry: map[&unit.entry], edge_assigns, n_args: max_args, reprocess_count, ret_slot, entry_states, node_map: map }
     }
 
     /// Execute one node from its entry state.
@@ -644,6 +701,7 @@ impl<'a> Lifter<'a> {
         let seq_base = (nid as u32) << 10;
         let mut seq_ctr = 0u32;
         let next_version = |st: &mut State| {
+            st.mem.tick();
             st.version = st.mem.gen;
             st.version
         };
@@ -684,7 +742,11 @@ impl<'a> Lifter<'a> {
                 op::JUMPDEST => {}
                 op::PC => st.stack.push(konst_u64(ins.pc as u64)),
                 op::MSIZE | op::GAS => st.stack.push(expr::env_seq(o)),
-                op::ADDRESS | op::ORIGIN | op::CALLER | op::CALLVALUE | op::CALLDATASIZE | op::CODESIZE | op::GASPRICE | op::RETURNDATASIZE | op::COINBASE | op::TIMESTAMP | op::NUMBER | op::PREVRANDAO | op::GASLIMIT | op::CHAINID | op::SELFBALANCE | op::BASEFEE | op::BLOBBASEFEE => {
+                op::RETURNDATASIZE => {
+                    // Zero in a fresh frame until the first call.
+                    st.stack.push(if st.called { expr::env(o) } else { konst(U256::ZERO) });
+                }
+                op::ADDRESS | op::ORIGIN | op::CALLER | op::CALLVALUE | op::CALLDATASIZE | op::CODESIZE | op::GASPRICE | op::COINBASE | op::TIMESTAMP | op::NUMBER | op::PREVRANDAO | op::GASLIMIT | op::CHAINID | op::SELFBALANCE | op::BASEFEE | op::BLOBBASEFEE => {
                     st.stack.push(expr::env(o));
                 }
                 op::CALLDATALOAD => {
@@ -719,9 +781,10 @@ impl<'a> Lifter<'a> {
                                 hidden.set.borrow_mut().extend(st.mem.consumers(off, l as u64));
                                 expr::intern(Node::Keccak(words, tail))
                             }
-                            None => expr::intern(Node::KeccakMem(off, len, st.version)),
+                            None => expr::intern(Node::KeccakMem(off, len, st.mem.version_for(off, l as u64))),
                         },
-                        _ => expr::intern(Node::KeccakMem(off, len, st.version)),
+                        // Symbolic length: anything from `off` on may be covered.
+                        _ => expr::intern(Node::KeccakMem(off, len, st.mem.version_for(off, u64::MAX / 4))),
                     };
                     st.stack.push(v);
                 }
@@ -768,6 +831,10 @@ impl<'a> Lifter<'a> {
                 }
                 op::JUMP => {
                     let _target = pop!();
+                    if self.oracle {
+                        term = Some(Term::Unresolved(_target));
+                        break;
+                    }
                     // Resolved by the unit: call, return, jump or switch.
                     if let Some(call) = &un.call {
                         term = Some(self.internal_call(unit, un, call, &mut st, &mut stmts, seq_base + seq_ctr, &mut underflow));
@@ -800,6 +867,10 @@ impl<'a> Lifter<'a> {
                 op::JUMPI => {
                     let _target = pop!();
                     let cond = pop!();
+                    if self.oracle {
+                        term = Some(Term::CondJump { cond, target: _target });
+                        break;
+                    }
                     let ts = succ_by_kind(&[Edge::True]);
                     let fs = succ_by_kind(&[Edge::False]);
                     let tnode = ts.first().copied();
@@ -928,6 +999,7 @@ impl<'a> Lifter<'a> {
                     }
                     stmts.push(Stmt::Call { seq, kind: o, gas, addr, value, in_off, in_len, out_off, out_len, input, result });
                     st.stack.push(result);
+                    st.called = true;
                 }
                 op::CREATE | op::CREATE2 => {
                     let value = pop!();
@@ -943,6 +1015,7 @@ impl<'a> Lifter<'a> {
                     next_version(&mut st);
                     stmts.push(Stmt::Create { seq, kind: o, value, off, len, salt, result, init });
                     st.stack.push(result);
+                    st.called = true;
                 }
                 op::RETURN | op::REVERT => {
                     let off = pop!();
@@ -1054,10 +1127,11 @@ impl<'a> Lifter<'a> {
                 }
             }
             None => {
-                // The callee may have written memory and storage.
+                // The callee may have written memory and storage, and may have made calls.
                 st.mem.clobber();
                 st.storage.clear();
                 st.sgen += 1;
+                st.called = true;
             }
         }
         let inlined = direct_returns.is_some();
@@ -1172,6 +1246,10 @@ fn merge_into(e: &mut Entry, exit: &State, node: usize, phi_ids: &mut HashMap<(u
         e.state.sgen = e.state.sgen.max(exit.sgen) + 1;
         changed = true;
     }
+    if exit.called && !e.state.called {
+        e.state.called = true;
+        changed = true;
+    }
     changed
 }
 
@@ -1243,6 +1321,10 @@ pub fn node_exprs(n: &LNode) -> Vec<ExprId> {
         Term::SelfDestruct(a) => v.push(*a),
         Term::InternalReturn(vals) => v.extend(vals.iter().copied()),
         Term::Unresolved(t) => v.push(*t),
+        Term::CondJump { cond, target } => {
+            v.push(*cond);
+            v.push(*target);
+        }
         _ => {}
     }
     v

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>evmdec — EVM decompiler and analyzer</title>
+<meta name="description" content="Decompile any EVM contract by address or bytecode into readable pseudo-Solidity and get a security report, before or after deployment.">
+<style>
+:root{--bg:#0b0d10;--panel:#111418;--line:#1f242b;--text:#e6e9ee;--muted:#8a94a3;--accent:#5ec2ff;--green:#3ddc97;--amber:#f2b94b;--red:#ff6b7a;--purple:#b98cff;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 var(--sans)}
+header{display:flex;gap:12px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+.logo{font-weight:800;letter-spacing:-.01em;font-size:18px}.logo span{color:var(--accent)}
+input,select,button,textarea{font:inherit;color:var(--text);background:#0d1014;border:1px solid var(--line);border-radius:6px;padding:7px 10px}
+input{min-width:360px;flex:1}button{cursor:pointer}button.primary{background:var(--accent);color:#000;font-weight:600;border-color:var(--accent)}
+button:disabled{opacity:.5;cursor:wait}
+main{display:grid;grid-template-columns:300px 1fr;height:calc(100vh - 54px)}
+aside{border-right:1px solid var(--line);overflow:auto;background:var(--panel)}
+section{overflow:auto;display:flex;flex-direction:column}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);padding:0 8px;background:var(--panel);position:sticky;top:0}
+.tabs button{border:0;background:transparent;color:var(--muted);padding:10px 12px;border-bottom:2px solid transparent;border-radius:0}
+.tabs button.active{color:var(--text);border-bottom-color:var(--accent)}
+pre{margin:0;padding:16px;font:13px/1.55 var(--mono);white-space:pre;overflow:auto;tab-size:4}
+.fn{padding:6px 12px;border-bottom:1px solid var(--line);cursor:pointer;font:12px var(--mono);display:flex;justify-content:space-between;gap:8px}
+.fn:hover{background:#171b21}.fn .k{color:var(--muted)}.fn.ext .n{color:var(--text)}.fn.int .n{color:var(--muted)}
+.badge{font-size:10px;padding:1px 6px;border-radius:10px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.badge.payable{color:var(--amber);border-color:#4a3a14}.badge.view{color:var(--green);border-color:#1c4a35}.badge.pure{color:var(--green)}
+.summary{padding:12px;border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}.summary b{color:var(--text)}
+.filter{width:100%;border-radius:0;border:0;border-bottom:1px solid var(--line);min-width:0}
+.report{padding:16px 24px;max-width:960px}.report h1{font-size:20px}.report h2{font-size:16px;margin-top:28px;border-bottom:1px solid var(--line);padding-bottom:4px}.report h3{font-size:14px;margin-top:20px}
+.report pre{background:#0d1014;border:1px solid var(--line);border-radius:6px}.report code{font-family:var(--mono);font-size:12px}
+.report table{border-collapse:collapse;font-size:12px}.report td,.report th{border:1px solid var(--line);padding:3px 8px;text-align:left}
+.sev-critical{color:var(--red);font-weight:700}.sev-high{color:#ff8e6b;font-weight:700}.sev-medium{color:var(--amber)}.sev-low{color:var(--accent)}.sev-info{color:var(--muted)}
+.landing{padding:48px 32px;max-width:860px;color:var(--muted)}.landing h1{color:var(--text);font-size:28px;margin:0 0 8px}.landing a{color:var(--accent)}
+.kw{color:var(--purple)}.ty{color:var(--accent)}.cm{color:#6e7a8a}.st{color:var(--green)}.nu{color:var(--amber)}.fnname{color:#ffd479}
+.err{color:var(--red);padding:16px}
+.status{color:var(--muted);font-size:12px}
+@media (max-width:800px){main{grid-template-columns:1fr}aside{display:none}input{min-width:0}}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">evm<span>dec</span></div>
+  <input id="q" placeholder="Contract address (0x…) or raw bytecode hex" autofocus>
+  <select id="chain"><option value="mainnet">mainnet</option></select>
+  <button class="primary" id="go">Decompile</button>
+  <span class="status" id="status"></span>
+</header>
+<main>
+  <aside id="side">
+    <div class="summary" id="summary">Paste an address or bytecode to start. Try <a href="#" data-try="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2">WETH</a>, <a href="#" data-try="0xdAC17F958D2ee523a2206206994597C13D831ec7">USDT</a>, <a href="#" data-try="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48">USDC (proxy)</a>.</div>
+    <input class="filter" id="filter" placeholder="filter functions">
+    <div id="fns"></div>
+  </aside>
+  <section>
+    <div class="tabs" id="tabs">
+      <button data-tab="code" class="active">Code</button>
+      <button data-tab="report">Report</button>
+      <button data-tab="impl" id="impltab" style="display:none">Implementation</button>
+      <button data-tab="storage">Storage &amp; events</button>
+      <button data-tab="disasm">Disassembly</button>
+      <button data-tab="json">JSON</button>
+      <span style="flex:1"></span>
+      <button id="dl">Download .sol</button>
+    </div>
+    <div id="view">
+      <div class="landing">
+        <h1>Decompile any EVM contract. Then read what it really does.</h1>
+        <p>evmdec turns deployed bytecode (fetched by address on any EVM chain) or freshly compiled bytecode into structured pseudo-Solidity: recovered functions with selectors, parameters and mutability, storage layout, events, internal functions, revert reasons. It then runs a security analysis — reentrancy, unchecked calls, delegatecall and selfdestruct exposure, missing access control, proxies, weak randomness, unchecked arithmetic on old compilers — and reports findings with evidence.</p>
+        <p>Paste the creation or runtime bytecode of a contract you are about to deploy to review it the way an attacker would see it, or an address to inspect what is live on-chain. Proxies are followed to their implementation.</p>
+        <p>Everything is written from scratch in Rust and verified: every basic block's lifted semantics are checked against a concrete EVM interpreter on random inputs. See the README for the measured numbers.</p>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+const $=s=>document.querySelector(s);let DATA=null,TAB='code',CUR=null;
+fetch('/api/chains').then(r=>r.json()).then(cs=>{const sel=$('#chain');sel.innerHTML='';cs.forEach(c=>{const o=document.createElement('option');o.value=c.name;o.textContent=c.name+' ('+c.id+')';sel.appendChild(o)})}).catch(()=>{});
+document.querySelectorAll('[data-try]').forEach(a=>a.onclick=e=>{e.preventDefault();$('#q').value=a.dataset.try;go()});
+$('#go').onclick=go;$('#q').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
+document.querySelectorAll('.tabs button[data-tab]').forEach(b=>b.onclick=()=>{TAB=b.dataset.tab;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('active',x===b));render()});
+$('#filter').oninput=renderFns;
+$('#dl').onclick=()=>{if(!DATA)return;const blob=new Blob([DATA.contract.source],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(DATA.contract.address||'contract')+'.sol';a.click()};
+async function go(){const q=$('#q').value.trim();if(!q)return;$('#go').disabled=true;$('#status').textContent='working…';try{
+  const body=/^0x[0-9a-fA-F]{40}$/.test(q)?{address:q,chain:$('#chain').value}:{bytecode:q};
+  const r=await fetch('/api/decompile',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);DATA=j;CUR=null;$('#impltab').style.display=j.implementation?'':'none';
+  const c=j.contract,s=c.stats;$('#summary').innerHTML=`<b>${c.language}</b> · ${s.code_bytes} bytes · ${s.external_functions} external / ${s.internal_functions} internal functions · coverage <b>${s.covered_blocks}/${s.code_blocks}</b> blocks · ${s.unresolved_jumps} unresolved jumps · ${s.time_ms} ms<br>risk score <b class="sev-${j.report.risk_score>=40?'critical':j.report.risk_score>=20?'high':j.report.risk_score>=8?'medium':'info'}">${j.report.risk_score}/100</b> · ${Object.entries(j.report.summary).map(([k,v])=>v+' '+k).join(', ')||'no findings'}${c.proxy?`<br>proxy → <b>${c.proxy.implementation}</b> (${c.proxy.kind})`:''}`;
+  $('#status').textContent='';renderFns();render();
+}catch(e){$('#view').innerHTML='<div class="err">'+esc(String(e.message||e))+'</div>';$('#status').textContent='failed'}finally{$('#go').disabled=false}}
+function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function hl(src){return esc(src).replace(/(\/\/.*)$/gm,'<span class="cm">$1</span>').replace(/("(?:[^"\\]|\\.)*")/g,'<span class="st">$1</span>').replace(/\b(function|contract|if|else|while|return|revert|require|emit|event|error|external|internal|view|pure|payable|returns|mapping|fallback|receive|constructor|break|continue|switch|case|goto|true|false)\b/g,'<span class="kw">$1</span>').replace(/\b(address|uint\d*|int\d*|bool|bytes\d*|string)\b/g,'<span class="ty">$1</span>').replace(/\b(0x[0-9a-fA-F]+|\d+)\b/g,'<span class="nu">$1</span>').replace(/\b(function<\/span>) ([A-Za-z_]\w*)/g,'$1 <span class="fnname">$2</span>')}
+function renderFns(){if(!DATA)return;const f=$('#filter').value.toLowerCase();const list=DATA.contract.functions.filter(x=>!f||x.name.toLowerCase().includes(f)||(x.selector||'').includes(f)).map(x=>`<div class="fn ${x.kind}" data-pc="${x.pc}"><span class="n">${esc(x.name)}${x.kind==='external'?'('+x.params.map(p=>p.ty).join(',')+')':''}</span><span><span class="badge ${x.mutability==='payable'?'payable':x.mutability==='view'||x.mutability==='pure'?'view':''}">${x.kind==='external'?x.mutability.replace('_',''):x.kind}</span></span></div>`).join('');$('#fns').innerHTML=list;document.querrySelectorAll&&0;document.querySelectorAll('#fns .fn').forEach(d=>d.onclick=()=>{CUR=+d.dataset.pc;TAB='code';document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('active',x.dataset.tab==='code'));render()})}
+function fnBlock(c,pc){const f=c.functions.find(x=>x.pc===pc);if(!f)return '';const head=f.kind==='external'?`// selector ${f.selector}${f.signature?'':' (unknown signature)'}\nfunction ${f.name}(${f.params.map(p=>p.ty+' '+p.name).join(', ')}) external${f.mutability==='view'?' view':f.mutability==='pure'?' pure':f.mutability==='payable'?' payable':''}${f.returns.length?' returns ('+f.returns.join(', ')+')':''} {`:f.kind==='fallback'?'fallback() external payable {':f.kind==='receive'?'receive() external payable {':`function ${f.name}(${Array.from({length:f.n_args},(_,i)=>'uint256 arg'+i).join(', ')}) internal${f.n_rets?' returns ('+Array(f.n_rets).fill('uint256').join(', ')+')':''} {`;return head+'\n'+f.code.replace(/^        /gm,'    ')+'}\n'}
+function md(s){return esc(s).replace(/^### (.*)$/gm,'<h3>$1</h3>').replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>').replace(/```solidity\n([\s\S]*?)```/g,'<pre>$1</pre>').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\[(CRITICAL|HIGH|MEDIUM|LOW|INFO)\]/g,(m,s)=>`<span class="sev-${s.toLowerCase()}">[${s}]</span>`).replace(/^\|(.+)\|$/gm,r=>'<tr>'+r.split('|').slice(1,-1).map(c=>'<td>'+c.trim()+'</td>').join('')+'</tr>').replace(/(<tr>.*<\/tr>\n?)+/g,t=>'<table>'+t+'</table>').replace(/^- (.*)$/gm,'<li>$1</li>').replace(/(<li>.*<\/li>\n?)+/g,l=>'<ul>'+l+'</ul>').replace(/\n\n/g,'<br><br>')}
+function render(){if(!DATA)return;const c=DATA.contract,v=$('#view');
+  if(TAB==='code'){v.innerHTML='<pre>'+hl(CUR!=null?fnBlock(c,CUR):c.source)+'</pre>'}
+  else if(TAB==='report'){v.innerHTML='<div class="report">'+md(DATA.report_markdown)+'</div>'}
+  else if(TAB==='impl'&&DATA.implementation){const i=DATA.implementation;v.innerHTML='<div class="report">'+md(i.report_markdown)+'</div><pre>'+hl(i.contract.source)+'</pre>'}
+  else if(TAB==='storage'){v.innerHTML='<div class="report"><h2>Storage layout</h2><table><tr><th>slot</th><th>name</th><th>type</th><th>reads</th><th>writes</th></tr>'+c.storage.map(s=>`<tr><td>${s.slot}</td><td>${s.name}</td><td>${esc(s.ty)}</td><td>${s.reads}</td><td>${s.writes}</td></tr>`).join('')+'</table><h2>Events</h2><ul>'+c.events.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul><h2>Custom errors</h2><ul>'+c.errors.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul><h2>Strings</h2><ul>'+c.strings.map(e=>'<li>'+esc(e)+'</li>').join('')+'</ul><h2>Selectors called on other contracts</h2><ul>'+c.selectors_called.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul></div>'}
+  else if(TAB==='disasm'){v.innerHTML='<pre>'+esc(DATA.disassembly.join('\n'))+'</pre>'}
+  else if(TAB==='json'){const j=JSON.parse(JSON.stringify(DATA));delete j.disassembly;v.innerHTML='<pre>'+esc(JSON.stringify(j,null,2))+'</pre>'}}
+</script>
+</body>
+</html>

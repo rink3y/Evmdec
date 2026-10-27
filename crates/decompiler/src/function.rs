@@ -112,6 +112,11 @@ pub fn discover(main: &Lifted) -> Dispatch {
             }
         }
     }
+    // No selector dispatcher at all (hand-written contract, minimal proxy, pure fallback): the
+    // whole entry region is the fallback.
+    if sel_nodes.is_empty() {
+        return Dispatch { functions: vec![], fallback: Some(main.entry), receive: None, dispatcher: HashSet::new() };
+    }
     // Dispatcher = nodes reachable from entry without entering a body, from which a selector
     // branch is reachable without entering a body.
     let mut fwd: HashSet<usize> = HashSet::new();
@@ -229,7 +234,7 @@ pub fn slice(l: &Lifted, entry: usize) -> Lifted {
             edge_assigns.insert((*a2, *b2), v.clone());
         }
     }
-    Lifted { nodes, entry: 0, edge_assigns, n_args: l.n_args, reprocess_count: 0, ret_slot: l.ret_slot }
+    Lifted { nodes, entry: 0, edge_assigns, n_args: l.n_args, reprocess_count: 0, ret_slot: l.ret_slot, entry_states: Vec::new(), node_map: HashMap::new() }
 }
 
 fn remap(t: &Term, map: &HashMap<usize, usize>) -> Term {

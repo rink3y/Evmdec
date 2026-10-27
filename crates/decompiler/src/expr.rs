@@ -674,7 +674,7 @@ mod tests {
         let x = arg(0);
         let e = op2(op::ADD, op2(op::ADD, x, konst_u64(4)), konst_u64(32));
         assert_eq!(split_offset(e), (Some(x), U256::from_u64(36)));
-        assert_eq!(op2(op::DIV, x, konst_u64(1 << 224)), op2(op::SHR, konst_u64(224), x));
+        assert_eq!(op2(op::DIV, x, konst(U256::ONE.shl(224))), op2(op::SHR, konst_u64(224), x));
         assert_eq!(op1(op::ISZERO, op1(op::ISZERO, op2(op::EQ, x, konst_u64(3)))), op2(op::EQ, x, konst_u64(3)));
         assert_eq!(op2(op::AND, op2(op::AND, x, konst(mask_bits(160))), konst(mask_bits(160))), op2(op::AND, x, konst(mask_bits(160))));
         assert_eq!(op2(op::SUB, op2(op::ADD, x, konst_u64(10)), konst_u64(4)), op2(op::ADD, x, konst_u64(6)));

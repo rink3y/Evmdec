@@ -1135,6 +1135,35 @@ impl<'a> Analysis<'a> {
     }
 }
 
+impl Unit {
+    /// The sub-unit reachable from node `entry` (ids remapped), for lifting a region separately.
+    pub fn slice(&self, entry: usize) -> (Unit, HashMap<usize, usize>) {
+        let mut order = Vec::new();
+        let mut seen = HashSet::new();
+        let mut q = VecDeque::new();
+        q.push_back(entry);
+        while let Some(x) = q.pop_front() {
+            if !seen.insert(x) {
+                continue;
+            }
+            order.push(x);
+            for (s, _) in &self.nodes[x].succs {
+                q.push_back(*s);
+            }
+        }
+        let map: HashMap<usize, usize> = order.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+        let mut nodes = Vec::new();
+        for &old in &order {
+            let mut nd = self.nodes[old].clone();
+            nd.id = map[&old];
+            nd.succs = nd.succs.iter().map(|(s, k)| (map[s], *k)).collect();
+            nd.preds = nd.preds.iter().filter_map(|p| map.get(p).copied()).collect();
+            nodes.push(nd);
+        }
+        (Unit { entry_block: self.nodes[entry].block, nodes, entry: 0, budget_exhausted: self.budget_exhausted }, map)
+    }
+}
+
 /// Whole-program recovery result.
 pub struct Recovered {
     pub main: Unit,

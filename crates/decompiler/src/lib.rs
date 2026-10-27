@@ -20,3 +20,7 @@ pub mod function;
 pub mod decompile;
 pub mod structure;
 pub mod analyze;
+pub mod interp;
+pub mod verify;
+#[cfg(feature = "rpc")]
+pub mod rpc;

@@ -24,6 +24,7 @@
  --kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");color-scheme:dark}
 
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans);display:grid;grid-template-rows:auto auto minmax(0,1fr);grid-template-columns:minmax(0,1fr)}
 button,input,select{font:inherit;color:inherit}
@@ -77,14 +78,14 @@ main>*{min-width:0;min-height:0;overflow:auto}
 .scale{display:flex;gap:16px;padding:7px 12px;border-bottom:1px solid var(--hair);font-size:12px;color:var(--muted);flex-wrap:wrap}
 .scale b{color:var(--fg);font-weight:600}
 .code{list-style:none;margin:0;padding:10px 0 32px;font:13px/1.5 var(--mono);tab-size:4;counter-reset:ln;overflow-x:auto}
-.code li{display:grid;grid-template-columns:3.4em 6.1em minmax(0,1fr);min-height:1.5em;align-items:start}
+.code li{display:grid;grid-template-columns:3.4em 8.6em minmax(0,1fr);min-height:1.5em;align-items:start;position:relative}
 .code li::before{counter-increment:ln;content:counter(ln);grid-column:1;grid-row:1;text-align:right;padding-right:.4em;color:var(--muted);font-variant-numeric:tabular-nums;user-select:none}
 .code code{grid-column:3;grid-row:1;white-space:pre;display:block;padding-right:1.5em;width:max-content;min-width:100%}
 .code .co-cell{grid-column:2;grid-row:1;display:flex;gap:2px;padding-left:2px;align-self:center}
 .co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 11px/1 var(--sans);text-decoration:none}
 .co:hover{background:var(--rubric);color:var(--on-rubric)}
-.code li.flagged{background:var(--well)}
-.code li.flagged code{border:6px solid transparent;border-image:var(--cloud) 6 round;margin:-6px 0;padding-left:1px}
+.code li.flagged{background:var(--well);padding:6px 0}
+.code li.flagged::after{content:"";position:absolute;top:0;bottom:0;left:calc(12em - 7px);right:4px;border:6px solid transparent;border-image:var(--cloud) 6 round;pointer-events:none}
 .code li.lit,.finding.lit{background:var(--lit)}
 .kw{color:var(--kw)}.ty{color:var(--ty)}.st{color:var(--str)}.nu{color:var(--num)}.cm{color:var(--cm)}.fnname{color:var(--fn);font-weight:600}
 pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:auto;tab-size:4}
@@ -287,8 +288,8 @@ function renderCode(){const c=DATA.contract;let ranges=[];let helpers=[];
  if(!ranges.length)ranges=[[0,SRC_LINES.length-1]];
  const block=([from,to])=>{let rows='';for(let i=from;i<=to;i++){const l=SRC_LINES[i];const co=CALLOUTS.get(i);const cls=co?' flagged':'';let bubbles='';if(co)bubbles='<span class="co-cell">'+co.map(n=>'<a class="co" href="#F'+n+'" aria-label="Finding '+n+': '+esc(FINDINGS[n-1].title)+'">'+n+'</a>').join('')+'</span>';rows+='<li id="L'+(i+1)+'" class="ln'+cls+'">'+bubbles+'<code>'+(hl(l)||' ')+'</code></li>'}return '<ol class="code" aria-label="Decompiled code, lines '+(from+1)+' to '+(to+1)+'" style="counter-reset:ln '+from+'">'+rows+'</ol>'};
  $('#panel-code').innerHTML=ranges.map(block).join('');
- const range=ranges[0],from=range[0],to=range[1];const f=CUR!=null?c.functions.find(x=>x.pc===CUR):null;const scale=$('#scale');scale.hidden=$('#tab-code').getAttribute('aria-selected')!=='true';
- scale.innerHTML='<span>'+(f?'Showing <b>'+esc(f.name)+'</b>'+(helpers.length?' and its helper'+(helpers.length>1?'s ':' ')+helpers.map(h=>'<b>'+esc(h)+'</b>').join(', '):'')+' (lines '+(from+1)+' to '+(to+1)+' of '+SRC_LINES.length+')':'Showing the <b>whole contract</b>, '+SRC_LINES.length+' lines')+'</span><span><b>'+CALLOUTS.size+'</b> flagged line'+(CALLOUTS.size===1?'':'s')+'</span><span>Callouts key to the details at right</span>'+(f?'<button type="button" id="showall" style="border:0;background:transparent;color:var(--fg);text-decoration:underline;padding:0">Show whole contract</button>':'');
+ const range=ranges[0],from=range[0],to=range[1];const f=CUR!=null?c.functions.find(x=>x.pc===CUR):null;const rangeText=ranges.map(([a,b])=>(a+1)+' to '+(b+1)).join(' and ');const scale=$('#scale');scale.hidden=$('#tab-code').getAttribute('aria-selected')!=='true';
+ scale.innerHTML='<span>'+(f?'Showing <b>'+esc(f.name)+'</b>'+(helpers.length?' and its helper'+(helpers.length>1?'s ':' ')+helpers.map(h=>'<b>'+esc(h)+'</b>').join(', '):'')+' (lines '+rangeText+' of '+SRC_LINES.length+')':'Showing the <b>whole contract</b>, '+SRC_LINES.length+' lines')+'</span><span><b>'+CALLOUTS.size+'</b> flagged line'+(CALLOUTS.size===1?'':'s')+'</span><span>Callouts key to the details at right</span>'+(f?'<button type="button" id="showall" style="border:0;background:transparent;color:var(--fg);text-decoration:underline;padding:0">Show whole contract</button>':'');
  const sa=$('#showall');if(sa)sa.addEventListener('click',()=>{CUR=null;renderFns();renderCode()})}
 
 function findingItem(n,f,open){const fn=f.function?f.function.split(' [')[0]:'contract';const lines=[];CALLOUTS.forEach((arr,k)=>{if(arr.includes(n))lines.push(k+1)});

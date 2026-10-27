@@ -846,7 +846,6 @@ impl<'a> Lifter<'a> {
                     // Resolved by the unit: call, return, jump or switch.
                     if let Some(call) = &un.call {
                         term = Some(self.internal_call(unit, un, call, &mut st, &mut stmts, seq_base + seq_ctr, &mut underflow));
-                        seq_ctr += 1;
                     } else if let Some(via) = un.returns_via {
                         // Values equal to the return address itself (solc < 0.5 leaves it for the
                         // caller to pop) are not results.

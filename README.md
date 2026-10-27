@@ -44,9 +44,11 @@ oracle, so the accuracy claim below is measured, not asserted.
 * **Verified.** A concrete EVM interpreter executes every basic block from random states and the
   result is compared with the lifted statements (stack, memory, storage, logs, calls, control
   decision). See *Accuracy*.
-* **CLI and web app.** `evmdec decompile <address|file|hex>`, `analyze`, `verify`, `disasm`,
+* **CLI and web app.** `evmdec decompile <address|file|hex>` (with `--lookup` to resolve
+  unknown selectors through openchain.xyz / 4byte.directory), `analyze`, `verify`, `disasm`,
   `info`, `cfg`; an axum server with a single-page UI (paste an address or bytecode, browse
-  functions, read the report, download `.sol`).
+  functions, read the report, download `.sol`). The CLI never fails on an input: if the
+  decompiler hits an internal error it prints the disassembly instead.
 
 ## Layout
 
@@ -76,6 +78,7 @@ solc --bin MyContract.sol | tail -1 > my.hex
 ./target/release/evmdec decompile my.hex --json          # everything: functions, storage, events, report
 
 # other views
+./target/release/evmdec decompile my.hex --lookup        # name unknown selectors via openchain / 4byte
 ./target/release/evmdec decompile my.hex --flat          # labels and gotos instead of structured code
 ./target/release/evmdec disasm my.hex
 ./target/release/evmdec verify my.hex --runs 8           # block oracle on this contract
@@ -111,7 +114,7 @@ deployer, UNI). Everything is reproducible with `corpus/bench.py` and `corpus/ve
 | return count | 512 / 515 = **99.4 %** |
 | events | 118 / 121 = **97.5 %** |
 | code blocks covered by some function | 10,810 / 10,810 = **100 %** |
-| unresolved jumps | 1 (in 22 contracts: one return inside Uniswap V3 factory's `createPool`) |
+| unresolved jumps | **0** |
 | total time | 1.0 s for the whole corpus |
 
 "Code blocks" are blocks the EVM can actually enter (the entry, `JUMPDEST`-started blocks and

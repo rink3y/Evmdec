@@ -22,6 +22,8 @@ pub struct Options {
     pub embedded: bool,
     /// Do not use the built-in signature dictionary (for measuring inference).
     pub no_sigs: bool,
+    /// Additional function signatures by selector (e.g. from an online lookup or an ABI).
+    pub extra_sigs: HashMap<u32, String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -175,7 +177,11 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         if !embedded_ranges.is_empty() {
             let keep: HashSet<usize> = prog.blocks.iter().filter(|b| !in_embedded(b.start)).map(|b| b.id).collect();
             rec.orphans.retain(|b, _| keep.contains(b));
-            rec.unresolved_jumps.retain(|pc| !in_embedded(*pc));
+            // Unresolved jumps are those of the surviving units only.
+            let mut un: Vec<usize> = std::iter::once(&rec.main).chain(rec.functions.values()).chain(rec.orphans.values()).flat_map(|u| u.nodes.iter().filter(|n| n.unresolved).map(|n| prog.blocks[n.block].end)).filter(|pc| !in_embedded(*pc)).collect();
+            un.sort_unstable();
+            un.dedup();
+            rec.unresolved_jumps = un;
         }
     };
     prune_embedded(&mut rec);
@@ -328,7 +334,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             vec![]
         };
         let mut returns = if matches!(kind, FnKind::External) { function::infer_returns(&l) } else { vec![] };
-        let signature = if opts.no_sigs { None } else { selector.and_then(sigs::function).map(|s| s.to_string()) };
+        let signature = if opts.no_sigs { None } else { selector.and_then(|sel| opts.extra_sigs.get(&sel).cloned().or_else(|| sigs::function(sel).map(|s| s.to_string()))) };
         let name = match (&signature, name_hint, selector) {
             (Some(s), _, _) => sigs::name_of(s).to_string(),
             (None, Some(h), _) => h,

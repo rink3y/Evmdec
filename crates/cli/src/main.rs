@@ -46,6 +46,9 @@ enum Cmd {
         /// Append the security report (markdown) after the code.
         #[arg(long)]
         report: bool,
+        /// Resolve unknown selectors online (openchain.xyz, 4byte.directory).
+        #[arg(long)]
+        lookup: bool,
     },
     /// Block-level oracle: execute every basic block concretely and through the lifted IR.
     Verify {
@@ -176,21 +179,54 @@ fn main() -> Result<()> {
                 for (f, u) in &rec.functions {
                     let calls = u.nodes.iter().filter(|n| n.call.is_some()).count();
                     let rets: Vec<String> = u.nodes.iter().filter_map(|n| n.returns_via.map(|v| format!("{:?}", v))).collect();
-                    println!("  function {:#x}: nodes={} calls={} returns_via={:?}", prog.blocks[*f].start, u.nodes.len(), calls, rets.iter().take(3).collect::<Vec<_>>());
+                    let unres: Vec<String> = u.nodes.iter().filter(|n| n.unresolved).map(|n| format!("{:#x}", prog.blocks[n.block].end)).collect();
+                    println!("  function {:#x}: nodes={} calls={} returns_via={:?} unresolved={:?}", prog.blocks[*f].start, u.nodes.len(), calls, rets.iter().take(3).collect::<Vec<_>>(), unres);
                 }
                 for (b, u) in &rec.orphans {
-                    println!("  orphan {:#x}: nodes={}", prog.blocks[*b].start, u.nodes.len());
+                    let unres: Vec<String> = u.nodes.iter().filter(|n| n.unresolved).map(|n| format!("{:#x}", prog.blocks[n.block].end)).collect();
+                    if !unres.is_empty() || u.nodes.len() > 1 {
+                        println!("  orphan {:#x}: nodes={} unresolved={:?}", prog.blocks[*b].start, u.nodes.len(), unres);
+                    }
                 }
+                let unres: Vec<String> = rec.main.nodes.iter().filter(|n| n.unresolved).map(|n| format!("{:#x}", prog.blocks[n.block].end)).collect();
+                println!("  main unresolved={:?}", unres);
             }
         }
-        Cmd::Decompile { input, rpc, chain, no_follow_proxy, flat, json, embedded, no_sigs, report } => {
-            let opts = evmdec::decompile::Options { flat, pcs: false, embedded, no_sigs };
+        Cmd::Decompile { input, rpc, chain, no_follow_proxy, flat, json, embedded, no_sigs, report, lookup } => {
+            let mut opts = evmdec::decompile::Options { flat, pcs: false, embedded, no_sigs, extra_sigs: Default::default() };
             let file = PathBuf::from(&input);
-            let c = if evmdec::rpc::is_address(&input) {
+            let is_addr = evmdec::rpc::is_address(&input);
+            let code = if is_addr { None } else { Some(load_input(&input)?) };
+            if lookup {
+                // First pass to learn the selectors, then resolve the unknown ones online.
+                let probe = match &code {
+                    Some(c) => Some(evmdec::decompile::decompile(c, &opts)),
+                    None => None,
+                };
+                if let Some(pc) = probe {
+                    let sels: Vec<u32> = pc.functions.iter().filter(|f| f.signature.is_none()).filter_map(|f| f.selector.as_ref()).filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).collect();
+                    opts.extra_sigs = evmdec::sigs::lookup_online(&sels);
+                    eprintln!("resolved {} of {} unknown selectors online", opts.extra_sigs.len(), sels.len());
+                }
+            }
+            let c = if is_addr {
                 fetch_and_decompile(&input, rpc.as_deref(), &chain, !no_follow_proxy, &opts)?
             } else {
-                let code = load_input(&input)?;
-                evmdec::decompile::decompile(&code, &opts)
+                let code = code.unwrap();
+                let opts2 = opts.clone();
+                match std::panic::catch_unwind(move || evmdec::decompile::decompile(&code, &opts2)) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        // Never fail outright: fall back to the disassembly.
+                        eprintln!("internal error while decompiling; printing the disassembly instead (please report this bytecode)");
+                        let code = load_input(&input)?;
+                        let info = evmdec::metadata::analyze(&code);
+                        for i in evmdec::disasm::disassemble(&info.runtime) {
+                            println!("{}", evmdec::disasm::format_instruction(&i));
+                        }
+                        return Ok(());
+                    }
+                }
             };
             if json {
                 let r = evmdec::analyze::analyze(&c);

@@ -41,6 +41,48 @@ pub fn error(selector: u32) -> Option<&'static str> {
     get().errors.get(&selector).copied()
 }
 
+/// Look up unknown selectors in the openchain.xyz signature database (falls back to 4byte.directory).
+/// Returns the first signature per selector. Network failures are not errors: the result is simply empty.
+#[cfg(feature = "rpc")]
+pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    let unknown: Vec<u32> = selectors.iter().copied().filter(|s| function(*s).is_none()).collect();
+    if unknown.is_empty() {
+        return out;
+    }
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
+    for chunk in unknown.chunks(50) {
+        let q: Vec<String> = chunk.iter().map(|s| format!("{:#010x}", s)).collect();
+        let url = format!("https://api.openchain.xyz/signature-database/v1/lookup?function={}&filter=true", q.join(","));
+        if let Ok(resp) = agent.get(&url).call() {
+            if let Ok(v) = resp.into_json::<serde_json::Value>() {
+                if let Some(map) = v.pointer("/result/function").and_then(|m| m.as_object()) {
+                    for (k, arr) in map {
+                        if let (Ok(sel), Some(first)) = (u32::from_str_radix(k.trim_start_matches("0x"), 16), arr.as_array().and_then(|a| a.first()).and_then(|e| e.get("name")).and_then(|n| n.as_str())) {
+                            out.insert(sel, first.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 4byte.directory for anything still unknown.
+    for sel in unknown {
+        if out.contains_key(&sel) {
+            continue;
+        }
+        let url = format!("https://www.4byte.directory/api/v1/signatures/?hex_signature={:#010x}&ordering=created_at", sel);
+        if let Ok(resp) = agent.get(&url).call() {
+            if let Ok(v) = resp.into_json::<serde_json::Value>() {
+                if let Some(t) = v.pointer("/results/0/text_signature").and_then(|x| x.as_str()) {
+                    out.insert(sel, t.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Name part of a signature: `transfer(address,uint256)` -> `transfer`.
 pub fn name_of(sig: &str) -> &str {
     sig.split('(').next().unwrap_or(sig)

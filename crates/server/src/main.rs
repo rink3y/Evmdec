@@ -27,6 +27,9 @@ struct DecompileReq {
     rpc: Option<String>,
     #[serde(default)]
     no_follow_proxy: bool,
+    /// Resolve unknown selectors online.
+    #[serde(default)]
+    lookup: bool,
 }
 
 fn error(status: StatusCode, msg: impl Into<String>) -> axum::response::Response {
@@ -34,9 +37,18 @@ fn error(status: StatusCode, msg: impl Into<String>) -> axum::response::Response
 }
 
 /// Run the decompiler and analyzer; returns the JSON document the UI consumes.
-fn run(code: &[u8], address: Option<&str>, chain: Option<&str>, rpc: Option<&str>, follow: bool) -> Result<Value, String> {
-    let opts = evmdec::decompile::Options::default();
+fn run(code: &[u8], address: Option<&str>, chain: Option<&str>, rpc: Option<&str>, follow: bool, lookup: bool) -> Result<Value, String> {
+    let mut opts = evmdec::decompile::Options::default();
     let mut c = evmdec::decompile::decompile(code, &opts);
+    if lookup {
+        let sels: Vec<u32> = c.functions.iter().filter(|f| f.signature.is_none()).filter_map(|f| f.selector.as_ref()).filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).collect();
+        if !sels.is_empty() {
+            opts.extra_sigs = evmdec::sigs::lookup_online(&sels);
+            if !opts.extra_sigs.is_empty() {
+                c = evmdec::decompile::decompile(code, &opts);
+            }
+        }
+    }
     c.address = address.map(|s| s.to_string());
     c.chain = chain.map(|s| s.to_string());
     let mut implementation: Option<Value> = None;
@@ -74,7 +86,7 @@ fn run(code: &[u8], address: Option<&str>, chain: Option<&str>, rpc: Option<&str
 
 async fn api_decompile(State(st): State<AppState>, Json(req): Json<DecompileReq>) -> axum::response::Response {
     let chain = req.chain.clone().unwrap_or_else(|| "mainnet".into());
-    let key = format!("{}|{}|{}|{}", req.bytecode.as_deref().unwrap_or(""), req.address.as_deref().unwrap_or("").to_lowercase(), chain, req.no_follow_proxy);
+    let key = format!("{}|{}|{}|{}|{}", req.bytecode.as_deref().unwrap_or(""), req.address.as_deref().unwrap_or("").to_lowercase(), chain, req.no_follow_proxy, req.lookup);
     if let Some(v) = st.cache.lock().unwrap().get(&key).cloned() {
         return Json((*v).clone()).into_response();
     }
@@ -89,7 +101,7 @@ async fn api_decompile(State(st): State<AppState>, Json(req): Json<DecompileReq>
             if code.is_empty() {
                 return Err((StatusCode::NOT_FOUND, format!("{} has no code on {}", addr, chain)));
             }
-            return run(&code, Some(&addr), Some(&chain), req.rpc.as_deref(), !req.no_follow_proxy).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e));
+            return run(&code, Some(&addr), Some(&chain), req.rpc.as_deref(), !req.no_follow_proxy, req.lookup).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e));
         }
         let hex = req.bytecode.unwrap_or_default();
         let code = evmdec::hex::decode(&hex).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -99,7 +111,7 @@ async fn api_decompile(State(st): State<AppState>, Json(req): Json<DecompileReq>
         if code.len() > 1 << 20 {
             return Err((StatusCode::BAD_REQUEST, "bytecode too large".into()));
         }
-        run(&code, None, None, None, false).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        run(&code, None, None, None, false, req.lookup).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
     })
     .await;
     match result {

@@ -46,11 +46,23 @@ switching to small and then widely spread values.
 A block is **verified** when at least one run agreed and none disagreed. A **mismatch** is a
 decompiler bug by definition; `--verbose` prints the lifted block and both sides.
 
-## 3. Coverage and control flow
+## 3. Random sample (`corpus/harvest.py`, `corpus/run_sample.sh`)
 
-Each contract reports the number of code blocks covered by some function (external, internal,
-fallback, orphan) and the number of jumps whose target could not be resolved. Code that nothing
-references is still decompiled as `orphan_<pc>` functions, so nothing is silently dropped.
+The hand-picked corpus could be lucky, so `corpus/harvest.py` draws random recent mainnet blocks
+and fetches the runtime code of every distinct transaction target with code; `corpus/run_sample.sh`
+decompiles each one with a 120 s limit and runs the block oracle. The addresses of the sample
+reported in the README are in `corpus/sample_ids.txt`. Nothing about the sample was chosen by hand.
+
+## 4. Coverage and control flow
+
+Each contract reports the number of *potential code* blocks covered by some function (external,
+internal, fallback, orphan) and the number of jumps whose target could not be resolved. A
+potential code block is one the EVM can enter: the entry, a `JUMPDEST`-started block, or the
+fall-through of a `JUMPI`; bytes after a terminator without a `JUMPDEST` cannot execute and are
+data or dead by construction. Embedded creation code (`CREATE2` payloads) and the metadata
+trailer are excluded. Computed jumps (targets built from calldata or shift-selected constants)
+are resolved by enumerating the destinations compatible with the expression's shape. Code that
+nothing references is still decompiled as `orphan_<pc>` functions, so nothing is silently dropped.
 
 ## Results
 
@@ -60,5 +72,7 @@ See the tables in [README.md](../README.md); regenerate with:
 cargo build --release
 python3 corpus/bench.py            # interface recovery (add --sigs to use the dictionary)
 RUNS=8 ./corpus/verify_all.sh      # block oracle over the corpus
-cargo test -p evmdec               # unit + integration tests
+python3 corpus/harvest.py --out sample --blocks 12 --max 120   # random mainnet sample
+DIR=sample RUNS=3 ./corpus/run_sample.sh                        # decompile + oracle on it
+cargo test -p evmdec               # unit + integration tests (corpus, oracle, analyzer)
 ```

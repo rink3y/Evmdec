@@ -280,18 +280,13 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     }
     tick("lift orphans", &mut tt);
-    // Map callee block ids to pcs in Internal statements.
-    let block_pc: HashMap<usize, usize> = prog.blocks.iter().map(|b| (b.id, b.start)).collect();
-
     let mut functions: Vec<Function> = Vec::new();
     let reprocess = main.reprocess_count + internals.values().map(|l| l.reprocess_count).sum::<usize>();
 
     // Effects of internal functions (transitive).
     let mut int_effects: HashMap<usize, function::Effects> = HashMap::new();
     for (pc, l) in &internals {
-        let mut e = function::effects(l);
-        e.internal_callees = e.internal_callees.iter().map(|b| block_pc[b]).collect();
-        int_effects.insert(*pc, e);
+        int_effects.insert(*pc, function::effects(l));
     }
     let transitive = |e: &function::Effects, int_effects: &HashMap<usize, function::Effects>| -> function::Effects {
         let mut acc = e.clone();
@@ -320,11 +315,9 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     // Leak the internal graphs for the lifetime of this analysis so the resolver can hand out
     // `&'static` references (the decompiler is a one-shot process per contract).
     let internals_static: &'static HashMap<usize, Lifted> = Box::leak(Box::new(internals.iter().map(|(pc, l)| (*pc, l.clone())).collect::<HashMap<usize, Lifted>>()));
-    let pc_of_block: HashMap<usize, usize> = block_pc.clone();
-    let resolve = move |block: usize| -> Option<&'static Lifted> { pc_of_block.get(&block).and_then(|pc| internals_static.get(pc)) };
+    let resolve = move |pc: usize| -> Option<&'static Lifted> { internals_static.get(&pc) };
     let make = |kind: FnKind, selector: Option<u32>, l: Lifted, pc: usize, name_hint: Option<String>, n_args: usize, n_rets: usize| -> Function {
-        let mut eff = function::effects(&l);
-        eff.internal_callees = eff.internal_callees.iter().map(|b| block_pc[b]).collect();
+        let eff = function::effects(&l);
         let calls = eff.internal_callees.clone();
         let eff = transitive(&eff, &int_effects);
         let mut params = if matches!(kind, FnKind::External) {

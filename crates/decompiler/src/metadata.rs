@@ -27,6 +27,13 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    /// solc started encoding its version in the metadata with 0.5.9 and switched the
+    /// source hash from `bzzr0` to `bzzr1` in 0.5.11; a `bzzr0`-only trailer therefore
+    /// pins the compiler below 0.5.9.
+    pub fn implies_pre_0_5_9(&self) -> bool {
+        self.compiler == "solc" && self.version.is_none() && self.bzzr.as_deref().map_or(false, |b| b.starts_with("bzzr0"))
+    }
+
     pub fn version_tuple(&self) -> Option<(u32, u32, u32)> {
         let v = self.version.as_ref()?;
         let mut it = v.split('.').map(|p| p.parse::<u32>().ok());

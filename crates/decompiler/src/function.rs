@@ -337,7 +337,7 @@ pub struct Param {
 /// Expressions of a function plus those of the internal functions it calls (two levels), with
 /// callee arguments substituted by the caller's actual values, so that decoding done in helper
 /// functions (solc >= 0.8) is visible.
-pub fn exprs_with_callees(l: &Lifted, resolve: &dyn Fn(usize) -> Option<&'static Lifted>, depth: usize) -> Vec<ExprId> {
+pub fn exprs_with_callees<'a>(l: &Lifted, resolve: &dyn Fn(usize) -> Option<&'a Lifted>, depth: usize) -> Vec<ExprId> {
     let mut out: Vec<ExprId> = Vec::new();
     for nd in &l.nodes {
         out.extend(lift::node_exprs(nd));
@@ -480,6 +480,8 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
     for nd in &l.nodes {
         if let Term::Return { len, data, .. } = &nd.term {
             let tys: Vec<String> = match (data, expr::as_const(*len)) {
+                // `(32, n, <n bytes>)`: one dynamic value encoded in place.
+                (Some(words), Some(l)) if words.len() >= 2 && expr::as_const(words[0]) == Some(U256::from_u64(32)) && expr::as_const(words[1]).map_or(false, |n| n.fits_u64() && l == U256::from_u64(64 + n.low_u64().div_ceil(32) * 32)) => vec!["bytes".into()],
                 (Some(words), Some(_)) => words.iter().map(|w| type_of_value(*w)).collect(),
                 (None, Some(l)) if l.fits_u64() && l.low_u64() % 32 == 0 && l.low_u64() <= 32 * 16 => vec!["uint256".to_string(); (l.low_u64() / 32) as usize],
                 (None, Some(_)) => vec!["bytes".into()],

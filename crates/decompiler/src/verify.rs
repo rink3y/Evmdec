@@ -618,7 +618,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         }
                         ev.mem_snapshots.push(mem.clone());
                     }
-                    Stmt::Internal { .. } | Stmt::Assign { .. } | Stmt::Drop(_) => {}
+                    Stmt::Internal { .. } | Stmt::Assign { .. } | Stmt::Drop(_) | Stmt::Require { .. } => {}
                 }
             }
             // Terminator.

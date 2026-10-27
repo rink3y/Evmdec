@@ -23,10 +23,13 @@ pub enum Stmt {
     Create { seq: u32, kind: u8, value: ExprId, off: ExprId, len: ExprId, salt: Option<ExprId>, result: ExprId, init: Option<Vec<ExprId>> },
     /// CALLDATACOPY / CODECOPY / RETURNDATACOPY / EXTCODECOPY / MCOPY.
     Copy { kind: u8, dest: ExprId, src: ExprId, len: ExprId, addr: Option<ExprId> },
-    /// Call of an internal function (another unit).
+    /// Call of the internal function (another unit) whose entry is at pc `callee`.
     Internal { seq: u32, callee: usize, args: Vec<ExprId>, results: Vec<ExprId> },
     /// Explicit `POP` of a value that had side effects (a call result that is ignored).
     Drop(ExprId),
+    /// A guard taken over from an inlined helper: execution continues only if `cond` holds,
+    /// otherwise the helper reverted with `data` (decoded payload words), or hit INVALID.
+    Require { cond: ExprId, data: Option<Vec<ExprId>>, invalid: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +97,8 @@ enum MVal {
     Copy(u8, ExprId, Option<ExprId>),
     /// Output region of call `seq`.
     CallOut(u32),
+    /// Bytes whose value differs between merged predecessors: a read hitting them is unknown.
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +141,34 @@ fn norm_offset(e: ExprId) -> (Option<ExprId>, u64) {
     } else {
         (Some(e), 0)
     }
+}
+
+/// A memory base that may equal any address: it holds a loop variable, argument, call result
+/// or other unknown rather than free-memory-pointer arithmetic.
+fn wild_base(b: ExprId) -> bool {
+    expr::contains(b, &|x| !matches!(x, Node::Const(_) | Node::Op(..) | Node::MLoad(..)))
+}
+
+/// Could a write through base `wb` (`woff`, `wlen` bytes) alias a read through base `rb`
+/// (`roff`, `rlen` bytes) when the bases differ? Only when one side is an unknown pointer.
+/// Such a pointer is unsigned and memory never wraps, so `p + k` lies at or above `k`; it also
+/// never points into the scratch area below 0x80.
+fn may_alias(wb: Option<ExprId>, woff: u64, wlen: Option<u64>, rb: Option<ExprId>, roff: u64, rlen: u64) -> bool {
+    let w_wild = wb.map_or(false, wild_base);
+    let r_wild = rb.map_or(false, wild_base);
+    if w_wild {
+        if rb.is_some() {
+            return true;
+        }
+        return roff >= 0x80 && roff + rlen > woff;
+    }
+    if r_wild {
+        if wb.is_some() {
+            return true;
+        }
+        return woff >= 0x80 && wlen.map_or(true, |l| woff + l > roff);
+    }
+    false
 }
 
 impl Mem {
@@ -226,7 +259,11 @@ impl Mem {
                 break;
             }
             if w.base != base {
-                // Different bases are assumed not to alias, except symbolic-length writes on the same base.
+                // Different bases are assumed not to alias (free-memory-pointer regions versus
+                // constants), unless one of them is an unknown pointer.
+                if may_alias(w.base, w.off, w.len, base, d, n) {
+                    return None;
+                }
                 continue;
             }
             let Some(wl) = w.len else {
@@ -275,6 +312,7 @@ impl Mem {
                     }
                     return None;
                 }
+                MVal::Unknown => return None,
             }
         }
         let _ = version;
@@ -283,7 +321,11 @@ impl Mem {
             return Some(if n == 32 { word } else { op2(op::SHR, konst_u64(8 * (32 - n)), word) });
         }
         if covered < n as usize {
-            if !self.fresh {
+            // Untouched bytes are zero only in a fresh frame, and only when the address is one
+            // whose writes we would have seen: a constant, or free-memory-pointer arithmetic. A
+            // base holding a loop variable, argument or other unknown may equal any written
+            // address, so the read is unknown.
+            if !self.fresh || base.map_or(false, wild_base) {
                 return None;
             }
         }
@@ -359,20 +401,49 @@ impl Mem {
         Some((words, tail))
     }
 
+    /// Words of a small region, with unknown words left as memory reads, provided at least one
+    /// word is known (so that a return of `(32, len, <copied data>)` keeps its decoded head).
+    fn read_region_lossy(&self, off: ExprId, len: u64, version: u32) -> Option<Vec<ExprId>> {
+        if len == 0 || len % 32 != 0 || len > 8 * 32 {
+            return None;
+        }
+        let words: Vec<ExprId> = (0..len / 32).map(|i| self.load_word(expr::add_const(off, U256::from(i * 32)), version)).collect();
+        if words.iter().all(|w| matches!(expr::node(*w), Node::MLoad(..))) {
+            return None;
+        }
+        Some(words)
+    }
+
     /// Intersection with another memory (merge point).
     fn intersect(&mut self, other: &Mem) -> bool {
-        let before = self.writes.len();
         let fresh_before = self.fresh;
         let gen_before = self.gen;
-        // Same write = same base/offset/length/value (generation and origin may differ).
-        self.writes.retain(|w| other.writes.iter().any(|o| o.base == w.base && o.off == w.off && o.len == w.len && o.val == w.val));
+        // Same write = same base/offset/length/value (generation and origin may differ). Bytes
+        // written differently (or only) on one side keep an `Unknown` write so that they are not
+        // read as fresh zeros or as the other side's value.
+        let same = |a: &MemWrite, b: &MemWrite| a.base == b.base && a.off == b.off && a.len == b.len && a.val == b.val;
+        let mut merged: Vec<MemWrite> = Vec::new();
+        for w in &self.writes {
+            if other.writes.iter().any(|o| same(o, w)) {
+                merged.push(w.clone());
+            } else {
+                merged.push(MemWrite { val: MVal::Unknown, origin: None, ..w.clone() });
+            }
+        }
+        for o in &other.writes {
+            if !self.writes.iter().any(|w| same(o, w)) && !merged.iter().any(|m| m.base == o.base && m.off == o.off && m.len == o.len) {
+                merged.push(MemWrite { val: MVal::Unknown, origin: None, ..o.clone() });
+            }
+        }
+        let changed_writes = merged.len() != self.writes.len() || merged.iter().zip(self.writes.iter()).any(|(a, b)| !(same(a, b)));
+        self.writes = merged;
         self.fresh &= other.fresh;
         if other.gen != self.gen || other.clobber_gen != self.clobber_gen {
             // Different histories: unknown reads must not be conflated across predecessors.
             self.gen = self.gen.max(other.gen) + 1;
             self.clobber_gen = self.gen;
         }
-        before != self.writes.len() || fresh_before != self.fresh || gen_before != self.gen
+        changed_writes || fresh_before != self.fresh || gen_before != self.gen
     }
 }
 
@@ -444,6 +515,9 @@ pub struct CalleeSummary {
     pub side_effects: bool,
     /// Every path reverts with this payload (offset, length, decoded words): a panic/revert helper.
     pub reverts: Option<(ExprId, ExprId, Option<Vec<ExprId>>)>,
+    /// Conditions that must hold on the summarised path (the other side of each branch reverts),
+    /// with the revert payload of the failing side and whether it is an INVALID (assert).
+    pub guards: Vec<(ExprId, Option<Vec<ExprId>>, bool)>,
 }
 
 /// Compute a summary from a lifted internal function, if it is simple enough.
@@ -462,6 +536,7 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                 Stmt::MStore { .. } => return None,
                 Stmt::Copy { .. } | Stmt::Internal { .. } | Stmt::Call { .. } | Stmt::Create { .. } => return None,
                 Stmt::SStore { .. } | Stmt::Log { .. } => sum.side_effects = true,
+                Stmt::Require { cond, data, invalid } => sum.guards.push((*cond, data.clone(), *invalid)),
                 Stmt::Assign { .. } | Stmt::Drop(_) => {}
             }
         }
@@ -474,17 +549,37 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
             Term::InternalReturn(vals) => {
                 sum.returns = vals.clone();
                 // Expressions must not depend on the callee's own memory versions in complex ways.
-                let ok = sum.returns.iter().chain(sum.mstores.iter().flat_map(|(a, b)| [a, b])).all(|e| expr::size(*e) <= 64 && !expr::contains(*e, &|x| matches!(x, Node::Var(_) | Node::IntRet(..) | Node::CallResult(_) | Node::Unknown(_))));
+                let simple = |e: &ExprId| expr::size(*e) <= 64 && !expr::contains(*e, &|x| matches!(x, Node::Var(_) | Node::IntRet(..) | Node::CallResult(_) | Node::Unknown(_)));
+                let ok = sum.returns.iter().chain(sum.mstores.iter().flat_map(|(a, b)| [a, b])).all(simple) && sum.guards.iter().all(|(c, d, _)| simple(c) && d.as_ref().map_or(true, |d| d.iter().all(simple)));
                 return if ok { Some(sum) } else { None };
             }
             Term::Jump(t) => n = *t,
-            Term::Branch { t, f, .. } => {
-                // Follow the non-reverting side if the other only reverts.
+            Term::Branch { cond, t, f } => {
+                // Follow the non-reverting side if the other only reverts, and remember the
+                // condition that side needs as a guard.
                 let rev = |x: usize| matches!(l.nodes[x].term, Term::Revert { .. } | Term::Invalid | Term::Infeasible) && l.nodes[x].stmts.iter().all(|s| matches!(s, Stmt::MStore { .. }));
+                let payload = |x: usize| -> (Option<Vec<ExprId>>, bool) {
+                    match &l.nodes[x].term {
+                        Term::Revert { data, .. } => (data.clone(), false),
+                        Term::Invalid => (None, true),
+                        _ => (None, false),
+                    }
+                };
                 match t {
-                    Some(t) if rev(*t) && !rev(*f) => n = *f,
-                    Some(t) if rev(*f) && !rev(*t) => n = *t,
-                    None => n = *f,
+                    Some(t) if rev(*t) && !rev(*f) => {
+                        let (d, inv) = payload(*t);
+                        sum.guards.push((expr::op1(op::ISZERO, *cond), d, inv));
+                        n = *f;
+                    }
+                    Some(t) if rev(*f) && !rev(*t) => {
+                        let (d, inv) = payload(*f);
+                        sum.guards.push((*cond, d, inv));
+                        n = *t;
+                    }
+                    None => {
+                        sum.guards.push((expr::op1(op::ISZERO, *cond), None, true));
+                        n = *f;
+                    }
                     _ => return None,
                 }
             }
@@ -1027,9 +1122,11 @@ impl<'a> Lifter<'a> {
                 op::RETURN | op::REVERT => {
                     let off = pop!();
                     let len = pop!();
-                    let data = expr::as_const(len).and_then(|l| l.as_usize()).and_then(|l| st.mem.read_region(off, l as u64, st.version)).map(|(w, _)| w);
+                    let mut data = expr::as_const(len).and_then(|l| l.as_usize()).and_then(|l| st.mem.read_region(off, l as u64, st.version)).map(|(w, _)| w);
                     if data.is_some() {
                         hidden.set.borrow_mut().extend(st.mem.consumers(off, expr::as_const(len).unwrap().low_u64()));
+                    } else if o == op::RETURN && !self.oracle {
+                        data = expr::as_const(len).and_then(|l| l.as_usize()).and_then(|l| st.mem.read_region_lossy(off, l as u64, st.version));
                     }
                     term = Some(if o == op::RETURN { Term::Return { off, len, data } } else { Term::Revert { off, len, data } });
                     break;
@@ -1154,8 +1251,18 @@ impl<'a> Lifter<'a> {
         let inlined = direct_returns.is_some();
         // A fully inlined pure helper (ABI decoder/encoder, getter) leaves no statement behind.
         let pure_inlined = inlined && summary.map_or(false, |s| s.mstores.is_empty() && !s.side_effects);
-        if !pure_inlined {
-            stmts.push(Stmt::Internal { seq, callee: call.callee, args, results: if inlined { vec![] } else { results } });
+        if pure_inlined {
+            // The helper's own checks (SafeMath asserts, bounds checks) survive as guards.
+            for (cond, data, invalid) in summary.map(|s| s.guards.as_slice()).unwrap_or(&[]) {
+                let cond = subst(*cond);
+                if expr::as_const(cond).map_or(false, |c| !c.is_zero()) {
+                    continue;
+                }
+                let data = data.as_ref().map(|d| d.iter().map(|e| subst(*e)).collect());
+                stmts.push(Stmt::Require { cond, data, invalid: *invalid });
+            }
+        } else {
+            stmts.push(Stmt::Internal { seq, callee: self.prog.blocks[call.callee].start, args, results: if inlined { vec![] } else { results } });
         }
         let conts: Vec<usize> = un.succs.iter().filter(|(_, k)| *k == Edge::Return).map(|(s, _)| *s).collect();
         match conts.len() {
@@ -1323,6 +1430,12 @@ pub fn node_exprs(n: &LNode) -> Vec<ExprId> {
             }
             Stmt::Internal { args, .. } => v.extend(args.iter().copied()),
             Stmt::Drop(e) => v.push(*e),
+            Stmt::Require { cond, data, .. } => {
+                v.push(*cond);
+                if let Some(d) = data {
+                    v.extend(d.iter().copied());
+                }
+            }
         }
     }
     match &n.term {

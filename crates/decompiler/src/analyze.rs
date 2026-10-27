@@ -43,6 +43,13 @@ pub struct Finding {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
     pub recommendation: String,
+    /// Number of code sites folded into this finding (same rule, same function).
+    #[serde(skip_serializing_if = "is_one")]
+    pub sites: usize,
+}
+
+fn is_one(n: &usize) -> bool {
+    *n == 1
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -59,7 +66,11 @@ pub struct Report {
 /// used by order-sensitive rules.
 #[derive(Clone)]
 struct Event {
+    /// Node of the function being analysed that this event belongs to (the call-site node for
+    /// events inlined from internal callees), so it indexes `l.nodes` and works with `reaches`.
     node: usize,
+    /// Program counter of the node that holds the statement (inside the callee when inlined).
+    pc: usize,
     stmt: Option<Stmt>,
     term: Option<Term>,
     /// Inside a loop body.
@@ -116,6 +127,10 @@ fn loop_nodes(l: &Lifted) -> HashSet<usize> {
 }
 
 fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Event> {
+    events_of_in(ctx, l, depth, in_loop_outer, None)
+}
+
+fn events_of_in(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool, outer_node: Option<usize>) -> Vec<Event> {
     let loops = loop_nodes(l);
     let mut out = Vec::new();
     // RPO order
@@ -135,19 +150,20 @@ fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Ev
     for nid in order {
         let nd = &l.nodes[nid];
         let in_loop = in_loop_outer || loops.contains(&nid);
+        let anchor = outer_node.unwrap_or(nid);
         for s in &nd.stmts {
-            out.push(Event { node: nid, stmt: Some(s.clone()), term: None, in_loop });
+            out.push(Event { node: anchor, pc: nd.pc, stmt: Some(s.clone()), term: None, in_loop });
             if let Stmt::Internal { callee, .. } = s {
                 if depth > 0 {
                     if let Some(f) = ctx.internals.get(callee) {
                         if let Some(cl) = &f.lifted {
-                            out.extend(events_of(ctx, cl, depth - 1, in_loop));
+                            out.extend(events_of_in(ctx, cl, depth - 1, in_loop, Some(anchor)));
                         }
                     }
                 }
             }
         }
-        out.push(Event { node: nid, stmt: None, term: Some(nd.term.clone()), in_loop });
+        out.push(Event { node: anchor, pc: nd.pc, stmt: None, term: Some(nd.term.clone()), in_loop });
     }
     out
 }
@@ -176,7 +192,7 @@ fn fname(f: &Function) -> String {
 }
 
 fn push(findings: &mut Vec<Finding>, id: &str, title: &str, sev: Severity, conf: Confidence, f: Option<&Function>, pc: Option<usize>, desc: String, evidence: Vec<String>, rec: &str) {
-    findings.push(Finding { id: id.into(), title: title.into(), severity: sev, confidence: conf, function: f.map(fname), pc, description: desc, evidence, recommendation: rec.into() });
+    findings.push(Finding { id: id.into(), title: title.into(), severity: sev, confidence: conf, function: f.map(fname), pc, description: desc, evidence, sites: 1, recommendation: rec.into() });
 }
 
 /// Is `cond` an authorization check on msg.sender: `msg.sender == <storage or constant address>`,
@@ -227,6 +243,23 @@ fn has_caller_check(l: &Lifted, before: Option<usize>) -> bool {
         }
     }
     false
+}
+
+/// All internal functions reachable from `f` through internal calls (transitively, `f` excluded).
+fn transitive_callees<'a>(ctx: &'a Ctx, f: &Function) -> Vec<&'a Function> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut work: Vec<usize> = f.calls.clone();
+    while let Some(pc) = work.pop() {
+        if !seen.insert(pc) {
+            continue;
+        }
+        if let Some(cf) = ctx.internals.get(&pc) {
+            out.push(*cf);
+            work.extend(cf.calls.iter().copied());
+        }
+    }
+    out
 }
 
 fn any_caller_check(ctx: &Ctx, f: &Function) -> bool {
@@ -345,7 +378,8 @@ pub fn analyze(c: &Contract) -> Report {
                 }
             }
             for (k, n) in counts {
-                if n >= 2 && l.nodes.iter().any(|nd| matches!(&nd.term, Term::Branch { cond, .. } if mentions(*cond, &|x| matches!(x, Node::SLoad(kk, false, _) if *kk == k)))) {
+                let tested = |cond: ExprId| mentions(cond, &|x| matches!(x, Node::SLoad(kk, false, _) if *kk == k));
+                if n >= 2 && events.iter().any(|e| matches!(&e.term, Some(Term::Branch { cond, .. }) if tested(*cond)) || matches!(&e.stmt, Some(Stmt::Require { cond, .. }) if tested(*cond))) {
                     guard = true;
                 }
             }
@@ -375,14 +409,14 @@ pub fn analyze(c: &Contract) -> Report {
                             delegatecall_targets_storage = true;
                         }
                         if from_calldata(*addr) && !caller_checked {
-                            push(&mut findings, "arbitrary-delegatecall", "Delegatecall to a caller-controlled address", Severity::Critical, Confidence::High, Some(f), Some(l.nodes[ev.node].pc),
+                            push(&mut findings, "arbitrary-delegatecall", "Delegatecall to a caller-controlled address", Severity::Critical, Confidence::High, Some(f), Some(ev.pc),
                                 format!("`{}` delegatecalls to `{}`, which is derived from calldata, without any msg.sender check. Anyone can execute arbitrary code in this contract's storage context (take over storage, selfdestruct).", f.name, target),
                                 vec![line.clone()], "Restrict the target to a whitelist or trusted storage slot and gate the function with access control.");
                         } else if from_calldata(*addr) {
-                            push(&mut findings, "delegatecall-user-target", "Delegatecall target derived from calldata (access-controlled)", Severity::High, Confidence::Medium, Some(f), Some(l.nodes[ev.node].pc),
+                            push(&mut findings, "delegatecall-user-target", "Delegatecall target derived from calldata (access-controlled)", Severity::High, Confidence::Medium, Some(f), Some(ev.pc),
                                 format!("`{}` delegatecalls to `{}` derived from calldata. Only safe if the caller check is sufficient and the target is trusted.", f.name, target), vec![line.clone()], "Validate the target against an allowlist even for privileged callers.");
                         } else if !storage_target && !is_const_addr(*addr) {
-                            push(&mut findings, "delegatecall-dynamic-target", "Delegatecall to a computed address", Severity::Medium, Confidence::Low, Some(f), Some(l.nodes[ev.node].pc),
+                            push(&mut findings, "delegatecall-dynamic-target", "Delegatecall to a computed address", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                 format!("`{}` delegatecalls to `{}`.", f.name, target), vec![line.clone()], "Make sure the computed implementation cannot be influenced by callers.");
                         }
                     }
@@ -400,7 +434,7 @@ pub fn analyze(c: &Contract) -> Report {
                             } else {
                                 (Severity::Medium, Confidence::Low, "")
                             };
-                            push(&mut findings, "reentrancy", "State written after an external call (reentrancy)", sev, conf, Some(f), Some(l.nodes[ev.node].pc),
+                            push(&mut findings, "reentrancy", "State written after an external call (reentrancy)", sev, conf, Some(f), Some(ev.pc),
                                 format!("`{}` performs an external call to `{}` and writes storage afterwards. A malicious callee can re-enter before the state update is applied (checks-effects-interactions violated).{}", f.name, target, extra),
                                 vec![line.clone()], "Apply the checks-effects-interactions pattern (update state before calling out) or use a reentrancy guard.");
                         }
@@ -416,14 +450,14 @@ pub fn analyze(c: &Contract) -> Report {
                             })
                         }) || l.edge_assigns.values().flatten().any(|(_, v)| mentions(*v, &|n| matches!(n, Node::CallResult(s) if *s == *seq)));
                         if !used && !precompile {
-                            push(&mut findings, "unchecked-call", "Return value of external call ignored", if value_nonzero { Severity::Medium } else { Severity::Low }, Confidence::High, Some(f), Some(l.nodes[ev.node].pc),
+                            push(&mut findings, "unchecked-call", "Return value of external call ignored", if value_nonzero { Severity::Medium } else { Severity::Low }, Confidence::High, Some(f), Some(ev.pc),
                                 format!("`{}` ignores the success flag of a low-level call to `{}`. If the call fails (reverting callee, out of gas, non-contract address) execution continues as if it succeeded{}.", f.name, target, if value_nonzero { ", and the ether is kept by this contract while state may assume it was sent" } else { "" }),
                                 vec![line.clone()], "Check the returned boolean (`require(success)`) or use a high-level call that reverts on failure.");
                         }
                         // Arbitrary call
                         let input_from_calldata = input.as_ref().map_or(false, |w| w.iter().any(|x| from_calldata(*x))) || expr::as_const(*in_len).is_none();
                         if from_calldata(*addr) && input_from_calldata && !caller_checked && f.kind == FnKind::External {
-                            push(&mut findings, "arbitrary-call", "Arbitrary external call with caller-controlled target and data", Severity::High, Confidence::Medium, Some(f), Some(l.nodes[ev.node].pc),
+                            push(&mut findings, "arbitrary-call", "Arbitrary external call with caller-controlled target and data", Severity::High, Confidence::Medium, Some(f), Some(ev.pc),
                                 format!("`{}` calls `{}` with calldata-derived payload and no access control. If this contract holds token approvals or ether, anyone can drain them through it (e.g. calling `transferFrom` on an approved token).", f.name, target),
                                 vec![line.clone()], "Restrict callable targets/selectors, or make sure the contract never holds funds or approvals.");
                         }
@@ -431,20 +465,20 @@ pub fn analyze(c: &Contract) -> Report {
                         if value_nonzero && from_caller(*addr) && !caller_checked && f.kind == FnKind::External {
                             let v = value.unwrap();
                             if !from_caller(v) && !from_calldata(v) || (from_calldata(v) && !from_caller(v)) {
-                                push(&mut findings, "unprotected-ether-withdrawal", "Ether sent to msg.sender without per-caller accounting", Severity::Medium, Confidence::Low, Some(f), Some(l.nodes[ev.node].pc),
+                                push(&mut findings, "unprotected-ether-withdrawal", "Ether sent to msg.sender without per-caller accounting", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                     format!("`{}` sends `{}` wei to msg.sender; the amount is not derived from a msg.sender-keyed balance and the function has no access control.", f.name, emit::fmt_expr(v, &names)),
                                     vec![line.clone()], "Verify the amount is bounded by what the caller is owed.");
                             }
                         }
                         if ev.in_loop && !precompile {
-                            push(&mut findings, "call-in-loop", "External call inside a loop", Severity::Low, Confidence::Medium, Some(f), Some(l.nodes[ev.node].pc),
+                            push(&mut findings, "call-in-loop", "External call inside a loop", Severity::Low, Confidence::Medium, Some(f), Some(ev.pc),
                                 format!("`{}` performs an external call to `{}` inside a loop; one failing or gas-hungry callee can block the whole iteration (denial of service).", f.name, target), vec![line.clone()], "Prefer pull-payments or bound the iteration.");
                         }
                         // ecrecover
                         if expr::as_const(*addr) == Some(U256::ONE) {
                             let zero_checked = l.nodes.iter().any(|nd| matches!(&nd.term, Term::Branch { cond, .. } if mentions(*cond, &|n| matches!(n, Node::ReturnData(s, _) if *s == *seq)) || mentions(*cond, &|n| matches!(n, Node::MLoad(..)))));
                             if !zero_checked {
-                                push(&mut findings, "ecrecover-zero", "ecrecover result may be the zero address", Severity::Medium, Confidence::Low, Some(f), Some(l.nodes[ev.node].pc),
+                                push(&mut findings, "ecrecover-zero", "ecrecover result may be the zero address", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                     format!("`{}` calls the ecrecover precompile; no comparison of the recovered address against zero was found. An invalid signature recovers to address(0), which may match an unset storage slot.", f.name), vec![line.clone()], "Require the recovered signer to be non-zero (or use OpenZeppelin ECDSA).");
                             }
                         }
@@ -453,7 +487,7 @@ pub fn analyze(c: &Contract) -> Report {
                 }
                 Stmt::Create { kind, .. } => {
                     let line = emit::fmt_stmt(stmt, &names);
-                    push(&mut findings, "contract-creation", if *kind == op::CREATE2 { "Deploys contracts with CREATE2" } else { "Deploys contracts with CREATE" }, Severity::Info, Confidence::High, Some(f), Some(l.nodes[ev.node].pc), format!("`{}` deploys a new contract.", f.name), vec![line], "Informational.");
+                    push(&mut findings, "contract-creation", if *kind == op::CREATE2 { "Deploys contracts with CREATE2" } else { "Deploys contracts with CREATE" }, Severity::Info, Confidence::High, Some(f), Some(ev.pc), format!("`{}` deploys a new contract.", f.name), vec![line], "Informational.");
                 }
                 _ => {}
             }
@@ -509,21 +543,23 @@ pub fn analyze(c: &Contract) -> Report {
         if pre08 && f.kind == FnKind::External {
             let mut flagged = 0;
             let mut ev_lines = Vec::new();
-            let mut all_exprs: Vec<ExprId> = Vec::new();
-            for nd in &l.nodes {
-                all_exprs.extend(lift::node_exprs(nd));
-            }
-            for c2 in &f.calls {
-                if let Some(cf) = ctx.internals.get(c2) {
-                    if let Some(cl) = &cf.lifted {
-                        for nd in &cl.nodes {
-                            all_exprs.extend(lift::node_exprs(nd));
-                        }
-                    }
+            let callees = transitive_callees(&ctx, f);
+            let mut bodies: Vec<&Lifted> = vec![l];
+            for cf in &callees {
+                if let Some(cl) = &cf.lifted {
+                    bodies.push(cl);
                 }
             }
-            let conds: Vec<ExprId> = all_exprs.iter().copied().filter(|e| expr::is_boolean(*e)).collect();
-            for nd in &l.nodes {
+            let resolve = |pc: usize| -> Option<&Lifted> { ctx.internals.get(&pc).and_then(|cf| cf.lifted.as_ref()) };
+            let mut memo = HashMap::new();
+            for body in &bodies {
+                // Conditions visible from this body: its own plus those of the helpers it calls,
+                // with the helpers' arguments replaced by the actual values (SafeMath-style checks
+                // live in the callee and mention the caller's operands only after substitution).
+                // Storage/memory versions are stripped so that a check made before an earlier
+                // store still matches the operands of a later one.
+                let conds: Vec<ExprId> = crate::function::exprs_with_callees(body, &resolve, 2).into_iter().filter(|e| expr::is_boolean(*e)).map(|e| strip_versions(e, &mut memo)).collect();
+                for nd in body.nodes.iter() {
                 for s in &nd.stmts {
                     if let Stmt::SStore { val, .. } = s {
                         let mut stack = vec![*val];
@@ -535,7 +571,8 @@ pub fn analyze(c: &Contract) -> Report {
                             if let Node::Op(o, v) = expr::node(x) {
                                 if (o == op::ADD || o == op::SUB || o == op::MUL) && !expr::is_const(v[0]) && !expr::is_const(v[1]) {
                                     // Is there a comparison involving this op or its operands (SafeMath-style check)?
-                                    let checked = conds.iter().any(|cnd| mentions(*cnd, &|n| matches!(n, Node::Op(_, w) if w.contains(&x) || (w.contains(&v[0]) && w.contains(&v[1])))));
+                                    let (xn, v0, v1) = (strip_versions(x, &mut memo), strip_versions(v[0], &mut memo), strip_versions(v[1], &mut memo));
+                                    let checked = conds.iter().any(|cnd| mentions(*cnd, &|n| matches!(n, Node::Op(_, w) if w.contains(&xn) || (w.contains(&v0) && w.contains(&v1)))));
                                     if !checked {
                                         flagged += 1;
                                         if ev_lines.len() < 3 {
@@ -548,6 +585,7 @@ pub fn analyze(c: &Contract) -> Report {
                         }
                     }
                 }
+            }
             }
             if flagged > 0 {
                 push(&mut findings, "unchecked-arithmetic", "Arithmetic without overflow check (compiler < 0.8)", Severity::Medium, Confidence::Low, Some(f), None,
@@ -630,6 +668,8 @@ pub fn analyze(c: &Contract) -> Report {
         if v.1 < 8 {
             push(&mut findings, "legacy-compiler", "Compiled with a pre-0.8 compiler", Severity::Info, Confidence::High, None, None, format!("solc {}.{}.{} has no built-in overflow checks and older ABI decoding (no validation of address/bool upper bits before 0.5).", v.0, v.1, v.2), vec![], "Prefer >= 0.8 for new deployments.");
         }
+    } else if c.info.metadata.as_ref().map_or(false, |m| m.implies_pre_0_5_9()) {
+        push(&mut findings, "legacy-compiler", "Compiled with a pre-0.8 compiler", Severity::Info, Confidence::High, None, None, "The metadata trailer carries a bzzr0 hash and no version field, which solc only emitted before 0.5.9. Such compilers have no built-in overflow checks and do not validate address/bool upper bits during ABI decoding (before 0.5).".into(), vec![], "Prefer >= 0.8 for new deployments.");
     } else if c.info.metadata.is_none() && !ctx.vyper {
         push(&mut findings, "no-metadata", "No compiler metadata", Severity::Info, Confidence::High, None, None, "The bytecode carries no CBOR metadata trailer (stripped, hand-written, or a very old compiler). Source verification is not possible by hash.".into(), vec![], "Informational.");
     }
@@ -648,6 +688,7 @@ pub fn analyze(c: &Contract) -> Report {
     // Deduplicate identical findings (same id, function, pc).
     let mut seen = HashSet::new();
     findings.retain(|f| seen.insert((f.id.clone(), f.function.clone(), f.pc, f.title.clone())));
+    let mut findings = merge_findings(findings);
     findings.sort_by(|a, b| a.severity.cmp(&b.severity).then(a.function.cmp(&b.function)));
 
     let mut summary = BTreeMap::new();
@@ -679,6 +720,91 @@ const COMPILER_BUGS: &[((u32, u32, u32), (u32, u32, u32), &str, &str)] = &[
     ((0, 6, 7), (0, 8, 20), "FullInlinerNonExpressionSplitArgumentEvaluationOrder", "With viaIR, the full inliner could evaluate function arguments in the wrong order (SOL-2023-2, only affects --via-ir builds)."),
     ((0, 7, 0), (0, 8, 25), "TransientStorageReentrancy", "Note: transient storage (0.8.24+) is not cleared across reentrant calls within a transaction; relevant only if TSTORE is used."),
 ];
+
+/// Rewrite storage/memory loads to version 0 so that structurally equal expressions compare
+/// equal across store generations.
+fn strip_versions(e: ExprId, memo: &mut HashMap<ExprId, ExprId>) -> ExprId {
+    expr::substitute(
+        e,
+        &|n| match n {
+            Node::SLoad(a, t, v) if *v != 0 => Some(expr::intern(Node::SLoad(strip_versions(*a, &mut HashMap::new()), *t, 0))),
+            Node::MLoad(a, v) if *v != 0 => Some(expr::intern(Node::MLoad(strip_versions(*a, &mut HashMap::new()), 0))),
+            _ => None,
+        },
+        memo,
+    )
+}
+
+/// Fold findings that describe one defect several times: the same rule firing at several sites
+/// of one function (a loop body with many calls), and the same site reached from several
+/// external functions through a shared helper. The report then has one entry per defect.
+fn merge_findings(findings: Vec<Finding>) -> Vec<Finding> {
+    let conf_rank = |c: Confidence| match c {
+        Confidence::High => 2,
+        Confidence::Medium => 1,
+        Confidence::Low => 0,
+    };
+    // Same rule and function.
+    let mut by_fn: Vec<Finding> = Vec::new();
+    for f in findings {
+        let same = by_fn.iter_mut().find(|p| p.id == f.id && p.title == f.title && p.function.is_some() && p.function == f.function);
+        match same {
+            Some(p) => {
+                p.sites += 1;
+                for e in f.evidence {
+                    if !p.evidence.contains(&e) && p.evidence.len() < 4 {
+                        p.evidence.push(e);
+                    }
+                }
+                if f.severity < p.severity {
+                    p.severity = f.severity;
+                    p.description = f.description;
+                }
+                if conf_rank(f.confidence) > conf_rank(p.confidence) {
+                    p.confidence = f.confidence;
+                }
+                if p.pc != f.pc {
+                    p.pc = None;
+                }
+            }
+            None => by_fn.push(f),
+        }
+    }
+    for f in &mut by_fn {
+        if f.sites > 1 {
+            f.description.push_str(&format!(" The pattern occurs at {} sites in this function.", f.sites));
+        }
+    }
+    // Same rule, same code site (pc) and evidence, several functions: a shared helper.
+    let mut out: Vec<Finding> = Vec::new();
+    let mut extra: Vec<Vec<String>> = Vec::new();
+    for f in by_fn {
+        let same = f.pc.and_then(|_| out.iter().position(|p| p.id == f.id && p.title == f.title && p.pc == f.pc && p.evidence == f.evidence && p.function.is_some() && f.function.is_some()));
+        match same {
+            Some(i) => {
+                if let Some(name) = f.function {
+                    extra[i].push(name);
+                }
+                if f.severity < out[i].severity {
+                    out[i].severity = f.severity;
+                }
+            }
+            None => {
+                out.push(f);
+                extra.push(Vec::new());
+            }
+        }
+    }
+    for (f, others) in out.iter_mut().zip(extra) {
+        if !others.is_empty() {
+            f.description.push_str(&format!(" The same code is reached from {}.", others.iter().map(|o| format!("`{}`", o)).collect::<Vec<_>>().join(", ")));
+            if let Some(name) = &mut f.function {
+                name.push_str(&format!(" (+{})", others.len()));
+            }
+        }
+    }
+    out
+}
 
 pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
     let mut out = String::new();

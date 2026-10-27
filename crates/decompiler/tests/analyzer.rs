@@ -98,3 +98,34 @@ fn report_renders() {
     assert!(md.contains("[CRITICAL]"));
     assert!(serde_json::to_string(&r).is_ok());
 }
+
+/// solc < 0.5.9 metadata trailer: `{"bzzr0": <32 bytes>}` followed by its 2-byte length.
+fn bzzr0_trailer() -> Vec<u8> {
+    let mut t = vec![0xa1, 0x65, b'b', b'z', b'z', b'r', b'0', 0x58, 0x20];
+    t.extend(std::iter::repeat(0x11).take(32));
+    t.extend_from_slice(&[0x00, 0x29]);
+    t
+}
+
+#[test]
+fn safemath_guard_in_inlined_helper_is_kept() {
+    // f(x): slot0 = add(slot0, x) where add() is an internal helper. The checked variant asserts
+    // on overflow (a > a + b -> INVALID), the unchecked one does not.
+    let call = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 SLOAD PUSH2 @ret SWAP2 PUSH2 @add JUMP :ret JUMPDEST PUSH1 0x00 SSTORE STOP";
+    let checked = format!("{call} :add JUMPDEST DUP2 DUP2 ADD DUP3 DUP2 GT PUSH2 @bad JUMPI SWAP2 POP POP SWAP1 JUMP :bad JUMPDEST INVALID");
+    let unchecked = format!("{call} :add JUMPDEST DUP2 DUP2 ADD SWAP2 POP POP SWAP1 JUMP");
+
+    let mut code = dispatcher(&checked);
+    code.extend(bzzr0_trailer());
+    let c = decompile(&code, &Options::default());
+    assert!(c.source.contains("assert("), "the helper's overflow check must survive inlining:\n{}", c.source);
+    let r = analyze(&c);
+    assert!(r.findings.iter().any(|f| f.id == "legacy-compiler"), "bzzr0-only metadata implies solc < 0.5.9");
+    assert!(!r.findings.iter().any(|f| f.id == "unchecked-arithmetic"), "guarded addition must not be flagged:\n{}", c.source);
+
+    let mut code = dispatcher(&unchecked);
+    code.extend(bzzr0_trailer());
+    let c = decompile(&code, &Options::default());
+    let r = analyze(&c);
+    assert!(r.findings.iter().any(|f| f.id == "unchecked-arithmetic"), "unguarded addition must be flagged:\n{}", c.source);
+}

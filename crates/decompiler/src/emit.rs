@@ -713,13 +713,54 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             }
         }
         Stmt::Drop(e) => format!("// ignored: {}", fmt_expr(*e, n)),
+        Stmt::Require { cond, data, invalid } => {
+            let c = fmt_expr(*cond, n);
+            if *invalid {
+                return format!("assert({});", c);
+            }
+            match data {
+                Some(words) if !words.is_empty() => {
+                    let p = fmt_payload(words, None, n, true);
+                    if p.starts_with('"') {
+                        format!("require({}, {});", c, p)
+                    } else if p.starts_with("Panic(0x1)") || p == "Panic(0x01)" {
+                        format!("assert({});", c)
+                    } else {
+                        format!("if (!({})) revert {};", c, p)
+                    }
+                }
+                _ => format!("require({});", c),
+            }
+        }
     }
+}
+
+/// Remove one pair of enclosing parentheses when they wrap the whole string.
+fn strip_outer_parens(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() < 2 || b[0] != b'(' || b[b.len() - 1] != b')' {
+        return s;
+    }
+    let mut depth = 0i32;
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 && i != b.len() - 1 {
+                    return s;
+                }
+            }
+            _ => {}
+        }
+    }
+    &s[1..s.len() - 1]
 }
 
 pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
     Some(match t {
         Term::Return { off, len, data } => match data {
-            Some(words) if !words.is_empty() => format!("return ({});", fmt_payload(words, expr::as_const(*len), n, false)).replace("return ((", "return (").replace("));", ");"),
+            Some(words) if !words.is_empty() => format!("return ({});", strip_outer_parens(&fmt_payload(words, expr::as_const(*len), n, false))),
             Some(_) => "return;".into(),
             None => {
                 if expr::as_const(*len) == Some(U256::ZERO) {
@@ -855,4 +896,18 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_outer_parens;
+
+    #[test]
+    fn outer_parens_are_stripped_only_when_they_wrap_everything() {
+        assert_eq!(strip_outer_parens("(a, b)"), "a, b");
+        assert_eq!(strip_outer_parens("(uint8(x))"), "uint8(x)");
+        assert_eq!(strip_outer_parens("uint8(x)"), "uint8(x)");
+        assert_eq!(strip_outer_parens("(a) + (b)"), "(a) + (b)");
+        assert_eq!(strip_outer_parens(""), "");
+    }
 }

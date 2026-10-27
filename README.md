@@ -29,7 +29,9 @@ oracle, so the accuracy claim below is measured, not asserted.
   with mappings and arrays (`stor_3[msg.sender][spender]`), events and custom errors by
   signature, `require(cond, "reason")`, `Panic(…)`, `if`/`else`/`while`/`break`/`continue`,
   ternaries and short-circuits, ABI-encoded external calls shown as `IERC20(t).transfer(to, amt)`
-  style calls, `emit Transfer(from, to, amount)`. A dictionary of ~900 function, event and error
+  style calls, `emit Transfer(from, to, amount)`. Small helpers (SafeMath, ABI decoders,
+  getters) are summarised and inlined at their call sites, and the checks they contain survive
+  as `require`/`assert` lines instead of disappearing with the call. A dictionary of ~1,250 function, event and error
   signatures (selectors computed with the built-in keccak, so every entry is correct) names what
   it can; everything else is named by selector.
 * **Security report.** Reentrancy (with guard and gas-stipend awareness), ignored call return
@@ -39,8 +41,11 @@ oracle, so the accuracy claim below is measured, not asserted.
   ecrecover misuse, unprotected upgrades, proxy detection (EIP-1967 / beacon / ZeppelinOS /
   EIP-1167 / storage-slot) with on-chain implementation resolution, known compiler bugs for the
   detected solc version, revert strings, privileged functions, selectors called on other
-  contracts. Each finding carries severity, confidence, the function and program counter,
-  evidence lines and a recommendation. Markdown and JSON.
+  contracts. Rules look through internal helpers (a call in a shared `_safeTransfer` is
+  attributed to every external function that reaches it), and findings are folded per defect:
+  one entry per rule and function, with the number of sites, and one entry for a helper shared
+  by several functions. Each finding carries severity, confidence, the function and program
+  counter, evidence lines and a recommendation. Markdown and JSON.
 * **Verified.** A concrete EVM interpreter executes every basic block from random states and the
   result is compared with the lifted statements (stack, memory, storage, logs, calls, control
   decision). See *Accuracy*.
@@ -110,12 +115,12 @@ deployer, UNI). Everything is reproducible with `corpus/bench.py` and `corpus/ve
 |---|---|
 | external function selectors found | **515 / 515** (recall 100 %, precision 100 %) |
 | state mutability (view/pure vs payable vs nonpayable) | 509 / 515 = **98.8 %** |
-| parameter count | 512 / 515 = **99.4 %** |
-| return count | 512 / 515 = **99.4 %** |
-| events | 118 / 121 = **97.5 %** |
+| parameter count | 513 / 515 = **99.6 %** |
+| return count | 513 / 515 = **99.6 %** |
+| events | 119 / 121 = **98.3 %** |
 | code blocks covered by some function | 10,810 / 10,810 = **100 %** |
 | unresolved jumps | **0** |
-| total time | 1.0 s for the whole corpus |
+| total time | 2.2 s for the whole corpus |
 
 "Code blocks" are blocks the EVM can actually enter (the entry, `JUMPDEST`-started blocks and
 `JUMPI` fall-throughs); bytes after a terminator without a `JUMPDEST` are data or dead by
@@ -123,7 +128,8 @@ construction, and embedded creation code (`CREATE2` payloads) and metadata are e
 
 The six mutability misses are `view` functions that make external calls on a pre-0.5 compiler
 (no `STATICCALL`) or `view` getters of transparent proxies that fall through to `delegatecall`;
-the parameter misses are a `LogNote`-style modifier reading raw calldata words.
+the two parameter misses are in MakerDAO Vat (a `LogNote`-style modifier reading raw calldata
+words) and Curve 3pool, the two return misses in Gnosis Safe and UNI.
 
 ### 2. Block-level semantics oracle (`evmdec verify`, 8 random states per block)
 
@@ -135,9 +141,9 @@ the control decision are compared.
 |---|---|
 | blocks | 13,656 |
 | runs | 109,011 |
-| agree | 107,476 |
+| agree | 107,480 |
 | **mismatch** | **0** |
-| inconclusive runs (reference cannot execute the random state, or it makes two differently-based memory accesses alias) | 1,557 |
+| inconclusive runs (reference cannot execute the random state, or it makes two differently-based memory accesses alias) | 1,553 |
 | blocks verified (≥ 1 agreeing run, no disagreement) | 13,610 / 13,656 |
 | **instructions in verified blocks** | **158,380 / 159,940 = 99.03 %** |
 

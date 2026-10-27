@@ -429,17 +429,18 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, revert: bool)
                     return format!("\"{}\"", s);
                 }
             }
+            let lenu = len.and_then(|l| l.as_usize());
             if sel == 0x4e487b71 && words.len() >= 2 {
-                if let Some(code) = expr::as_const(shifted_word(words, 0)) {
+                if let Some(code) = expr::as_const(shifted_word_len(words, 0, lenu)) {
                     return format!("Panic({})", panic_name(code.low_u64()));
                 }
             }
-            let nargs = len.and_then(|l| l.as_usize()).map(|l| l.saturating_sub(4) / 32).unwrap_or(words.len().saturating_sub(1));
+            let nargs = lenu.map(|l| l.saturating_sub(4) / 32).unwrap_or(words.len().saturating_sub(1));
             if let Some(sig) = sigs::error(sel) {
-                let args: Vec<String> = (0..nargs).map(|i| fmt_expr(shifted_word(words, i), n)).collect();
+                let args: Vec<String> = (0..nargs).map(|i| fmt_expr(shifted_word_len(words, i, lenu), n)).collect();
                 return format!("{}({})", sigs::name_of(sig), args.join(", "));
             }
-            let args: Vec<String> = (0..nargs).map(|i| fmt_expr(shifted_word(words, i), n)).collect();
+            let args: Vec<String> = (0..nargs).map(|i| fmt_expr(shifted_word_len(words, i, lenu), n)).collect();
             return format!("CustomError_{:08x}({})", sel, args.join(", "));
         }
     }
@@ -448,12 +449,24 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, revert: bool)
 }
 
 /// ABI word `i` of a payload that starts with a 4-byte selector: bytes `4 + 32*i .. 36 + 32*i`,
-/// which straddle memory words `i` and `i + 1`.
-fn shifted_word(words: &[ExprId], i: usize) -> ExprId {
-    let hi = words.get(i).copied().unwrap_or_else(|| expr::konst(U256::ZERO));
-    let lo = words.get(i + 1).copied().unwrap_or_else(|| expr::konst(U256::ZERO));
+/// which straddle memory words `i` and `i + 1`. The last word of a payload whose length is not a
+/// multiple of 32 holds its `len % 32` bytes right-aligned and is left-aligned here first.
+fn shifted_word_len(words: &[ExprId], i: usize, len: Option<usize>) -> ExprId {
+    let align = |j: usize| -> ExprId {
+        let w = words.get(j).copied().unwrap_or_else(|| expr::konst(U256::ZERO));
+        match len {
+            Some(l) if j == words.len() - 1 && l % 32 != 0 => expr::op2(op::SHL, expr::konst_u64(8 * (32 - (l % 32)) as u64), w),
+            _ => w,
+        }
+    };
+    let hi = align(i);
+    let lo = align(i + 1);
     // (hi << 32) | (lo >> 224)
     expr::op2(op::OR, expr::op2(op::SHL, expr::konst_u64(32), hi), expr::op2(op::SHR, expr::konst_u64(224), lo))
+}
+
+fn shifted_word(words: &[ExprId], i: usize) -> ExprId {
+    shifted_word_len(words, i, None)
 }
 
 fn panic_name(code: u64) -> String {
@@ -550,7 +563,7 @@ pub fn fmt_call_input(words: &[ExprId], in_len: Option<U256>, n: &Names) -> (Opt
         if looks_like_selector && first_bytes >= 4 {
             let sel = c0.shr(8 * (first_bytes as u32 - 4)).low_u64() as u32;
             let nargs = in_len.map(|l| l.saturating_sub(4) / 32).unwrap_or(words.len().saturating_sub(1));
-            let args: Vec<String> = (0..nargs.min(words.len())).map(|i| fmt_expr(shifted_word(words, i), n)).collect();
+            let args: Vec<String> = (0..nargs.min(words.len())).map(|i| fmt_expr(shifted_word_len(words, i, in_len), n)).collect();
             let name = match sigs::function(sel) {
                 Some(sig) => sigs::name_of(sig).to_string(),
                 None => format!("func_{:08x}", sel),

@@ -42,6 +42,10 @@ pub struct Program {
     pub blocks: Vec<Block>,
     pub block_at_pc: BTreeMap<usize, usize>,
     pub jumpdests: HashSet<usize>,
+    /// Candidate targets of computed jumps (block id -> target blocks), derived from the shape of
+    /// the target expression (alignment masks, shifts): hand-written dispatchers that jump to
+    /// `calldata[i] & 0x3ff0`-style addresses.
+    pub computed_jumps: HashMap<usize, Vec<usize>>,
 }
 
 impl Program {
@@ -75,7 +79,15 @@ impl Program {
             blocks.push(b);
             i = j + 1;
         }
-        Program { code, insns, blocks, block_at_pc, jumpdests }
+        Program { code, insns, blocks, block_at_pc, jumpdests, computed_jumps: HashMap::new() }
+    }
+
+    /// Can the EVM ever enter this block? Only the entry, JUMPDEST-started blocks and the
+    /// fall-through of a JUMPI can be executed; bytes after a terminator without a JUMPDEST are
+    /// data or dead by construction.
+    pub fn is_potential_code(&self, b: usize) -> bool {
+        let blk = &self.blocks[b];
+        blk.start == 0 || blk.is_jumpdest || (b > 0 && self.blocks[b - 1].terminator == op::JUMPI) || (b > 0 && !op::is_terminator(self.blocks[b - 1].terminator))
     }
 
     pub fn block_insns(&self, b: &Block) -> &[Instruction] {
@@ -430,6 +442,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                 flow = Some(match t {
                     AVal::Const(c) | AVal::Pc(c) => Flow::Jump(c.as_usize().and_then(|pc| prog.target_block(pc)).into_iter().collect()),
                     AVal::Table => Flow::Jump(table_targets(prog, &st.mem).into_iter().filter_map(|pc| prog.target_block(pc)).collect()),
+                    AVal::Unk if prog.computed_jumps.contains_key(&b.id) => Flow::Jump(prog.computed_jumps[&b.id].clone()),
                     v => Flow::Return(v),
                 });
                 break;
@@ -441,6 +454,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                 flow = Some(match t {
                     AVal::Const(c) | AVal::Pc(c) => Flow::Branch { targets: c.as_usize().and_then(|pc| prog.target_block(pc)).into_iter().collect(), fallthrough },
                     AVal::Table => Flow::Branch { targets: table_targets(prog, &st.mem).into_iter().filter_map(|pc| prog.target_block(pc)).collect(), fallthrough },
+                    AVal::Unk if prog.computed_jumps.contains_key(&b.id) => Flow::Branch { targets: prog.computed_jumps[&b.id].clone(), fallthrough },
                     v => Flow::BranchUnresolved { target: v, fallthrough },
                 });
                 break;

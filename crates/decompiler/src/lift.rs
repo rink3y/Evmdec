@@ -442,6 +442,8 @@ pub struct CalleeSummary {
     pub mstores: Vec<(ExprId, ExprId)>,
     /// Writes storage, logs, calls or creates.
     pub side_effects: bool,
+    /// Every path reverts with this payload (offset, length, decoded words): a panic/revert helper.
+    pub reverts: Option<(ExprId, ExprId, Option<Vec<ExprId>>)>,
 }
 
 /// Compute a summary from a lifted internal function, if it is simple enough.
@@ -464,6 +466,11 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
             }
         }
         match &nd.term {
+            Term::Revert { off, len, data } if seen.len() <= 4 => {
+                // A helper whose only job is to revert (solc panic/error helpers).
+                sum.reverts = Some((*off, *len, data.clone()));
+                return Some(sum);
+            }
             Term::InternalReturn(vals) => {
                 sum.returns = vals.clone();
                 // Expressions must not depend on the callee's own memory versions in complex ways.
@@ -658,7 +665,8 @@ impl<'a> Lifter<'a> {
             }
             let before: usize = edge_assigns.values().map(|v| v.len()).sum();
             for v in edge_assigns.values_mut() {
-                v.retain(|(var, _)| used.contains(var));
+                // Copies of an undefined value carry no information.
+                v.retain(|(var, val)| used.contains(var) && !matches!(expr::node(*val), Node::Unknown(_)));
             }
             edge_assigns.retain(|_, v| !v.is_empty());
             let after: usize = edge_assigns.values().map(|v| v.len()).sum();
@@ -1089,6 +1097,16 @@ impl<'a> Lifter<'a> {
             let mut memo = HashMap::new();
             expr::substitute(e, &|n| if let Node::Arg(i) = n { Some(at(*i as usize)) } else { None }, &mut memo)
         };
+        if let Some(sum) = summary {
+            if let Some((off, len, data)) = &sum.reverts {
+                // The helper always reverts: this call site is a revert.
+                for (o, v) in &sum.mstores {
+                    st.mem.store(subst(*o), Some(32), MVal::Word(subst(*v)));
+                }
+                let data = data.as_ref().map(|d| d.iter().map(|e| subst(*e)).collect());
+                return Term::Revert { off: subst(*off), len: subst(*len), data };
+            }
+        }
         let unknown_pushed = call.pushed.iter().filter(|v| !matches!(v, AVal::Slot(_) | AVal::Const(_) | AVal::Pc(_))).count();
         let direct_returns: Option<Vec<ExprId>> = summary.filter(|s| s.returns.len() == unknown_pushed).map(|s| s.returns.iter().map(|e| subst(*e)).collect());
         let mut results = Vec::new();
@@ -1328,6 +1346,71 @@ pub fn node_exprs(n: &LNode) -> Vec<ExprId> {
         _ => {}
     }
     v
+}
+
+/// Bits a computed jump target may have set, from the shape of its expression (`x & 0x3ff0`,
+/// `y << 6`, `byte(..) * 64`): the set of JUMPDESTs compatible with that pattern is the set of
+/// possible targets. `None` when the expression gives no usable constraint.
+pub fn jump_target_bits(e: ExprId) -> Option<U256> {
+    match expr::node(e) {
+        Node::Const(c) => Some(c),
+        Node::Op(op::AND, v) => {
+            let (a, b) = (jump_target_bits(v[0]), jump_target_bits(v[1]));
+            match (a, b) {
+                (Some(x), Some(y)) => Some(x & y),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                _ => None,
+            }
+        }
+        Node::Op(op::OR, v) | Node::Op(op::XOR, v) | Node::Op(op::ADD, v) => {
+            let a = jump_target_bits(v[0])?;
+            let b = jump_target_bits(v[1])?;
+            // ADD may carry; be conservative by allowing all bits up to the sum's width.
+            if matches!(expr::node(e), Node::Op(op::ADD, _)) {
+                let bits = a.bits().max(b.bits()) + 1;
+                Some(expr::mask_bits(bits))
+            } else {
+                Some(a | b)
+            }
+        }
+        Node::Op(op::SHL, v) => {
+            let k = expr::as_const(v[0])?;
+            if k >= U256::from_u64(256) {
+                return Some(U256::ZERO);
+            }
+            Some(jump_target_bits(v[1])?.shl(k.low_u64() as u32))
+        }
+        Node::Op(op::MUL, v) => {
+            let (x, c) = if let Some(c) = expr::as_const(v[1]) { (v[0], c) } else { (v[1], expr::as_const(v[0])?) };
+            if !c.is_power_of_two() {
+                return None;
+            }
+            Some(jump_target_bits(x)?.shl(c.trailing_zeros()))
+        }
+        Node::Op(op::SHR, v) => {
+            let k = expr::as_const(v[0])?;
+            if k >= U256::from_u64(256) {
+                return Some(U256::ZERO);
+            }
+            Some(jump_target_bits(v[1])?.shr(k.low_u64() as u32))
+        }
+        Node::Op(op::BYTE, _) => Some(U256::from_u64(0xff)),
+        Node::Op(op::DIV, v) => {
+            let c = expr::as_const(v[1])?;
+            if !c.is_power_of_two() {
+                return None;
+            }
+            Some(jump_target_bits(v[0])?.shr(c.trailing_zeros()))
+        }
+        _ => {
+            let b = expr::value_bits(e);
+            if b < 256 {
+                Some(expr::mask_bits(b))
+            } else {
+                Some(U256::MAX)
+            }
+        }
+    }
 }
 
 /// Reachable set from the entry.

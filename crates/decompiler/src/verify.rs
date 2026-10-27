@@ -73,8 +73,9 @@ struct Eval<'a> {
     creates: Vec<U256>,
     gas_obs: Vec<U256>,
     msize_obs: Vec<U256>,
-    gas_idx: usize,
-    msize_idx: usize,
+    /// Sequence number of each GAS / MSIZE node in program order (rank = observation index).
+    gas_rank: HashMap<u32, usize>,
+    msize_rank: HashMap<u32, usize>,
     code: &'a [u8],
     returndata: Vec<u8>,
     inconclusive: Option<String>,
@@ -111,7 +112,7 @@ impl<'a> Eval<'a> {
                     U256::ZERO
                 }
             }
-            Node::Env(o, _) => match o {
+            Node::Env(o, seq) => match o {
                 op::ADDRESS => self.host.address,
                 op::ORIGIN => self.host.origin,
                 op::CALLER => self.host.caller,
@@ -130,16 +131,14 @@ impl<'a> Eval<'a> {
                 op::BASEFEE => self.host.basefee,
                 op::BLOBBASEFEE => self.host.blobbasefee,
                 op::GAS => {
-                    let v = self.gas_obs.get(self.gas_idx).copied();
-                    self.gas_idx += 1;
+                    let v = self.gas_rank.get(&seq).and_then(|i| self.gas_obs.get(*i)).copied();
                     v.unwrap_or_else(|| {
                         self.inconclusive = Some("gas observation".into());
                         U256::ZERO
                     })
                 }
                 op::MSIZE => {
-                    let v = self.msize_obs.get(self.msize_idx).copied();
-                    self.msize_idx += 1;
+                    let v = self.msize_rank.get(&seq).and_then(|i| self.msize_obs.get(*i)).copied();
                     v.unwrap_or_else(|| {
                         self.inconclusive = Some("msize observation".into());
                         U256::ZERO
@@ -471,7 +470,32 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
             completed += 1;
             stats.runs += 1;
             // Lifted run.
-            let mut ev = Eval { host: &host, stack0: stack0.clone(), mem_snapshots: vec![mem0.clone()], stor_snapshots: vec![HashMap::new()], tstor_snapshots: vec![HashMap::new()], calls: Vec::new(), creates: Vec::new(), gas_obs: m.gas_obs.clone(), msize_obs: m.msize_obs.clone(), gas_idx: 0, msize_idx: 0, code, returndata: returndata0.clone(), inconclusive: None };
+            // GAS / MSIZE nodes carry increasing sequence numbers in program order; map their
+            // rank to the interpreter's observation order.
+            let (gas_rank, msize_rank) = {
+                let mut gas: Vec<u32> = Vec::new();
+                let mut msz: Vec<u32> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                let mut stack: Vec<ExprId> = crate::lift::node_exprs(ln);
+                stack.extend(ln.exit_stack.iter().copied());
+                while let Some(x) = stack.pop() {
+                    if !seen.insert(x) {
+                        continue;
+                    }
+                    match expr::node(x) {
+                        Node::Env(op::GAS, s) => gas.push(s),
+                        Node::Env(op::MSIZE, s) => msz.push(s),
+                        _ => {}
+                    }
+                    stack.extend(expr::children(x));
+                }
+                gas.sort_unstable();
+                gas.dedup();
+                msz.sort_unstable();
+                msz.dedup();
+                (gas.iter().enumerate().map(|(i, s)| (*s, i)).collect::<HashMap<u32, usize>>(), msz.iter().enumerate().map(|(i, s)| (*s, i)).collect::<HashMap<u32, usize>>())
+            };
+            let mut ev = Eval { host: &host, stack0: stack0.clone(), mem_snapshots: vec![mem0.clone()], stor_snapshots: vec![HashMap::new()], tstor_snapshots: vec![HashMap::new()], calls: Vec::new(), creates: Vec::new(), gas_obs: m.gas_obs.clone(), msize_obs: m.msize_obs.clone(), gas_rank, msize_rank, code, returndata: returndata0.clone(), inconclusive: None };
             let mut memo: HashMap<ExprId, U256> = HashMap::new();
             let mut mem = mem0.clone();
             let mut storage: HashMap<U256, U256> = HashMap::new();

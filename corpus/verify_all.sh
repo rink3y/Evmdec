@@ -8,7 +8,7 @@ tb=0; tr=0; ta=0; tm=0; ti=0; tbv=0; tiv=0; tit=0
 for f in "$DIR"/*.hex; do
   name=$(basename "$f" .hex)
   out=$("$BIN" verify "$f" --runs "$RUNS" --json)
-  g() { echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['$1'])"; }
+  g() { printf "%s" "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['$1'])"; }
   b=$(g blocks); r=$(g runs); a=$(g agree); m=$(g mismatch); i=$(g inconclusive); bv=$(g blocks_verified); iv=$(g instructions_verified); it=$(g instructions_total)
   pct=$(python3 -c "print(f'{100*$iv/max(1,$it):.2f}')")
   printf "%-22s %7s %7s %6s %6s %6s %9s %9s %8s\n" "$name" "$b" "$r" "$a" "$m" "$i" "$bv/$b" "$iv/$it" "$pct"

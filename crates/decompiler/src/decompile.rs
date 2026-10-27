@@ -309,7 +309,14 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     }
 
     // Inventories.
-    let (storage, events, errors, strings, selectors_called) = inventories(&functions, vyper);
+    let (storage, events, errors, mut strings, selectors_called) = inventories(&functions, vyper);
+    for st in scan_strings(code, code_end) {
+        if !strings.iter().any(|x| x.contains(&st)) {
+            strings.push(st);
+        }
+    }
+    strings.sort();
+    strings.dedup();
 
     tick("discover+inventories", &mut tt);
     // Render code for each function.
@@ -387,7 +394,7 @@ fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
     out
 }
 
-fn make_names(f: &Function, storage: &[StorageVar], vyper: bool) -> Names {
+pub fn make_names(f: &Function, storage: &[StorageVar], vyper: bool) -> Names {
     let mut n = Names::default();
     n.vyper = vyper;
     for p in &f.params {
@@ -580,6 +587,26 @@ fn collect_sloads(e: expr::ExprId, slots: &mut BTreeMap<U256, (usize, usize, BTr
         }
         stack.extend(expr::children(x));
     }
+}
+
+/// Printable ASCII runs in the code's data area (strings longer than 32 bytes are stored as data
+/// and loaded with CODECOPY by older compilers).
+fn scan_strings(code: &[u8], code_end: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let end = code_end.min(code.len());
+    while i < end {
+        let start = i;
+        while i < end && (0x20..0x7f).contains(&code[i]) {
+            i += 1;
+        }
+        let run = &code[start..i];
+        if run.len() >= 12 && run.iter().filter(|b| b.is_ascii_alphabetic() || **b == b' ').count() * 3 >= run.len() * 2 && run.contains(&b' ') {
+            out.push(String::from_utf8_lossy(run).trim().to_string());
+        }
+        i += 1;
+    }
+    out
 }
 
 fn collect_strings(e: expr::ExprId, out: &mut BTreeSet<String>) {

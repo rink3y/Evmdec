@@ -453,10 +453,12 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
     for e in exprs {
         visit(*e);
     }
+    // The ABI head-size check (solc >= 0.5) gives the exact head word count; otherwise fall back
+    // to the highest calldata word read. Reads beyond a present check are not parameters (e.g.
+    // `LogNote`-style modifiers logging raw calldata words).
     let count = match (max_idx, head_words) {
-        (Some(m), Some(h)) => (m + 1).max(h),
+        (_, Some(h)) => h,
         (Some(m), None) => m + 1,
-        (None, Some(h)) => h,
         (None, None) => 0,
     };
     (0..count)
@@ -505,6 +507,14 @@ pub fn type_of_value(e: ExprId) -> String {
         Node::Env(op::TIMESTAMP, _) | Node::Env(op::NUMBER, _) => "uint256".into(),
         n if expr::is_boolean(e) && !matches!(n, Node::Const(_)) => "bool".into(),
         Node::Const(c) if c.byte_len() == 20 && (150..=160).contains(&c.bits()) => "address".into(),
+        Node::Op(op::SHR, _) | Node::Op(op::DIV, _) | Node::Op(op::BYTE, _) => {
+            let b = expr::value_bits(e);
+            if b < 256 && b % 8 == 0 && b > 0 {
+                if b == 160 { "address".into() } else { format!("uint{}", b) }
+            } else {
+                "uint256".into()
+            }
+        }
         _ => "uint256".into(),
     }
 }

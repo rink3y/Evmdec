@@ -573,6 +573,43 @@ impl<'a> Lifter<'a> {
                 }
             }
         }
+        // Dead phi elimination: copies to variables that nothing reads are dropped (iterate, since
+        // a phi may only feed another dead phi).
+        loop {
+            let mut used: HashSet<ExprId> = HashSet::new();
+            let collect = |e: ExprId, used: &mut HashSet<ExprId>| {
+                let mut stack = vec![e];
+                let mut seen = HashSet::new();
+                while let Some(x) = stack.pop() {
+                    if !seen.insert(x) || seen.len() > 100_000 {
+                        continue;
+                    }
+                    if matches!(expr::node(x), Node::Var(_)) {
+                        used.insert(x);
+                    }
+                    stack.extend(expr::children(x));
+                }
+            };
+            for nd in &nodes {
+                for e in node_exprs(nd) {
+                    collect(e, &mut used);
+                }
+            }
+            for v in edge_assigns.values() {
+                for (_, val) in v {
+                    collect(*val, &mut used);
+                }
+            }
+            let before: usize = edge_assigns.values().map(|v| v.len()).sum();
+            for v in edge_assigns.values_mut() {
+                v.retain(|(var, _)| used.contains(var));
+            }
+            edge_assigns.retain(|_, v| !v.is_empty());
+            let after: usize = edge_assigns.values().map(|v| v.len()).sum();
+            if after == before {
+                break;
+            }
+        }
         // preds
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
         for nd in &nodes {
@@ -1024,7 +1061,11 @@ impl<'a> Lifter<'a> {
             }
         }
         let inlined = direct_returns.is_some();
-        stmts.push(Stmt::Internal { seq, callee: call.callee, args, results: if inlined { vec![] } else { results } });
+        // A fully inlined pure helper (ABI decoder/encoder, getter) leaves no statement behind.
+        let pure_inlined = inlined && summary.map_or(false, |s| s.mstores.is_empty() && !s.side_effects);
+        if !pure_inlined {
+            stmts.push(Stmt::Internal { seq, callee: call.callee, args, results: if inlined { vec![] } else { results } });
+        }
         let conts: Vec<usize> = un.succs.iter().filter(|(_, k)| *k == Edge::Return).map(|(s, _)| *s).collect();
         match conts.len() {
             0 => Term::Infeasible,

@@ -226,6 +226,12 @@ pub fn op1(o: u8, a: ExprId) -> ExprId {
     }
     match o {
         op::ISZERO => {
+            // ISZERO(a - b) / ISZERO(a ^ b) -> a == b
+            if let Node::Op(io, v) = node(a) {
+                if io == op::SUB || io == op::XOR {
+                    return op2(op::EQ, v[0], v[1]);
+                }
+            }
             // ISZERO(ISZERO(ISZERO(x))) -> ISZERO(x)
             if let Node::Op(op::ISZERO, v) = node(a) {
                 if let Node::Op(op::ISZERO, w) = node(v[0]) {

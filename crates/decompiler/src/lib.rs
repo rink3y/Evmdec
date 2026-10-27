@@ -19,3 +19,4 @@ pub mod emit;
 pub mod function;
 pub mod decompile;
 pub mod structure;
+pub mod analyze;

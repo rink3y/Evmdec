@@ -96,7 +96,19 @@ def main():
             # parameter count: ABI head words (dynamic = 1 word each)
             n_in = len(it.get('inputs', []))
             # tuples occupy several words when static; count ABI head words
+            def is_dynamic(t):
+                ty = t['type']
+                if ty in ('string', 'bytes') or ty.endswith('[]'): return True
+                if ty.startswith('tuple'):
+                    return any(is_dynamic(c) for c in t['components'])
+                import re
+                m2 = re.match(r'(.*)\[(\d+)\]$', ty)
+                if m2:
+                    base = dict(t); base['type'] = m2.group(1)
+                    return is_dynamic(base)
+                return False
             def head_words(t):
+                if is_dynamic(t): return 1
                 if t['type'].startswith('tuple') and not t['type'].endswith(']'):
                     return sum(head_words(c) for c in t['components'])
                 if t['type'].endswith(']') and not t['type'].endswith('[]'):

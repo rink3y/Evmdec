@@ -34,6 +34,15 @@ enum Cmd {
         /// Disable the built-in signature dictionary.
         #[arg(long)]
         no_sigs: bool,
+        /// Append the security report (markdown) after the code.
+        #[arg(long)]
+        report: bool,
+    },
+    /// Security analysis report (markdown, or JSON with --json).
+    Analyze {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -102,14 +111,31 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Decompile { file, flat, json, embedded, no_sigs } => {
+        Cmd::Decompile { file, flat, json, embedded, no_sigs, report } => {
             let code = load(&file)?;
             let opts = evmdec::decompile::Options { flat, pcs: false, embedded, no_sigs };
             let c = evmdec::decompile::decompile(&code, &opts);
             if json {
-                println!("{}", serde_json::to_string_pretty(&c)?);
+                let r = evmdec::analyze::analyze(&c);
+                let mut v = serde_json::to_value(&c)?;
+                v["report"] = serde_json::to_value(&r)?;
+                println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 print!("{}", c.source);
+                if report {
+                    let r = evmdec::analyze::analyze(&c);
+                    println!("\n/*\n{}*/", evmdec::analyze::render_markdown(&c, &r, &file.display().to_string()));
+                }
+            }
+        }
+        Cmd::Analyze { file, json } => {
+            let code = load(&file)?;
+            let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+            let r = evmdec::analyze::analyze(&c);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print!("{}", evmdec::analyze::render_markdown(&c, &r, &file.display().to_string()));
             }
         }
         Cmd::Disasm { file } => {

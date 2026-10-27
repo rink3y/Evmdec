@@ -39,6 +39,9 @@ pub enum Term {
     Branch { cond: ExprId, t: Option<usize>, f: usize },
     Switch { target: ExprId, cases: Vec<usize> },
     Return { off: ExprId, len: ExprId, data: Option<Vec<ExprId>> },
+    /// Return of one dynamic `bytes`/`string` value held in memory at `ptr` (length word first),
+    /// recognised from the compiler's encoding boilerplate.
+    ReturnDyn { ptr: ExprId },
     Revert { off: ExprId, len: ExprId, data: Option<Vec<ExprId>> },
     Stop,
     Invalid,
@@ -1204,17 +1207,21 @@ impl<'a> Lifter<'a> {
             }
         }
         let unknown_pushed = call.pushed.iter().filter(|v| !matches!(v, AVal::Slot(_) | AVal::Const(_) | AVal::Pc(_))).count();
-        let direct_returns: Option<Vec<ExprId>> = summary.filter(|s| s.returns.len() == unknown_pushed).map(|s| s.returns.iter().map(|e| subst(*e)).collect());
+        // The callee's summarised return values, one per pushed entry (preferred: a helper that
+        // returns one of its arguments leaves a `Slot` push, which still counts as a return), or
+        // one per unknown push.
+        let by_position = summary.map_or(false, |s| s.returns.len() == call.pushed.len());
+        let direct_returns: Option<Vec<ExprId>> = summary.filter(|s| by_position || s.returns.len() == unknown_pushed).map(|s| s.returns.iter().map(|e| subst(*e)).collect());
         let mut results = Vec::new();
         let mut j = 0u16;
         let mut pushed_vals = Vec::new();
-        for v in &call.pushed {
+        for (idx, v) in call.pushed.iter().enumerate() {
             let e = match v {
                 AVal::Slot(i) => at(*i as usize),
                 AVal::Const(c) | AVal::Pc(c) => konst(*c),
                 _ => {
                     let r = match &direct_returns {
-                        Some(d) => d[j as usize],
+                        Some(d) => d[if by_position { idx } else { j as usize }],
                         None => expr::intern(Node::IntRet(seq, j)),
                     };
                     j += 1;
@@ -1228,12 +1235,27 @@ impl<'a> Lifter<'a> {
             st.stack.pop();
         }
         st.stack.extend(pushed_vals);
+        let inlined = direct_returns.is_some();
+        // An inlined helper without storage/log/call effects is transparent: its memory writes
+        // and checks become statements of the caller and no call remains. Helpers with side
+        // effects, or whose results could not be substituted, stay as calls.
+        let transparent = inlined && summary.map_or(false, |s| !s.side_effects);
         match summary {
             Some(sum) => {
                 // Replay the callee's memory writes; storage is untouched unless it has side effects.
                 for (off, val) in &sum.mstores {
                     let (o, v) = (subst(*off), subst(*val));
-                    st.mem.store(o, Some(32), MVal::Word(v));
+                    if transparent {
+                        let origin = Some((un.id, stmts.len()));
+                        st.mem.store_from(o, Some(32), MVal::Word(v), origin);
+                        stmts.push(Stmt::MStore { off: o, val: v, width: 32 });
+                    } else {
+                        st.mem.store(o, Some(32), MVal::Word(v));
+                    }
+                }
+                if transparent && !sum.mstores.is_empty() {
+                    st.mem.tick();
+                    st.version = st.mem.gen;
                 }
                 if sum.side_effects {
                     st.storage.clear();
@@ -1248,10 +1270,7 @@ impl<'a> Lifter<'a> {
                 st.called = true;
             }
         }
-        let inlined = direct_returns.is_some();
-        // A fully inlined pure helper (ABI decoder/encoder, getter) leaves no statement behind.
-        let pure_inlined = inlined && summary.map_or(false, |s| s.mstores.is_empty() && !s.side_effects);
-        if pure_inlined {
+        if transparent {
             // The helper's own checks (SafeMath asserts, bounds checks) survive as guards.
             for (cond, data, invalid) in summary.map(|s| s.guards.as_slice()).unwrap_or(&[]) {
                 let cond = subst(*cond);
@@ -1449,6 +1468,7 @@ pub fn node_exprs(n: &LNode) -> Vec<ExprId> {
             }
         }
         Term::SelfDestruct(a) => v.push(*a),
+        Term::ReturnDyn { ptr } => v.push(*ptr),
         Term::InternalReturn(vals) => v.extend(vals.iter().copied()),
         Term::Unresolved(t) => v.push(*t),
         Term::CondJump { cond, target } => {

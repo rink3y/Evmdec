@@ -131,7 +131,9 @@ def main():
         for e in c['events']:
             if e.startswith('0x') and ' ' in e: got_ev.add(e.split()[0][2:])
             else:
-                got_ev.add(keccak256(e.encode()).hex())
+                # Declarations carry `indexed` markers; the topic hash uses the bare signature.
+                bare = e.replace(' indexed', '').replace(', ', ',')
+                got_ev.add(keccak256(bare.encode()).hex())
         ev_found = len(abi_ev & got_ev)
         st = c['stats']
         rows.append((name, len(abi_sel), len(got), len(match), mut_ok, par_ok, ret_ok, len(abi_ev), ev_found, st['covered_blocks'], st['code_blocks'], st['unresolved_jumps'], dt))

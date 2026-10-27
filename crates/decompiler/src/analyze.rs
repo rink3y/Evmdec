@@ -71,6 +71,8 @@ struct Event {
     node: usize,
     /// Program counter of the node that holds the statement (inside the callee when inlined).
     pc: usize,
+    /// Entry pc of the internal function whose body holds the statement, when inlined.
+    callee: Option<usize>,
     stmt: Option<Stmt>,
     term: Option<Term>,
     /// Inside a loop body.
@@ -127,10 +129,10 @@ fn loop_nodes(l: &Lifted) -> HashSet<usize> {
 }
 
 fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Event> {
-    events_of_in(ctx, l, depth, in_loop_outer, None)
+    events_of_in(ctx, l, depth, in_loop_outer, None, None)
 }
 
-fn events_of_in(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool, outer_node: Option<usize>) -> Vec<Event> {
+fn events_of_in(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool, outer_node: Option<usize>, callee: Option<usize>) -> Vec<Event> {
     let loops = loop_nodes(l);
     let mut out = Vec::new();
     // RPO order
@@ -152,18 +154,18 @@ fn events_of_in(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool, outer_
         let in_loop = in_loop_outer || loops.contains(&nid);
         let anchor = outer_node.unwrap_or(nid);
         for s in &nd.stmts {
-            out.push(Event { node: anchor, pc: nd.pc, stmt: Some(s.clone()), term: None, in_loop });
-            if let Stmt::Internal { callee, .. } = s {
+            out.push(Event { node: anchor, pc: nd.pc, callee, stmt: Some(s.clone()), term: None, in_loop });
+            if let Stmt::Internal { callee: target, .. } = s {
                 if depth > 0 {
-                    if let Some(f) = ctx.internals.get(callee) {
+                    if let Some(f) = ctx.internals.get(target) {
                         if let Some(cl) = &f.lifted {
-                            out.extend(events_of_in(ctx, cl, depth - 1, in_loop, Some(anchor)));
+                            out.extend(events_of_in(ctx, cl, depth - 1, in_loop, Some(anchor), Some(*target)));
                         }
                     }
                 }
             }
         }
-        out.push(Event { node: anchor, pc: nd.pc, stmt: None, term: Some(nd.term.clone()), in_loop });
+        out.push(Event { node: anchor, pc: nd.pc, callee, stmt: None, term: Some(nd.term.clone()), in_loop });
     }
     out
 }
@@ -322,7 +324,7 @@ pub fn analyze(c: &Contract) -> Report {
     let ctx = Ctx { c, internals, version, vyper: c.language.starts_with("vyper") };
     let mut findings: Vec<Finding> = Vec::new();
     let mut report = Report::default();
-    let names_for = |f: &Function| -> Names { decompile::make_names(f, &c.storage, ctx.vyper) };
+    let names_for = |f: &Function| -> Names { decompile::make_names(f, &c.storage, ctx.vyper, &c.string_loaders) };
 
     // ---- contract kind ----
     let sels: HashSet<String> = c.functions.iter().filter_map(|f| f.signature.clone()).collect();
@@ -388,10 +390,13 @@ pub fn analyze(c: &Contract) -> Report {
         // Walk events for call-related rules.
         for (i, ev) in events.iter().enumerate() {
             let Some(stmt) = &ev.stmt else { continue };
+            // Evidence from an inlined helper is rendered with that helper's own names.
+            let helper_names = ev.callee.and_then(|pc| ctx.internals.get(&pc)).map(|cf| names_for(cf));
+            let names = helper_names.as_ref().unwrap_or(&names);
             match stmt {
                 Stmt::Call { kind, addr, value, input, in_len, result, gas, seq, .. } => {
-                    let target = emit::fmt_expr(*addr, &names);
-                    let line = emit::fmt_stmt(stmt, &names);
+                    let target = emit::fmt_expr(*addr, names);
+                    let line = emit::fmt_stmt(stmt, names);
                     external_calls.insert(format!("{}: {}", fname(f), line.trim_end_matches(';')));
                     let value_nonzero = value.map_or(false, |v| expr::as_const(v) != Some(U256::ZERO));
                     let gas_stipend = expr::as_const(*gas).map_or(false, |g| g <= U256::from_u64(2300)) || matches!(expr::node(*gas), Node::Op(op::MUL, ref v) if expr::as_const(v[1]) == Some(U256::from_u64(2300)) || expr::as_const(v[0]) == Some(U256::from_u64(2300)));
@@ -475,7 +480,7 @@ pub fn analyze(c: &Contract) -> Report {
                             });
                             if !from_caller(v) && !accounted {
                                 push(&mut findings, "unprotected-ether-withdrawal", "Ether sent to msg.sender without per-caller accounting", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
-                                    format!("`{}` sends `{}` wei to msg.sender; the amount is not derived from a msg.sender-keyed balance and the function has no access control.", f.name, emit::fmt_expr(v, &names)),
+                                    format!("`{}` sends `{}` wei to msg.sender; the amount is not derived from a msg.sender-keyed balance and the function has no access control.", f.name, emit::fmt_expr(v, names)),
                                     vec![line.clone()], "Verify the amount is bounded by what the caller is owed.");
                             }
                         }
@@ -495,7 +500,7 @@ pub fn analyze(c: &Contract) -> Report {
                     let _ = result;
                 }
                 Stmt::Create { kind, .. } => {
-                    let line = emit::fmt_stmt(stmt, &names);
+                    let line = emit::fmt_stmt(stmt, names);
                     push(&mut findings, "contract-creation", if *kind == op::CREATE2 { "Deploys contracts with CREATE2" } else { "Deploys contracts with CREATE" }, Severity::Info, Confidence::High, Some(f), Some(ev.pc), format!("`{}` deploys a new contract.", f.name), vec![line], "Informational.");
                 }
                 _ => {}
@@ -553,15 +558,16 @@ pub fn analyze(c: &Contract) -> Report {
             let mut flagged = 0;
             let mut ev_lines = Vec::new();
             let callees = transitive_callees(&ctx, f);
-            let mut bodies: Vec<&Lifted> = vec![l];
+            let mut bodies: Vec<(&Lifted, &Function)> = vec![(l, f)];
             for cf in &callees {
                 if let Some(cl) = &cf.lifted {
-                    bodies.push(cl);
+                    bodies.push((cl, cf));
                 }
             }
             let resolve = |pc: usize| -> Option<&Lifted> { ctx.internals.get(&pc).and_then(|cf| cf.lifted.as_ref()) };
             let mut memo = HashMap::new();
-            for body in &bodies {
+            for (body, body_fn) in &bodies {
+                let body_names = names_for(body_fn);
                 // Conditions visible from this body: its own plus those of the helpers it calls,
                 // with the helpers' arguments replaced by the actual values (SafeMath-style checks
                 // live in the callee and mention the caller's operands only after substitution).
@@ -585,12 +591,15 @@ pub fn analyze(c: &Contract) -> Report {
                                     if !checked {
                                         flagged += 1;
                                         if ev_lines.len() < 3 {
-                                            ev_lines.push(emit::fmt_stmt(s, &names));
+                                            ev_lines.push(emit::fmt_stmt(s, &body_names));
                                         }
                                     }
                                 }
                             }
-                            stack.extend(expr::children(x));
+                            // Addresses inside loads and hashes are pointer arithmetic, not values.
+                            if !matches!(expr::node(x), Node::MLoad(..) | Node::SLoad(..) | Node::KeccakMem(..) | Node::CallDataLoad(_) | Node::CopiedWord(..) | Node::ReturnData(..)) {
+                                stack.extend(expr::children(x));
+                            }
                         }
                     }
                 }

@@ -49,6 +49,9 @@ pub struct Function {
     /// Internal-unit argument and return counts.
     pub n_args: usize,
     pub n_rets: usize,
+    /// Internal helper whose every call site was inlined: not printed.
+    #[serde(default)]
+    pub inlined: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -109,6 +112,9 @@ pub struct Contract {
     /// Implementation behind this proxy, when resolved on-chain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyRef>,
+    /// Internal helpers that copy a storage string to memory: entry pc -> slot.
+    #[serde(skip)]
+    pub string_loaders: HashMap<usize, U256>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -244,7 +250,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     let mut internals: BTreeMap<usize, Lifted> = BTreeMap::new();
     let mut by_block: Vec<(usize, Lifted)> = Vec::new();
     // Callees before callers where possible: iterate until the summary set stabilises.
-    for _round in 0..3 {
+    for _round in 0..8 {
         by_block.clear();
         for (b, unit) in &rec.functions {
             let l = int_lifter.lift(unit, None);
@@ -266,6 +272,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         internals.insert(prog.blocks[b].start, l);
     }
     tick("lift internals", &mut tt);
+    // Helpers that load a storage string: their result prints as the storage variable.
+    let loaders: HashMap<usize, U256> = internals.iter().filter_map(|(pc, l)| crate::idiom::storage_string_loader(l).map(|k| (*pc, k))).collect();
     let lifter = Lifter { prog: &prog, root: true, summaries: int_lifter.summaries.clone(), oracle: false };
     let main = lifter.lift(&rec.main, None);
     let dispatch = function::discover(&main);
@@ -354,7 +362,10 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         if kind == FnKind::Receive {
             returns.clear();
         }
-        Function { kind, selector: selector.map(|s| format!("{:#010x}", s)), name, signature, mutability, params, returns, pc, code: String::new(), nodes: l.nodes.len(), effects: eff, lifted: Some(l), calls, n_args, n_rets }
+        if l.nodes.iter().any(|nd| matches!(&nd.term, Term::ReturnDyn { ptr } if crate::idiom::is_string_pointer(&l, *ptr, &loaders).is_some())) {
+            returns = vec!["string".into()];
+        }
+        Function { kind, selector: selector.map(|s| format!("{:#010x}", s)), name, signature, mutability, params, returns, pc, code: String::new(), nodes: l.nodes.len(), effects: eff, lifted: Some(l), calls, n_args, n_rets, inlined: false }
     };
 
     // Each external function is lifted again on its own from the state the dispatcher hands it,
@@ -371,23 +382,27 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         function::slice(&main, entry)
     };
     for d in &dispatch.functions {
-        let sl = relift(d.entry);
+        let mut sl = relift(d.entry);
+        crate::idiom::fold(&mut sl);
         let pc = main.nodes[d.entry].pc;
         functions.push(make(FnKind::External, Some(d.selector), sl, pc, None, 0, 0));
     }
     if let Some(r) = dispatch.receive {
-        let sl = relift(r);
+        let mut sl = relift(r);
+        crate::idiom::fold(&mut sl);
         functions.push(make(FnKind::Receive, None, sl, main.nodes[r].pc, Some("receive".into()), 0, 0));
     }
     if let Some(f) = dispatch.fallback {
-        let sl = relift(f);
+        let mut sl = relift(f);
+        crate::idiom::fold(&mut sl);
         functions.push(make(FnKind::Fallback, None, sl, main.nodes[f].pc, Some("fallback".into()), 0, 0));
     }
     if dispatch.functions.is_empty() && dispatch.fallback.is_none() && dispatch.receive.is_none() {
         // No dispatcher at all: the whole runtime is one entry (e.g. a hand-written contract).
         functions.push(make(FnKind::Fallback, None, main.clone(), 0, Some("fallback".into()), 0, 0));
     }
-    for (pc, l) in internals {
+    for (pc, mut l) in internals {
+        crate::idiom::fold(&mut l);
         let n_rets = l.nodes.iter().filter_map(|n| if let Term::InternalReturn(v) = &n.term { Some(v.len()) } else { None }).max().unwrap_or(0);
         let n_args = match l.ret_slot {
             Some(k) => (k as usize).min(l.n_args),
@@ -400,8 +415,33 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         functions.push(make(FnKind::Orphan, None, l, pc, Some(format!("orphan_{:#x}", pc)), n_args, 0));
     }
 
+    // Internal helpers that no printed statement calls any more (every call site was inlined or
+    // aliased) are kept for the JSON but not printed.
+    {
+        let mut referenced: HashSet<usize> = HashSet::new();
+        for f in &functions {
+            if let Some(l) = &f.lifted {
+                for nd in &l.nodes {
+                    for st in &nd.stmts {
+                        if let Stmt::Internal { callee, results, .. } = st {
+                            if !(loaders.contains_key(callee) && !results.is_empty()) {
+                                referenced.insert(*callee);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for f in functions.iter_mut() {
+            if f.kind == FnKind::Internal && !referenced.contains(&f.pc) {
+                f.inlined = true;
+            }
+        }
+    }
+
     // Inventories.
-    let (storage, events, errors, mut strings, selectors_called) = inventories(&functions, vyper);
+    let string_slots: HashSet<U256> = loaders.values().copied().collect();
+    let (storage, events, errors, mut strings, selectors_called) = inventories(&functions, vyper, &string_slots);
     for st in scan_strings(code, code_end) {
         if !strings.iter().any(|x| x.contains(&st)) {
             strings.push(st);
@@ -413,7 +453,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     tick("discover+inventories", &mut tt);
     // Render code for each function.
     for f in functions.iter_mut() {
-        let names = make_names(f, &storage, vyper);
+        let names = make_names(f, &storage, vyper, &loaders);
         let l = f.lifted.as_ref().unwrap();
         let t1 = std::time::Instant::now();
         let body = if opts.flat { emit::fmt_flat(l, &names, "        ") } else { crate::structure::fmt_structured(l, &names, "        ") };
@@ -488,7 +528,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             }
         }
     }
-    let mut c = Contract { info: info.clone(), kind: info.kind, language, functions, storage, events, errors, strings, selectors_called, stats, source: String::new(), embedded, constructor: None, delegatecall_slots: dc_slots, delegatecall_targets: dc_targets, address: None, chain: None, proxy: None };
+    let mut c = Contract { info: info.clone(), kind: info.kind, language, functions, storage, events, errors, strings, selectors_called, stats, source: String::new(), embedded, constructor: None, delegatecall_slots: dc_slots, delegatecall_targets: dc_targets, address: None, chain: None, proxy: None, string_loaders: loaders };
     c.source = render(&c, "Contract");
     c
 }
@@ -520,7 +560,7 @@ fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
     out
 }
 
-pub fn make_names(f: &Function, storage: &[StorageVar], vyper: bool) -> Names {
+pub fn make_names(f: &Function, storage: &[StorageVar], vyper: bool, loaders: &HashMap<usize, U256>) -> Names {
     let mut n = Names::default();
     n.vyper = vyper;
     for p in &f.params {
@@ -545,10 +585,22 @@ pub fn make_names(f: &Function, storage: &[StorageVar], vyper: bool) -> Names {
             n.storage.insert(slot, s.name.clone());
         }
     }
+    if let Some(l) = &f.lifted {
+        for nd in &l.nodes {
+            for st in &nd.stmts {
+                if let Stmt::Internal { callee, results, .. } = st {
+                    if let (Some(k), [r]) = (loaders.get(callee), results.as_slice()) {
+                        let name = n.storage.get(k).cloned().unwrap_or_else(|| format!("stor_{}", k.to_decimal()));
+                        n.aliases.insert(*r, name);
+                    }
+                }
+            }
+        }
+    }
     n
 }
 
-fn inventories(functions: &[Function], vyper: bool) -> (Vec<StorageVar>, Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>) -> (Vec<StorageVar>, Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     let mut slots: BTreeMap<U256, (usize, usize, BTreeSet<String>)> = BTreeMap::new();
     let mut events: BTreeSet<String> = BTreeSet::new();
     let mut errors: BTreeSet<String> = BTreeSet::new();
@@ -566,7 +618,7 @@ fn inventories(functions: &[Function], vyper: bool) -> (Vec<StorageVar>, Vec<Str
                     Stmt::Log { topics, .. } => {
                         if let Some(t0) = topics.first().and_then(|t| expr::as_const(*t)) {
                             match sigs::event(&t0.to_be_bytes()) {
-                                Some(sig) => events.insert(sig.to_string()),
+                                Some(sig) => events.insert(with_indexed(sig, topics.len() - 1)),
                                 None => events.insert(format!("{} (unknown, {} indexed)", t0.to_hex_padded(32), topics.len() - 1)),
                             };
                         } else if topics.is_empty() {
@@ -618,7 +670,7 @@ fn inventories(functions: &[Function], vyper: bool) -> (Vec<StorageVar>, Vec<Str
     let storage: Vec<StorageVar> = slots
         .into_iter()
         .map(|(slot, (reads, writes, tys))| {
-            let ty = if tys.is_empty() { "uint256".to_string() } else if tys.len() == 1 { tys.into_iter().next().unwrap() } else {
+            let ty = if string_slots.contains(&slot) { "string".to_string() } else if tys.is_empty() { "uint256".to_string() } else if tys.len() == 1 { tys.into_iter().next().unwrap() } else {
                 // Prefer the most specific.
                 let mut v: Vec<String> = tys.into_iter().collect();
                 v.sort_by_key(|t| if t.starts_with("mapping") { 0 } else if t.contains('[') { 1 } else if t == "address" || t == "bool" { 2 } else { 3 });
@@ -629,6 +681,38 @@ fn inventories(functions: &[Function], vyper: bool) -> (Vec<StorageVar>, Vec<Str
         })
         .collect();
     (storage, events.into_iter().collect(), errors.into_iter().collect(), strings.into_iter().collect(), selectors.into_iter().collect())
+}
+
+/// `Transfer(address,address,uint256)` with 2 topics besides the signature becomes
+/// `Transfer(address indexed, address indexed, uint256)`. Solidity emits indexed parameters as
+/// topics in declaration order and they are conventionally declared first, so the first `n`
+/// parameters are marked.
+fn with_indexed(sig: &str, n: usize) -> String {
+    let Some(open) = sig.find('(') else { return sig.to_string() };
+    let name = &sig[..open];
+    let inner = sig[open + 1..].trim_end_matches(')');
+    if inner.is_empty() || n == 0 {
+        return sig.to_string();
+    }
+    // Split on top-level commas (tuple types contain nested commas).
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    let n = n.min(parts.len());
+    let out: Vec<String> = parts.iter().enumerate().map(|(i, p)| if i < n { format!("{} indexed", p) } else { p.to_string() }).collect();
+    format!("{}({})", name, out.join(", "))
 }
 
 fn note_slot(key: expr::ExprId, slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>, read: bool, val: Option<expr::ExprId>, vyper: bool) {
@@ -766,7 +850,16 @@ pub fn render(c: &Contract, name: &str) -> String {
             out.push_str(&format!("// Metadata: {}\n", h));
         }
     }
-    out.push_str(&format!("// Coverage: {}/{} code blocks, {} unresolved jumps, {} external / {} internal functions.\n", c.stats.covered_blocks, c.stats.code_blocks, c.stats.unresolved_jumps, c.stats.external_functions, c.stats.internal_functions));
+    let inlined = c.functions.iter().filter(|f| f.inlined).count();
+    out.push_str(&format!(
+        "// Coverage: {}/{} code blocks, {} unresolved jumps, {} external / {} internal functions{}.\n",
+        c.stats.covered_blocks,
+        c.stats.code_blocks,
+        c.stats.unresolved_jumps,
+        c.stats.external_functions,
+        c.stats.internal_functions,
+        if inlined > 0 { format!(" ({} inlined at every call site and not shown)", inlined) } else { String::new() }
+    ));
     out.push_str(&format!("\ncontract {} {{\n", name));
     if !c.storage.is_empty() {
         out.push_str("    // ---- storage layout ----\n");
@@ -788,6 +881,9 @@ pub fn render(c: &Contract, name: &str) -> String {
         out.push('\n');
     }
     for f in &c.functions {
+        if f.inlined {
+            continue;
+        }
         out.push_str(&fmt_function_header(f));
         out.push_str(&f.code);
         out.push_str("    }\n\n");

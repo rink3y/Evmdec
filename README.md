@@ -29,9 +29,15 @@ oracle, so the accuracy claim below is measured, not asserted.
   with mappings and arrays (`stor_3[msg.sender][spender]`), events and custom errors by
   signature, `require(cond, "reason")`, `Panic(…)`, `if`/`else`/`while`/`break`/`continue`,
   ternaries and short-circuits, ABI-encoded external calls shown as `IERC20(t).transfer(to, amt)`
-  style calls, `emit Transfer(from, to, amount)`. Small helpers (SafeMath, ABI decoders,
-  getters) are summarised and inlined at their call sites, and the checks they contain survive
-  as `require`/`assert` lines instead of disappearing with the call. A dictionary of ~1,250 function, event and error
+  style calls, `emit Transfer(from, to, amount)`, `event Transfer(address indexed, address indexed, uint256)`
+  with `indexed` recovered from the topic count. Small helpers (SafeMath, ABI decoders and
+  encoders, getters) are summarised and inlined at their call sites, the checks they contain
+  survive as `require`/`assert` lines, and helpers left with no call site are not printed.
+  Compiler idioms are folded: a storage `string` getter prints as `return name;` with the slot
+  typed `string`, the dynamic-bytes return encoder (copy loop plus padding) becomes `return x;`,
+  `success = to.call{value: v, gas: 2300}(""); require(success)` prints as
+  `payable(to).transfer(v)`, and functions that only ever return the constants 0/1 return `bool`.
+  A dictionary of ~1,250 function, event and error
   signatures (selectors computed with the built-in keccak, so every entry is correct) names what
   it can; everything else is named by selector.
 * **Security report.** Reentrancy (with guard and gas-stipend awareness), ignored call return
@@ -116,7 +122,7 @@ deployer, UNI). Everything is reproducible with `corpus/bench.py` and `corpus/ve
 | external function selectors found | **515 / 515** (recall 100 %, precision 100 %) |
 | state mutability (view/pure vs payable vs nonpayable) | 509 / 515 = **98.8 %** |
 | parameter count | 513 / 515 = **99.6 %** |
-| return count | 513 / 515 = **99.6 %** |
+| return count | 514 / 515 = **99.8 %** |
 | events | 119 / 121 = **98.3 %** |
 | code blocks covered by some function | 10,810 / 10,810 = **100 %** |
 | unresolved jumps | **0** |
@@ -129,7 +135,7 @@ construction, and embedded creation code (`CREATE2` payloads) and metadata are e
 The six mutability misses are `view` functions that make external calls on a pre-0.5 compiler
 (no `STATICCALL`) or `view` getters of transparent proxies that fall through to `delegatecall`;
 the two parameter misses are in MakerDAO Vat (a `LogNote`-style modifier reading raw calldata
-words) and Curve 3pool, the two return misses in Gnosis Safe and UNI.
+words) and Curve 3pool, the one return miss in Gnosis Safe.
 
 ### 2. Block-level semantics oracle (`evmdec verify`, 8 random states per block)
 

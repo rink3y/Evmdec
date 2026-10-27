@@ -13,6 +13,9 @@ use std::collections::HashMap;
 pub struct Names {
     /// calldata word index -> parameter name
     pub params: HashMap<u32, String>,
+    /// Expressions printed under a fixed name (e.g. the pointer returned by a storage-string
+    /// loader prints as the storage variable).
+    pub aliases: HashMap<ExprId, String>,
     /// internal-unit argument index -> name
     pub args: HashMap<u32, String>,
     /// storage slot (constant) -> name
@@ -164,6 +167,9 @@ pub fn fmt_expr(e: ExprId, n: &Names) -> String {
 }
 
 fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
+    if let Some(a) = n.aliases.get(&e) {
+        return a.clone();
+    }
     if let Some(t) = n.temp_of.borrow().get(&e) {
         return t.clone();
     }
@@ -793,6 +799,7 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
             }
         },
         Term::Stop => "return;".into(),
+        Term::ReturnDyn { ptr } => format!("return {};", fmt_expr(*ptr, n)),
         Term::Invalid => "assert(false); // INVALID".into(),
         Term::SelfDestruct(a) => format!("selfdestruct({});", fmt_expr(*a, n)),
         Term::InternalReturn(vals) => {

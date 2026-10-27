@@ -490,6 +490,25 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
             if tys.len() > best.len() || (tys.len() == best.len() && tys.iter().filter(|t| *t != "uint256").count() > best.iter().filter(|t| *t != "uint256").count()) {
                 best = tys;
             }
+        } else if let Term::ReturnDyn { .. } = &nd.term {
+            if best.is_empty() {
+                best = vec!["bytes".into()];
+            }
+        }
+    }
+    // A position that only ever returns the constants 0 and 1, with 1 seen, is a bool.
+    if !best.is_empty() {
+        let rets: Vec<&Vec<ExprId>> = l.nodes.iter().filter_map(|nd| if let Term::Return { data: Some(w), .. } = &nd.term { if w.len() == best.len() { Some(w) } else { None } } else { None }).collect();
+        if !rets.is_empty() {
+            for (i, ty) in best.iter_mut().enumerate() {
+                if ty != "uint256" {
+                    continue;
+                }
+                let consts: Vec<Option<U256>> = rets.iter().map(|w| expr::as_const(w[i])).collect();
+                if consts.iter().all(|c| matches!(c, Some(c) if *c == U256::ZERO || *c == U256::ONE)) && consts.contains(&Some(U256::ONE)) {
+                    *ty = "bool".into();
+                }
+            }
         }
     }
     best

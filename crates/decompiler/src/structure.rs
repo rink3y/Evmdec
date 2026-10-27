@@ -364,8 +364,52 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// `success = to.call{value: v, gas: (v == 0) * 2300}(""); require(success);` is Solidity's
+    /// `to.transfer(v)`: print it that way and continue on the success path.
+    fn try_transfer_idiom(&mut self, n: usize, stop: Option<usize>, depth: usize) -> bool {
+        let nd = &self.l.nodes[n];
+        let Term::Branch { cond, t: Some(t), f } = &nd.term else { return false };
+        let Some(Stmt::Call { kind: op::CALL, addr, value: Some(value), in_len, gas, seq, .. }) = nd.stmts.last() else { return false };
+        if expr::as_const(*in_len) != Some(U256::ZERO) {
+            return false;
+        }
+        let stipend = expr::as_const(*gas).map_or(false, |g| g == U256::from_u64(2300)) || matches!(expr::node(*gas), Node::Op(op::MUL, ref v) if expr::as_const(v[1]) == Some(U256::from_u64(2300)) || expr::as_const(v[0]) == Some(U256::from_u64(2300)));
+        if !stipend {
+            return false;
+        }
+        let is_result = |e: ExprId| matches!(expr::node(e), Node::CallResult(s) if s == *seq);
+        // require(success): the revert side has no reason.
+        let (ok, revert) = if is_result(*cond) {
+            (*t, *f)
+        } else if matches!(expr::node(*cond), Node::Op(op::ISZERO, ref v) if is_result(v[0])) {
+            (*f, *t)
+        } else {
+            return false;
+        };
+        if self.revert_reason(revert) != Some(None) {
+            return false;
+        }
+        let (addr, value, cond) = (*addr, *value, *cond);
+        let count = nd.stmts.len();
+        for s in &self.l.nodes[n].stmts[..count - 1] {
+            let txt = emit::fmt_stmt(s, self.names);
+            self.line(depth, &txt);
+        }
+        self.line(depth, &format!("payable({}).transfer({});", emit::fmt_expr(addr, self.names), emit::fmt_expr(value, self.names)));
+        self.facts.push((cond, ok == *t));
+        self.transfer(n, ok, stop, depth);
+        self.facts.pop();
+        true
+    }
+
     fn stmts(&mut self, n: usize, depth: usize) {
         for s in &self.l.nodes[n].stmts {
+            // A call whose every result prints under an alias (storage-string loader) is implied.
+            if let Stmt::Internal { results, .. } = s {
+                if !results.is_empty() && results.iter().all(|r| self.names.aliases.contains_key(r)) {
+                    continue;
+                }
+            }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
         }
@@ -458,6 +502,9 @@ impl<'a> Printer<'a> {
         self.emitted.insert(n);
         if self.labels.contains(&n) {
             self.line(depth.saturating_sub(1), &format!("L{:x}:", self.node_pc(n)));
+        }
+        if self.try_transfer_idiom(n, stop, depth) {
+            return;
         }
         self.stmts(n, depth);
         let term = self.l.nodes[n].term.clone();

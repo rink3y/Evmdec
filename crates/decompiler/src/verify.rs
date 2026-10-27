@@ -678,7 +678,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                 }
                 Term::Invalid => Outcome::Invalid,
                 Term::SelfDestruct(a) => Outcome::SelfDestruct(ev.eval(*a, &mut memo)),
-                Term::Jump(_) | Term::Infeasible => Outcome::Fallthrough,
+                Term::Jump(_) | Term::Infeasible | Term::ReturnDyn { .. } => Outcome::Fallthrough,
                 other => {
                     ev.inconclusive = Some(format!("terminator {:?}", std::mem::discriminant(other)));
                     Outcome::Fallthrough

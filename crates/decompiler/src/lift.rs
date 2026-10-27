@@ -839,7 +839,7 @@ impl<'a> Lifter<'a> {
                 }
                 op::JUMP => {
                     let _target = pop!();
-                    if self.oracle {
+                    if self.oracle || un.computed_cut {
                         term = Some(Term::Unresolved(_target));
                         break;
                     }
@@ -1411,6 +1411,68 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
             }
         }
     }
+}
+
+/// Leaves of an expression that are not constants (unknown inputs).
+pub fn unknown_leaves(e: ExprId) -> Vec<ExprId> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 10_000 {
+            continue;
+        }
+        match expr::node(x) {
+            Node::Const(_) => {}
+            Node::Op(_, _) => stack.extend(expr::children(x)),
+            _ => out.push(x),
+        }
+    }
+    out
+}
+
+/// Candidate code addresses for a computed jump target: when the expression has a single
+/// unknown input, substitute a range of small values, powers of two and masks for it and keep the
+/// results that are jump destinations (exact for shift-selected targets and calldata-byte
+/// dispatchers); otherwise, or additionally, every destination compatible with the bit pattern.
+pub fn jump_candidates(e: ExprId, jumpdests: &HashSet<usize>, code_len: usize) -> Vec<usize> {
+    let mut out: HashSet<usize> = HashSet::new();
+    let leaves = unknown_leaves(e);
+    // A bare stack input (`Arg`) is a return address or a caller-provided pointer, never a
+    // dispatcher index: only calldata/memory/environment-derived inputs are enumerated.
+    if leaves.len() == 1 && !matches!(expr::node(leaves[0]), Node::Arg(_) | Node::Var(_) | Node::IntRet(..) | Node::Unknown(_)) {
+        let leaf = leaves[0];
+        let mut samples: Vec<U256> = (0..=1024u64).map(U256::from_u64).collect();
+        for k in 0..256u32 {
+            samples.push(U256::ONE.shl(k));
+            samples.push(expr::mask_bits(k));
+        }
+        samples.push(U256::MAX);
+        for v in samples {
+            let mut memo = HashMap::new();
+            let r = expr::substitute(e, &|n| if std::ptr::eq(n, n) && expr::intern(n.clone()) == leaf { Some(konst(v)) } else { None }, &mut memo);
+            if let Some(c) = expr::as_const(r) {
+                if let Some(pc) = c.as_usize() {
+                    if pc < code_len && jumpdests.contains(&pc) {
+                        out.insert(pc);
+                    }
+                }
+            }
+        }
+    }
+    let bare_stack = matches!(expr::node(e), Node::Arg(_) | Node::Var(_));
+    if let (Some(bits), false) = (jump_target_bits(e), bare_stack) {
+        if bits != U256::MAX {
+            for &pc in jumpdests {
+                if pc < code_len && (U256::from(pc) & !bits).is_zero() {
+                    out.insert(pc);
+                }
+            }
+        }
+    }
+    let mut v: Vec<usize> = out.into_iter().collect();
+    v.sort_unstable();
+    v
 }
 
 /// Reachable set from the entry.

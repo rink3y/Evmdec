@@ -701,6 +701,8 @@ pub struct Analysis<'a> {
 }
 
 const MAX_EXITS: usize = 24;
+/// Total nodes across all orphan units (unreached code is decompiled best-effort).
+const MAX_ORPHAN_NODES: usize = 60_000;
 /// Distinct contexts a single block may have inside one unit walk. Loops that push or pop a
 /// stack entry per iteration (Vyper buffer copies) would otherwise create a node per iteration.
 const MAX_BLOCK_CONTEXTS: usize = 12;
@@ -997,6 +999,9 @@ pub struct UNode {
     pub unresolved: bool,
     /// The path into this node underflows the real frame's stack and cannot execute.
     pub infeasible: bool,
+    /// A computed jump that this (orphan) unit does not follow; its targets are shown where the
+    /// main unit dispatches on it.
+    pub computed_cut: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1010,6 +1015,12 @@ pub struct Unit {
 impl<'a> Analysis<'a> {
     /// Build the explicit graph for the region starting at `entry_block` with `entry_state`.
     pub fn build_unit(&self, entry_block: usize, entry_state: AState) -> Unit {
+        self.build_unit_opts(entry_block, entry_state, true, MAX_WALK_NODES * 4)
+    }
+
+    /// `follow_computed`: take computed-jump candidates (orphans do not, so that unreachable
+    /// handlers of a jump-table dispatcher do not each re-explore the whole program).
+    pub fn build_unit_opts(&self, entry_block: usize, entry_state: AState, follow_computed: bool, max_nodes: usize) -> Unit {
         let prog = self.prog;
         let mut nodes: Vec<UNode> = Vec::new();
         let mut index: HashMap<(usize, Sig), usize> = HashMap::new();
@@ -1028,20 +1039,35 @@ impl<'a> Analysis<'a> {
             }
             let id = nodes.len();
             list.push(id);
-            nodes.push(UNode { id, block: blk, entry: st.clone(), succs: vec![], preds: vec![], call: None, returns_via: None, unresolved: false, infeasible: false });
+            nodes.push(UNode { id, block: blk, entry: st.clone(), succs: vec![], preds: vec![], call: None, returns_via: None, unresolved: false, infeasible: false, computed_cut: false });
             index.insert(key, id);
             work.push_back(id);
             id
         };
         let entry = intern(entry_block, &entry_state, &mut nodes, &mut index, &mut work);
         while let Some(n) = work.pop_front() {
-            if nodes.len() > MAX_WALK_NODES * 4 {
+            if nodes.len() > max_nodes {
                 budget_exhausted = true;
                 break;
             }
             let blk = nodes[n].block;
             let st = nodes[n].entry.clone();
-            let exit = exec_block(prog, &prog.blocks[blk], &st);
+            let mut exit = exec_block(prog, &prog.blocks[blk], &st);
+            let mut cut = false;
+            if !follow_computed && prog.computed_jumps.contains_key(&blk) {
+                match exit.flow {
+                    Flow::Jump(_) => {
+                        exit.flow = Flow::Halt(op::JUMP);
+                        cut = true;
+                    }
+                    Flow::Branch { fallthrough, .. } => {
+                        exit.flow = Flow::Branch { targets: vec![], fallthrough };
+                        cut = true;
+                    }
+                    _ => {}
+                }
+            }
+            nodes[n].computed_cut = cut;
             let st = exit.state;
             if st.underflowed() {
                 // Infeasible path in a real frame (stack underflow): no successors.
@@ -1238,12 +1264,18 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
     }
     let mut orphans = BTreeMap::new();
     let mut unresolved = Vec::new();
+    let mut orphan_nodes = 0usize;
     for b in &prog.blocks {
         if b.start >= code_end {
             break;
         }
         if !covered.contains(&b.id) && b.is_jumpdest {
-            let unit = an.build_unit(b.id, AState::new());
+            if orphan_nodes > MAX_ORPHAN_NODES {
+                // Budget: remaining unreached blocks stay uncovered (reported in the statistics).
+                break;
+            }
+            let unit = an.build_unit_opts(b.id, AState::new(), false, MAX_WALK_NODES);
+            orphan_nodes += unit.nodes.len();
             for n in &unit.nodes {
                 covered.insert(n.block);
             }

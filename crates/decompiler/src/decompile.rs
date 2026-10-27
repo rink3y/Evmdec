@@ -66,6 +66,8 @@ pub struct Stats {
     pub code_blocks: usize,
     pub covered_blocks: usize,
     pub unresolved_jumps: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_jump_pcs: Vec<String>,
     pub budget_exhausted: bool,
     pub external_functions: usize,
     pub internal_functions: usize,
@@ -165,27 +167,36 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     let mut prog = Program::new(code.to_vec());
     let mut code_end = info.metadata.as_ref().map(|m| m.offset).unwrap_or(code.len());
     let mut rec = cfg::recover(&prog, code_end);
+    // Embedded creation code (CODECOPY'd into memory and fed to CREATE/CREATE2) is data for the
+    // purposes of this contract: it is excluded from coverage and decompiled separately on request.
+    let embedded_ranges = embedded_regions(&prog, &rec);
+    let in_embedded = |pc: usize| embedded_ranges.iter().any(|(o, l)| pc >= *o && pc < *o + *l);
+    let prune_embedded = |rec: &mut Recovered| {
+        if !embedded_ranges.is_empty() {
+            let keep: HashSet<usize> = prog.blocks.iter().filter(|b| !in_embedded(b.start)).map(|b| b.id).collect();
+            rec.orphans.retain(|b, _| keep.contains(b));
+            rec.unresolved_jumps.retain(|pc| !in_embedded(*pc));
+        }
+    };
+    prune_embedded(&mut rec);
     // Computed jumps (hand-written dispatchers): derive candidate targets from the target
     // expression's shape and recover again with them.
     if !rec.unresolved_jumps.is_empty() {
         let oracle = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: true };
         let mut computed: HashMap<usize, Vec<usize>> = HashMap::new();
         for b in &prog.blocks {
-            if !matches!(b.terminator, op::JUMP | op::JUMPI) || !rec.unresolved_jumps.contains(&b.end) {
+            if !matches!(b.terminator, op::JUMP | op::JUMPI) || !rec.unresolved_jumps.contains(&b.end) || in_embedded(b.start) || b.end > code_end {
                 continue;
             }
-            let unit = cfg::Unit { entry_block: b.id, nodes: vec![cfg::UNode { id: 0, block: b.id, entry: cfg::AState::new(), succs: vec![], preds: vec![], call: None, returns_via: None, unresolved: true, infeasible: false }], entry: 0, budget_exhausted: false };
+            let unit = cfg::Unit { entry_block: b.id, nodes: vec![cfg::UNode { id: 0, block: b.id, entry: cfg::AState::new(), succs: vec![], preds: vec![], call: None, returns_via: None, unresolved: true, infeasible: false, computed_cut: false }], entry: 0, budget_exhausted: false };
             let l = oracle.lift(&unit, None);
             let target = match &l.nodes[0].term {
                 Term::Unresolved(t) => *t,
                 Term::CondJump { target, .. } => *target,
                 _ => continue,
             };
-            let Some(bits) = lift::jump_target_bits(target) else { continue };
-            if bits == U256::MAX {
-                continue;
-            }
-            let cands: Vec<usize> = prog.blocks.iter().filter(|x| x.is_jumpdest && (U256::from(x.start) & !bits).is_zero()).map(|x| x.id).collect();
+            let pcs = lift::jump_candidates(target, &prog.jumpdests, code_end);
+            let cands: Vec<usize> = pcs.iter().filter_map(|pc| prog.block_at_pc.get(pc).copied()).collect();
             if !cands.is_empty() && cands.len() <= 512 {
                 computed.insert(b.id, cands);
             }
@@ -193,6 +204,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         if !computed.is_empty() {
             prog.computed_jumps = computed;
             rec = cfg::recover(&prog, code_end);
+            prune_embedded(&mut rec);
         }
     }
     if info.metadata.is_none() {
@@ -208,16 +220,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                 rec = cfg::recover(&prog, code_end);
             }
         }
-    }
-    // Embedded creation code (CODECOPY'd into memory and fed to CREATE/CREATE2) is data for the
-    // purposes of this contract: it is excluded from coverage and decompiled separately on request.
-    let embedded_ranges = embedded_regions(&prog, &rec);
-    let in_embedded = |pc: usize| embedded_ranges.iter().any(|(o, l)| pc >= *o && pc < *o + *l);
-    if !embedded_ranges.is_empty() {
-        // Re-run recovery so that orphan discovery skips the embedded bytes.
-        let keep: HashSet<usize> = prog.blocks.iter().filter(|b| !in_embedded(b.start)).map(|b| b.id).collect();
-        rec.orphans.retain(|b, _| keep.contains(b));
-        rec.unresolved_jumps.retain(|pc| !in_embedded(*pc));
     }
     let language = detect_language(info, code);
     let vyper = language.starts_with("vyper");
@@ -432,6 +434,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         code_blocks,
         covered_blocks: covered.iter().filter(|b| prog.blocks[**b].start < code_end && !in_embedded(prog.blocks[**b].start) && prog.is_potential_code(**b)).count(),
         unresolved_jumps: rec.unresolved_jumps.len(),
+        unresolved_jump_pcs: rec.unresolved_jumps.iter().map(|pc| format!("{:#x}", pc)).collect(),
         budget_exhausted: rec.budget_exhausted,
         external_functions: functions.iter().filter(|f| f.kind == FnKind::External).count(),
         internal_functions: functions.iter().filter(|f| f.kind == FnKind::Internal).count(),

@@ -411,7 +411,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
         let n_ins = b.last - b.first + 1;
         stats.instructions_total += n_ins;
         // Lift the block alone with an unknown entry stack.
-        let unit = Unit { entry_block: b.id, nodes: vec![UNode { id: 0, block: b.id, entry: AState::new(), succs: vec![], preds: vec![], call: None, returns_via: None, unresolved: true, infeasible: false }], entry: 0, budget_exhausted: false };
+        let unit = Unit { entry_block: b.id, nodes: vec![UNode { id: 0, block: b.id, entry: AState::new(), succs: vec![], preds: vec![], call: None, returns_via: None, unresolved: true, infeasible: false, computed_cut: false }], entry: 0, budget_exhausted: false };
         let lifted = lifter.lift(&unit, None);
         let ln = &lifted.nodes[0];
         let need = required_depth(&prog, b.id).max(lifted.n_args);

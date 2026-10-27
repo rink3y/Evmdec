@@ -41,6 +41,10 @@ pub enum Node {
     /// Bytes read from a copied region (CALLDATACOPY/CODECOPY/RETURNDATACOPY/EXTCODECOPY/MCOPY):
     /// `kind` is the copying opcode, then (source offset, memory version).
     CopiedWord(u8, ExprId, u32),
+    /// The j-th result of internal call `seq`.
+    IntRet(u32, u16),
+    /// Memory word of unknown content at (offset) after an internal call `seq`... (reserved)
+    Unknown(u32),
 }
 
 struct Arena {
@@ -269,6 +273,17 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             if cb == Some(U256::ZERO) {
                 return a;
             }
+            // x + (y - x) -> y ; (y - x) + x -> y
+            if let Node::Op(op::SUB, v) = node(b) {
+                if v[1] == a {
+                    return v[0];
+                }
+            }
+            if let Node::Op(op::SUB, v) = node(a) {
+                if v[1] == b {
+                    return v[0];
+                }
+            }
             // (x + c1) + c2 -> x + (c1+c2)
             if let Some(c2) = cb {
                 if let Node::Op(op::ADD, v) = node(a) {
@@ -294,6 +309,29 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             }
             if a == b {
                 return konst(U256::ZERO);
+            }
+            // (x + y) - x -> y ; (x + y) - y -> x
+            if let Node::Op(op::ADD, v) = node(a) {
+                if v[0] == b {
+                    return v[1];
+                }
+                if v[1] == b {
+                    return v[0];
+                }
+                // (x + c1) - (x + c2) -> c1 - c2
+                if let Node::Op(op::ADD, w) = node(b) {
+                    if v[0] == w[0] {
+                        if let (Some(c1), Some(c2)) = (as_const(v[1]), as_const(w[1])) {
+                            return konst(c1.wrapping_sub(c2));
+                        }
+                    }
+                }
+            }
+            // x - (x - y) -> y
+            if let Node::Op(op::SUB, v) = node(b) {
+                if v[0] == a {
+                    return v[1];
+                }
             }
             if let Some(c2) = cb {
                 if let Node::Op(op::ADD, v) = node(a) {

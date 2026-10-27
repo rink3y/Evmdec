@@ -19,6 +19,22 @@ enum Cmd {
     Disasm { file: PathBuf },
     /// Control-flow recovery statistics.
     Cfg { file: PathBuf },
+    /// Decompile to pseudo-Solidity.
+    Decompile {
+        file: PathBuf,
+        /// Labels and gotos instead of structured code.
+        #[arg(long)]
+        flat: bool,
+        /// JSON output with all facts.
+        #[arg(long)]
+        json: bool,
+        /// Also decompile embedded contracts (CREATE/CREATE2 payloads).
+        #[arg(long)]
+        embedded: bool,
+        /// Disable the built-in signature dictionary.
+        #[arg(long)]
+        no_sigs: bool,
+    },
 }
 
 fn load(file: &PathBuf) -> Result<Vec<u8>> {
@@ -84,6 +100,16 @@ fn main() -> Result<()> {
                 for (b, u) in &rec.orphans {
                     println!("  orphan {:#x}: nodes={}", prog.blocks[*b].start, u.nodes.len());
                 }
+            }
+        }
+        Cmd::Decompile { file, flat, json, embedded, no_sigs } => {
+            let code = load(&file)?;
+            let opts = evmdec::decompile::Options { flat, pcs: false, embedded, no_sigs };
+            let c = evmdec::decompile::decompile(&code, &opts);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&c)?);
+            } else {
+                print!("{}", c.source);
             }
         }
         Cmd::Disasm { file } => {

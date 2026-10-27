@@ -453,11 +453,11 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         None => {
                             if !st.mem.regions.is_empty() {
                                 AVal::Table
-                            } else if st.mem.clobbered {
-                                AVal::Unk
-                            } else if st.root {
+                            } else if st.root && !st.mem.clobbered {
                                 AVal::Const(U256::ZERO)
                             } else if o % 32 == 0 {
+                                // Optimistic even after writes to unknown offsets: compilers keep
+                                // return addresses in dedicated slots, and targets are validated.
                                 AVal::Mem(o as u32)
                             } else {
                                 AVal::Unk
@@ -703,9 +703,7 @@ fn resolve(v: AVal, st: &mut AState) -> AVal {
         AVal::Mem(o) => match st.mem.load_word(o as usize) {
             Some(x) => x,
             None => {
-                if st.mem.clobbered {
-                    AVal::Unk
-                } else if st.root {
+                if st.root && !st.mem.clobbered {
                     AVal::Const(U256::ZERO)
                 } else {
                     AVal::Mem(o)

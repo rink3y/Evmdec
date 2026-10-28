@@ -116,8 +116,10 @@ main>*{min-width:0;min-height:0;overflow:auto}
 .tabs [role=tab]{flex:none;border:0;background:transparent;padding:10px 16px;border-right:1px solid var(--hair);color:var(--muted);white-space:nowrap;font:600 13px/1.2 var(--cond);letter-spacing:.1em;text-transform:uppercase}
 .tabs [role=tab]:hover{color:var(--fg)}
 .tabs [role=tab][aria-selected="true"]{color:var(--fg);box-shadow:inset 0 -2px 0 var(--rubric)}
-.tabs .dl.done{color:var(--fg)}
-.tabs #copy{margin-left:auto}.tabs #dl{margin-left:0}
+.tabs .copy{flex:none;display:inline-flex;align-items:center;gap:6px;align-self:center;margin:0 10px 0 auto;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);padding:5px 10px 5px 8px;font:600 12px/1 var(--cond);letter-spacing:.1em;text-transform:uppercase;white-space:nowrap;cursor:pointer}
+.tabs .copy:hover{background:var(--well);border-color:var(--fg)}
+.tabs .copy.done{border-color:var(--rubric);color:var(--rubric)}
+.tabs #dl{margin-left:0}
 .tabs .dl{flex:none;margin-left:auto;border:0;border-left:1px solid var(--hair);background:transparent;padding:0 16px;white-space:nowrap;font:600 13px/1.2 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--rubric)}
 .scale{display:flex;gap:16px;padding:7px 12px;border-bottom:1px solid var(--hair);font-size:13px;color:var(--muted);flex-wrap:wrap}
 .scale b{color:var(--fg);font-weight:600}
@@ -233,7 +235,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
       <button role="tab" id="tab-storage" aria-controls="panel-storage" aria-selected="false" tabindex="-1">Storage &amp; events</button>
       <button role="tab" id="tab-disasm" aria-controls="panel-disasm" aria-selected="false" tabindex="-1">Disassembly</button>
       <button role="tab" id="tab-json" aria-controls="panel-json" aria-selected="false" tabindex="-1">JSON</button>
-      <button id="copy" class="dl" type="button" aria-live="off">Copy</button>
+      <button id="copy" class="copy" type="button"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.5 5.5v-3a1.5 1.5 0 0 0-1.5-1.5h-6A1.5 1.5 0 0 0 1.5 2.5v6A1.5 1.5 0 0 0 3 10h2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg><span>Copy</span></button>
       <button id="dl" class="dl" type="button">Download .sol</button>
     </div>
     <div class="scale" id="scale" hidden></div>
@@ -287,8 +289,8 @@ function shownText(){if(!DATA)return '';if(CUR==null)return DATA.contract.source
 async function copyShown(){const text=shownText();if(!text)return;const btn=$('#copy');let ok=false;
  try{await navigator.clipboard.writeText(text);ok=true}catch(e){const ta=document.createElement('textarea');ta.value=text;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{ok=document.execCommand('copy')}catch(e2){}ta.remove()}
  const what=CUR==null?'the whole contract':'the function and its helpers';const n=text.split('\n').length;
- btn.textContent=ok?'Copied':'Copy failed';btn.classList.toggle('done',ok);say(ok?'Copied '+what+', '+n+' lines':'Copy failed; select the code and copy it by hand');
- clearTimeout(btn._t);btn._t=setTimeout(()=>{btn.textContent='Copy';btn.classList.remove('done')},1600)}
+ btn.querySelector('span').textContent=ok?'Copied':'Copy failed';btn.classList.toggle('done',ok);say(ok?'Copied '+what+', '+n+' lines':'Copy failed; select the code and copy it by hand');
+ clearTimeout(btn._t);btn._t=setTimeout(()=>{btn.querySelector('span').textContent='Copy';btn.classList.remove('done')},1600)}
 $('#copy').addEventListener('click',copyShown);
 $('#dl').addEventListener('click',()=>{if(!DATA)return;const blob=new Blob([DATA.contract.source],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(DATA.contract.address||'contract')+'.sol';a.click();say('Downloaded '+a.download)});
 function fromUrl(){const p=new URLSearchParams(location.search);const a=p.get('address');if(a&&/^0x[0-9a-fA-F]{40}$/.test(a)){$('#q').value=a;const sel=$('#chain'),c=p.get('chain');if(c&&[...sel.options].some(o=>o.value===c))sel.value=c;go()}}

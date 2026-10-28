@@ -71,6 +71,10 @@ pub struct Function {
 #[derive(Clone, Debug, Serialize)]
 /// A storage slot the contract reads or writes, as listed in the contract header.
 pub struct StorageVar {
+    /// The variable is a fixed-size array laid out from this slot (`uint[256] owners`): its
+    /// elements occupy the following slots rather than `keccak256(slot) + i`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fixed_array: bool,
     /// Root slot as `0x`-prefixed hex (the base slot for mappings and arrays).
     pub slot: String,
     /// Printed name: `stor_<slot>` (decimal for small slots, hex otherwise).
@@ -745,8 +749,33 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                 }
             }
         }
+        // A "helper" whose entry block every caller also holds as a plain node of its own is
+        // the continuation of those callers (old solc reaches the rest of a modified function
+        // both by falling through and by a jump with a return address): its body is already
+        // printed inline, so the duplicate definition is not.
+        let mut continuation: HashSet<usize> = HashSet::new();
+        for f in &functions {
+            if f.kind != FnKind::Internal || !referenced.contains(&f.pc) {
+                continue;
+            }
+            let callers: Vec<&Function> = functions
+                .iter()
+                .filter(|g| g.pc != f.pc && g.calls.contains(&f.pc))
+                .collect();
+            if !callers.is_empty()
+                && callers.iter().all(|g| {
+                    g.lifted
+                        .as_ref()
+                        .is_some_and(|l| l.nodes.iter().any(|nd| nd.pc == f.pc))
+                })
+            {
+                continuation.insert(f.pc);
+            }
+        }
         for f in functions.iter_mut() {
-            if f.kind == FnKind::Internal && !referenced.contains(&f.pc) {
+            if f.kind == FnKind::Internal
+                && (!referenced.contains(&f.pc) || continuation.contains(&f.pc))
+            {
                 f.inlined = true;
             }
         }
@@ -1014,6 +1043,9 @@ pub fn make_names(
     for s in storage {
         if let Some(slot) = U256::from_hex_str(&s.slot).or_else(|| U256::from_dec_str(&s.slot)) {
             n.storage.insert(slot, s.name.clone());
+            if s.ty.ends_with("[]") && s.fixed_array {
+                n.array_bases.insert(slot);
+            }
             for fld in &s.fields {
                 n.fields
                     .insert((slot, fld.offset, fld.bits), fld.name.clone());
@@ -1075,6 +1107,7 @@ fn inventories(
     };
     // Packed fields: slot -> (offset, bits) -> constant values written (for bool typing).
     let mut fields: PackedFields = BTreeMap::new();
+    let bases = fixed_array_bases(functions);
     for f in functions {
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
@@ -1084,8 +1117,9 @@ fn inventories(
                         key,
                         val,
                         transient: false,
+                        ..
                     } => {
-                        note_slot(*key, &mut slots, false, Some(*val), vyper);
+                        note_slot(*key, &mut slots, false, Some(*val), vyper, &bases);
                         if let Some((k, off, bits, value)) = emit::packed_write(*key, *val) {
                             fields
                                 .entry(k)
@@ -1168,7 +1202,7 @@ fn inventories(
                 }
             }
             for e in lift::node_exprs(nd) {
-                collect_sloads(e, &mut slots, vyper);
+                collect_sloads(e, &mut slots, vyper, &bases);
                 collect_strings(e, &mut strings);
                 collect_fields(e, &mut fields);
             }
@@ -1178,6 +1212,17 @@ fn inventories(
     let storage: Vec<StorageVar> = slots
         .into_iter()
         .map(|(slot, (reads, writes, tys))| {
+            let fixed_array = tys.contains("fixed[]");
+            let tys: BTreeSet<String> = tys
+                .into_iter()
+                .map(|t| {
+                    if t == "fixed[]" {
+                        "uint256[]".to_string()
+                    } else {
+                        t
+                    }
+                })
+                .collect();
             let ty = if string_slots.contains(&slot) {
                 "string".to_string()
             } else {
@@ -1261,6 +1306,7 @@ fn inventories(
                 "packed".to_string()
             };
             StorageVar {
+                fixed_array,
                 slot: slot.to_hex(),
                 name,
                 ty,
@@ -1329,8 +1375,9 @@ fn note_slot(
     read: bool,
     val: Option<expr::ExprId>,
     vyper: bool,
+    bases: &BTreeSet<U256>,
 ) {
-    let (root, ty) = slot_root(key, vyper);
+    let (root, ty) = slot_root(key, vyper, bases);
     let Some(root) = root else { return };
     let e = slots.entry(root).or_insert((0, 0, BTreeSet::new()));
     if read {
@@ -1348,9 +1395,103 @@ fn note_slot(
     }
 }
 
+/// First slots of fixed-size arrays: constants `c` in keys of the form `index + c` where the
+/// index is neither constant nor hashed. Nearby constants (`index + 3` for an array at 2, from
+/// `owners[n + 1]`) fold onto the lowest one of their cluster.
+fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
+    let mut seen: BTreeSet<U256> = BTreeSet::new();
+    // (key, index expressions bounded by `index < N` in the same function)
+    let mut keys: Vec<(expr::ExprId, usize)> = Vec::new();
+    let mut bounded: Vec<HashSet<expr::ExprId>> = Vec::new();
+    for (fi, f) in functions.iter().enumerate() {
+        let Some(l) = &f.lifted else { continue };
+        let mut bounds: HashSet<expr::ExprId> = HashSet::new();
+        for nd in &l.nodes {
+            let mut conds: Vec<expr::ExprId> = nd
+                .stmts
+                .iter()
+                .filter_map(|st| match st {
+                    Stmt::Require { cond, .. } => Some(*cond),
+                    _ => None,
+                })
+                .collect();
+            if let Term::Branch { cond, .. } = &nd.term {
+                conds.push(*cond);
+            }
+            for mut c in conds {
+                while let Node::Op(op::ISZERO, v) = expr::node(c) {
+                    c = v[0];
+                }
+                match expr::node(c) {
+                    Node::Op(op::LT, v) if expr::as_const(v[1]).is_some_and(|n| n.bits() <= 16) => {
+                        bounds.insert(v[0]);
+                    }
+                    Node::Op(op::GT, v) if expr::as_const(v[0]).is_some_and(|n| n.bits() <= 16) => {
+                        bounds.insert(v[1]);
+                    }
+                    _ => {}
+                }
+            }
+            for st in &nd.stmts {
+                if let Stmt::SStore { key, .. } = st {
+                    keys.push((*key, fi));
+                }
+            }
+            for e in lift::node_exprs(nd) {
+                let mut stack = vec![e];
+                let mut visited = HashSet::new();
+                while let Some(x) = stack.pop() {
+                    if !visited.insert(x) || visited.len() > 20_000 {
+                        continue;
+                    }
+                    if let Node::SLoad(k, false, _) = expr::node(x) {
+                        keys.push((k, fi));
+                    }
+                    stack.extend(expr::children(x));
+                }
+            }
+        }
+        bounded.resize(fi + 1, HashSet::new());
+        bounded[fi] = bounds;
+    }
+    // Only an index the function bounds (`require(i < 256)`) marks a fixed-size array; a bare
+    // `p + 1` is as often a pointer into a dynamic array's data.
+    for (k, fi) in keys {
+        if let Node::Op(op::ADD, v) = expr::node(k) {
+            for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                if let Some(c) = expr::as_const(a) {
+                    let plain = emit::is_plain_index(b);
+                    let is_bounded = bounded.get(fi).is_some_and(|bs| bs.contains(&b));
+                    if plain && is_bounded && c.bits() <= 32 && !c.is_zero() {
+                        seen.insert(c);
+                    }
+                }
+            }
+        }
+    }
+    // Cluster: a constant within 16 of a lower one is an offset into that array.
+    let mut bases: BTreeSet<U256> = BTreeSet::new();
+    for c in seen {
+        match bases.range(..=c).next_back() {
+            Some(b) if c.wrapping_sub(*b).low_u64() < 16 => {}
+            _ => {
+                bases.insert(c);
+            }
+        }
+    }
+    bases
+}
+
 /// Root slot of a storage key and the shape of the variable it implies.
-fn slot_root(key: expr::ExprId, vyper: bool) -> (Option<U256>, Option<String>) {
+fn slot_root(
+    key: expr::ExprId,
+    vyper: bool,
+    bases: &BTreeSet<U256>,
+) -> (Option<U256>, Option<String>) {
     if let Some(c) = expr::as_const(key) {
+        if let Some(s) = emit::hashed_slot(c) {
+            return (Some(s), Some("uint256[]".into()));
+        }
         return (Some(c), None);
     }
     match expr::node(key) {
@@ -1360,7 +1501,7 @@ fn slot_root(key: expr::ExprId, vyper: bool) -> (Option<U256>, Option<String>) {
             } else {
                 (words[0], words[1])
             };
-            let (root, inner) = slot_root(s, vyper);
+            let (root, inner) = slot_root(s, vyper, bases);
             let kt = function::type_of_value(k);
             let kt = if kt == "uint256" {
                 "uint256".to_string()
@@ -1374,11 +1515,29 @@ fn slot_root(key: expr::ExprId, vyper: bool) -> (Option<U256>, Option<String>) {
             (root, Some(ty))
         }
         Node::Keccak(words, 0) if words.len() == 1 => {
-            let (root, _) = slot_root(words[0], vyper);
+            let (root, _) = slot_root(words[0], vyper, bases);
             (root, Some("uint256[]".into()))
         }
         Node::Op(op::ADD, v) => {
-            let (root, inner) = slot_root(v[0], vyper);
+            // `keccak256(slot) + i` with the hash precomputed by the compiler.
+            for (a, _) in [(v[0], v[1]), (v[1], v[0])] {
+                if let Some(s) = expr::as_const(a).and_then(emit::hashed_slot) {
+                    return (Some(s), Some("uint256[]".into()));
+                }
+            }
+            // `index + c` into a fixed-size array at a known base.
+            for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                if let Some(c) = expr::as_const(a) {
+                    if emit::is_plain_index(b) {
+                        if let Some(base) = bases.range(..=c).next_back() {
+                            if c.wrapping_sub(*base).low_u64() < 16 {
+                                return (Some(*base), Some("fixed[]".into()));
+                            }
+                        }
+                    }
+                }
+            }
+            let (root, inner) = slot_root(v[0], vyper, bases);
             match inner {
                 Some(t) if t.starts_with("mapping") => (root, Some(t)),
                 _ => (root, Some("uint256[]".into())),
@@ -1413,6 +1572,7 @@ fn collect_sloads(
     e: expr::ExprId,
     slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>,
     vyper: bool,
+    bases: &BTreeSet<U256>,
 ) {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
@@ -1422,13 +1582,13 @@ fn collect_sloads(
         }
         let n = expr::node(x);
         match &n {
-            Node::SLoad(key, false, _) => note_slot(*key, slots, true, None, vyper),
+            Node::SLoad(key, false, _) => note_slot(*key, slots, true, None, vyper, bases),
             Node::Op(op::AND, v) => {
                 if let (Node::SLoad(key, false, _), Some(m)) =
                     (expr::node(v[0]), expr::as_const(v[1]))
                 {
                     if m.is_low_mask() {
-                        let (root, inner) = slot_root(key, vyper);
+                        let (root, inner) = slot_root(key, vyper, bases);
                         if let Some(root) = root {
                             let bits = m.bits();
                             let t = if bits == 160 {
@@ -1601,8 +1761,17 @@ pub fn render(c: &Contract, name: &str) -> String {
         for s in &c.storage {
             if s.fields.is_empty() {
                 out.push_str(&format!(
-                    "    {} {}; // slot {}, {} reads, {} writes\n",
-                    s.ty, s.name, s.slot, s.reads, s.writes
+                    "    {} {}; // slot {}, {}{} reads, {} writes\n",
+                    s.ty,
+                    s.name,
+                    s.slot,
+                    if s.fixed_array {
+                        "fixed-size array in the slots that follow, "
+                    } else {
+                        ""
+                    },
+                    s.reads,
+                    s.writes
                 ));
             } else {
                 out.push_str(&format!(

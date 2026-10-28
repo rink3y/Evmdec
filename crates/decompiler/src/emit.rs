@@ -1,12 +1,63 @@
 //! Rendering expressions and statements as pseudo-Solidity.
 
 use crate::expr::{self, ExprId, Node};
+use crate::keccak;
 use crate::lift::{Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::sigs;
 use crate::u256::U256;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::OnceLock;
+
+/// How many small slots the hashed-slot table covers.
+const HASHED_SLOTS: u64 = 4096;
+
+/// The slot `s` whose dynamic-array data lives at `c = keccak256(s)`, for small `s`. Compilers
+/// precompute that hash for state variables, so the constant shows up in the code as is.
+pub fn hashed_slot(c: U256) -> Option<U256> {
+    static TABLE: OnceLock<HashMap<U256, u64>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (0..HASHED_SLOTS)
+            .map(|s| {
+                let h = keccak::keccak256(&U256::from_u64(s).to_be_bytes());
+                (U256::from_be_bytes(&h), s)
+            })
+            .collect()
+    });
+    if c.bits() < 200 {
+        return None;
+    }
+    table.get(&c).map(|s| U256::from_u64(*s))
+}
+
+/// An index into a storage array rather than a hashed slot: not a constant, not a
+/// `keccak256(...)` and not `keccak256(...) + k` (a mapping value used as the index is fine).
+pub fn is_plain_index(e: ExprId) -> bool {
+    if expr::as_const(e).is_some() {
+        return false;
+    }
+    match expr::node(e) {
+        Node::Keccak(..) => false,
+        Node::Op(op::ADD, v) => !v.iter().any(|x| matches!(expr::node(*x), Node::Keccak(..))),
+        _ => true,
+    }
+}
+
+/// `slot_in_fixed_array`: a key `x + c` with a small constant `c` addresses element `x + (c - b)`
+/// of the fixed-size array whose first slot `b` is the nearest known base at or below `c`.
+fn fixed_array_base(c: U256, bases: &BTreeSet<U256>) -> Option<(U256, U256)> {
+    if c.bits() > 32 {
+        return None;
+    }
+    let b = *bases.range(..=c).next_back()?;
+    let off = c.wrapping_sub(b);
+    if off.low_u64() < 16 {
+        Some((b, off))
+    } else {
+        None
+    }
+}
 
 /// How a compiler lays out mapping slots: `keccak(key . slot)` (Solidity) or `keccak(slot . key)`
 /// (Vyper).
@@ -73,6 +124,13 @@ pub struct Names {
     pub args: HashMap<u32, String>,
     /// storage slot (constant) -> name
     pub storage: HashMap<U256, String>,
+    /// First slots of fixed-size storage arrays (`uint[256] owners` occupies `base..base+256`).
+    pub array_bases: BTreeSet<U256>,
+    /// Loads that read a slot's value from before a store printed earlier on the path: printed
+    /// under the temporary that saved that value. Filled by the structurer as it prints.
+    pub stale: RefCell<HashMap<ExprId, String>>,
+    /// Number of temporaries handed out so far (names stay unique across blocks).
+    pub temp_seq: RefCell<u32>,
     /// Sequence numbers renamed to small indices.
     pub seqs: RefCell<HashMap<u32, u32>>,
     /// Phi variables renamed to small indices (`v1`, `v2`, …) in order of first use.
@@ -96,6 +154,13 @@ impl Names {
     /// Temporaries created while rendering the last statement(s); the caller prints them first.
     pub fn take_temps(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.temps.borrow_mut())
+    }
+
+    /// Forget the temporaries of the block just printed: a temporary is declared where it is
+    /// first used, so a later block must not refer to one declared inside another branch.
+    pub fn end_block(&self) {
+        self.temp_of.borrow_mut().clear();
+        self.memo.borrow_mut().clear();
     }
     fn seq(&self, s: u32) -> u32 {
         let mut m = self.seqs.borrow_mut();
@@ -241,6 +306,9 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     if let Some(a) = n.aliases.get(&e) {
         return a.clone();
     }
+    if let Some(a) = n.stale.borrow().get(&e) {
+        return a.clone();
+    }
     if let Some(t) = n.temp_of.borrow().get(&e) {
         return t.clone();
     }
@@ -249,13 +317,94 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     }
     let (s, p) = fmt_inner(e, n);
     if s.len() > TEMP_THRESHOLD && !matches!(expr::node(e), Node::Const(_)) {
-        let name = format!("t{}", n.temp_of.borrow().len() + 1);
+        *n.temp_seq.borrow_mut() += 1;
+        let name = format!("t{}", n.temp_seq.borrow());
         n.temps.borrow_mut().push((name.clone(), s));
         n.temp_of.borrow_mut().insert(e, name.clone());
         return name;
     }
     n.memo.borrow_mut().insert(e, (s.clone(), p));
     paren(s, p, outer)
+}
+
+/// Every expression a statement mentions.
+fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
+    crate::lift::node_exprs(&crate::lift::LNode {
+        id: 0,
+        block: 0,
+        pc: 0,
+        stmts: vec![s.clone()],
+        term: Term::Stop,
+        preds: vec![],
+        succs: vec![],
+        entry_stack: vec![],
+        exit_stack: vec![],
+    })
+}
+
+/// The constant byte range a statement writes to memory, when it is a plain store.
+fn written_range(s: &Stmt) -> Option<(u64, u64)> {
+    match s {
+        Stmt::MStore { off, width, .. } => {
+            let o = expr::as_const(*off)?.as_usize()? as u64;
+            Some((o, o + *width as u64))
+        }
+        Stmt::Copy { dest, len, .. } => {
+            let d = expr::as_const(*dest)?.as_usize()? as u64;
+            let l = expr::as_const(*len)?.as_usize()? as u64;
+            Some((d, d + l))
+        }
+        _ => None,
+    }
+}
+
+/// Could the statement read memory? Anything but a store whose operands are memory-free.
+fn reads_memory(s: &Stmt) -> bool {
+    match s {
+        Stmt::MStore { .. } | Stmt::SStore { .. } | Stmt::Assign { .. } | Stmt::Drop(_) => {
+            stmt_exprs(s)
+                .iter()
+                .any(|e| expr::contains(*e, &|n| matches!(n, Node::MLoad(..))))
+        }
+        Stmt::Copy { kind, .. } => *kind == op::MCOPY,
+        _ => true,
+    }
+}
+
+/// Statements of one block that store to memory and are overwritten by a later store of the
+/// same block before anything could read them, plus `mem[x] = mem[x]` no-ops. The lifted IR is
+/// left as is (the oracle checks it); only the printout drops them.
+pub fn dead_memory_stores(stmts: &[Stmt]) -> std::collections::HashSet<usize> {
+    let mut dead = std::collections::HashSet::new();
+    for (i, s) in stmts.iter().enumerate() {
+        if let Stmt::MStore {
+            off,
+            val,
+            width: 32,
+            ..
+        } = s
+        {
+            if matches!(expr::node(*val), Node::MLoad(a, _) if a == *off) {
+                dead.insert(i);
+                continue;
+            }
+        }
+        let Some((lo, hi)) = written_range(s) else {
+            continue;
+        };
+        for later in &stmts[i + 1..] {
+            if let Some((l2, h2)) = written_range(later) {
+                if l2 <= lo && h2 >= hi {
+                    dead.insert(i);
+                    break;
+                }
+            }
+            if reads_memory(later) {
+                break;
+            }
+        }
+    }
+    dead
 }
 
 /// solc's ABI decoder validators on a calldata word: `x == address(x)` (the word is a clean
@@ -473,6 +622,9 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
         if let Some(name) = n.storage.get(&c) {
             return name.clone();
         }
+        if let Some(s) = hashed_slot(c) {
+            return format!("{}[0]", fmt_slot(expr::konst(s), n, space));
+        }
         return if c.bits() <= 32 {
             format!("{}_{}", prefix, c.to_decimal())
         } else {
@@ -497,6 +649,25 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
         Node::Op(op::ADD, v) => {
             // array element: keccak(slot) + i, or (base) + i for struct fields in mappings
             let (base, idx) = (v[0], v[1]);
+            // A precomputed `keccak256(slot)` on either side: element `idx` of that array.
+            for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                if let Some(s) = expr::as_const(a).and_then(hashed_slot) {
+                    return format!("{}[{}]", fmt_slot(expr::konst(s), n, space), fmt_expr(b, n));
+                }
+            }
+            // `index + small constant`: a fixed-size array laid out from a known base slot.
+            for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                if let (Some(c), true) = (expr::as_const(a), is_plain_index(b)) {
+                    if let Some((root, off)) = fixed_array_base(c, &n.array_bases) {
+                        let idx_s = if off.is_zero() {
+                            fmt_expr(b, n)
+                        } else {
+                            format!("{} + {}", fmt_expr(b, n), off.to_decimal())
+                        };
+                        return format!("{}[{}]", fmt_slot(expr::konst(root), n, space), idx_s);
+                    }
+                }
+            }
             match expr::node(base) {
                 Node::Keccak(words, 0) if words.len() == 1 => {
                     format!("{}[{}]", fmt_slot(words[0], n, space), fmt_expr(idx, n))
@@ -1220,6 +1391,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             key,
             val,
             transient,
+            ..
         } => {
             if !n.fields.is_empty() && !*transient {
                 if let Some((k, off, bits, value)) = packed_write(*key, *val) {
@@ -1642,7 +1814,12 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
         if needs_label.contains(&nid) {
             out.push_str(&format!("{}L{:x}:\n", indent, nd.pc));
         }
-        for s in &nd.stmts {
+        n.end_block();
+        let dead = dead_memory_stores(&nd.stmts);
+        for (i, s) in nd.stmts.iter().enumerate() {
+            if dead.contains(&i) {
+                continue;
+            }
             let txt = fmt_stmt(s, n);
             for (name, def) in n.take_temps() {
                 out.push_str(&format!("{}    uint256 {} = {};\n", indent, name, def));

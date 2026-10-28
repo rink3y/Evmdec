@@ -175,8 +175,15 @@ struct Event {
     /// Program counter of the node that holds the statement (inside the callee when inlined).
     pc: usize,
     /// Entry pc of the internal function whose body holds the statement, when inlined.
-    #[allow(dead_code)]
     callee: Option<usize>,
+    /// Which inlined body the event belongs to: 0 for the function itself, otherwise a number
+    /// unique to one inlining of one helper, so two events with the same `inst` share a graph.
+    inst: usize,
+    /// Node id inside that body (`inner` indexes the helper's own `Lifted` when `inst != 0`).
+    inner: usize,
+    /// The inlining path from the function down to the event: `(inst, callee entry pc, node in
+    /// that body)` per level, the last entry being the event's own body and node.
+    path: Vec<(usize, Option<usize>, usize)>,
     stmt: Option<Stmt>,
     term: Option<Term>,
     /// Inside a loop body.
@@ -191,6 +198,8 @@ struct Ctx<'a> {
     /// Memory an internal function (transitively) writes: constant offsets with lengths, or
     /// `None` when it writes through a pointer.
     callee_writes: RefCell<HashMap<usize, Option<MemWrites>>>,
+    /// Counter handing out `Event::inst` numbers.
+    inst_seq: std::cell::Cell<usize>,
 }
 
 /// Constant-offset memory writes of a unit: `(offset, length)` with `None` for an unknown length.
@@ -538,9 +547,34 @@ fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Ev
         in_loop_outer,
         None,
         None,
+        0,
+        &[],
         &HashMap::new(),
         &mut mem,
     )
+}
+
+/// Can `b` execute after `a` on some path? The two inlining paths are walked together: at the
+/// deepest body both events share, their nodes in that body decide (the same node counts, since
+/// `b` follows `a` in event order; otherwise that body's graph is asked).
+fn ev_reaches(ctx: &Ctx, l: &Lifted, a: &Event, b: &Event) -> bool {
+    for (i, ((ia, ca, na), (ib, _, nb))) in a.path.iter().zip(b.path.iter()).enumerate() {
+        if ia != ib {
+            // Two helpers inlined from the same node of the parent body: event order decides.
+            return true;
+        }
+        if na == nb {
+            continue;
+        }
+        let graph = if i == 0 {
+            Some(l)
+        } else {
+            ca.and_then(|pc| ctx.internals.get(&pc))
+                .and_then(|f| f.lifted.as_ref())
+        };
+        return graph.is_none_or(|g| reaches(g, *na, *nb));
+    }
+    true
 }
 
 /// `subst` maps the helper's `Arg(i)` to the caller's actual values, so inlined statements read
@@ -557,6 +591,8 @@ fn events_of_in(
     in_loop_outer: bool,
     outer_node: Option<usize>,
     callee: Option<usize>,
+    inst: usize,
+    ancestors: &[(usize, Option<usize>, usize)],
     subst: &HashMap<u32, ExprId>,
     mem: &mut lift::MemView,
 ) -> Vec<Event> {
@@ -632,6 +668,11 @@ fn events_of_in(
         let nd = &l.nodes[nid];
         let in_loop = in_loop_outer || loops.contains(&nid);
         let anchor = outer_node.unwrap_or(nid);
+        let path: Vec<(usize, Option<usize>, usize)> = ancestors
+            .iter()
+            .copied()
+            .chain(std::iter::once((inst, callee, nid)))
+            .collect();
         for s in &nd.stmts {
             let s = lift::map_stmt(s, &|e| apply(e, mem));
             if let Stmt::Internal { callee: t, .. } = &s {
@@ -724,10 +765,14 @@ fn events_of_in(
                                 node: anchor,
                                 pc: nd.pc,
                                 callee,
+                                inst,
+                                inner: nid,
+                                path: path.clone(),
                                 stmt: Some(s.clone()),
                                 term: None,
                                 in_loop,
                             });
+                            ctx.inst_seq.set(ctx.inst_seq.get() + 1);
                             out.extend(events_of_in(
                                 ctx,
                                 cl,
@@ -735,6 +780,8 @@ fn events_of_in(
                                 in_loop,
                                 Some(anchor),
                                 Some(*target),
+                                ctx.inst_seq.get(),
+                                &path,
                                 &inner,
                                 mem,
                             ));
@@ -747,6 +794,9 @@ fn events_of_in(
                 node: anchor,
                 pc: nd.pc,
                 callee,
+                inst,
+                inner: nid,
+                path: path.clone(),
                 stmt: Some(s),
                 term: None,
                 in_loop,
@@ -757,6 +807,9 @@ fn events_of_in(
             node: anchor,
             pc: nd.pc,
             callee,
+            inst,
+            inner: nid,
+            path: path.clone(),
             stmt: None,
             term: Some(term),
             in_loop,
@@ -984,6 +1037,7 @@ pub fn analyze(c: &Contract) -> Report {
         version,
         vyper: c.language.starts_with("vyper"),
         callee_writes: Default::default(),
+        inst_seq: std::cell::Cell::new(0),
     };
     let mut findings: Vec<Finding> = Vec::new();
     let mut report = Report::default();
@@ -1226,8 +1280,16 @@ pub fn analyze(c: &Contract) -> Report {
                     // Reentrancy: state write reachable after a non-static external call.
                     if *kind == op::CALL || *kind == op::CALLCODE {
                         let later_write = events[i + 1..].iter().any(|e2| {
-                            matches!(&e2.stmt, Some(Stmt::SStore { .. }))
-                                && (reaches(l, ev.node, e2.node))
+                            let hit = matches!(&e2.stmt, Some(Stmt::SStore { .. }))
+                                && ev_reaches(&ctx, l, ev, e2);
+                            if hit && std::env::var("EVMDEC_DEBUG_REENTRANCY").is_ok() {
+                                eprintln!(
+                                    "[reentrancy] {} call pc={} inst={} inner={} node={} callee={:?} -> store pc={} inst={} inner={} node={} callee={:?}: {}",
+                                    f.name, ev.pc, ev.inst, ev.inner, ev.node, ev.callee, e2.pc, e2.inst, e2.inner, e2.node, e2.callee,
+                                    e2.stmt.as_ref().map(|st| emit::fmt_stmt(st, names)).unwrap_or_default()
+                                );
+                            }
+                            hit
                         });
                         if later_write && !precompile {
                             let hook = selector.is_some_and(|s| CALLBACK_SELECTORS.contains(&s));
@@ -1237,6 +1299,8 @@ pub fn analyze(c: &Contract) -> Report {
                                 (Severity::Low, Confidence::Medium, " The call forwards only a 2300 gas stipend (`transfer`/`send`), which limits what a reentrant callee can do.")
                             } else if hook {
                                 (Severity::High, Confidence::High, " The call is a token transfer with a receiver hook (ERC721/ERC1155/ERC777 `on…Received`/`tokensReceived`), so the recipient is called with the state not yet updated.")
+                            } else if (value_nonzero || user_target) && caller_checked {
+                                (Severity::Medium, Confidence::Medium, " The function is behind a msg.sender check, so the re-entering callee must be, or be controlled by, an authorised account (an owner-chosen payee that is itself an owner, for instance).")
                             } else if value_nonzero || user_target {
                                 (Severity::High, Confidence::Medium, "")
                             } else {
@@ -2144,6 +2208,9 @@ pub fn analyze(c: &Contract) -> Report {
         }
     }
 
+    // ---- authorisation that fails by returning instead of reverting ----
+    silent_guard_findings(&ctx, &mut findings);
+
     // ---- cross-function passes: inferred access policy, attack chains ----
     policy_findings(&facts, &mut findings);
     chain_findings(&facts, &auth, &mut findings);
@@ -2331,6 +2398,102 @@ pub fn analyze(c: &Contract) -> Report {
     report.external_calls = external_calls.into_iter().collect();
     report.summary = summary;
     report
+}
+
+/// From `start`, every path halts normally (return/stop/internal return) without touching
+/// state: no store, log, call, create or selfdestruct. `None` when a path reverts or the walk
+/// runs away.
+fn effect_free_exit(l: &Lifted, start: usize) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 2000 {
+            continue;
+        }
+        let nd = &l.nodes[x];
+        for st in &nd.stmts {
+            if matches!(
+                st,
+                Stmt::SStore { .. }
+                    | Stmt::Log { .. }
+                    | Stmt::Call { .. }
+                    | Stmt::Create { .. }
+                    | Stmt::Internal { .. }
+            ) {
+                return false;
+            }
+        }
+        match &nd.term {
+            Term::Revert { .. } | Term::Invalid | Term::SelfDestruct(_) | Term::Unresolved(_) => {
+                return false
+            }
+            Term::Return { .. } | Term::ReturnDyn { .. } | Term::Stop | Term::InternalReturn(_) => {
+            }
+            _ => stack.extend(nd.succs.iter().copied()),
+        }
+    }
+    true
+}
+
+/// A msg.sender test whose failing side returns normally, with nothing changed, instead of
+/// reverting (`if (!isOwner(msg.sender)) return;`, or a pre-0.4 modifier whose body is simply
+/// skipped). Reported on the function that holds the test; helpers name their external callers.
+fn silent_guard_findings(ctx: &Ctx, findings: &mut Vec<Finding>) {
+    for f in &ctx.c.functions {
+        if f.kind == FnKind::Orphan || f.inlined {
+            continue;
+        }
+        let Some(l) = &f.lifted else { continue };
+        let names = decompile::make_names(
+            f,
+            &ctx.c.storage,
+            MappingLayout::of_language(&ctx.c.language),
+            &ctx.c.string_loaders,
+        );
+        for nd in &l.nodes {
+            let Term::Branch {
+                cond,
+                t: Some(t),
+                f: fnode,
+            } = &nd.term
+            else {
+                continue;
+            };
+            if !is_auth_cond(*cond) {
+                continue;
+            }
+            let (t, fnode) = (*t, *fnode);
+            let silent = match (effect_free_exit(l, t), effect_free_exit(l, fnode)) {
+                (true, false) => Some(t),
+                (false, true) => Some(fnode),
+                _ => None,
+            };
+            let Some(_) = silent else { continue };
+            let callers: Vec<String> = if f.kind == FnKind::Internal {
+                ctx.c
+                    .functions
+                    .iter()
+                    .filter(|g| g.kind != FnKind::Internal && g.kind != FnKind::Orphan)
+                    .filter(|g| transitive_callees(ctx, g).iter().any(|cf| cf.pc == f.pc))
+                    .map(|g| g.name.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let reach = if callers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " The helper guards {}.",
+                    join_names(&callers.iter().map(|c| c.as_str()).collect::<Vec<_>>(), 6)
+                )
+            };
+            push(findings, "silent-auth-failure", "Authorisation failure returns instead of reverting", Severity::Low, Confidence::Medium, Some(f), Some(nd.pc),
+                format!("`{}` tests `{}`; when the test fails it returns normally without changing state instead of reverting.{} A caller cannot tell a rejected call from a successful one by the transaction's status, and ether sent along stays in the contract.", f.name, emit::fmt_cond(*cond, &names), reach),
+                vec![format!("if ({}) …", emit::fmt_cond(*cond, &names))], "Revert (require) when the caller is not authorised.");
+            break;
+        }
+    }
 }
 
 // Same shape as `push`, for findings anchored on a function's facts.

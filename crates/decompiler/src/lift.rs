@@ -40,6 +40,9 @@ pub enum Stmt {
         val: ExprId,
         /// Transient storage (`TSTORE`) rather than persistent storage.
         transient: bool,
+        /// Storage generation before this write: an `SLoad` of the same slot whose generation is
+        /// at most this read the value the write replaces.
+        gen: u32,
     },
     /// Event emission (`LOG0`..`LOG4`).
     Log {
@@ -1858,11 +1861,13 @@ impl<'a> Lifter<'a> {
                         st.storage.retain(|(_, _, t)| *t != transient);
                     }
                     st.storage.push((key, val, transient));
+                    let gen = st.sgen;
                     st.sgen += 1;
                     stmts.push(Stmt::SStore {
                         key,
                         val,
                         transient,
+                        gen,
                     });
                 }
                 op::JUMP => {
@@ -2766,10 +2771,12 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             key,
             val,
             transient,
+            gen,
         } => Stmt::SStore {
             key: f(*key),
             val: f(*val),
             transient: *transient,
+            gen: *gen,
         },
         Stmt::Log {
             off,

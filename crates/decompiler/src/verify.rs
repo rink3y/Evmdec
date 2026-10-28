@@ -618,6 +618,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         key,
                         val,
                         transient: t,
+                        ..
                     } => {
                         let k = ev.eval(*key, &mut memo);
                         let v = ev.eval(*val, &mut memo);

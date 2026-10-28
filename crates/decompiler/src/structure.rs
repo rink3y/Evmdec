@@ -307,6 +307,90 @@ struct Printer<'a> {
     used: Vec<ExprId>,
     /// Boolean facts known on the current path: (condition, value).
     facts: Vec<(ExprId, bool)>,
+    /// Per store statement `(node, index)`: loads of the same slot from before the store that
+    /// are still used afterwards, each with the temporary that keeps the old value.
+    stale_plan: HashMap<(usize, usize), Vec<(ExprId, String)>>,
+}
+
+/// Loads of persistent slot `key` with generation at most `gen` anywhere in `e`.
+fn stale_loads_in(e: ExprId, key: ExprId, gen: u32, out: &mut Vec<ExprId>) {
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 20_000 {
+            continue;
+        }
+        if let Node::SLoad(k, false, g) = expr::node(x) {
+            if k == key && g <= gen && !out.contains(&x) {
+                out.push(x);
+            }
+        }
+        stack.extend(expr::children(x));
+    }
+}
+
+/// For every store to a constant slot, the loads of that slot taken before the store and used
+/// after it (in the rest of the block or anywhere reachable from it). Printing those as the
+/// slot name would read the new value, so each gets a temporary saved just before the store.
+fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(ExprId, String)>> {
+    let mut plan: HashMap<(usize, usize), Vec<(ExprId, String)>> = HashMap::new();
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for nd in &l.nodes {
+        for (i, st) in nd.stmts.iter().enumerate() {
+            let Stmt::SStore {
+                key,
+                transient: false,
+                gen,
+                ..
+            } = st
+            else {
+                continue;
+            };
+            if !expr::is_const(*key) {
+                continue;
+            }
+            // Expressions evaluated after the store: the store's own value is evaluated before
+            // it, so it is excluded, as is everything on the path up to it.
+            let mut after: Vec<ExprId> = Vec::new();
+            let mut probe = nd.clone();
+            probe.stmts = nd.stmts[i + 1..].to_vec();
+            after.extend(crate::lift::node_exprs(&probe));
+            let mut seen = HashSet::new();
+            let mut stack: Vec<usize> = nd.succs.clone();
+            while let Some(x) = stack.pop() {
+                if !seen.insert(x) || seen.len() > 5000 {
+                    continue;
+                }
+                after.extend(crate::lift::node_exprs(&l.nodes[x]));
+                stack.extend(l.nodes[x].succs.iter().copied());
+            }
+            for ((from, _), assigns) in &l.edge_assigns {
+                if *from == nd.id || seen.contains(from) {
+                    after.extend(assigns.iter().map(|(_, v)| *v));
+                }
+            }
+            let mut stale: Vec<ExprId> = Vec::new();
+            for e in after {
+                stale_loads_in(e, *key, *gen, &mut stale);
+            }
+            if stale.is_empty() {
+                continue;
+            }
+            let base = emit::fmt_slot(*key, names, emit::SlotSpace::Persistent);
+            let n = counts.entry(base.clone()).or_insert(0);
+            *n += 1;
+            let tmp = if *n == 1 {
+                format!("prev_{}", base)
+            } else {
+                format!("prev{}_{}", n, base)
+            };
+            plan.insert(
+                (nd.id, i),
+                stale.into_iter().map(|e| (e, tmp.clone())).collect(),
+            );
+        }
+    }
+    plan
 }
 
 const DUP_LIMIT: usize = 6;
@@ -490,7 +574,30 @@ impl<'a> Printer<'a> {
     }
 
     fn stmts(&mut self, n: usize, depth: usize) {
-        for s in &self.l.nodes[n].stmts {
+        self.names.end_block();
+        let dead = emit::dead_memory_stores(&self.l.nodes[n].stmts);
+        for (i, s) in self.l.nodes[n].stmts.iter().enumerate() {
+            if dead.contains(&i) {
+                continue;
+            }
+            // A slot about to be overwritten while an older read of it is still needed: keep
+            // the old value in a temporary and print those reads under it from here on.
+            if let Some(stale) = self.stale_plan.get(&(n, i)) {
+                let (loads, tmp) = (stale.clone(), stale[0].1.clone());
+                let key = match s {
+                    Stmt::SStore { key, .. } => *key,
+                    _ => unreachable!("stale plan entries are stores"),
+                };
+                let def = format!(
+                    "uint256 {} = {};",
+                    tmp,
+                    emit::fmt_slot(key, self.names, emit::SlotSpace::Persistent)
+                );
+                self.line(depth, &def);
+                for (e, t) in loads {
+                    self.names.stale.borrow_mut().insert(e, t);
+                }
+            }
             // A call whose every result prints under an alias (storage-string loader) is implied.
             if let Stmt::Internal { results, .. } = s {
                 if !results.is_empty() && results.iter().all(|r| self.names.aliases.contains_key(r))
@@ -1140,7 +1247,9 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         next_tmp: 1 << 30,
         used,
         facts: Vec::new(),
+        stale_plan: plan_stale_loads(l, names),
     };
+    names.stale.borrow_mut().clear();
     p.go(l.entry, None, base_depth);
     // Emit any reachable nodes that were targeted by gotos but never emitted (irreducible parts).
     let mut pending: Vec<usize> = p
@@ -1184,7 +1293,9 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             gotos: 0,
             active: HashSet::new(),
             facts: Vec::new(),
+            stale_plan: std::mem::take(&mut p.stale_plan),
         };
+        names.stale.borrow_mut().clear();
         p2.go(l.entry, None, base_depth);
         let mut pending: Vec<usize> = p2
             .labels

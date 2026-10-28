@@ -307,3 +307,118 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
         c.strings
     );
 }
+
+/// The original multi-owner wallet (Gav Wood's Wallet.sol as deployed on mainnet, no metadata):
+/// pre-0.4 modifiers reach the rest of a function both by falling through and by a jump with a
+/// return address, the owner list is a fixed-size array, and the pending-operation index is a
+/// dynamic array whose data slot the compiler precomputed.
+#[test]
+fn old_multiowned_wallet_reads_as_source() {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/regress/parity_wallet_v1.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
+    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    let src = &c.source;
+    // Dictionary: the wallet's selectors and events are known.
+    for s in [
+        "function confirm(bytes32 arg0)",
+        "function revoke(bytes32 arg0)",
+        "function changeOwner(address arg0, address arg1)",
+        "function kill(address arg0)",
+        "event ConfirmationNeeded(",
+        "event MultiTransact(",
+    ] {
+        assert!(src.contains(s), "missing {s}");
+    }
+    assert!(
+        !src.contains("unknown signature"),
+        "every selector of the wallet is in the dictionary"
+    );
+    // Storage: `uint[256] m_owners` at slot 2, `bytes32[] m_pendingIndex` at slot 0x104 with
+    // its elements at keccak256(0x104) + i; no variable named after the hash.
+    assert!(
+        src.contains("uint256[] stor_2; // slot 0x2, fixed-size array"),
+        "{src}"
+    );
+    assert!(
+        src.contains("stor_2[stor_258[address(arg0)]]"),
+        "owners[ownerIndex]"
+    );
+    assert!(
+        src.contains("uint256[] stor_260; // slot 0x104"),
+        "pending index array"
+    );
+    assert!(
+        src.contains("stor_260[prev_stor_260]"),
+        "pendingIndex[pending.index]"
+    );
+    assert!(
+        !src.contains("stor_0x4c0be602"),
+        "precomputed hash printed as a variable"
+    );
+    // A slot read before it is incremented keeps its old value under a temporary.
+    assert!(src.contains("uint256 prev_stor_260 = stor_260;"), "{src}");
+    assert!(src.contains("stor_260 = prev_stor_260 + 1;"));
+    assert!(src.contains("require(prev_stor_260 < stor_260);"));
+    assert!(
+        !src.contains("require(stor_260 < stor_260)"),
+        "stale read printed as the slot"
+    );
+    // The scratch loads of the precomputed hash and no-op stores are not printed.
+    assert!(!src.contains("code[4056"), "dead CODECOPY printed");
+    assert!(!src.contains("mem[0x0] = mem[0x0]"), "no-op store printed");
+    // Continuations of modified functions are not printed as separate helpers.
+    for h in [
+        "func_0x7be",
+        "func_0x965",
+        "func_0xa05",
+        "func_0xadb",
+        "func_0xbdd",
+    ] {
+        assert!(
+            !src.contains(&format!("function {h}(")),
+            "{h} printed twice"
+        );
+    }
+    // Every temporary is declared before it is used, in the function that uses it.
+    for body in src.split("\n    function ").skip(1) {
+        let mut declared: Vec<String> = Vec::new();
+        for line in body.lines() {
+            for (i, _) in line.match_indices('t') {
+                let rest = &line[i..];
+                if i > 0 && line.as_bytes()[i - 1].is_ascii_alphanumeric() {
+                    continue;
+                }
+                let name: String = rest
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric())
+                    .collect();
+                if name.len() < 2 || !name[1..].chars().all(|ch| ch.is_ascii_digit()) {
+                    continue;
+                }
+                if line.contains(&format!("uint256 {name} =")) {
+                    declared.push(name);
+                } else {
+                    assert!(
+                        declared.contains(&name),
+                        "{name} used before declaration:\n{line}"
+                    );
+                }
+            }
+        }
+    }
+    // Report: one real reentrancy per path (confirm's delete-after-call), behind the owner
+    // gate, and the silent modifier failure.
+    let r = evmdec::analyze::analyze(&c);
+    let re: Vec<_> = r.findings.iter().filter(|f| f.id == "reentrancy").collect();
+    assert_eq!(
+        re.len(),
+        2,
+        "{:?}",
+        re.iter().map(|f| &f.function).collect::<Vec<_>>()
+    );
+    assert!(re
+        .iter()
+        .all(|f| f.severity == evmdec::analyze::Severity::Medium && f.sites == 1));
+    assert!(r.findings.iter().any(|f| f.id == "silent-auth-failure"));
+}

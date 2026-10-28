@@ -46,13 +46,24 @@ oracle, so the accuracy claim below is measured, not asserted.
   Packed storage slots are split into their fields (`uint112 stor_8_0; uint112 stor_8_14;
   uint32 stor_8_28;` for a Uniswap V2 pair's reserves, `address` + `bool` owner/paused pairs,
   signed fields via `signextend`), and reads and writes of a field print as the field.
-  A dictionary of ~1,250 function, event and error
+  Fixed-size storage arrays (`uint[256] owners` laid out from slot 2, recognised by the bounds
+  check on the index) print as `stor_2[i]`, and a dynamic array whose data slot the compiler
+  precomputed (`keccak256(0x104)` appearing as a constant) prints as `stor_260[i]` rather than
+  as a variable named after the hash. A slot read before it is overwritten and used afterwards
+  (`pending.index = list.length++`) keeps its old value in a `prev_<slot>` temporary instead of
+  printing as the slot twice; memory scratch stores overwritten before anything reads them are
+  not printed; temporaries are declared in the block that uses them; and the continuation of a
+  pre-0.4 modified function, which the compiler reaches both by falling through and by a jump
+  with a return address, is shown once, inline, not again as a helper.
+  A dictionary of ~1,280 function, event and error
   signatures (selectors computed with the built-in keccak, so every entry is correct) names what
   it can; everything else is named by selector.
 * **Security report.** 40+ rules over the lifted IR (not opcode patterns): reentrancy (ETH or
   token hook before a storage write; a guard counts only when a slot is tested before the call,
   set on entry and restored to a constant afterwards, storage or transient; ERC721/1155/777 hook
-  selectors raise confidence), ignored call results, ERC20 `transfer`/`transferFrom` results
+  selectors raise confidence; "written after the call" is decided on the control flow of the
+  helper the call sits in, not on the call site, and a function behind a msg.sender check is
+  reported at medium severity with the exploit condition spelled out), ignored call results, ERC20 `transfer`/`transferFrom` results
   never decoded, arbitrary `call`/`delegatecall` with caller-controlled target and selector,
   run-time-dispatched calls (relayers, cross-chain executors), `transferFrom(from, …)` moving
   someone else's approved tokens on the caller's say-so, decisions trusted to the answers of a
@@ -65,7 +76,8 @@ oracle, so the accuracy claim below is measured, not asserted.
   state-changing functions callable by anyone, storage-bounded loops, calls in loops, `tx.origin`,
   `selfdestruct` (also when it sits in a helper behind a deadline, where the first caller after
   the deadline collects the balance), payout amounts computed with wrapping arithmetic from an
-  unbounded parameter on pre-0.8 compilers, the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked
+  unbounded parameter on pre-0.8 compilers, authorisation checks whose failing side returns
+  normally instead of reverting (pre-0.4 modifiers, `if (!isOwner(msg.sender)) return;`), the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked
   ether, unprotected upgrades,
   proxy detection (EIP-1967 / beacon / ZeppelinOS / EIP-1167 / storage-slot) with on-chain
   implementation resolution, known compiler bugs for the detected solc version. Rules look

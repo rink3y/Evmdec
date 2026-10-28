@@ -59,7 +59,7 @@ header :focus-visible,.tb :focus-visible{outline-color:var(--band-rubric);outlin
 
 /* ink band: header strip and title block */
 header{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:stretch;background:var(--band);color:var(--band-fg);border-bottom:1px solid var(--band-line)}
-.brand{display:flex;align-items:center;padding:0 18px;border-right:1px solid var(--band-line);font:700 20px/1 var(--cond);letter-spacing:.02em;text-transform:lowercase}
+.brand{display:flex;align-items:center;padding:0 18px;border-right:1px solid var(--band-line);font:700 20px/1 var(--cond);letter-spacing:.02em;text-transform:lowercase;color:inherit;text-decoration:none}.brand:hover{color:var(--band-rubric)}
 .query{display:flex;min-width:0;align-items:stretch}
 .query input{flex:1;min-width:0;height:44px;border:0;border-right:1px solid var(--band-line);background:var(--field);color:var(--field-fg);padding:0 14px;font:14px/1.5 var(--mono)}
 .query input::placeholder{color:var(--band-muted);opacity:1}
@@ -178,7 +178,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 </head>
 <body data-state="empty">
 <header>
-  <div class="brand">evmdec</div>
+  <a class="brand" href="/" aria-label="evmdec home">evmdec</a>
   <form class="query" id="form" role="search" aria-label="Decompile a contract">
     <label for="q" class="sr">Contract address or raw bytecode hex</label>
     <input id="q" name="q" type="text" placeholder="Contract address (0x…) or raw bytecode hex" autocomplete="off" spellcheck="false" autofocus>

@@ -349,6 +349,10 @@ function renderFindings(){$('#findings').innerHTML=FINDINGS.length?FINDINGS.map(
 function light(id,block){document.querySelectorAll('.lit').forEach(x=>x.classList.remove('lit'));const el=document.getElementById(id);if(!el)return;el.classList.add('lit');
  if(/^F\d+$/.test(id)){const n=+id.slice(1);document.querySelectorAll('.co[href="#'+id+'"]').forEach(a=>a.closest('li').classList.add('lit'));const b=el.querySelector('button');if(b&&b.getAttribute('aria-expanded')!=='true')b.click();b&&b.focus({preventScroll:true});say('Finding '+n+': '+FINDINGS[n-1].title)}
  if(/^L\d+$/.test(id)){const co=el.querySelector('.co');if(co)co.focus({preventScroll:true});say('Line '+id.slice(1))}
+
+ /* The tab bar (and the scale strip under it) are sticky inside the drawing's scroll box: keep the
+    target clear of them, or a "start" scroll hides the very line that was asked for. */
+ if(/^L\d+$/.test(id)){let h=8;const box=el.closest('main>*');if(box){box.querySelectorAll('.tabs,#scale').forEach(x=>{if(!x.hidden&&getComputedStyle(x).position==='sticky')h+=x.offsetHeight})}el.style.scrollMarginTop=h+'px'}
  el.scrollIntoView({block:block||'center'})}
 /* A helper call jumps to the helper's definition inside the current view (whole contract or the
    chosen function with its helpers); it never widens the view. The definition row gets a way back. */

@@ -116,6 +116,8 @@ main>*{min-width:0;min-height:0;overflow:auto}
 .tabs [role=tab]{flex:none;border:0;background:transparent;padding:10px 16px;border-right:1px solid var(--hair);color:var(--muted);white-space:nowrap;font:600 13px/1.2 var(--cond);letter-spacing:.1em;text-transform:uppercase}
 .tabs [role=tab]:hover{color:var(--fg)}
 .tabs [role=tab][aria-selected="true"]{color:var(--fg);box-shadow:inset 0 -2px 0 var(--rubric)}
+.tabs .dl.done{color:var(--fg)}
+.tabs #copy{margin-left:auto}.tabs #dl{margin-left:0}
 .tabs .dl{flex:none;margin-left:auto;border:0;border-left:1px solid var(--hair);background:transparent;padding:0 16px;white-space:nowrap;font:600 13px/1.2 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--rubric)}
 .scale{display:flex;gap:16px;padding:7px 12px;border-bottom:1px solid var(--hair);font-size:13px;color:var(--muted);flex-wrap:wrap}
 .scale b{color:var(--fg);font-weight:600}
@@ -231,6 +233,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
       <button role="tab" id="tab-storage" aria-controls="panel-storage" aria-selected="false" tabindex="-1">Storage &amp; events</button>
       <button role="tab" id="tab-disasm" aria-controls="panel-disasm" aria-selected="false" tabindex="-1">Disassembly</button>
       <button role="tab" id="tab-json" aria-controls="panel-json" aria-selected="false" tabindex="-1">JSON</button>
+      <button id="copy" class="dl" type="button" aria-live="off">Copy</button>
       <button id="dl" class="dl" type="button">Download .sol</button>
     </div>
     <div class="scale" id="scale" hidden></div>
@@ -252,7 +255,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 'use strict';
 const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let DATA=null,CUR=null,FINDINGS=[],CALLOUTS=new Map(),SRC_LINES=[];
+let DATA=null,CUR=null,FINDINGS=[],CALLOUTS=new Map(),SRC_LINES=[],SHOWN=[];
 const SEV={critical:0,high:1,medium:2,low:3,info:4},SEVL={critical:'Critical',high:'High',medium:'Medium',low:'Low',info:'Info'};
 const root=document.documentElement,status=$('#status');
 function say(t){status.textContent='';setTimeout(()=>{status.textContent=t},30)}
@@ -278,6 +281,15 @@ tabs.forEach(t=>{t.addEventListener('click',()=>selectTab(t));t.addEventListener
 document.querySelectorAll('[data-try]').forEach(b=>b.addEventListener('click',()=>{$('#q').value=b.dataset.try;const sel=$('#chain');if([...sel.options].some(o=>o.value===b.dataset.chain))sel.value=b.dataset.chain;go()}));
 $('#form').addEventListener('submit',e=>{e.preventDefault();go()});
 $('#filter').addEventListener('input',renderFns);
+/* Copy what the drawing shows: the whole contract on F-00, otherwise the chosen function with
+   its helpers (the same lines the code pane displays). */
+function shownText(){if(!DATA)return '';if(CUR==null)return DATA.contract.source;return SHOWN.map(([a,b])=>SRC_LINES.slice(a,b+1).join('\n')).join('\n\n')+'\n'}
+async function copyShown(){const text=shownText();if(!text)return;const btn=$('#copy');let ok=false;
+ try{await navigator.clipboard.writeText(text);ok=true}catch(e){const ta=document.createElement('textarea');ta.value=text;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{ok=document.execCommand('copy')}catch(e2){}ta.remove()}
+ const what=CUR==null?'the whole contract':'the function and its helpers';const n=text.split('\n').length;
+ btn.textContent=ok?'Copied':'Copy failed';btn.classList.toggle('done',ok);say(ok?'Copied '+what+', '+n+' lines':'Copy failed; select the code and copy it by hand');
+ clearTimeout(btn._t);btn._t=setTimeout(()=>{btn.textContent='Copy';btn.classList.remove('done')},1600)}
+$('#copy').addEventListener('click',copyShown);
 $('#dl').addEventListener('click',()=>{if(!DATA)return;const blob=new Blob([DATA.contract.source],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(DATA.contract.address||'contract')+'.sol';a.click();say('Downloaded '+a.download)});
 function fromUrl(){const p=new URLSearchParams(location.search);const a=p.get('address');if(a&&/^0x[0-9a-fA-F]{40}$/.test(a)){$('#q').value=a;const sel=$('#chain'),c=p.get('chain');if(c&&[...sel.options].some(o=>o.value===c))sel.value=c;go()}}
 
@@ -331,7 +343,7 @@ function fnRange(c,pc){const f=c.functions.find(x=>x.pc===pc);if(!f)return null;
 function helpersOf(c,pc){const out=[];const seen=new Set([pc]);const work=[pc];while(work.length){const cur=work.shift();const f=c.functions.find(x=>x.pc===cur);if(!f)continue;(f.calls||[]).forEach(q=>{if(seen.has(q))return;seen.add(q);const g=c.functions.find(x=>x.pc===q);if(g&&!g.inlined){out.push(q);work.push(q)}})}return out}
 function renderCode(){const c=DATA.contract;let ranges=[];let helpers=[];
  if(CUR!=null){const r=fnRange(c,CUR);if(r){ranges.push(r);helpersOf(c,CUR).forEach(q=>{const h=fnRange(c,q);if(h){ranges.push(h);helpers.push(c.functions.find(x=>x.pc===q).name)}})}}
- if(!ranges.length)ranges=[[0,SRC_LINES.length-1]];
+ if(!ranges.length)ranges=[[0,SRC_LINES.length-1]];SHOWN=ranges;
  const block=([from,to])=>{let rows='';for(let i=from;i<=to;i++){const l=SRC_LINES[i];const co=CALLOUTS.get(i);const cls=co?' flagged':'';let bubbles='';if(co)bubbles='<span class="co-cell">'+co.map(n=>'<a class="co" href="#F'+n+'" aria-label="Finding '+n+': '+esc(FINDINGS[n-1].title)+'">'+n+'</a>').join('')+'</span>';const def=/^\s*function (func_0x[0-9a-f]+)\(/.exec(l);rows+='<li id="L'+(i+1)+'" class="ln'+cls+'"'+(def?' data-fn="'+def[1]+'"':'')+'>'+bubbles+'<code>'+(hl(l)||' ')+'</code></li>'}return '<ol class="code" aria-label="Decompiled code, lines '+(from+1)+' to '+(to+1)+'" style="counter-reset:ln '+from+'">'+rows+'</ol>'};
  $('#panel-code').innerHTML=ranges.map(block).join('');
  const range=ranges[0],from=range[0],to=range[1];const f=CUR!=null?c.functions.find(x=>x.pc===CUR):null;const rangeText=ranges.map(([a,b])=>(a+1)+' to '+(b+1)).join(' and ');const scale=$('#scale');scale.hidden=$('#tab-code').getAttribute('aria-selected')!=='true';

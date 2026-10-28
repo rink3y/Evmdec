@@ -93,7 +93,9 @@ oracle, so the accuracy claim below is measured, not asserted.
   unknown selectors through openchain.xyz / 4byte.directory), `analyze`, `verify`, `disasm`,
   `info`, `cfg`; an axum server with a single-page UI laid out as a drawing set: a title block
   (chain, address, compiler, code size, coverage, findings, risk), an indexed function list, the
-  code as the drawing with numbered callouts keyed to the findings beside it, and tabs for the
+  code as the drawing with numbered callouts keyed to the findings beside it (helper calls such
+  as `func_0x29d(...)` link to the helper's definition within the current view, with a way back),
+  and tabs for the
   report, storage and events, disassembly and JSON. Results are linkable
   (`/?chain=mainnet&address=0x…`), the page follows the system colour scheme with a manual
   override, and it meets WCAG 2.2 AA (contrast on both themes, keyboard operation of every

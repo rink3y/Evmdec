@@ -127,6 +127,11 @@ main>*{min-width:0;min-height:0;overflow:auto}
 .code .co-cell{grid-column:2;grid-row:1;display:flex;gap:2px;padding-left:2px;align-self:center}
 .co{flex:none;display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1.5px solid var(--rubric);color:var(--rubric);background:var(--bg);font:600 12px/1 var(--cond);text-decoration:none}
 .co:hover{background:var(--rubric);color:var(--on-rubric)}
+.fnref{color:inherit;text-decoration:underline dotted;text-decoration-color:var(--muted);text-underline-offset:3px;text-decoration-thickness:1px}
+.fnref:hover{color:var(--rubric);text-decoration:underline solid;text-decoration-color:var(--rubric)}
+.code code:focus{outline:none}
+.back{margin-left:1.5em;font:600 11px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;color:var(--rubric);text-decoration:none;border:1px solid var(--rubric);border-radius:2px;padding:2px 6px;vertical-align:middle}
+.back:hover{background:var(--rubric);color:var(--on-rubric)}
 .code li.flagged{background:var(--well);padding:6px 0}
 .code li.flagged::after{content:"";position:absolute;top:0;bottom:0;left:calc(12em - 7px);right:4px;border:6px solid transparent;border-image:var(--cloud) 6 round;pointer-events:none}
 .code li.lit,.finding.lit{background:var(--lit)}
@@ -312,7 +317,7 @@ function prepareFindings(){const f=(DATA.report.findings||[]).slice();f.sort((a,
  $('#details-h').textContent='Details · '+f.length+' finding'+(f.length===1?'':'s')}
 
 function hl(src){const KW=/^(function|contract|if|else|while|return|revert|require|assert|emit|event|error|external|internal|view|pure|payable|returns|mapping|fallback|receive|constructor|break|continue|switch|case|goto|true|false|unchecked|delete|new)$/,TY=/^(address|uint\d*|int\d*|bool|bytes\d*|string)$/;
- return esc(src).replace(/(\/\/[^\n]*)|(&quot;(?:[^\\\n]|\\.)*?&quot;)|\b(0x[0-9a-fA-F]+|\d+)\b|\b([A-Za-z_]\w*)\b/g,(m,cm,st,nu,id)=>{if(cm)return '<span class="cm">'+cm+'</span>';if(st)return '<span class="st">'+st+'</span>';if(nu)return '<span class="nu">'+nu+'</span>';if(KW.test(id))return '<span class="kw">'+id+'</span>';if(TY.test(id))return '<span class="ty">'+id+'</span>';return id}).replace(/(<span class="kw">function<\/span>) ([A-Za-z_]\w*)/g,'$1 <span class="fnname">$2</span>')}
+ return esc(src).replace(/(\/\/[^\n]*)|(&quot;(?:[^\\\n]|\\.)*?&quot;)|\b(0x[0-9a-fA-F]+|\d+)\b|\b([A-Za-z_]\w*)\b/g,(m,cm,st,nu,id)=>{if(cm)return '<span class="cm">'+cm+'</span>';if(st)return '<span class="st">'+st+'</span>';if(nu)return '<span class="nu">'+nu+'</span>';if(KW.test(id))return '<span class="kw">'+id+'</span>';if(TY.test(id))return '<span class="ty">'+id+'</span>';return id}).replace(/(<span class="kw">function<\/span>) ([A-Za-z_]\w*)/g,'$1 <span class="fnname">$2</span>').replace(/(<span class="fnname">)?\b(func_0x[0-9a-f]+)(?=\()/g,(m,def,name)=>def?m:'<a class="fnref" href="#fn-'+name+'" data-fn="'+name+'" aria-label="Go to the definition of '+name+'">'+name+'</a>')}
 
 function renderFns(){if(!DATA)return;const q=$('#filter').value.toLowerCase();const fs=DATA.contract.functions.filter(x=>!x.inlined);let out='<li><button type="button" data-pc="-1" aria-current="'+(CUR==null?'true':'false')+'"><span class="sheet-no">F-00</span><span class="name">Whole contract</span><span class="mut">'+SRC_LINES.length+' lines</span></button></li>',sheet=0,lastKind='';
  fs.forEach(x=>{sheet++;if(x.kind!==lastKind){lastKind=x.kind;const n=fs.filter(y=>y.kind===x.kind).length;out+='<li class="grp" role="presentation">'+esc(x.kind)+' · '+n+'</li>'}
@@ -323,11 +328,11 @@ function renderFns(){if(!DATA)return;const q=$('#filter').value.toLowerCase();co
  $('#fns').innerHTML=out;document.querySelectorAll('#fns button').forEach(b=>b.addEventListener('click',()=>{const pc=+b.dataset.pc;CUR=(pc<0||CUR===pc)?null:pc;renderFns();renderCode();selectTab($('#tab-code'));$('#panel-code').scrollTop=0}))}
 
 function fnRange(c,pc){const f=c.functions.find(x=>x.pc===pc);if(!f)return null;const head=f.kind==='external'?'function '+f.name+'(':f.kind==='fallback'?'fallback()':f.kind==='receive'?'receive()':'function '+f.name+'(';let s=SRC_LINES.findIndex(l=>l.trim().startsWith(head));if(s<0)return null;let e=s;for(let i=s;i<SRC_LINES.length;i++){if(SRC_LINES[i]==='    }'){e=i;break}}if(s>0&&SRC_LINES[s-1].trim().startsWith('//'))s--;return [s,e]}
-function helpersOf(c,pc){const out=[];const seen=new Set([pc]);const work=[pc];while(work.length){const f=c.functions.find(x=>x.pc===work.shift());if(!f)continue;(f.calls||[]).forEach(q=>{if(seen.has(q))return;seen.add(q);const g=c.functions.find(x=>x.pc===q);if(g&&!g.inlined){out.push(q);work.push(q)}})}return out}
+function helpersOf(c,pc){const out=[];const seen=new Set([pc]);const work=[pc];while(work.length){const cur=work.shift();const f=c.functions.find(x=>x.pc===cur);if(!f)continue;(f.calls||[]).forEach(q=>{if(seen.has(q))return;seen.add(q);const g=c.functions.find(x=>x.pc===q);if(g&&!g.inlined){out.push(q);work.push(q)}})}return out}
 function renderCode(){const c=DATA.contract;let ranges=[];let helpers=[];
  if(CUR!=null){const r=fnRange(c,CUR);if(r){ranges.push(r);helpersOf(c,CUR).forEach(q=>{const h=fnRange(c,q);if(h){ranges.push(h);helpers.push(c.functions.find(x=>x.pc===q).name)}})}}
  if(!ranges.length)ranges=[[0,SRC_LINES.length-1]];
- const block=([from,to])=>{let rows='';for(let i=from;i<=to;i++){const l=SRC_LINES[i];const co=CALLOUTS.get(i);const cls=co?' flagged':'';let bubbles='';if(co)bubbles='<span class="co-cell">'+co.map(n=>'<a class="co" href="#F'+n+'" aria-label="Finding '+n+': '+esc(FINDINGS[n-1].title)+'">'+n+'</a>').join('')+'</span>';rows+='<li id="L'+(i+1)+'" class="ln'+cls+'">'+bubbles+'<code>'+(hl(l)||' ')+'</code></li>'}return '<ol class="code" aria-label="Decompiled code, lines '+(from+1)+' to '+(to+1)+'" style="counter-reset:ln '+from+'">'+rows+'</ol>'};
+ const block=([from,to])=>{let rows='';for(let i=from;i<=to;i++){const l=SRC_LINES[i];const co=CALLOUTS.get(i);const cls=co?' flagged':'';let bubbles='';if(co)bubbles='<span class="co-cell">'+co.map(n=>'<a class="co" href="#F'+n+'" aria-label="Finding '+n+': '+esc(FINDINGS[n-1].title)+'">'+n+'</a>').join('')+'</span>';const def=/^\s*function (func_0x[0-9a-f]+)\(/.exec(l);rows+='<li id="L'+(i+1)+'" class="ln'+cls+'"'+(def?' data-fn="'+def[1]+'"':'')+'>'+bubbles+'<code>'+(hl(l)||' ')+'</code></li>'}return '<ol class="code" aria-label="Decompiled code, lines '+(from+1)+' to '+(to+1)+'" style="counter-reset:ln '+from+'">'+rows+'</ol>'};
  $('#panel-code').innerHTML=ranges.map(block).join('');
  const range=ranges[0],from=range[0],to=range[1];const f=CUR!=null?c.functions.find(x=>x.pc===CUR):null;const rangeText=ranges.map(([a,b])=>(a+1)+' to '+(b+1)).join(' and ');const scale=$('#scale');scale.hidden=$('#tab-code').getAttribute('aria-selected')!=='true';
  scale.innerHTML='<span>'+(f?'Showing <b>'+esc(f.name)+'</b>'+(helpers.length?' and its helper'+(helpers.length>1?'s ':' ')+helpers.map(h=>'<b>'+esc(h)+'</b>').join(', '):'')+' (lines '+rangeText+' of '+SRC_LINES.length+')':'Showing the <b>whole contract</b>, '+SRC_LINES.length+' lines')+'</span><span><b>'+CALLOUTS.size+'</b> flagged line'+(CALLOUTS.size===1?'':'s')+'</span><span>Callouts key to the details at right</span>';}
@@ -341,11 +346,20 @@ function renderFindings(){$('#findings').innerHTML=FINDINGS.length?FINDINGS.map(
  document.querySelectorAll('.finding>button').forEach(b=>b.addEventListener('click',()=>{const on=b.getAttribute('aria-expanded')!=='true';b.setAttribute('aria-expanded',on?'true':'false');document.getElementById(b.getAttribute('aria-controls')).hidden=!on}))}
 
 /* a chosen callout or line stays lit until another is chosen */
-function light(id){document.querySelectorAll('.lit').forEach(x=>x.classList.remove('lit'));const el=document.getElementById(id);if(!el)return;el.classList.add('lit');
+function light(id,block){document.querySelectorAll('.lit').forEach(x=>x.classList.remove('lit'));const el=document.getElementById(id);if(!el)return;el.classList.add('lit');
  if(/^F\d+$/.test(id)){const n=+id.slice(1);document.querySelectorAll('.co[href="#'+id+'"]').forEach(a=>a.closest('li').classList.add('lit'));const b=el.querySelector('button');if(b&&b.getAttribute('aria-expanded')!=='true')b.click();b&&b.focus({preventScroll:true});say('Finding '+n+': '+FINDINGS[n-1].title)}
  if(/^L\d+$/.test(id)){const co=el.querySelector('.co');if(co)co.focus({preventScroll:true});say('Line '+id.slice(1))}
- el.scrollIntoView({block:'center'})}
-document.addEventListener('click',e=>{const a=e.target.closest('a[href^="#"]');if(!a)return;const id=a.getAttribute('href').slice(1);if(/^(F|L)\d+$/.test(id)){e.preventDefault();if(/^L/.test(id)&&CUR!=null&&!document.getElementById(id)){CUR=null;renderFns();renderCode()}light(id)}});
+ el.scrollIntoView({block:block||'center'})}
+/* A helper call jumps to the helper's definition inside the current view (whole contract or the
+   chosen function with its helpers); it never widens the view. The definition row gets a way back. */
+function gotoHelper(a){const name=a.dataset.fn;const target=document.querySelector('#panel-code li.ln[data-fn="'+name+'"]');
+ if(!target){say(name+' is not part of this view');return}
+ const from=a.closest('li.ln');document.querySelectorAll('#panel-code .back').forEach(b=>b.remove());
+ if(from){const n=from.id.slice(1);history.replaceState({line:from.id},'',location.search+'#'+from.id);history.pushState({line:target.id},'','#'+target.id);target.querySelector('code').insertAdjacentHTML('beforeend','  <a class="back" href="#'+from.id+'">\u21a9 back to line '+n+'</a>')}
+ light(target.id,'start');const code=target.querySelector('code');code.setAttribute('tabindex','-1');code.focus({preventScroll:true});say('Definition of '+name+' at line '+target.id.slice(1))}
+window.addEventListener('popstate',e=>{if(e.state&&e.state.line&&document.getElementById(e.state.line)){document.querySelectorAll('#panel-code .back').forEach(b=>b.remove());light(e.state.line)}});
+document.addEventListener('click',e=>{const ref=e.target.closest('a.fnref');if(ref){e.preventDefault();gotoHelper(ref);return}
+ const a=e.target.closest('a[href^="#"]');if(!a)return;const id=a.getAttribute('href').slice(1);if(/^(F|L)\d+$/.test(id)){e.preventDefault();if(a.classList.contains('back'))a.remove();if(/^L/.test(id)&&CUR!=null&&!document.getElementById(id)){CUR=null;renderFns();renderCode()}light(id)}});
 
 function storagePanel(c){const rows=c.storage.flatMap(s=>(s.fields&&s.fields.length)?s.fields.map(f=>'<tr><td>'+s.slot+' bytes '+f.offset+'..'+(f.offset+Math.ceil(f.bits/8))+'</td><td>'+esc(f.name)+'</td><td>'+esc(f.ty)+'</td><td>'+s.reads+'</td><td>'+s.writes+'</td></tr>'):['<tr><td>'+s.slot+'</td><td>'+esc(s.name)+'</td><td>'+esc(s.ty)+'</td><td>'+s.reads+'</td><td>'+s.writes+'</td></tr>']).join('');
  const list=(a,empty)=>a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>'+empty+'</p>';

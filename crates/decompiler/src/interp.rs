@@ -2,38 +2,49 @@
 //! External effects (calls, creates, environment, other accounts) are provided by a deterministic
 //! pseudo-random host so that both sides of a comparison see the same world.
 
-use crate::keccak::keccak256;
+use crate::keccak;
 use crate::opcode as op;
 use crate::u256::U256;
 use std::collections::HashMap;
 
 /// Deterministic PRNG (xorshift64*).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Rng(pub u64);
 impl Rng {
+    /// Creates a generator from `seed`; the state is forced odd so it is never the all-zero
+    /// fixed point of xorshift.
     pub fn new(seed: u64) -> Rng {
-        Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1)
+        Rng(seed.wrapping_mul(0x9e3779b97f4a7c15) | 1)
     }
-    pub fn next(&mut self) -> u64 {
+    /// Advances the state and returns the next 64-bit output.
+    pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
         x ^= x >> 27;
         self.0 = x;
-        x.wrapping_mul(0x2545F4914F6CDD1D)
+        x.wrapping_mul(0x2545f4914f6cdd1d)
     }
+    /// A value in `0..n` (`0` when `n == 0`).
     pub fn below(&mut self, n: u64) -> u64 {
         if n == 0 {
             0
         } else {
-            self.next() % n
+            self.next_u64() % n
         }
     }
+    /// A uniformly random 256-bit word.
     pub fn word(&mut self) -> U256 {
-        U256([self.next(), self.next(), self.next(), self.next()])
+        U256([
+            self.next_u64(),
+            self.next_u64(),
+            self.next_u64(),
+            self.next_u64(),
+        ])
     }
+    /// `n` random bytes.
     pub fn bytes(&mut self, n: usize) -> Vec<u8> {
-        (0..n).map(|_| self.next() as u8).collect()
+        (0..n).map(|_| self.next_u64() as u8).collect()
     }
     /// A stack value drawn from a distribution that exercises offsets, small ints, addresses and full words.
     pub fn value(&mut self) -> U256 {
@@ -42,7 +53,7 @@ impl Rng {
             3..=5 => U256::from_u64(0x80 + 32 * self.below(64)),
             6 => U256::from_u64(0x1000 + self.below(0x4000)),
             7 => U256::from_be_bytes(&self.bytes(20)),
-            8 => U256::from_u64(self.next()),
+            8 => U256::from_u64(self.next_u64()),
             9 => U256::MAX.wrapping_sub(U256::from_u64(self.below(64))),
             _ => self.word(),
         }
@@ -50,37 +61,60 @@ impl Rng {
 }
 
 fn h(data: &[u8]) -> U256 {
-    U256::from_be_bytes(&keccak256(data))
+    U256::from_be_bytes(&keccak::keccak256(data))
 }
 
 /// The world outside the frame: environment values and deterministic external effects.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Host {
+    /// Address of the executing account (`ADDRESS`).
     pub address: U256,
+    /// Immediate caller of the frame (`CALLER`).
     pub caller: U256,
+    /// Transaction sender (`ORIGIN`).
     pub origin: U256,
+    /// Value sent with the call (`CALLVALUE`).
     pub callvalue: U256,
+    /// Input data of the frame (`CALLDATALOAD`, `CALLDATASIZE`, `CALLDATACOPY`).
     pub calldata: Vec<u8>,
+    /// Gas price of the transaction (`GASPRICE`).
     pub gasprice: U256,
+    /// Block beneficiary (`COINBASE`).
     pub coinbase: U256,
+    /// Block timestamp (`TIMESTAMP`).
     pub timestamp: U256,
+    /// Block number (`NUMBER`); also bounds the range `blockhash` answers for.
     pub number: U256,
+    /// Beacon chain randomness (`PREVRANDAO`).
     pub prevrandao: U256,
+    /// Block gas limit (`GASLIMIT`).
     pub gaslimit: U256,
+    /// Chain identifier (`CHAINID`).
     pub chainid: U256,
+    /// Balance of the executing account (`SELFBALANCE`).
     pub selfbalance: U256,
+    /// Block base fee (`BASEFEE`).
     pub basefee: U256,
+    /// Blob base fee (`BLOBBASEFEE`).
     pub blobbasefee: U256,
+    /// Seed from which every external effect (balances, code, storage, call and create results)
+    /// is derived, so two machines sharing a host observe the same world.
     pub seed: u64,
 }
 
 impl Host {
+    /// Draws a plausible environment from `rng`: 20-byte addresses, up to 260 bytes of calldata,
+    /// recent-looking block values and a fresh effect `seed`.
     pub fn random(rng: &mut Rng) -> Host {
         Host {
             address: U256::from_be_bytes(&rng.bytes(20)),
             caller: U256::from_be_bytes(&rng.bytes(20)),
             origin: U256::from_be_bytes(&rng.bytes(20)),
-            callvalue: if rng.below(2) == 0 { U256::ZERO } else { U256::from_u64(rng.next()) },
+            callvalue: if rng.below(2) == 0 {
+                U256::ZERO
+            } else {
+                U256::from_u64(rng.next_u64())
+            },
             calldata: {
                 let n = rng.below(260) as usize;
                 rng.bytes(n)
@@ -92,32 +126,48 @@ impl Host {
             prevrandao: rng.word(),
             gaslimit: U256::from_u64(30_000_000),
             chainid: U256::from_u64(1 + rng.below(5)),
-            selfbalance: U256::from_u64(rng.next()),
+            selfbalance: U256::from_u64(rng.next_u64()),
             basefee: U256::from_u64(rng.below(1 << 36)),
             blobbasefee: U256::from_u64(rng.below(1 << 20)),
-            seed: rng.next(),
+            seed: rng.next_u64(),
         }
     }
+    /// Balance of account `a` (`BALANCE`): seed-derived, limited to 64 bits.
     pub fn balance(&self, a: U256) -> U256 {
-        h(&[&self.seed.to_be_bytes()[..], b"bal", &a.to_be_bytes()].concat()) & U256::from_u64(u64::MAX)
+        h(&[&self.seed.to_be_bytes()[..], b"bal", &a.to_be_bytes()].concat())
+            & U256::from_u64(u64::MAX)
     }
+    /// Code size of account `a` (`EXTCODESIZE`): seed-derived, below 300 bytes.
     pub fn extcodesize(&self, a: U256) -> U256 {
-        U256::from_u64(h(&[&self.seed.to_be_bytes()[..], b"size", &a.to_be_bytes()].concat()).low_u64() % 300)
+        U256::from_u64(
+            h(&[&self.seed.to_be_bytes()[..], b"size", &a.to_be_bytes()].concat()).low_u64() % 300,
+        )
     }
+    /// Code hash of account `a` (`EXTCODEHASH`): seed-derived, not the hash of `extcode`.
     pub fn extcodehash(&self, a: U256) -> U256 {
         h(&[&self.seed.to_be_bytes()[..], b"hash", &a.to_be_bytes()].concat())
     }
+    /// Code of account `a` (`EXTCODECOPY`): `extcodesize(a)` seed-derived bytes.
     pub fn extcode(&self, a: U256) -> Vec<u8> {
         let n = self.extcodesize(a).low_u64() as usize;
         let mut v = Vec::new();
         let mut i = 0u64;
         while v.len() < n {
-            v.extend_from_slice(&keccak256(&[&self.seed.to_be_bytes()[..], b"code", &a.to_be_bytes(), &i.to_be_bytes()].concat()));
+            v.extend_from_slice(&keccak::keccak256(
+                &[
+                    &self.seed.to_be_bytes()[..],
+                    b"code",
+                    &a.to_be_bytes(),
+                    &i.to_be_bytes(),
+                ]
+                .concat(),
+            ));
             i += 1;
         }
         v.truncate(n);
         v
     }
+    /// Hash of block `n` (`BLOCKHASH`): zero unless `n` is one of the 256 blocks before `number`.
     pub fn blockhash(&self, n: U256) -> U256 {
         if n >= self.number || self.number.wrapping_sub(n) > U256::from_u64(256) {
             U256::ZERO
@@ -125,6 +175,7 @@ impl Host {
             h(&[&self.seed.to_be_bytes()[..], b"bh", &n.to_be_bytes()].concat())
         }
     }
+    /// Versioned hash of blob `i` (`BLOBHASH`): zero for indices of 3 and above.
     pub fn blobhash(&self, i: U256) -> U256 {
         if i >= U256::from_u64(3) {
             U256::ZERO
@@ -135,7 +186,7 @@ impl Host {
     /// Initial storage value of a key (random but deterministic).
     pub fn storage(&self, k: U256) -> U256 {
         let r = h(&[&self.seed.to_be_bytes()[..], b"stor", &k.to_be_bytes()].concat());
-        if r.low_u64() % 3 == 0 {
+        if r.low_u64().is_multiple_of(3) {
             U256::ZERO
         } else {
             r
@@ -143,56 +194,87 @@ impl Host {
     }
     /// Outcome of the i-th external call: (success, return data).
     pub fn call_result(&self, i: usize) -> (bool, Vec<u8>) {
-        let r = keccak256(&[&self.seed.to_be_bytes()[..], b"call", &(i as u64).to_be_bytes()].concat());
-        let success = r[0] % 4 != 0;
+        let r = keccak::keccak256(
+            &[
+                &self.seed.to_be_bytes()[..],
+                b"call",
+                &(i as u64).to_be_bytes(),
+            ]
+            .concat(),
+        );
+        let success = !r[0].is_multiple_of(4);
         let n = (r[1] as usize) % 97;
         let mut data = Vec::new();
         let mut j = 0u64;
         while data.len() < n {
-            data.extend_from_slice(&keccak256(&[&r[..], &j.to_be_bytes()].concat()));
+            data.extend_from_slice(&keccak::keccak256(&[&r[..], &j.to_be_bytes()].concat()));
             j += 1;
         }
         data.truncate(n);
         (success, data)
     }
+    /// Address returned by the i-th `CREATE`/`CREATE2`; zero (failure) for roughly one in five.
     pub fn create_result(&self, i: usize) -> U256 {
-        let r = h(&[&self.seed.to_be_bytes()[..], b"create", &(i as u64).to_be_bytes()].concat());
-        if r.low_u64() % 5 == 0 {
+        let r = h(&[
+            &self.seed.to_be_bytes()[..],
+            b"create",
+            &(i as u64).to_be_bytes(),
+        ]
+        .concat());
+        if r.low_u64().is_multiple_of(5) {
             U256::ZERO
         } else {
             r & crate::expr::mask_bits(160)
         }
     }
+    /// Gas available when the frame starts: between one and two million, seed-derived.
     pub fn initial_gas(&self) -> u64 {
         1_000_000 + (self.seed % 1_000_000)
     }
 }
 
+/// Operands of one external call, recorded so both sides of a comparison can be checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallRecord {
+    /// The opcode: `CALL`, `CALLCODE`, `DELEGATECALL` or `STATICCALL`.
     pub kind: u8,
+    /// Gas operand.
     pub gas: U256,
+    /// Callee address.
     pub addr: U256,
+    /// Value operand (zero for `DELEGATECALL` and `STATICCALL`, which have none).
     pub value: U256,
+    /// Input bytes read from memory.
     pub input: Vec<u8>,
+    /// Memory offset the return data is written to.
     pub out_off: U256,
+    /// Maximum number of return-data bytes written to memory.
     pub out_len: U256,
 }
 
+/// Operands of one contract creation, recorded so both sides of a comparison can be checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateRecord {
+    /// The opcode: `CREATE` or `CREATE2`.
     pub kind: u8,
+    /// Value endowed to the new account.
     pub value: U256,
+    /// Init code read from memory.
     pub init: Vec<u8>,
+    /// Salt operand; present only for `CREATE2`.
     pub salt: Option<U256>,
 }
 
+/// One emitted log (`LOG0`..`LOG4`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {
+    /// Topics in operand order (zero to four).
     pub topics: Vec<U256>,
+    /// Payload read from memory.
     pub data: Vec<u8>,
 }
 
+/// How a block's execution ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Block ended with JUMP to this target value.
@@ -201,42 +283,80 @@ pub enum Outcome {
     JumpI(U256, U256),
     /// Fell through to the next block.
     Fallthrough,
+    /// `STOP`.
     Stop,
+    /// `RETURN` with the returned bytes.
     Return(Vec<u8>),
+    /// `REVERT` with the revert data.
     Revert(Vec<u8>),
+    /// `SELFDESTRUCT` with the beneficiary address.
     SelfDestruct(U256),
+    /// `INVALID` or an undefined opcode.
     Invalid,
     /// Exceptional halt inside the block (stack underflow/overflow, bad opcode).
     Exception(String),
 }
 
-#[derive(Clone)]
+/// Execution state of one frame: the EVM machine state plus a record of every external effect.
+#[derive(Clone, Debug)]
 pub struct Machine<'a> {
+    /// The bytecode being executed.
     pub code: &'a [u8],
+    /// Environment and external effects.
     pub host: &'a Host,
+    /// Operand stack, bottom first.
     pub stack: Vec<U256>,
+    /// Memory, always a whole number of 32-byte words.
     pub memory: Vec<u8>,
     /// Storage overrides (reads fall back to `host.storage`).
     pub storage: HashMap<U256, U256>,
+    /// Transient storage (`TLOAD`/`TSTORE`); unset keys read as zero.
     pub transient: HashMap<U256, U256>,
+    /// Return data of the last call or create (`RETURNDATASIZE`/`RETURNDATACOPY`).
     pub returndata: Vec<u8>,
+    /// Remaining gas, decremented by each instruction's static cost.
     pub gas: u64,
+    /// Logs emitted so far, in order.
     pub logs: Vec<LogRecord>,
+    /// External calls made so far, in order; the index selects `Host::call_result`.
     pub calls: Vec<CallRecord>,
+    /// Creations made so far, in order; the index selects `Host::create_result`.
     pub creates: Vec<CreateRecord>,
     /// Values observed by GAS and MSIZE, in order (the lifter treats them as opaque).
     pub gas_obs: Vec<U256>,
+    /// Values observed by `MSIZE`, in order.
     pub msize_obs: Vec<U256>,
+    /// Offset of the next instruction to execute.
     pub pc: usize,
 }
 
 impl<'a> Machine<'a> {
+    /// A machine at offset 0 with empty stack, memory and effects, and the host's initial gas.
     pub fn new(code: &'a [u8], host: &'a Host) -> Machine<'a> {
-        Machine { code, host, stack: Vec::new(), memory: Vec::new(), storage: HashMap::new(), transient: HashMap::new(), returndata: Vec::new(), gas: host.initial_gas(), logs: vec![], calls: vec![], creates: vec![], gas_obs: vec![], msize_obs: vec![], pc: 0 }
+        Machine {
+            code,
+            host,
+            stack: Vec::new(),
+            memory: Vec::new(),
+            storage: HashMap::new(),
+            transient: HashMap::new(),
+            returndata: Vec::new(),
+            gas: host.initial_gas(),
+            logs: vec![],
+            calls: vec![],
+            creates: vec![],
+            gas_obs: vec![],
+            msize_obs: vec![],
+            pc: 0,
+        }
     }
 
+    /// Current value of storage key `k`: a write made in this frame, else the host's initial value.
     pub fn sload(&self, k: U256) -> U256 {
-        self.storage.get(&k).copied().unwrap_or_else(|| self.host.storage(k))
+        self.storage
+            .get(&k)
+            .copied()
+            .unwrap_or_else(|| self.host.storage(k))
     }
 
     const MEM_LIMIT: usize = 1 << 26;
@@ -248,39 +368,52 @@ impl<'a> Machine<'a> {
         if end > Self::MEM_LIMIT {
             return Err("memory offset too large".into());
         }
-        let rounded = (end + 31) / 32 * 32;
+        let rounded = end.div_ceil(32) * 32;
         if rounded > self.memory.len() {
             self.memory.resize(rounded, 0);
         }
         Ok(())
     }
+    /// Reads `len` bytes at `off`, expanding memory first; fails when the range exceeds the
+    /// memory limit.
     pub fn mread(&mut self, off: U256, len: usize) -> Result<Vec<u8>, String> {
         if len == 0 {
             return Ok(vec![]);
         }
-        let o = off.as_usize().filter(|o| *o < Self::MEM_LIMIT).ok_or("memory offset too large")?;
+        let o = off
+            .as_usize()
+            .filter(|o| *o < Self::MEM_LIMIT)
+            .ok_or("memory offset too large")?;
         self.expand(o, len)?;
         Ok(self.memory[o..o + len].to_vec())
     }
+    /// Writes `data` at `off`, expanding memory first; fails when the range exceeds the memory
+    /// limit.
     pub fn mwrite(&mut self, off: U256, data: &[u8]) -> Result<(), String> {
         if data.is_empty() {
             return Ok(());
         }
-        let o = off.as_usize().filter(|o| *o < Self::MEM_LIMIT).ok_or("memory offset too large")?;
+        let o = off
+            .as_usize()
+            .filter(|o| *o < Self::MEM_LIMIT)
+            .ok_or("memory offset too large")?;
         self.expand(o, data.len())?;
         self.memory[o..o + data.len()].copy_from_slice(data);
         Ok(())
     }
     fn copy_in(&mut self, dest: U256, src: U256, len: U256, source: &[u8]) -> Result<(), String> {
-        let n = len.as_usize().filter(|n| *n < (1 << 26)).ok_or("copy length too large")?;
+        let n = len
+            .as_usize()
+            .filter(|n| *n < (1 << 26))
+            .ok_or("copy length too large")?;
         if n == 0 {
             return Ok(());
         }
         let mut buf = vec![0u8; n];
         if let Some(s) = src.as_usize() {
-            for i in 0..n {
+            for (i, out) in buf.iter_mut().enumerate() {
                 if let Some(b) = source.get(s.saturating_add(i)) {
-                    buf[i] = *b;
+                    *out = *b;
                 }
             }
         }
@@ -288,7 +421,9 @@ impl<'a> Machine<'a> {
     }
 
     fn pop(&mut self) -> Result<U256, String> {
-        self.stack.pop().ok_or_else(|| "stack underflow".to_string())
+        self.stack
+            .pop()
+            .ok_or_else(|| "stack underflow".to_string())
     }
     fn push(&mut self, v: U256) -> Result<(), String> {
         if self.stack.len() >= 1024 {
@@ -315,7 +450,9 @@ impl<'a> Machine<'a> {
     pub fn step(&mut self) -> Result<Option<Outcome>, String> {
         let o = self.code[self.pc];
         let info = op::info(o);
-        self.gas = self.gas.saturating_sub(info.map(|i| i.gas as u64).unwrap_or(0));
+        self.gas = self
+            .gas
+            .saturating_sub(info.map(|i| i.gas as u64).unwrap_or(0));
         let mut next = self.pc + 1;
         macro_rules! bin {
             ($f:expr) => {{
@@ -329,9 +466,9 @@ impl<'a> Machine<'a> {
             op::ADD => bin!(|a: U256, b: U256| a.wrapping_add(b)),
             op::MUL => bin!(|a: U256, b: U256| a.wrapping_mul(b)),
             op::SUB => bin!(|a: U256, b: U256| a.wrapping_sub(b)),
-            op::DIV => bin!(|a: U256, b: U256| a.div(b)),
+            op::DIV => bin!(|a: U256, b: U256| a / b),
             op::SDIV => bin!(|a: U256, b: U256| a.sdiv(b)),
-            op::MOD => bin!(|a: U256, b: U256| a.rem(b)),
+            op::MOD => bin!(|a: U256, b: U256| a % b),
             op::SMOD => bin!(|a: U256, b: U256| a.smod(b)),
             op::ADDMOD => {
                 let a = self.pop()?;
@@ -350,7 +487,9 @@ impl<'a> Machine<'a> {
             op::LT => bin!(|a: U256, b: U256| U256::from(a < b)),
             op::GT => bin!(|a: U256, b: U256| U256::from(a > b)),
             op::SLT => bin!(|a: U256, b: U256| U256::from(a.scmp(&b) == std::cmp::Ordering::Less)),
-            op::SGT => bin!(|a: U256, b: U256| U256::from(a.scmp(&b) == std::cmp::Ordering::Greater)),
+            op::SGT => {
+                bin!(|a: U256, b: U256| U256::from(a.scmp(&b) == std::cmp::Ordering::Greater))
+            }
             op::EQ => bin!(|a: U256, b: U256| U256::from(a == b)),
             op::ISZERO => {
                 let a = self.pop()?;
@@ -364,20 +503,43 @@ impl<'a> Machine<'a> {
                 self.push(!a)?;
             }
             op::BYTE => bin!(|a: U256, b: U256| U256::byte(a, b)),
-            op::SHL => bin!(|a: U256, b: U256| if a >= U256::from_u64(256) { U256::ZERO } else { b.shl(a.low_u64() as u32) }),
-            op::SHR => bin!(|a: U256, b: U256| if a >= U256::from_u64(256) { U256::ZERO } else { b.shr(a.low_u64() as u32) }),
-            op::SAR => bin!(|a: U256, b: U256| if a >= U256::from_u64(256) { if b.is_negative() { U256::MAX } else { U256::ZERO } } else { b.sar(a.low_u64() as u32) }),
+            op::SHL => bin!(|a: U256, b: U256| if a >= U256::from_u64(256) {
+                U256::ZERO
+            } else {
+                b << a.low_u64() as u32
+            }),
+            op::SHR => bin!(|a: U256, b: U256| if a >= U256::from_u64(256) {
+                U256::ZERO
+            } else {
+                b >> a.low_u64() as u32
+            }),
+            op::SAR => bin!(|a: U256, b: U256| if a >= U256::from_u64(256) {
+                if b.is_negative() {
+                    U256::MAX
+                } else {
+                    U256::ZERO
+                }
+            } else {
+                b.sar(a.low_u64() as u32)
+            }),
             op::KECCAK256 => {
                 let off = self.pop()?;
                 let len = self.pop()?;
-                let n = len.as_usize().filter(|n| *n < (1 << 24)).ok_or("keccak length too large")?;
+                let n = len
+                    .as_usize()
+                    .filter(|n| *n < (1 << 24))
+                    .ok_or("keccak length too large")?;
                 let data = self.mread(off, n)?;
-                self.push(U256::from_be_bytes(&keccak256(&data)))?;
+                self.push(U256::from_be_bytes(&keccak::keccak256(&data)))?;
             }
             op::ADDRESS => self.push(self.host.address)?,
             op::BALANCE => {
                 let a = self.pop()?;
-                let v = if a == self.host.address { self.host.selfbalance } else { self.host.balance(a) };
+                let v = if a == self.host.address {
+                    self.host.selfbalance
+                } else {
+                    self.host.balance(a)
+                };
                 self.push(v)?;
             }
             op::ORIGIN => self.push(self.host.origin)?,
@@ -387,9 +549,9 @@ impl<'a> Machine<'a> {
                 let off = self.pop()?;
                 let mut buf = [0u8; 32];
                 if let Some(o) = off.as_usize() {
-                    for i in 0..32 {
+                    for (i, out) in buf.iter_mut().enumerate() {
                         if let Some(b) = self.host.calldata.get(o.saturating_add(i)) {
-                            buf[i] = *b;
+                            *out = *b;
                         }
                     }
                 }
@@ -414,7 +576,11 @@ impl<'a> Machine<'a> {
             op::GASPRICE => self.push(self.host.gasprice)?,
             op::EXTCODESIZE => {
                 let a = self.pop()?;
-                let v = if a == self.host.address { U256::from(self.code.len()) } else { self.host.extcodesize(a) };
+                let v = if a == self.host.address {
+                    U256::from(self.code.len())
+                } else {
+                    self.host.extcodesize(a)
+                };
                 self.push(v)?;
             }
             op::EXTCODECOPY => {
@@ -422,7 +588,11 @@ impl<'a> Machine<'a> {
                 let d = self.pop()?;
                 let s = self.pop()?;
                 let l = self.pop()?;
-                let src = if a == self.host.address { self.code.to_vec() } else { self.host.extcode(a) };
+                let src = if a == self.host.address {
+                    self.code.to_vec()
+                } else {
+                    self.host.extcode(a)
+                };
                 self.copy_in(d, s, l, &src)?;
             }
             op::RETURNDATASIZE => self.push(U256::from(self.returndata.len()))?,
@@ -430,8 +600,10 @@ impl<'a> Machine<'a> {
                 let d = self.pop()?;
                 let s = self.pop()?;
                 let l = self.pop()?;
-                let end = s.as_usize().and_then(|s| l.as_usize().map(|l| s.saturating_add(l)));
-                if end.map_or(true, |e| e > self.returndata.len()) && !l.is_zero() {
+                let end = s
+                    .as_usize()
+                    .and_then(|s| l.as_usize().map(|l| s.saturating_add(l)));
+                if end.is_none_or(|e| e > self.returndata.len()) && !l.is_zero() {
                     return Err("returndata out of bounds".into());
                 }
                 let src = self.returndata.clone();
@@ -521,7 +693,10 @@ impl<'a> Machine<'a> {
                 let d = self.pop()?;
                 let s = self.pop()?;
                 let l = self.pop()?;
-                let n = l.as_usize().filter(|n| *n < (1 << 24)).ok_or("mcopy too large")?;
+                let n = l
+                    .as_usize()
+                    .filter(|n| *n < (1 << 24))
+                    .ok_or("mcopy too large")?;
                 let data = self.mread(s, n)?;
                 self.mwrite(d, &data)?;
             }
@@ -558,7 +733,10 @@ impl<'a> Machine<'a> {
                 for _ in 0..n {
                     topics.push(self.pop()?);
                 }
-                let l = len.as_usize().filter(|l| *l < (1 << 24)).ok_or("log too large")?;
+                let l = len
+                    .as_usize()
+                    .filter(|l| *l < (1 << 24))
+                    .ok_or("log too large")?;
                 let data = self.mread(off, l)?;
                 self.logs.push(LogRecord { topics, data });
             }
@@ -566,11 +744,23 @@ impl<'a> Machine<'a> {
                 let value = self.pop()?;
                 let off = self.pop()?;
                 let len = self.pop()?;
-                let salt = if o == op::CREATE2 { Some(self.pop()?) } else { None };
-                let l = len.as_usize().filter(|l| *l < (1 << 24)).ok_or("init code too large")?;
+                let salt = if o == op::CREATE2 {
+                    Some(self.pop()?)
+                } else {
+                    None
+                };
+                let l = len
+                    .as_usize()
+                    .filter(|l| *l < (1 << 24))
+                    .ok_or("init code too large")?;
                 let init = self.mread(off, l)?;
                 let idx = self.creates.len();
-                self.creates.push(CreateRecord { kind: o, value, init, salt });
+                self.creates.push(CreateRecord {
+                    kind: o,
+                    value,
+                    init,
+                    salt,
+                });
                 let addr = self.host.create_result(idx);
                 self.returndata = Vec::new();
                 self.push(addr)?;
@@ -578,18 +768,40 @@ impl<'a> Machine<'a> {
             op::CALL | op::CALLCODE | op::DELEGATECALL | op::STATICCALL => {
                 let gas = self.pop()?;
                 let addr = self.pop()?;
-                let value = if o == op::CALL || o == op::CALLCODE { self.pop()? } else { U256::ZERO };
+                let value = if o == op::CALL || o == op::CALLCODE {
+                    self.pop()?
+                } else {
+                    U256::ZERO
+                };
                 let in_off = self.pop()?;
                 let in_len = self.pop()?;
                 let out_off = self.pop()?;
                 let out_len = self.pop()?;
-                let il = in_len.as_usize().filter(|l| *l < (1 << 24)).ok_or("call input too large")?;
+                let il = in_len
+                    .as_usize()
+                    .filter(|l| *l < (1 << 24))
+                    .ok_or("call input too large")?;
                 let input = self.mread(in_off, il)?;
                 let idx = self.calls.len();
-                self.calls.push(CallRecord { kind: o, gas, addr, value, input: input.clone(), out_off, out_len });
+                self.calls.push(CallRecord {
+                    kind: o,
+                    gas,
+                    addr,
+                    value,
+                    input: input.clone(),
+                    out_off,
+                    out_len,
+                });
                 // The identity precompile echoes its input; every other call is opaque.
-                let (success, data) = if addr == U256::from_u64(4) { (true, input) } else { self.host.call_result(idx) };
-                let ol = out_len.as_usize().filter(|l| *l < (1 << 24)).ok_or("call output too large")?;
+                let (success, data) = if addr == U256::from_u64(4) {
+                    (true, input)
+                } else {
+                    self.host.call_result(idx)
+                };
+                let ol = out_len
+                    .as_usize()
+                    .filter(|l| *l < (1 << 24))
+                    .ok_or("call output too large")?;
                 if ol > 0 {
                     let mut buf = data.clone();
                     buf.truncate(ol);
@@ -603,9 +815,16 @@ impl<'a> Machine<'a> {
             op::RETURN | op::REVERT => {
                 let off = self.pop()?;
                 let len = self.pop()?;
-                let l = len.as_usize().filter(|l| *l < (1 << 24)).ok_or("return too large")?;
+                let l = len
+                    .as_usize()
+                    .filter(|l| *l < (1 << 24))
+                    .ok_or("return too large")?;
                 let data = self.mread(off, l)?;
-                return Ok(Some(if o == op::RETURN { Outcome::Return(data) } else { Outcome::Revert(data) }));
+                return Ok(Some(if o == op::RETURN {
+                    Outcome::Return(data)
+                } else {
+                    Outcome::Revert(data)
+                }));
             }
             op::SELFDESTRUCT => {
                 let a = self.pop()?;

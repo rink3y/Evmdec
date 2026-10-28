@@ -6,11 +6,14 @@ use crate::u256::U256;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// Handle to an interned expression: an index into the thread-local arena.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ExprId(pub u32);
 
+/// One expression node; children are `ExprId`s, so trees are DAGs shared by construction.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Node {
+    /// A 256-bit constant.
     Const(U256),
     /// Opcode with no operands (CALLER, CALLVALUE, TIMESTAMP, ...). `PC` and `MSIZE`/`GAS`
     /// carry a sequence number so distinct evaluations are not merged.
@@ -35,6 +38,7 @@ pub enum Node {
     /// A value flowing in from predecessors that differs between them (SSA phi), or a stack
     /// slot of unknown origin at a function entry (`Arg`).
     Var(u32),
+    /// Stack slot `n` of unknown origin at a function entry (see `Var`).
     Arg(u32),
     /// Return-data word: value loaded from the output region of call `seq` at word `off`.
     ReturnData(u32, ExprId),
@@ -57,6 +61,7 @@ thread_local! {
     static ARENA: RefCell<Arena> = RefCell::new(Arena { nodes: Vec::new(), map: HashMap::new(), seq: 0 });
 }
 
+/// Intern `n`, returning the existing id when a structurally equal node is already in the arena.
 pub fn intern(n: Node) -> ExprId {
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
@@ -70,10 +75,12 @@ pub fn intern(n: Node) -> ExprId {
     })
 }
 
+/// Clone of the node behind `id`.
 pub fn node(id: ExprId) -> Node {
     ARENA.with(|a| a.borrow().nodes[id.0 as usize].clone())
 }
 
+/// Run `f` on the node behind `id` without cloning it.
 pub fn with_node<R>(id: ExprId, f: impl FnOnce(&Node) -> R) -> R {
     ARENA.with(|a| f(&a.borrow().nodes[id.0 as usize]))
 }
@@ -87,43 +94,60 @@ pub fn next_seq() -> u32 {
     })
 }
 
+/// Number of distinct nodes interned so far.
 pub fn arena_size() -> usize {
     ARENA.with(|a| a.borrow().nodes.len())
 }
 
+/// Constant expression.
 pub fn konst(v: U256) -> ExprId {
     intern(Node::Const(v))
 }
+/// Constant expression from a `u64`.
 pub fn konst_u64(v: u64) -> ExprId {
     konst(U256::from_u64(v))
 }
+/// The value of `id` if it is a constant.
 pub fn as_const(id: ExprId) -> Option<U256> {
-    with_node(id, |n| if let Node::Const(v) = n { Some(*v) } else { None })
+    with_node(id, |n| {
+        if let Node::Const(v) = n {
+            Some(*v)
+        } else {
+            None
+        }
+    })
 }
+/// Is `id` a constant?
 pub fn is_const(id: ExprId) -> bool {
     as_const(id).is_some()
 }
+/// Phi variable `n`.
 pub fn var(n: u32) -> ExprId {
     intern(Node::Var(n))
 }
+/// Function argument `n`.
 pub fn arg(n: u32) -> ExprId {
     intern(Node::Arg(n))
 }
+/// Environment opcode `o` without a sequence number (merged across evaluations).
 pub fn env(o: u8) -> ExprId {
     intern(Node::Env(o, 0))
 }
+/// Environment opcode `o` with a fresh sequence number, so this evaluation stays distinct.
 pub fn env_seq(o: u8) -> ExprId {
     intern(Node::Env(o, next_seq()))
 }
+/// `CALLDATALOAD(off)`.
 pub fn calldataload(off: ExprId) -> ExprId {
     intern(Node::CallDataLoad(off))
 }
 
+/// Mask with the low `bits` bits set (`U256::MAX` for 256 or more).
 pub fn mask_bits(bits: u32) -> U256 {
     if bits >= 256 {
         U256::MAX
     } else {
-        U256::ONE.shl(bits).wrapping_sub(U256::ONE)
+        (U256::ONE << bits).wrapping_sub(U256::ONE)
     }
 }
 
@@ -154,6 +178,7 @@ pub fn split_offset(e: ExprId) -> (Option<ExprId>, U256) {
     }
 }
 
+/// `e + c`, or `e` itself when `c` is zero.
 pub fn add_const(e: ExprId, c: U256) -> ExprId {
     if c.is_zero() {
         e
@@ -171,9 +196,9 @@ fn fold2(o: u8, a: U256, b: U256) -> Option<U256> {
         op::ADD => a.wrapping_add(b),
         op::MUL => a.wrapping_mul(b),
         op::SUB => a.wrapping_sub(b),
-        op::DIV => a.div(b),
+        op::DIV => a / b,
         op::SDIV => a.sdiv(b),
-        op::MOD => a.rem(b),
+        op::MOD => a % b,
         op::SMOD => a.smod(b),
         op::EXP => a.pow(b),
         op::SIGNEXTEND => U256::signextend(a, b),
@@ -190,14 +215,14 @@ fn fold2(o: u8, a: U256, b: U256) -> Option<U256> {
             if a >= U256::from_u64(256) {
                 U256::ZERO
             } else {
-                b.shl(a.low_u64() as u32)
+                b << a.low_u64() as u32
             }
         }
         op::SHR => {
             if a >= U256::from_u64(256) {
                 U256::ZERO
             } else {
-                b.shr(a.low_u64() as u32)
+                b >> a.low_u64() as u32
             }
         }
         op::SAR => {
@@ -287,12 +312,16 @@ pub fn may_bits(e: ExprId) -> U256 {
             Node::Op(op::AND, v) => go(v[0], depth + 1) & go(v[1], depth + 1),
             Node::Op(op::OR, v) | Node::Op(op::XOR, v) => go(v[0], depth + 1) | go(v[1], depth + 1),
             Node::Op(op::SHL, v) => match as_const(v[0]) {
-                Some(s) if s.fits_u64() && s.low_u64() < 256 => go(v[1], depth + 1).shl(s.low_u64() as u32),
+                Some(s) if s.fits_u64() && s.low_u64() < 256 => {
+                    go(v[1], depth + 1) << s.low_u64() as u32
+                }
                 Some(_) => U256::ZERO,
                 None => U256::MAX,
             },
             Node::Op(op::SHR, v) => match as_const(v[0]) {
-                Some(s) if s.fits_u64() && s.low_u64() < 256 => go(v[1], depth + 1).shr(s.low_u64() as u32),
+                Some(s) if s.fits_u64() && s.low_u64() < 256 => {
+                    go(v[1], depth + 1) >> s.low_u64() as u32
+                }
                 Some(_) => U256::ZERO,
                 None => U256::MAX,
             },
@@ -312,7 +341,11 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
         }
     }
     // Canonical operand order for commutative ops: constant on the right.
-    let (a, b, ca, cb) = if is_commutative(o) && ca.is_some() && cb.is_none() { (b, a, cb, ca) } else { (a, b, ca, cb) };
+    let (a, b, ca, cb) = if is_commutative(o) && ca.is_some() && cb.is_none() {
+        (b, a, cb, ca)
+    } else {
+        (a, b, ca, cb)
+    };
     match o {
         op::ADD => {
             if cb == Some(U256::ZERO) {
@@ -339,12 +372,16 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                 if let Node::Op(op::SUB, v) = node(a) {
                     if let Some(c1) = as_const(v[1]) {
                         // (x - c1) + c2
-                        return if c2 >= c1 { op2(op::ADD, v[0], konst(c2.wrapping_sub(c1))) } else { op2(op::SUB, v[0], konst(c1.wrapping_sub(c2))) };
+                        return if c2 >= c1 {
+                            op2(op::ADD, v[0], konst(c2.wrapping_sub(c1)))
+                        } else {
+                            op2(op::SUB, v[0], konst(c1.wrapping_sub(c2)))
+                        };
                     }
                 }
                 // Negative constant: x + (2^256 - k) -> x - k, for small k (nicer output)
-                if c2.is_negative() && c2.neg() < U256::from_u64(1 << 32) {
-                    return intern(Node::Op(op::SUB, vec![a, konst(c2.neg())]));
+                if c2.is_negative() && (-c2) < U256::from_u64(1 << 32) {
+                    return intern(Node::Op(op::SUB, vec![a, konst(-c2)]));
                 }
             }
         }
@@ -381,7 +418,11 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             if let Some(c2) = cb {
                 if let Node::Op(op::ADD, v) = node(a) {
                     if let Some(c1) = as_const(v[1]) {
-                        return if c1 >= c2 { op2(op::ADD, v[0], konst(c1.wrapping_sub(c2))) } else { op2(op::SUB, v[0], konst(c2.wrapping_sub(c1))) };
+                        return if c1 >= c2 {
+                            op2(op::ADD, v[0], konst(c1.wrapping_sub(c2)))
+                        } else {
+                            op2(op::SUB, v[0], konst(c2.wrapping_sub(c1)))
+                        };
                     }
                 }
                 if let Node::Op(op::SUB, v) = node(a) {
@@ -607,6 +648,7 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
     intern(Node::Op(o, vec![a, b]))
 }
 
+/// Build a ternary op (ADDMOD/MULMOD), folding when every operand is constant.
 pub fn op3(o: u8, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
     if let (Some(x), Some(y), Some(z)) = (as_const(a), as_const(b), as_const(c)) {
         match o {
@@ -624,7 +666,15 @@ pub fn value_bits(e: ExprId) -> u32 {
         Node::Const(c) => c.bits(),
         Node::Env(o, _) => match o {
             op::CALLER | op::ADDRESS | op::ORIGIN | op::COINBASE => 160,
-            op::TIMESTAMP | op::NUMBER | op::GASLIMIT | op::GAS | op::CALLDATASIZE | op::RETURNDATASIZE | op::CODESIZE | op::MSIZE | op::PC => 64,
+            op::TIMESTAMP
+            | op::NUMBER
+            | op::GASLIMIT
+            | op::GAS
+            | op::CALLDATASIZE
+            | op::RETURNDATASIZE
+            | op::CODESIZE
+            | op::MSIZE
+            | op::PC => 64,
             _ => 256,
         },
         Node::Op(o, v) => match o {
@@ -686,8 +736,14 @@ pub fn size(e: ExprId) -> usize {
         }
         *budget -= 1;
         match node(e) {
-            Node::Op(_, v) | Node::Keccak(v, _) => 1 + v.iter().map(|x| go(*x, budget)).sum::<usize>(),
-            Node::MLoad(a, _) | Node::SLoad(a, _, _) | Node::CallDataLoad(a) | Node::ReturnData(_, a) | Node::CopiedWord(_, a, _) => 1 + go(a, budget),
+            Node::Op(_, v) | Node::Keccak(v, _) => {
+                1 + v.iter().map(|x| go(*x, budget)).sum::<usize>()
+            }
+            Node::MLoad(a, _)
+            | Node::SLoad(a, _, _)
+            | Node::CallDataLoad(a)
+            | Node::ReturnData(_, a)
+            | Node::CopiedWord(_, a, _) => 1 + go(a, budget),
             Node::KeccakMem(a, b, _) => 1 + go(a, budget) + go(b, budget),
             _ => 1,
         }
@@ -700,7 +756,11 @@ pub fn size(e: ExprId) -> usize {
 pub fn children(e: ExprId) -> Vec<ExprId> {
     match node(e) {
         Node::Op(_, v) | Node::Keccak(v, _) => v,
-        Node::MLoad(a, _) | Node::SLoad(a, _, _) | Node::CallDataLoad(a) | Node::ReturnData(_, a) | Node::CopiedWord(_, a, _) => vec![a],
+        Node::MLoad(a, _)
+        | Node::SLoad(a, _, _)
+        | Node::CallDataLoad(a)
+        | Node::ReturnData(_, a)
+        | Node::CopiedWord(_, a, _) => vec![a],
         Node::KeccakMem(a, b, _) => vec![a, b],
         _ => vec![],
     }
@@ -723,7 +783,11 @@ pub fn contains(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
 }
 
 /// Replace every `Var(i)` / `Arg(i)` according to `f` (returns None to keep). Memoised.
-pub fn substitute(e: ExprId, f: &dyn Fn(&Node) -> Option<ExprId>, memo: &mut HashMap<ExprId, ExprId>) -> ExprId {
+pub fn substitute(
+    e: ExprId,
+    f: &dyn Fn(&Node) -> Option<ExprId>,
+    memo: &mut HashMap<ExprId, ExprId>,
+) -> ExprId {
     if let Some(r) = memo.get(&e) {
         return *r;
     }
@@ -754,7 +818,11 @@ pub fn substitute(e: ExprId, f: &dyn Fn(&Node) -> Option<ExprId>, memo: &mut Has
         Node::CallDataLoad(a) => intern(Node::CallDataLoad(substitute(a, f, memo))),
         Node::ReturnData(s, a) => intern(Node::ReturnData(s, substitute(a, f, memo))),
         Node::CopiedWord(k, a, ver) => intern(Node::CopiedWord(k, substitute(a, f, memo), ver)),
-        Node::KeccakMem(a, b, ver) => intern(Node::KeccakMem(substitute(a, f, memo), substitute(b, f, memo), ver)),
+        Node::KeccakMem(a, b, ver) => intern(Node::KeccakMem(
+            substitute(a, f, memo),
+            substitute(b, f, memo),
+            ver,
+        )),
         _ => e,
     };
     memo.insert(e, r);
@@ -772,9 +840,25 @@ mod tests {
         let x = arg(0);
         let e = op2(op::ADD, op2(op::ADD, x, konst_u64(4)), konst_u64(32));
         assert_eq!(split_offset(e), (Some(x), U256::from_u64(36)));
-        assert_eq!(op2(op::DIV, x, konst(U256::ONE.shl(224))), op2(op::SHR, konst_u64(224), x));
-        assert_eq!(op1(op::ISZERO, op1(op::ISZERO, op2(op::EQ, x, konst_u64(3)))), op2(op::EQ, x, konst_u64(3)));
-        assert_eq!(op2(op::AND, op2(op::AND, x, konst(mask_bits(160))), konst(mask_bits(160))), op2(op::AND, x, konst(mask_bits(160))));
-        assert_eq!(op2(op::SUB, op2(op::ADD, x, konst_u64(10)), konst_u64(4)), op2(op::ADD, x, konst_u64(6)));
+        assert_eq!(
+            op2(op::DIV, x, konst(U256::ONE << 224)),
+            op2(op::SHR, konst_u64(224), x)
+        );
+        assert_eq!(
+            op1(op::ISZERO, op1(op::ISZERO, op2(op::EQ, x, konst_u64(3)))),
+            op2(op::EQ, x, konst_u64(3))
+        );
+        assert_eq!(
+            op2(
+                op::AND,
+                op2(op::AND, x, konst(mask_bits(160))),
+                konst(mask_bits(160))
+            ),
+            op2(op::AND, x, konst(mask_bits(160)))
+        );
+        assert_eq!(
+            op2(op::SUB, op2(op::ADD, x, konst_u64(10)), konst_u64(4)),
+            op2(op::ADD, x, konst_u64(6))
+        );
     }
 }

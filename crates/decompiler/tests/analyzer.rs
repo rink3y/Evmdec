@@ -1,7 +1,7 @@
 //! The analyzer on hand-assembled contracts with known defects.
 
-use evmdec::analyze::{analyze, Severity};
-use evmdec::decompile::{decompile, Options};
+use evmdec::analyze::{self, Severity};
+use evmdec::decompile::{self, Options};
 
 /// Tiny assembler: mnemonics with immediates, e.g. "PUSH1 0x80". Labels: `:name` defines,
 /// `PUSH2 @name` references (patched to 2 bytes).
@@ -9,7 +9,9 @@ fn asm(src: &str) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut labels = std::collections::HashMap::new();
     let mut fixups: Vec<(usize, String)> = Vec::new();
-    let opcodes: std::collections::HashMap<&str, u8> = (0u8..=255).filter_map(|o| evmdec::opcode::info(o).map(|i| (i.name, o))).collect();
+    let opcodes: std::collections::HashMap<&str, u8> = (0u8..=255)
+        .filter_map(|o| evmdec::opcode::info(o).map(|i| (i.name, o)))
+        .collect();
     for tok in src.split_whitespace() {
         if let Some(l) = tok.strip_prefix(':') {
             labels.insert(l.to_string(), out.len());
@@ -25,7 +27,11 @@ fn asm(src: &str) -> Vec<u8> {
             out.extend_from_slice(&bytes);
             continue;
         }
-        out.push(*opcodes.get(tok).unwrap_or_else(|| panic!("unknown mnemonic {tok}")));
+        out.push(
+            *opcodes
+                .get(tok)
+                .unwrap_or_else(|| panic!("unknown mnemonic {tok}")),
+        );
     }
     for (pos, l) in fixups {
         let t = labels[&l] as u16;
@@ -46,54 +52,79 @@ fn dispatcher(body: &str) -> Vec<u8> {
 fn reentrancy_is_reported_and_cei_is_not() {
     // withdraw(): balance = sload(caller); call{value: balance}(caller); sstore(caller, 0)
     let vulnerable = dispatcher("CALLER SLOAD DUP1 PUSH1 0x00 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP PUSH1 0x00 CALLER SSTORE STOP");
-    let c = decompile(&vulnerable, &Options::default());
-    let r = analyze(&c);
-    let f = r.findings.iter().find(|f| f.id == "reentrancy").expect("reentrancy finding");
-    assert!(matches!(f.severity, Severity::High | Severity::Medium), "{:?}", f.severity);
+    let c = decompile::decompile(&vulnerable, &Options::default());
+    let r = analyze::analyze(&c);
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.id == "reentrancy")
+        .expect("reentrancy finding");
+    assert!(
+        matches!(f.severity, Severity::High | Severity::Medium),
+        "{:?}",
+        f.severity
+    );
     // Checks-effects-interactions: sstore before the call.
     let safe = dispatcher("CALLER SLOAD PUSH1 0x00 CALLER SSTORE DUP1 PUSH1 0x00 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP STOP");
-    let c = decompile(&safe, &Options::default());
-    let r = analyze(&c);
-    assert!(!r.findings.iter().any(|f| f.id == "reentrancy"), "false reentrancy on CEI code");
-    assert!(r.findings.iter().any(|f| f.id == "unchecked-call"), "ignored success flag should be reported");
+    let c = decompile::decompile(&safe, &Options::default());
+    let r = analyze::analyze(&c);
+    assert!(
+        !r.findings.iter().any(|f| f.id == "reentrancy"),
+        "false reentrancy on CEI code"
+    );
+    assert!(
+        r.findings.iter().any(|f| f.id == "unchecked-call"),
+        "ignored success flag should be reported"
+    );
 }
 
 #[test]
 fn unprotected_selfdestruct_and_tx_origin() {
     let code = dispatcher("CALLER SELFDESTRUCT");
-    let r = analyze(&decompile(&code, &Options::default()));
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
     let f = r.findings.iter().find(|f| f.id == "selfdestruct").unwrap();
     assert_eq!(f.severity, Severity::Critical);
     // Guarded by owner == msg.sender (slot 0): severity drops.
     let guarded = dispatcher("PUSH1 0x00 SLOAD CALLER EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST CALLER SELFDESTRUCT");
-    let r = analyze(&decompile(&guarded, &Options::default()));
+    let r = analyze::analyze(&decompile::decompile(&guarded, &Options::default()));
     let f = r.findings.iter().find(|f| f.id == "selfdestruct").unwrap();
     assert_eq!(f.severity, Severity::Medium);
     assert!(r.privileged_functions.len() == 1);
     // tx.origin authorization
     let origin = dispatcher("PUSH1 0x00 SLOAD ORIGIN EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST PUSH1 0x01 PUSH1 0x05 SSTORE STOP");
-    let r = analyze(&decompile(&origin, &Options::default()));
+    let r = analyze::analyze(&decompile::decompile(&origin, &Options::default()));
     assert!(r.findings.iter().any(|f| f.id == "tx-origin"));
 }
 
 #[test]
 fn arbitrary_delegatecall_and_owner_write() {
     // delegatecall to calldata[4]
-    let dc = dispatcher("PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x04 CALLDATALOAD GAS DELEGATECALL POP STOP");
-    let r = analyze(&decompile(&dc, &Options::default()));
-    let f = r.findings.iter().find(|f| f.id == "arbitrary-delegatecall").unwrap();
+    let dc =
+        dispatcher("PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x04 CALLDATALOAD GAS DELEGATECALL POP STOP");
+    let r = analyze::analyze(&decompile::decompile(&dc, &Options::default()));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.id == "arbitrary-delegatecall")
+        .unwrap();
     assert_eq!(f.severity, Severity::Critical);
     // Two functions: 0xaaaaaaaa writes slot 0 from calldata without a check; 0xbbbbbbbb is gated by slot 0 == caller.
     let two = asm("PUSH1 0x80 PUSH1 0x40 MSTORE PUSH1 0x00 CALLDATALOAD PUSH1 0xe0 SHR DUP1 PUSH4 0xaaaaaaaa EQ PUSH2 @a JUMPI PUSH4 0xbbbbbbbb EQ PUSH2 @b JUMPI PUSH1 0x00 DUP1 REVERT :a JUMPDEST PUSH1 0x04 CALLDATALOAD PUSH1 0x00 SSTORE STOP :b JUMPDEST PUSH1 0x00 SLOAD CALLER EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST PUSH1 0x01 PUSH1 0x07 SSTORE STOP");
-    let r = analyze(&decompile(&two, &Options::default()));
-    assert!(r.findings.iter().any(|f| f.id == "unprotected-owner-write" && f.severity == Severity::Critical), "{:?}", r.findings.iter().map(|f| &f.id).collect::<Vec<_>>());
+    let r = analyze::analyze(&decompile::decompile(&two, &Options::default()));
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.id == "unprotected-owner-write" && f.severity == Severity::Critical),
+        "{:?}",
+        r.findings.iter().map(|f| &f.id).collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn report_renders() {
     let code = dispatcher("CALLER SELFDESTRUCT");
-    let c = decompile(&code, &Options::default());
-    let r = analyze(&c);
+    let c = decompile::decompile(&code, &Options::default());
+    let r = analyze::analyze(&c);
     let md = evmdec::analyze::render_markdown(&c, &r, "test");
     assert!(md.contains("[CRITICAL]"));
     assert!(serde_json::to_string(&r).is_ok());
@@ -102,7 +133,7 @@ fn report_renders() {
 /// solc < 0.5.9 metadata trailer: `{"bzzr0": <32 bytes>}` followed by its 2-byte length.
 fn bzzr0_trailer() -> Vec<u8> {
     let mut t = vec![0xa1, 0x65, b'b', b'z', b'z', b'r', b'0', 0x58, 0x20];
-    t.extend(std::iter::repeat(0x11).take(32));
+    t.extend(std::iter::repeat_n(0x11, 32));
     t.extend_from_slice(&[0x00, 0x29]);
     t
 }
@@ -117,37 +148,75 @@ fn safemath_guard_in_inlined_helper_is_kept() {
 
     let mut code = dispatcher(&checked);
     code.extend(bzzr0_trailer());
-    let c = decompile(&code, &Options::default());
-    assert!(c.source.contains("assert("), "the helper's overflow check must survive inlining:\n{}", c.source);
-    let r = analyze(&c);
-    assert!(r.findings.iter().any(|f| f.id == "legacy-compiler"), "bzzr0-only metadata implies solc < 0.5.9");
-    assert!(!r.findings.iter().any(|f| f.id == "unchecked-arithmetic"), "guarded addition must not be flagged:\n{}", c.source);
+    let c = decompile::decompile(&code, &Options::default());
+    assert!(
+        c.source.contains("assert("),
+        "the helper's overflow check must survive inlining:\n{}",
+        c.source
+    );
+    let r = analyze::analyze(&c);
+    assert!(
+        r.findings.iter().any(|f| f.id == "legacy-compiler"),
+        "bzzr0-only metadata implies solc < 0.5.9"
+    );
+    assert!(
+        !r.findings.iter().any(|f| f.id == "unchecked-arithmetic"),
+        "guarded addition must not be flagged:\n{}",
+        c.source
+    );
 
     let mut code = dispatcher(&unchecked);
     code.extend(bzzr0_trailer());
-    let c = decompile(&code, &Options::default());
-    let r = analyze(&c);
-    assert!(r.findings.iter().any(|f| f.id == "unchecked-arithmetic"), "unguarded addition must be flagged:\n{}", c.source);
+    let c = decompile::decompile(&code, &Options::default());
+    let r = analyze::analyze(&c);
+    assert!(
+        r.findings.iter().any(|f| f.id == "unchecked-arithmetic"),
+        "unguarded addition must be flagged:\n{}",
+        c.source
+    );
 }
 
 #[test]
 fn reentrancy_guard_is_recognised_only_when_it_locks() {
     // lock: require(slot1 == 1); slot1 = 0; call; slot1 = 1; slot_caller = 0
     let locked = dispatcher("PUSH1 0x01 SLOAD PUSH1 0x01 EQ PUSH2 @go JUMPI PUSH1 0x00 DUP1 REVERT :go JUMPDEST PUSH1 0x00 PUSH1 0x01 SSTORE CALLER SLOAD DUP1 PUSH1 0x00 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP PUSH1 0x01 PUSH1 0x01 SSTORE PUSH1 0x00 CALLER SSTORE STOP");
-    let r = analyze(&decompile(&locked, &Options::default()));
-    let f = r.findings.iter().find(|f| f.id == "reentrancy").expect("reentrancy finding");
-    assert_eq!(f.severity, Severity::Info, "a lock written before and after the call is a guard");
+    let r = analyze::analyze(&decompile::decompile(&locked, &Options::default()));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.id == "reentrancy")
+        .expect("reentrancy finding");
+    assert_eq!(
+        f.severity,
+        Severity::Info,
+        "a lock written before and after the call is a guard"
+    );
     // No lock, but the function still writes two slots twice after the call: not a guard.
     let unlocked = dispatcher("CALLER SLOAD DUP1 PUSH1 0x00 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP PUSH1 0x05 PUSH1 0x07 SSTORE PUSH1 0x00 CALLER SSTORE PUSH1 0x06 PUSH1 0x07 SSTORE STOP");
-    let r = analyze(&decompile(&unlocked, &Options::default()));
-    let f = r.findings.iter().find(|f| f.id == "reentrancy").expect("reentrancy finding");
-    assert!(matches!(f.severity, Severity::High | Severity::Medium), "writes after the call without a tested lock are not a guard: {:?}", f.severity);
+    let r = analyze::analyze(&decompile::decompile(&unlocked, &Options::default()));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.id == "reentrancy")
+        .expect("reentrancy finding");
+    assert!(
+        matches!(f.severity, Severity::High | Severity::Medium),
+        "writes after the call without a tested lock are not a guard: {:?}",
+        f.severity
+    );
 }
 
 #[test]
 fn erc20_transfer_result_ignored_is_reported() {
     // token.transfer(caller, 1) with out_len 0 and only the success flag checked.
     let body = "PUSH4 0xa9059cbb PUSH1 0xe0 SHL PUSH1 0x00 MSTORE CALLER PUSH1 0x04 MSTORE PUSH1 0x01 PUSH1 0x24 MSTORE PUSH1 0x00 PUSH1 0x00 PUSH1 0x44 PUSH1 0x00 PUSH1 0x00 PUSH1 0x04 CALLDATALOAD GAS CALL PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST STOP";
-    let r = analyze(&decompile(&dispatcher(body), &Options::default()));
-    assert!(r.findings.iter().any(|f| f.id == "erc20-return-ignored"), "{:?}", r.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>());
+    let r = analyze::analyze(&decompile::decompile(
+        &dispatcher(body),
+        &Options::default(),
+    ));
+    assert!(
+        r.findings.iter().any(|f| f.id == "erc20-return-ignored"),
+        "{:?}",
+        r.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
+    );
 }

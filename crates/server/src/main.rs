@@ -39,11 +39,24 @@ fn error(status: StatusCode, msg: impl Into<String>) -> axum::response::Response
 }
 
 /// Run the decompiler and analyzer; returns the JSON document the UI consumes.
-fn run(code: &[u8], address: Option<&str>, chain: Option<&str>, rpc: Option<&str>, follow: bool, lookup: bool) -> Result<Value, String> {
+fn run(
+    code: &[u8],
+    address: Option<&str>,
+    chain: Option<&str>,
+    rpc: Option<&str>,
+    follow: bool,
+    lookup: bool,
+) -> Result<Value, String> {
     let mut opts = evmdec::decompile::Options::default();
     let mut c = evmdec::decompile::decompile(code, &opts);
     if lookup {
-        let sels: Vec<u32> = c.functions.iter().filter(|f| f.signature.is_none()).filter_map(|f| f.selector.as_ref()).filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).collect();
+        let sels: Vec<u32> = c
+            .functions
+            .iter()
+            .filter(|f| f.signature.is_none())
+            .filter_map(|f| f.selector.as_ref())
+            .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .collect();
         if !sels.is_empty() {
             opts.extra_sigs = evmdec::sigs::lookup_online(&sels);
             if !opts.extra_sigs.is_empty() {
@@ -56,10 +69,20 @@ fn run(code: &[u8], address: Option<&str>, chain: Option<&str>, rpc: Option<&str
     let mut implementation: Option<Value> = None;
     if let (Some(addr), Some(ch), true) = (address, chain, follow) {
         if let Ok(client) = evmdec::rpc::Client::new(rpc, ch) {
-            let slots: Vec<evmdec::U256> = c.delegatecall_slots.iter().filter_map(|s| evmdec::U256::from_hex_str(s)).collect();
-            let targets: Vec<evmdec::U256> = c.delegatecall_targets.iter().filter_map(|s| evmdec::U256::from_hex_str(s)).collect();
+            let slots: Vec<evmdec::U256> = c
+                .delegatecall_slots
+                .iter()
+                .filter_map(|s| evmdec::U256::from_hex_str(s))
+                .collect();
+            let targets: Vec<evmdec::U256> = c
+                .delegatecall_targets
+                .iter()
+                .filter_map(|s| evmdec::U256::from_hex_str(s))
+                .collect();
             if !slots.is_empty() || !targets.is_empty() || code.len() < 100 {
-                if let Ok(Some(p)) = evmdec::rpc::resolve_proxy(&client, addr, code, &slots, &targets) {
+                if let Ok(Some(p)) =
+                    evmdec::rpc::resolve_proxy(&client, addr, code, &slots, &targets)
+                {
                     if let Ok(ic) = client.get_code(&p.implementation) {
                         if !ic.is_empty() {
                             let mut icon = evmdec::decompile::decompile(&ic, &opts);
@@ -67,18 +90,32 @@ fn run(code: &[u8], address: Option<&str>, chain: Option<&str>, rpc: Option<&str
                             icon.chain = Some(ch.to_string());
                             icon.source = evmdec::decompile::render(&icon, "Implementation");
                             let ir = evmdec::analyze::analyze(&icon);
-                            let imd = evmdec::analyze::render_markdown(&icon, &ir, &format!("implementation {}", p.implementation));
-                            implementation = Some(json!({"contract": icon, "report": ir, "report_markdown": imd, "proxy_kind": p.kind, "admin": p.admin}));
+                            let imd = evmdec::analyze::render_markdown(
+                                &icon,
+                                &ir,
+                                &format!("implementation {}", p.implementation),
+                            );
+                            implementation = Some(
+                                json!({"contract": icon, "report": ir, "report_markdown": imd, "proxy_kind": p.kind, "admin": p.admin}),
+                            );
                         }
                     }
-                    c.proxy = Some(evmdec::decompile::ProxyRef { kind: p.kind, implementation: p.implementation, admin: p.admin, contract: None });
+                    c.proxy = Some(evmdec::decompile::ProxyRef {
+                        kind: p.kind,
+                        implementation: p.implementation,
+                        admin: p.admin,
+                        contract: None,
+                    });
                 }
             }
         }
     }
     let r = evmdec::analyze::analyze(&c);
     let md = evmdec::analyze::render_markdown(&c, &r, address.unwrap_or("bytecode"));
-    let disasm: Vec<String> = evmdec::disasm::disassemble(&c.info.runtime).iter().map(evmdec::disasm::format_instruction).collect();
+    let disasm: Vec<String> = evmdec::disasm::disassemble(&c.info.runtime)
+        .iter()
+        .map(evmdec::disasm::format_instruction)
+        .collect();
     let mut v = json!({"contract": c, "report": r, "report_markdown": md, "disassembly": disasm});
     if let Some(i) = implementation {
         v["implementation"] = i;
@@ -86,10 +123,26 @@ fn run(code: &[u8], address: Option<&str>, chain: Option<&str>, rpc: Option<&str
     Ok(v)
 }
 
-async fn api_decompile(State(st): State<AppState>, Json(req): Json<DecompileReq>) -> axum::response::Response {
+async fn api_decompile(
+    State(st): State<AppState>,
+    Json(req): Json<DecompileReq>,
+) -> axum::response::Response {
     let chain = req.chain.clone().unwrap_or_else(|| "mainnet".into());
-    let key = format!("{}|{}|{}|{}|{}", req.bytecode.as_deref().unwrap_or(""), req.address.as_deref().unwrap_or("").to_lowercase(), chain, req.no_follow_proxy, req.lookup);
-    if let Some(v) = st.cache.lock().unwrap().get(&key).cloned() {
+    let key = format!(
+        "{}|{}|{}|{}|{}",
+        req.bytecode.as_deref().unwrap_or(""),
+        req.address.as_deref().unwrap_or("").to_lowercase(),
+        chain,
+        req.no_follow_proxy,
+        req.lookup
+    );
+    if let Some(v) = st
+        .cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned()
+    {
         return Json((*v).clone()).into_response();
     }
     let result = tokio::task::spawn_blocking(move || -> Result<Value, (StatusCode, String)> {
@@ -98,12 +151,26 @@ async fn api_decompile(State(st): State<AppState>, Json(req): Json<DecompileReq>
             if !evmdec::rpc::is_address(&addr) {
                 return Err((StatusCode::BAD_REQUEST, "invalid address".into()));
             }
-            let client = evmdec::rpc::Client::new(req.rpc.as_deref(), &chain).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-            let code = client.get_code(&addr).map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+            let client = evmdec::rpc::Client::new(req.rpc.as_deref(), &chain)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            let code = client
+                .get_code(&addr)
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
             if code.is_empty() {
-                return Err((StatusCode::NOT_FOUND, format!("{} has no code on {}", addr, chain)));
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("{} has no code on {}", addr, chain),
+                ));
             }
-            return run(&code, Some(&addr), Some(&chain), req.rpc.as_deref(), !req.no_follow_proxy, req.lookup).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e));
+            return run(
+                &code,
+                Some(&addr),
+                Some(&chain),
+                req.rpc.as_deref(),
+                !req.no_follow_proxy,
+                req.lookup,
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e));
         }
         let hex = req.bytecode.unwrap_or_default();
         let code = evmdec::hex::decode(&hex).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -113,13 +180,17 @@ async fn api_decompile(State(st): State<AppState>, Json(req): Json<DecompileReq>
         if code.len() > 1 << 20 {
             return Err((StatusCode::BAD_REQUEST, "bytecode too large".into()));
         }
-        run(&code, None, None, None, false, req.lookup).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        run(&code, None, None, None, false, req.lookup)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
     })
     .await;
     match result {
         Ok(Ok(v)) => {
             let v = Arc::new(v);
-            let mut cache = st.cache.lock().unwrap();
+            let mut cache = st
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if cache.len() > 256 {
                 cache.clear();
             }
@@ -127,28 +198,66 @@ async fn api_decompile(State(st): State<AppState>, Json(req): Json<DecompileReq>
             Json((*v).clone()).into_response()
         }
         Ok(Err((status, msg))) => error(status, msg),
-        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("decompiler panicked: {}", e)),
+        Err(e) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("decompiler panicked: {}", e),
+        ),
     }
 }
 
-async fn api_address(State(st): State<AppState>, Path((chain, address)): Path<(String, String)>) -> axum::response::Response {
-    api_decompile(State(st), Json(DecompileReq { address: Some(address), chain: Some(chain), ..Default::default() })).await
+async fn api_address(
+    State(st): State<AppState>,
+    Path((chain, address)): Path<(String, String)>,
+) -> axum::response::Response {
+    api_decompile(
+        State(st),
+        Json(DecompileReq {
+            address: Some(address),
+            chain: Some(chain),
+            ..Default::default()
+        }),
+    )
+    .await
 }
 
 /// The page, with `__ORIGIN__` (used by the Open Graph tags, which need absolute URLs) replaced
 /// by the scheme and host this request arrived on.
 async fn index(headers: header::HeaderMap) -> Html<String> {
-    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost:8080");
-    let proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()).unwrap_or(if host.starts_with("localhost") || host.starts_with("127.") { "http" } else { "https" });
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost:8080");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or(
+            if host.starts_with("localhost") || host.starts_with("127.") {
+                "http"
+            } else {
+                "https"
+            },
+        );
     Html(INDEX.replace("__ORIGIN__", &format!("{}://{}", proto, host)))
 }
 
 async fn og_image() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=86400")], OG_PNG)
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        OG_PNG,
+    )
 }
 
 async fn favicon() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, "public, max-age=86400")], FAVICON)
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON,
+    )
 }
 
 async fn robots() -> &'static str {
@@ -160,12 +269,18 @@ async fn healthz() -> &'static str {
 }
 
 async fn chains() -> Json<Value> {
-    Json(json!(evmdec::rpc::CHAINS.iter().map(|c| json!({"name": c.name, "id": c.id})).collect::<Vec<_>>()))
+    Json(json!(evmdec::rpc::CHAINS
+        .iter()
+        .map(|c| json!({"name": c.name, "id": c.id}))
+        .collect::<Vec<_>>()))
 }
 
 #[tokio::main]
 async fn main() {
-    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
     let app = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))

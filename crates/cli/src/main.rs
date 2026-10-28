@@ -1,11 +1,15 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 #[allow(unused_imports)]
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "evmdec", version, about = "EVM bytecode decompiler and security analyzer")]
+#[command(
+    name = "evmdec",
+    version,
+    about = "EVM bytecode decompiler and security analyzer"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -96,33 +100,63 @@ fn load_input(input: &str) -> Result<Vec<u8>> {
     anyhow::bail!("'{}' is neither a file, a hex string nor an address", input)
 }
 
-fn fetch_and_decompile(address: &str, rpc: Option<&str>, chain: &str, follow: bool, opts: &evmdec::decompile::Options) -> Result<evmdec::decompile::Contract> {
+fn fetch_and_decompile(
+    address: &str,
+    rpc: Option<&str>,
+    chain: &str,
+    follow: bool,
+    opts: &evmdec::decompile::Options,
+) -> Result<evmdec::decompile::Contract> {
     let client = evmdec::rpc::Client::new(rpc, chain).map_err(|e| anyhow::anyhow!(e))?;
     eprintln!("fetching code of {} on {}...", address, chain);
     let code = client.get_code(address).map_err(|e| anyhow::anyhow!(e))?;
     if code.is_empty() {
-        anyhow::bail!("{} has no code on {} (not a contract, or wrong chain)", address, chain);
+        anyhow::bail!(
+            "{} has no code on {} (not a contract, or wrong chain)",
+            address,
+            chain
+        );
     }
     let mut c = evmdec::decompile::decompile(&code, opts);
     c.address = Some(address.to_string());
     c.chain = Some(chain.to_string());
     if follow {
-        let slots: Vec<evmdec::U256> = c.delegatecall_slots.iter().filter_map(|s| evmdec::U256::from_hex_str(s)).collect();
-        let targets: Vec<evmdec::U256> = c.delegatecall_targets.iter().filter_map(|s| evmdec::U256::from_hex_str(s)).collect();
+        let slots: Vec<evmdec::U256> = c
+            .delegatecall_slots
+            .iter()
+            .filter_map(|s| evmdec::U256::from_hex_str(s))
+            .collect();
+        let targets: Vec<evmdec::U256> = c
+            .delegatecall_targets
+            .iter()
+            .filter_map(|s| evmdec::U256::from_hex_str(s))
+            .collect();
         let is_proxy = !slots.is_empty() || !targets.is_empty() || code.len() < 100;
         if is_proxy {
             match evmdec::rpc::resolve_proxy(&client, address, &code, &slots, &targets) {
                 Ok(Some(p)) => {
-                    eprintln!("{}: implementation {} — fetching...", p.kind, p.implementation);
-                    let impl_code = client.get_code(&p.implementation).map_err(|e| anyhow::anyhow!(e))?;
-                    let ic = if impl_code.is_empty() { None } else {
+                    eprintln!(
+                        "{}: implementation {} — fetching...",
+                        p.kind, p.implementation
+                    );
+                    let impl_code = client
+                        .get_code(&p.implementation)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    let ic = if impl_code.is_empty() {
+                        None
+                    } else {
                         let mut ic = evmdec::decompile::decompile(&impl_code, opts);
                         ic.address = Some(p.implementation.clone());
                         ic.chain = Some(chain.to_string());
                         ic.source = evmdec::decompile::render(&ic, "Implementation");
                         Some(Box::new(ic))
                     };
-                    c.proxy = Some(evmdec::decompile::ProxyRef { kind: p.kind, implementation: p.implementation, admin: p.admin, contract: ic });
+                    c.proxy = Some(evmdec::decompile::ProxyRef {
+                        kind: p.kind,
+                        implementation: p.implementation,
+                        admin: p.admin,
+                        contract: ic,
+                    });
                     c.source = evmdec::decompile::render(&c, "Proxy");
                 }
                 Ok(None) => {}
@@ -146,85 +180,180 @@ fn main() -> Result<()> {
             let info = evmdec::metadata::analyze(&code);
             let t = std::time::Instant::now();
             let prog = evmdec::cfg::Program::new(info.runtime.clone());
-            let code_end = info.metadata.as_ref().map(|m| m.offset).unwrap_or(prog.code.len());
+            let code_end = info
+                .metadata
+                .as_ref()
+                .map(|m| m.offset)
+                .unwrap_or(prog.code.len());
             let rec = evmdec::cfg::recover(&prog, code_end);
-            let total_nodes: usize = rec.main.nodes.len() + rec.functions.values().map(|u| u.nodes.len()).sum::<usize>() + rec.orphans.values().map(|u| u.nodes.len()).sum::<usize>();
+            let total_nodes: usize = rec.main.nodes.len()
+                + rec.functions.values().map(|u| u.nodes.len()).sum::<usize>()
+                + rec.orphans.values().map(|u| u.nodes.len()).sum::<usize>();
             let code_blocks = prog.blocks.iter().filter(|b| b.start < code_end).count();
             println!("blocks={} code_blocks={} main_nodes={} functions={} orphans={} total_nodes={} unresolved_jumps={} budget_exhausted={} time={:?}",
                 prog.blocks.len(), code_blocks, rec.main.nodes.len(), rec.functions.len(), rec.orphans.len(), total_nodes, rec.unresolved_jumps.len(), rec.budget_exhausted, t.elapsed());
-            for pc in &rec.unresolved_jumps { println!("  unresolved jump ending at {:#x}", pc); }
+            for pc in &rec.unresolved_jumps {
+                println!("  unresolved jump ending at {:#x}", pc);
+            }
             if let Ok(v) = std::env::var("EVMDEC_SUMMARY") {
                 let an = evmdec::cfg::Analysis::new(&prog);
                 for pcs in v.split(',') {
                     let pc = usize::from_str_radix(pcs.trim_start_matches("0x"), 16)?;
                     let b = prog.block_at_pc[&pc];
                     let s = an.summary(b);
-                    println!("  summary {:#x}: exits={:?} may_halt={} unresolved={} blocks={}", pc, s.exits, s.may_halt, s.unresolved, s.blocks.len());
+                    println!(
+                        "  summary {:#x}: exits={:?} may_halt={} unresolved={} blocks={}",
+                        pc,
+                        s.exits,
+                        s.may_halt,
+                        s.unresolved,
+                        s.blocks.len()
+                    );
                 }
             }
             if std::env::var("EVMDEC_CTX").is_ok() {
                 let mut per: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-                for n in &rec.main.nodes { per.entry(n.block).or_default().push(n.id); }
+                for n in &rec.main.nodes {
+                    per.entry(n.block).or_default().push(n.id);
+                }
                 let mut v: Vec<(usize, usize)> = per.iter().map(|(b, v)| (v.len(), *b)).collect();
                 v.sort_unstable_by(|a, b| b.cmp(a));
                 for (cnt, b) in v.iter().take(5) {
                     println!("  main block {:#x} nodes={}", prog.blocks[*b].start, cnt);
                     for id in per[b].iter().take(5) {
                         let n = &rec.main.nodes[*id];
-                        println!("     {:?} preds={:?}", n.entry, n.preds.iter().map(|p| format!("{:#x}", prog.blocks[rec.main.nodes[*p].block].start)).collect::<Vec<_>>());
+                        println!(
+                            "     {:?} preds={:?}",
+                            n.entry,
+                            n.preds
+                                .iter()
+                                .map(|p| format!(
+                                    "{:#x}",
+                                    prog.blocks[rec.main.nodes[*p].block].start
+                                ))
+                                .collect::<Vec<_>>()
+                        );
                     }
                 }
             }
             if std::env::var("EVMDEC_DEBUG").is_ok() {
                 for (f, u) in &rec.functions {
                     let calls = u.nodes.iter().filter(|n| n.call.is_some()).count();
-                    let rets: Vec<String> = u.nodes.iter().filter_map(|n| n.returns_via.map(|v| format!("{:?}", v))).collect();
-                    let unres: Vec<String> = u.nodes.iter().filter(|n| n.unresolved).map(|n| format!("{:#x}", prog.blocks[n.block].end)).collect();
-                    println!("  function {:#x}: nodes={} calls={} returns_via={:?} unresolved={:?}", prog.blocks[*f].start, u.nodes.len(), calls, rets.iter().take(3).collect::<Vec<_>>(), unres);
+                    let rets: Vec<String> = u
+                        .nodes
+                        .iter()
+                        .filter_map(|n| n.returns_via.map(|v| format!("{:?}", v)))
+                        .collect();
+                    let unres: Vec<String> = u
+                        .nodes
+                        .iter()
+                        .filter(|n| n.unresolved)
+                        .map(|n| format!("{:#x}", prog.blocks[n.block].end))
+                        .collect();
+                    println!(
+                        "  function {:#x}: nodes={} calls={} returns_via={:?} unresolved={:?}",
+                        prog.blocks[*f].start,
+                        u.nodes.len(),
+                        calls,
+                        rets.iter().take(3).collect::<Vec<_>>(),
+                        unres
+                    );
                 }
                 for (b, u) in &rec.orphans {
-                    let unres: Vec<String> = u.nodes.iter().filter(|n| n.unresolved).map(|n| format!("{:#x}", prog.blocks[n.block].end)).collect();
+                    let unres: Vec<String> = u
+                        .nodes
+                        .iter()
+                        .filter(|n| n.unresolved)
+                        .map(|n| format!("{:#x}", prog.blocks[n.block].end))
+                        .collect();
                     if !unres.is_empty() || u.nodes.len() > 1 {
-                        println!("  orphan {:#x}: nodes={} unresolved={:?}", prog.blocks[*b].start, u.nodes.len(), unres);
+                        println!(
+                            "  orphan {:#x}: nodes={} unresolved={:?}",
+                            prog.blocks[*b].start,
+                            u.nodes.len(),
+                            unres
+                        );
                     }
                 }
-                let unres: Vec<String> = rec.main.nodes.iter().filter(|n| n.unresolved).map(|n| format!("{:#x}", prog.blocks[n.block].end)).collect();
+                let unres: Vec<String> = rec
+                    .main
+                    .nodes
+                    .iter()
+                    .filter(|n| n.unresolved)
+                    .map(|n| format!("{:#x}", prog.blocks[n.block].end))
+                    .collect();
                 println!("  main unresolved={:?}", unres);
             }
         }
-        Cmd::Decompile { input, rpc, chain, no_follow_proxy, flat, json, embedded, no_sigs, report, lookup } => {
-            let mut opts = evmdec::decompile::Options { flat, pcs: false, embedded, no_sigs, extra_sigs: Default::default() };
+        Cmd::Decompile {
+            input,
+            rpc,
+            chain,
+            no_follow_proxy,
+            flat,
+            json,
+            embedded,
+            no_sigs,
+            report,
+            lookup,
+        } => {
+            let mut opts = evmdec::decompile::Options {
+                flat,
+                pcs: false,
+                embedded,
+                no_sigs,
+                extra_sigs: Default::default(),
+            };
             let file = PathBuf::from(&input);
             let is_addr = evmdec::rpc::is_address(&input);
-            let code = if is_addr { None } else { Some(load_input(&input)?) };
+            let code = if is_addr {
+                None
+            } else {
+                Some(load_input(&input)?)
+            };
             if lookup {
                 // First pass to learn the selectors, then resolve the unknown ones online.
-                let probe = match &code {
-                    Some(c) => Some(evmdec::decompile::decompile(c, &opts)),
-                    None => None,
-                };
+                let probe = code
+                    .as_ref()
+                    .map(|c| evmdec::decompile::decompile(c, &opts));
                 if let Some(pc) = probe {
-                    let sels: Vec<u32> = pc.functions.iter().filter(|f| f.signature.is_none()).filter_map(|f| f.selector.as_ref()).filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).collect();
+                    let sels: Vec<u32> = pc
+                        .functions
+                        .iter()
+                        .filter(|f| f.signature.is_none())
+                        .filter_map(|f| f.selector.as_ref())
+                        .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                        .collect();
                     opts.extra_sigs = evmdec::sigs::lookup_online(&sels);
-                    eprintln!("resolved {} of {} unknown selectors online", opts.extra_sigs.len(), sels.len());
+                    eprintln!(
+                        "resolved {} of {} unknown selectors online",
+                        opts.extra_sigs.len(),
+                        sels.len()
+                    );
                 }
             }
-            let c = if is_addr {
-                fetch_and_decompile(&input, rpc.as_deref(), &chain, !no_follow_proxy, &opts)?
-            } else {
-                let code = code.unwrap();
-                let opts2 = opts.clone();
-                match std::panic::catch_unwind(move || evmdec::decompile::decompile(&code, &opts2)) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        // Never fail outright: fall back to the disassembly.
-                        eprintln!("internal error while decompiling; printing the disassembly instead (please report this bytecode)");
-                        let code = load_input(&input)?;
-                        let info = evmdec::metadata::analyze(&code);
-                        for i in evmdec::disasm::disassemble(&info.runtime) {
-                            println!("{}", evmdec::disasm::format_instruction(&i));
+            let c = match code {
+                None => {
+                    fetch_and_decompile(&input, rpc.as_deref(), &chain, !no_follow_proxy, &opts)?
+                }
+                Some(code) => {
+                    let opts2 = opts.clone();
+                    // Defense in depth only: the decompiler is written to never panic (the
+                    // corpus and oracle runs check that), so this guard is never relied upon.
+                    // When it does fire, the user still gets a disassembly instead of nothing.
+                    match std::panic::catch_unwind(move || {
+                        evmdec::decompile::decompile(&code, &opts2)
+                    }) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            eprintln!("internal error while decompiling; printing the disassembly instead (please report this bytecode)");
+                            let code = load_input(&input)?;
+                            let info = evmdec::metadata::analyze(&code);
+                            for i in evmdec::disasm::disassemble(&info.runtime) {
+                                println!("{}", evmdec::disasm::format_instruction(&i));
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
                     }
                 }
             };
@@ -237,24 +366,50 @@ fn main() -> Result<()> {
                 print!("{}", c.source);
                 if report {
                     let r = evmdec::analyze::analyze(&c);
-                    println!("\n/*\n{}*/", evmdec::analyze::render_markdown(&c, &r, &file.display().to_string()));
+                    println!(
+                        "\n/*\n{}*/",
+                        evmdec::analyze::render_markdown(&c, &r, &file.display().to_string())
+                    );
                     if let Some(p) = &c.proxy {
                         if let Some(ic) = &p.contract {
                             let r2 = evmdec::analyze::analyze(ic);
-                            println!("\n/*\n{}*/", evmdec::analyze::render_markdown(ic, &r2, &format!("implementation {}", p.implementation)));
+                            println!(
+                                "\n/*\n{}*/",
+                                evmdec::analyze::render_markdown(
+                                    ic,
+                                    &r2,
+                                    &format!("implementation {}", p.implementation)
+                                )
+                            );
                         }
                     }
                 }
             }
         }
-        Cmd::Verify { file, runs, seed, verbose, json } => {
+        Cmd::Verify {
+            file,
+            runs,
+            seed,
+            verbose,
+            json,
+        } => {
             let code = load(&file)?;
             let info = evmdec::metadata::analyze(&code);
-            let st = evmdec::verify::verify(&info.runtime, &evmdec::verify::VerifyOptions { runs, seed, verbose });
+            let st = evmdec::verify::verify(
+                &info.runtime,
+                &evmdec::verify::VerifyOptions {
+                    runs,
+                    seed,
+                    verbose,
+                },
+            );
             if json {
                 println!("{}", serde_json::to_string_pretty(&st)?);
             } else {
-                println!("blocks={} runs={} agree={} mismatch={} inconclusive={}", st.blocks, st.runs, st.agree, st.mismatch, st.inconclusive);
+                println!(
+                    "blocks={} runs={} agree={} mismatch={} inconclusive={}",
+                    st.blocks, st.runs, st.agree, st.mismatch, st.inconclusive
+                );
                 println!("blocks verified={} mismatched={} inconclusive={}; instructions verified {}/{} ({:.3}%)", st.blocks_verified, st.blocks_mismatched, st.blocks_inconclusive, st.instructions_verified, st.instructions_total, 100.0 * st.instructions_verified as f64 / st.instructions_total.max(1) as f64);
                 let mut reasons: Vec<(&String, &usize)> = st.inconclusive_reasons.iter().collect();
                 reasons.sort_by(|a, b| b.1.cmp(a.1));
@@ -273,7 +428,10 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&r)?);
             } else {
-                print!("{}", evmdec::analyze::render_markdown(&c, &r, &file.display().to_string()));
+                print!(
+                    "{}",
+                    evmdec::analyze::render_markdown(&c, &r, &file.display().to_string())
+                );
             }
         }
         Cmd::Disasm { file } => {

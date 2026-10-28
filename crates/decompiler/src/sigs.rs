@@ -5,19 +5,28 @@ use crate::keccak;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+/// The signature dictionary indexed by hash, built once from the string tables below.
+#[derive(Debug)]
 pub struct Sigs {
+    /// 4-byte selector to every function signature that hashes to it (collisions keep all).
     pub functions: HashMap<u32, Vec<&'static str>>,
+    /// Event topic0 (keccak256 of the signature) to the event signature.
     pub events: HashMap<[u8; 32], &'static str>,
+    /// 4-byte selector to custom error signature.
     pub errors: HashMap<u32, &'static str>,
 }
 
 static SIGS: OnceLock<Sigs> = OnceLock::new();
 
+/// The process-wide dictionary, hashed lazily on first use.
 pub fn get() -> &'static Sigs {
     SIGS.get_or_init(|| {
         let mut functions: HashMap<u32, Vec<&'static str>> = HashMap::new();
         for s in FUNCTIONS {
-            functions.entry(keccak::selector_u32(s)).or_default().push(s);
+            functions
+                .entry(keccak::selector_u32(s))
+                .or_default()
+                .push(s);
         }
         let mut events = HashMap::new();
         for s in EVENTS {
@@ -27,16 +36,26 @@ pub fn get() -> &'static Sigs {
         for s in ERRORS {
             errors.insert(keccak::selector_u32(s), *s);
         }
-        Sigs { functions, events, errors }
+        Sigs {
+            functions,
+            events,
+            errors,
+        }
     })
 }
 
+/// Function signature for a selector; the first listed wins on a collision.
 pub fn function(selector: u32) -> Option<&'static str> {
-    get().functions.get(&selector).and_then(|v| v.first().copied())
+    get()
+        .functions
+        .get(&selector)
+        .and_then(|v| v.first().copied())
 }
+/// Event signature for a topic0 hash.
 pub fn event(topic: &[u8; 32]) -> Option<&'static str> {
     get().events.get(topic).copied()
 }
+/// Custom error signature for a selector.
 pub fn error(selector: u32) -> Option<&'static str> {
     get().errors.get(&selector).copied()
 }
@@ -46,19 +65,34 @@ pub fn error(selector: u32) -> Option<&'static str> {
 #[cfg(feature = "rpc")]
 pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
     let mut out = HashMap::new();
-    let unknown: Vec<u32> = selectors.iter().copied().filter(|s| function(*s).is_none()).collect();
+    let unknown: Vec<u32> = selectors
+        .iter()
+        .copied()
+        .filter(|s| function(*s).is_none())
+        .collect();
     if unknown.is_empty() {
         return out;
     }
-    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
     for chunk in unknown.chunks(50) {
         let q: Vec<String> = chunk.iter().map(|s| format!("{:#010x}", s)).collect();
-        let url = format!("https://api.openchain.xyz/signature-database/v1/lookup?function={}&filter=true", q.join(","));
+        let url = format!(
+            "https://api.openchain.xyz/signature-database/v1/lookup?function={}&filter=true",
+            q.join(",")
+        );
         if let Ok(resp) = agent.get(&url).call() {
             if let Ok(v) = resp.into_json::<serde_json::Value>() {
                 if let Some(map) = v.pointer("/result/function").and_then(|m| m.as_object()) {
                     for (k, arr) in map {
-                        if let (Ok(sel), Some(first)) = (u32::from_str_radix(k.trim_start_matches("0x"), 16), arr.as_array().and_then(|a| a.first()).and_then(|e| e.get("name")).and_then(|n| n.as_str())) {
+                        if let (Ok(sel), Some(first)) = (
+                            u32::from_str_radix(k.trim_start_matches("0x"), 16),
+                            arr.as_array()
+                                .and_then(|a| a.first())
+                                .and_then(|e| e.get("name"))
+                                .and_then(|n| n.as_str()),
+                        ) {
                             out.insert(sel, first.to_string());
                         }
                     }
@@ -74,7 +108,10 @@ pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
         let url = format!("https://www.4byte.directory/api/v1/signatures/?hex_signature={:#010x}&ordering=created_at", sel);
         if let Ok(resp) = agent.get(&url).call() {
             if let Ok(v) = resp.into_json::<serde_json::Value>() {
-                if let Some(t) = v.pointer("/results/0/text_signature").and_then(|x| x.as_str()) {
+                if let Some(t) = v
+                    .pointer("/results/0/text_signature")
+                    .and_then(|x| x.as_str())
+                {
                     out.insert(sel, t.to_string());
                 }
             }
@@ -119,6 +156,7 @@ pub fn params_of(sig: &str) -> Vec<String> {
     out
 }
 
+/// Function signatures in canonical ABI form, grouped by the protocols they come from.
 pub const FUNCTIONS: &[&str] = &[
     // ERC20 / ERC20 extensions
     "name()", "symbol()", "decimals()", "totalSupply()", "balanceOf(address)", "transfer(address,uint256)", "transferFrom(address,address,uint256)",
@@ -231,6 +269,7 @@ pub const FUNCTIONS: &[&str] = &[
     "fallback()", "receive()", "proxyOwner()", "transferProxyOwnership(address)", "upgradeTo(string,address)", "upgradeToAndCall(string,address,bytes)", "setImplementation(address)", "setPendingImplementation(address)", "acceptImplementation()", "_setImplementation(address,bool,bytes)", "comptrollerImplementation()", "pendingComptrollerImplementation()", "_become(address)",
 ];
 
+/// Event signatures in canonical ABI form.
 pub const EVENTS: &[&str] = &[
     "Transfer(address,address,uint256)", "Approval(address,address,uint256)", "Transfer(address,address,uint256,bytes)", "TransferSingle(address,address,address,uint256,uint256)", "TransferBatch(address,address,address,uint256[],uint256[])", "ApprovalForAll(address,address,bool)", "URI(string,uint256)",
     "OwnershipTransferred(address,address)", "OwnershipTransferStarted(address,address)", "OwnerNominated(address)", "OwnerChanged(address,address)", "AdminChanged(address,address)", "Upgraded(address)", "BeaconUpgraded(address)", "Initialized(uint8)", "Initialized(uint64)",
@@ -251,17 +290,238 @@ pub const EVENTS: &[&str] = &[
     "AnswerUpdated(int256,uint256,uint256)", "NewRound(uint256,address,uint256)", "SwapAndLiquify(uint256,uint256,uint256)", "MinTokensBeforeSwapUpdated(uint256)", "SwapAndLiquifyEnabledUpdated(bool)", "MaxTxAmountUpdated(uint256)", "ExcludeFromFee(address)", "Snapshot(uint256)", "Mint(address,uint256)", "Burned(address,uint256)", "Minted(address,uint256)", "TokensMinted(address,uint256)", "TokensBurned(address,uint256)", "Locked(address,uint256)", "Unlocked(address,uint256)", "Stake(address,uint256)", "Unstake(address,uint256)", "Harvest(address,uint256)", "EmergencyWithdraw(address,uint256,uint256)", "Deposit(address,uint256,uint256)", "Withdraw(address,uint256,uint256)", "ImplementationUpdated(address,address)", "ProxyOwnershipTransferred(address,address)", "ProxyUpdated(address,address)", "NewImplementation(address,address)", "NewPendingImplementation(address,address)",
 ];
 
+/// Custom error signatures in canonical ABI form.
 pub const ERRORS: &[&str] = &[
-    "Error(string)", "Panic(uint256)",
-    "OwnableUnauthorizedAccount(address)", "OwnableInvalidOwner(address)", "AccessControlUnauthorizedAccount(address,bytes32)", "AccessControlBadConfirmation()", "EnforcedPause()", "ExpectedPause()", "ReentrancyGuardReentrantCall()",
-    "ERC20InsufficientBalance(address,uint256,uint256)", "ERC20InvalidSender(address)", "ERC20InvalidReceiver(address)", "ERC20InsufficientAllowance(address,uint256,uint256)", "ERC20InvalidApprover(address)", "ERC20InvalidSpender(address)",
-    "ERC721InvalidOwner(address)", "ERC721NonexistentToken(uint256)", "ERC721IncorrectOwner(address,uint256,address)", "ERC721InvalidSender(address)", "ERC721InvalidReceiver(address)", "ERC721InsufficientApproval(address,uint256)", "ERC721InvalidApprover(address)", "ERC721InvalidOperator(address)",
-    "ERC1155InsufficientBalance(address,uint256,uint256,uint256)", "ERC1155InvalidSender(address)", "ERC1155InvalidReceiver(address)", "ERC1155MissingApprovalForAll(address,address)", "ERC1155InvalidApprover(address)", "ERC1155InvalidOperator(address)", "ERC1155InvalidArrayLength(uint256,uint256)",
-    "ERC2612ExpiredSignature(uint256)", "ERC2612InvalidSigner(address,address)", "InvalidAccountNonce(address,uint256)", "ECDSAInvalidSignature()", "ECDSAInvalidSignatureLength(uint256)", "ECDSAInvalidSignatureS(bytes32)", "SafeERC20FailedOperation(address)", "FailedInnerCall()", "AddressInsufficientBalance(address)", "AddressEmptyCode(address)", "FailedCall()", "InsufficientBalance(uint256,uint256)", "FailedDeployment()",
-    "ERC1967InvalidImplementation(address)", "ERC1967InvalidAdmin(address)", "ERC1967InvalidBeacon(address)", "ERC1967NonPayable()", "UUPSUnauthorizedCallContext()", "UUPSUnsupportedProxiableUUID(bytes32)", "InvalidInitialization()", "NotInitializing()", "ProxyDeniedAdminAccess()",
-    "AllowanceExpired(uint256)", "InsufficientAllowance(uint256)", "ExcessiveInvalidation()", "InvalidAmount(uint256)", "LengthMismatch()", "InvalidNonce()", "SignatureExpired(uint256)", "InvalidSignature()", "InvalidSignatureLength()", "InvalidSigner()", "InvalidContractSignature()", "InvalidSpender()",
-    "TransactionDeadlinePassed()", "V2TooLittleReceived()", "V2TooMuchRequested()", "V2InvalidPath()", "V3TooLittleReceived()", "V3TooMuchRequested()", "V3InvalidSwap()", "V3InvalidCaller()", "V3InvalidAmountOut()", "ExecutionFailed(uint256,bytes)", "ETHNotAccepted()", "InvalidCommandType(uint256)", "InsufficientToken()", "InsufficientETH()", "FromAddressIsNotOwner()", "InvalidBips()", "UnsafeCast()", "ContractLocked()", "InvalidReserves()", "InvalidPath()",
-    "InvalidTime()", "InvalidMsgValue()", "BadFulfillmentComponents()", "OrderAlreadyFilled(bytes32)", "InvalidSigner()", "InvalidCanceller()", "BadSignatureV(uint8)", "InvalidSignature()", "InvalidTime(uint256,uint256)", "OrderIsCancelled(bytes32)", "OrderPartiallyFilled(bytes32)", "ConsiderationNotMet(uint256,uint256,uint256)", "InsufficientNativeTokensSupplied()", "NativeTokenTransferGenericFailure(address,uint256)", "InvalidERC721TransferAmount(uint256)", "InvalidContractOrder(bytes32)", "NoReentrantCalls()", "InvalidCallToConduit(address)", "MissingItemAmount()", "UnusedItemParameters()", "InvalidBasicOrderParameterEncoding()", "OrderCriteriaResolverOutOfRange(uint8)", "CriteriaNotEnabledForItem()", "InvalidProof()", "InvalidRestrictedOrder(bytes32)", "Invalid1155BatchTransferEncoding()", "NoSpecifiedOrdersAvailable()", "InvalidNativeOfferItem()", "PartialFillsNotEnabledForOrder()", "InvalidFulfillmentComponentData()", "InexactFraction()", "MismatchedFulfillmentOfferAndConsiderationComponents(uint256)", "OfferAndConsiderationRequiredOnFulfillment()", "InvalidMsgValue(uint256)", "BadReturnValueFromERC20OnTransfer(address,address,address,uint256)", "TokenTransferGenericFailure(address,address,address,uint256,uint256)", "NoContract(address)", "BadContractSignature()",
-    "ZeroAddress()", "ZeroAmount()", "Unauthorized()", "NotOwner()", "NotAdmin()", "Forbidden()", "InvalidAddress()", "InvalidInput()", "InvalidParameter()", "InsufficientFunds()", "InsufficientBalance()", "InsufficientLiquidity()", "Expired()", "Deadline()", "DeadlineExpired()", "Slippage()", "Reentrancy()", "Reentrant()", "AlreadyInitialized()", "NotInitialized()", "Paused()", "NotPaused()", "Locked()", "TransferFailed()", "ETHTransferFailed()", "ApproveFailed()", "CallFailed()", "InvalidSelector()", "InvalidLength()", "ArrayLengthMismatch()", "AmountTooLow()", "AmountTooHigh()", "ExceedsMaxSupply()", "MaxSupplyReached()", "SoldOut()", "SaleNotActive()", "MintingNotActive()", "InvalidProof()", "AlreadyClaimed()", "NotWhitelisted()", "NothingToClaim()", "InvalidPrice()", "InvalidToken()", "InvalidRecipient()", "InvalidCaller()", "OnlyOwner()", "OnlyAdmin()", "OnlyPool()", "OnlyFactory()", "OnlyRouter()", "NotAuthorized()", "CallerNotOwner()", "InvalidImplementation()", "SameAddress()", "AlreadyExists()", "DoesNotExist()", "NotFound()", "OutOfBounds()", "IndexOutOfBounds()", "Overflow()", "Underflow()", "DivisionByZero()", "MathOverflowedMulDiv()", "StringsInsufficientHexLength(uint256,uint256)", "StringsInvalidChar()", "SafeCastOverflowedUintDowncast(uint8,uint256)", "SafeCastOverflowedIntToUint(int256)", "SafeCastOverflowedUintToInt(uint256)", "CheckpointUnorderedInsertion()", "ERC20ExceededCap(uint256,uint256)", "ERC20InvalidCap(uint256)", "ERC4626ExceededMaxDeposit(address,uint256,uint256)", "ERC4626ExceededMaxMint(address,uint256,uint256)", "ERC4626ExceededMaxWithdraw(address,uint256,uint256)", "ERC4626ExceededMaxRedeem(address,uint256,uint256)", "VotesExpiredSignature(uint256)", "GovernorInvalidProposalLength(uint256,uint256,uint256)", "GovernorAlreadyCastVote(address)", "GovernorDisabledDeposit()", "GovernorOnlyExecutor(address)", "GovernorNonexistentProposal(uint256)", "GovernorUnexpectedProposalState(uint256,uint8,bytes32)", "GovernorInvalidVotingPeriod(uint256)", "GovernorInsufficientProposerVotes(address,uint256,uint256)", "GovernorRestrictedProposer(address)", "GovernorInvalidVoteType()", "GovernorQueueNotImplemented()", "GovernorNotQueuedProposal(uint256)", "GovernorAlreadyQueuedProposal(uint256)", "GovernorInvalidSignature(address)", "TimelockUnexpectedOperationState(bytes32,bytes32)", "TimelockUnexecutedPredecessor(bytes32)", "TimelockInvalidOperationLength(uint256,uint256,uint256)", "TimelockInsufficientDelay(uint256,uint256)", "TimelockUnauthorizedCaller(address)",
-    "Create2EmptyBytecode()", "Create2FailedDeployment()", "Create2InsufficientBalance(uint256,uint256)", "ERC1167FailedCreateClone()", "MulticallFailed()", "SafeERC20FailedDecreaseAllowance(address,uint256,uint256)", "InvalidShortString()", "StringTooLong(string)", "ERC2981InvalidDefaultRoyalty(uint256,uint256)", "ERC2981InvalidDefaultRoyaltyReceiver(address)", "ERC2981InvalidTokenRoyalty(uint256,uint256,uint256)", "ERC2981InvalidTokenRoyaltyReceiver(uint256,address)", "ERC721EnumerableForbiddenBatchMint()", "ERC721OutOfBoundsIndex(address,uint256)", "ERC2771InvalidForwarder(address)",
+    "Error(string)",
+    "Panic(uint256)",
+    "OwnableUnauthorizedAccount(address)",
+    "OwnableInvalidOwner(address)",
+    "AccessControlUnauthorizedAccount(address,bytes32)",
+    "AccessControlBadConfirmation()",
+    "EnforcedPause()",
+    "ExpectedPause()",
+    "ReentrancyGuardReentrantCall()",
+    "ERC20InsufficientBalance(address,uint256,uint256)",
+    "ERC20InvalidSender(address)",
+    "ERC20InvalidReceiver(address)",
+    "ERC20InsufficientAllowance(address,uint256,uint256)",
+    "ERC20InvalidApprover(address)",
+    "ERC20InvalidSpender(address)",
+    "ERC721InvalidOwner(address)",
+    "ERC721NonexistentToken(uint256)",
+    "ERC721IncorrectOwner(address,uint256,address)",
+    "ERC721InvalidSender(address)",
+    "ERC721InvalidReceiver(address)",
+    "ERC721InsufficientApproval(address,uint256)",
+    "ERC721InvalidApprover(address)",
+    "ERC721InvalidOperator(address)",
+    "ERC1155InsufficientBalance(address,uint256,uint256,uint256)",
+    "ERC1155InvalidSender(address)",
+    "ERC1155InvalidReceiver(address)",
+    "ERC1155MissingApprovalForAll(address,address)",
+    "ERC1155InvalidApprover(address)",
+    "ERC1155InvalidOperator(address)",
+    "ERC1155InvalidArrayLength(uint256,uint256)",
+    "ERC2612ExpiredSignature(uint256)",
+    "ERC2612InvalidSigner(address,address)",
+    "InvalidAccountNonce(address,uint256)",
+    "ECDSAInvalidSignature()",
+    "ECDSAInvalidSignatureLength(uint256)",
+    "ECDSAInvalidSignatureS(bytes32)",
+    "SafeERC20FailedOperation(address)",
+    "FailedInnerCall()",
+    "AddressInsufficientBalance(address)",
+    "AddressEmptyCode(address)",
+    "FailedCall()",
+    "InsufficientBalance(uint256,uint256)",
+    "FailedDeployment()",
+    "ERC1967InvalidImplementation(address)",
+    "ERC1967InvalidAdmin(address)",
+    "ERC1967InvalidBeacon(address)",
+    "ERC1967NonPayable()",
+    "UUPSUnauthorizedCallContext()",
+    "UUPSUnsupportedProxiableUUID(bytes32)",
+    "InvalidInitialization()",
+    "NotInitializing()",
+    "ProxyDeniedAdminAccess()",
+    "AllowanceExpired(uint256)",
+    "InsufficientAllowance(uint256)",
+    "ExcessiveInvalidation()",
+    "InvalidAmount(uint256)",
+    "LengthMismatch()",
+    "InvalidNonce()",
+    "SignatureExpired(uint256)",
+    "InvalidSignature()",
+    "InvalidSignatureLength()",
+    "InvalidSigner()",
+    "InvalidContractSignature()",
+    "InvalidSpender()",
+    "TransactionDeadlinePassed()",
+    "V2TooLittleReceived()",
+    "V2TooMuchRequested()",
+    "V2InvalidPath()",
+    "V3TooLittleReceived()",
+    "V3TooMuchRequested()",
+    "V3InvalidSwap()",
+    "V3InvalidCaller()",
+    "V3InvalidAmountOut()",
+    "ExecutionFailed(uint256,bytes)",
+    "ETHNotAccepted()",
+    "InvalidCommandType(uint256)",
+    "InsufficientToken()",
+    "InsufficientETH()",
+    "FromAddressIsNotOwner()",
+    "InvalidBips()",
+    "UnsafeCast()",
+    "ContractLocked()",
+    "InvalidReserves()",
+    "InvalidPath()",
+    "InvalidTime()",
+    "InvalidMsgValue()",
+    "BadFulfillmentComponents()",
+    "OrderAlreadyFilled(bytes32)",
+    "InvalidSigner()",
+    "InvalidCanceller()",
+    "BadSignatureV(uint8)",
+    "InvalidSignature()",
+    "InvalidTime(uint256,uint256)",
+    "OrderIsCancelled(bytes32)",
+    "OrderPartiallyFilled(bytes32)",
+    "ConsiderationNotMet(uint256,uint256,uint256)",
+    "InsufficientNativeTokensSupplied()",
+    "NativeTokenTransferGenericFailure(address,uint256)",
+    "InvalidERC721TransferAmount(uint256)",
+    "InvalidContractOrder(bytes32)",
+    "NoReentrantCalls()",
+    "InvalidCallToConduit(address)",
+    "MissingItemAmount()",
+    "UnusedItemParameters()",
+    "InvalidBasicOrderParameterEncoding()",
+    "OrderCriteriaResolverOutOfRange(uint8)",
+    "CriteriaNotEnabledForItem()",
+    "InvalidProof()",
+    "InvalidRestrictedOrder(bytes32)",
+    "Invalid1155BatchTransferEncoding()",
+    "NoSpecifiedOrdersAvailable()",
+    "InvalidNativeOfferItem()",
+    "PartialFillsNotEnabledForOrder()",
+    "InvalidFulfillmentComponentData()",
+    "InexactFraction()",
+    "MismatchedFulfillmentOfferAndConsiderationComponents(uint256)",
+    "OfferAndConsiderationRequiredOnFulfillment()",
+    "InvalidMsgValue(uint256)",
+    "BadReturnValueFromERC20OnTransfer(address,address,address,uint256)",
+    "TokenTransferGenericFailure(address,address,address,uint256,uint256)",
+    "NoContract(address)",
+    "BadContractSignature()",
+    "ZeroAddress()",
+    "ZeroAmount()",
+    "Unauthorized()",
+    "NotOwner()",
+    "NotAdmin()",
+    "Forbidden()",
+    "InvalidAddress()",
+    "InvalidInput()",
+    "InvalidParameter()",
+    "InsufficientFunds()",
+    "InsufficientBalance()",
+    "InsufficientLiquidity()",
+    "Expired()",
+    "Deadline()",
+    "DeadlineExpired()",
+    "Slippage()",
+    "Reentrancy()",
+    "Reentrant()",
+    "AlreadyInitialized()",
+    "NotInitialized()",
+    "Paused()",
+    "NotPaused()",
+    "Locked()",
+    "TransferFailed()",
+    "ETHTransferFailed()",
+    "ApproveFailed()",
+    "CallFailed()",
+    "InvalidSelector()",
+    "InvalidLength()",
+    "ArrayLengthMismatch()",
+    "AmountTooLow()",
+    "AmountTooHigh()",
+    "ExceedsMaxSupply()",
+    "MaxSupplyReached()",
+    "SoldOut()",
+    "SaleNotActive()",
+    "MintingNotActive()",
+    "InvalidProof()",
+    "AlreadyClaimed()",
+    "NotWhitelisted()",
+    "NothingToClaim()",
+    "InvalidPrice()",
+    "InvalidToken()",
+    "InvalidRecipient()",
+    "InvalidCaller()",
+    "OnlyOwner()",
+    "OnlyAdmin()",
+    "OnlyPool()",
+    "OnlyFactory()",
+    "OnlyRouter()",
+    "NotAuthorized()",
+    "CallerNotOwner()",
+    "InvalidImplementation()",
+    "SameAddress()",
+    "AlreadyExists()",
+    "DoesNotExist()",
+    "NotFound()",
+    "OutOfBounds()",
+    "IndexOutOfBounds()",
+    "Overflow()",
+    "Underflow()",
+    "DivisionByZero()",
+    "MathOverflowedMulDiv()",
+    "StringsInsufficientHexLength(uint256,uint256)",
+    "StringsInvalidChar()",
+    "SafeCastOverflowedUintDowncast(uint8,uint256)",
+    "SafeCastOverflowedIntToUint(int256)",
+    "SafeCastOverflowedUintToInt(uint256)",
+    "CheckpointUnorderedInsertion()",
+    "ERC20ExceededCap(uint256,uint256)",
+    "ERC20InvalidCap(uint256)",
+    "ERC4626ExceededMaxDeposit(address,uint256,uint256)",
+    "ERC4626ExceededMaxMint(address,uint256,uint256)",
+    "ERC4626ExceededMaxWithdraw(address,uint256,uint256)",
+    "ERC4626ExceededMaxRedeem(address,uint256,uint256)",
+    "VotesExpiredSignature(uint256)",
+    "GovernorInvalidProposalLength(uint256,uint256,uint256)",
+    "GovernorAlreadyCastVote(address)",
+    "GovernorDisabledDeposit()",
+    "GovernorOnlyExecutor(address)",
+    "GovernorNonexistentProposal(uint256)",
+    "GovernorUnexpectedProposalState(uint256,uint8,bytes32)",
+    "GovernorInvalidVotingPeriod(uint256)",
+    "GovernorInsufficientProposerVotes(address,uint256,uint256)",
+    "GovernorRestrictedProposer(address)",
+    "GovernorInvalidVoteType()",
+    "GovernorQueueNotImplemented()",
+    "GovernorNotQueuedProposal(uint256)",
+    "GovernorAlreadyQueuedProposal(uint256)",
+    "GovernorInvalidSignature(address)",
+    "TimelockUnexpectedOperationState(bytes32,bytes32)",
+    "TimelockUnexecutedPredecessor(bytes32)",
+    "TimelockInvalidOperationLength(uint256,uint256,uint256)",
+    "TimelockInsufficientDelay(uint256,uint256)",
+    "TimelockUnauthorizedCaller(address)",
+    "Create2EmptyBytecode()",
+    "Create2FailedDeployment()",
+    "Create2InsufficientBalance(uint256,uint256)",
+    "ERC1167FailedCreateClone()",
+    "MulticallFailed()",
+    "SafeERC20FailedDecreaseAllowance(address,uint256,uint256)",
+    "InvalidShortString()",
+    "StringTooLong(string)",
+    "ERC2981InvalidDefaultRoyalty(uint256,uint256)",
+    "ERC2981InvalidDefaultRoyaltyReceiver(address)",
+    "ERC2981InvalidTokenRoyalty(uint256,uint256,uint256)",
+    "ERC2981InvalidTokenRoyaltyReceiver(uint256,address)",
+    "ERC721EnumerableForbiddenBatchMint()",
+    "ERC721OutOfBoundsIndex(address,uint256)",
+    "ERC2771InvalidForwarder(address)",
 ];

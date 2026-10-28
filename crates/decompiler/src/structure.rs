@@ -1,7 +1,7 @@
 //! Control-flow structuring: turns the lifted graph into nested `if`/`else`/`while`/`require`
 //! with `break`/`continue`, falling back to labelled `goto` only when the graph is irreducible.
 
-use crate::emit::{self, Names};
+use crate::emit::{self, Names, PayloadKind};
 use crate::expr::{self, ExprId, Node};
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
@@ -21,17 +21,24 @@ struct Graph {
     reachable: Vec<bool>,
 }
 
-fn dominators(n: usize, entry: usize, succs: &[Vec<usize>], preds: &[Vec<usize>], rpo: &[usize], rpo_index: &[usize]) -> Vec<Option<usize>> {
+fn dominators(
+    n: usize,
+    entry: usize,
+    succs: &[Vec<usize>],
+    preds: &[Vec<usize>],
+    rpo: &[usize],
+    rpo_index: &[usize],
+) -> Vec<Option<usize>> {
     // Cooper-Harvey-Kennedy.
     let mut idom: Vec<Option<usize>> = vec![None; n];
     idom[entry] = Some(entry);
     let intersect = |mut a: usize, mut b: usize, idom: &Vec<Option<usize>>| -> usize {
         while a != b {
             while rpo_index[a] > rpo_index[b] {
-                a = idom[a].unwrap();
+                a = idom[a].expect("processed nodes have an immediate dominator");
             }
             while rpo_index[b] > rpo_index[a] {
-                b = idom[b].unwrap();
+                b = idom[b].expect("processed nodes have an immediate dominator");
             }
         }
         a
@@ -178,8 +185,19 @@ impl Graph {
             rrpo_index[x] = i;
         }
         let ipdom_full = dominators(n + 1, n, &rsuccs, &rpreds, &rorder, &rrpo_index);
-        let ipdom: Vec<Option<usize>> = (0..n).map(|x| ipdom_full[x].filter(|d| *d != n && *d != x)).collect();
-        Graph { n, succs, preds, rpo, rpo_index, idom, ipdom, reachable }
+        let ipdom: Vec<Option<usize>> = (0..n)
+            .map(|x| ipdom_full[x].filter(|d| *d != n && *d != x))
+            .collect();
+        Graph {
+            n,
+            succs,
+            preds,
+            rpo,
+            rpo_index,
+            idom,
+            ipdom,
+            reachable,
+        }
     }
 
     fn dominates(&self, a: usize, mut b: usize) -> bool {
@@ -207,7 +225,9 @@ fn is_noreturn_leaf(l: &Lifted, mut x: usize) -> bool {
             return false;
         }
         match &nd.term {
-            Term::Revert { .. } | Term::Invalid | Term::Infeasible | Term::Unresolved(_) => return true,
+            Term::Revert { .. } | Term::Invalid | Term::Infeasible | Term::Unresolved(_) => {
+                return true
+            }
             Term::Jump(t) => x = *t,
             _ => return false,
         }
@@ -231,7 +251,11 @@ fn find_loops(g: &Graph) -> HashMap<usize, Loop> {
         for &s in &g.succs[x] {
             if g.dominates(s, x) {
                 // Back edge x -> s. Natural loop body: nodes reaching x without passing s.
-                let entry = loops.entry(s).or_insert(Loop { header: s, body: HashSet::new(), exits: Vec::new() });
+                let entry = loops.entry(s).or_insert(Loop {
+                    header: s,
+                    body: HashSet::new(),
+                    exits: Vec::new(),
+                });
                 entry.body.insert(s);
                 let mut stack = vec![x];
                 while let Some(y) = stack.pop() {
@@ -340,7 +364,12 @@ impl<'a> Printer<'a> {
                 return None;
             }
             for s in &nd.stmts {
-                if let Stmt::MStore { off, val, width: 32 } = s {
+                if let Stmt::MStore {
+                    off,
+                    val,
+                    width: 32,
+                } = s
+                {
                     stores.push((*off, *val));
                 }
             }
@@ -349,7 +378,12 @@ impl<'a> Printer<'a> {
                 Term::Revert { data, len, off } => {
                     return Some(match data {
                         Some(words) if !words.is_empty() => {
-                            let p = emit::fmt_payload(words, expr::as_const(*len), self.names, true);
+                            let p = emit::fmt_payload(
+                                words,
+                                expr::as_const(*len),
+                                self.names,
+                                PayloadKind::Revert,
+                            );
                             Some(p)
                         }
                         Some(_) => None,
@@ -359,8 +393,14 @@ impl<'a> Printer<'a> {
                             } else if let Some((words, l)) = payload_from_stores(&stores, *off) {
                                 // A revert tail shared by several sites: the lifter saw merged
                                 // memory, but the stores on this path spell the payload out.
-                                let p = emit::fmt_payload(&words, Some(U256::from_u64(l)), self.names, true);
-                                if p.starts_with('"') || p.starts_with("Panic(") || p.contains('(') {
+                                let p = emit::fmt_payload(
+                                    &words,
+                                    Some(U256::from_u64(l)),
+                                    self.names,
+                                    PayloadKind::Revert,
+                                );
+                                if p.starts_with('"') || p.starts_with("Panic(") || p.contains('(')
+                                {
                                     Some(p)
                                 } else {
                                     return None;
@@ -389,12 +429,31 @@ impl<'a> Printer<'a> {
     /// `to.transfer(v)`: print it that way and continue on the success path.
     fn try_transfer_idiom(&mut self, n: usize, stop: Option<usize>, depth: usize) -> bool {
         let nd = &self.l.nodes[n];
-        let Term::Branch { cond, t: Some(t), f } = &nd.term else { return false };
-        let Some(Stmt::Call { kind: op::CALL, addr, value: Some(value), in_len, gas, seq, .. }) = nd.stmts.last() else { return false };
+        let Term::Branch {
+            cond,
+            t: Some(t),
+            f,
+        } = &nd.term
+        else {
+            return false;
+        };
+        let Some(Stmt::Call {
+            kind: op::CALL,
+            addr,
+            value: Some(value),
+            in_len,
+            gas,
+            seq,
+            ..
+        }) = nd.stmts.last()
+        else {
+            return false;
+        };
         if expr::as_const(*in_len) != Some(U256::ZERO) {
             return false;
         }
-        let stipend = expr::as_const(*gas).map_or(false, |g| g == U256::from_u64(2300)) || matches!(expr::node(*gas), Node::Op(op::MUL, ref v) if expr::as_const(v[1]) == Some(U256::from_u64(2300)) || expr::as_const(v[0]) == Some(U256::from_u64(2300)));
+        let stipend = expr::as_const(*gas).is_some_and(|g| g == U256::from_u64(2300))
+            || matches!(expr::node(*gas), Node::Op(op::MUL, ref v) if expr::as_const(v[1]) == Some(U256::from_u64(2300)) || expr::as_const(v[0]) == Some(U256::from_u64(2300)));
         if !stipend {
             return false;
         }
@@ -416,7 +475,14 @@ impl<'a> Printer<'a> {
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
         }
-        self.line(depth, &format!("payable({}).transfer({});", emit::fmt_expr(addr, self.names), emit::fmt_expr(value, self.names)));
+        self.line(
+            depth,
+            &format!(
+                "payable({}).transfer({});",
+                emit::fmt_expr(addr, self.names),
+                emit::fmt_expr(value, self.names)
+            ),
+        );
         self.facts.push((cond, ok == *t));
         self.transfer(n, ok, stop, depth);
         self.facts.pop();
@@ -427,13 +493,18 @@ impl<'a> Printer<'a> {
         for s in &self.l.nodes[n].stmts {
             // A call whose every result prints under an alias (storage-string loader) is implied.
             if let Stmt::Internal { results, .. } = s {
-                if !results.is_empty() && results.iter().all(|r| self.names.aliases.contains_key(r)) {
+                if !results.is_empty() && results.iter().all(|r| self.names.aliases.contains_key(r))
+                {
                     continue;
                 }
             }
             if let Stmt::Drop(e) = s {
                 let target = expr::node(*e);
-                if self.used.iter().any(|u| expr::contains(*u, &|nd| *nd == target)) {
+                if self
+                    .used
+                    .iter()
+                    .any(|u| expr::contains(*u, &|nd| *nd == target))
+                {
                     continue;
                 }
             }
@@ -446,28 +517,43 @@ impl<'a> Printer<'a> {
     /// variable assigned above it, saving a variable's old value in a temporary when the copies
     /// form a cycle (`a = b; b = a`).
     fn assign_lines(&mut self, assigns: &[(ExprId, ExprId)], depth: usize) {
-        let mut rem: Vec<(ExprId, ExprId)> = assigns.iter().copied().filter(|(a, b)| a != b).collect();
+        let mut rem: Vec<(ExprId, ExprId)> =
+            assigns.iter().copied().filter(|(a, b)| a != b).collect();
         while !rem.is_empty() {
             let reads = |rhs: ExprId, var: ExprId| {
                 let target = expr::node(var);
                 expr::contains(rhs, &|nd| *nd == target)
             };
-            let pick = rem.iter().position(|(var, _)| !rem.iter().any(|(v2, rhs)| v2 != var && reads(*rhs, *var)));
+            let pick = rem
+                .iter()
+                .position(|(var, _)| !rem.iter().any(|(v2, rhs)| v2 != var && reads(*rhs, *var)));
             match pick {
                 Some(i) => {
                     let (var, val) = rem.remove(i);
-                    let s = format!("{} = {};", emit::fmt_expr(var, self.names), emit::fmt_expr(val, self.names));
+                    let s = format!(
+                        "{} = {};",
+                        emit::fmt_expr(var, self.names),
+                        emit::fmt_expr(val, self.names)
+                    );
                     self.line(depth, &s);
                 }
                 None => {
                     let (var, _) = rem[0];
                     let tmp = expr::intern(Node::Var(self.next_tmp));
                     self.next_tmp += 1;
-                    let s = format!("{} = {};", emit::fmt_expr(tmp, self.names), emit::fmt_expr(var, self.names));
+                    let s = format!(
+                        "{} = {};",
+                        emit::fmt_expr(tmp, self.names),
+                        emit::fmt_expr(var, self.names)
+                    );
                     self.line(depth, &s);
                     let target = expr::node(var);
                     for (_, rhs) in rem.iter_mut() {
-                        *rhs = expr::substitute(*rhs, &|nd| if *nd == target { Some(tmp) } else { None }, &mut HashMap::new());
+                        *rhs = expr::substitute(
+                            *rhs,
+                            &|nd| if *nd == target { Some(tmp) } else { None },
+                            &mut HashMap::new(),
+                        );
                     }
                 }
             }
@@ -499,7 +585,10 @@ impl<'a> Printer<'a> {
                 } else {
                     self.labels.insert(n);
                     self.gotos += 1;
-                    self.line(depth, &format!("goto L{:x}; // continue outer loop", self.node_pc(n)));
+                    self.line(
+                        depth,
+                        &format!("goto L{:x}; // continue outer loop", self.node_pc(n)),
+                    );
                 }
                 return;
             }
@@ -509,7 +598,10 @@ impl<'a> Printer<'a> {
                 } else {
                     self.labels.insert(n);
                     self.gotos += 1;
-                    self.line(depth, &format!("goto L{:x}; // break outer loop", self.node_pc(n)));
+                    self.line(
+                        depth,
+                        &format!("goto L{:x}; // break outer loop", self.node_pc(n)),
+                    );
                 }
                 return;
             }
@@ -589,10 +681,20 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn emit_loop(&mut self, header: usize, body: &HashSet<usize>, exits: &[usize], stop: Option<usize>, depth: usize) {
+    fn emit_loop(
+        &mut self,
+        header: usize,
+        body: &HashSet<usize>,
+        exits: &[usize],
+        stop: Option<usize>,
+        depth: usize,
+    ) {
         self.emitted.insert(header);
         if self.labels.contains(&header) {
-            self.line(depth.saturating_sub(1), &format!("L{:x}:", self.node_pc(header)));
+            self.line(
+                depth.saturating_sub(1),
+                &format!("L{:x}:", self.node_pc(header)),
+            );
         }
         // Prefer the post-dominator of the header as the loop's continuation if it is an exit.
         let exit = match exits.len() {
@@ -617,20 +719,31 @@ impl<'a> Printer<'a> {
         if nd.stmts.is_empty() {
             if let Term::Jump(j) = &nd.term {
                 let jn = &self.l.nodes[*j];
-                if body.contains(j) && jn.stmts.is_empty() && jn.preds.len() == 1 && !self.l.edge_assigns.contains_key(&(header, *j)) && matches!(jn.term, Term::Branch { .. }) {
+                if body.contains(j)
+                    && jn.stmts.is_empty()
+                    && jn.preds.len() == 1
+                    && !self.l.edge_assigns.contains_key(&(header, *j))
+                    && matches!(jn.term, Term::Branch { .. })
+                {
                     cond_node = *j;
                 }
             }
         }
         let cn = &self.l.nodes[cond_node];
         if cn.stmts.is_empty() {
-            if let Term::Branch { cond, t, f } = &cn.term {
-                if let Some(t) = t {
+            if let Term::Branch {
+                cond,
+                t: Some(t),
+                f,
+            } = &cn.term
+            {
+                {
                     if body.contains(t) && !body.contains(f) {
                         while_cond = Some((emit::fmt_expr(*cond, self.names), *t));
                         exit = Some(*f);
                     } else if body.contains(f) && !body.contains(t) {
-                        while_cond = Some((emit::fmt_expr(expr::op1(op::ISZERO, *cond), self.names), *f));
+                        while_cond =
+                            Some((emit::fmt_expr(expr::op1(op::ISZERO, *cond), self.names), *f));
                         exit = Some(*t);
                     }
                 }
@@ -640,8 +753,28 @@ impl<'a> Printer<'a> {
             self.emitted.insert(cond_node);
         }
         if std::env::var("EVMDEC_DEBUG_LOOP").is_ok() {
-            let tf = match &nd.term { Term::Branch { t, f, .. } => format!("branch t={:?} (in body {:?}) f={} (in body {})", t, t.map(|t| body.contains(&t)), f, body.contains(f)), Term::Jump(j) => format!("jump {}", j), Term::Switch { .. } => "switch".into(), _ => "other".into() };
-            eprintln!("loop header {} pc={:#x} stmts={} {} body={:?} exits={:?} while={}", header, self.node_pc(header), nd.stmts.len(), tf, body.iter().collect::<Vec<_>>(), exits, while_cond.is_some());
+            let tf = match &nd.term {
+                Term::Branch { t, f, .. } => format!(
+                    "branch t={:?} (in body {:?}) f={} (in body {})",
+                    t,
+                    t.map(|t| body.contains(&t)),
+                    f,
+                    body.contains(f)
+                ),
+                Term::Jump(j) => format!("jump {}", j),
+                Term::Switch { .. } => "switch".into(),
+                _ => "other".into(),
+            };
+            eprintln!(
+                "loop header {} pc={:#x} stmts={} {} body={:?} exits={:?} while={}",
+                header,
+                self.node_pc(header),
+                nd.stmts.len(),
+                tf,
+                body.iter().collect::<Vec<_>>(),
+                exits,
+                while_cond.is_some()
+            );
         }
         self.loop_stack.push((header, exit, depth + 1));
         match while_cond {
@@ -660,7 +793,9 @@ impl<'a> Printer<'a> {
                 let term = self.l.nodes[header].term.clone();
                 match term {
                     Term::Jump(t) => self.transfer(header, t, None, depth + 1),
-                    Term::Branch { cond, t, f } => self.emit_branch(header, cond, t, f, None, depth + 1),
+                    Term::Branch { cond, t, f } => {
+                        self.emit_branch(header, cond, t, f, None, depth + 1)
+                    }
                     other => {
                         if let Some(s) = emit::fmt_term_halt(&other, self.names) {
                             self.line(depth + 1, &s);
@@ -699,7 +834,15 @@ impl<'a> Printer<'a> {
         None
     }
 
-    fn emit_branch(&mut self, n: usize, cond: ExprId, t: Option<usize>, f: usize, stop: Option<usize>, depth: usize) {
+    fn emit_branch(
+        &mut self,
+        n: usize,
+        cond: ExprId,
+        t: Option<usize>,
+        f: usize,
+        stop: Option<usize>,
+        depth: usize,
+    ) {
         // A condition already decided on this path: only one side can execute.
         if let Some(v) = self.known(cond) {
             match (v, t) {
@@ -719,10 +862,16 @@ impl<'a> Printer<'a> {
         let f_rev = self.revert_reason(f);
         let join = self.g.ipdom[n];
         if let Some(reason) = f_rev.clone() {
-            if t.is_some() && t_rev.is_none() {
+            if let (Some(t), None) = (t, &t_rev) {
                 // if (!cond) revert  =>  require(cond)
-                let t = t.unwrap();
-                self.line(depth, &format!("require({}{});", emit::fmt_cond(cond, self.names), reason_suffix(&reason)));
+                self.line(
+                    depth,
+                    &format!(
+                        "require({}{});",
+                        emit::fmt_cond(cond, self.names),
+                        reason_suffix(&reason)
+                    ),
+                );
                 self.facts.push((cond, true));
                 self.transfer(n, t, stop, depth);
                 self.facts.pop();
@@ -732,7 +881,14 @@ impl<'a> Printer<'a> {
         if let Some(reason) = t_rev.clone() {
             if f_rev.is_none() {
                 let ncond = expr::op1(op::ISZERO, cond);
-                self.line(depth, &format!("require({}{});", emit::fmt_cond(ncond, self.names), reason_suffix(&reason)));
+                self.line(
+                    depth,
+                    &format!(
+                        "require({}{});",
+                        emit::fmt_cond(ncond, self.names),
+                        reason_suffix(&reason)
+                    ),
+                );
                 self.facts.push((cond, false));
                 self.transfer(n, f, stop, depth);
                 self.facts.pop();
@@ -740,7 +896,10 @@ impl<'a> Printer<'a> {
             }
         }
         let Some(t) = t else {
-            self.line(depth, &format!("if ({}) {{ revert(); }}", emit::fmt_expr(cond, self.names)));
+            self.line(
+                depth,
+                &format!("if ({}) {{ revert(); }}", emit::fmt_expr(cond, self.names)),
+            );
             self.transfer(n, f, stop, depth);
             return;
         };
@@ -775,7 +934,10 @@ impl<'a> Printer<'a> {
             }
         };
         let first_is_true_side = first == t && first_cond == cond;
-        self.line(depth, &format!("if ({}) {{", emit::fmt_expr(first_cond, self.names)));
+        self.line(
+            depth,
+            &format!("if ({}) {{", emit::fmt_expr(first_cond, self.names)),
+        );
         self.active.insert(n);
         self.facts.push((cond, first_is_true_side));
         self.transfer(n, first, join, depth + 1);
@@ -811,7 +973,13 @@ impl<'a> Printer<'a> {
     /// Edge copies of a side that is either the join itself or a statement-free node jumping to it.
     fn side_assigns(&self, n: usize, side: usize, join: usize) -> Option<Vec<(ExprId, ExprId)>> {
         if side == join {
-            return Some(self.l.edge_assigns.get(&(n, side)).cloned().unwrap_or_default());
+            return Some(
+                self.l
+                    .edge_assigns
+                    .get(&(n, side))
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
         let nd = &self.l.nodes[side];
         if !nd.stmts.is_empty() || nd.preds.len() != 1 || self.emitted.contains(&side) {
@@ -819,15 +987,33 @@ impl<'a> Printer<'a> {
         }
         match nd.term {
             Term::Jump(t) if t == join => {
-                let mut v = self.l.edge_assigns.get(&(n, side)).cloned().unwrap_or_default();
-                v.extend(self.l.edge_assigns.get(&(side, join)).cloned().unwrap_or_default());
+                let mut v = self
+                    .l
+                    .edge_assigns
+                    .get(&(n, side))
+                    .cloned()
+                    .unwrap_or_default();
+                v.extend(
+                    self.l
+                        .edge_assigns
+                        .get(&(side, join))
+                        .cloned()
+                        .unwrap_or_default(),
+                );
                 Some(v)
             }
             _ => None,
         }
     }
 
-    fn try_ternary(&mut self, n: usize, cond: ExprId, t: usize, f: usize, join: usize) -> Option<String> {
+    fn try_ternary(
+        &mut self,
+        n: usize,
+        cond: ExprId,
+        t: usize,
+        f: usize,
+        join: usize,
+    ) -> Option<String> {
         let ta = self.side_assigns(n, t, join)?;
         let fa = self.side_assigns(n, f, join)?;
         if ta.len() != 1 || fa.len() != 1 || ta[0].0 != fa[0].0 {
@@ -845,7 +1031,11 @@ impl<'a> Printer<'a> {
         // `v = c ? x : y` with one side equal to the condition (or its negation) is a
         // short-circuit:  c ? x : c  = c && x      c ? c : y  = c || y
         //                 c ? !c : y = !c && y     c ? x : !c = !c || x
-        let (var_s, c_s, nc_s) = (emit::fmt_expr(var, self.names), emit::fmt_expr(cond, self.names), emit::fmt_expr(ncond, self.names));
+        let (var_s, c_s, nc_s) = (
+            emit::fmt_expr(var, self.names),
+            emit::fmt_expr(cond, self.names),
+            emit::fmt_expr(ncond, self.names),
+        );
         let txt = if y == cond {
             format!("{} = {} && {};", var_s, c_s, emit::fmt_expr(x, self.names))
         } else if x == cond {
@@ -855,7 +1045,13 @@ impl<'a> Printer<'a> {
         } else if y == ncond {
             format!("{} = {} || {};", var_s, nc_s, emit::fmt_expr(x, self.names))
         } else {
-            format!("{} = {} ? {} : {};", var_s, c_s, emit::fmt_expr(x, self.names), emit::fmt_expr(y, self.names))
+            format!(
+                "{} = {} ? {} : {};",
+                var_s,
+                c_s,
+                emit::fmt_expr(x, self.names),
+                emit::fmt_expr(y, self.names)
+            )
         };
         if expr::is_boolean(x) && expr::is_boolean(y) {
             expr::mark_boolean(var);
@@ -884,7 +1080,11 @@ impl<'a> Printer<'a> {
                 return false;
             }
             // Loop control edges count as terminal.
-            if self.loop_stack.iter().any(|(h, e, _)| *h == x || *e == Some(x)) {
+            if self
+                .loop_stack
+                .iter()
+                .any(|(h, e, _)| *h == x || *e == Some(x))
+            {
                 continue;
             }
             for &s in &self.g.succs[x] {
@@ -906,11 +1106,16 @@ fn reason_suffix(reason: &Option<String>) -> String {
     }
 }
 
+#[derive(Clone, Debug)]
+/// Structured rendering of one function body.
 pub struct Structured {
+    /// The body as indented pseudo-Solidity.
     pub text: String,
+    /// Number of `goto`s that were needed because the graph is irreducible.
     pub gotos: usize,
 }
 
+/// Structure and render `l` at `base_depth` levels of indentation (four spaces each).
 pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     let g = Graph::new(l);
     let loops = find_loops(&g);
@@ -921,10 +1126,29 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         used.extend(crate::lift::node_exprs(&probe));
     }
     used.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
-    let mut p = Printer { l, g, loops, names, out: String::new(), emitted: HashSet::new(), labels: HashSet::new(), loop_stack: Vec::new(), gotos: 0, active: HashSet::new(), next_tmp: 1 << 30, used, facts: Vec::new() };
+    let mut p = Printer {
+        l,
+        g,
+        loops,
+        names,
+        out: String::new(),
+        emitted: HashSet::new(),
+        labels: HashSet::new(),
+        loop_stack: Vec::new(),
+        gotos: 0,
+        active: HashSet::new(),
+        next_tmp: 1 << 30,
+        used,
+        facts: Vec::new(),
+    };
     p.go(l.entry, None, base_depth);
     // Emit any reachable nodes that were targeted by gotos but never emitted (irreducible parts).
-    let mut pending: Vec<usize> = p.labels.iter().copied().filter(|n| !p.emitted.contains(n)).collect();
+    let mut pending: Vec<usize> = p
+        .labels
+        .iter()
+        .copied()
+        .filter(|n| !p.emitted.contains(n))
+        .collect();
     let mut rounds = 0;
     while !pending.is_empty() && rounds < 64 {
         rounds += 1;
@@ -934,16 +1158,40 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
                 p.emit_node(n, None, base_depth);
             }
         }
-        pending = p.labels.iter().copied().filter(|n| !p.emitted.contains(n)).collect();
+        pending = p
+            .labels
+            .iter()
+            .copied()
+            .filter(|n| !p.emitted.contains(n))
+            .collect();
     }
     // Labels are known only after printing: insert them where referenced nodes were emitted.
     // The printer emits labels eagerly when known; a second pass handles labels discovered later.
     let text = if p.labels.iter().any(|n| p.emitted.contains(n)) {
         let g2 = Graph::new(l);
         let loops2 = find_loops(&g2);
-        let mut p2 = Printer { l, g: g2, loops: loops2, names, out: String::new(), next_tmp: p.next_tmp, used: p.used.clone(), emitted: HashSet::new(), labels: p.labels.clone(), loop_stack: Vec::new(), gotos: 0, active: HashSet::new(), facts: Vec::new() };
+        let mut p2 = Printer {
+            l,
+            g: g2,
+            loops: loops2,
+            names,
+            out: String::new(),
+            next_tmp: p.next_tmp,
+            used: p.used.clone(),
+            emitted: HashSet::new(),
+            labels: p.labels.clone(),
+            loop_stack: Vec::new(),
+            gotos: 0,
+            active: HashSet::new(),
+            facts: Vec::new(),
+        };
         p2.go(l.entry, None, base_depth);
-        let mut pending: Vec<usize> = p2.labels.iter().copied().filter(|n| !p2.emitted.contains(n)).collect();
+        let mut pending: Vec<usize> = p2
+            .labels
+            .iter()
+            .copied()
+            .filter(|n| !p2.emitted.contains(n))
+            .collect();
         let mut rounds = 0;
         while !pending.is_empty() && rounds < 64 {
             rounds += 1;
@@ -953,14 +1201,22 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
                     p2.emit_node(n, None, base_depth);
                 }
             }
-            pending = p2.labels.iter().copied().filter(|n| !p2.emitted.contains(n)).collect();
+            pending = p2
+                .labels
+                .iter()
+                .copied()
+                .filter(|n| !p2.emitted.contains(n))
+                .collect();
         }
         p.gotos = p2.gotos;
         p2.out
     } else {
         p.out
     };
-    Structured { text: drop_empty_else(&text), gotos: p.gotos }
+    Structured {
+        text: drop_empty_else(&text),
+        gotos: p.gotos,
+    }
 }
 
 /// Empty branches: `} else {` directly followed by `}` loses the else; `if (...) {` directly
@@ -985,13 +1241,23 @@ fn drop_empty_once(text: &str) -> String {
     let mut i = 0;
     while i < lines.len() {
         let l = lines[i];
-        if l.trim() == "} else {" && i + 1 < lines.len() && lines[i + 1].trim() == "}" && indent(lines[i + 1]) == indent(l) {
+        if l.trim() == "} else {"
+            && i + 1 < lines.len()
+            && lines[i + 1].trim() == "}"
+            && indent(lines[i + 1]) == indent(l)
+        {
             out.push(lines[i + 1]);
             i += 2;
             continue;
         }
         let t = l.trim();
-        if t.starts_with("if (") && t.ends_with(") {") && i + 1 < lines.len() && lines[i + 1].trim() == "}" && indent(lines[i + 1]) == indent(l) && !(i + 2 < lines.len() && lines[i + 2].trim().starts_with("else")) {
+        if t.starts_with("if (")
+            && t.ends_with(") {")
+            && i + 1 < lines.len()
+            && lines[i + 1].trim() == "}"
+            && indent(lines[i + 1]) == indent(l)
+            && !(i + 2 < lines.len() && lines[i + 2].trim().starts_with("else"))
+        {
             i += 2;
             continue;
         }
@@ -1003,6 +1269,8 @@ fn drop_empty_once(text: &str) -> String {
     s
 }
 
+/// Structured rendering of `l`, indented by `indent` (a multiple of four spaces); the
+/// counterpart of [`emit::fmt_flat`].
 pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
     let depth = indent.len() / 4;
     structure(l, n, depth).text
@@ -1012,17 +1280,6 @@ pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
 fn unused(_: &Node) {}
 #[allow(dead_code)]
 fn unused2(_: &dyn Fn(&lift::LNode)) {}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn empty_branches_are_dropped() {
-        let t = "            } else {\n                if (32 > returndatasize()) {\n                }\n                log1(x);\n            }\n";
-        let out = super::drop_empty_else(t);
-        assert!(!out.contains("if (32"), "{}", out);
-    }
-}
-
 
 /// The memory image at `ptr` written by constant word stores, as 32-byte words plus its length.
 fn payload_from_stores(stores: &[(ExprId, ExprId)], ptr: ExprId) -> Option<(Vec<ExprId>, u64)> {
@@ -1069,4 +1326,14 @@ fn payload_from_stores(stores: &[(ExprId, ExprId)], ptr: ExprId) -> Option<(Vec<
         i += 32;
     }
     Some((words, len))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn empty_branches_are_dropped() {
+        let t = "            } else {\n                if (32 > returndatasize()) {\n                }\n                log1(x);\n            }\n";
+        let out = super::drop_empty_else(t);
+        assert!(!out.contains("if (32"), "{}", out);
+    }
 }

@@ -1,7 +1,7 @@
 //! Whole-contract decompilation: orchestration and the output model.
 
 use crate::cfg::{self, Program, Recovered};
-use crate::emit::{self, Names};
+use crate::emit::{self, MappingLayout, Names};
 use crate::expr::{self, Node};
 use crate::function::{self, FnKind, Mutability, Param};
 use crate::lift::{self, Lifted, Lifter, Stmt, Term};
@@ -13,6 +13,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug, Default)]
+/// Knobs for one decompilation run.
 pub struct Options {
     /// Emit labels/gotos instead of structured code.
     pub flat: bool,
@@ -27,27 +28,40 @@ pub struct Options {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// One decompiled function: an external entry point, an internal helper or an orphan region.
 pub struct Function {
+    /// External entry, fallback, receive, constructor, internal helper or orphan region.
     pub kind: FnKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 4-byte selector as `0x`-prefixed hex; external functions only.
     pub selector: Option<String>,
+    /// Printed name: from the signature when known, else `func_<selector>` or `func_<pc>`.
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Canonical signature (`name(type,...)`) when the selector is in a dictionary.
     pub signature: Option<String>,
+    /// Inferred state mutability (`pure`, `view`, `nonpayable` or `payable`).
     pub mutability: Mutability,
+    /// Parameters: from the signature when known, inferred from calldata use otherwise.
     pub params: Vec<Param>,
+    /// Inferred return types.
     pub returns: Vec<String>,
     /// Entry program counter.
     pub pc: usize,
+    /// Body rendered as pseudo-Solidity, without the header line.
     pub code: String,
+    /// Number of nodes in the lifted control-flow graph (a size measure).
     pub nodes: usize,
+    /// State the function touches, including through the internal functions it calls.
     pub effects: function::Effects,
     #[serde(skip)]
+    /// The lifted graph the code was rendered from; kept for later analysis, not serialised.
     pub lifted: Option<Lifted>,
     /// Internal functions this one calls (entry pcs).
     pub calls: Vec<usize>,
-    /// Internal-unit argument and return counts.
+    /// Number of stack arguments an internal unit takes.
     pub n_args: usize,
+    /// Number of values an internal unit returns (the largest `InternalReturn` seen).
     pub n_rets: usize,
     /// Internal helper whose every call site was inlined: not printed.
     #[serde(default)]
@@ -55,11 +69,17 @@ pub struct Function {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// A storage slot the contract reads or writes, as listed in the contract header.
 pub struct StorageVar {
+    /// Root slot as `0x`-prefixed hex (the base slot for mappings and arrays).
     pub slot: String,
+    /// Printed name: `stor_<slot>` (decimal for small slots, hex otherwise).
     pub name: String,
+    /// Inferred type (`mapping(…)`, `address`, `string`, …); `packed` when `fields` is set.
     pub ty: String,
+    /// Number of `SLOAD`s of this slot, or of a key rooted at it, across all functions.
     pub reads: usize,
+    /// Number of `SSTORE`s to this slot, or to a key rooted at it, across all functions.
     pub writes: usize,
     /// Fields of a packed slot (several variables share the 32 bytes).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -67,48 +87,80 @@ pub struct StorageVar {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// One variable of a packed storage slot.
 pub struct StorageField {
     /// Byte offset within the slot (0 = least significant).
     pub offset: u32,
+    /// Width in bits.
     pub bits: u32,
+    /// Printed name: `<slot name>_<byte offset>`.
     pub name: String,
+    /// Type inferred from the width and the constants written (`bool`, `address`, `uintN`, `intN`).
     pub ty: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Coverage and size figures for one code body, printed in the header comment.
 pub struct Stats {
+    /// Length of the analysed bytecode in bytes.
     pub code_bytes: usize,
+    /// Number of decoded instructions.
     pub instructions: usize,
+    /// Number of basic blocks, data and dead regions included.
     pub blocks: usize,
+    /// Blocks the EVM could enter, excluding the metadata trailer and embedded creation code.
     pub code_blocks: usize,
+    /// Of `code_blocks`, those reached by the main unit, an internal function or an orphan.
     pub covered_blocks: usize,
+    /// Jumps whose target could not be resolved.
     pub unresolved_jumps: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Program counters of the unresolved jumps, as hex.
     pub unresolved_jump_pcs: Vec<String>,
+    /// Control-flow recovery gave up early on some unit, so the output may be incomplete.
     pub budget_exhausted: bool,
+    /// Number of external functions (dispatcher entries).
     pub external_functions: usize,
+    /// Number of internal functions, inlined ones included.
     pub internal_functions: usize,
+    /// Number of orphan regions (code reached by nothing).
     pub orphans: usize,
+    /// Nodes the lifter processed more than once while reaching a fixpoint, summed over units.
     pub lift_reprocess: usize,
+    /// Wall-clock time of the decompilation in milliseconds.
     pub time_ms: u128,
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// The decompilation of one code body: the JSON the CLI prints and the web UI shows.
 pub struct Contract {
+    /// Bytecode layout: creation/runtime split, constructor arguments and metadata trailer.
     pub info: BytecodeInfo,
+    /// Whether the input was runtime code or creation (deployment) code.
     pub kind: CodeKind,
+    /// Compiler and version (`solc 0.8.19`), or a guess from the prologue without metadata.
     pub language: String,
+    /// Every recovered function: external entries first, then internal helpers and orphans.
     pub functions: Vec<Function>,
+    /// Storage variables, ordered by slot.
     pub storage: Vec<StorageVar>,
+    /// Event declarations (`Name(type indexed name, …)` or a placeholder with the topic hash).
     pub events: Vec<String>,
+    /// Custom error declarations the code reverts with.
     pub errors: Vec<String>,
+    /// String constants found in revert payloads, stored values and the code bytes.
     pub strings: Vec<String>,
+    /// `0xselector signature` of the external functions this contract calls.
     pub selectors_called: Vec<String>,
+    /// Coverage and size figures.
     pub stats: Stats,
+    /// The whole contract rendered as pseudo-Solidity.
     pub source: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Contracts this one deploys, decompiled from embedded creation code (`Options::embedded`).
     pub embedded: Vec<Contract>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// The constructor, decompiled from the creation code when the input was creation code.
     pub constructor: Option<Box<Contract>>,
     /// Storage slots whose value is used as a DELEGATECALL target (proxy implementation slots).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -120,6 +172,7 @@ pub struct Contract {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Chain the contract was fetched from, when fetched by address.
     pub chain: Option<String>,
     /// Implementation behind this proxy, when resolved on-chain.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,21 +183,40 @@ pub struct Contract {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// The implementation a proxy contract forwards to.
 pub struct ProxyRef {
+    /// Human-readable pattern name, e.g. `EIP-1967 proxy` or `EIP-1167 minimal proxy`.
     pub kind: String,
+    /// Implementation address.
     pub implementation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Admin address, for patterns that have one.
     pub admin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// The implementation's own decompilation, when its code was fetched.
     pub contract: Option<Box<Contract>>,
 }
 
+/// Decompile a bytecode blob: runtime code, or creation code with its constructor.
+///
+/// Creation code yields the runtime contract with `constructor` filled in; the rendered source of
+/// the whole thing lands in `Contract::source`.
 pub fn decompile(code: &[u8], opts: &Options) -> Contract {
     let t0 = std::time::Instant::now();
     let info = metadata::analyze(code);
     let mut c = decompile_runtime(&info.runtime, &info, opts);
     if info.kind == CodeKind::Creation && !info.constructor.is_empty() {
-        let cinfo = BytecodeInfo { kind: CodeKind::Runtime, runtime: info.constructor.clone(), constructor: vec![], constructor_args: vec![], runtime_offset: 0, runtime_len: info.constructor.len(), constructor_args_len: 0, metadata: None, constructor_metadata: None };
+        let cinfo = BytecodeInfo {
+            kind: CodeKind::Runtime,
+            runtime: info.constructor.clone(),
+            constructor: vec![],
+            constructor_args: vec![],
+            runtime_offset: 0,
+            runtime_len: info.constructor.len(),
+            constructor_args_len: 0,
+            metadata: None,
+            constructor_metadata: None,
+        };
         let mut ctor = decompile_runtime(&info.constructor, &cinfo, opts);
         for f in ctor.functions.iter_mut() {
             if f.kind == FnKind::Fallback || (f.kind == FnKind::External && false) {
@@ -168,7 +240,12 @@ fn detect_language(info: &BytecodeInfo, code: &[u8]) -> String {
         };
     }
     // Vyper (< 0.3.10) has no metadata; solc runtime starts with the free-memory-pointer setup.
-    let solc_prologue = code.len() > 4 && code[0] == 0x60 && (code[1] == 0x80 || code[1] == 0x60) && code[2] == 0x60 && code[3] == 0x40 && code[4] == 0x52;
+    let solc_prologue = code.len() > 4
+        && code[0] == 0x60
+        && (code[1] == 0x80 || code[1] == 0x60)
+        && code[2] == 0x60
+        && code[3] == 0x40
+        && code[4] == 0x52;
     if solc_prologue {
         return "solc (unknown version, no metadata)".into();
     }
@@ -178,6 +255,11 @@ fn detect_language(info: &BytecodeInfo, code: &[u8]) -> String {
     "unknown".into()
 }
 
+/// Decompile one code body (`info` says how it sits in the input) into a [`Contract`].
+///
+/// Recovers the control flow, lifts internal functions, the dispatcher and orphans, infers
+/// signatures and the storage layout, then renders every function. Embedded creation code is
+/// treated as data unless `opts.embedded` is set.
 pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Contract {
     let t0 = std::time::Instant::now();
     let timing = std::env::var("EVMDEC_TIMING").is_ok();
@@ -185,18 +267,41 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         eprintln!("[timing] start runtime of {} bytes", code.len());
     }
     let mut prog = Program::new(code.to_vec());
-    let mut code_end = info.metadata.as_ref().map(|m| m.offset).unwrap_or(code.len());
+    let mut code_end = info
+        .metadata
+        .as_ref()
+        .map(|m| m.offset)
+        .unwrap_or(code.len());
     let mut rec = cfg::recover(&prog, code_end);
     // Embedded creation code (CODECOPY'd into memory and fed to CREATE/CREATE2) is data for the
     // purposes of this contract: it is excluded from coverage and decompiled separately on request.
     let embedded_ranges = embedded_regions(&prog, &rec);
-    let in_embedded = |pc: usize| embedded_ranges.iter().any(|(o, l)| pc >= *o && pc < *o + *l);
+    let in_embedded = |pc: usize| {
+        embedded_ranges
+            .iter()
+            .any(|(o, l)| pc >= *o && pc < *o + *l)
+    };
     let prune_embedded = |rec: &mut Recovered| {
         if !embedded_ranges.is_empty() {
-            let keep: HashSet<usize> = prog.blocks.iter().filter(|b| !in_embedded(b.start)).map(|b| b.id).collect();
+            let keep: HashSet<usize> = prog
+                .blocks
+                .iter()
+                .filter(|b| !in_embedded(b.start))
+                .map(|b| b.id)
+                .collect();
             rec.orphans.retain(|b, _| keep.contains(b));
             // Unresolved jumps are those of the surviving units only.
-            let mut un: Vec<usize> = std::iter::once(&rec.main).chain(rec.functions.values()).chain(rec.orphans.values()).flat_map(|u| u.nodes.iter().filter(|n| n.unresolved).map(|n| prog.blocks[n.block].end)).filter(|pc| !in_embedded(*pc)).collect();
+            let mut un: Vec<usize> = std::iter::once(&rec.main)
+                .chain(rec.functions.values())
+                .chain(rec.orphans.values())
+                .flat_map(|u| {
+                    u.nodes
+                        .iter()
+                        .filter(|n| n.unresolved)
+                        .map(|n| prog.blocks[n.block].end)
+                })
+                .filter(|pc| !in_embedded(*pc))
+                .collect();
             un.sort_unstable();
             un.dedup();
             rec.unresolved_jumps = un;
@@ -206,13 +311,39 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     // Computed jumps (hand-written dispatchers): derive candidate targets from the target
     // expression's shape and recover again with them.
     if !rec.unresolved_jumps.is_empty() {
-        let oracle = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: true, copy_loops: Default::default() };
+        let oracle = Lifter {
+            prog: &prog,
+            root: false,
+            summaries: HashMap::new(),
+            oracle: true,
+            copy_loops: Default::default(),
+        };
         let mut computed: HashMap<usize, Vec<usize>> = HashMap::new();
         for b in &prog.blocks {
-            if !matches!(b.terminator, op::JUMP | op::JUMPI) || !rec.unresolved_jumps.contains(&b.end) || in_embedded(b.start) || b.end > code_end {
+            if !matches!(b.terminator, op::JUMP | op::JUMPI)
+                || !rec.unresolved_jumps.contains(&b.end)
+                || in_embedded(b.start)
+                || b.end > code_end
+            {
                 continue;
             }
-            let unit = cfg::Unit { entry_block: b.id, nodes: vec![cfg::UNode { id: 0, block: b.id, entry: cfg::AState::new(), succs: vec![], preds: vec![], call: None, returns_via: None, unresolved: true, infeasible: false, computed_cut: false }], entry: 0, budget_exhausted: false };
+            let unit = cfg::Unit {
+                entry_block: b.id,
+                nodes: vec![cfg::UNode {
+                    id: 0,
+                    block: b.id,
+                    entry: cfg::AState::new(),
+                    succs: vec![],
+                    preds: vec![],
+                    call: None,
+                    returns_via: None,
+                    unresolved: true,
+                    infeasible: false,
+                    computed_cut: false,
+                }],
+                entry: 0,
+                budget_exhausted: false,
+            };
             let l = oracle.lift(&unit, None);
             let target = match &l.nodes[0].term {
                 Term::Unresolved(t) => *t,
@@ -220,7 +351,10 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                 _ => continue,
             };
             let pcs = lift::jump_candidates(target, &prog.jumpdests, code_end);
-            let cands: Vec<usize> = pcs.iter().filter_map(|pc| prog.block_at_pc.get(pc).copied()).collect();
+            let cands: Vec<usize> = pcs
+                .iter()
+                .filter_map(|pc| prog.block_at_pc.get(pc).copied())
+                .collect();
             if !cands.is_empty() && cands.len() <= 512 {
                 computed.insert(b.id, cands);
             }
@@ -235,10 +369,22 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         // Without a metadata trailer the end of the code is unknown: a trailing region that is
         // reached by nothing and whose JUMPDESTs are referenced by no PUSH in reached code is data
         // (Vyper constants, embedded payloads), not code.
-        let reached: BTreeSet<usize> = std::iter::once(&rec.main).chain(rec.functions.values()).flat_map(|u| u.nodes.iter().map(|n| n.block)).collect();
+        let reached: BTreeSet<usize> = std::iter::once(&rec.main)
+            .chain(rec.functions.values())
+            .flat_map(|u| u.nodes.iter().map(|n| n.block))
+            .collect();
         if let Some(last) = reached.iter().max() {
             let last_end = prog.blocks[*last].end;
-            let referenced: HashSet<usize> = std::iter::once(&rec.main).chain(rec.functions.values()).flat_map(|u| u.nodes.iter()).flat_map(|n| prog.block_insns(&prog.blocks[n.block]).iter().filter_map(|i| i.imm.and_then(|v| v.as_usize()))).filter(|pc| *pc >= last_end && prog.jumpdests.contains(pc)).collect();
+            let referenced: HashSet<usize> = std::iter::once(&rec.main)
+                .chain(rec.functions.values())
+                .flat_map(|u| u.nodes.iter())
+                .flat_map(|n| {
+                    prog.block_insns(&prog.blocks[n.block])
+                        .iter()
+                        .filter_map(|i| i.imm.and_then(|v| v.as_usize()))
+                })
+                .filter(|pc| *pc >= last_end && prog.jumpdests.contains(pc))
+                .collect();
             if referenced.is_empty() && last_end < code.len() {
                 code_end = last_end;
                 rec = cfg::recover(&prog, code_end);
@@ -246,7 +392,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     }
     let language = detect_language(info, code);
-    let vyper = language.starts_with("vyper");
+    let layout = MappingLayout::of_language(&language);
 
     let tick = |label: &str, t: &mut std::time::Instant| {
         if timing {
@@ -258,7 +404,13 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     tick("recover", &mut tt);
     // Internal function units first: simple ones (ABI decoders/encoders, getters) are summarised
     // and seen through at their call sites.
-    let mut int_lifter = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: false, copy_loops: Default::default() };
+    let mut int_lifter = Lifter {
+        prog: &prog,
+        root: false,
+        summaries: HashMap::new(),
+        oracle: false,
+        copy_loops: Default::default(),
+    };
     let mut internals: BTreeMap<usize, Lifted> = BTreeMap::new();
     let mut by_block: Vec<(usize, Lifted)> = Vec::new();
     // Callees before callers where possible: iterate until the summary set stabilises.
@@ -272,16 +424,27 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let debug_sum = std::env::var("EVMDEC_DEBUG_SUMMARY").is_ok();
         for (b, l) in &by_block {
             if debug_sum {
-                eprintln!("[summary] round {} function {:#x}:", _round, prog.blocks[*b].start);
+                eprintln!(
+                    "[summary] round {} function {:#x}:",
+                    _round, prog.blocks[*b].start
+                );
             }
             if let Some(sm) = lift::summarize(l) {
                 if debug_sum {
-                    eprintln!("[summary]   ok: returns {} mstores {} copies {} maybe {} guards {}", sm.returns.len(), sm.mstores.len(), sm.copies.len(), sm.maybe_mstores.len(), sm.guards.len());
+                    eprintln!(
+                        "[summary]   ok: returns {} mstores {} copies {} maybe {} guards {}",
+                        sm.returns.len(),
+                        sm.mstores.len(),
+                        sm.copies.len(),
+                        sm.maybe_mstores.len(),
+                        sm.guards.len()
+                    );
                 }
                 sums.insert(*b, sm);
             }
         }
-        let same = sums.len() == int_lifter.summaries.len() && sums.keys().all(|k| int_lifter.summaries.contains_key(k));
+        let same = sums.len() == int_lifter.summaries.len()
+            && sums.keys().all(|k| int_lifter.summaries.contains_key(k));
         int_lifter.summaries = sums;
         if same {
             break;
@@ -292,8 +455,17 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     }
     tick("lift internals", &mut tt);
     // Helpers that load a storage string: their result prints as the storage variable.
-    let loaders: HashMap<usize, U256> = internals.iter().filter_map(|(pc, l)| crate::idiom::storage_string_loader(l).map(|k| (*pc, k))).collect();
-    let lifter = Lifter { prog: &prog, root: true, summaries: int_lifter.summaries.clone(), oracle: false, copy_loops: Default::default() };
+    let loaders: HashMap<usize, U256> = internals
+        .iter()
+        .filter_map(|(pc, l)| crate::idiom::storage_string_loader(l).map(|k| (*pc, k)))
+        .collect();
+    let lifter = Lifter {
+        prog: &prog,
+        root: true,
+        summaries: int_lifter.summaries.clone(),
+        oracle: false,
+        copy_loops: Default::default(),
+    };
     let main = lifter.lift_summarizing(&rec.main, None);
     let dispatch = function::discover(&main);
     let contract_nonpayable = function::dispatcher_nonpayable(&main, &dispatch.dispatcher);
@@ -303,19 +475,27 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let t1 = std::time::Instant::now();
         orphans.insert(prog.blocks[*b].start, int_lifter.lift(unit, None));
         if timing && t1.elapsed().as_millis() > 200 {
-            eprintln!("[timing] slow orphan {:#x}: nodes={} {:?}", prog.blocks[*b].start, unit.nodes.len(), t1.elapsed());
+            eprintln!(
+                "[timing] slow orphan {:#x}: nodes={} {:?}",
+                prog.blocks[*b].start,
+                unit.nodes.len(),
+                t1.elapsed()
+            );
         }
     }
     tick("lift orphans", &mut tt);
     let mut functions: Vec<Function> = Vec::new();
-    let reprocess = main.reprocess_count + internals.values().map(|l| l.reprocess_count).sum::<usize>();
+    let reprocess =
+        main.reprocess_count + internals.values().map(|l| l.reprocess_count).sum::<usize>();
 
     // Effects of internal functions (transitive).
     let mut int_effects: HashMap<usize, function::Effects> = HashMap::new();
     for (pc, l) in &internals {
         int_effects.insert(*pc, function::effects(l));
     }
-    let transitive = |e: &function::Effects, int_effects: &HashMap<usize, function::Effects>| -> function::Effects {
+    let transitive = |e: &function::Effects,
+                      int_effects: &HashMap<usize, function::Effects>|
+     -> function::Effects {
         let mut acc = e.clone();
         let mut seen: HashSet<usize> = HashSet::new();
         let mut stack: Vec<usize> = acc.internal_callees.clone();
@@ -341,9 +521,21 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
 
     // Leak the internal graphs for the lifetime of this analysis so the resolver can hand out
     // `&'static` references (the decompiler is a one-shot process per contract).
-    let internals_static: &'static HashMap<usize, Lifted> = Box::leak(Box::new(internals.iter().map(|(pc, l)| (*pc, l.clone())).collect::<HashMap<usize, Lifted>>()));
+    let internals_static: &'static HashMap<usize, Lifted> = Box::leak(Box::new(
+        internals
+            .iter()
+            .map(|(pc, l)| (*pc, l.clone()))
+            .collect::<HashMap<usize, Lifted>>(),
+    ));
     let resolve = move |pc: usize| -> Option<&'static Lifted> { internals_static.get(&pc) };
-    let make = |kind: FnKind, selector: Option<u32>, l: Lifted, pc: usize, name_hint: Option<String>, n_args: usize, n_rets: usize| -> Function {
+    let make = |kind: FnKind,
+                selector: Option<u32>,
+                l: Lifted,
+                pc: usize,
+                name_hint: Option<String>,
+                n_args: usize,
+                n_rets: usize|
+     -> Function {
         let eff = function::effects(&l);
         let calls = eff.internal_callees.clone();
         let eff = transitive(&eff, &int_effects);
@@ -353,8 +545,21 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         } else {
             vec![]
         };
-        let mut returns = if matches!(kind, FnKind::External) { function::infer_returns(&l) } else { vec![] };
-        let signature = if opts.no_sigs { None } else { selector.and_then(|sel| opts.extra_sigs.get(&sel).cloned().or_else(|| sigs::function(sel).map(|s| s.to_string()))) };
+        let mut returns = if matches!(kind, FnKind::External) {
+            function::infer_returns(&l)
+        } else {
+            vec![]
+        };
+        let signature = if opts.no_sigs {
+            None
+        } else {
+            selector.and_then(|sel| {
+                opts.extra_sigs
+                    .get(&sel)
+                    .cloned()
+                    .or_else(|| sigs::function(sel).map(|s| s.to_string()))
+            })
+        };
         let name = match (&signature, name_hint, selector) {
             (Some(s), _, _) => sigs::name_of(s).to_string(),
             (None, Some(h), _) => h,
@@ -364,13 +569,26 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         if let Some(sig) = &signature {
             let tys = sigs::params_of(sig);
             if tys.len() >= params.len() {
-                params = tys.iter().enumerate().map(|(i, t)| Param { index: i as u32, ty: t.clone(), name: format!("arg{}", i) }).collect();
+                params = tys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| Param {
+                        index: i as u32,
+                        ty: t.clone(),
+                        name: format!("arg{}", i),
+                    })
+                    .collect();
             }
         }
         let nonpayable = contract_nonpayable || function::is_nonpayable(&l);
-        let state_changing = eff.writes_storage || eff.logs || eff.calls || eff.creates || eff.selfdestruct;
+        let state_changing =
+            eff.writes_storage || eff.logs || eff.calls || eff.creates || eff.selfdestruct;
         let mutability = if state_changing || kind == FnKind::Fallback || kind == FnKind::Receive {
-            if nonpayable { Mutability::NonPayable } else { Mutability::Payable }
+            if nonpayable {
+                Mutability::NonPayable
+            } else {
+                Mutability::Payable
+            }
         } else if !nonpayable && kind == FnKind::External {
             Mutability::Payable
         } else if eff.reads_storage || eff.reads_env || eff.static_calls {
@@ -384,13 +602,35 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         if l.nodes.iter().any(|nd| matches!(&nd.term, Term::ReturnDyn { ptr } if crate::idiom::is_string_pointer(&l, *ptr, &loaders).is_some())) {
             returns = vec!["string".into()];
         }
-        Function { kind, selector: selector.map(|s| format!("{:#010x}", s)), name, signature, mutability, params, returns, pc, code: String::new(), nodes: l.nodes.len(), effects: eff, lifted: Some(l), calls, n_args, n_rets, inlined: false }
+        Function {
+            kind,
+            selector: selector.map(|s| format!("{:#010x}", s)),
+            name,
+            signature,
+            mutability,
+            params,
+            returns,
+            pc,
+            code: String::new(),
+            nodes: l.nodes.len(),
+            effects: eff,
+            lifted: Some(l),
+            calls,
+            n_args,
+            n_rets,
+            inlined: false,
+        }
     };
 
     // Each external function is lifted again on its own from the state the dispatcher hands it,
     // so that code shared between functions (ABI-encoding tails, reverts) is specialised per
     // function instead of merged across all of them.
-    let unit_node_of = |lifted_node: usize| -> Option<usize> { main.node_map.iter().find(|(_, v)| **v == lifted_node).map(|(k, _)| *k) };
+    let unit_node_of = |lifted_node: usize| -> Option<usize> {
+        main.node_map
+            .iter()
+            .find(|(_, v)| **v == lifted_node)
+            .map(|(k, _)| *k)
+    };
     let relift = |entry: usize| -> Lifted {
         if let Some(un) = unit_node_of(entry) {
             if let Some(state) = Lifter::entry_state_of(&main, un) {
@@ -409,29 +649,80 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     if let Some(r) = dispatch.receive {
         let mut sl = relift(r);
         crate::idiom::fold(&mut sl);
-        functions.push(make(FnKind::Receive, None, sl, main.nodes[r].pc, Some("receive".into()), 0, 0));
+        functions.push(make(
+            FnKind::Receive,
+            None,
+            sl,
+            main.nodes[r].pc,
+            Some("receive".into()),
+            0,
+            0,
+        ));
     }
     if let Some(f) = dispatch.fallback {
         let mut sl = relift(f);
         crate::idiom::fold(&mut sl);
-        functions.push(make(FnKind::Fallback, None, sl, main.nodes[f].pc, Some("fallback".into()), 0, 0));
+        functions.push(make(
+            FnKind::Fallback,
+            None,
+            sl,
+            main.nodes[f].pc,
+            Some("fallback".into()),
+            0,
+            0,
+        ));
     }
     if dispatch.functions.is_empty() && dispatch.fallback.is_none() && dispatch.receive.is_none() {
         // No dispatcher at all: the whole runtime is one entry (e.g. a hand-written contract).
-        functions.push(make(FnKind::Fallback, None, main.clone(), 0, Some("fallback".into()), 0, 0));
+        functions.push(make(
+            FnKind::Fallback,
+            None,
+            main.clone(),
+            0,
+            Some("fallback".into()),
+            0,
+            0,
+        ));
     }
     for (pc, mut l) in internals {
         crate::idiom::fold(&mut l);
-        let n_rets = l.nodes.iter().filter_map(|n| if let Term::InternalReturn(v) = &n.term { Some(v.len()) } else { None }).max().unwrap_or(0);
+        let n_rets = l
+            .nodes
+            .iter()
+            .filter_map(|n| {
+                if let Term::InternalReturn(v) = &n.term {
+                    Some(v.len())
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0);
         let n_args = match l.ret_slot {
             Some(k) => (k as usize).min(l.n_args),
             None => l.n_args,
         };
-        functions.push(make(FnKind::Internal, None, l, pc, Some(format!("func_{:#x}", pc)), n_args, n_rets));
+        functions.push(make(
+            FnKind::Internal,
+            None,
+            l,
+            pc,
+            Some(format!("func_{:#x}", pc)),
+            n_args,
+            n_rets,
+        ));
     }
     for (pc, l) in orphans {
         let n_args = l.n_args;
-        functions.push(make(FnKind::Orphan, None, l, pc, Some(format!("orphan_{:#x}", pc)), n_args, 0));
+        functions.push(make(
+            FnKind::Orphan,
+            None,
+            l,
+            pc,
+            Some(format!("orphan_{:#x}", pc)),
+            n_args,
+            0,
+        ));
     }
 
     // Internal helpers that no printed statement calls any more (every call site was inlined or
@@ -442,7 +733,10 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             if let Some(l) = &f.lifted {
                 for nd in &l.nodes {
                     for st in &nd.stmts {
-                        if let Stmt::Internal { callee, results, .. } = st {
+                        if let Stmt::Internal {
+                            callee, results, ..
+                        } = st
+                        {
                             if !(loaders.contains_key(callee) && !results.is_empty()) {
                                 referenced.insert(*callee);
                             }
@@ -460,8 +754,24 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
 
     // Inventories.
     let string_slots: HashSet<U256> = loaders.values().copied().collect();
-    let solc08 = info.metadata.as_ref().and_then(|m| if m.compiler == "solc" { m.version_tuple() } else { None }).map_or(false, |v| v >= (0, 8, 0));
-    let (storage, events, errors, mut strings, selectors_called) = inventories(&functions, vyper, &string_slots);
+    let solc08 = info
+        .metadata
+        .as_ref()
+        .and_then(|m| {
+            if m.compiler == "solc" {
+                m.version_tuple()
+            } else {
+                None
+            }
+        })
+        .is_some_and(|v| v >= (0, 8, 0));
+    let Inventories {
+        storage,
+        events,
+        errors,
+        mut strings,
+        selectors: selectors_called,
+    } = inventories(&functions, layout, &string_slots);
     for st in scan_strings(code, code_end) {
         if !strings.iter().any(|x| x.contains(&st)) {
             strings.push(st);
@@ -470,39 +780,85 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     strings.sort();
     strings.dedup();
     // Pieces of a longer string (32-byte halves of a revert reason) are not strings of their own.
-    strings.retain(|s| s.len() >= 5 && s.chars().filter(|c| c.is_ascii_alphabetic()).count() * 2 >= s.len());
+    strings.retain(|s| {
+        s.len() >= 5 && s.chars().filter(|c| c.is_ascii_alphabetic()).count() * 2 >= s.len()
+    });
     let snap = strings.clone();
-    strings.retain(|s| !snap.iter().any(|o| o.len() > s.len() && o.contains(s.as_str())));
+    strings.retain(|s| {
+        !snap
+            .iter()
+            .any(|o| o.len() > s.len() && o.contains(s.as_str()))
+    });
 
     tick("discover+inventories", &mut tt);
     // Render code for each function.
     for f in functions.iter_mut() {
-        let mut names = make_names(f, &storage, vyper, &loaders);
+        let mut names = make_names(f, &storage, layout, &loaders);
         names.hide_checked = solc08;
-        let l = f.lifted.as_ref().unwrap();
+        let l = f
+            .lifted
+            .as_ref()
+            .expect("functions are lifted before they are printed");
         let t1 = std::time::Instant::now();
-        let body = if opts.flat { emit::fmt_flat(l, &names, "        ") } else { crate::structure::fmt_structured(l, &names, "        ") };
+        let body = if opts.flat {
+            emit::fmt_flat(l, &names, "        ")
+        } else {
+            crate::structure::fmt_structured(l, &names, "        ")
+        };
         if timing && t1.elapsed().as_millis() > 200 {
-            eprintln!("[timing] slow render {} nodes={} {:?}", f.name, l.nodes.len(), t1.elapsed());
+            eprintln!(
+                "[timing] slow render {} nodes={} {:?}",
+                f.name,
+                l.nodes.len(),
+                t1.elapsed()
+            );
         }
         f.code = body;
     }
     tick("render", &mut tt);
 
-    let covered: BTreeSet<usize> = std::iter::once(&rec.main).chain(rec.functions.values()).chain(rec.orphans.values()).flat_map(|u| u.nodes.iter().map(|n| n.block)).collect();
-    let code_blocks = prog.blocks.iter().filter(|b| b.start < code_end && !in_embedded(b.start) && prog.is_potential_code(b.id)).count();
+    let covered: BTreeSet<usize> = std::iter::once(&rec.main)
+        .chain(rec.functions.values())
+        .chain(rec.orphans.values())
+        .flat_map(|u| u.nodes.iter().map(|n| n.block))
+        .collect();
+    let code_blocks = prog
+        .blocks
+        .iter()
+        .filter(|b| b.start < code_end && !in_embedded(b.start) && prog.is_potential_code(b.id))
+        .count();
     let stats = Stats {
         code_bytes: code.len(),
         instructions: prog.insns.len(),
         blocks: prog.blocks.len(),
         code_blocks,
-        covered_blocks: covered.iter().filter(|b| prog.blocks[**b].start < code_end && !in_embedded(prog.blocks[**b].start) && prog.is_potential_code(**b)).count(),
+        covered_blocks: covered
+            .iter()
+            .filter(|b| {
+                prog.blocks[**b].start < code_end
+                    && !in_embedded(prog.blocks[**b].start)
+                    && prog.is_potential_code(**b)
+            })
+            .count(),
         unresolved_jumps: rec.unresolved_jumps.len(),
-        unresolved_jump_pcs: rec.unresolved_jumps.iter().map(|pc| format!("{:#x}", pc)).collect(),
+        unresolved_jump_pcs: rec
+            .unresolved_jumps
+            .iter()
+            .map(|pc| format!("{:#x}", pc))
+            .collect(),
         budget_exhausted: rec.budget_exhausted,
-        external_functions: functions.iter().filter(|f| f.kind == FnKind::External).count(),
-        internal_functions: functions.iter().filter(|f| f.kind == FnKind::Internal).count(),
-        orphans: functions.iter().filter(|f| f.kind == FnKind::Orphan).count(),
+        external_functions: functions
+            .iter()
+            .filter(|f| f.kind == FnKind::External)
+            .count(),
+        internal_functions: functions
+            .iter()
+            .filter(|f| f.kind == FnKind::Internal)
+            .count(),
+        orphans: functions
+            .iter()
+            .filter(|f| f.kind == FnKind::Orphan)
+            .count(),
         lift_reprocess: reprocess,
         time_ms: t0.elapsed().as_millis(),
     };
@@ -513,7 +869,13 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             let sub = &code[region.0..region.0 + region.1];
             let sub_info = metadata::analyze(sub);
             if sub_info.kind == CodeKind::Creation || sub_info.metadata.is_some() {
-                let mut sc = decompile(sub, &Options { embedded: false, ..opts.clone() });
+                let mut sc = decompile(
+                    sub,
+                    &Options {
+                        embedded: false,
+                        ..opts.clone()
+                    },
+                );
                 sc.source = render(&sc, &format!("Embedded_{:#x}", region.0));
                 embedded.push(sc);
             }
@@ -527,7 +889,12 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
             for st in &nd.stmts {
-                if let Stmt::Call { kind: op::DELEGATECALL, addr, .. } = st {
+                if let Stmt::Call {
+                    kind: op::DELEGATECALL,
+                    addr,
+                    ..
+                } = st
+                {
                     let a = match expr::node(*addr) {
                         Node::Op(op::AND, v) => v[0],
                         _ => *addr,
@@ -553,7 +920,27 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             }
         }
     }
-    let mut c = Contract { info: info.clone(), kind: info.kind, language, functions, storage, events, errors, strings, selectors_called, stats, source: String::new(), embedded, constructor: None, delegatecall_slots: dc_slots, delegatecall_targets: dc_targets, address: None, chain: None, proxy: None, string_loaders: loaders };
+    let mut c = Contract {
+        info: info.clone(),
+        kind: info.kind,
+        language,
+        functions,
+        storage,
+        events,
+        errors,
+        strings,
+        selectors_called,
+        stats,
+        source: String::new(),
+        embedded,
+        constructor: None,
+        delegatecall_slots: dc_slots,
+        delegatecall_targets: dc_targets,
+        address: None,
+        chain: None,
+        proxy: None,
+        string_loaders: loaders,
+    };
     c.source = render(&c, "Contract");
     c
 }
@@ -571,8 +958,15 @@ fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
                     let st = metadata::constant_stack(&insns[..i]);
                     let l = st.len();
                     if l >= 3 {
-                        if let (Some(off), Some(len)) = (st[l - 2].and_then(|v| v.as_usize()), st[l - 3].and_then(|v| v.as_usize())) {
-                            if len >= 64 && off + len <= prog.code.len() && off > b.end && !out.contains(&(off, len)) {
+                        if let (Some(off), Some(len)) = (
+                            st[l - 2].and_then(|v| v.as_usize()),
+                            st[l - 3].and_then(|v| v.as_usize()),
+                        ) {
+                            if len >= 64
+                                && off + len <= prog.code.len()
+                                && off > b.end
+                                && !out.contains(&(off, len))
+                            {
                                 out.push((off, len));
                             }
                         }
@@ -585,9 +979,18 @@ fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
     out
 }
 
-pub fn make_names(f: &Function, storage: &[StorageVar], vyper: bool, loaders: &HashMap<usize, U256>) -> Names {
-    let mut n = Names::default();
-    n.vyper = vyper;
+/// Naming context for printing `f`: parameters, internal-unit arguments, storage variables and
+/// packed fields, plus aliases for the results of storage-string loaders.
+pub fn make_names(
+    f: &Function,
+    storage: &[StorageVar],
+    layout: MappingLayout,
+    loaders: &HashMap<usize, U256>,
+) -> Names {
+    let mut n = Names {
+        layout,
+        ..Default::default()
+    };
     for p in &f.params {
         n.params.insert(p.index, p.name.clone());
     }
@@ -600,7 +1003,10 @@ pub fn make_names(f: &Function, storage: &[StorageVar], vyper: bool, loaders: &H
             } else if i == k && l.ret_slot.is_some() {
                 "__return_pc".to_string()
             } else {
-                format!("caller_stack{}", i - k - if l.ret_slot.is_some() { 1 } else { 0 })
+                format!(
+                    "caller_stack{}",
+                    i - k - if l.ret_slot.is_some() { 1 } else { 0 }
+                )
             };
             n.args.insert(i as u32, name);
         }
@@ -609,16 +1015,24 @@ pub fn make_names(f: &Function, storage: &[StorageVar], vyper: bool, loaders: &H
         if let Some(slot) = U256::from_hex_str(&s.slot).or_else(|| U256::from_dec_str(&s.slot)) {
             n.storage.insert(slot, s.name.clone());
             for fld in &s.fields {
-                n.fields.insert((slot, fld.offset, fld.bits), fld.name.clone());
+                n.fields
+                    .insert((slot, fld.offset, fld.bits), fld.name.clone());
             }
         }
     }
     if let Some(l) = &f.lifted {
         for nd in &l.nodes {
             for st in &nd.stmts {
-                if let Stmt::Internal { callee, results, .. } = st {
+                if let Stmt::Internal {
+                    callee, results, ..
+                } = st
+                {
                     if let (Some(k), [r]) = (loaders.get(callee), results.as_slice()) {
-                        let name = n.storage.get(k).cloned().unwrap_or_else(|| format!("stor_{}", k.to_decimal()));
+                        let name = n
+                            .storage
+                            .get(k)
+                            .cloned()
+                            .unwrap_or_else(|| format!("stor_{}", k.to_decimal()));
                         n.aliases.insert(*r, name);
                     }
                 }
@@ -628,24 +1042,57 @@ pub fn make_names(f: &Function, storage: &[StorageVar], vyper: bool, loaders: &H
     n
 }
 
-fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>) -> (Vec<StorageVar>, Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+/// Packed storage fields: slot -> (byte offset, bits) -> constant values written (for typing).
+type PackedFields = BTreeMap<U256, BTreeMap<(u32, u32), Vec<Option<U256>>>>;
+
+/// What a contract's functions reference, collected for the contract header.
+struct Inventories {
+    storage: Vec<StorageVar>,
+    /// Event declarations (`Name(type indexed name, …)` or the raw topic).
+    events: Vec<String>,
+    /// Custom error declarations.
+    errors: Vec<String>,
+    /// String constants the code reverts with or stores.
+    strings: Vec<String>,
+    /// `0xselector signature` of the external functions the contract calls.
+    selectors: Vec<String>,
+}
+
+fn inventories(
+    functions: &[Function],
+    layout: MappingLayout,
+    string_slots: &HashSet<U256>,
+) -> Inventories {
+    let vyper = layout == MappingLayout::Vyper;
     let mut slots: BTreeMap<U256, (usize, usize, BTreeSet<String>)> = BTreeMap::new();
     let mut events: BTreeSet<String> = BTreeSet::new();
     let mut errors: BTreeSet<String> = BTreeSet::new();
     let mut strings: BTreeSet<String> = BTreeSet::new();
     let mut selectors: BTreeSet<String> = BTreeSet::new();
-    let names = Names { vyper, ..Default::default() };
+    let names = Names {
+        layout,
+        ..Default::default()
+    };
     // Packed fields: slot -> (offset, bits) -> constant values written (for bool typing).
-    let mut fields: BTreeMap<U256, BTreeMap<(u32, u32), Vec<Option<U256>>>> = BTreeMap::new();
+    let mut fields: PackedFields = BTreeMap::new();
     for f in functions {
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
             for s in &nd.stmts {
                 match s {
-                    Stmt::SStore { key, val, transient: false } => {
+                    Stmt::SStore {
+                        key,
+                        val,
+                        transient: false,
+                    } => {
                         note_slot(*key, &mut slots, false, Some(*val), vyper);
                         if let Some((k, off, bits, value)) = emit::packed_write(*key, *val) {
-                            fields.entry(k).or_default().entry((off, bits)).or_default().push(expr::as_const(value));
+                            fields
+                                .entry(k)
+                                .or_default()
+                                .entry((off, bits))
+                                .or_default()
+                                .push(expr::as_const(value));
                         }
                     }
                     Stmt::Log { topics, data, .. } => {
@@ -655,29 +1102,39 @@ fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>
                                 None => {
                                     // Unknown signature: named by the hash's first four bytes, with
                                     // one indexed parameter per extra topic and one per data word.
-                                    let mut tys: Vec<String> = vec!["uint256 indexed".to_string(); topics.len() - 1];
+                                    let mut tys: Vec<String> =
+                                        vec!["uint256 indexed".to_string(); topics.len() - 1];
                                     match data {
-                                        Some(w) => tys.extend(w.iter().map(|_| "uint256".to_string())),
+                                        Some(w) => {
+                                            tys.extend(w.iter().map(|_| "uint256".to_string()))
+                                        }
                                         None => tys.push("bytes".to_string()),
                                     }
-                                    events.insert(format!("{}({}); // topic0 {}", emit::event_placeholder_name(t0), tys.join(", "), t0.to_hex_padded(32)))
+                                    events.insert(format!(
+                                        "{}({}); // topic0 {}",
+                                        emit::event_placeholder_name(t0),
+                                        tys.join(", "),
+                                        t0.to_hex_padded(32)
+                                    ))
                                 }
                             };
                         } else if topics.is_empty() {
                             events.insert("<anonymous log0>".into());
                         }
                     }
-                    Stmt::Call { input, in_len, .. } => {
-                        if let Some(words) = input {
-                            if let Some(w0) = words.first() {
-                                let in_len_c = expr::as_const(*in_len).and_then(|l| l.as_usize());
-                                if let Some(sel) = emit::leading_selector(*w0, in_len_c) {
-                                    if in_len_c.map_or(true, |l| l >= 4 && (l - 4) % 32 == 0) {
-                                        selectors.insert(match sigs::function(sel) {
-                                            Some(sig) => format!("{:#010x} {}", sel, sig),
-                                            None => format!("{:#010x}", sel),
-                                        });
-                                    }
+                    Stmt::Call {
+                        input: Some(words),
+                        in_len,
+                        ..
+                    } => {
+                        if let Some(w0) = words.first() {
+                            let in_len_c = expr::as_const(*in_len).and_then(|l| l.as_usize());
+                            if let Some(sel) = emit::leading_selector(*w0, in_len_c) {
+                                if in_len_c.is_none_or(|l| l >= 4 && (l - 4) % 32 == 0) {
+                                    selectors.insert(match sigs::function(sel) {
+                                        Some(sig) => format!("{:#010x} {}", sel, sig),
+                                        None => format!("{:#010x}", sel),
+                                    });
                                 }
                             }
                         }
@@ -685,12 +1142,20 @@ fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>
                     _ => {}
                 }
             }
-            if let Term::Revert { data: Some(words), len, .. } = &nd.term {
+            if let Term::Revert {
+                data: Some(words),
+                len,
+                ..
+            } = &nd.term
+            {
                 if let Some(c0) = words.first().and_then(|w| expr::as_const(*w)) {
                     if (c0 & expr::mask_bits(224)).is_zero() {
-                        let sel = c0.shr(224).low_u64() as u32;
+                        let sel = (c0 >> 224).low_u64() as u32;
                         if sel == 0x08c379a0 {
-                            if let Some(s) = emit::decode_string_payload(words, expr::as_const(*len).and_then(|l| l.as_usize())) {
+                            if let Some(s) = emit::decode_string_payload(
+                                words,
+                                expr::as_const(*len).and_then(|l| l.as_usize()),
+                            ) {
                                 strings.insert(s);
                             }
                         } else if sel != 0x4e487b71 {
@@ -713,41 +1178,105 @@ fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>
     let storage: Vec<StorageVar> = slots
         .into_iter()
         .map(|(slot, (reads, writes, tys))| {
-            let ty = if string_slots.contains(&slot) { "string".to_string() } else if tys.is_empty() { "uint256".to_string() } else if tys.len() == 1 { tys.into_iter().next().unwrap() } else {
+            let ty = if string_slots.contains(&slot) {
+                "string".to_string()
+            } else {
                 // Prefer the most specific.
                 let mut v: Vec<String> = tys.into_iter().collect();
-                v.sort_by_key(|t| if t.starts_with("mapping") { 0 } else if t.contains('[') { 1 } else if t == "address" || t == "bool" { 2 } else { 3 });
-                v[0].clone()
+                v.sort_by_key(|t| {
+                    if t.starts_with("mapping") {
+                        0
+                    } else if t.contains('[') {
+                        1
+                    } else if t == "address" || t == "bool" {
+                        2
+                    } else {
+                        3
+                    }
+                });
+                v.into_iter()
+                    .next()
+                    .unwrap_or_else(|| "uint256".to_string())
             };
-            let name = if slot.bits() <= 32 { format!("stor_{}", slot.to_decimal()) } else { format!("stor_{}", slot.to_hex()) };
+            let name = if slot.bits() <= 32 {
+                format!("stor_{}", slot.to_decimal())
+            } else {
+                format!("stor_{}", slot.to_hex())
+            };
             // A slot is packed when a field starts past byte 0 or several fields share it.
             let mut fs: Vec<StorageField> = Vec::new();
             // (a string slot is read with `& 1` and `>> 8`, which is its length encoding, not packing)
             if let (Some(acc), false) = (fields.get(&slot), string_slots.contains(&slot)) {
-                let keys: Vec<(u32, u32)> = acc.keys().copied().filter(|(off, bits)| *bits < 256 && off * 8 + bits <= 256).collect();
+                let keys: Vec<(u32, u32)> = acc
+                    .keys()
+                    .copied()
+                    .filter(|(off, bits)| *bits < 256 && off * 8 + bits <= 256)
+                    .collect();
                 let packed = keys.iter().any(|(off, _)| *off > 0) || keys.len() > 1;
                 if packed {
                     // Drop a field that is the union of others (`slot >> 8` read as one word over two fields).
                     let mut sorted = keys.clone();
                     sorted.sort();
                     for (off, bits) in sorted {
-                        let covered = keys.iter().any(|(o2, b2)| (*o2, *b2) != (off, bits) && *o2 >= off && o2 * 8 + b2 <= off * 8 + bits) && keys.iter().filter(|(o2, _)| *o2 >= off && o2 * 8 < off * 8 + bits).count() > 1;
+                        let covered = keys.iter().any(|(o2, b2)| {
+                            (*o2, *b2) != (off, bits) && *o2 >= off && o2 * 8 + b2 <= off * 8 + bits
+                        }) && keys
+                            .iter()
+                            .filter(|(o2, _)| *o2 >= off && o2 * 8 < off * 8 + bits)
+                            .count()
+                            > 1;
                         if covered {
                             continue;
                         }
                         let writes = &acc[&(off, bits)];
-                        let signed = writes.iter().any(|w| *w == Some(U256::MAX));
-                        let boolish = bits == 8 && !writes.is_empty() && writes.iter().all(|w| matches!(w, Some(c) if c.is_zero() || *c == U256::ONE));
-                        let ty = if signed { format!("int{}", bits) } else if bits == 160 { "address".to_string() } else if bits == 1 || boolish { "bool".to_string() } else if bits % 8 == 0 { format!("uint{}", bits) } else { format!("uint{}", bits.div_ceil(8) * 8) };
-                        fs.push(StorageField { offset: off, bits, name: format!("{}_{}", name, off), ty });
+                        let signed = writes.contains(&Some(U256::MAX));
+                        let boolish = bits == 8
+                            && !writes.is_empty()
+                            && writes
+                                .iter()
+                                .all(|w| matches!(w, Some(c) if c.is_zero() || *c == U256::ONE));
+                        let ty = if signed {
+                            format!("int{}", bits)
+                        } else if bits == 160 {
+                            "address".to_string()
+                        } else if bits == 1 || boolish {
+                            "bool".to_string()
+                        } else if bits % 8 == 0 {
+                            format!("uint{}", bits)
+                        } else {
+                            format!("uint{}", bits.div_ceil(8) * 8)
+                        };
+                        fs.push(StorageField {
+                            offset: off,
+                            bits,
+                            name: format!("{}_{}", name, off),
+                            ty,
+                        });
                     }
                 }
             }
-            let ty = if fs.is_empty() { ty } else { "packed".to_string() };
-            StorageVar { slot: slot.to_hex(), name, ty, reads, writes, fields: fs }
+            let ty = if fs.is_empty() {
+                ty
+            } else {
+                "packed".to_string()
+            };
+            StorageVar {
+                slot: slot.to_hex(),
+                name,
+                ty,
+                reads,
+                writes,
+                fields: fs,
+            }
         })
         .collect();
-    (storage, events.into_iter().collect(), errors.into_iter().collect(), strings.into_iter().collect(), selectors.into_iter().collect())
+    Inventories {
+        storage,
+        events: events.into_iter().collect(),
+        errors: errors.into_iter().collect(),
+        strings: strings.into_iter().collect(),
+        selectors: selectors.into_iter().collect(),
+    }
 }
 
 /// `Transfer(address,address,uint256)` with 2 topics besides the signature becomes
@@ -755,7 +1284,9 @@ fn inventories(functions: &[Function], vyper: bool, string_slots: &HashSet<U256>
 /// topics in declaration order and they are conventionally declared first, so the first `n`
 /// parameters are marked.
 fn with_indexed(sig: &str, n: usize) -> String {
-    let Some(open) = sig.find('(') else { return sig.to_string() };
+    let Some(open) = sig.find('(') else {
+        return sig.to_string();
+    };
     let name = &sig[..open];
     let inner = sig[open + 1..].trim_end_matches(')');
     if inner.is_empty() || n == 0 {
@@ -778,11 +1309,27 @@ fn with_indexed(sig: &str, n: usize) -> String {
     }
     parts.push(&inner[start..]);
     let n = n.min(parts.len());
-    let out: Vec<String> = parts.iter().enumerate().map(|(i, p)| if i < n { format!("{} indexed", p) } else { p.to_string() }).collect();
+    let out: Vec<String> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if i < n {
+                format!("{} indexed", p)
+            } else {
+                p.to_string()
+            }
+        })
+        .collect();
     format!("{}({})", name, out.join(", "))
 }
 
-fn note_slot(key: expr::ExprId, slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>, read: bool, val: Option<expr::ExprId>, vyper: bool) {
+fn note_slot(
+    key: expr::ExprId,
+    slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>,
+    read: bool,
+    val: Option<expr::ExprId>,
+    vyper: bool,
+) {
     let (root, ty) = slot_root(key, vyper);
     let Some(root) = root else { return };
     let e = slots.entry(root).or_insert((0, 0, BTreeSet::new()));
@@ -808,10 +1355,18 @@ fn slot_root(key: expr::ExprId, vyper: bool) -> (Option<U256>, Option<String>) {
     }
     match expr::node(key) {
         Node::Keccak(words, 0) if words.len() == 2 => {
-            let (k, s) = if vyper { (words[1], words[0]) } else { (words[0], words[1]) };
+            let (k, s) = if vyper {
+                (words[1], words[0])
+            } else {
+                (words[0], words[1])
+            };
             let (root, inner) = slot_root(s, vyper);
             let kt = function::type_of_value(k);
-            let kt = if kt == "uint256" { "uint256".to_string() } else { kt };
+            let kt = if kt == "uint256" {
+                "uint256".to_string()
+            } else {
+                kt
+            };
             let ty = match inner {
                 Some(t) => format!("mapping({} => {})", kt, t),
                 None => format!("mapping({} => uint256)", kt),
@@ -834,7 +1389,7 @@ fn slot_root(key: expr::ExprId, vyper: bool) -> (Option<U256>, Option<String>) {
 }
 
 /// Packed-field reads anywhere in `e` (see `emit::packed_read`).
-fn collect_fields(e: expr::ExprId, fields: &mut BTreeMap<U256, BTreeMap<(u32, u32), Vec<Option<U256>>>>) {
+fn collect_fields(e: expr::ExprId, fields: &mut PackedFields) {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
     while let Some(x) = stack.pop() {
@@ -854,7 +1409,11 @@ fn collect_fields(e: expr::ExprId, fields: &mut BTreeMap<U256, BTreeMap<(u32, u3
     }
 }
 
-fn collect_sloads(e: expr::ExprId, slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>, vyper: bool) {
+fn collect_sloads(
+    e: expr::ExprId,
+    slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>,
+    vyper: bool,
+) {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
     while let Some(x) = stack.pop() {
@@ -865,17 +1424,31 @@ fn collect_sloads(e: expr::ExprId, slots: &mut BTreeMap<U256, (usize, usize, BTr
         match &n {
             Node::SLoad(key, false, _) => note_slot(*key, slots, true, None, vyper),
             Node::Op(op::AND, v) => {
-                if let (Node::SLoad(key, false, _), Some(m)) = (expr::node(v[0]), expr::as_const(v[1])) {
+                if let (Node::SLoad(key, false, _), Some(m)) =
+                    (expr::node(v[0]), expr::as_const(v[1]))
+                {
                     if m.is_low_mask() {
                         let (root, inner) = slot_root(key, vyper);
                         if let Some(root) = root {
                             let bits = m.bits();
-                            let t = if bits == 160 { "address".to_string() } else if bits == 1 { "bool".to_string() } else if bits % 8 == 0 { format!("uint{}", bits) } else { "uint256".into() };
+                            let t = if bits == 160 {
+                                "address".to_string()
+                            } else if bits == 1 {
+                                "bool".to_string()
+                            } else if bits % 8 == 0 {
+                                format!("uint{}", bits)
+                            } else {
+                                "uint256".into()
+                            };
                             let full = match inner {
                                 Some(i) => i.replace("=> uint256)", &format!("=> {})", t)),
                                 None => t,
                             };
-                            slots.entry(root).or_insert((0, 0, BTreeSet::new())).2.insert(full);
+                            slots
+                                .entry(root)
+                                .or_insert((0, 0, BTreeSet::new()))
+                                .2
+                                .insert(full);
                         }
                     }
                 }
@@ -906,7 +1479,7 @@ fn scan_strings(code: &[u8], code_end: usize) -> Vec<String> {
             if a.opcode == 0x60 && b.opcode == crate::opcode::SHL {
                 if let Some(k) = a.imm.and_then(|k| k.as_usize()) {
                     if k < 256 {
-                        imm = imm.shl(k as u32);
+                        imm = imm << k as u32;
                         size = 32;
                     }
                 }
@@ -919,7 +1492,9 @@ fn scan_strings(code: &[u8], code_end: usize) -> Vec<String> {
         let b = &bytes[32 - size..];
         let text_end = b.iter().position(|x| *x == 0).unwrap_or(b.len());
         let run = &b[..text_end];
-        let printable = !run.is_empty() && run.iter().all(|x| (0x20..0x7f).contains(x)) && b[text_end..].iter().all(|x| *x == 0);
+        let printable = !run.is_empty()
+            && run.iter().all(|x| (0x20..0x7f).contains(x))
+            && b[text_end..].iter().all(|x| *x == 0);
         if !printable {
             continue;
         }
@@ -959,7 +1534,11 @@ fn scan_strings(code: &[u8], code_end: usize) -> Vec<String> {
     out.sort();
     out.dedup();
     let snap = out.clone();
-    out.retain(|s| !snap.iter().any(|o| o.len() > s.len() && o.contains(s.as_str())));
+    out.retain(|s| {
+        !snap
+            .iter()
+            .any(|o| o.len() > s.len() && o.contains(s.as_str()))
+    });
     out
 }
 
@@ -968,7 +1547,10 @@ fn collect_strings(e: expr::ExprId, out: &mut BTreeSet<String>) {
         let b = c.to_be_bytes();
         // Left-aligned ASCII (string constants are stored left-aligned).
         let end = b.iter().position(|x| *x == 0).unwrap_or(32);
-        if end >= 4 && b[..end].iter().all(|x| (0x20..0x7f).contains(x)) && b[end..].iter().all(|x| *x == 0) {
+        if end >= 4
+            && b[..end].iter().all(|x| (0x20..0x7f).contains(x))
+            && b[end..].iter().all(|x| *x == 0)
+        {
             out.insert(String::from_utf8_lossy(&b[..end]).into_owned());
         }
     }
@@ -986,10 +1568,18 @@ fn mutability_str(m: Mutability) -> &'static str {
 /// Render the whole contract as pseudo-Solidity.
 pub fn render(c: &Contract, name: &str) -> String {
     let mut out = String::new();
-    out.push_str(&format!("// Decompiled by evmdec. Compiler: {}.\n", c.language));
+    out.push_str(&format!(
+        "// Decompiled by evmdec. Compiler: {}.\n",
+        c.language
+    ));
     if let Some(m) = &c.info.metadata {
         if let Some(h) = &m.ipfs {
-            out.push_str(&format!("// Metadata: ipfs {}\n", h));
+            match m.ipfs_cid() {
+                Some(cid) => {
+                    out.push_str(&format!("// Metadata: ipfs {} (multihash {})\n", cid, h))
+                }
+                None => out.push_str(&format!("// Metadata: ipfs {}\n", h)),
+            }
         }
         if let Some(h) = &m.bzzr {
             out.push_str(&format!("// Metadata: {}\n", h));
@@ -1010,11 +1600,24 @@ pub fn render(c: &Contract, name: &str) -> String {
         out.push_str("    // ---- storage layout ----\n");
         for s in &c.storage {
             if s.fields.is_empty() {
-                out.push_str(&format!("    {} {}; // slot {}, {} reads, {} writes\n", s.ty, s.name, s.slot, s.reads, s.writes));
+                out.push_str(&format!(
+                    "    {} {}; // slot {}, {} reads, {} writes\n",
+                    s.ty, s.name, s.slot, s.reads, s.writes
+                ));
             } else {
-                out.push_str(&format!("    // slot {} is packed ({} reads, {} writes):\n", s.slot, s.reads, s.writes));
+                out.push_str(&format!(
+                    "    // slot {} is packed ({} reads, {} writes):\n",
+                    s.slot, s.reads, s.writes
+                ));
                 for fld in &s.fields {
-                    out.push_str(&format!("    {} {}; // slot {} bytes {}..{}\n", fld.ty, fld.name, s.slot, fld.offset, fld.offset + fld.bits.div_ceil(8)));
+                    out.push_str(&format!(
+                        "    {} {}; // slot {} bytes {}..{}\n",
+                        fld.ty,
+                        fld.name,
+                        s.slot,
+                        fld.offset,
+                        fld.offset + fld.bits.div_ceil(8)
+                    ));
                 }
             }
         }
@@ -1054,7 +1657,10 @@ pub fn render(c: &Contract, name: &str) -> String {
         out.push_str(&ctor.source);
     }
     if let Some(p) = &c.proxy {
-        out.push_str(&format!("\n// ---- {}: implementation {} ----\n", p.kind, p.implementation));
+        out.push_str(&format!(
+            "\n// ---- {}: implementation {} ----\n",
+            p.kind, p.implementation
+        ));
         if let Some(ic) = &p.contract {
             out.push_str(&ic.source);
         }
@@ -1062,19 +1668,44 @@ pub fn render(c: &Contract, name: &str) -> String {
     out
 }
 
+/// The `function …(…) … {` line of a function, preceded by its selector comment.
 pub fn fmt_function_header(f: &Function) -> String {
     let mut s = String::new();
     match f.kind {
         FnKind::External => {
-            let params: Vec<String> = f.params.iter().map(|p| format!("{} {}", p.ty, p.name)).collect();
-            s.push_str(&format!("    // selector {}{}\n", f.selector.clone().unwrap_or_default(), if f.signature.is_none() { " (unknown signature)" } else { "" }));
-            s.push_str(&format!("    function {}({}) external{}", f.name, params.join(", "), mutability_str(f.mutability)));
+            let params: Vec<String> = f
+                .params
+                .iter()
+                .map(|p| format!("{} {}", p.ty, p.name))
+                .collect();
+            s.push_str(&format!(
+                "    // selector {}{}\n",
+                f.selector.clone().unwrap_or_default(),
+                if f.signature.is_none() {
+                    " (unknown signature)"
+                } else {
+                    ""
+                }
+            ));
+            s.push_str(&format!(
+                "    function {}({}) external{}",
+                f.name,
+                params.join(", "),
+                mutability_str(f.mutability)
+            ));
             if !f.returns.is_empty() {
                 s.push_str(&format!(" returns ({})", f.returns.join(", ")));
             }
             s.push_str(" {\n");
         }
-        FnKind::Fallback => s.push_str(&format!("    fallback() external{} {{\n", if f.mutability == Mutability::Payable { " payable" } else { "" })),
+        FnKind::Fallback => s.push_str(&format!(
+            "    fallback() external{} {{\n",
+            if f.mutability == Mutability::Payable {
+                " payable"
+            } else {
+                ""
+            }
+        )),
         FnKind::Receive => s.push_str("    receive() external payable {\n"),
         FnKind::Constructor => s.push_str("    constructor() {\n"),
         FnKind::Internal => {
@@ -1083,15 +1714,28 @@ pub fn fmt_function_header(f: &Function) -> String {
                 Mutability::View | Mutability::Pure => mutability_str(f.mutability),
                 _ => "",
             };
-            s.push_str(&format!("    function {}({}) internal{}", f.name, params.join(", "), m));
+            s.push_str(&format!(
+                "    function {}({}) internal{}",
+                f.name,
+                params.join(", "),
+                m
+            ));
             if f.n_rets > 0 {
-                s.push_str(&format!(" returns ({})", vec!["uint256"; f.n_rets].join(", ")));
+                s.push_str(&format!(
+                    " returns ({})",
+                    vec!["uint256"; f.n_rets].join(", ")
+                ));
             }
             s.push_str(" {\n");
         }
         FnKind::Orphan => {
             let params: Vec<String> = (0..f.n_args).map(|i| format!("uint256 arg{}", i)).collect();
-            s.push_str(&format!("    // unreachable code at {:#x}\n    function {}({}) internal {{\n", f.pc, f.name, params.join(", ")));
+            s.push_str(&format!(
+                "    // unreachable code at {:#x}\n    function {}({}) internal {{\n",
+                f.pc,
+                f.name,
+                params.join(", ")
+            ));
         }
     }
     s

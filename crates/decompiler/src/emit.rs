@@ -8,8 +8,59 @@ use crate::u256::U256;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// How a compiler lays out mapping slots: `keccak(key . slot)` (Solidity) or `keccak(slot . key)`
+/// (Vyper).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MappingLayout {
+    /// Solidity: the key precedes the slot in the hashed preimage.
+    #[default]
+    Solidity,
+    /// Vyper: the slot precedes the key in the hashed preimage.
+    Vyper,
+}
+
+impl MappingLayout {
+    /// The layout used by the compiler a [`Contract::language`](crate::decompile::Contract) names.
+    pub fn of_language(language: &str) -> MappingLayout {
+        if language.starts_with("vyper") {
+            MappingLayout::Vyper
+        } else {
+            MappingLayout::Solidity
+        }
+    }
+}
+
+/// Which storage a slot expression addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SlotSpace {
+    /// Persistent storage (`SLOAD` / `SSTORE`), printed as `stor…`.
+    Persistent,
+    /// Transient storage (`TLOAD` / `TSTORE`, EIP-1153), printed as `tstor…`.
+    Transient,
+}
+
+impl SlotSpace {
+    /// The space a statement's `transient` flag selects.
+    pub fn from_transient(transient: bool) -> SlotSpace {
+        if transient {
+            SlotSpace::Transient
+        } else {
+            SlotSpace::Persistent
+        }
+    }
+}
+
+/// What an ABI-encoded payload is for; decides how a selector-led payload is rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PayloadKind {
+    /// Data handed to `RETURN`.
+    Return,
+    /// Data handed to `REVERT`: `Error(string)`, `Panic(uint256)` and custom errors are decoded.
+    Revert,
+}
+
 /// Naming context for one function.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Names {
     /// calldata word index -> parameter name
     pub params: HashMap<u32, String>,
@@ -24,14 +75,17 @@ pub struct Names {
     pub storage: HashMap<U256, String>,
     /// Sequence numbers renamed to small indices.
     pub seqs: RefCell<HashMap<u32, u32>>,
+    /// Phi variables renamed to small indices (`v1`, `v2`, …) in order of first use.
     pub vars: RefCell<HashMap<u32, u32>>,
-    /// Vyper-style mapping layout (slot first, then key).
-    pub vyper: bool,
+    /// Mapping slot layout of the source compiler.
+    pub layout: MappingLayout,
     /// solc >= 0.8: the compiler's own overflow / division-by-zero panics are not printed.
     pub hide_checked: bool,
     /// Large shared sub-expressions are hoisted into temporaries: pending definitions.
     pub temps: RefCell<Vec<(String, String)>>,
+    /// Expression -> temporary name, for expressions already hoisted.
     pub temp_of: RefCell<HashMap<ExprId, String>>,
+    /// Rendered text and precedence of the expressions printed so far.
     pub memo: RefCell<HashMap<ExprId, (String, u8)>>,
 }
 
@@ -67,6 +121,8 @@ const P_EXP: u8 = 10;
 const P_UNARY: u8 = 11;
 const P_PRIMARY: u8 = 12;
 
+/// A constant in its most readable form: decimal, `type(uintN).max`, `NeK`, `2**K`, an address,
+/// or hex.
 pub fn fmt_const(c: U256) -> String {
     if c.is_zero() {
         return "0".into();
@@ -85,7 +141,7 @@ pub fn fmt_const(c: U256) -> String {
         return format!("{}e{}", trimmed, zeros);
     }
     let bits = c.bits();
-    if c.is_low_mask() && bits % 8 == 0 && bits < 256 {
+    if c.is_low_mask() && bits.is_multiple_of(8) && bits < 256 {
         return format!("type(uint{}).max", bits);
     }
     if (150..=160).contains(&bits) && c.byte_len() == 20 {
@@ -99,17 +155,26 @@ pub fn fmt_const(c: U256) -> String {
 
 fn fmt_int_const(c: U256) -> String {
     if c.is_negative() {
-        format!("-{}", fmt_const(c.neg()))
+        format!("-{}", fmt_const(-c))
     } else {
         fmt_const(c)
     }
 }
 
+/// Is `e` the function selector, `calldataload(0) >> 224` in one of the shapes solc emits?
 pub fn is_selector_expr(e: ExprId) -> bool {
     match expr::node(e) {
-        Node::Op(op::SHR, v) => expr::as_const(v[0]) == Some(U256::from_u64(224)) && matches!(expr::node(v[1]), Node::CallDataLoad(o) if expr::as_const(o) == Some(U256::ZERO)),
-        Node::Op(op::AND, v) => is_selector_expr(v[0]) && expr::as_const(v[1]) == Some(U256::from_u64(0xffffffff)),
-        Node::Op(op::DIV, v) => expr::as_const(v[1]) == Some(U256::ONE.shl(224)) && matches!(expr::node(v[0]), Node::CallDataLoad(o) if expr::as_const(o) == Some(U256::ZERO)),
+        Node::Op(op::SHR, v) => {
+            expr::as_const(v[0]) == Some(U256::from_u64(224))
+                && matches!(expr::node(v[1]), Node::CallDataLoad(o) if expr::as_const(o) == Some(U256::ZERO))
+        }
+        Node::Op(op::AND, v) => {
+            is_selector_expr(v[0]) && expr::as_const(v[1]) == Some(U256::from_u64(0xffffffff))
+        }
+        Node::Op(op::DIV, v) => {
+            expr::as_const(v[1]) == Some(U256::ONE << 224)
+                && matches!(expr::node(v[0]), Node::CallDataLoad(o) if expr::as_const(o) == Some(U256::ZERO))
+        }
         _ => false,
     }
 }
@@ -145,6 +210,7 @@ fn selector_operands(v: &[ExprId]) -> Option<u32> {
     None
 }
 
+/// Index of the ABI word at a constant calldata offset `4 + 32*i`; `None` for anything else.
 pub fn calldata_word_index(off: ExprId) -> Option<u32> {
     let c = expr::as_const(off)?;
     if c < U256::from_u64(4) || !c.fits_u64() {
@@ -166,6 +232,7 @@ fn paren(s: String, inner: u8, outer: u8) -> String {
     }
 }
 
+/// Render an expression; sub-expressions longer than the threshold become temporaries.
 pub fn fmt_expr(e: ExprId, n: &Names) -> String {
     fmt_prec(e, 0, n)
 }
@@ -194,12 +261,19 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
 /// solc's ABI decoder validators on a calldata word: `x == address(x)` (the word is a clean
 /// address) and `x == bool(x)`. The parameter type already says so.
 fn is_abi_validator(cond: ExprId) -> bool {
-    let Node::Op(op::EQ, v) = expr::node(cond) else { return false };
+    let Node::Op(op::EQ, v) = expr::node(cond) else {
+        return false;
+    };
     let is_param = |e: ExprId| matches!(expr::node(e), Node::CallDataLoad(_));
     let cleaned = |x: ExprId, y: ExprId| -> bool {
         match expr::node(y) {
-            Node::Op(op::AND, w) => (w[0] == x && expr::as_const(w[1]) == Some(expr::mask_bits(160))) || (w[1] == x && expr::as_const(w[0]) == Some(expr::mask_bits(160))),
-            Node::Op(op::ISZERO, w) => matches!(expr::node(w[0]), Node::Op(op::ISZERO, z) if z[0] == x),
+            Node::Op(op::AND, w) => {
+                (w[0] == x && expr::as_const(w[1]) == Some(expr::mask_bits(160)))
+                    || (w[1] == x && expr::as_const(w[0]) == Some(expr::mask_bits(160)))
+            }
+            Node::Op(op::ISZERO, w) => {
+                matches!(expr::node(w[0]), Node::Op(op::ISZERO, z) if z[0] == x)
+            }
             _ => false,
         }
     };
@@ -282,7 +356,8 @@ pub fn packed_read(e: ExprId) -> Option<(U256, u32, u32)> {
             Node::Op(op::DIV, w) => {
                 let d = expr::as_const(w[1])?;
                 if let Node::SLoad(k, false, _) = expr::node(w[0]) {
-                    if d.is_power_of_two() && d.trailing_zeros() % 8 == 0 && d.trailing_zeros() > 0 {
+                    if d.is_power_of_two() && d.trailing_zeros() % 8 == 0 && d.trailing_zeros() > 0
+                    {
                         return Some((expr::as_const(k)?, d.trailing_zeros()));
                     }
                 }
@@ -335,10 +410,17 @@ pub fn packed_read(e: ExprId) -> Option<(U256, u32, u32)> {
 /// `(slot, byte offset, bits, value)`.
 pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)> {
     let k = expr::as_const(key)?;
-    let Node::Op(op::OR, v) = expr::node(val) else { return None };
+    let Node::Op(op::OR, v) = expr::node(val) else {
+        return None;
+    };
     for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
-        let Node::Op(op::AND, w) = expr::node(a) else { continue };
-        let (Node::SLoad(kk, false, _), Some(keep)) = (expr::node(w[0]), expr::as_const(w[1])) else { continue };
+        let Node::Op(op::AND, w) = expr::node(a) else {
+            continue;
+        };
+        let (Node::SLoad(kk, false, _), Some(keep)) = (expr::node(w[0]), expr::as_const(w[1]))
+        else {
+            continue;
+        };
         if expr::as_const(kk) != Some(k) {
             continue;
         }
@@ -347,7 +429,7 @@ pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)
             continue;
         }
         let s = field.trailing_zeros();
-        let shifted = field.shr(s);
+        let shifted = field >> s;
         if !shifted.is_low_mask() || s % 8 != 0 {
             continue;
         }
@@ -357,9 +439,16 @@ pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)
             b
         } else {
             match expr::node(b) {
-                Node::Op(op::SHL, x) if expr::as_const(x[0]) == Some(U256::from_u64(s as u64)) => x[1],
-                Node::Op(op::MUL, x) if expr::as_const(x[1]).map_or(false, |c| c.is_power_of_two() && c.trailing_zeros() == s) => x[0],
-                Node::Const(c) => expr::konst(c.shr(s)),
+                Node::Op(op::SHL, x) if expr::as_const(x[0]) == Some(U256::from_u64(s as u64)) => {
+                    x[1]
+                }
+                Node::Op(op::MUL, x)
+                    if expr::as_const(x[1])
+                        .is_some_and(|c| c.is_power_of_two() && c.trailing_zeros() == s) =>
+                {
+                    x[0]
+                }
+                Node::Const(c) => expr::konst(c >> s),
                 _ => expr::op2(op::SHR, expr::konst_u64(s as u64), b),
             }
         };
@@ -373,26 +462,48 @@ pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)
     None
 }
 
-pub fn fmt_slot(e: ExprId, n: &Names, transient: bool) -> String {
-    let prefix = if transient { "tstor" } else { "stor" };
+/// Render a storage key: a named variable or `stor_N` for a constant, `name[key]` for mapping and
+/// array elements, `name.fieldN` for struct fields.
+pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
+    let prefix = match space {
+        SlotSpace::Persistent => "stor",
+        SlotSpace::Transient => "tstor",
+    };
     if let Some(c) = expr::as_const(e) {
         if let Some(name) = n.storage.get(&c) {
             return name.clone();
         }
-        return if c.bits() <= 32 { format!("{}_{}", prefix, c.to_decimal()) } else { format!("{}_{}", prefix, c.to_hex()) };
+        return if c.bits() <= 32 {
+            format!("{}_{}", prefix, c.to_decimal())
+        } else {
+            format!("{}_{}", prefix, c.to_hex())
+        };
     }
     match expr::node(e) {
         Node::Keccak(words, 0) if words.len() == 2 => {
-            let (key, slot) = if n.vyper || (expr::as_const(words[0]).map_or(false, |c| c.bits() <= 16) && !expr::as_const(words[1]).map_or(false, |c| c.bits() <= 16)) { (words[1], words[0]) } else { (words[0], words[1]) };
-            format!("{}[{}]", fmt_slot(slot, n, transient), fmt_expr(key, n))
+            let (key, slot) = if n.layout == MappingLayout::Vyper
+                || (expr::as_const(words[0]).is_some_and(|c| c.bits() <= 16)
+                    && !expr::as_const(words[1]).is_some_and(|c| c.bits() <= 16))
+            {
+                (words[1], words[0])
+            } else {
+                (words[0], words[1])
+            };
+            format!("{}[{}]", fmt_slot(slot, n, space), fmt_expr(key, n))
         }
-        Node::Keccak(words, 0) if words.len() == 1 => format!("{}[0]", fmt_slot(words[0], n, transient)),
+        Node::Keccak(words, 0) if words.len() == 1 => {
+            format!("{}[0]", fmt_slot(words[0], n, space))
+        }
         Node::Op(op::ADD, v) => {
             // array element: keccak(slot) + i, or (base) + i for struct fields in mappings
             let (base, idx) = (v[0], v[1]);
             match expr::node(base) {
-                Node::Keccak(words, 0) if words.len() == 1 => format!("{}[{}]", fmt_slot(words[0], n, transient), fmt_expr(idx, n)),
-                Node::Keccak(words, 0) if words.len() == 2 => format!("{}.field{}", fmt_slot(base, n, transient), fmt_expr(idx, n)),
+                Node::Keccak(words, 0) if words.len() == 1 => {
+                    format!("{}[{}]", fmt_slot(words[0], n, space), fmt_expr(idx, n))
+                }
+                Node::Keccak(words, 0) if words.len() == 2 => {
+                    format!("{}.field{}", fmt_slot(base, n, space), fmt_expr(idx, n))
+                }
                 _ => format!("{}[{}]", prefix, fmt_expr(e, n)),
             }
         }
@@ -449,11 +560,23 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
         Node::Const(c) => (fmt_const(c), P_PRIMARY),
         Node::Env(o, seq) => (env_name(o, seq, n), P_PRIMARY),
         Node::Var(v) => (format!("v{}", n.var(v)), P_PRIMARY),
-        Node::Arg(i) => (n.args.get(&i).cloned().unwrap_or_else(|| format!("arg{}", i)), P_PRIMARY),
+        Node::Arg(i) => (
+            n.args
+                .get(&i)
+                .cloned()
+                .unwrap_or_else(|| format!("arg{}", i)),
+            P_PRIMARY,
+        ),
         Node::Unknown(u) => (format!("unknown_{}", n.seq(u)), P_PRIMARY),
         Node::CallDataLoad(off) => {
             if let Some(i) = calldata_word_index(off) {
-                return (n.params.get(&i).cloned().unwrap_or_else(|| format!("arg{}", i)), P_PRIMARY);
+                return (
+                    n.params
+                        .get(&i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("arg{}", i)),
+                    P_PRIMARY,
+                );
             }
             if expr::as_const(off) == Some(U256::ZERO) {
                 return ("msg.data[0:32]".into(), P_PRIMARY);
@@ -461,7 +584,10 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             (format!("calldata[{}]", fmt_expr(off, n)), P_PRIMARY)
         }
         Node::MLoad(off, _) => (format!("mem[{}]", fmt_mem_off(off, n)), P_PRIMARY),
-        Node::SLoad(key, transient, _) => (fmt_slot(key, n, transient), P_PRIMARY),
+        Node::SLoad(key, transient, _) => (
+            fmt_slot(key, n, SlotSpace::from_transient(transient)),
+            P_PRIMARY,
+        ),
         Node::Keccak(words, tail) => {
             let mut parts: Vec<String> = Vec::new();
             for (i, w) in words.iter().enumerate() {
@@ -471,13 +597,29 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
                     parts.push(fmt_expr(*w, n));
                 }
             }
-            (format!("keccak256(abi.encodePacked({}))", parts.join(", ")), P_PRIMARY)
+            (
+                format!("keccak256(abi.encodePacked({}))", parts.join(", ")),
+                P_PRIMARY,
+            )
         }
-        Node::KeccakMem(off, len, _) => (format!("keccak256(mem[{}:{}])", fmt_expr(off, n), fmt_prec(expr::op2(op::ADD, off, len), 0, n)), P_PRIMARY),
+        Node::KeccakMem(off, len, _) => (
+            format!(
+                "keccak256(mem[{}:{}])",
+                fmt_expr(off, n),
+                fmt_prec(expr::op2(op::ADD, off, len), 0, n)
+            ),
+            P_PRIMARY,
+        ),
         Node::CallResult(seq) => (format!("success_{}", n.seq(seq)), P_PRIMARY),
         Node::CreateResult(seq) => (format!("deployed_{}", n.seq(seq)), P_PRIMARY),
-        Node::ReturnData(seq, off) => (format!("returndata_{}[{}]", n.seq(seq), fmt_expr(off, n)), P_PRIMARY),
-        Node::CopiedWord(kind, src, _) => (format!("{}[{}]", copy_source(kind), fmt_expr(src, n)), P_PRIMARY),
+        Node::ReturnData(seq, off) => (
+            format!("returndata_{}[{}]", n.seq(seq), fmt_expr(off, n)),
+            P_PRIMARY,
+        ),
+        Node::CopiedWord(kind, src, _) => (
+            format!("{}[{}]", copy_source(kind), fmt_expr(src, n)),
+            P_PRIMARY,
+        ),
         Node::IntRet(seq, j) => (format!("ret_{}_{}", n.seq(seq), j), P_PRIMARY),
         Node::Op(o, v) => fmt_op(o, &v, n),
     }
@@ -490,15 +632,61 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             // Negated comparisons
             if let Node::Op(io, iv) = expr::node(a) {
                 match io {
-                    op::EQ => return (format!("{} != {}", fmt_prec(iv[0], P_EQ + 1, n), fmt_eq_rhs(iv[0], iv[1], P_EQ + 1, n)), P_EQ),
-                    op::LT => return (format!("{} >= {}", fmt_prec(iv[0], P_CMP + 1, n), fmt_prec(iv[1], P_CMP + 1, n)), P_CMP),
-                    op::GT => return (format!("{} <= {}", fmt_prec(iv[0], P_CMP + 1, n), fmt_prec(iv[1], P_CMP + 1, n)), P_CMP),
-                    op::SLT | op::SGT if size_compare(io, iv[0], iv[1], n).is_some() => {
-                        let s = size_compare(io, iv[0], iv[1], n).unwrap();
-                        return (s.replacen(if io == op::SLT { " < " } else { " > " }, if io == op::SLT { " >= " } else { " <= " }, 1), P_CMP);
+                    op::EQ => {
+                        return (
+                            format!(
+                                "{} != {}",
+                                fmt_prec(iv[0], P_EQ + 1, n),
+                                fmt_eq_rhs(iv[0], iv[1], P_EQ + 1, n)
+                            ),
+                            P_EQ,
+                        )
                     }
-                    op::SLT => return (format!("{} >= {}", fmt_signed(iv[0], n), fmt_signed(iv[1], n)), P_CMP),
-                    op::SGT => return (format!("{} <= {}", fmt_signed(iv[0], n), fmt_signed(iv[1], n)), P_CMP),
+                    op::LT => {
+                        return (
+                            format!(
+                                "{} >= {}",
+                                fmt_prec(iv[0], P_CMP + 1, n),
+                                fmt_prec(iv[1], P_CMP + 1, n)
+                            ),
+                            P_CMP,
+                        )
+                    }
+                    op::GT => {
+                        return (
+                            format!(
+                                "{} <= {}",
+                                fmt_prec(iv[0], P_CMP + 1, n),
+                                fmt_prec(iv[1], P_CMP + 1, n)
+                            ),
+                            P_CMP,
+                        )
+                    }
+                    op::SLT | op::SGT if size_compare(io, iv[0], iv[1], n).is_some() => {
+                        let Some(s) = size_compare(io, iv[0], iv[1], n) else {
+                            unreachable!("guard checked size_compare")
+                        };
+                        return (
+                            s.replacen(
+                                if io == op::SLT { " < " } else { " > " },
+                                if io == op::SLT { " >= " } else { " <= " },
+                                1,
+                            ),
+                            P_CMP,
+                        );
+                    }
+                    op::SLT => {
+                        return (
+                            format!("{} >= {}", fmt_signed(iv[0], n), fmt_signed(iv[1], n)),
+                            P_CMP,
+                        )
+                    }
+                    op::SGT => {
+                        return (
+                            format!("{} <= {}", fmt_signed(iv[0], n), fmt_signed(iv[1], n)),
+                            P_CMP,
+                        )
+                    }
                     _ => {}
                 }
             }
@@ -514,27 +702,127 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             }
         }
         (op::NOT, 1) => (format!("~{}", fmt_prec(v[0], P_UNARY, n)), P_UNARY),
-        (op::BALANCE, 1) => (format!("{}.balance", fmt_prec(v[0], P_PRIMARY, n)), P_PRIMARY),
-        (op::EXTCODESIZE, 1) => (format!("{}.code.length", fmt_prec(v[0], P_PRIMARY, n)), P_PRIMARY),
-        (op::EXTCODEHASH, 1) => (format!("{}.codehash", fmt_prec(v[0], P_PRIMARY, n)), P_PRIMARY),
+        (op::BALANCE, 1) => (
+            format!("{}.balance", fmt_prec(v[0], P_PRIMARY, n)),
+            P_PRIMARY,
+        ),
+        (op::EXTCODESIZE, 1) => (
+            format!("{}.code.length", fmt_prec(v[0], P_PRIMARY, n)),
+            P_PRIMARY,
+        ),
+        (op::EXTCODEHASH, 1) => (
+            format!("{}.codehash", fmt_prec(v[0], P_PRIMARY, n)),
+            P_PRIMARY,
+        ),
         (op::BLOCKHASH, 1) => (format!("blockhash({})", fmt_expr(v[0], n)), P_PRIMARY),
         (op::BLOBHASH, 1) => (format!("blobhash({})", fmt_expr(v[0], n)), P_PRIMARY),
-        (op::ADD, 2) => (format!("{} + {}", fmt_prec(v[0], P_ADD, n), fmt_prec(v[1], P_ADD + 1, n)), P_ADD),
-        (op::SUB, 2) => (format!("{} - {}", fmt_prec(v[0], P_ADD, n), fmt_prec(v[1], P_ADD + 1, n)), P_ADD),
-        (op::MUL, 2) => (format!("{} * {}", fmt_prec(v[0], P_MUL, n), fmt_prec(v[1], P_MUL + 1, n)), P_MUL),
-        (op::DIV, 2) => (format!("{} / {}", fmt_prec(v[0], P_MUL, n), fmt_prec(v[1], P_MUL + 1, n)), P_MUL),
-        (op::MOD, 2) => (format!("{} % {}", fmt_prec(v[0], P_MUL, n), fmt_prec(v[1], P_MUL + 1, n)), P_MUL),
-        (op::SDIV, 2) => (format!("{} / {}", fmt_signed(v[0], n), fmt_signed(v[1], n)), P_MUL),
-        (op::SMOD, 2) => (format!("{} % {}", fmt_signed(v[0], n), fmt_signed(v[1], n)), P_MUL),
-        (op::EXP, 2) => (format!("{} ** {}", fmt_prec(v[0], P_EXP + 1, n), fmt_prec(v[1], P_EXP, n)), P_EXP),
-        (op::LT, 2) => (format!("{} < {}", fmt_prec(v[0], P_CMP + 1, n), fmt_prec(v[1], P_CMP + 1, n)), P_CMP),
-        (op::GT, 2) => (format!("{} > {}", fmt_prec(v[0], P_CMP + 1, n), fmt_prec(v[1], P_CMP + 1, n)), P_CMP),
-        (op::SLT, 2) | (op::SGT, 2) if size_compare(o, v[0], v[1], n).is_some() => (size_compare(o, v[0], v[1], n).unwrap(), P_CMP),
-        (op::SLT, 2) => (format!("{} < {}", fmt_signed(v[0], n), fmt_signed(v[1], n)), P_CMP),
-        (op::SGT, 2) => (format!("{} > {}", fmt_signed(v[0], n), fmt_signed(v[1], n)), P_CMP),
-        (op::EQ, 2) => (format!("{} == {}", fmt_prec(v[0], P_EQ + 1, n), fmt_eq_rhs(v[0], v[1], P_EQ + 1, n)), P_EQ),
-        (op::AND, 2) if expr::is_boolean(v[0]) && expr::is_boolean(v[1]) => (format!("{} && {}", fmt_prec(v[0], P_AND, n), fmt_prec(v[1], P_AND + 1, n)), P_AND),
-        (op::OR, 2) if expr::is_boolean(v[0]) && expr::is_boolean(v[1]) => (format!("{} || {}", fmt_prec(v[0], P_OR, n), fmt_prec(v[1], P_OR + 1, n)), P_OR),
+        (op::ADD, 2) => (
+            format!(
+                "{} + {}",
+                fmt_prec(v[0], P_ADD, n),
+                fmt_prec(v[1], P_ADD + 1, n)
+            ),
+            P_ADD,
+        ),
+        (op::SUB, 2) => (
+            format!(
+                "{} - {}",
+                fmt_prec(v[0], P_ADD, n),
+                fmt_prec(v[1], P_ADD + 1, n)
+            ),
+            P_ADD,
+        ),
+        (op::MUL, 2) => (
+            format!(
+                "{} * {}",
+                fmt_prec(v[0], P_MUL, n),
+                fmt_prec(v[1], P_MUL + 1, n)
+            ),
+            P_MUL,
+        ),
+        (op::DIV, 2) => (
+            format!(
+                "{} / {}",
+                fmt_prec(v[0], P_MUL, n),
+                fmt_prec(v[1], P_MUL + 1, n)
+            ),
+            P_MUL,
+        ),
+        (op::MOD, 2) => (
+            format!(
+                "{} % {}",
+                fmt_prec(v[0], P_MUL, n),
+                fmt_prec(v[1], P_MUL + 1, n)
+            ),
+            P_MUL,
+        ),
+        (op::SDIV, 2) => (
+            format!("{} / {}", fmt_signed(v[0], n), fmt_signed(v[1], n)),
+            P_MUL,
+        ),
+        (op::SMOD, 2) => (
+            format!("{} % {}", fmt_signed(v[0], n), fmt_signed(v[1], n)),
+            P_MUL,
+        ),
+        (op::EXP, 2) => (
+            format!(
+                "{} ** {}",
+                fmt_prec(v[0], P_EXP + 1, n),
+                fmt_prec(v[1], P_EXP, n)
+            ),
+            P_EXP,
+        ),
+        (op::LT, 2) => (
+            format!(
+                "{} < {}",
+                fmt_prec(v[0], P_CMP + 1, n),
+                fmt_prec(v[1], P_CMP + 1, n)
+            ),
+            P_CMP,
+        ),
+        (op::GT, 2) => (
+            format!(
+                "{} > {}",
+                fmt_prec(v[0], P_CMP + 1, n),
+                fmt_prec(v[1], P_CMP + 1, n)
+            ),
+            P_CMP,
+        ),
+        (op::SLT, 2) | (op::SGT, 2) => match size_compare(o, v[0], v[1], n) {
+            Some(s) => (s, P_CMP),
+            None if o == op::SLT => (
+                format!("{} < {}", fmt_signed(v[0], n), fmt_signed(v[1], n)),
+                P_CMP,
+            ),
+            None => (
+                format!("{} > {}", fmt_signed(v[0], n), fmt_signed(v[1], n)),
+                P_CMP,
+            ),
+        },
+        (op::EQ, 2) => (
+            format!(
+                "{} == {}",
+                fmt_prec(v[0], P_EQ + 1, n),
+                fmt_eq_rhs(v[0], v[1], P_EQ + 1, n)
+            ),
+            P_EQ,
+        ),
+        (op::AND, 2) if expr::is_boolean(v[0]) && expr::is_boolean(v[1]) => (
+            format!(
+                "{} && {}",
+                fmt_prec(v[0], P_AND, n),
+                fmt_prec(v[1], P_AND + 1, n)
+            ),
+            P_AND,
+        ),
+        (op::OR, 2) if expr::is_boolean(v[0]) && expr::is_boolean(v[1]) => (
+            format!(
+                "{} || {}",
+                fmt_prec(v[0], P_OR, n),
+                fmt_prec(v[1], P_OR + 1, n)
+            ),
+            P_OR,
+        ),
         (op::AND, 2) => {
             if let Some(m) = expr::as_const(v[1]) {
                 if m.is_low_mask() {
@@ -547,32 +835,102 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                     }
                 }
             }
-            (format!("{} & {}", fmt_prec(v[0], P_AND, n), fmt_prec(v[1], P_AND + 1, n)), P_AND)
+            (
+                format!(
+                    "{} & {}",
+                    fmt_prec(v[0], P_AND, n),
+                    fmt_prec(v[1], P_AND + 1, n)
+                ),
+                P_AND,
+            )
         }
-        (op::OR, 2) => (format!("{} | {}", fmt_prec(v[0], P_OR, n), fmt_prec(v[1], P_OR + 1, n)), P_OR),
-        (op::XOR, 2) => (format!("{} ^ {}", fmt_prec(v[0], P_XOR, n), fmt_prec(v[1], P_XOR + 1, n)), P_XOR),
-        (op::SHL, 2) => (format!("{} << {}", fmt_prec(v[1], P_SHIFT, n), fmt_prec(v[0], P_SHIFT + 1, n)), P_SHIFT),
+        (op::OR, 2) => (
+            format!(
+                "{} | {}",
+                fmt_prec(v[0], P_OR, n),
+                fmt_prec(v[1], P_OR + 1, n)
+            ),
+            P_OR,
+        ),
+        (op::XOR, 2) => (
+            format!(
+                "{} ^ {}",
+                fmt_prec(v[0], P_XOR, n),
+                fmt_prec(v[1], P_XOR + 1, n)
+            ),
+            P_XOR,
+        ),
+        (op::SHL, 2) => (
+            format!(
+                "{} << {}",
+                fmt_prec(v[1], P_SHIFT, n),
+                fmt_prec(v[0], P_SHIFT + 1, n)
+            ),
+            P_SHIFT,
+        ),
         (op::SHR, 2) => {
             if is_selector_expr(expr::intern(Node::Op(op::SHR, v.to_vec()))) {
                 return ("msg.sig".into(), P_PRIMARY);
             }
-            (format!("{} >> {}", fmt_prec(v[1], P_SHIFT, n), fmt_prec(v[0], P_SHIFT + 1, n)), P_SHIFT)
+            (
+                format!(
+                    "{} >> {}",
+                    fmt_prec(v[1], P_SHIFT, n),
+                    fmt_prec(v[0], P_SHIFT + 1, n)
+                ),
+                P_SHIFT,
+            )
         }
-        (op::SAR, 2) => (format!("{} >> {}", fmt_signed(v[1], n), fmt_prec(v[0], P_SHIFT + 1, n)), P_SHIFT),
-        (op::BYTE, 2) => (format!("byte({}, {})", fmt_expr(v[0], n), fmt_expr(v[1], n)), P_PRIMARY),
+        (op::SAR, 2) => (
+            format!(
+                "{} >> {}",
+                fmt_signed(v[1], n),
+                fmt_prec(v[0], P_SHIFT + 1, n)
+            ),
+            P_SHIFT,
+        ),
+        (op::BYTE, 2) => (
+            format!("byte({}, {})", fmt_expr(v[0], n), fmt_expr(v[1], n)),
+            P_PRIMARY,
+        ),
         (op::SIGNEXTEND, 2) => {
             if let Some(k) = expr::as_const(v[0]) {
                 if k < U256::from_u64(31) {
-                    return (format!("int{}({})", 8 * (k.low_u64() + 1), fmt_expr(v[1], n)), P_PRIMARY);
+                    return (
+                        format!("int{}({})", 8 * (k.low_u64() + 1), fmt_expr(v[1], n)),
+                        P_PRIMARY,
+                    );
                 }
             }
-            (format!("signextend({}, {})", fmt_expr(v[0], n), fmt_expr(v[1], n)), P_PRIMARY)
+            (
+                format!("signextend({}, {})", fmt_expr(v[0], n), fmt_expr(v[1], n)),
+                P_PRIMARY,
+            )
         }
-        (op::ADDMOD, 3) => (format!("addmod({}, {}, {})", fmt_expr(v[0], n), fmt_expr(v[1], n), fmt_expr(v[2], n)), P_PRIMARY),
-        (op::MULMOD, 3) => (format!("mulmod({}, {}, {})", fmt_expr(v[0], n), fmt_expr(v[1], n), fmt_expr(v[2], n)), P_PRIMARY),
+        (op::ADDMOD, 3) => (
+            format!(
+                "addmod({}, {}, {})",
+                fmt_expr(v[0], n),
+                fmt_expr(v[1], n),
+                fmt_expr(v[2], n)
+            ),
+            P_PRIMARY,
+        ),
+        (op::MULMOD, 3) => (
+            format!(
+                "mulmod({}, {}, {})",
+                fmt_expr(v[0], n),
+                fmt_expr(v[1], n),
+                fmt_expr(v[2], n)
+            ),
+            P_PRIMARY,
+        ),
         _ => {
             let args: Vec<String> = v.iter().map(|x| fmt_expr(*x, n)).collect();
-            (format!("{}({})", op::name(o).to_lowercase(), args.join(", ")), P_PRIMARY)
+            (
+                format!("{}({})", op::name(o).to_lowercase(), args.join(", ")),
+                P_PRIMARY,
+            )
         }
     }
 }
@@ -582,7 +940,7 @@ fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
     if is_selector_expr(lhs) {
         if let Some(c) = expr::as_const(rhs) {
             let sel = c.low_u64() as u32;
-            let s = format!("{}", c.to_hex_padded(4));
+            let s = c.to_hex_padded(4).to_string();
             return match sigs::function(sel) {
                 Some(sig) => format!("{} /* {} */", s, sig),
                 None => s,
@@ -606,8 +964,12 @@ pub fn leading_selector(word0: ExprId, len: Option<usize>) -> Option<u32> {
         return None;
     }
     let from_const = |c: U256| -> Option<u32> {
-        let sel = c.shr(8 * (first_bytes - 4)).low_u64() as u32;
-        if sel == 0 { None } else { Some(sel) }
+        let sel = (c >> (8 * (first_bytes - 4))).low_u64() as u32;
+        if sel == 0 {
+            None
+        } else {
+            Some(sel)
+        }
     };
     if let Some(c) = expr::as_const(word0) {
         return from_const(c);
@@ -626,15 +988,20 @@ pub fn leading_selector(word0: ExprId, len: Option<usize>) -> Option<u32> {
     None
 }
 
-pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, revert: bool) -> String {
+/// Render ABI-encoded payload words: a revert reason string, `Panic(…)`, a custom error with its
+/// arguments, a returned string, or the words joined with commas.
+pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, kind: PayloadKind) -> String {
     if words.is_empty() {
         return String::new();
     }
     // Error(string) / Panic / custom error: first word's top 4 bytes
     let lenu = len.and_then(|l| l.as_usize());
     if let Some(sel) = leading_selector(words[0], lenu) {
-        let top4_only = lenu.map_or(expr::as_const(words[0]).map_or(true, |c| (c & expr::mask_bits(224)).is_zero()), |l| l >= 4 && (l - 4) % 32 == 0);
-        if revert && top4_only {
+        let top4_only = lenu.map_or(
+            expr::as_const(words[0]).is_none_or(|c| (c & expr::mask_bits(224)).is_zero()),
+            |l| l >= 4 && (l - 4) % 32 == 0,
+        );
+        if kind == PayloadKind::Revert && top4_only {
             if sel == 0x08c379a0 {
                 if let Some(s) = decode_string_payload(words, lenu) {
                     return format!("\"{}\"", s);
@@ -645,19 +1012,31 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, revert: bool)
                     return format!("Panic({})", panic_name(code.low_u64()));
                 }
             }
-            let nargs = lenu.map(|l| l.saturating_sub(4) / 32).unwrap_or(words.len().saturating_sub(1));
+            let nargs = lenu
+                .map(|l| l.saturating_sub(4) / 32)
+                .unwrap_or(words.len().saturating_sub(1));
             if let Some(sig) = sigs::error(sel) {
-                let args: Vec<String> = (0..nargs).map(|i| fmt_expr(shifted_word_len(words, i, lenu), n)).collect();
+                let args: Vec<String> = (0..nargs)
+                    .map(|i| fmt_expr(shifted_word_len(words, i, lenu), n))
+                    .collect();
                 return format!("{}({})", sigs::name_of(sig), args.join(", "));
             }
-            let args: Vec<String> = (0..nargs).map(|i| fmt_expr(shifted_word_len(words, i, lenu), n)).collect();
+            let args: Vec<String> = (0..nargs)
+                .map(|i| fmt_expr(shifted_word_len(words, i, lenu), n))
+                .collect();
             return format!("CustomError_{:08x}({})", sel, args.join(", "));
         }
     }
     // A single dynamic value `(32, len, data…)` returned in place: show the text when it is one.
-    if !revert && words.len() >= 3 && expr::as_const(words[0]) == Some(U256::from_u64(32)) {
+    if kind == PayloadKind::Return
+        && words.len() >= 3
+        && expr::as_const(words[0]) == Some(U256::from_u64(32))
+    {
         if let Some(len) = expr::as_const(words[1]).and_then(|l| l.as_usize()) {
-            if len > 0 && len <= 32 * (words.len() - 2) && lenu.map_or(true, |l| l == 64 + len.div_ceil(32) * 32) {
+            if len > 0
+                && len <= 32 * (words.len() - 2)
+                && lenu.is_none_or(|l| l == 64 + len.div_ceil(32) * 32)
+            {
                 let mut bytes = Vec::new();
                 for w in &words[2..] {
                     match expr::as_const(*w) {
@@ -686,16 +1065,25 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, revert: bool)
 /// multiple of 32 holds its `len % 32` bytes right-aligned and is left-aligned here first.
 pub fn shifted_word_len(words: &[ExprId], i: usize, len: Option<usize>) -> ExprId {
     let align = |j: usize| -> ExprId {
-        let w = words.get(j).copied().unwrap_or_else(|| expr::konst(U256::ZERO));
+        let w = words
+            .get(j)
+            .copied()
+            .unwrap_or_else(|| expr::konst(U256::ZERO));
         match len {
-            Some(l) if j == words.len() - 1 && l % 32 != 0 => expr::op2(op::SHL, expr::konst_u64(8 * (32 - (l % 32)) as u64), w),
+            Some(l) if j == words.len() - 1 && l % 32 != 0 => {
+                expr::op2(op::SHL, expr::konst_u64(8 * (32 - (l % 32)) as u64), w)
+            }
             _ => w,
         }
     };
     let hi = align(i);
     let lo = align(i + 1);
     // (hi << 32) | (lo >> 224)
-    expr::op2(op::OR, expr::op2(op::SHL, expr::konst_u64(32), hi), expr::op2(op::SHR, expr::konst_u64(224), lo))
+    expr::op2(
+        op::OR,
+        expr::op2(op::SHL, expr::konst_u64(32), hi),
+        expr::op2(op::SHR, expr::konst_u64(224), lo),
+    )
 }
 
 fn panic_name(code: u64) -> String {
@@ -756,12 +1144,16 @@ pub fn decode_plain_string(words: &[ExprId]) -> Option<String> {
         return None;
     }
     bytes.truncate(len);
-    if !bytes.iter().all(|b| *b >= 0x20 && *b < 0x7f || *b == b'\n' || *b == b'\t') {
+    if !bytes
+        .iter()
+        .all(|b| *b >= 0x20 && *b < 0x7f || *b == b'\n' || *b == b'\t')
+    {
         return None;
     }
     Some(escape(&String::from_utf8_lossy(&bytes)))
 }
 
+/// Escape a string for a double-quoted Solidity literal.
 pub fn escape(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -771,7 +1163,9 @@ pub fn escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c == '\u{fffd}' => out.push_str(&format!("\\x{:02x}", c as u32 & 0xff)),
+            c if (c as u32) < 0x20 || c == '\u{fffd}' => {
+                out.push_str(&format!("\\x{:02x}", c as u32 & 0xff))
+            }
             c => out.push(c),
         }
     }
@@ -779,17 +1173,28 @@ pub fn escape(s: &str) -> String {
 }
 
 /// Render the input of an external call: `abi.encodeWithSelector(...)` decoded when possible.
-pub fn fmt_call_input(words: &[ExprId], in_len: Option<U256>, n: &Names) -> (Option<String>, Vec<String>) {
+pub fn fmt_call_input(
+    words: &[ExprId],
+    in_len: Option<U256>,
+    n: &Names,
+) -> (Option<String>, Vec<String>) {
     // Returns (function name if known, args)
     if words.is_empty() {
         return (None, vec![]);
     }
     let in_len = in_len.and_then(|l| l.as_usize());
     if let Some(sel) = leading_selector(words[0], in_len) {
-        let looks_like_selector = in_len.map_or(expr::as_const(words[0]).map_or(true, |c| (c & expr::mask_bits(224)).is_zero()), |l| l >= 4 && (l - 4) % 32 == 0);
+        let looks_like_selector = in_len.map_or(
+            expr::as_const(words[0]).is_none_or(|c| (c & expr::mask_bits(224)).is_zero()),
+            |l| l >= 4 && (l - 4) % 32 == 0,
+        );
         if looks_like_selector {
-            let nargs = in_len.map(|l| l.saturating_sub(4) / 32).unwrap_or(words.len().saturating_sub(1));
-            let args: Vec<String> = (0..nargs.min(words.len())).map(|i| fmt_expr(shifted_word_len(words, i, in_len), n)).collect();
+            let nargs = in_len
+                .map(|l| l.saturating_sub(4) / 32)
+                .unwrap_or(words.len().saturating_sub(1));
+            let args: Vec<String> = (0..nargs.min(words.len()))
+                .map(|i| fmt_expr(shifted_word_len(words, i, in_len), n))
+                .collect();
             let name = match sigs::function(sel) {
                 Some(sig) => sigs::name_of(sig).to_string(),
                 None => format!("func_{:08x}", sel),
@@ -800,6 +1205,7 @@ pub fn fmt_call_input(words: &[ExprId], in_len: Option<U256>, n: &Names) -> (Opt
     (None, words.iter().map(|w| fmt_expr(*w, n)).collect())
 }
 
+/// Render one statement as a line of pseudo-Solidity, without indentation.
 pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
     match s {
         Stmt::Assign { var, value } => format!("{} = {};", fmt_expr(*var, n), fmt_expr(*value, n)),
@@ -810,7 +1216,11 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 format!("mem[{}] = {};", fmt_mem_off(*off, n), fmt_expr(*val, n))
             }
         }
-        Stmt::SStore { key, val, transient } => {
+        Stmt::SStore {
+            key,
+            val,
+            transient,
+        } => {
             if !n.fields.is_empty() && !*transient {
                 if let Some((k, off, bits, value)) = packed_write(*key, *val) {
                     if let Some(name) = n.fields.get(&(k, off, bits)) {
@@ -818,9 +1228,18 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     }
                 }
             }
-            format!("{} = {};", fmt_slot(*key, n, *transient), fmt_expr(*val, n))
+            format!(
+                "{} = {};",
+                fmt_slot(*key, n, SlotSpace::from_transient(*transient)),
+                fmt_expr(*val, n)
+            )
         }
-        Stmt::Log { off, len, topics, data } => {
+        Stmt::Log {
+            off,
+            len,
+            topics,
+            data,
+        } => {
             let mut args: Vec<String> = Vec::new();
             let mut name = None;
             if let Some(t0) = topics.first().and_then(|t| expr::as_const(*t)) {
@@ -840,19 +1259,38 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 }
                 None => {
                     if expr::as_const(*len) != Some(U256::ZERO) {
-                        args.push(format!("mem[{}:{}]", fmt_expr(*off, n), fmt_expr(expr::op2(op::ADD, *off, *len), n)));
+                        args.push(format!(
+                            "mem[{}:{}]",
+                            fmt_expr(*off, n),
+                            fmt_expr(expr::op2(op::ADD, *off, *len), n)
+                        ));
                     }
                 }
             }
             match name {
                 Some(nm) => format!("emit {}({});", nm, args.join(", ")),
                 None => match topics.first().and_then(|t| expr::as_const(*t)) {
-                    Some(t0) => format!("emit {}({});", event_placeholder_name(t0), args[1..].join(", ")),
+                    Some(t0) => format!(
+                        "emit {}({});",
+                        event_placeholder_name(t0),
+                        args[1..].join(", ")
+                    ),
                     None => format!("log{}({});", topics.len(), args.join(", ")),
                 },
             }
         }
-        Stmt::Call { kind, gas, addr, value, in_off, in_len, out_len, input, result, .. } => {
+        Stmt::Call {
+            kind,
+            gas,
+            addr,
+            value,
+            in_off,
+            in_len,
+            out_len: _,
+            input,
+            result,
+            ..
+        } => {
             let target = fmt_prec(*addr, P_PRIMARY, n);
             let mut opts = Vec::new();
             if let Some(v) = value {
@@ -860,11 +1298,16 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     opts.push(format!("value: {}", fmt_expr(*v, n)));
                 }
             }
-            let gas_is_all = matches!(expr::node(*gas), Node::Env(op::GAS, _)) || matches!(expr::node(*gas), Node::Op(op::SUB, v) if matches!(expr::node(v[0]), Node::Env(op::GAS, _)));
+            let gas_is_all = matches!(expr::node(*gas), Node::Env(op::GAS, _))
+                || matches!(expr::node(*gas), Node::Op(op::SUB, v) if matches!(expr::node(v[0]), Node::Env(op::GAS, _)));
             if !gas_is_all {
                 opts.push(format!("gas: {}", fmt_expr(*gas, n)));
             }
-            let opts_s = if opts.is_empty() { String::new() } else { format!("{{{}}}", opts.join(", ")) };
+            let opts_s = if opts.is_empty() {
+                String::new()
+            } else {
+                format!("{{{}}}", opts.join(", "))
+            };
             let method = match *kind {
                 op::CALL => "call",
                 op::CALLCODE => "callcode",
@@ -877,56 +1320,140 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 None => (None, vec![]),
             };
             let payload = match (&fname, input) {
-                (Some(f), _) => format!("abi.encodeWithSelector({}.selector, {})", f, args.join(", ")).replace(", )", ")"),
+                (Some(f), _) => format!(
+                    "abi.encodeWithSelector({}.selector, {})",
+                    f,
+                    args.join(", ")
+                )
+                .replace(", )", ")"),
                 (None, Some(_)) if args.is_empty() => "\"\"".into(),
                 (None, Some(_)) => format!("abi.encode({})", args.join(", ")),
                 (None, None) => {
                     if expr::as_const(*in_len) == Some(U256::ZERO) {
                         "\"\"".into()
                     } else {
-                        format!("mem[{}:{}]", fmt_expr(*in_off, n), fmt_expr(expr::op2(op::ADD, *in_off, *in_len), n))
+                        format!(
+                            "mem[{}:{}]",
+                            fmt_expr(*in_off, n),
+                            fmt_expr(expr::op2(op::ADD, *in_off, *in_len), n)
+                        )
                     }
                 }
             };
-            let ret = if expr::as_const(*out_len) == Some(U256::ZERO) { String::new() } else { String::new() };
-            let _ = ret;
             // Known target function: show as a typed call.
             match fname {
                 Some(f) if *kind == op::CALL || *kind == op::STATICCALL => {
-                    format!("{} = {}.{}{}({}); // {}({})", fmt_expr(*result, n), target, method, opts_s, payload, f, args.join(", "))
+                    format!(
+                        "{} = {}.{}{}({}); // {}({})",
+                        fmt_expr(*result, n),
+                        target,
+                        method,
+                        opts_s,
+                        payload,
+                        f,
+                        args.join(", ")
+                    )
                 }
-                _ => format!("{} = {}.{}{}({});", fmt_expr(*result, n), target, method, opts_s, payload),
+                _ => format!(
+                    "{} = {}.{}{}({});",
+                    fmt_expr(*result, n),
+                    target,
+                    method,
+                    opts_s,
+                    payload
+                ),
             }
         }
-        Stmt::Create { kind, value, off, len, salt, result, init, .. } => {
+        Stmt::Create {
+            kind,
+            value,
+            off,
+            len,
+            salt,
+            result,
+            init,
+            ..
+        } => {
             let code = match init {
                 Some(words) if !words.is_empty() => format!("bytecode[{} words]", words.len()),
-                _ => format!("mem[{}:{}]", fmt_expr(*off, n), fmt_expr(expr::op2(op::ADD, *off, *len), n)),
+                _ => format!(
+                    "mem[{}:{}]",
+                    fmt_expr(*off, n),
+                    fmt_expr(expr::op2(op::ADD, *off, *len), n)
+                ),
             };
-            let v = if expr::as_const(*value) == Some(U256::ZERO) { String::new() } else { format!("{{value: {}}}", fmt_expr(*value, n)) };
+            let v = if expr::as_const(*value) == Some(U256::ZERO) {
+                String::new()
+            } else {
+                format!("{{value: {}}}", fmt_expr(*value, n))
+            };
             match (kind, salt) {
-                (&op::CREATE2, Some(s)) => format!("{} = create2{}({}, salt: {});", fmt_expr(*result, n), v, code, fmt_expr(*s, n)),
+                (&op::CREATE2, Some(s)) => format!(
+                    "{} = create2{}({}, salt: {});",
+                    fmt_expr(*result, n),
+                    v,
+                    code,
+                    fmt_expr(*s, n)
+                ),
                 _ => format!("{} = create{}({});", fmt_expr(*result, n), v, code),
             }
         }
-        Stmt::Copy { kind, dest, src, len, addr } => {
+        Stmt::Copy {
+            kind,
+            dest,
+            src,
+            len,
+            addr,
+        } => {
             let src_s = match addr {
-                Some(a) => format!("{}.code[{}:+{}]", fmt_prec(*a, P_PRIMARY, n), fmt_expr(*src, n), fmt_expr(*len, n)),
-                None => format!("{}[{}:+{}]", copy_source(*kind), fmt_expr(*src, n), fmt_expr(*len, n)),
+                Some(a) => format!(
+                    "{}.code[{}:+{}]",
+                    fmt_prec(*a, P_PRIMARY, n),
+                    fmt_expr(*src, n),
+                    fmt_expr(*len, n)
+                ),
+                None => format!(
+                    "{}[{}:+{}]",
+                    copy_source(*kind),
+                    fmt_expr(*src, n),
+                    fmt_expr(*len, n)
+                ),
             };
-            format!("mem[{}:+{}] = {};", fmt_expr(*dest, n), fmt_expr(*len, n), src_s)
+            format!(
+                "mem[{}:+{}] = {};",
+                fmt_expr(*dest, n),
+                fmt_expr(*len, n),
+                src_s
+            )
         }
-        Stmt::Internal { callee, args, results, .. } => {
+        Stmt::Internal {
+            callee,
+            args,
+            results,
+            ..
+        } => {
             let a: Vec<String> = args.iter().map(|x| fmt_expr(*x, n)).collect();
             let call = format!("func_{:#x}({})", callee, a.join(", "));
             match results.len() {
                 0 => format!("{};", call),
                 1 => format!("{} = {};", fmt_expr(results[0], n), call),
-                _ => format!("({}) = {};", results.iter().map(|r| fmt_expr(*r, n)).collect::<Vec<_>>().join(", "), call),
+                _ => format!(
+                    "({}) = {};",
+                    results
+                        .iter()
+                        .map(|r| fmt_expr(*r, n))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    call
+                ),
             }
         }
         Stmt::Drop(e) => format!("// ignored: {}", fmt_expr(*e, n)),
-        Stmt::Require { cond, data, invalid } => {
+        Stmt::Require {
+            cond,
+            data,
+            invalid,
+        } => {
             if is_abi_validator(*cond) {
                 return String::new();
             }
@@ -937,9 +1464,12 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             match data {
                 Some(words) if !words.is_empty() => {
                     // Selector payloads (Error(string), Panic(code), custom errors) are 4 + 32n bytes.
-                    let len = leading_selector(words[0], None).map(|_| U256::from_u64(4 + 32 * (words.len() as u64 - 1)));
-                    let p = fmt_payload(words, len, n, true);
-                    if n.hide_checked && (p == "Panic(arithmetic overflow)" || p == "Panic(division by zero)") {
+                    let len = leading_selector(words[0], None)
+                        .map(|_| U256::from_u64(4 + 32 * (words.len() as u64 - 1)));
+                    let p = fmt_payload(words, len, n, PayloadKind::Revert);
+                    if n.hide_checked
+                        && (p == "Panic(arithmetic overflow)" || p == "Panic(division by zero)")
+                    {
                         return String::new();
                     }
                     if p == "Panic(assert failed)" {
@@ -947,7 +1477,11 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     } else if p.starts_with('"') || p.starts_with("Panic(") {
                         format!("require({}, {});", c, p)
                     } else {
-                        format!("if ({}) revert {};", fmt_expr(expr::op1(op::ISZERO, *cond), n), p)
+                        format!(
+                            "if ({}) revert {};",
+                            fmt_expr(expr::op1(op::ISZERO, *cond), n),
+                            p
+                        )
                     }
                 }
                 _ => format!("require({});", c),
@@ -978,23 +1512,40 @@ fn strip_outer_parens(s: &str) -> &str {
     &s[1..s.len() - 1]
 }
 
+/// Render a terminator that ends the function (`return`, `revert`, `selfdestruct`, …) or has no
+/// structured form (an unresolved `jump`); `None` for branches and jumps within the function.
 pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
     Some(match t {
         Term::Return { off, len, data } => match data {
-            Some(words) if !words.is_empty() => format!("return ({});", strip_outer_parens(&fmt_payload(words, expr::as_const(*len), n, false))),
+            Some(words) if !words.is_empty() => format!(
+                "return ({});",
+                strip_outer_parens(&fmt_payload(
+                    words,
+                    expr::as_const(*len),
+                    n,
+                    PayloadKind::Return
+                ))
+            ),
             Some(_) => "return;".into(),
             None => {
                 if expr::as_const(*len) == Some(U256::ZERO) {
                     "return;".into()
                 } else {
-                    format!("return mem[{}:{}];", fmt_expr(*off, n), fmt_expr(expr::op2(op::ADD, *off, *len), n))
+                    format!(
+                        "return mem[{}:{}];",
+                        fmt_expr(*off, n),
+                        fmt_expr(expr::op2(op::ADD, *off, *len), n)
+                    )
                 }
             }
         },
         Term::Revert { off, len, data } => match data {
             Some(words) if !words.is_empty() => {
-                let p = fmt_payload(words, expr::as_const(*len), n, true);
-                if p.starts_with('"') || p.starts_with("Panic(") || p.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+                let p = fmt_payload(words, expr::as_const(*len), n, PayloadKind::Revert);
+                if p.starts_with('"')
+                    || p.starts_with("Panic(")
+                    || p.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                {
                     if p.starts_with('"') {
                         format!("revert({});", p)
                     } else {
@@ -1009,7 +1560,11 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
                 if expr::as_const(*len) == Some(U256::ZERO) {
                     "revert();".into()
                 } else {
-                    format!("revert(mem[{}:{}]);", fmt_expr(*off, n), fmt_expr(expr::op2(op::ADD, *off, *len), n))
+                    format!(
+                        "revert(mem[{}:{}]);",
+                        fmt_expr(*off, n),
+                        fmt_expr(expr::op2(op::ADD, *off, *len), n)
+                    )
                 }
             }
         },
@@ -1021,11 +1576,21 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
             if vals.is_empty() {
                 "return;".into()
             } else {
-                format!("return ({});", vals.iter().map(|v| fmt_expr(*v, n)).collect::<Vec<_>>().join(", "))
+                format!(
+                    "return ({});",
+                    vals.iter()
+                        .map(|v| fmt_expr(*v, n))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
         }
         Term::Unresolved(t) => format!("jump({}); // unresolved target", fmt_expr(*t, n)),
-        Term::CondJump { cond, target } => format!("if ({}) jump({});", fmt_expr(*cond, n), fmt_expr(*target, n)),
+        Term::CondJump { cond, target } => format!(
+            "if ({}) jump({});",
+            fmt_expr(*cond, n),
+            fmt_expr(*target, n)
+        ),
         Term::Infeasible => "// unreachable (invalid jump or stack underflow)".into(),
         _ => return None,
     })
@@ -1038,7 +1603,12 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     let mut order: Vec<usize> = Vec::new();
     // Reverse post-order from entry.
     let mut seen = std::collections::HashSet::new();
-    fn dfs(l: &Lifted, x: usize, seen: &mut std::collections::HashSet<usize>, order: &mut Vec<usize>) {
+    fn dfs(
+        l: &Lifted,
+        x: usize,
+        seen: &mut std::collections::HashSet<usize>,
+        order: &mut Vec<usize>,
+    ) {
         if !seen.insert(x) {
             return;
         }
@@ -1058,7 +1628,11 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
             continue;
         }
         let prev = if idx > 0 { Some(order[idx - 1]) } else { None };
-        let falls = prev.map_or(false, |p| matches!(l.nodes[p].term, Term::Jump(t) if t == nid) && nd.preds.len() == 1 && !l.edge_assigns.contains_key(&(p, nid)));
+        let falls = prev.is_some_and(|p| {
+            matches!(l.nodes[p].term, Term::Jump(t) if t == nid)
+                && nd.preds.len() == 1
+                && !l.edge_assigns.contains_key(&(p, nid))
+        });
         if !falls {
             needs_label.insert(nid);
         }
@@ -1094,15 +1668,29 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
             }
             Term::Branch { cond, t, f } => {
                 match t {
-                    Some(t) => out.push_str(&format!("{}    if ({}) {{ {} }}\n", indent, fmt_expr(*cond, n), goto(*t))),
-                    None => out.push_str(&format!("{}    if ({}) {{ revert(); }}\n", indent, fmt_expr(*cond, n))),
+                    Some(t) => out.push_str(&format!(
+                        "{}    if ({}) {{ {} }}\n",
+                        indent,
+                        fmt_expr(*cond, n),
+                        goto(*t)
+                    )),
+                    None => out.push_str(&format!(
+                        "{}    if ({}) {{ revert(); }}\n",
+                        indent,
+                        fmt_expr(*cond, n)
+                    )),
                 }
                 if Some(*f) != next || l.edge_assigns.contains_key(&(nid, *f)) {
                     out.push_str(&format!("{}    {}\n", indent, goto(*f)));
                 }
             }
             Term::Switch { target, cases } => {
-                out.push_str(&format!("{}    switch ({}) {{ {} }}\n", indent, fmt_expr(*target, n), cases.iter().map(|c| goto(*c)).collect::<Vec<_>>().join(" ")));
+                out.push_str(&format!(
+                    "{}    switch ({}) {{ {} }}\n",
+                    indent,
+                    fmt_expr(*target, n),
+                    cases.iter().map(|c| goto(*c)).collect::<Vec<_>>().join(" ")
+                ));
             }
             other => {
                 if let Some(s) = fmt_term_halt(other, n) {

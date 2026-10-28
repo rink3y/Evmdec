@@ -6,6 +6,7 @@ use crate::opcode;
 use crate::u256::U256;
 use serde::Serialize;
 
+/// Decoded CBOR metadata trailer that solc and vyper append after the runtime code.
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 pub struct Metadata {
     /// "solc" or "vyper".
@@ -13,27 +14,47 @@ pub struct Metadata {
     /// Version as "major.minor.patch" when encoded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// IPFS multihash of the source metadata JSON, as plain hex.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ipfs: Option<String>,
+    /// Swarm hash of the source metadata as `bzzr0:<hex>` or `bzzr1:<hex>`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bzzr: Option<String>,
+    /// solc's `experimental` flag (ABIEncoderV2 or other experimental features enabled).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub experimental: bool,
     /// Byte offset where the metadata trailer begins (code ends here).
     pub offset: usize,
+    /// Total trailer size in bytes, including the two-byte length suffix.
     pub length: usize,
+    /// Every key present in the CBOR map, in order, so unknown ones are not lost.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub raw_keys: Vec<String>,
 }
 
 impl Metadata {
+    /// The IPFS content identifier (CIDv0, `Qm…`) of the source metadata JSON.
+    ///
+    /// solc stores the hash as a raw multihash: `0x12` (sha2-256), `0x20` (32 bytes), digest.
+    /// Returns `None` when no hash is present or it is not of that form.
+    pub fn ipfs_cid(&self) -> Option<String> {
+        let bytes = hex::decode(self.ipfs.as_deref()?).ok()?;
+        if bytes.len() != 34 || bytes[0] != 0x12 || bytes[1] != 0x20 {
+            return None;
+        }
+        Some(base58(&bytes))
+    }
+
     /// solc started encoding its version in the metadata with 0.5.9 and switched the
     /// source hash from `bzzr0` to `bzzr1` in 0.5.11; a `bzzr0`-only trailer therefore
     /// pins the compiler below 0.5.9.
     pub fn implies_pre_0_5_9(&self) -> bool {
-        self.compiler == "solc" && self.version.is_none() && self.bzzr.as_deref().map_or(false, |b| b.starts_with("bzzr0"))
+        self.compiler == "solc"
+            && self.version.is_none()
+            && self.bzzr.as_deref().is_some_and(|b| b.starts_with("bzzr0"))
     }
 
+    /// `version` parsed as `(major, minor, patch)`, if present and well-formed.
     pub fn version_tuple(&self) -> Option<(u32, u32, u32)> {
         let v = self.version.as_ref()?;
         let mut it = v.split('.').map(|p| p.parse::<u32>().ok());
@@ -138,11 +159,17 @@ pub fn parse_metadata(code: &[u8]) -> Option<Metadata> {
     let start = n - 2 - len;
     let blob = &code[start..n - 2];
     let mut pos = 0;
-    let Cbor::Map(entries) = cbor_read(blob, &mut pos, 0)? else { return None };
+    let Cbor::Map(entries) = cbor_read(blob, &mut pos, 0)? else {
+        return None;
+    };
     if pos != blob.len() {
         return None;
     }
-    let mut md = Metadata { offset: start, length: len + 2, ..Default::default() };
+    let mut md = Metadata {
+        offset: start,
+        length: len + 2,
+        ..Default::default()
+    };
     let mut recognised = false;
     for (k, v) in entries {
         let Cbor::Text(key) = k else { return None };
@@ -160,7 +187,16 @@ pub fn parse_metadata(code: &[u8]) -> Option<Metadata> {
             }
             ("vyper", Cbor::Array(a)) => {
                 md.compiler = "vyper".into();
-                let parts: Vec<String> = a.iter().filter_map(|x| if let Cbor::UInt(n) = x { Some(n.to_string()) } else { None }).collect();
+                let parts: Vec<String> = a
+                    .iter()
+                    .filter_map(|x| {
+                        if let Cbor::UInt(n) = x {
+                            Some(n.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 if parts.len() == 3 {
                     md.version = Some(parts.join("."));
                 }
@@ -191,15 +227,20 @@ pub fn parse_metadata(code: &[u8]) -> Option<Metadata> {
     Some(md)
 }
 
+/// Whether the input bytecode is deployed code or the init code that deploys it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeKind {
+    /// Deployed (runtime) code, as returned by `eth_getCode`.
     Runtime,
+    /// Creation (init) code: constructor, embedded runtime, then constructor arguments.
     Creation,
 }
 
+/// How the input bytecode splits into constructor, runtime and arguments, plus its metadata.
 #[derive(Clone, Debug, Serialize)]
 pub struct BytecodeInfo {
+    /// What the input was recognised as.
     pub kind: CodeKind,
     /// The runtime code (the input itself for runtime code; the returned region for creation code).
     #[serde(skip)]
@@ -210,11 +251,16 @@ pub struct BytecodeInfo {
     /// For creation code: ABI-encoded constructor arguments appended after the runtime.
     #[serde(skip)]
     pub constructor_args: Vec<u8>,
+    /// Byte offset of the runtime code within the input (0 for runtime code).
     pub runtime_offset: usize,
+    /// Length of the runtime code in bytes.
     pub runtime_len: usize,
+    /// Length of the constructor arguments in bytes (0 for runtime code).
     pub constructor_args_len: usize,
+    /// Metadata trailer of the runtime code, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
+    /// Metadata trailer of the constructor code, if the input is creation code and it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub constructor_metadata: Option<Metadata>,
 }
@@ -230,7 +276,11 @@ pub fn constant_stack(insns: &[disasm::Instruction]) -> Vec<Option<U256>> {
             st.push(i.imm);
         } else if opcode::is_dup(op) {
             let n = (op - 0x7f) as usize;
-            let v = if st.len() >= n { st[st.len() - n] } else { None };
+            let v = if st.len() >= n {
+                st[st.len() - n]
+            } else {
+                None
+            };
             st.push(v);
         } else if opcode::is_swap(op) {
             let n = (op - 0x8f) as usize;
@@ -269,9 +319,14 @@ fn detect_creation(code: &[u8]) -> Option<(usize, usize)> {
             let l = st.len();
             if l >= 3 {
                 if let (Some(dest), Some(offset), Some(len)) = (st[l - 1], st[l - 2], st[l - 3]) {
-                    if let (Some(dest), Some(offset), Some(len)) = (dest.as_usize(), offset.as_usize(), len.as_usize()) {
+                    if let (Some(dest), Some(offset), Some(len)) =
+                        (dest.as_usize(), offset.as_usize(), len.as_usize())
+                    {
                         // Must copy a region that starts after this CODECOPY and is non-trivial.
-                        if offset > insns[i].pc && len >= 1 && offset.checked_add(len).map_or(false, |e| e <= code.len()) {
+                        if offset > insns[i].pc
+                            && len >= 1
+                            && offset.checked_add(len).is_some_and(|e| e <= code.len())
+                        {
                             // Look for a RETURN later in the same block (before next terminator) that returns from `dest`.
                             let mut j = i + 1;
                             let mut found = false;
@@ -283,7 +338,11 @@ fn detect_creation(code: &[u8]) -> Option<(usize, usize)> {
                                     if l2 >= 2 {
                                         let roff = st2[l2 - 1];
                                         let rlen = st2[l2 - 2];
-                                        if (roff.is_none() || roff.and_then(|v| v.as_usize()) == Some(dest)) && (rlen.is_none() || rlen.and_then(|v| v.as_usize()) == Some(len)) {
+                                        if (roff.is_none()
+                                            || roff.and_then(|v| v.as_usize()) == Some(dest))
+                                            && (rlen.is_none()
+                                                || rlen.and_then(|v| v.as_usize()) == Some(len))
+                                        {
                                             found = true;
                                         }
                                     } else {
@@ -298,7 +357,7 @@ fn detect_creation(code: &[u8]) -> Option<(usize, usize)> {
                             }
                             if found {
                                 // Prefer the largest region (the runtime) when several copies exist (immutables are smaller).
-                                if best.map_or(true, |(_, bl)| len > bl) {
+                                if best.is_none_or(|(_, bl)| len > bl) {
                                     best = Some((offset, len));
                                 }
                             }
@@ -321,6 +380,7 @@ fn detect_creation(code: &[u8]) -> Option<(usize, usize)> {
     best
 }
 
+/// Classify `code` as creation or runtime, split it accordingly and parse its metadata.
 pub fn analyze(code: &[u8]) -> BytecodeInfo {
     if let Some((off, len)) = detect_creation(code) {
         let runtime = code[off..off + len].to_vec();
@@ -350,5 +410,47 @@ pub fn analyze(code: &[u8]) -> BytecodeInfo {
         constructor_args: Vec::new(),
         metadata: parse_metadata(code),
         constructor_metadata: None,
+    }
+}
+
+/// Base58btc (the Bitcoin/IPFS alphabet) encoding of `bytes`, as used for CIDv0 (`Qm…`).
+fn base58(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let mut digits: Vec<u8> = vec![0];
+    for &b in bytes {
+        let mut carry = b as u32;
+        for d in digits.iter_mut() {
+            carry += (*d as u32) << 8;
+            *d = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    let zeros = bytes.iter().take_while(|&&b| b == 0).count();
+    let mut out: String = std::iter::repeat_n('1', zeros).collect();
+    out.extend(digits.iter().rev().map(|&d| ALPHABET[d as usize] as char));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipfs_cid_renders_the_multihash_as_base58() {
+        let md = Metadata {
+            ipfs: Some(
+                "1220ac2f73a8a42fb656e037faafe3f9cd5da4f8716016daabc5646a90ab4183ca44".into(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            md.ipfs_cid().as_deref(),
+            Some("QmZvnoMz7Fa2K3yc1J3yBH4DvE7z96jKVVFyiTvQWCNnCT")
+        );
+        assert_eq!(Metadata::default().ipfs_cid(), None);
     }
 }

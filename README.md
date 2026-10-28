@@ -99,6 +99,22 @@ oracle, so the accuracy claim below is measured, not asserted.
 | `testdata/mainnet` | 22 mainnet contracts (runtime bytecode + Sourcify ABI) used by the benchmark and the tests |
 | `corpus/bench.py`, `corpus/verify_all.sh` | the measurements below |
 | `docs/verification.md` | methodology and definitions |
+| `rustfmt.toml`, `.claude/agents/rust-style-reviewer.md` | code style: Google's Rust style guide (see below) |
+
+## Code style
+
+The Rust crates follow [Google's Rust style guide](https://google.github.io/styleguide/rustguide.html).
+`rustfmt.toml` carries the guide's formatter settings that are stable on the current toolchain
+(`max_width = 100`); the guide's remaining rules (one `use` per module, no glob imports, free
+functions called through their module, `expect` over `unwrap`, pattern matching over
+check-then-unwrap, enums over `bool` parameters, documented public items, the standard operator
+traits rather than `shl`/`div`-style inherent methods, no `catch_unwind` except as documented
+defense in depth) are enforced by review. The crate root turns on `#![warn(missing_docs)]`, and
+`cargo clippy --all-targets` is kept at zero warnings.
+
+`.claude/agents/rust-style-reviewer.md` is a Claude Code agent that reviews a change against the
+guide and reports findings as `path:line`, rule, fix. Ask for it by name (`rust-style-reviewer`)
+before committing Rust changes.
 
 ## Quick start
 

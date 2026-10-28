@@ -4,10 +4,14 @@ use crate::opcode;
 use crate::u256::U256;
 use serde::Serialize;
 
+/// One decoded EVM instruction.
 #[derive(Clone, Debug, Serialize)]
 pub struct Instruction {
+    /// Byte offset of the opcode within the code.
     pub pc: usize,
+    /// Raw opcode byte.
     pub opcode: u8,
+    /// Mnemonic, or `UNKNOWN_xx` for an undefined opcode.
     pub name: String,
     /// Immediate value of a PUSH (PUSH0 => zero).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20,9 +24,11 @@ pub struct Instruction {
 }
 
 impl Instruction {
+    /// True for `PUSH0`..`PUSH32`.
     pub fn is_push(&self) -> bool {
         opcode::is_push(self.opcode)
     }
+    /// The PUSH immediate, or `None` for any other instruction.
     pub fn push_value(&self) -> Option<U256> {
         self.imm
     }
@@ -40,12 +46,16 @@ pub fn disassemble(code: &[u8]) -> Vec<Instruction> {
     let mut out = Vec::with_capacity(code.len() / 2);
     let mut pc = 0;
     while pc < code.len() {
-        out.push(decode_at(code, pc));
-        pc += out.last().unwrap().size;
+        let insn = decode_at(code, pc);
+        pc += insn.size;
+        out.push(insn);
     }
     out
 }
 
+/// Decodes the single instruction at byte offset `pc`, which must lie within `code`.
+///
+/// A PUSH immediate cut short by the end of code is zero-padded and flagged `truncated`.
 pub fn decode_at(code: &[u8], pc: usize) -> Instruction {
     let op = code[pc];
     let info = opcode::info(op);
@@ -65,7 +75,14 @@ pub fn decode_at(code: &[u8], pc: usize) -> Instruction {
     } else {
         None
     };
-    Instruction { pc, opcode: op, name: opcode::name(op), imm, size: 1 + imm_len, truncated }
+    Instruction {
+        pc,
+        opcode: op,
+        name: opcode::name(op),
+        imm,
+        size: 1 + imm_len,
+        truncated,
+    }
 }
 
 /// All valid jump destinations: JUMPDEST bytes that are not inside a PUSH immediate.
@@ -77,14 +94,25 @@ pub fn jumpdests(code: &[u8]) -> Vec<usize> {
         if op == opcode::JUMPDEST {
             v.push(pc);
         }
-        pc += 1 + if opcode::is_push(op) { (op - 0x5f) as usize } else { 0 };
+        pc += 1 + if opcode::is_push(op) {
+            (op - 0x5f) as usize
+        } else {
+            0
+        };
     }
     v
 }
 
+/// Renders an instruction as `pc: NAME imm`, with a six-digit hex pc and the immediate
+/// padded to the PUSH width.
 pub fn format_instruction(i: &Instruction) -> String {
     match i.imm {
-        Some(v) if i.opcode != opcode::PUSH0 => format!("{:06x}: {} {}", i.pc, i.name, v.to_hex_padded((i.opcode - 0x5f) as usize)),
+        Some(v) if i.opcode != opcode::PUSH0 => format!(
+            "{:06x}: {} {}",
+            i.pc,
+            i.name,
+            v.to_hex_padded((i.opcode - 0x5f) as usize)
+        ),
         _ => format!("{:06x}: {}", i.pc, i.name),
     }
 }

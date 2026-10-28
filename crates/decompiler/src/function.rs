@@ -8,37 +8,55 @@ use crate::u256::U256;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// The role a recovered function plays in the contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FnKind {
+    /// Selector-dispatched function reachable from the dispatcher.
     External,
+    /// Code run when no selector matches (or the whole entry region when there is no dispatcher).
     Fallback,
+    /// Code run for empty calldata (the `calldatasize == 0` branch of the dispatcher).
     Receive,
+    /// Entry point of creation code: the fallback of a constructor unit, reclassified.
     Constructor,
+    /// Internal helper reached by jump-and-return calls, never dispatched directly.
     Internal,
+    /// Code region reached by no recovered jump or call (`orphan_<pc>`).
     Orphan,
 }
 
+/// Solidity state mutability of a function, inferred from its side effects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mutability {
+    /// Neither reads nor writes state (storage, chain environment, external calls).
     Pure,
+    /// Reads storage or the chain environment, or makes static calls, but never writes state.
     View,
+    /// May change state and rejects a non-zero `msg.value`.
     NonPayable,
+    /// Accepts `msg.value`: no check reverts on a non-zero call value.
     Payable,
 }
 
+/// An external function found in the dispatcher: its selector and body entry.
 #[derive(Clone, Debug)]
 pub struct Discovered {
+    /// Four-byte function selector the dispatcher compares against.
     pub selector: u32,
     /// Entry node (in the main lifted graph).
     pub entry: usize,
 }
 
+/// Result of dispatcher analysis on the main lifted graph.
 #[derive(Clone, Debug)]
 pub struct Dispatch {
+    /// Selector-dispatched functions, sorted by selector.
     pub functions: Vec<Discovered>,
+    /// Entry node of the fallback body: a non-reverting dispatcher exit that is not a function.
     pub fallback: Option<usize>,
+    /// Entry node of the receive body (the `calldatasize == 0` branch), if any.
     pub receive: Option<usize>,
     /// Nodes forming the dispatcher itself.
     pub dispatcher: HashSet<usize>,
@@ -67,17 +85,17 @@ fn branch_polarity(cond: ExprId) -> Option<(u32, bool)> {
 pub fn dispatcher_nonpayable(main: &Lifted, dispatcher: &HashSet<usize>) -> bool {
     for &n in dispatcher {
         if let Term::Branch { cond, t, f } = &main.nodes[n].term {
-            let reverts = |x: Option<usize>| x.map_or(true, |x| is_plain_revert(main, x));
+            let reverts = |x: Option<usize>| x.is_none_or(|x| is_plain_revert(main, x));
             match expr::node(*cond) {
-                Node::Op(op::ISZERO, v) if matches!(expr::node(v[0]), Node::Env(op::CALLVALUE, _)) => {
+                Node::Op(op::ISZERO, v)
+                    if matches!(expr::node(v[0]), Node::Env(op::CALLVALUE, _)) =>
+                {
                     if reverts(Some(*f)) {
                         return true;
                     }
                 }
-                Node::Env(op::CALLVALUE, _) => {
-                    if reverts(*t) {
-                        return true;
-                    }
+                Node::Env(op::CALLVALUE, _) if reverts(*t) => {
+                    return true;
                 }
                 _ => {}
             }
@@ -89,7 +107,6 @@ pub fn dispatcher_nonpayable(main: &Lifted, dispatcher: &HashSet<usize>) -> bool
 fn mentions(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
     expr::contains(e, pred)
 }
-
 
 /// Find the external functions reachable from the dispatcher of the main lifted unit.
 pub fn discover(main: &Lifted) -> Dispatch {
@@ -104,7 +121,10 @@ pub fn discover(main: &Lifted) -> Dispatch {
                 let body = if body_true { *t } else { Some(*f) };
                 if let Some(b) = body {
                     if !functions.iter().any(|d| d.selector == sel) {
-                        functions.push(Discovered { selector: sel, entry: b });
+                        functions.push(Discovered {
+                            selector: sel,
+                            entry: b,
+                        });
                         entries.insert(b);
                     }
                     sel_nodes.push(nid);
@@ -115,7 +135,12 @@ pub fn discover(main: &Lifted) -> Dispatch {
     // No selector dispatcher at all (hand-written contract, minimal proxy, pure fallback): the
     // whole entry region is the fallback.
     if sel_nodes.is_empty() {
-        return Dispatch { functions: vec![], fallback: Some(main.entry), receive: None, dispatcher: HashSet::new() };
+        return Dispatch {
+            functions: vec![],
+            fallback: Some(main.entry),
+            receive: None,
+            dispatcher: HashSet::new(),
+        };
     }
     // Dispatcher = nodes reachable from entry without entering a body, from which a selector
     // branch is reachable without entering a body.
@@ -138,7 +163,11 @@ pub fn discover(main: &Lifted) -> Dispatch {
         }
     }
     let mut dispatcher: HashSet<usize> = HashSet::new();
-    let mut q: VecDeque<usize> = sel_nodes.iter().copied().filter(|n| fwd.contains(n)).collect();
+    let mut q: VecDeque<usize> = sel_nodes
+        .iter()
+        .copied()
+        .filter(|n| fwd.contains(n))
+        .collect();
     while let Some(x) = q.pop_front() {
         if !dispatcher.insert(x) {
             continue;
@@ -190,13 +219,22 @@ pub fn discover(main: &Lifted) -> Dispatch {
         }
     }
     functions.sort_by_key(|d| d.selector);
-    Dispatch { functions, fallback, receive, dispatcher }
+    Dispatch {
+        functions,
+        fallback,
+        receive,
+        dispatcher,
+    }
 }
 
 fn is_plain_revert(l: &Lifted, n: usize) -> bool {
     let nd = &l.nodes[n];
     match &nd.term {
-        Term::Revert { data, len, .. } => nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. })) && (data.as_ref().map_or(false, |d| d.is_empty()) || expr::as_const(*len) == Some(U256::ZERO)),
+        Term::Revert { data, len, .. } => {
+            nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. }))
+                && (data.as_ref().is_some_and(|d| d.is_empty())
+                    || expr::as_const(*len) == Some(U256::ZERO))
+        }
         Term::Invalid | Term::Infeasible => true,
         Term::Jump(t) if nd.stmts.is_empty() && *t != n => is_plain_revert(l, *t),
         _ => false,
@@ -224,7 +262,11 @@ pub fn slice(l: &Lifted, entry: usize) -> Lifted {
         let mut nd = l.nodes[old].clone();
         nd.id = map[&old];
         nd.succs = nd.succs.iter().map(|s| map[s]).collect();
-        nd.preds = nd.preds.iter().filter_map(|p| map.get(p).copied()).collect();
+        nd.preds = nd
+            .preds
+            .iter()
+            .filter_map(|p| map.get(p).copied())
+            .collect();
         nd.term = remap(&nd.term, &map);
         nodes.push(nd);
     }
@@ -234,15 +276,31 @@ pub fn slice(l: &Lifted, entry: usize) -> Lifted {
             edge_assigns.insert((*a2, *b2), v.clone());
         }
     }
-    Lifted { nodes, entry: 0, edge_assigns, n_args: l.n_args, reprocess_count: 0, ret_slot: l.ret_slot, entry_states: Vec::new(), node_map: HashMap::new() }
+    Lifted {
+        nodes,
+        entry: 0,
+        edge_assigns,
+        n_args: l.n_args,
+        reprocess_count: 0,
+        ret_slot: l.ret_slot,
+        entry_states: Vec::new(),
+        node_map: HashMap::new(),
+    }
 }
 
 fn remap(t: &Term, map: &HashMap<usize, usize>) -> Term {
     let m = |x: &usize| map[x];
     match t {
         Term::Jump(n) => Term::Jump(m(n)),
-        Term::Branch { cond, t, f } => Term::Branch { cond: *cond, t: t.as_ref().map(m), f: m(f) },
-        Term::Switch { target, cases } => Term::Switch { target: *target, cases: cases.iter().map(m).collect() },
+        Term::Branch { cond, t, f } => Term::Branch {
+            cond: *cond,
+            t: t.as_ref().map(m),
+            f: m(f),
+        },
+        Term::Switch { target, cases } => Term::Switch {
+            target: *target,
+            cases: cases.iter().map(m).collect(),
+        },
         other => other.clone(),
     }
 }
@@ -250,18 +308,29 @@ fn remap(t: &Term, map: &HashMap<usize, usize>) -> Term {
 /// Side-effect summary of a lifted graph (before considering internal callees).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Effects {
+    /// Contains an `SSTORE`.
     pub writes_storage: bool,
+    /// Reads a storage slot (`SLOAD`).
     pub reads_storage: bool,
+    /// Emits an event (`LOG0`..`LOG4`).
     pub logs: bool,
+    /// Makes a non-static external call (`CALL`, `CALLCODE` or `DELEGATECALL`).
     pub calls: bool,
+    /// Makes a `STATICCALL`.
     pub static_calls: bool,
+    /// Deploys a contract (`CREATE` or `CREATE2`).
     pub creates: bool,
+    /// Ends in `SELFDESTRUCT`.
     pub selfdestruct: bool,
+    /// Makes a `DELEGATECALL` or `CALLCODE` (runs foreign code in this contract's context).
     pub delegatecall: bool,
+    /// Reads chain or transaction environment (`CALLER`, `TIMESTAMP`, `BALANCE`, ...).
     pub reads_env: bool,
+    /// Entry pcs of the internal functions called directly, in first-call order, no duplicates.
     pub internal_callees: Vec<usize>,
 }
 
+/// Summarises the side effects of a lifted graph, ignoring those of its internal callees.
 pub fn effects(l: &Lifted) -> Effects {
     let mut e = Effects::default();
     for nd in &l.nodes {
@@ -280,10 +349,8 @@ pub fn effects(l: &Lifted) -> Effects {
                     }
                 }
                 Stmt::Create { .. } => e.creates = true,
-                Stmt::Internal { callee, .. } => {
-                    if !e.internal_callees.contains(callee) {
-                        e.internal_callees.push(*callee);
-                    }
+                Stmt::Internal { callee, .. } if !e.internal_callees.contains(callee) => {
+                    e.internal_callees.push(*callee);
                 }
                 _ => {}
             }
@@ -295,7 +362,10 @@ pub fn effects(l: &Lifted) -> Effects {
             if mentions(x, &|n| matches!(n, Node::SLoad(..))) {
                 e.reads_storage = true;
             }
-            if mentions(x, &|n| matches!(n, Node::Env(o, _) if matches!(*o, op::CALLER | op::ORIGIN | op::TIMESTAMP | op::NUMBER | op::COINBASE | op::GASLIMIT | op::CHAINID | op::SELFBALANCE | op::BASEFEE | op::ADDRESS | op::PREVRANDAO | op::GASPRICE | op::BLOBBASEFEE)) || matches!(n, Node::Op(o, _) if matches!(*o, op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH | op::BLOCKHASH))) {
+            if mentions(x, &|n| {
+                matches!(n, Node::Env(o, _) if matches!(*o, op::CALLER | op::ORIGIN | op::TIMESTAMP | op::NUMBER | op::COINBASE | op::GASLIMIT | op::CHAINID | op::SELFBALANCE | op::BASEFEE | op::ADDRESS | op::PREVRANDAO | op::GASPRICE | op::BLOBBASEFEE))
+                    || matches!(n, Node::Op(o, _) if matches!(*o, op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH | op::BLOCKHASH))
+            }) {
                 e.reads_env = true;
             }
         }
@@ -308,17 +378,21 @@ pub fn is_nonpayable(l: &Lifted) -> bool {
     for nd in &l.nodes {
         if let Term::Branch { cond, t, f } = &nd.term {
             let n = expr::node(*cond);
-            let reverts = |x: Option<usize>| x.map_or(true, |x| is_plain_revert(l, x) || matches!(l.nodes[x].term, Term::Revert { .. }));
+            let reverts = |x: Option<usize>| {
+                x.is_none_or(|x| {
+                    is_plain_revert(l, x) || matches!(l.nodes[x].term, Term::Revert { .. })
+                })
+            };
             match n {
-                Node::Op(op::ISZERO, v) if matches!(expr::node(v[0]), Node::Env(op::CALLVALUE, _)) => {
+                Node::Op(op::ISZERO, v)
+                    if matches!(expr::node(v[0]), Node::Env(op::CALLVALUE, _)) =>
+                {
                     if reverts(Some(*f)) {
                         return true;
                     }
                 }
-                Node::Env(op::CALLVALUE, _) => {
-                    if reverts(*t) {
-                        return true;
-                    }
+                Node::Env(op::CALLVALUE, _) if reverts(*t) => {
+                    return true;
                 }
                 _ => {}
             }
@@ -327,17 +401,25 @@ pub fn is_nonpayable(l: &Lifted) -> bool {
     false
 }
 
+/// A recovered calldata parameter.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Param {
+    /// Zero-based position among the ABI head words.
     pub index: u32,
+    /// Inferred Solidity type (`uint256` when nothing narrows it).
     pub ty: String,
+    /// Placeholder name, `arg<index>`.
     pub name: String,
 }
 
 /// Expressions of a function plus those of the internal functions it calls (two levels), with
 /// callee arguments substituted by the caller's actual values, so that decoding done in helper
 /// functions (solc >= 0.8) is visible.
-pub fn exprs_with_callees<'a>(l: &Lifted, resolve: &dyn Fn(usize) -> Option<&'a Lifted>, depth: usize) -> Vec<ExprId> {
+pub fn exprs_with_callees<'a>(
+    l: &Lifted,
+    resolve: &dyn Fn(usize) -> Option<&'a Lifted>,
+    depth: usize,
+) -> Vec<ExprId> {
     let mut out: Vec<ExprId> = Vec::new();
     for nd in &l.nodes {
         out.extend(lift::node_exprs(nd));
@@ -358,7 +440,17 @@ pub fn exprs_with_callees<'a>(l: &Lifted, resolve: &dyn Fn(usize) -> Option<&'a 
                     let inner = exprs_with_callees(cl, resolve, depth - 1);
                     let mut memo = HashMap::new();
                     for e in inner {
-                        let sub = expr::substitute(e, &|n| if let Node::Arg(i) = n { map.get(i).copied() } else { None }, &mut memo);
+                        let sub = expr::substitute(
+                            e,
+                            &|n| {
+                                if let Node::Arg(i) = n {
+                                    map.get(i).copied()
+                                } else {
+                                    None
+                                }
+                            },
+                            &mut memo,
+                        );
                         out.push(sub);
                     }
                 }
@@ -374,6 +466,10 @@ pub fn infer_params(l: &Lifted) -> Vec<Param> {
     infer_params_from(&exprs)
 }
 
+/// Infers calldata parameters from a set of expressions.
+///
+/// Masks and sign-extensions give the types; the ABI head-size check (or, failing that, the
+/// highest calldata word read) gives the count.
 pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
     let mut max_idx: Option<u32> = None;
     let mut types: HashMap<u32, String> = HashMap::new();
@@ -404,21 +500,33 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
                     }
                 }
                 Node::Op(op::AND, v) => {
-                    if let (Node::CallDataLoad(off), Some(m)) = (expr::node(v[0]), expr::as_const(v[1])) {
+                    if let (Node::CallDataLoad(off), Some(m)) =
+                        (expr::node(v[0]), expr::as_const(v[1]))
+                    {
                         if let Some(i) = calldata_word_index(off) {
                             if m.is_low_mask() {
                                 let bits = m.bits();
-                                let ty = if bits == 160 { "address".to_string() } else if bits == 1 { "bool".to_string() } else { format!("uint{}", bits) };
+                                let ty = if bits == 160 {
+                                    "address".to_string()
+                                } else if bits == 1 {
+                                    "bool".to_string()
+                                } else {
+                                    format!("uint{}", bits)
+                                };
                                 types.entry(i).or_insert(ty);
                             }
                         }
                     }
                 }
                 Node::Op(op::SIGNEXTEND, v) => {
-                    if let (Some(k), Node::CallDataLoad(off)) = (expr::as_const(v[0]), expr::node(v[1])) {
+                    if let (Some(k), Node::CallDataLoad(off)) =
+                        (expr::as_const(v[0]), expr::node(v[1]))
+                    {
                         if let Some(i) = calldata_word_index(off) {
                             if k < U256::from_u64(31) {
-                                types.entry(i).or_insert(format!("int{}", 8 * (k.low_u64() + 1)));
+                                types
+                                    .entry(i)
+                                    .or_insert(format!("int{}", 8 * (k.low_u64() + 1)));
                             }
                         }
                     }
@@ -432,15 +540,21 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
                         }
                     }
                 }
-                Node::Op(op::LT, v) | Node::Op(op::GT, v) | Node::Op(op::SLT, v) | Node::Op(op::SGT, v) => {
+                Node::Op(op::LT, v)
+                | Node::Op(op::GT, v)
+                | Node::Op(op::SLT, v)
+                | Node::Op(op::SGT, v) => {
                     // calldatasize - 4 < 32n  or  calldatasize < 4 + 32n (head size check)
                     for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                         if let Some(c) = expr::as_const(b) {
                             if c.fits_u64() {
                                 let (base, delta) = expr::split_offset(a);
-                                if base.map_or(false, |x| matches!(expr::node(x), Node::Env(op::CALLDATASIZE, _))) {
+                                if base.is_some_and(|x| {
+                                    matches!(expr::node(x), Node::Env(op::CALLDATASIZE, _))
+                                }) {
                                     // a = calldatasize - 4 (delta = -4) or calldatasize
-                                    let k = c.low_u64() as i128 - if delta.is_negative() { 0 } else { 4 };
+                                    let k = c.low_u64() as i128
+                                        - if delta.is_negative() { 0 } else { 4 };
                                     if k >= 0 && k % 32 == 0 && k / 32 <= 64 {
                                         let w = (k / 32) as u32;
                                         head_words = Some(head_words.map_or(w, |h| h.max(w)));
@@ -461,7 +575,11 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
     // `iszero(iszero(x))` is both the bool cleanup and `x != 0`: a word is a bool only when it
     // is never used raw anywhere else (arithmetic, comparison, call argument, hash input).
     {
-        let bool_words: Vec<u32> = types.iter().filter(|(_, t)| *t == "bool").map(|(i, _)| *i).collect();
+        let bool_words: Vec<u32> = types
+            .iter()
+            .filter(|(_, t)| *t == "bool")
+            .map(|(i, _)| *i)
+            .collect();
         if !bool_words.is_empty() {
             let mut raw: HashSet<u32> = HashSet::new();
             let mut seen = HashSet::new();
@@ -473,7 +591,8 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
                 let kids = expr::children(x);
                 let is_cleanup = matches!(expr::node(x), Node::Op(op::ISZERO, ref v) if matches!(expr::node(v[0]), Node::Op(op::ISZERO, _)));
                 let is_validator = matches!(expr::node(x), Node::Op(op::EQ, ref v) if v.iter().any(|y| matches!(expr::node(*y), Node::Op(op::ISZERO, _))));
-                if !is_cleanup && !is_validator && !matches!(expr::node(x), Node::Op(op::ISZERO, _)) {
+                if !is_cleanup && !is_validator && !matches!(expr::node(x), Node::Op(op::ISZERO, _))
+                {
                     for k in &kids {
                         if let Node::CallDataLoad(off) = expr::node(*k) {
                             if let Some(i) = calldata_word_index(off) {
@@ -501,8 +620,16 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
     };
     (0..count)
         .map(|i| {
-            let ty = if dynamic.contains(&i) { "bytes".to_string() } else { types.get(&i).cloned().unwrap_or_else(|| "uint256".into()) };
-            Param { index: i, ty, name: format!("arg{}", i) }
+            let ty = if dynamic.contains(&i) {
+                "bytes".to_string()
+            } else {
+                types.get(&i).cloned().unwrap_or_else(|| "uint256".into())
+            };
+            Param {
+                index: i,
+                ty,
+                name: format!("arg{}", i),
+            }
         })
         .collect()
 }
@@ -514,17 +641,37 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
         if let Term::Return { len, data, .. } = &nd.term {
             let tys: Vec<String> = match (data, expr::as_const(*len)) {
                 // `(32, n, <n bytes>)`: one dynamic value encoded in place.
-                (Some(words), Some(l)) if words.len() >= 2 && expr::as_const(words[0]) == Some(U256::from_u64(32)) && expr::as_const(words[1]).map_or(false, |n| n.fits_u64() && l == U256::from_u64(64 + n.low_u64().div_ceil(32) * 32)) => {
+                (Some(words), Some(l))
+                    if words.len() >= 2
+                        && expr::as_const(words[0]) == Some(U256::from_u64(32))
+                        && expr::as_const(words[1]).is_some_and(|n| {
+                            n.fits_u64() && l == U256::from_u64(64 + n.low_u64().div_ceil(32) * 32)
+                        }) =>
+                {
                     // Printable constant text is a `string`; anything else stays `bytes`.
-                    let text = crate::emit::decode_plain_string(&words[1..]).map_or(false, |t| !t.is_empty() && t.chars().all(|c| !c.is_control() && c != '\u{fffd}'));
-                    vec![if text { "string".into() } else { "bytes".into() }]
+                    let text = crate::emit::decode_plain_string(&words[1..]).is_some_and(|t| {
+                        !t.is_empty() && t.chars().all(|c| !c.is_control() && c != '\u{fffd}')
+                    });
+                    vec![if text {
+                        "string".into()
+                    } else {
+                        "bytes".into()
+                    }]
                 }
                 (Some(words), Some(_)) => words.iter().map(|w| type_of_value(*w)).collect(),
-                (None, Some(l)) if l.fits_u64() && l.low_u64() % 32 == 0 && l.low_u64() <= 32 * 16 => vec!["uint256".to_string(); (l.low_u64() / 32) as usize],
+                (None, Some(l))
+                    if l.fits_u64() && l.low_u64() % 32 == 0 && l.low_u64() <= 32 * 16 =>
+                {
+                    vec!["uint256".to_string(); (l.low_u64() / 32) as usize]
+                }
                 (None, Some(_)) => vec!["bytes".into()],
                 (_, None) => vec!["bytes".into()],
             };
-            if tys.len() > best.len() || (tys.len() == best.len() && tys.iter().filter(|t| *t != "uint256").count() > best.iter().filter(|t| *t != "uint256").count()) {
+            if tys.len() > best.len()
+                || (tys.len() == best.len()
+                    && tys.iter().filter(|t| *t != "uint256").count()
+                        > best.iter().filter(|t| *t != "uint256").count())
+            {
                 best = tys;
             }
         } else if let Term::ReturnDyn { .. } = &nd.term {
@@ -535,14 +682,32 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
     }
     // A position that only ever returns the constants 0 and 1, with 1 seen, is a bool.
     if !best.is_empty() {
-        let rets: Vec<&Vec<ExprId>> = l.nodes.iter().filter_map(|nd| if let Term::Return { data: Some(w), .. } = &nd.term { if w.len() == best.len() { Some(w) } else { None } } else { None }).collect();
+        let rets: Vec<&Vec<ExprId>> = l
+            .nodes
+            .iter()
+            .filter_map(|nd| {
+                if let Term::Return { data: Some(w), .. } = &nd.term {
+                    if w.len() == best.len() {
+                        Some(w)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
         if !rets.is_empty() {
             for (i, ty) in best.iter_mut().enumerate() {
                 if ty != "uint256" {
                     continue;
                 }
                 let consts: Vec<Option<U256>> = rets.iter().map(|w| expr::as_const(w[i])).collect();
-                if consts.iter().all(|c| matches!(c, Some(c) if *c == U256::ZERO || *c == U256::ONE)) && consts.contains(&Some(U256::ONE)) {
+                if consts
+                    .iter()
+                    .all(|c| matches!(c, Some(c) if *c == U256::ZERO || *c == U256::ONE))
+                    && consts.contains(&Some(U256::ONE))
+                {
                     *ty = "bool".into();
                 }
             }
@@ -551,13 +716,22 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
     best
 }
 
+/// Best-effort Solidity type of a value from the shape of its expression (`uint256` by default).
 pub fn type_of_value(e: ExprId) -> String {
     match expr::node(e) {
         Node::Op(op::AND, v) => {
             if let Some(m) = expr::as_const(v[1]) {
                 if m.is_low_mask() {
                     let bits = m.bits();
-                    return if bits == 160 { "address".into() } else if bits == 1 { "bool".into() } else if bits % 8 == 0 { format!("uint{}", bits) } else { "uint256".into() };
+                    return if bits == 160 {
+                        "address".into()
+                    } else if bits == 1 {
+                        "bool".into()
+                    } else if bits % 8 == 0 {
+                        format!("uint{}", bits)
+                    } else {
+                        "uint256".into()
+                    };
                 }
             }
             "uint256".into()
@@ -566,14 +740,22 @@ pub fn type_of_value(e: ExprId) -> String {
             Some(k) if k < U256::from_u64(31) => format!("int{}", 8 * (k.low_u64() + 1)),
             _ => "int256".into(),
         },
-        Node::Env(op::CALLER, _) | Node::Env(op::ADDRESS, _) | Node::Env(op::ORIGIN, _) | Node::Env(op::COINBASE, _) | Node::CreateResult(_) => "address".into(),
+        Node::Env(op::CALLER, _)
+        | Node::Env(op::ADDRESS, _)
+        | Node::Env(op::ORIGIN, _)
+        | Node::Env(op::COINBASE, _)
+        | Node::CreateResult(_) => "address".into(),
         Node::Env(op::TIMESTAMP, _) | Node::Env(op::NUMBER, _) => "uint256".into(),
         n if expr::is_boolean(e) && !matches!(n, Node::Const(_)) => "bool".into(),
         Node::Const(c) if c.byte_len() == 20 && (150..=160).contains(&c.bits()) => "address".into(),
         Node::Op(op::SHR, _) | Node::Op(op::DIV, _) | Node::Op(op::BYTE, _) => {
             let b = expr::value_bits(e);
-            if b < 256 && b % 8 == 0 && b > 0 {
-                if b == 160 { "address".into() } else { format!("uint{}", b) }
+            if b < 256 && b.is_multiple_of(8) && b > 0 {
+                if b == 160 {
+                    "address".into()
+                } else {
+                    format!("uint{}", b)
+                }
             } else {
                 "uint256".into()
             }

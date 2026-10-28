@@ -1,0 +1,10 @@
+# Formatting follows Google's Rust style guide
+# (https://google.github.io/styleguide/rustguide.html). Only options that are
+# stable on the current toolchain are set here; the guide's remaining settings
+# are enforced by the `rust-style-reviewer` agent and by review:
+#
+#   imports_granularity = "Module"   one `use` per module, types grouped in braces
+#   hex_literal_case = "Lower"       0xdeadbeef, never 0xDEADBEEF
+#   format_macro_matchers = true     macro_rules! matchers are formatted too
+edition = "2021"
+max_width = 100

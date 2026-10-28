@@ -8,27 +8,40 @@
 use crate::cfg::{AState, Program, UNode, Unit};
 use crate::expr::{self, ExprId, Node};
 use crate::interp::{Host, Machine, Outcome, Rng};
-use crate::keccak::keccak256;
+use crate::keccak;
 use crate::lift::{Lifter, Stmt, Term};
 use crate::opcode as op;
 use crate::u256::U256;
 use serde::Serialize;
 use std::collections::HashMap;
 
+/// Totals of one verification pass, per run and per block.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct VerifyStats {
+    /// Basic blocks in the program.
     pub blocks: usize,
+    /// Runs in which the reference interpreter completed the block.
     pub runs: usize,
+    /// Runs in which both sides agreed.
     pub agree: usize,
+    /// Runs in which the two sides diverged.
     pub mismatch: usize,
+    /// Runs that proved nothing (unsupported terminator, memory aliasing between symbolic bases,
+    /// or a block for which no executable state was ever found).
     pub inconclusive: usize,
     /// Instructions in blocks whose every run agreed.
     pub instructions_total: usize,
+    /// Instructions in verified blocks.
     pub instructions_verified: usize,
+    /// Blocks with at least one agreeing run and no mismatch.
     pub blocks_verified: usize,
+    /// Blocks with at least one mismatching run.
     pub blocks_mismatched: usize,
+    /// Blocks with neither an agreeing nor a mismatching run.
     pub blocks_inconclusive: usize,
+    /// Number of inconclusive runs per reason.
     pub inconclusive_reasons: HashMap<String, usize>,
+    /// Descriptions of the first mismatches found (at most 50), with the block's start offset.
     pub mismatches: Vec<String>,
 }
 
@@ -89,9 +102,9 @@ impl<'a> Eval<'a> {
     fn read_word(buf: &[u8], off: U256) -> U256 {
         let mut b = [0u8; 32];
         if let Some(o) = off.as_usize() {
-            for i in 0..32 {
+            for (i, out) in b.iter_mut().enumerate() {
                 if let Some(x) = buf.get(o.saturating_add(i)) {
-                    b[i] = *x;
+                    *out = *x;
                 }
             }
         }
@@ -131,14 +144,22 @@ impl<'a> Eval<'a> {
                 op::BASEFEE => self.host.basefee,
                 op::BLOBBASEFEE => self.host.blobbasefee,
                 op::GAS => {
-                    let v = self.gas_rank.get(&seq).and_then(|i| self.gas_obs.get(*i)).copied();
+                    let v = self
+                        .gas_rank
+                        .get(&seq)
+                        .and_then(|i| self.gas_obs.get(*i))
+                        .copied();
                     v.unwrap_or_else(|| {
                         self.inconclusive = Some("gas observation".into());
                         U256::ZERO
                     })
                 }
                 op::MSIZE => {
-                    let v = self.msize_rank.get(&seq).and_then(|i| self.msize_obs.get(*i)).copied();
+                    let v = self
+                        .msize_rank
+                        .get(&seq)
+                        .and_then(|i| self.msize_obs.get(*i))
+                        .copied();
                     v.unwrap_or_else(|| {
                         self.inconclusive = Some("msize observation".into());
                         U256::ZERO
@@ -159,7 +180,11 @@ impl<'a> Eval<'a> {
             }
             Node::SLoad(key, transient, sgen) => {
                 let k = self.eval(key, memo);
-                let snaps = if transient { &self.tstor_snapshots } else { &self.stor_snapshots };
+                let snaps = if transient {
+                    &self.tstor_snapshots
+                } else {
+                    &self.stor_snapshots
+                };
                 let i = (sgen as usize).min(snaps.len() - 1);
                 match snaps[i].get(&k) {
                     Some(v) => *v,
@@ -182,7 +207,7 @@ impl<'a> Eval<'a> {
                         bytes.extend_from_slice(&v);
                     }
                 }
-                U256::from_be_bytes(&keccak256(&bytes))
+                U256::from_be_bytes(&keccak::keccak256(&bytes))
             }
             Node::KeccakMem(off, len, gen) => {
                 let o = self.eval(off, memo);
@@ -195,13 +220,13 @@ impl<'a> Eval<'a> {
                 } else {
                     let mut buf = vec![0u8; n];
                     if let Some(o) = o.as_usize() {
-                        for i in 0..n {
+                        for (i, out) in buf.iter_mut().enumerate() {
                             if let Some(x) = mem.get(o.saturating_add(i)) {
-                                buf[i] = *x;
+                                *out = *x;
                             }
                         }
                     }
-                    U256::from_be_bytes(&keccak256(&buf))
+                    U256::from_be_bytes(&keccak::keccak256(&buf))
                 }
             }
             Node::CallResult(seq) => match self.calls.get(call_index(seq)) {
@@ -225,7 +250,7 @@ impl<'a> Eval<'a> {
                         // The lifter models the out region as return data: bytes beyond the actual
                         // return data are *not* written by the EVM (old memory stays), so this is only
                         // exact when the data covers the read.
-                        if o.as_usize().map_or(true, |o| o + 32 > data.len()) {
+                        if o.as_usize().is_none_or(|o| o + 32 > data.len()) {
                             self.inconclusive = Some("returndata shorter than out region".into());
                         }
                         Self::read_word(data, o)
@@ -278,9 +303,9 @@ impl<'a> Eval<'a> {
                     (op::ADD, 2) => a[0].wrapping_add(a[1]),
                     (op::MUL, 2) => a[0].wrapping_mul(a[1]),
                     (op::SUB, 2) => a[0].wrapping_sub(a[1]),
-                    (op::DIV, 2) => a[0].div(a[1]),
+                    (op::DIV, 2) => a[0] / a[1],
                     (op::SDIV, 2) => a[0].sdiv(a[1]),
-                    (op::MOD, 2) => a[0].rem(a[1]),
+                    (op::MOD, 2) => a[0] % a[1],
                     (op::SMOD, 2) => a[0].smod(a[1]),
                     (op::EXP, 2) => a[0].pow(a[1]),
                     (op::SIGNEXTEND, 2) => U256::signextend(a[0], a[1]),
@@ -297,14 +322,14 @@ impl<'a> Eval<'a> {
                         if a[0] >= U256::from_u64(256) {
                             U256::ZERO
                         } else {
-                            a[1].shl(a[0].low_u64() as u32)
+                            a[1] << a[0].low_u64() as u32
                         }
                     }
                     (op::SHR, 2) => {
                         if a[0] >= U256::from_u64(256) {
                             U256::ZERO
                         } else {
-                            a[1].shr(a[0].low_u64() as u32)
+                            a[1] >> a[0].low_u64() as u32
                         }
                     }
                     (op::SAR, 2) => {
@@ -341,9 +366,11 @@ fn write_mem(mem: &mut Vec<u8>, off: U256, data: &[u8]) -> bool {
     if data.is_empty() {
         return true;
     }
-    let Some(o) = off.as_usize().filter(|o| *o < (1 << 26)) else { return false };
+    let Some(o) = off.as_usize().filter(|o| *o < (1 << 26)) else {
+        return false;
+    };
     let end = o + data.len();
-    let rounded = (end + 31) / 32 * 32;
+    let rounded = end.div_ceil(32) * 32;
     if rounded > mem.len() {
         mem.resize(rounded, 0);
     }
@@ -356,7 +383,7 @@ fn expand_mem(mem: &mut Vec<u8>, off: U256, len: usize) {
         return;
     }
     if let Some(o) = off.as_usize() {
-        let rounded = (o + len + 31) / 32 * 32;
+        let rounded = (o + len).div_ceil(32) * 32;
         if rounded > mem.len() {
             mem.resize(rounded, 0);
         }
@@ -366,9 +393,9 @@ fn expand_mem(mem: &mut Vec<u8>, off: U256, len: usize) {
 fn copy_from(src: &[u8], s: U256, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     if let Some(s) = s.as_usize() {
-        for i in 0..n {
+        for (i, out) in buf.iter_mut().enumerate() {
             if let Some(b) = src.get(s.saturating_add(i)) {
-                buf[i] = *b;
+                *out = *b;
             }
         }
     }
@@ -386,7 +413,9 @@ fn required_depth(prog: &Program, b: usize) -> usize {
         } else if op::is_swap(o) {
             ((o - 0x8e) as i64, (o - 0x8e) as i64)
         } else {
-            op::info(o).map(|i| (i.pops as i64, i.pushes as i64)).unwrap_or((0, 0))
+            op::info(o)
+                .map(|i| (i.pops as i64, i.pushes as i64))
+                .unwrap_or((0, 0))
         };
         depth -= pops;
         min = min.min(depth);
@@ -395,15 +424,28 @@ fn required_depth(prog: &Program, b: usize) -> usize {
     (-min) as usize
 }
 
+/// Parameters of a verification pass.
+#[derive(Clone, Debug)]
 pub struct VerifyOptions {
+    /// Completed reference runs wanted per block; up to ten times as many states are tried.
     pub runs: usize,
+    /// Seed of the random states, making a pass reproducible.
     pub seed: u64,
+    /// Print each mismatch with the block's lifted statements and exit stack to stderr.
     pub verbose: bool,
 }
 
+/// Lifts every block of `code` in isolation and compares it against the interpreter on random
+/// states, returning the totals.
 pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
     let prog = Program::new(code.to_vec());
-    let lifter = Lifter { prog: &prog, root: false, summaries: HashMap::new(), oracle: true, copy_loops: Default::default() };
+    let lifter = Lifter {
+        prog: &prog,
+        root: false,
+        summaries: HashMap::new(),
+        oracle: true,
+        copy_loops: Default::default(),
+    };
     let mut stats = VerifyStats::default();
     let mut rng = Rng::new(opts.seed);
     for b in &prog.blocks {
@@ -411,7 +453,23 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
         let n_ins = b.last - b.first + 1;
         stats.instructions_total += n_ins;
         // Lift the block alone with an unknown entry stack.
-        let unit = Unit { entry_block: b.id, nodes: vec![UNode { id: 0, block: b.id, entry: AState::new(), succs: vec![], preds: vec![], call: None, returns_via: None, unresolved: true, infeasible: false, computed_cut: false }], entry: 0, budget_exhausted: false };
+        let unit = Unit {
+            entry_block: b.id,
+            nodes: vec![UNode {
+                id: 0,
+                block: b.id,
+                entry: AState::new(),
+                succs: vec![],
+                preds: vec![],
+                call: None,
+                returns_via: None,
+                unresolved: true,
+                infeasible: false,
+                computed_cut: false,
+            }],
+            entry: 0,
+            budget_exhausted: false,
+        };
         let lifted = lifter.lift(&unit, None);
         let ln = &lifted.nodes[0];
         let need = required_depth(&prog, b.id).max(lifted.n_args);
@@ -428,7 +486,13 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
             // Input phases: mixed random values first; after repeated infeasible states (huge
             // memory offsets) small word-aligned values; then widely spread values so that
             // differently-based memory accesses cannot alias.
-            let phase = if attempts <= opts.runs * 2 { 0 } else if attempts <= opts.runs * 5 { 1 } else { 2 };
+            let phase = if attempts <= opts.runs * 2 {
+                0
+            } else if attempts <= opts.runs * 5 {
+                1
+            } else {
+                2
+            };
             let stack0: Vec<U256> = (0..depth)
                 .map(|i| match phase {
                     0 => rng.value(),
@@ -463,7 +527,10 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                 if attempts >= max_attempts && completed == 0 {
                     stats.inconclusive += 1;
                     block_inconclusive = true;
-                    *stats.inconclusive_reasons.entry(format!("reference exception: {}", reason)).or_default() += 1;
+                    *stats
+                        .inconclusive_reasons
+                        .entry(format!("reference exception: {}", reason))
+                        .or_default() += 1;
                 }
                 continue;
             }
@@ -493,9 +560,33 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                 gas.dedup();
                 msz.sort_unstable();
                 msz.dedup();
-                (gas.iter().enumerate().map(|(i, s)| (*s, i)).collect::<HashMap<u32, usize>>(), msz.iter().enumerate().map(|(i, s)| (*s, i)).collect::<HashMap<u32, usize>>())
+                (
+                    gas.iter()
+                        .enumerate()
+                        .map(|(i, s)| (*s, i))
+                        .collect::<HashMap<u32, usize>>(),
+                    msz.iter()
+                        .enumerate()
+                        .map(|(i, s)| (*s, i))
+                        .collect::<HashMap<u32, usize>>(),
+                )
             };
-            let mut ev = Eval { host: &host, stack0: stack0.clone(), mem_snapshots: vec![mem0.clone()], stor_snapshots: vec![HashMap::new()], tstor_snapshots: vec![HashMap::new()], calls: Vec::new(), creates: Vec::new(), gas_obs: m.gas_obs.clone(), msize_obs: m.msize_obs.clone(), gas_rank, msize_rank, code, returndata: returndata0.clone(), inconclusive: None };
+            let mut ev = Eval {
+                host: &host,
+                stack0: stack0.clone(),
+                mem_snapshots: vec![mem0.clone()],
+                stor_snapshots: vec![HashMap::new()],
+                tstor_snapshots: vec![HashMap::new()],
+                calls: Vec::new(),
+                creates: Vec::new(),
+                gas_obs: m.gas_obs.clone(),
+                msize_obs: m.msize_obs.clone(),
+                gas_rank,
+                msize_rank,
+                code,
+                returndata: returndata0.clone(),
+                inconclusive: None,
+            };
             let mut memo: HashMap<ExprId, U256> = HashMap::new();
             let mut mem = mem0.clone();
             let mut storage: HashMap<U256, U256> = HashMap::new();
@@ -512,14 +603,22 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         let o = ev.eval(*off, &mut memo);
                         let v = ev.eval(*val, &mut memo);
                         let bytes = v.to_be_bytes();
-                        let data: &[u8] = if *width == 32 { &bytes[..] } else { &bytes[31..] };
+                        let data: &[u8] = if *width == 32 {
+                            &bytes[..]
+                        } else {
+                            &bytes[31..]
+                        };
                         acc.note(*off, o, data.len());
                         if !write_mem(&mut mem, o, data) {
                             ev.inconclusive = Some("memory offset".into());
                         }
                         ev.mem_snapshots.push(mem.clone());
                     }
-                    Stmt::SStore { key, val, transient: t } => {
+                    Stmt::SStore {
+                        key,
+                        val,
+                        transient: t,
+                    } => {
                         let k = ev.eval(*key, &mut memo);
                         let v = ev.eval(*val, &mut memo);
                         if *t {
@@ -530,7 +629,12 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                             ev.stor_snapshots.push(storage.clone());
                         }
                     }
-                    Stmt::Log { off, len, topics, data } => {
+                    Stmt::Log {
+                        off,
+                        len,
+                        topics,
+                        data,
+                    } => {
                         let tv: Vec<U256> = topics.iter().map(|t| ev.eval(*t, &mut memo)).collect();
                         let l = ev.eval(*len, &mut memo).as_usize().unwrap_or(0);
                         let o = ev.eval(*off, &mut memo);
@@ -540,9 +644,23 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         };
                         acc.note(*off, o, l);
                         expand_mem(&mut mem, o, l);
-                        logs.push(crate::interp::LogRecord { topics: tv, data: bytes });
+                        logs.push(crate::interp::LogRecord {
+                            topics: tv,
+                            data: bytes,
+                        });
                     }
-                    Stmt::Call { kind, gas, addr, value, in_off, in_len, out_off, out_len, input, .. } => {
+                    Stmt::Call {
+                        kind,
+                        gas,
+                        addr,
+                        value,
+                        in_off,
+                        in_len,
+                        out_off,
+                        out_len,
+                        input,
+                        ..
+                    } => {
                         let g = ev.eval(*gas, &mut memo);
                         let a = ev.eval(*addr, &mut memo);
                         let v = value.map(|v| ev.eval(v, &mut memo)).unwrap_or(U256::ZERO);
@@ -559,8 +677,20 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         acc.note(*out_off, oo, ol);
                         expand_mem(&mut mem, io, il);
                         let idx = calls.len();
-                        calls.push(crate::interp::CallRecord { kind: *kind, gas: g, addr: a, value: v, input: input_bytes.clone(), out_off: oo, out_len: olv });
-                        let (ok, data) = if a == U256::from_u64(4) { (true, input_bytes) } else { host.call_result(idx) };
+                        calls.push(crate::interp::CallRecord {
+                            kind: *kind,
+                            gas: g,
+                            addr: a,
+                            value: v,
+                            input: input_bytes.clone(),
+                            out_off: oo,
+                            out_len: olv,
+                        });
+                        let (ok, data) = if a == U256::from_u64(4) {
+                            (true, input_bytes)
+                        } else {
+                            host.call_result(idx)
+                        };
                         ev.calls.push((ok, data.clone()));
                         if ol > 0 {
                             let mut buf = data.clone();
@@ -575,7 +705,15 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                             ev.stor_snapshots.push(storage.clone());
                         }
                     }
-                    Stmt::Create { kind, value, off, len, salt, init, .. } => {
+                    Stmt::Create {
+                        kind,
+                        value,
+                        off,
+                        len,
+                        salt,
+                        init,
+                        ..
+                    } => {
                         let v = ev.eval(*value, &mut memo);
                         let o = ev.eval(*off, &mut memo);
                         let l = ev.eval(*len, &mut memo).as_usize().unwrap_or(0);
@@ -587,13 +725,24 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         acc.note(*off, o, l);
                         expand_mem(&mut mem, o, l);
                         let idx = creates.len();
-                        creates.push(crate::interp::CreateRecord { kind: *kind, value: v, init: bytes, salt: sv });
+                        creates.push(crate::interp::CreateRecord {
+                            kind: *kind,
+                            value: v,
+                            init: bytes,
+                            salt: sv,
+                        });
                         ev.creates.push(host.create_result(idx));
                         ev.returndata = Vec::new();
                         ev.stor_snapshots.push(storage.clone());
                         ev.mem_snapshots.push(mem.clone());
                     }
-                    Stmt::Copy { kind, dest, src, len, addr } => {
+                    Stmt::Copy {
+                        kind,
+                        dest,
+                        src,
+                        len,
+                        addr,
+                    } => {
                         let d = ev.eval(*dest, &mut memo);
                         let sv = ev.eval(*src, &mut memo);
                         let l = ev.eval(*len, &mut memo).as_usize().unwrap_or(0);
@@ -604,7 +753,11 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                             op::MCOPY => copy_from(&mem, sv, l),
                             op::EXTCODECOPY => {
                                 let a = addr.map(|a| ev.eval(a, &mut memo)).unwrap_or(U256::ZERO);
-                                let c = if a == host.address { code.to_vec() } else { host.extcode(a) };
+                                let c = if a == host.address {
+                                    code.to_vec()
+                                } else {
+                                    host.extcode(a)
+                                };
                                 copy_from(&c, sv, l)
                             }
                             _ => vec![0u8; l],
@@ -618,11 +771,18 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         }
                         ev.mem_snapshots.push(mem.clone());
                     }
-                    Stmt::Internal { .. } | Stmt::Assign { .. } | Stmt::Drop(_) | Stmt::Require { .. } => {}
+                    Stmt::Internal { .. }
+                    | Stmt::Assign { .. }
+                    | Stmt::Drop(_)
+                    | Stmt::Require { .. } => {}
                 }
             }
             // Terminator.
-            let exit_stack: Vec<U256> = ln.exit_stack.iter().map(|e| ev.eval(*e, &mut memo)).collect();
+            let exit_stack: Vec<U256> = ln
+                .exit_stack
+                .iter()
+                .map(|e| ev.eval(*e, &mut memo))
+                .collect();
             // Memory reads inside expressions (for the aliasing check).
             {
                 let mut seen = std::collections::HashSet::new();
@@ -680,14 +840,18 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                 Term::SelfDestruct(a) => Outcome::SelfDestruct(ev.eval(*a, &mut memo)),
                 Term::Jump(_) | Term::Infeasible | Term::ReturnDyn { .. } => Outcome::Fallthrough,
                 other => {
-                    ev.inconclusive = Some(format!("terminator {:?}", std::mem::discriminant(other)));
+                    ev.inconclusive =
+                        Some(format!("terminator {:?}", std::mem::discriminant(other)));
                     Outcome::Fallthrough
                 }
             };
             if let Some(reason) = &ev.inconclusive {
                 stats.inconclusive += 1;
                 block_inconclusive = true;
-                *stats.inconclusive_reasons.entry(reason.clone()).or_default() += 1;
+                *stats
+                    .inconclusive_reasons
+                    .entry(reason.clone())
+                    .or_default() += 1;
                 continue;
             }
             if acc.aliased() {
@@ -695,7 +859,10 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                 // documented no-alias assumption does not apply, so the run proves nothing.
                 stats.inconclusive += 1;
                 block_inconclusive = true;
-                *stats.inconclusive_reasons.entry("memory aliasing between symbolic bases".into()).or_default() += 1;
+                *stats
+                    .inconclusive_reasons
+                    .entry("memory aliasing between symbolic bases".into())
+                    .or_default() += 1;
                 continue;
             }
             // Compare.
@@ -711,21 +878,38 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
             };
             // Exit stack: the reference stack may contain the untouched part below.
             let ref_stack = &m.stack;
-            let stack_eq = if matches!(outcome, Outcome::Jump(_) | Outcome::JumpI(..) | Outcome::Fallthrough) {
+            let stack_eq = if matches!(
+                outcome,
+                Outcome::Jump(_) | Outcome::JumpI(..) | Outcome::Fallthrough
+            ) {
                 let k = exit_stack.len();
                 // Our explicit exit stack covers the top `k` entries; below them the reference must
                 // hold the untouched entry stack.
                 let untouched = stack0.len().saturating_sub(lifted.n_args);
-                ref_stack.len() == untouched + k && ref_stack[untouched..] == exit_stack[..] && ref_stack[..untouched] == stack0[..untouched]
+                ref_stack.len() == untouched + k
+                    && ref_stack[untouched..] == exit_stack[..]
+                    && ref_stack[..untouched] == stack0[..untouched]
             } else {
                 true
             };
             if !outcome_eq {
-                diverged = Some(format!("outcome {:?} vs {:?}", short(&outcome), short(&lifted_outcome)));
+                diverged = Some(format!(
+                    "outcome {:?} vs {:?}",
+                    short(&outcome),
+                    short(&lifted_outcome)
+                ));
             } else if !stack_eq {
-                diverged = Some(format!("exit stack ref={} ours={}", fmt_stack(ref_stack), fmt_stack(&exit_stack)));
+                diverged = Some(format!(
+                    "exit stack ref={} ours={}",
+                    fmt_stack(ref_stack),
+                    fmt_stack(&exit_stack)
+                ));
             } else if ref_mem != our_mem {
-                let first = ref_mem.iter().zip(&our_mem).position(|(a, b)| a != b).unwrap_or(0);
+                let first = ref_mem
+                    .iter()
+                    .zip(&our_mem)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0);
                 diverged = Some(format!("memory differs at offset {:#x}", first));
             } else if m.storage != storage {
                 diverged = Some("storage differs".into());
@@ -747,7 +931,9 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                     stats.mismatch += 1;
                     block_ok = false;
                     if stats.mismatches.len() < 50 {
-                        stats.mismatches.push(format!("block {:#x}: {}", b.start, d));
+                        stats
+                            .mismatches
+                            .push(format!("block {:#x}: {}", b.start, d));
                     }
                     if opts.verbose {
                         eprintln!("MISMATCH block {:#x}..{:#x}: {}", b.start, b.end, d);
@@ -758,7 +944,14 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         if let Some(t) = crate::emit::fmt_term_halt(&ln.term, &names) {
                             eprintln!("    {}", t);
                         }
-                        eprintln!("    exit stack: {}", ln.exit_stack.iter().map(|e| crate::emit::fmt_expr(*e, &names)).collect::<Vec<_>>().join(", "));
+                        eprintln!(
+                            "    exit stack: {}",
+                            ln.exit_stack
+                                .iter()
+                                .map(|e| crate::emit::fmt_expr(*e, &names))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
                     }
                 }
             }
@@ -777,7 +970,12 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
     stats
 }
 
-fn words_to_bytes(words: &[ExprId], len: usize, ev: &mut Eval, memo: &mut HashMap<ExprId, U256>) -> Vec<u8> {
+fn words_to_bytes(
+    words: &[ExprId],
+    len: usize,
+    ev: &mut Eval,
+    memo: &mut HashMap<ExprId, U256>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     for (i, w) in words.iter().enumerate() {
         let v = ev.eval(*w, memo).to_be_bytes();
@@ -804,5 +1002,8 @@ fn short(o: &Outcome) -> String {
 }
 
 fn fmt_stack(s: &[U256]) -> String {
-    format!("[{}]", s.iter().map(|v| v.to_hex()).collect::<Vec<_>>().join(", "))
+    format!(
+        "[{}]",
+        s.iter().map(|v| v.to_hex()).collect::<Vec<_>>().join(", ")
+    )
 }

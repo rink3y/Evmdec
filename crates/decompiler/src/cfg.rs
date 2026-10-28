@@ -21,14 +21,18 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
+/// A maximal straight-line run of instructions, ending at a terminator or before a JUMPDEST.
 #[derive(Clone, Debug, Serialize)]
 pub struct Block {
+    /// Index of this block in `Program::blocks`.
     pub id: usize,
+    /// Byte offset of the first instruction.
     pub start: usize,
     /// Exclusive byte end.
     pub end: usize,
     /// Index range into `Program::insns`.
     pub first: usize,
+    /// Index of the last instruction in `Program::insns` (inclusive).
     pub last: usize,
     /// Opcode of the last instruction.
     pub terminator: u8,
@@ -36,11 +40,18 @@ pub struct Block {
     pub is_jumpdest: bool,
 }
 
+/// Disassembled runtime code split into basic blocks.
+#[derive(Debug)]
 pub struct Program {
+    /// Raw bytecode.
     pub code: Vec<u8>,
+    /// Instructions in code order.
     pub insns: Vec<Instruction>,
+    /// Basic blocks in code order.
     pub blocks: Vec<Block>,
+    /// Block id by start byte offset.
     pub block_at_pc: BTreeMap<usize, usize>,
+    /// Byte offsets of every JUMPDEST (the valid jump targets).
     pub jumpdests: HashSet<usize>,
     /// Candidate targets of computed jumps (block id -> target blocks), derived from the shape of
     /// the target expression (alignment masks, shifts): hand-written dispatchers that jump to
@@ -49,6 +60,7 @@ pub struct Program {
 }
 
 impl Program {
+    /// Disassemble `code` and split it into blocks at terminators and JUMPDESTs.
     pub fn new(code: Vec<u8>) -> Program {
         let insns = disasm::disassemble(&code);
         let jumpdests: HashSet<usize> = disasm::jumpdests(&code).into_iter().collect();
@@ -60,7 +72,10 @@ impl Program {
             let mut j = i;
             loop {
                 let o = insns[j].opcode;
-                if op::is_terminator(o) || j + 1 >= insns.len() || insns[j + 1].opcode == op::JUMPDEST {
+                if op::is_terminator(o)
+                    || j + 1 >= insns.len()
+                    || insns[j + 1].opcode == op::JUMPDEST
+                {
                     break;
                 }
                 j += 1;
@@ -79,7 +94,14 @@ impl Program {
             blocks.push(b);
             i = j + 1;
         }
-        Program { code, insns, blocks, block_at_pc, jumpdests, computed_jumps: HashMap::new() }
+        Program {
+            code,
+            insns,
+            blocks,
+            block_at_pc,
+            jumpdests,
+            computed_jumps: HashMap::new(),
+        }
     }
 
     /// Can the EVM ever enter this block? Only the entry, JUMPDEST-started blocks and the
@@ -87,9 +109,13 @@ impl Program {
     /// data or dead by construction.
     pub fn is_potential_code(&self, b: usize) -> bool {
         let blk = &self.blocks[b];
-        blk.start == 0 || blk.is_jumpdest || (b > 0 && self.blocks[b - 1].terminator == op::JUMPI) || (b > 0 && !op::is_terminator(self.blocks[b - 1].terminator))
+        blk.start == 0
+            || blk.is_jumpdest
+            || (b > 0 && self.blocks[b - 1].terminator == op::JUMPI)
+            || (b > 0 && !op::is_terminator(self.blocks[b - 1].terminator))
     }
 
+    /// Instructions of block `b`.
     pub fn block_insns(&self, b: &Block) -> &[Instruction] {
         &self.insns[b.first..=b.last]
     }
@@ -103,6 +129,7 @@ impl Program {
         }
     }
 
+    /// Block following `b` in code order, if any.
     pub fn next_block(&self, b: usize) -> Option<usize> {
         if b + 1 < self.blocks.len() {
             Some(b + 1)
@@ -113,13 +140,18 @@ impl Program {
 
     /// Block containing `pc`.
     pub fn block_containing(&self, pc: usize) -> Option<usize> {
-        self.block_at_pc.range(..=pc).next_back().map(|(_, b)| *b).filter(|b| self.blocks[*b].end > pc)
+        self.block_at_pc
+            .range(..=pc)
+            .next_back()
+            .map(|(_, b)| *b)
+            .filter(|b| self.blocks[*b].end > pc)
     }
 }
 
 /// Abstract value for control-flow recovery.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum AVal {
+    /// A known constant.
     Const(U256),
     /// A constant derived from `PC` (Vyper < 0.3 computes return addresses as `PC + k`).
     Pc(U256),
@@ -129,10 +161,12 @@ pub enum AVal {
     Mem(u32),
     /// Some value derived from a constant code region copied into memory (a jump table entry).
     Table,
+    /// Anything else.
     Unk,
 }
 
 impl AVal {
+    /// The constant value, if known (plain or `PC`-derived).
     pub fn konst(&self) -> Option<U256> {
         match self {
             AVal::Const(c) | AVal::Pc(c) => Some(*c),
@@ -145,6 +179,8 @@ impl AVal {
 }
 
 #[derive(Clone)]
+// The three maps are shared between the states of a walk and only replaced on write
+// (`Rc::make_mut`), so cloning a state at every branch stays cheap.
 struct AMem {
     /// Known 32-byte words at constant offsets (word writes only).
     words: Rc<BTreeMap<u32, AVal>>,
@@ -160,7 +196,12 @@ const MAX_AMEM: usize = 1 << 16;
 
 impl AMem {
     fn new() -> AMem {
-        AMem { words: Rc::new(BTreeMap::new()), bytes: Rc::new(Vec::new()), regions: Rc::new(Vec::new()), clobbered: false }
+        AMem {
+            words: Rc::new(BTreeMap::new()),
+            bytes: Rc::new(Vec::new()),
+            regions: Rc::new(Vec::new()),
+            clobbered: false,
+        }
     }
     fn write_bytes(&mut self, off: usize, data: &[Option<u8>]) {
         if off > MAX_AMEM || data.is_empty() {
@@ -231,8 +272,8 @@ impl AMem {
         }
         if off + 32 <= self.bytes.len() {
             let mut buf = [0u8; 32];
-            for i in 0..32 {
-                buf[i] = self.bytes[off + i]?;
+            for (i, out) in buf.iter_mut().enumerate() {
+                *out = self.bytes[off + i]?;
             }
             return Some(AVal::Const(U256::from_be_bytes(&buf)));
         }
@@ -253,13 +294,30 @@ pub struct AState {
     pub root: bool,
 }
 
+impl Default for AState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AState {
+    /// State at the entry of a region: every stack entry and memory word is a symbolic token.
     pub fn new() -> AState {
-        AState { stack: Vec::new(), consumed: 0, mem: AMem::new(), root: false }
+        AState {
+            stack: Vec::new(),
+            consumed: 0,
+            mem: AMem::new(),
+            root: false,
+        }
     }
     /// State at the start of a real call frame (pc 0 of a runtime): empty stack, zero memory.
     pub fn root() -> AState {
-        AState { stack: Vec::new(), consumed: 0, mem: AMem::new(), root: true }
+        AState {
+            stack: Vec::new(),
+            consumed: 0,
+            mem: AMem::new(),
+            root: true,
+        }
     }
     /// The path popped below the stack a real frame started with.
     pub fn underflowed(&self) -> bool {
@@ -338,7 +396,11 @@ impl AState {
 
 impl std::fmt::Debug for AState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AState(stack={:?}, consumed={})", self.stack, self.consumed)
+        write!(
+            f,
+            "AState(stack={:?}, consumed={})",
+            self.stack, self.consumed
+        )
     }
 }
 
@@ -349,6 +411,8 @@ enum SigVal {
     Mem(u32),
 }
 
+/// Identity of a node within a unit walk: the positions of code addresses and entry tokens on
+/// the stack and in memory. Two states with the same `Sig` at the same block are one node.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Sig {
     items: Vec<(u16, SigVal)>,
@@ -361,21 +425,49 @@ pub enum Flow {
     /// Jump to constant targets (one for JUMP, several for a jump table).
     Jump(Vec<usize>),
     /// Conditional: true targets (constant) and fall-through block.
-    Branch { targets: Vec<usize>, fallthrough: Option<usize> },
+    Branch {
+        /// Constant targets taken when the condition is non-zero.
+        targets: Vec<usize>,
+        /// Block executed when the condition is zero, if any.
+        fallthrough: Option<usize>,
+    },
     /// JUMP to a value that is not a constant: a return through `token` (Slot/Mem) or unknown.
     Return(AVal),
+    /// No terminator: execution continues into the given block.
     Fallthrough(usize),
+    /// Execution ends here; carries the terminating opcode (STOP, RETURN, REVERT, INVALID, ...).
     Halt(u8),
     /// JUMPI whose target is not constant; fall-through is still possible.
-    BranchUnresolved { target: AVal, fallthrough: Option<usize> },
+    BranchUnresolved {
+        /// The non-constant jump target.
+        target: AVal,
+        /// Block executed when the condition is zero, if any.
+        fallthrough: Option<usize>,
+    },
+}
+
+/// Whether a walk takes the candidates of a computed jump (one whose target is not a constant).
+///
+/// Orphan units ignore them so that the unreachable handlers of a jump-table dispatcher do not
+/// each re-explore the whole program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ComputedJumps {
+    /// Follow every resolved candidate target.
+    Follow,
+    /// Stop at computed jumps.
+    Ignore,
 }
 
 /// Outcome of abstractly executing one block.
+#[derive(Debug)]
 pub struct BlockExit {
+    /// Abstract state at the end of the block.
     pub state: AState,
+    /// How control leaves the block.
     pub flow: Flow,
     /// Memory word offsets written with constant offsets.
     pub mem_written: Vec<u32>,
+    /// Some memory write in the block had an unknown offset.
     pub mem_clobbered: bool,
 }
 
@@ -388,18 +480,18 @@ fn fold_const2(o: u8, a: U256, b: U256) -> Option<U256> {
             if a >= U256::from_u64(256) {
                 U256::ZERO
             } else {
-                b.shl(a.low_u64() as u32)
+                b << a.low_u64() as u32
             }
         }
         op::SHR => {
             if a >= U256::from_u64(256) {
                 U256::ZERO
             } else {
-                b.shr(a.low_u64() as u32)
+                b >> a.low_u64() as u32
             }
         }
         op::BYTE => U256::byte(a, b),
-        op::DIV if b.is_power_of_two() => a.div(b),
+        op::DIV if b.is_power_of_two() => a / b,
         op::MUL if b.is_power_of_two() || a.is_power_of_two() => a.wrapping_mul(b),
         op::EXP if a == U256::from_u64(2) => a.pow(b),
         _ => return None,
@@ -440,9 +532,21 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
             op::JUMP => {
                 let t = st.pop();
                 flow = Some(match t {
-                    AVal::Const(c) | AVal::Pc(c) => Flow::Jump(c.as_usize().and_then(|pc| prog.target_block(pc)).into_iter().collect()),
-                    AVal::Table => Flow::Jump(table_targets(prog, &st.mem).into_iter().filter_map(|pc| prog.target_block(pc)).collect()),
-                    AVal::Unk if prog.computed_jumps.contains_key(&b.id) => Flow::Jump(prog.computed_jumps[&b.id].clone()),
+                    AVal::Const(c) | AVal::Pc(c) => Flow::Jump(
+                        c.as_usize()
+                            .and_then(|pc| prog.target_block(pc))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    AVal::Table => Flow::Jump(
+                        table_targets(prog, &st.mem)
+                            .into_iter()
+                            .filter_map(|pc| prog.target_block(pc))
+                            .collect(),
+                    ),
+                    AVal::Unk if prog.computed_jumps.contains_key(&b.id) => {
+                        Flow::Jump(prog.computed_jumps[&b.id].clone())
+                    }
                     v => Flow::Return(v),
                 });
                 break;
@@ -452,10 +556,29 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                 let _cond = st.pop();
                 let fallthrough = prog.next_block(b.id);
                 flow = Some(match t {
-                    AVal::Const(c) | AVal::Pc(c) => Flow::Branch { targets: c.as_usize().and_then(|pc| prog.target_block(pc)).into_iter().collect(), fallthrough },
-                    AVal::Table => Flow::Branch { targets: table_targets(prog, &st.mem).into_iter().filter_map(|pc| prog.target_block(pc)).collect(), fallthrough },
-                    AVal::Unk if prog.computed_jumps.contains_key(&b.id) => Flow::Branch { targets: prog.computed_jumps[&b.id].clone(), fallthrough },
-                    v => Flow::BranchUnresolved { target: v, fallthrough },
+                    AVal::Const(c) | AVal::Pc(c) => Flow::Branch {
+                        targets: c
+                            .as_usize()
+                            .and_then(|pc| prog.target_block(pc))
+                            .into_iter()
+                            .collect(),
+                        fallthrough,
+                    },
+                    AVal::Table => Flow::Branch {
+                        targets: table_targets(prog, &st.mem)
+                            .into_iter()
+                            .filter_map(|pc| prog.target_block(pc))
+                            .collect(),
+                        fallthrough,
+                    },
+                    AVal::Unk if prog.computed_jumps.contains_key(&b.id) => Flow::Branch {
+                        targets: prog.computed_jumps[&b.id].clone(),
+                        fallthrough,
+                    },
+                    v => Flow::BranchUnresolved {
+                        target: v,
+                        fallthrough,
+                    },
                 });
                 break;
             }
@@ -497,7 +620,8 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                             st.mem.store_word(o, val);
                             mem_written.push(o as u32);
                         } else {
-                            st.mem.store_byte(o, val.konst().map(|c| c.to_be_bytes()[31]));
+                            st.mem
+                                .store_byte(o, val.konst().map(|c| c.to_be_bytes()[31]));
                             mem_written.push((o - o % 32) as u32);
                         }
                     }
@@ -515,7 +639,15 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                 let len = st.pop();
                 match (to_usize(dest), to_usize(src), to_usize(len)) {
                     (Some(d), Some(s), Some(l)) if d < MAX_AMEM && l <= MAX_AMEM => {
-                        let data: Vec<Option<u8>> = (0..l).map(|i| Some(s.checked_add(i).and_then(|p| prog.code.get(p).copied()).unwrap_or(0))).collect();
+                        let data: Vec<Option<u8>> = (0..l)
+                            .map(|i| {
+                                Some(
+                                    s.checked_add(i)
+                                        .and_then(|p| prog.code.get(p).copied())
+                                        .unwrap_or(0),
+                                )
+                            })
+                            .collect();
                         st.mem.clear(d, l);
                         st.mem.write_bytes(d, &data);
                         if s < prog.code.len() && l >= 2 {
@@ -565,7 +697,11 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                 }
             }
             op::CALL | op::CALLCODE | op::DELEGATECALL | op::STATICCALL => {
-                let n = if o == op::CALL || o == op::CALLCODE { 7 } else { 6 };
+                let n = if o == op::CALL || o == op::CALLCODE {
+                    7
+                } else {
+                    6
+                };
                 let mut args = Vec::new();
                 for _ in 0..n {
                     args.push(st.pop());
@@ -588,7 +724,9 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
             }
             _ => {
                 let info = op::info(o);
-                let (pops, pushes) = info.map(|i| (i.pops as usize, i.pushes as usize)).unwrap_or((0, 0));
+                let (pops, pushes) = info
+                    .map(|i| (i.pops as usize, i.pushes as usize))
+                    .unwrap_or((0, 0));
                 let mut args = Vec::with_capacity(pops);
                 for _ in 0..pops {
                     args.push(st.pop());
@@ -596,20 +734,52 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                 if pushes == 1 {
                     let v = match (pops, o) {
                         (2, _) => match (args[0], args[1]) {
-                            (AVal::Pc(a), AVal::Const(b)) | (AVal::Const(a), AVal::Pc(b)) | (AVal::Pc(a), AVal::Pc(b)) if matches!(o, op::ADD | op::SUB) => {
-                                AVal::Pc(if o == op::ADD { a.wrapping_add(b) } else { a.wrapping_sub(b) })
+                            (AVal::Pc(a), AVal::Const(b))
+                            | (AVal::Const(a), AVal::Pc(b))
+                            | (AVal::Pc(a), AVal::Pc(b))
+                                if matches!(o, op::ADD | op::SUB) =>
+                            {
+                                AVal::Pc(if o == op::ADD {
+                                    a.wrapping_add(b)
+                                } else {
+                                    a.wrapping_sub(b)
+                                })
                             }
                             (AVal::Const(a), AVal::Const(b)) if matches!(o, op::ADD | op::SUB) => {
                                 // Folded only when the result is a code address, so loop counters stay unknown.
-                                let r = if o == op::ADD { a.wrapping_add(b) } else { a.wrapping_sub(b) };
-                                if r.as_usize().map_or(false, |pc| prog.jumpdests.contains(&pc)) {
+                                let r = if o == op::ADD {
+                                    a.wrapping_add(b)
+                                } else {
+                                    a.wrapping_sub(b)
+                                };
+                                if r.as_usize().is_some_and(|pc| prog.jumpdests.contains(&pc)) {
                                     AVal::Const(r)
                                 } else {
                                     AVal::Unk
                                 }
                             }
-                            (AVal::Const(a), AVal::Const(b)) => fold_const2(o, a, b).map(AVal::Const).unwrap_or(AVal::Unk),
-                            (AVal::Table, _) | (_, AVal::Table) if matches!(o, op::AND | op::OR | op::XOR | op::SHL | op::SHR | op::SAR | op::BYTE | op::DIV | op::MOD | op::ADD | op::SUB | op::MUL) => AVal::Table,
+                            (AVal::Const(a), AVal::Const(b)) => {
+                                fold_const2(o, a, b).map(AVal::Const).unwrap_or(AVal::Unk)
+                            }
+                            (AVal::Table, _) | (_, AVal::Table)
+                                if matches!(
+                                    o,
+                                    op::AND
+                                        | op::OR
+                                        | op::XOR
+                                        | op::SHL
+                                        | op::SHR
+                                        | op::SAR
+                                        | op::BYTE
+                                        | op::DIV
+                                        | op::MOD
+                                        | op::ADD
+                                        | op::SUB
+                                        | op::MUL
+                                ) =>
+                            {
+                                AVal::Table
+                            }
                             _ => AVal::Unk,
                         },
                         (1, op::NOT) => match args[0] {
@@ -632,7 +802,12 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
         Some(nb) => Flow::Fallthrough(nb),
         None => Flow::Halt(op::STOP),
     });
-    BlockExit { state: st, flow, mem_written, mem_clobbered }
+    BlockExit {
+        state: st,
+        flow,
+        mem_written,
+        mem_clobbered,
+    }
 }
 
 /// Every plausible 2-byte big-endian jump destination inside the code regions copied into memory.
@@ -666,17 +841,24 @@ fn table_targets(prog: &Program, mem: &AMem) -> Vec<usize> {
 pub struct Exit {
     /// Return token (Slot/Mem) through which the JUMP leaves, or `Unk`.
     pub via: AVal,
+    /// Entry stack slots consumed on the way to this exit.
     pub consumed: u16,
+    /// Stack left above the remaining entry slots at the exit (top last).
     pub pushed: Vec<AVal>,
 }
 
+/// How control can leave the region reachable from a block (see the module docs).
 #[derive(Clone, Debug, Default)]
 pub struct Summary {
+    /// Ways of leaving the region through a non-constant JUMP (at most `MAX_EXITS`).
     pub exits: Vec<Exit>,
+    /// Some path halts (STOP/RETURN/REVERT/...) instead of exiting.
     pub may_halt: bool,
+    /// Some jump in the region could not be resolved, or the walk ran out of budget.
     pub unresolved: bool,
     /// Memory words (constant offsets) that may be written before any exit.
     pub mem_written: Vec<u32>,
+    /// Some path writes memory at an unknown offset before an exit.
     pub mem_clobbered: bool,
     /// Blocks reachable within the region (for coverage accounting).
     pub blocks: Vec<usize>,
@@ -689,14 +871,21 @@ enum Memo {
     Complete,
 }
 
+/// Summary analysis over a `Program`: memoised block summaries and the internal-call targets
+/// they reveal.
 pub struct Analysis<'a> {
+    /// The program being analysed.
     pub prog: &'a Program,
+    // Memo tables and counters live behind `RefCell` because the walk recurses through `&self`
+    // (summaries of callees are computed on demand while a caller is being walked).
     summaries: RefCell<Vec<Summary>>,
     memo: RefCell<Vec<Option<Memo>>>,
     stack_depth: RefCell<usize>,
     /// Blocks used as internal-call targets with a constant continuation.
     pub call_targets: RefCell<HashSet<usize>>,
+    /// Abstract instructions executed so far (bounded by `MAX_STEPS`).
     pub steps: RefCell<usize>,
+    /// Set once a step or recursion budget was hit; results are then incomplete.
     pub budget_exhausted: RefCell<bool>,
 }
 
@@ -776,6 +965,7 @@ fn add_exit(exits: &mut Vec<Exit>, ex: Exit) -> bool {
 }
 
 impl<'a> Analysis<'a> {
+    /// Analysis of `prog` with empty memo tables.
     pub fn new(prog: &'a Program) -> Analysis<'a> {
         Analysis {
             prog,
@@ -788,11 +978,16 @@ impl<'a> Analysis<'a> {
         }
     }
 
+    /// Summary of the region reachable from block `b`, computed and memoised on demand.
     pub fn summary(&self, b: usize) -> Summary {
         let m = self.memo.borrow()[b];
         match m {
-            Some(Memo::Complete) | Some(Memo::Pending) => return self.summaries.borrow()[b].clone(),
-            Some(Memo::Provisional(n)) if n >= MAX_PROVISIONAL_RECOMPUTES => return self.summaries.borrow()[b].clone(),
+            Some(Memo::Complete) | Some(Memo::Pending) => {
+                return self.summaries.borrow()[b].clone()
+            }
+            Some(Memo::Provisional(n)) if n >= MAX_PROVISIONAL_RECOMPUTES => {
+                return self.summaries.borrow()[b].clone()
+            }
             _ => {}
         }
         if *self.stack_depth.borrow() > MAX_RECURSION || *self.steps.borrow() > MAX_STEPS {
@@ -811,7 +1006,12 @@ impl<'a> Analysis<'a> {
             let changed = {
                 let mut s = self.summaries.borrow_mut();
                 let old = &s[b];
-                let changed = old.exits != summary.exits || old.may_halt != summary.may_halt || old.unresolved != summary.unresolved || old.mem_clobbered != summary.mem_clobbered || old.mem_written != summary.mem_written || old.blocks != summary.blocks;
+                let changed = old.exits != summary.exits
+                    || old.may_halt != summary.may_halt
+                    || old.unresolved != summary.unresolved
+                    || old.mem_clobbered != summary.mem_clobbered
+                    || old.mem_written != summary.mem_written
+                    || old.blocks != summary.blocks;
                 s[b] = summary;
                 changed
             };
@@ -872,7 +1072,12 @@ impl<'a> Analysis<'a> {
             mem_written.extend(exit.mem_written.iter().copied());
             summary.mem_clobbered |= exit.mem_clobbered;
             let st = exit.state;
-            let follow_consts = |targets: &[usize], st: &AState, work: &mut VecDeque<(usize, AState)>, summary: &mut Summary, depends: &mut bool, mem_written: &mut HashSet<u32>| {
+            let follow_consts = |targets: &[usize],
+                                 st: &AState,
+                                 work: &mut VecDeque<(usize, AState)>,
+                                 summary: &mut Summary,
+                                 depends: &mut bool,
+                                 mem_written: &mut HashSet<u32>| {
                 for &t in targets {
                     if t == b {
                         // Back to our own entry: a loop over the region. The exits of the
@@ -892,7 +1097,10 @@ impl<'a> Analysis<'a> {
                         *depends = true;
                     }
                     let sub = self.summary(t);
-                    if matches!(self.memo.borrow()[t], Some(Memo::Pending) | Some(Memo::Provisional(_))) {
+                    if matches!(
+                        self.memo.borrow()[t],
+                        Some(Memo::Pending) | Some(Memo::Provisional(_))
+                    ) {
                         *depends = true;
                     }
                     summary.may_halt |= sub.may_halt;
@@ -916,9 +1124,26 @@ impl<'a> Analysis<'a> {
                 }
             };
             match exit.flow {
-                Flow::Jump(ref targets) => follow_consts(targets, &st, &mut work, &mut summary, &mut depends_on_pending, &mut mem_written),
-                Flow::Branch { ref targets, fallthrough } => {
-                    follow_consts(targets, &st, &mut work, &mut summary, &mut depends_on_pending, &mut mem_written);
+                Flow::Jump(ref targets) => follow_consts(
+                    targets,
+                    &st,
+                    &mut work,
+                    &mut summary,
+                    &mut depends_on_pending,
+                    &mut mem_written,
+                ),
+                Flow::Branch {
+                    ref targets,
+                    fallthrough,
+                } => {
+                    follow_consts(
+                        targets,
+                        &st,
+                        &mut work,
+                        &mut summary,
+                        &mut depends_on_pending,
+                        &mut mem_written,
+                    );
                     if let Some(f) = fallthrough {
                         work.push_back((f, st.clone()));
                     }
@@ -944,7 +1169,13 @@ impl<'a> Analysis<'a> {
         (summary, depends_on_pending)
     }
 
-    fn record_exit(&self, summary: &mut Summary, via: AVal, st: &AState, work: &mut VecDeque<(usize, AState)>) {
+    fn record_exit(
+        &self,
+        summary: &mut Summary,
+        via: AVal,
+        st: &AState,
+        work: &mut VecDeque<(usize, AState)>,
+    ) {
         if let Some(pc) = to_usize(via) {
             // A constant produced inside the region (e.g. a loop whose continuation resolved).
             if let Some(cb) = self.prog.target_block(pc) {
@@ -953,7 +1184,14 @@ impl<'a> Analysis<'a> {
             return;
         }
         if via.is_token() {
-            add_exit(&mut summary.exits, Exit { via, consumed: st.consumed, pushed: st.stack.clone() });
+            add_exit(
+                &mut summary.exits,
+                Exit {
+                    via,
+                    consumed: st.consumed,
+                    pushed: st.stack.clone(),
+                },
+            );
         } else {
             summary.unresolved = true;
         }
@@ -964,18 +1202,25 @@ impl<'a> Analysis<'a> {
 // Units: explicit graphs for the lifter
 // ---------------------------------------------------------------------------------------------
 
+/// Kind of a successor edge in a `Unit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Edge {
+    /// The block has no terminator and continues into the next one.
     Fallthrough,
+    /// Unconditional JUMP to a resolved target.
     Jump,
+    /// JUMPI taken.
     True,
+    /// JUMPI not taken (fall-through).
     False,
     /// Continuation after an internal call returns.
     Return,
 }
 
+/// An internal call made by the JUMP at the end of a node.
 #[derive(Clone, Debug)]
 pub struct CallInfo {
+    /// Entry block of the called function.
     pub callee: usize,
     /// Stack entries consumed by the callee (including the return address).
     pub consumed: u16,
@@ -985,17 +1230,24 @@ pub struct CallInfo {
     pub ret_slot: Option<u16>,
 }
 
+/// A block in a specific stack context: one node of a `Unit` graph.
 #[derive(Clone, Debug)]
 pub struct UNode {
+    /// Index of this node in `Unit::nodes`.
     pub id: usize,
+    /// The basic block this node executes.
     pub block: usize,
+    /// Abstract state at the start of the block in this context.
     pub entry: AState,
+    /// Successor nodes with the kind of edge leading to each.
     pub succs: Vec<(usize, Edge)>,
+    /// Predecessor node ids.
     pub preds: Vec<usize>,
     /// Set when the block's JUMP is an internal call: the continuation nodes are `Return` succs.
     pub call: Option<CallInfo>,
     /// The block ends by returning from this unit through a token (Slot/Mem).
     pub returns_via: Option<AVal>,
+    /// The block's jump target could not be resolved to code.
     pub unresolved: bool,
     /// The path into this node underflows the real frame's stack and cannot execute.
     pub infeasible: bool,
@@ -1004,30 +1256,52 @@ pub struct UNode {
     pub computed_cut: bool,
 }
 
+/// Explicit control-flow graph of one region (public entry, internal function or orphan block).
 #[derive(Clone, Debug)]
 pub struct Unit {
+    /// Basic block the unit starts at.
     pub entry_block: usize,
+    /// Nodes indexed by `UNode::id`.
     pub nodes: Vec<UNode>,
+    /// Id of the entry node.
     pub entry: usize,
+    /// The walk hit a node or context limit and the graph is incomplete.
     pub budget_exhausted: bool,
 }
 
 impl<'a> Analysis<'a> {
     /// Build the explicit graph for the region starting at `entry_block` with `entry_state`.
     pub fn build_unit(&self, entry_block: usize, entry_state: AState) -> Unit {
-        self.build_unit_opts(entry_block, entry_state, true, MAX_WALK_NODES * 4)
+        self.build_unit_opts(
+            entry_block,
+            entry_state,
+            ComputedJumps::Follow,
+            MAX_WALK_NODES * 4,
+        )
     }
 
-    /// `follow_computed`: take computed-jump candidates (orphans do not, so that unreachable
-    /// handlers of a jump-table dispatcher do not each re-explore the whole program).
-    pub fn build_unit_opts(&self, entry_block: usize, entry_state: AState, follow_computed: bool, max_nodes: usize) -> Unit {
+    /// Like [`build_unit`](Self::build_unit) with an explicit computed-jump policy and node
+    /// budget.
+    pub fn build_unit_opts(
+        &self,
+        entry_block: usize,
+        entry_state: AState,
+        computed: ComputedJumps,
+        max_nodes: usize,
+    ) -> Unit {
+        let follow_computed = computed == ComputedJumps::Follow;
         let prog = self.prog;
         let mut nodes: Vec<UNode> = Vec::new();
         let mut index: HashMap<(usize, Sig), usize> = HashMap::new();
         let mut work: VecDeque<usize> = VecDeque::new();
         let mut budget_exhausted = false;
         let mut per_block: HashMap<usize, Vec<usize>> = HashMap::new();
-        let mut intern = |blk: usize, st: &AState, nodes: &mut Vec<UNode>, index: &mut HashMap<(usize, Sig), usize>, work: &mut VecDeque<usize>| -> usize {
+        let mut intern = |blk: usize,
+                          st: &AState,
+                          nodes: &mut Vec<UNode>,
+                          index: &mut HashMap<(usize, Sig), usize>,
+                          work: &mut VecDeque<usize>|
+         -> usize {
             let key = (blk, st.sig(prog));
             if let Some(&id) = index.get(&key) {
                 return id;
@@ -1039,7 +1313,18 @@ impl<'a> Analysis<'a> {
             }
             let id = nodes.len();
             list.push(id);
-            nodes.push(UNode { id, block: blk, entry: st.clone(), succs: vec![], preds: vec![], call: None, returns_via: None, unresolved: false, infeasible: false, computed_cut: false });
+            nodes.push(UNode {
+                id,
+                block: blk,
+                entry: st.clone(),
+                succs: vec![],
+                preds: vec![],
+                call: None,
+                returns_via: None,
+                unresolved: false,
+                infeasible: false,
+                computed_cut: false,
+            });
             index.insert(key, id);
             work.push_back(id);
             id
@@ -1061,7 +1346,10 @@ impl<'a> Analysis<'a> {
                         cut = true;
                     }
                     Flow::Branch { fallthrough, .. } => {
-                        exit.flow = Flow::Branch { targets: vec![], fallthrough };
+                        exit.flow = Flow::Branch {
+                            targets: vec![],
+                            fallthrough,
+                        };
                         cut = true;
                     }
                     _ => {}
@@ -1075,62 +1363,96 @@ impl<'a> Analysis<'a> {
                 continue;
             }
             let mut succs: Vec<(usize, Edge)> = Vec::new();
-            let mut resolve_targets = |targets: &[usize], kind: Edge, st: &AState, nodes: &mut Vec<UNode>, index: &mut HashMap<(usize, Sig), usize>, work: &mut VecDeque<usize>, succs: &mut Vec<(usize, Edge)>, call: &mut Option<CallInfo>| {
-                for &t in targets {
-                    // Is this an internal call? Only JUMPs (not JUMPIs) can be calls.
-                    if kind == Edge::Jump {
-                        let sub = self.summary(t);
-                        let mut call_conts: Vec<(usize, Exit, AVal)> = Vec::new();
-                        for ex in &sub.exits {
-                            let mut s2 = st.clone();
-                            let via = resolve(ex.via, &mut s2);
-                            if let Some(pc) = to_usize(via) {
-                                if let Some(cb) = prog.target_block(pc) {
-                                    call_conts.push((cb, ex.clone(), ex.via));
-                                }
-                            }
-                        }
-                        if !call_conts.is_empty() {
-                            let ex0 = &call_conts[0].1;
-                            let ret_slot = match call_conts[0].2 {
-                                AVal::Slot(i) => Some(i),
-                                _ => None,
-                            };
-                            *call = Some(CallInfo { callee: t, consumed: ex0.consumed, pushed: ex0.pushed.clone(), ret_slot });
-                            for (cb, ex, _) in &call_conts {
+            let mut resolve_targets =
+                |targets: &[usize],
+                 kind: Edge,
+                 st: &AState,
+                 nodes: &mut Vec<UNode>,
+                 index: &mut HashMap<(usize, Sig), usize>,
+                 work: &mut VecDeque<usize>,
+                 succs: &mut Vec<(usize, Edge)>,
+                 call: &mut Option<CallInfo>| {
+                    for &t in targets {
+                        // Is this an internal call? Only JUMPs (not JUMPIs) can be calls.
+                        if kind == Edge::Jump {
+                            let sub = self.summary(t);
+                            let mut call_conts: Vec<(usize, Exit, AVal)> = Vec::new();
+                            for ex in &sub.exits {
                                 let mut s2 = st.clone();
-                                apply_exit(ex, &mut s2);
-                                // The callee may have written memory: forget those words.
-                                for &o in &sub.mem_written {
-                                    Rc::make_mut(&mut s2.mem.words).remove(&o);
-                                }
-                                if sub.mem_clobbered {
-                                    s2.mem.clobbered = true;
-                                }
-                                let id = intern(*cb, &s2, nodes, index, work);
-                                if !succs.contains(&(id, Edge::Return)) {
-                                    succs.push((id, Edge::Return));
+                                let via = resolve(ex.via, &mut s2);
+                                if let Some(pc) = to_usize(via) {
+                                    if let Some(cb) = prog.target_block(pc) {
+                                        call_conts.push((cb, ex.clone(), ex.via));
+                                    }
                                 }
                             }
-                            continue;
+                            if !call_conts.is_empty() {
+                                let ex0 = &call_conts[0].1;
+                                let ret_slot = match call_conts[0].2 {
+                                    AVal::Slot(i) => Some(i),
+                                    _ => None,
+                                };
+                                *call = Some(CallInfo {
+                                    callee: t,
+                                    consumed: ex0.consumed,
+                                    pushed: ex0.pushed.clone(),
+                                    ret_slot,
+                                });
+                                for (cb, ex, _) in &call_conts {
+                                    let mut s2 = st.clone();
+                                    apply_exit(ex, &mut s2);
+                                    // The callee may have written memory: forget those words.
+                                    for &o in &sub.mem_written {
+                                        Rc::make_mut(&mut s2.mem.words).remove(&o);
+                                    }
+                                    if sub.mem_clobbered {
+                                        s2.mem.clobbered = true;
+                                    }
+                                    let id = intern(*cb, &s2, nodes, index, work);
+                                    if !succs.contains(&(id, Edge::Return)) {
+                                        succs.push((id, Edge::Return));
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        let id = intern(t, st, nodes, index, work);
+                        if !succs.contains(&(id, kind)) {
+                            succs.push((id, kind));
                         }
                     }
-                    let id = intern(t, st, nodes, index, work);
-                    if !succs.contains(&(id, kind)) {
-                        succs.push((id, kind));
-                    }
-                }
-            };
+                };
             let mut call = None;
             match exit.flow {
                 Flow::Jump(ref targets) => {
                     if targets.is_empty() {
                         nodes[n].unresolved = true;
                     }
-                    resolve_targets(targets, Edge::Jump, &st, &mut nodes, &mut index, &mut work, &mut succs, &mut call)
+                    resolve_targets(
+                        targets,
+                        Edge::Jump,
+                        &st,
+                        &mut nodes,
+                        &mut index,
+                        &mut work,
+                        &mut succs,
+                        &mut call,
+                    )
                 }
-                Flow::Branch { ref targets, fallthrough } => {
-                    resolve_targets(targets, Edge::True, &st, &mut nodes, &mut index, &mut work, &mut succs, &mut call);
+                Flow::Branch {
+                    ref targets,
+                    fallthrough,
+                } => {
+                    resolve_targets(
+                        targets,
+                        Edge::True,
+                        &st,
+                        &mut nodes,
+                        &mut index,
+                        &mut work,
+                        &mut succs,
+                        &mut call,
+                    );
                     if let Some(f) = fallthrough {
                         let id = intern(f, &st, &mut nodes, &mut index, &mut work);
                         succs.push((id, Edge::False));
@@ -1171,7 +1493,12 @@ impl<'a> Analysis<'a> {
             }
             nodes[n].succs = succs;
         }
-        Unit { entry_block, nodes, entry, budget_exhausted }
+        Unit {
+            entry_block,
+            nodes,
+            entry,
+            budget_exhausted,
+        }
     }
 }
 
@@ -1197,21 +1524,37 @@ impl Unit {
             let mut nd = self.nodes[old].clone();
             nd.id = map[&old];
             nd.succs = nd.succs.iter().map(|(s, k)| (map[s], *k)).collect();
-            nd.preds = nd.preds.iter().filter_map(|p| map.get(p).copied()).collect();
+            nd.preds = nd
+                .preds
+                .iter()
+                .filter_map(|p| map.get(p).copied())
+                .collect();
             nodes.push(nd);
         }
-        (Unit { entry_block: self.nodes[entry].block, nodes, entry: 0, budget_exhausted: self.budget_exhausted }, map)
+        (
+            Unit {
+                entry_block: self.nodes[entry].block,
+                nodes,
+                entry: 0,
+                budget_exhausted: self.budget_exhausted,
+            },
+            map,
+        )
     }
 }
 
 /// Whole-program recovery result.
+#[derive(Debug)]
 pub struct Recovered {
+    /// The public entry: dispatcher and external function bodies.
     pub main: Unit,
     /// Internal functions: entry block -> unit.
     pub functions: BTreeMap<usize, Unit>,
     /// Orphan regions (blocks reached by nothing), by entry block.
     pub orphans: BTreeMap<usize, Unit>,
+    /// End offsets of blocks whose jump could not be resolved, sorted and deduplicated.
     pub unresolved_jumps: Vec<usize>,
+    /// Some walk or summary ran out of budget; the result is incomplete.
     pub budget_exhausted: bool,
 }
 
@@ -1219,7 +1562,18 @@ pub struct Recovered {
 pub fn recover(prog: &Program, code_end: usize) -> Recovered {
     let an = Analysis::new(prog);
     if prog.blocks.is_empty() {
-        return Recovered { main: Unit { entry_block: 0, nodes: vec![], entry: 0, budget_exhausted: false }, functions: BTreeMap::new(), orphans: BTreeMap::new(), unresolved_jumps: vec![], budget_exhausted: false };
+        return Recovered {
+            main: Unit {
+                entry_block: 0,
+                nodes: vec![],
+                entry: 0,
+                budget_exhausted: false,
+            },
+            functions: BTreeMap::new(),
+            orphans: BTreeMap::new(),
+            unresolved_jumps: vec![],
+            budget_exhausted: false,
+        };
     }
     let _ = an.summary(0);
     let main = an.build_unit(0, AState::root());
@@ -1274,7 +1628,8 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
                 // Budget: remaining unreached blocks stay uncovered (reported in the statistics).
                 break;
             }
-            let unit = an.build_unit_opts(b.id, AState::new(), false, MAX_WALK_NODES);
+            let unit =
+                an.build_unit_opts(b.id, AState::new(), ComputedJumps::Ignore, MAX_WALK_NODES);
             orphan_nodes += unit.nodes.len();
             for n in &unit.nodes {
                 covered.insert(n.block);
@@ -1282,7 +1637,10 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
             orphans.insert(b.id, unit);
         }
     }
-    for u in std::iter::once(&main).chain(functions.values()).chain(orphans.values()) {
+    for u in std::iter::once(&main)
+        .chain(functions.values())
+        .chain(orphans.values())
+    {
         for n in &u.nodes {
             if n.unresolved {
                 unresolved.push(prog.blocks[n.block].end);
@@ -1291,6 +1649,14 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
     }
     unresolved.sort_unstable();
     unresolved.dedup();
-    let budget = *an.budget_exhausted.borrow() || main.budget_exhausted || functions.values().any(|u| u.budget_exhausted);
-    Recovered { main, functions, orphans, unresolved_jumps: unresolved, budget_exhausted: budget }
+    let budget = *an.budget_exhausted.borrow()
+        || main.budget_exhausted
+        || functions.values().any(|u| u.budget_exhausted);
+    Recovered {
+        main,
+        functions,
+        orphans,
+        unresolved_jumps: unresolved,
+        budget_exhausted: budget,
+    }
 }

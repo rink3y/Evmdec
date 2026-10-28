@@ -196,6 +196,201 @@ struct Ctx<'a> {
 /// Constant-offset memory writes of a unit: `(offset, length)` with `None` for an unknown length.
 type MemWrites = Vec<(ExprId, Option<u64>)>;
 
+/// What one entry point does, kept for the cross-function passes: the access-control policy
+/// the contract follows (and the functions that deviate from it) and multi-step attack chains.
+struct FnFacts {
+    /// Display name (`fname`).
+    name: String,
+    /// Entry pc, used as the finding's location.
+    pc: usize,
+    /// An externally callable function (not fallback/receive/constructor).
+    external: bool,
+    /// Writes storage, calls out, creates or self-destructs.
+    state_changing: bool,
+    /// A msg.sender comparison guards it somewhere on its path (helpers included).
+    caller_checked: bool,
+    /// Constant storage slots its msg.sender checks compare against, with their printed names.
+    auth_slots: Vec<(ExprId, String)>,
+    /// Constant (non-mapping) storage slots it writes: slot, how the value is chosen, printed
+    /// statement.
+    const_writes: Vec<(ExprId, WriteSource, String)>,
+    /// Calls that carry ether: target, amount, printed statement.
+    ether_out: Vec<(ExprId, ExprId, String)>,
+    /// `selfdestruct` beneficiaries with the printed statement.
+    selfdestructs: Vec<(ExprId, String)>,
+    /// `delegatecall` targets with the printed statement.
+    delegatecalls: Vec<(ExprId, String)>,
+    /// Some guard compares against the block number or timestamp.
+    time_gated: bool,
+    /// Some guard tests a constant slot for "not yet set" (`require(owner == 0)`): an
+    /// initializer, reachable only while the contract is uninitialised.
+    init_guarded: bool,
+}
+
+/// Where the value stored into a constant slot comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteSource {
+    /// A calldata word stored as is (an address mask on it is allowed): the caller picks it.
+    Calldata,
+    /// `msg.sender` stored as is.
+    Caller,
+    /// Anything else: a computed value, a constant, another slot.
+    Other,
+}
+
+fn write_source(val: ExprId) -> WriteSource {
+    // A packed address write keeps the slot's other bytes: `x | slot & 0xffff…0000`.
+    let keeps_old_bytes = |e: ExprId| {
+        matches!(expr::node(e), Node::Op(op::AND, w)
+            if w.iter().any(|x| matches!(expr::node(*x), Node::SLoad(..)))
+                && w.iter().any(|x| expr::as_const(*x).is_some()))
+    };
+    let v = match expr::node(val) {
+        Node::Op(op::OR, w) if keeps_old_bytes(w[1]) => w[0],
+        Node::Op(op::OR, w) if keeps_old_bytes(w[0]) => w[1],
+        _ => val,
+    };
+    let v = match expr::node(v) {
+        Node::Op(op::AND, w) if expr::as_const(w[1]).is_some_and(|m| m.is_low_mask()) => w[0],
+        Node::Op(op::AND, w) if expr::as_const(w[0]).is_some_and(|m| m.is_low_mask()) => w[1],
+        _ => v,
+    };
+    match expr::node(v) {
+        Node::CallDataLoad(_) | Node::CopiedWord(op::CALLDATACOPY, _, _) => WriteSource::Calldata,
+        Node::Env(op::CALLER, _) => WriteSource::Caller,
+        _ => WriteSource::Other,
+    }
+}
+
+/// The `require` and branch conditions along a function's events, helpers included.
+fn guard_conds(events: &[Event]) -> Vec<ExprId> {
+    let mut out = Vec::new();
+    for e in events {
+        if let Some(Stmt::Require { cond, .. }) = &e.stmt {
+            out.push(*cond);
+        }
+        if let Some(Term::Branch { cond, .. }) = &e.term {
+            out.push(*cond);
+        }
+    }
+    out
+}
+
+/// A condition on the block number or timestamp (a deadline, a lock-up, a vesting schedule).
+fn is_time_cond(cond: ExprId) -> bool {
+    mentions(cond, &|n| {
+        matches!(n, Node::Env(op::TIMESTAMP | op::NUMBER, _))
+    })
+}
+
+/// Does the expression read the (persistent) storage slot `slot`?
+fn reads_slot(e: ExprId, slot: ExprId) -> bool {
+    mentions(e, &|n| matches!(n, Node::SLoad(k, false, _) if *k == slot))
+}
+
+fn collect_facts(f: &Function, events: &[Event], caller_checked: bool, names: &Names) -> FnFacts {
+    let mut facts = FnFacts {
+        name: fname(f),
+        pc: f.pc,
+        external: f.kind == FnKind::External,
+        state_changing: f.effects.writes_storage
+            || f.effects.calls
+            || f.effects.selfdestruct
+            || f.effects.creates,
+        caller_checked,
+        auth_slots: Vec::new(),
+        const_writes: Vec::new(),
+        ether_out: Vec::new(),
+        selfdestructs: Vec::new(),
+        delegatecalls: Vec::new(),
+        time_gated: false,
+        init_guarded: false,
+    };
+    for cond in guard_conds(events) {
+        if is_auth_cond(cond) {
+            let mut slots = HashSet::new();
+            collect_sload_keys(cond, &mut slots);
+            for k in slots {
+                if expr::is_const(k) && !facts.auth_slots.iter().any(|(s, _)| *s == k) {
+                    facts
+                        .auth_slots
+                        .push((k, emit::fmt_slot(k, names, SlotSpace::Persistent)));
+                }
+            }
+        }
+        if is_time_cond(cond) {
+            facts.time_gated = true;
+        }
+        // `require(slot == 0)`, `if (!slot)`, a branch on the bare slot or on a masked byte of
+        // it: the shapes an "already initialised?" test takes in solc and Vyper output.
+        if matches!(
+            expr::node(cond),
+            Node::Op(op::ISZERO | op::EQ | op::AND, _) | Node::SLoad(..)
+        ) && mentions(
+            cond,
+            &|n| matches!(n, Node::SLoad(k, false, _) if expr::is_const(*k)),
+        ) && !is_auth_cond(cond)
+        {
+            facts.init_guarded = true;
+        }
+    }
+    for ev in events {
+        match &ev.stmt {
+            Some(
+                st @ Stmt::SStore {
+                    key,
+                    val,
+                    transient: false,
+                    ..
+                },
+            ) if expr::is_const(*key) => {
+                facts
+                    .const_writes
+                    .push((*key, write_source(*val), emit::fmt_stmt(st, names)));
+            }
+            Some(
+                st @ Stmt::Call {
+                    kind, addr, value, ..
+                },
+            ) => {
+                if *kind == op::DELEGATECALL || *kind == op::CALLCODE {
+                    facts.delegatecalls.push((*addr, emit::fmt_stmt(st, names)));
+                }
+                if let Some(v) = value {
+                    if expr::as_const(*v) != Some(U256::ZERO) {
+                        facts.ether_out.push((*addr, *v, emit::fmt_stmt(st, names)));
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(Term::SelfDestruct(a)) = &ev.term {
+            facts
+                .selfdestructs
+                .push((*a, format!("selfdestruct({});", emit::fmt_expr(*a, names))));
+        }
+    }
+    if std::env::var("EVMDEC_DEBUG_FACTS").is_ok() {
+        eprintln!(
+            "[facts] {} checked={} init={} time={} auth={:?} writes={} ether={} sd={} dc={} guards={:?}",
+            facts.name,
+            facts.caller_checked,
+            facts.init_guarded,
+            facts.time_gated,
+            facts.auth_slots.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>(),
+            facts.const_writes.len(),
+            facts.ether_out.len(),
+            facts.selfdestructs.len(),
+            facts.delegatecalls.len(),
+            guard_conds(events)
+                .iter()
+                .map(|c| emit::fmt_cond(*c, names))
+                .collect::<Vec<_>>()
+        );
+    }
+    facts
+}
+
 /// Constant-offset memory writes of some nodes (`None`: a write through a pointer or into
 /// an unknown callee).
 fn writes_of<'a>(
@@ -836,6 +1031,7 @@ pub fn analyze(c: &Contract) -> Report {
     let mut external_calls: BTreeSet<String> = BTreeSet::new();
     let mut privileged: Vec<String> = Vec::new();
     let mut unauthenticated: Vec<String> = Vec::new();
+    let mut facts: Vec<FnFacts> = Vec::new();
     // Reentrancy lock slots and the functions that use them (Vyper lock-slot bug detection).
     let mut lock_slots: HashMap<ExprId, HashSet<usize>> = HashMap::new();
     // Contract-wide: does anything ever send ether out?
@@ -854,6 +1050,7 @@ pub fn analyze(c: &Contract) -> Report {
         let names = names_for(f);
         let events = events_of(&ctx, l, 5, false);
         let caller_checked = any_caller_check(&ctx, f);
+        facts.push(collect_facts(f, &events, caller_checked, &names));
         let state_changing = f.effects.writes_storage
             || f.effects.calls
             || f.effects.selfdestruct
@@ -1371,6 +1568,51 @@ pub fn analyze(c: &Contract) -> Report {
                                     vec![line.clone()], "Verify the amount is bounded by what the caller is owed.");
                             }
                         }
+                        // Pre-0.8: a payout amount computed with `-` or `*` from a parameter that
+                        // no earlier comparison bounds wraps silently (accounting error).
+                        if let (Some(v), true) = (*value, value_nonzero) {
+                            let wrapping = ctx.version.is_some_and(|ver| ver < (0, 8, 0))
+                                || c.info
+                                    .metadata
+                                    .as_ref()
+                                    .is_some_and(|m| m.implies_pre_0_5_9());
+                            let unbounded_param = |e: ExprId| -> bool {
+                                mentions(
+                                    e,
+                                    &|n| matches!(n, Node::Op(op::SUB | op::MUL, ref w) if w.iter().any(|x| from_calldata(*x))),
+                                )
+                            };
+                            let bounded = events[..i]
+                                .iter()
+                                .flat_map(|e| {
+                                    let mut v = Vec::new();
+                                    if let Some(Stmt::Require { cond, .. }) = &e.stmt {
+                                        v.push(*cond);
+                                    }
+                                    if let Some(Term::Branch { cond, .. }) = &e.term {
+                                        v.push(*cond);
+                                    }
+                                    v
+                                })
+                                .any(|cond| {
+                                    from_calldata(cond)
+                                        && matches!(
+                                            expr::node(cond),
+                                            Node::Op(op::LT | op::GT | op::SLT | op::SGT, _)
+                                                | Node::Op(op::ISZERO, _)
+                                        )
+                                });
+                            if wrapping && !ctx.vyper && unbounded_param(v) && !bounded {
+                                let sev = if caller_checked {
+                                    Severity::Low
+                                } else {
+                                    Severity::Medium
+                                };
+                                push(&mut findings, "unbounded-payout-parameter", "Payout amount computed from an unbounded parameter with wrapping arithmetic", sev, Confidence::Low, Some(f), Some(ev.pc),
+                                    format!("`{}` sends `{}`: the amount is computed with `-` or `*` from a call parameter that no earlier check bounds, and this compiler version does not check overflow. A parameter outside the intended range wraps the amount instead of reverting{}.", f.name, emit::fmt_expr(v, names), if caller_checked { "; the function is access-controlled, so this needs a privileged mistake" } else { "" }),
+                                    vec![line.clone()], "Bound the parameter with a require, or use checked arithmetic (SafeMath / solc >= 0.8).");
+                            }
+                        }
                         if ev.in_loop && !precompile {
                             push(&mut findings, "call-in-loop", "External call inside a loop", Severity::Low, Confidence::Medium, Some(f), Some(ev.pc),
                                 format!("`{}` performs an external call to `{}` inside a loop; one failing or gas-hungry callee can block the whole iteration (denial of service).", f.name, target), vec![line.clone()], "Prefer pull-payments or bound the iteration.");
@@ -1450,23 +1692,54 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // Terminators: selfdestruct, unresolved
+        // Terminators: selfdestruct (in the function or an inlined helper), unresolved
+        for ev in &events {
+            let Some(Term::SelfDestruct(a)) = &ev.term else {
+                continue;
+            };
+            let a = *a;
+            let to_caller = from_caller(a) || from_calldata(a);
+            let time_guard = guard_conds(&events).into_iter().find(|c| is_time_cond(*c));
+            let (sev, conf, title) = if caller_checked {
+                (
+                    Severity::Medium,
+                    Confidence::Medium,
+                    "Contract can self-destruct",
+                )
+            } else if to_caller {
+                (
+                    Severity::Critical,
+                    Confidence::High,
+                    "Anyone can destroy the contract and collect its balance",
+                )
+            } else {
+                (
+                    Severity::Critical,
+                    Confidence::High,
+                    "Contract can self-destruct",
+                )
+            };
+            let guard_note = if caller_checked {
+                " (behind a msg.sender check)".to_string()
+            } else if let Some(g) = time_guard {
+                format!(
+                    " with no access control: the only guard is the time condition `{}`, so once it holds the first caller triggers it",
+                    emit::fmt_cond(g, &names)
+                )
+            } else {
+                " with no access control found".to_string()
+            };
+            let where_ = match ev.callee {
+                Some(pc) => format!(" (in the helper `func_{:#x}`)", pc),
+                None => String::new(),
+            };
+            push(&mut findings, "selfdestruct", title, sev, conf, Some(f), Some(ev.pc),
+                format!("`{}` can destroy the contract and send its balance to `{}`{}{}.", f.name, emit::fmt_expr(a, &names), guard_note, where_),
+                vec![format!("selfdestruct({});", emit::fmt_expr(a, &names))], "Remove selfdestruct or make sure the access control is correct (note: Cancun changed selfdestruct semantics).");
+        }
         for nd in &l.nodes {
-            match &nd.term {
-                Term::SelfDestruct(a) => {
-                    let (sev, conf) = if caller_checked {
-                        (Severity::Medium, Confidence::Medium)
-                    } else {
-                        (Severity::Critical, Confidence::High)
-                    };
-                    push(&mut findings, "selfdestruct", "Contract can self-destruct", sev, conf, Some(f), Some(nd.pc),
-                        format!("`{}` can destroy the contract and send its balance to `{}`{}.", f.name, emit::fmt_expr(*a, &names), if caller_checked { " (behind a msg.sender check)" } else { " with no access control found" }),
-                        vec![format!("selfdestruct({});", emit::fmt_expr(*a, &names))], "Remove selfdestruct or make sure the access control is correct (note: Cancun changed selfdestruct semantics).");
-                }
-                Term::Unresolved(t) => {
-                    push(&mut findings, "unresolved-jump", "Jump target could not be resolved", Severity::Info, Confidence::High, Some(f), Some(nd.pc), format!("A jump to `{}` could not be resolved statically; code behind it is not shown.", emit::fmt_expr(*t, &names)), vec![], "Review the disassembly around this program counter.");
-                }
-                _ => {}
+            if let Term::Unresolved(t) = &nd.term {
+                push(&mut findings, "unresolved-jump", "Jump target could not be resolved", Severity::Info, Confidence::High, Some(f), Some(nd.pc), format!("A jump to `{}` could not be resolved statically; code behind it is not shown.", emit::fmt_expr(*t, &names)), vec![], "Review the disassembly around this program counter.");
             }
         }
 
@@ -1871,6 +2144,10 @@ pub fn analyze(c: &Contract) -> Report {
         }
     }
 
+    // ---- cross-function passes: inferred access policy, attack chains ----
+    policy_findings(&facts, &mut findings);
+    chain_findings(&facts, &auth, &mut findings);
+
     // ---- contract-level findings ----
     if std::env::var("EVMDEC_DEBUG_LOCKS").is_ok() {
         for (slot, fs) in &lock_slots {
@@ -2054,6 +2331,290 @@ pub fn analyze(c: &Contract) -> Report {
     report.external_calls = external_calls.into_iter().collect();
     report.summary = summary;
     report
+}
+
+// Same shape as `push`, for findings anchored on a function's facts.
+#[allow(clippy::too_many_arguments)]
+fn push_fact(
+    findings: &mut Vec<Finding>,
+    id: &str,
+    title: &str,
+    sev: Severity,
+    conf: Confidence,
+    x: &FnFacts,
+    desc: String,
+    evidence: Vec<String>,
+    rec: &str,
+) {
+    findings.push(Finding {
+        id: id.into(),
+        title: title.into(),
+        severity: sev,
+        confidence: conf,
+        function: Some(x.name.clone()),
+        pc: Some(x.pc),
+        description: desc,
+        evidence,
+        recommendation: rec.into(),
+        sites: 1,
+    });
+}
+
+fn join_names(names: &[&str], max: usize) -> String {
+    let shown: Vec<String> = names.iter().take(max).map(|n| format!("`{}`", n)).collect();
+    if names.len() > max {
+        format!("{} and {} more", shown.join(", "), names.len() - max)
+    } else {
+        shown.join(", ")
+    }
+}
+
+/// Access control by intent: when several state-changing functions compare msg.sender against
+/// the same slot, that is the contract's policy. A state-changing function without the check
+/// that still does what the gated ones do (moves ether, self-destructs, delegatecalls, or writes
+/// a configuration slot otherwise written only behind the check) is reported as a deviation.
+fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
+    let gated: Vec<&FnFacts> = facts
+        .iter()
+        .filter(|x| x.external && x.state_changing && x.caller_checked)
+        .collect();
+    if gated.len() < 2 {
+        return;
+    }
+    let mut uses: HashMap<ExprId, (usize, String)> = HashMap::new();
+    for g in &gated {
+        for (slot, name) in &g.auth_slots {
+            let e = uses.entry(*slot).or_insert((0, name.clone()));
+            e.0 += 1;
+        }
+    }
+    let policy: Vec<(ExprId, String)> = uses
+        .into_iter()
+        .filter(|(_, (n, _))| *n >= 2)
+        .map(|(slot, (_, name))| (slot, name))
+        .collect();
+    if policy.is_empty() {
+        return;
+    }
+    let policy_names: Vec<&str> = policy.iter().map(|(_, n)| n.as_str()).collect();
+    let followers: Vec<&FnFacts> = gated
+        .iter()
+        .copied()
+        .filter(|g| {
+            g.auth_slots
+                .iter()
+                .any(|(s, _)| policy.iter().any(|(p, _)| p == s))
+        })
+        .collect();
+    if followers.len() < 2 {
+        return;
+    }
+    let follower_names: Vec<&str> = followers.iter().map(|g| g.name.as_str()).collect();
+    // Slots written only behind the policy check.
+    let mut gated_slots: HashSet<ExprId> = HashSet::new();
+    for g in &followers {
+        gated_slots.extend(g.const_writes.iter().map(|(s, _, _)| *s));
+    }
+    for x in facts
+        .iter()
+        .filter(|x| x.external && x.state_changing && !x.caller_checked)
+    {
+        for (s, _, _) in &x.const_writes {
+            // Written by two unprotected functions: an ordinary public slot, not a gated one.
+            if facts
+                .iter()
+                .filter(|y| !y.caller_checked && !std::ptr::eq(*y, x))
+                .any(|y| y.const_writes.iter().any(|(t, _, _)| t == s))
+            {
+                gated_slots.remove(s);
+            }
+        }
+        let mut does: Vec<String> = Vec::new();
+        let mut evidence: Vec<String> = Vec::new();
+        let mut sev = Severity::Low;
+        let mut conf = Confidence::Medium;
+        let raise = |sev: &mut Severity, to: Severity| {
+            if to < *sev {
+                *sev = to;
+            }
+        };
+        // Ether to an address the caller picks is a user-facing payout (a withdrawal, a swap):
+        // `unprotected-ether-withdrawal` judges those. Ether to a constant address is a call
+        // into a known contract (WETH.deposit). Ether to an address held in storage is a
+        // treasury/owner payout, the kind the gated functions make.
+        for (addr, _, line) in &x.ether_out {
+            if from_caller(*addr) || from_calldata(*addr) || !from_storage(*addr) {
+                continue;
+            }
+            does.push("sends ether to an address held in storage".into());
+            raise(&mut sev, Severity::Medium);
+            conf = Confidence::Low;
+            evidence.push(line.clone());
+        }
+        for (a, line) in &x.selfdestructs {
+            let to_user = from_caller(*a) || from_calldata(*a);
+            does.push(if to_user {
+                "self-destructs to an address the caller chooses".into()
+            } else {
+                "self-destructs".into()
+            });
+            raise(
+                &mut sev,
+                if to_user {
+                    Severity::High
+                } else {
+                    Severity::Medium
+                },
+            );
+            evidence.push(line.clone());
+        }
+        // A delegatecall to a constant address is a linked library; to a calldata address it is
+        // `arbitrary-delegatecall`. One to a stored address is an upgrade path.
+        for (t, line) in &x.delegatecalls {
+            if !from_storage(*t) || from_calldata(*t) || from_caller(*t) {
+                continue;
+            }
+            does.push("delegatecalls an address held in storage".into());
+            raise(&mut sev, Severity::Medium);
+            evidence.push(line.clone());
+        }
+        for (slot, _, line) in &x.const_writes {
+            if policy.iter().any(|(p, _)| p == slot) {
+                // The owner slot itself: `unprotected-owner-write` covers it.
+                continue;
+            }
+            if gated_slots.contains(slot) {
+                does.push(
+                    "writes a storage slot that is otherwise written only behind the check".into(),
+                );
+                raise(&mut sev, Severity::Medium);
+                evidence.push(line.clone());
+            }
+        }
+        if does.is_empty() {
+            continue;
+        }
+        does.sort();
+        does.dedup();
+        evidence.truncate(4);
+        let time_note = if x.time_gated {
+            " Its only guard is a block or time condition, which gates when, not who."
+        } else {
+            ""
+        };
+        push_fact(findings, "inconsistent-access-control", "Missing access control, judged by the contract's own policy", sev, conf, x,
+            format!("{} state-changing functions ({}) require msg.sender to match {}. `{}` has no such check yet {}.{} Either the omission is intentional and should be documented, or a modifier is missing.",
+                followers.len(), join_names(&follower_names, 4), join_names(&policy_names, 2), x.name, does.join(", "), time_note),
+            evidence, "Apply the same access control as the sibling functions, or make the public intent explicit.");
+    }
+}
+
+/// Multi-step attacks assembled from per-function facts: a write that anyone can make, followed
+/// by a function that trusts the written slot.
+fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<Finding>) {
+    let mut reported: HashSet<(String, String)> = HashSet::new();
+    for x in facts.iter().filter(|x| x.external && !x.caller_checked) {
+        // A write behind a not-yet-set check is open only until the contract is initialised:
+        // a real chain for an implementation left uninitialised, nothing otherwise.
+        let (chain_sev, init_note) = if x.init_guarded {
+            (Severity::Medium, " Step 1 sits behind a not-yet-initialised check, so the chain is open only while the contract (or a bare implementation) is uninitialised.")
+        } else {
+            (Severity::Critical, "")
+        };
+        for (slot, source, wline) in &x.const_writes {
+            if *source == WriteSource::Other {
+                continue;
+            }
+            // (1) Take over a role, then use what the role can do.
+            if auth.contains(slot) {
+                for g in facts
+                    .iter()
+                    .filter(|g| g.caller_checked && g.auth_slots.iter().any(|(s, _)| s == slot))
+                {
+                    let mut steps: Vec<String> = Vec::new();
+                    for (_, _, line) in &g.ether_out {
+                        steps.push(format!("send ether: `{}`", line));
+                    }
+                    for (_, line) in &g.selfdestructs {
+                        steps.push(format!("destroy the contract: `{}`", line));
+                    }
+                    for (_, line) in &g.delegatecalls {
+                        steps.push(format!("run foreign code: `{}`", line));
+                    }
+                    if steps.is_empty() || !reported.insert((x.name.clone(), g.name.clone())) {
+                        continue;
+                    }
+                    let slot_name = g
+                        .auth_slots
+                        .iter()
+                        .find(|(s, _)| s == slot)
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_default();
+                    push_fact(findings, "attack-chain", "Attack chain: take over the privileged role, then drain", chain_sev, Confidence::Medium, x,
+                        format!("Step 1: `{}` lets anyone write `{}`, the slot that `{}` compares msg.sender against. Step 2: as the new `{}`, call `{}` to {}.{}",
+                            x.name, slot_name, g.name, slot_name, g.name, steps.join("; "), init_note),
+                        vec![wline.clone(), steps[0].split('`').nth(1).unwrap_or_default().to_string()],
+                        "Protect the role write (step 1); the chain then collapses to an ordinary privileged function.");
+                }
+            }
+            // (2) Set a payout target or amount, then trigger the payout. Storing msg.sender
+            // (a depositor, the current king) is a pull-payment design, so only a value the
+            // caller passes in counts.
+            if *source != WriteSource::Calldata {
+                continue;
+            }
+            for g in facts
+                .iter()
+                .filter(|g| !g.caller_checked && !std::ptr::eq(*g, x))
+            {
+                let mut hits: Vec<(String, String)> = Vec::new();
+                for (addr, val, line) in &g.ether_out {
+                    if reads_slot(*addr, *slot) {
+                        hits.push((
+                            "sends ether to the address stored there".into(),
+                            line.clone(),
+                        ));
+                    } else if reads_slot(*val, *slot) {
+                        hits.push((
+                            "uses it as the amount of an ether transfer".into(),
+                            line.clone(),
+                        ));
+                    }
+                }
+                for (a, line) in &g.selfdestructs {
+                    if reads_slot(*a, *slot) {
+                        hits.push((
+                            "self-destructs to the address stored there".into(),
+                            line.clone(),
+                        ));
+                    }
+                }
+                for (t, line) in &g.delegatecalls {
+                    if reads_slot(*t, *slot) {
+                        hits.push((
+                            "delegatecalls the address stored there".into(),
+                            line.clone(),
+                        ));
+                    }
+                }
+                let Some((what, gline)) = hits.first().cloned() else {
+                    continue;
+                };
+                if !reported.insert((x.name.clone(), g.name.clone())) {
+                    continue;
+                }
+                let slot_name = wline
+                    .split(" = ")
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                push_fact(findings, "attack-chain", "Attack chain: set a trusted slot, then trigger the function that trusts it", chain_sev, Confidence::Medium, x,
+                    format!("Step 1: `{}` lets anyone write `{}` from its arguments. Step 2: `{}`, also callable by anyone, {}.{}", x.name, slot_name, g.name, what, init_note),
+                    vec![wline.clone(), gline], "Protect the write in step 1 or validate the slot's value where it is used.");
+            }
+        }
+    }
 }
 
 /// 0..100: the worst finding sets the level (weighted by its confidence), the rest add a little.

@@ -63,7 +63,10 @@ oracle, so the accuracy claim below is measured, not asserted.
   pre-0.8 compilers and inside `unchecked {}` blocks, authority slots and initializers writable
   without access control, ether withdrawable by anyone (caller-keyed accounting is recognised),
   state-changing functions callable by anyone, storage-bounded loops, calls in loops, `tx.origin`,
-  `selfdestruct`, the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked ether, unprotected upgrades,
+  `selfdestruct` (also when it sits in a helper behind a deadline, where the first caller after
+  the deadline collects the balance), payout amounts computed with wrapping arithmetic from an
+  unbounded parameter on pre-0.8 compilers, the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked
+  ether, unprotected upgrades,
   proxy detection (EIP-1967 / beacon / ZeppelinOS / EIP-1167 / storage-slot) with on-chain
   implementation resolution, known compiler bugs for the detected solc version. Rules look
   through internal helpers (a call in a shared `_safeTransfer` is attributed to every external
@@ -74,6 +77,15 @@ oracle, so the accuracy claim below is measured, not asserted.
   program counter, evidence lines and a recommendation; the risk score weighs the worst finding
   by its confidence. Markdown and JSON. Recall is measured on 22 known-exploited contracts
   (see *Accuracy*).
+  Two passes read across functions. *Access control by intent*: when several state-changing
+  functions compare `msg.sender` against the same slot, that is the contract's policy, and a
+  state-changing function without the check that still does what the gated ones do (sends ether
+  to a stored address, self-destructs, delegatecalls a stored address, writes a slot otherwise
+  written only behind the check) is reported as `inconsistent-access-control`. *Attack chains*:
+  a write anyone can make (`owner = msg.sender`, `payee = arg0`) is paired with the function
+  that trusts the written slot (an owner-only drain, a payout to `payee`) into one
+  `attack-chain` finding with the two steps spelled out; chains open only while a contract is
+  uninitialised are reported at medium severity.
 * **Verified.** A concrete EVM interpreter executes every basic block from random states and the
   result is compared with the lifted statements (stack, memory, storage, logs, calls, control
   decision). See *Accuracy*.

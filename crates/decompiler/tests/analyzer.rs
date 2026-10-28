@@ -220,3 +220,167 @@ fn erc20_transfer_result_ignored_is_reported() {
         r.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
     );
 }
+
+/// Three selectors -> three bodies, anything else reverts.
+fn dispatcher3(a: &str, b: &str, c: &str) -> Vec<u8> {
+    asm(&format!(
+        "PUSH1 0x80 PUSH1 0x40 MSTORE PUSH1 0x00 CALLDATALOAD PUSH1 0xe0 SHR DUP1 PUSH4 0xaaaaaaaa EQ PUSH2 @a JUMPI DUP1 PUSH4 0xbbbbbbbb EQ PUSH2 @b JUMPI PUSH4 0xcccccccc EQ PUSH2 @c JUMPI PUSH1 0x00 DUP1 REVERT :a JUMPDEST POP {a} :b JUMPDEST POP {b} :c JUMPDEST {c}"
+    ))
+}
+
+const OWNER_GATE: &str =
+    "PUSH1 0x00 SLOAD CALLER EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST";
+
+fn ids(r: &evmdec::analyze::Report) -> Vec<String> {
+    r.findings.iter().map(|f| f.id.clone()).collect()
+}
+
+#[test]
+fn selfdestruct_in_a_time_gated_helper_is_critical() {
+    // f(): helper(); helper: if (block.number >= slot5) selfdestruct(msg.sender); return
+    let body = "PUSH2 @ret PUSH2 @helper JUMP :ret JUMPDEST STOP :helper JUMPDEST PUSH1 0x05 SLOAD NUMBER LT PUSH2 @back JUMPI CALLER SELFDESTRUCT :back JUMPDEST JUMP";
+    let c = decompile::decompile(&dispatcher(body), &Options::default());
+    let r = analyze::analyze(&c);
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.id == "selfdestruct")
+        .unwrap_or_else(|| {
+            panic!(
+                "selfdestruct must be seen through the helper: {:?}\n{}",
+                ids(&r),
+                c.source
+            )
+        });
+    assert_eq!(f.severity, Severity::Critical);
+    assert!(
+        f.title.contains("collect its balance") && f.description.contains("time condition"),
+        "{} / {}",
+        f.title,
+        f.description
+    );
+}
+
+#[test]
+fn access_control_policy_flags_the_odd_one_out() {
+    // a, b: owner-only setters of slots 7 and 8; c: writes slot 7 with no check at all.
+    let a = format!("{OWNER_GATE} PUSH1 0x04 CALLDATALOAD PUSH1 0x07 SSTORE STOP");
+    let b = "PUSH1 0x00 SLOAD CALLER EQ PUSH2 @ok2 JUMPI PUSH1 0x00 DUP1 REVERT :ok2 JUMPDEST PUSH1 0x04 CALLDATALOAD PUSH1 0x08 SSTORE STOP";
+    let c = "PUSH1 0x04 CALLDATALOAD PUSH1 0x07 SSTORE STOP";
+    let r = analyze::analyze(&decompile::decompile(
+        &dispatcher3(&a, b, c),
+        &Options::default(),
+    ));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.id == "inconsistent-access-control")
+        .unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium);
+    assert!(
+        f.function
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cccccccc"),
+        "{:?}",
+        f.function
+    );
+    assert!(
+        f.description.contains("2 state-changing functions"),
+        "{}",
+        f.description
+    );
+}
+
+#[test]
+fn attack_chains_are_assembled_across_functions() {
+    // Rubixi: a() sets owner = msg.sender unguarded; b() is owner-only and pays the balance out.
+    let a = "CALLER PUSH1 0x00 SSTORE STOP";
+    let b = format!("{OWNER_GATE} PUSH1 0x00 DUP1 DUP1 DUP1 SELFBALANCE CALLER GAS CALL POP STOP");
+    let r = analyze::analyze(&decompile::decompile(
+        &dispatcher3(a, &b, "STOP"),
+        &Options::default(),
+    ));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.id == "attack-chain")
+        .unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Critical);
+    assert!(
+        f.description.contains("Step 1") && f.description.contains("Step 2"),
+        "{}",
+        f.description
+    );
+
+    // Set the payout address from calldata in a(), then b() sends the balance to it.
+    let a = "PUSH1 0x04 CALLDATALOAD PUSH1 0x05 SSTORE STOP";
+    let b = "PUSH1 0x00 DUP1 DUP1 DUP1 SELFBALANCE PUSH1 0x05 SLOAD GAS CALL POP STOP";
+    let r = analyze::analyze(&decompile::decompile(
+        &dispatcher3(a, b, "STOP"),
+        &Options::default(),
+    ));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.id == "attack-chain")
+        .unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(
+        f.description
+            .contains("sends ether to the address stored there"),
+        "{}",
+        f.description
+    );
+
+    // Storing msg.sender (a depositor) and paying it later is a pull payment, not a chain.
+    let a = "CALLER PUSH1 0x05 SSTORE STOP";
+    let r = analyze::analyze(&decompile::decompile(
+        &dispatcher3(a, b, "STOP"),
+        &Options::default(),
+    ));
+    assert!(
+        !r.findings.iter().any(|f| f.id == "attack-chain"),
+        "{:?}",
+        ids(&r)
+    );
+}
+
+#[test]
+fn wrapping_payout_arithmetic_needs_a_bound() {
+    // send((1000 - arg) * balance / 1000) to slot1, compiled before 0.8.
+    let payout = "PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x04 CALLDATALOAD PUSH2 0x03e8 SUB SELFBALANCE MUL PUSH2 0x03e8 SWAP1 DIV PUSH1 0x01 SLOAD GAS CALL POP STOP";
+    let mut code = dispatcher(payout);
+    code.extend(bzzr0_trailer());
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.id == "unbounded-payout-parameter")
+        .unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium);
+
+    // require(arg <= 1000) first: bounded.
+    let bounded = format!(
+        "PUSH1 0x04 CALLDATALOAD PUSH2 0x03e9 GT PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST {payout}"
+    );
+    let mut code = dispatcher(&bounded);
+    code.extend(bzzr0_trailer());
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.id == "unbounded-payout-parameter"),
+        "{:?}",
+        ids(&r)
+    );
+
+    // Same code with no metadata at all: the compiler era is unknown, so no claim is made.
+    let r = analyze::analyze(&decompile::decompile(
+        &dispatcher(payout),
+        &Options::default(),
+    ));
+    assert!(!r
+        .findings
+        .iter()
+        .any(|f| f.id == "unbounded-payout-parameter"));
+}

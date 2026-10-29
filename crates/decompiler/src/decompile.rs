@@ -1035,10 +1035,19 @@ fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
 /// read: an entry written as `| 1` / `& ~0xff` and read through an 8-bit mask is a `bool`, one
 /// written or read through a 160-bit mask an `address`, a narrower one `uintN`.
 fn element_types(functions: &[Function]) -> HashMap<U256, String> {
-    // root -> (write widths, constants written, a non-0/1 write seen, read widths). Writes
-    // decide when there are any: a read mask may be ABI packing (`uint32(x)` of an address
-    // straddling two payload words), a write mask never is.
-    let mut seen: HashMap<U256, (BTreeSet<u32>, Vec<U256>, bool, BTreeSet<u32>)> = HashMap::new();
+    /// What the accesses to one root's entries show. Writes decide when there are any: a read
+    /// mask may be ABI packing (`uint32(x)` of an address straddling two payload words), a
+    /// write mask never is.
+    #[derive(Default)]
+    struct Accesses {
+        write_widths: BTreeSet<u32>,
+        /// Constants written as bool-sized values (0 or 1).
+        flags: Vec<U256>,
+        /// Some write was neither 0 nor 1.
+        other_write: bool,
+        read_widths: BTreeSet<u32>,
+    }
+    let mut seen: HashMap<U256, Accesses> = HashMap::new();
     let width_of = |mask: U256| -> Option<u32> {
         let cleared = !mask;
         cleared.is_low_mask().then(|| cleared.bits())
@@ -1086,11 +1095,11 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
                     },
                 };
                 let e = seen.entry(root).or_default();
-                e.0.insert(bits);
+                e.write_widths.insert(bits);
                 match value.map(expr::as_const) {
-                    None => e.1.push(U256::ZERO),
-                    Some(Some(c)) if c.is_zero() || c == U256::ONE => e.1.push(c),
-                    Some(_) => e.2 = true,
+                    None => e.flags.push(U256::ZERO),
+                    Some(Some(c)) if c.is_zero() || c == U256::ONE => e.flags.push(c),
+                    Some(_) => e.other_write = true,
                 }
             }
             for e in lift::node_exprs(nd) {
@@ -1107,7 +1116,7 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
                             {
                                 if m.is_low_mask() {
                                     if let Some(root) = emit::element_root(k) {
-                                        seen.entry(root).or_default().3.insert(m.bits());
+                                        seen.entry(root).or_default().read_widths.insert(m.bits());
                                     }
                                 }
                             }
@@ -1119,13 +1128,17 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
         }
     }
     seen.into_iter()
-        .filter_map(|(root, (writes, consts, other, reads))| {
-            let widths = if writes.is_empty() { reads } else { writes };
+        .filter_map(|(root, a)| {
+            let widths = if a.write_widths.is_empty() {
+                a.read_widths
+            } else {
+                a.write_widths
+            };
             let w = *widths.iter().next()?;
             if widths.len() != 1 {
                 return None;
             }
-            let ty = if w == 8 && !other && consts.contains(&U256::ONE) {
+            let ty = if w == 8 && !a.other_write && a.flags.contains(&U256::ONE) {
                 "bool".to_string()
             } else if w == 160 {
                 "address".to_string()

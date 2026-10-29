@@ -5,6 +5,8 @@ corpus/*.json
 !corpus/addrs.txt
 *.swp
 /sample
+/sigs.idx
+/.sigs-cache
 __pycache__/
 .impeccable/review/
 .impeccable/mocks/

@@ -2,6 +2,8 @@
 //! computed with our own keccak at first use, so every entry is correct by construction.
 
 use crate::keccak;
+use crate::sigdb;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -44,20 +46,37 @@ pub fn get() -> &'static Sigs {
     })
 }
 
-/// Function signature for a selector; the first listed wins on a collision.
-pub fn function(selector: u32) -> Option<&'static str> {
-    get()
-        .functions
-        .get(&selector)
-        .and_then(|v| v.first().copied())
+/// Function signature for a selector: the built-in dictionary first (the first listed wins on
+/// a collision), then the local index ([`crate::sigdb`]) when one is installed.
+pub fn function(selector: u32) -> Option<Cow<'static, str>> {
+    if let Some(s) = get().functions.get(&selector).and_then(|v| v.first()) {
+        return Some(Cow::Borrowed(s));
+    }
+    sigdb::global()
+        .and_then(|db| db.selector(selector).into_iter().next())
+        .map(Cow::Owned)
 }
-/// Event signature for a topic0 hash.
-pub fn event(topic: &[u8; 32]) -> Option<&'static str> {
-    get().events.get(topic).copied()
+
+/// Event signature for a topic0 hash, from the built-in dictionary or the local index.
+pub fn event(topic: &[u8; 32]) -> Option<Cow<'static, str>> {
+    if let Some(s) = get().events.get(topic) {
+        return Some(Cow::Borrowed(s));
+    }
+    sigdb::global()
+        .and_then(|db| db.topic(topic))
+        .map(Cow::Owned)
 }
-/// Custom error signature for a selector.
-pub fn error(selector: u32) -> Option<&'static str> {
-    get().errors.get(&selector).copied()
+
+/// Custom error signature for a selector, from the built-in dictionary or the local index.
+/// The index does not record kinds, so for a selector outside the dictionary this is the same
+/// lookup as [`function`]: a function signature can come back where revert data is decoded.
+pub fn error(selector: u32) -> Option<Cow<'static, str>> {
+    if let Some(s) = get().errors.get(&selector) {
+        return Some(Cow::Borrowed(s));
+    }
+    sigdb::global()
+        .and_then(|db| db.selector(selector).into_iter().next())
+        .map(Cow::Owned)
 }
 
 /// Look up unknown selectors in the openchain.xyz signature database (falls back to 4byte.directory).

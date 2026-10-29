@@ -131,11 +131,12 @@ oracle, so the accuracy claim below is measured, not asserted.
 
 | path | what |
 |---|---|
-| `crates/decompiler` (`evmdec`) | the library: `u256`, `keccak`, `disasm`, `metadata`, `cfg` (summary analysis, units), `expr` (hash-consed IR + simplifier), `lift`, `structure`, `emit`, `function`, `sigs`, `decompile`, `analyze`, `interp`, `verify`, `rpc` |
+| `crates/decompiler` (`evmdec`) | the library: `u256`, `keccak`, `disasm`, `metadata`, `cfg` (summary analysis, units), `expr` (hash-consed IR + simplifier), `lift`, `structure`, `emit`, `function`, `sigs`, `sigdb` (local signature index), `decompile`, `analyze`, `interp`, `verify`, `rpc` |
 | `crates/cli` (`evmdec`) | command line |
 | `crates/server` (`evmdec-server`) | web service + UI (`crates/server/static/index.html`) |
 | `testdata/mainnet` | 22 mainnet contracts (runtime bytecode + Sourcify ABI) used by the benchmark and the tests |
 | `corpus/bench.py`, `corpus/verify_all.sh` | the measurements below |
+| `corpus/build_sigs.py` | one-time build of the full local signature index (`sigs.idx`, see Quick start) |
 | `docs/verification.md` | methodology and definitions |
 | `rustfmt.toml`, `.claude/agents/rust-style-reviewer.md` | code style: Google's Rust style guide (see below) |
 
@@ -171,7 +172,8 @@ solc --bin MyContract.sol | tail -1 > my.hex
 ./target/release/evmdec decompile my.hex --json          # everything: functions, storage, events, report
 
 # other views
-./target/release/evmdec decompile my.hex --lookup        # name unknown selectors via openchain / 4byte
+./target/release/evmdec decompile my.hex --lookup        # name unknown selectors online (openchain / 4byte)
+./target/release/evmdec sigs 0xa9059cbb 0xddf252ad...    # what the dictionaries know about a selector / topic
 ./target/release/evmdec decompile my.hex --flat          # labels and gotos instead of structured code
 ./target/release/evmdec disasm my.hex
 ./target/release/evmdec verify my.hex --runs 8           # block oracle on this contract
@@ -181,6 +183,27 @@ PORT=8080 ./target/release/evmdec-server
 ```
 
 Or with Docker: `docker build -t evmdec . && docker run -p 8080:8080 evmdec`.
+
+### Full signature database (one-time build)
+
+The binary ships a dictionary of about 1,300 common signatures. For everything else, install the
+whole public signature database (Sourcify's 4byte export: 10.7 million function, event and error
+signatures) as one local file, built **once** when you build or deploy the product:
+
+```sh
+pip install pyarrow numpy
+python3 corpus/build_sigs.py --out sigs.idx          # downloads ~540 MB of Parquet, writes ~470 MB
+sudo install -D sigs.idx /var/lib/evmdec/sigs.idx    # or keep it next to the binary / in ./
+```
+
+`evmdec` and `evmdec-server` find the index at `$EVMDEC_SIGS`, `./sigs.idx`, `<binary dir>/sigs.idx`,
+`/var/lib/evmdec/sigs.idx` or `~/.evmdec/sigs.idx` (first that exists; `EVMDEC_SIGS=` disables it).
+The file is a sorted table searched in place with positional reads, so nothing is loaded at start-up,
+a lookup costs a few microseconds once the page cache is warm, and decompile time is unchanged; the
+Docker image builds the index in its own stage (`--build-arg SIGS=0` skips it). `evmdec sigs` shows
+which index is in use and what it knows about a selector or topic. The `--lookup` flag (online
+services) is still there for selectors the export does not have yet; rebuild the index to pick up new
+signatures (`.sigs-cache/` keeps the shards already downloaded).
 
 API: `POST /api/decompile` with `{"address": "0x…", "chain": "mainnet"}` or `{"bytecode": "0x…"}`,
 `GET /api/address/{chain}/{address}`, `GET /api/chains`. Responses contain `contract` (functions,

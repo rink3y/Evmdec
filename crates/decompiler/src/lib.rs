@@ -24,6 +24,7 @@ pub mod interp;
 pub mod lift;
 #[cfg(feature = "rpc")]
 pub mod rpc;
+pub mod sigdb;
 pub mod sigs;
 pub mod structure;
 pub mod verify;

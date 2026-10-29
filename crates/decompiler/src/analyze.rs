@@ -1439,9 +1439,9 @@ pub fn analyze(c: &Contract) -> Report {
                                         && !decoded
                                         && !matches!(expr::node(*addr), Node::Const(_))
                                     {
-                                        let name = sigs::function(sel)
-                                            .map(sigs::name_of)
-                                            .unwrap_or("transfer");
+                                        let sig = sigs::function(sel);
+                                        let name =
+                                            sig.as_deref().map(sigs::name_of).unwrap_or("transfer");
                                         push(&mut findings, "erc20-return-ignored", "ERC20 call result not checked", Severity::Low, Confidence::Medium, Some(f), Some(ev.pc),
                                             format!("`{}` calls `{}` on `{}` and never reads the returned boolean. Tokens that return `false` instead of reverting (and tokens that return nothing) are treated as if the transfer succeeded.", f.name, name, target),
                                             vec![line.clone()], "Use a SafeERC20-style wrapper: require the call to succeed and, when return data is present, require it to decode to true.");

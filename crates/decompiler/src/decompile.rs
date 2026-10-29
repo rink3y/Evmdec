@@ -561,7 +561,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                 opts.extra_sigs
                     .get(&sel)
                     .cloned()
-                    .or_else(|| sigs::function(sel).map(|s| s.to_string()))
+                    .or_else(|| sigs::function(sel).map(|s| s.into_owned()))
             })
         };
         let name = match (&signature, name_hint, selector) {
@@ -1132,7 +1132,7 @@ fn inventories(
                     Stmt::Log { topics, data, .. } => {
                         if let Some(t0) = topics.first().and_then(|t| expr::as_const(*t)) {
                             match sigs::event(&t0.to_be_bytes()) {
-                                Some(sig) => events.insert(with_indexed(sig, topics.len() - 1)),
+                                Some(sig) => events.insert(with_indexed(&sig, topics.len() - 1)),
                                 None => {
                                     // Unknown signature: named by the hash's first four bytes, with
                                     // one indexed parameter per extra topic and one per data word.

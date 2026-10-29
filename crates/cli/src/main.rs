@@ -73,6 +73,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Look up selectors (8 hex digits) or event topics (64 hex digits) in the signature
+    /// dictionary and the local index; with no argument, report which index is in use.
+    Sigs {
+        /// 4-byte selectors or 32-byte topic hashes, with or without 0x.
+        hashes: Vec<String>,
+    },
 }
 
 fn load(file: &PathBuf) -> Result<Vec<u8>> {
@@ -419,6 +425,53 @@ fn main() -> Result<()> {
                 for m in st.mismatches.iter().take(20) {
                     println!("  {}", m);
                 }
+            }
+        }
+        Cmd::Sigs { hashes } => {
+            if hashes.is_empty() {
+                match evmdec::sigdb::global() {
+                    Some(db) => println!("local index: {} signatures", db.len()),
+                    None => println!(
+                        "local index: none (set EVMDEC_SIGS or install sigs.idx; see corpus/build_sigs.py)"
+                    ),
+                }
+            }
+            for h in &hashes {
+                let hex = h.trim().trim_start_matches("0x");
+                let line = match hex.len() {
+                    8 => {
+                        let sel = u32::from_str_radix(hex, 16)
+                            .with_context(|| format!("bad selector {h}"))?;
+                        let mut names: Vec<String> = Vec::new();
+                        if let Some(s) = evmdec::sigs::function(sel) {
+                            names.push(s.into_owned());
+                        }
+                        if let Some(s) = evmdec::sigs::error(sel) {
+                            if !names.iter().any(|n| n == &*s) {
+                                names.push(s.into_owned());
+                            }
+                        }
+                        if let Some(db) = evmdec::sigdb::global() {
+                            for s in db.selector(sel) {
+                                if !names.contains(&s) {
+                                    names.push(s);
+                                }
+                            }
+                        }
+                        names.join(" | ")
+                    }
+                    64 => {
+                        let bytes = evmdec::hex::decode(hex).map_err(|e| anyhow::anyhow!(e))?;
+                        let topic: [u8; 32] = bytes[..]
+                            .try_into()
+                            .expect("64 hex digits decode to 32 bytes");
+                        evmdec::sigs::event(&topic)
+                            .map(|s| s.into_owned())
+                            .unwrap_or_default()
+                    }
+                    _ => anyhow::bail!("'{h}' is neither a 4-byte selector nor a 32-byte topic"),
+                };
+                println!("0x{hex} {}", if line.is_empty() { "?" } else { &line });
             }
         }
         Cmd::Analyze { file, json } => {

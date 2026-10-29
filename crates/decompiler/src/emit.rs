@@ -359,7 +359,7 @@ pub fn fmt_log_parts(topics: &[ExprId], data_args: Vec<String>, n: &Names) -> St
     let mut name = None;
     if let Some(t0) = topics.first().and_then(|t| expr::as_const(*t)) {
         if let Some(sig) = sigs::event(&t0.to_be_bytes()) {
-            name = Some(sigs::name_of(sig).to_string());
+            name = Some(sigs::name_of(&sig).to_string());
         }
     }
     let start = if name.is_some() { 1 } else { 0 };
@@ -1274,7 +1274,7 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, kind: Payload
                 let args: Vec<String> = (0..nargs)
                     .map(|i| fmt_expr(shifted_word_len(words, i, lenu), n))
                     .collect();
-                return format!("{}({})", sigs::name_of(sig), args.join(", "));
+                return format!("{}({})", sigs::name_of(&sig), args.join(", "));
             }
             let args: Vec<String> = (0..nargs)
                 .map(|i| fmt_expr(shifted_word_len(words, i, lenu), n))
@@ -1451,7 +1451,7 @@ pub fn fmt_call_input(
                 .map(|i| fmt_expr(shifted_word_len(words, i, in_len), n))
                 .collect();
             let name = match sigs::function(sel) {
-                Some(sig) => sigs::name_of(sig).to_string(),
+                Some(sig) => sigs::name_of(&sig).to_string(),
                 None => format!("func_{:08x}", sel),
             };
             return (Some(name), args);

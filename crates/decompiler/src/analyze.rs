@@ -216,11 +216,9 @@ struct Ctx<'a> {
     /// An ordinary external function copies calldata to memory (calldata arrays or tuples
     /// passed on, re-encoded).
     calldata_copies: bool,
-    /// Constant slots written by external functions without an access check (helpers
-    /// included), with the names of those functions: what anyone can change.
-    unguarded_writers: HashMap<U256, Vec<String>>,
-    /// Of those, the slots some unguarded function increments (`length + 1`): arrays anyone
-    /// can add an entry to.
+    /// Constant slots some external function without an access check increments
+    /// (`length + 1`, helpers included), with the names of those functions: arrays anyone can
+    /// add an entry to.
     unguarded_extenders: HashMap<U256, Vec<String>>,
 }
 
@@ -612,8 +610,8 @@ fn self_deployed(events: &[Event], addr: ExprId) -> bool {
     let created_at = events
         .iter()
         .position(|ev| matches!(&ev.stmt, Some(Stmt::Create { seq, .. }) if *seq == sq));
-    match created_at {
-        Some(i) => events[..i].iter().any(|ev| {
+    created_at.is_some_and(|i| {
+        events[..i].iter().any(|ev| {
             matches!(
                 &ev.stmt,
                 Some(Stmt::Copy {
@@ -621,9 +619,8 @@ fn self_deployed(events: &[Event], addr: ExprId) -> bool {
                     ..
                 })
             )
-        }),
-        None => false,
-    }
+        })
+    })
 }
 
 /// The dynamic storage array an expression indexes into (`stor_4[i]` reads
@@ -637,24 +634,8 @@ fn array_root_of(e: ExprId) -> Option<U256> {
             continue;
         }
         if let Node::SLoad(key, false, _) = expr::node(x) {
-            match expr::node(key) {
-                Node::Const(c) => found = emit::hashed_slot(c).map(|(s, _)| s),
-                Node::Op(op::ADD, v) => {
-                    for a in v {
-                        match expr::node(a) {
-                            Node::Keccak(w, _) if w.len() == 1 => {
-                                found = expr::as_const(w[0]).filter(|c| c.bits() <= 32)
-                            }
-                            Node::Const(c) => {
-                                if let Some((s, _)) = emit::hashed_slot(c) {
-                                    found = Some(s);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
+            if !expr::is_const(key) || emit::hashed_slot(expr::as_const(key)?).is_some() {
+                found = emit::element_root(key);
             }
         }
         stack.extend(expr::children(x));
@@ -1456,20 +1437,14 @@ pub fn analyze(c: &Contract) -> Report {
         field_writes: HashSet::new(),
         transient_storage: false,
         calldata_copies: false,
-        unguarded_writers: HashMap::new(),
         unguarded_extenders: HashMap::new(),
     };
     ctx.roles = role_mappings(&ctx);
-    for f in c
-        .functions
-        .iter()
-        .filter(|f| f.kind == FnKind::External && f.lifted.is_some())
-    {
+    for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
         if any_caller_check(&ctx, f) {
             continue;
         }
         let Some(l) = &f.lifted else { continue };
-        let mut written: HashSet<U256> = HashSet::new();
         let mut grown: HashSet<U256> = HashSet::new();
         for ev in events_of(&ctx, l, 5, false) {
             if let Some(Stmt::SStore {
@@ -1480,7 +1455,6 @@ pub fn analyze(c: &Contract) -> Report {
             }) = &ev.stmt
             {
                 if let Some(k) = expr::as_const(*key) {
-                    written.insert(k);
                     // `slot = slot + c`: the slot grows (an array gets an entry).
                     if let Node::Op(op::ADD, v) = expr::node(*val) {
                         if v.iter().any(|x| reads_slot(*x, *key))
@@ -1491,9 +1465,6 @@ pub fn analyze(c: &Contract) -> Report {
                     }
                 }
             }
-        }
-        for k in written {
-            ctx.unguarded_writers.entry(k).or_default().push(fname(f));
         }
         for k in grown {
             ctx.unguarded_extenders.entry(k).or_default().push(fname(f));

@@ -180,12 +180,12 @@ pub struct Names {
     /// Which of the current function's return positions (declaration order) are `bool`.
     pub bool_returns: Vec<bool>,
     /// Root slots of dynamic storage arrays: the bare slot is the array's length.
-    pub dyn_arrays: std::collections::HashSet<U256>,
+    pub dyn_arrays: HashSet<U256>,
     /// Element value type of mappings and arrays, by root slot: `bool`, `address`, `uintN`.
     pub elem_types: HashMap<U256, String>,
     /// Entry pcs of the compiler's array-resize helpers (`slot.length = n`, clearing the
     /// dropped elements).
-    pub array_resizers: std::collections::HashSet<usize>,
+    pub array_resizers: HashSet<usize>,
     /// Rendered text and precedence of the expressions printed so far.
     pub memo: RefCell<HashMap<ExprId, (String, u8)>>,
 }
@@ -765,27 +765,20 @@ pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)
 /// are known to be zero and the mask is noise.
 pub fn element_write(key: ExprId, val: ExprId, n: &Names) -> Option<(U256, ExprId)> {
     let root = element_root(key)?;
-    let ty = n.elem_types.get(&root)?;
-    let width_bits: u32 = match ty.as_str() {
-        "bool" => 8,
-        "address" => 160,
-        t => t.strip_prefix("uint")?.parse().ok()?,
-    };
-    let keeps = |e: ExprId| -> bool {
-        match expr::node(e) {
-            Node::Op(op::AND, w) => {
-                let (load, mask) = match (expr::node(w[0]), expr::as_const(w[1])) {
-                    (Node::SLoad(k, false, _), Some(m)) if k == key => (true, m),
-                    _ => match (expr::node(w[1]), expr::as_const(w[0])) {
-                        (Node::SLoad(k, false, _), Some(m)) if k == key => (true, m),
-                        _ => (false, U256::ZERO),
-                    },
-                };
-                load && !mask == expr::mask_bits(width_bits)
+    let width_bits = element_width(n.elem_types.get(&root)?)?;
+    // The mask kept on the slot's own load, if `e` is `slot & mask`.
+    let kept_mask = |e: ExprId| -> Option<U256> {
+        let Node::Op(op::AND, w) = expr::node(e) else {
+            return None;
+        };
+        [(w[0], w[1]), (w[1], w[0])].into_iter().find_map(|(a, b)| {
+            match (expr::node(a), expr::as_const(b)) {
+                (Node::SLoad(k, false, _), Some(m)) if k == key => Some(m),
+                _ => None,
             }
-            _ => false,
-        }
+        })
     };
+    let keeps = |e: ExprId| kept_mask(e).is_some_and(|m| !m == expr::mask_bits(width_bits));
     match expr::node(val) {
         Node::Op(op::OR, v) if keeps(v[1]) => Some((root, v[0])),
         Node::Op(op::OR, v) if keeps(v[0]) => Some((root, v[1])),
@@ -807,17 +800,21 @@ fn element_typed_load(e: ExprId, n: &Names) -> Option<ExprId> {
             continue;
         }
         let root = element_root(key)?;
-        let ty = n.elem_types.get(&root)?;
-        let width: u32 = match ty.as_str() {
-            "bool" => 8,
-            "address" => 160,
-            t => t.strip_prefix("uint")?.parse().ok()?,
-        };
+        let width = element_width(n.elem_types.get(&root)?)?;
         if m.bits() == width {
             return Some(a);
         }
     }
     None
+}
+
+/// Width in bits of a concrete element type (`bool`, `address`, `uintN`).
+pub fn element_width(ty: &str) -> Option<u32> {
+    match ty {
+        "bool" => Some(8),
+        "address" => Some(160),
+        t => t.strip_prefix("uint")?.parse().ok(),
+    }
 }
 
 /// Root slot of a mapping entry or dynamic array element key.
@@ -977,6 +974,10 @@ fn copy_source(kind: u8) -> &'static str {
 }
 
 fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
+    // `uint8(stor_3[x])`, `address(stor_4[i])`: a typed element needs no cast.
+    if let Some(load) = element_typed_load(e, n) {
+        return (fmt_expr(load, n), P_PRIMARY);
+    }
     if !n.fields.is_empty() {
         if let Some((k, off, bits)) = packed_read(e) {
             if let Some(name) = n.fields.get(&(k, off, bits)) {
@@ -1016,14 +1017,6 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             fmt_slot(key, n, SlotSpace::from_transient(transient)),
             P_PRIMARY,
         ),
-        // `uint8(stor_3[x])`, `address(stor_4[i])`: a typed element needs no cast.
-        Node::Op(op::AND, v)
-            if element_typed_load(expr::intern(Node::Op(op::AND, v.clone())), n).is_some() =>
-        {
-            let load = element_typed_load(expr::intern(Node::Op(op::AND, v.clone())), n)
-                .expect("checked by the guard");
-            (fmt_expr(load, n), P_PRIMARY)
-        }
         Node::Keccak(words, tail) => {
             let mut parts: Vec<String> = Vec::new();
             for (i, w) in words.iter().enumerate() {

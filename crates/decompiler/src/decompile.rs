@@ -1185,6 +1185,7 @@ fn is_array_resizer(l: &Lifted) -> bool {
                 {
                     clears = true;
                 }
+                // Larger shrinks zero the dropped elements in a loop the compiler outlines.
                 Stmt::Internal { .. } => clears = true,
                 Stmt::Call { .. } | Stmt::Log { .. } | Stmt::Create { .. } => return false,
                 _ => {}
@@ -1545,7 +1546,7 @@ fn inventories(
                 }
             }
             // Init code of a deployed contract is bytes, not this contract's string constants.
-            let init_words: HashSet<expr::ExprId> = nd
+            let init_words: HashSet<ExprId> = nd
                 .stmts
                 .iter()
                 .filter_map(|s| match s {

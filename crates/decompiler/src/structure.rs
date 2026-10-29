@@ -6,6 +6,7 @@ use crate::expr::{self, ExprId, Node};
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::u256::U256;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 struct Graph {
@@ -316,7 +317,8 @@ struct Printer<'a> {
     /// Memory stores nothing reads before the function ends (not printed).
     dead_stores: HashSet<(usize, usize)>,
     /// Statements folded into an earlier line (the element store of a `push`): not printed.
-    skipped: std::cell::RefCell<HashSet<(usize, usize)>>,
+    /// Filled while the printer's `&self` rendering methods run, hence the cell.
+    skipped: RefCell<HashSet<(usize, usize)>>,
 }
 
 /// A log whose data is the ABI encoding of a calldata range, with the stores that built it.
@@ -750,10 +752,6 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
                 return None;
             }
         }
-    }
-    if sub.is_empty() {
-        fail("no variables differ");
-        return None;
     }
     if sub.is_empty() {
         fail("no variables differ");
@@ -1778,7 +1776,6 @@ impl<'a> Printer<'a> {
         index: usize,
         slot: ExprId,
         new_len: ExprId,
-        skip_next: &mut bool,
     ) -> Option<String> {
         let c = expr::as_const(slot)?;
         let name = self
@@ -1824,11 +1821,7 @@ impl<'a> Printer<'a> {
                         let value = emit::element_write(*key, *val, self.names)
                             .map(|(_, v)| v)
                             .unwrap_or(*val);
-                        if nn == node {
-                            *skip_next = true;
-                        } else {
-                            self.skipped.borrow_mut().insert((nn, ni));
-                        }
+                        self.skipped.borrow_mut().insert((nn, ni));
                         return Some(format!(
                             "{}.push({});",
                             name,
@@ -1874,12 +1867,8 @@ impl<'a> Printer<'a> {
         for f in &folded {
             dead.extend(f.hidden.iter().copied());
         }
-        let mut skip_next = false;
         for (i, s) in self.l.nodes[n].stmts.iter().enumerate() {
             if dead.contains(&i) || self.skipped.borrow().contains(&(n, i)) {
-                continue;
-            }
-            if std::mem::take(&mut skip_next) {
                 continue;
             }
             if let (Some(f), Stmt::Log { topics, .. }) = (folded.iter().find(|f| f.index == i), s) {
@@ -1916,7 +1905,7 @@ impl<'a> Printer<'a> {
             // store that follows), `a.pop()`.
             if let Stmt::Internal { callee, args, .. } = s {
                 if self.names.array_resizers.contains(callee) && args.len() == 2 {
-                    if let Some(txt) = self.array_resize(n, i, args[0], args[1], &mut skip_next) {
+                    if let Some(txt) = self.array_resize(n, i, args[0], args[1]) {
                         self.line(depth, &txt);
                         continue;
                     }

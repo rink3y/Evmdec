@@ -716,6 +716,102 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
     best
 }
 
+/// Return types of an internal unit with `n_rets` results: a position that only ever returns
+/// the constants 0 and 1, with 1 seen, or only comparisons, is a `bool`; everything else is
+/// `uint256`.
+pub fn infer_internal_returns(l: &Lifted, n_rets: usize) -> Vec<String> {
+    let mut tys = vec!["uint256".to_string(); n_rets];
+    let rets: Vec<&Vec<ExprId>> = l
+        .nodes
+        .iter()
+        .filter_map(|nd| match &nd.term {
+            Term::InternalReturn(v) if v.len() == n_rets => Some(v),
+            _ => None,
+        })
+        .collect();
+    if rets.is_empty() {
+        return tys;
+    }
+    for (i, ty) in tys.iter_mut().enumerate() {
+        // Values are deepest first: the j-th result is the j-th from the top.
+        let j = n_rets - 1 - i;
+        let consts: Vec<Option<U256>> = rets.iter().map(|w| expr::as_const(w[j])).collect();
+        let all_flags = consts
+            .iter()
+            .all(|c| matches!(c, Some(c) if *c == U256::ZERO || *c == U256::ONE));
+        let comparisons = rets.iter().all(|w| expr::is_boolean(w[j]));
+        if (all_flags && consts.contains(&Some(U256::ONE))) || (comparisons && !all_flags) {
+            *ty = "bool".into();
+        }
+    }
+    tys
+}
+
+/// Parameter types of an internal unit with `n_params` parameters (`arg0` is the deepest):
+/// `address` for a parameter used as a call target, a `selfdestruct` beneficiary, compared with
+/// `msg.sender` or masked to 160 bits; `uint256` otherwise.
+pub fn internal_param_types(l: &Lifted, n_params: usize) -> Vec<String> {
+    let mut tys = vec!["uint256".to_string(); n_params];
+    let k = l.ret_slot.map(|k| k as usize).unwrap_or(l.n_args);
+    let param_of = |e: ExprId| -> Option<usize> {
+        let e = match expr::node(e) {
+            Node::Op(op::AND, v) if expr::as_const(v[1]) == Some(expr::mask_bits(160)) => v[0],
+            Node::Op(op::AND, v) if expr::as_const(v[0]) == Some(expr::mask_bits(160)) => v[1],
+            _ => e,
+        };
+        match expr::node(e) {
+            Node::Arg(i) if (i as usize) < k => Some(k - 1 - i as usize),
+            _ => None,
+        }
+    };
+    let mut address = |e: ExprId| {
+        if let Some(j) = param_of(e) {
+            if j < n_params {
+                tys[j] = "address".to_string();
+            }
+        }
+    };
+    for nd in &l.nodes {
+        for s in &nd.stmts {
+            if let Stmt::Call { addr, .. } = s {
+                address(*addr);
+            }
+        }
+        if let Term::SelfDestruct(a) = &nd.term {
+            address(*a);
+        }
+        for e in lift::node_exprs(nd) {
+            let mut seen = HashSet::new();
+            let mut stack = vec![e];
+            while let Some(x) = stack.pop() {
+                if !seen.insert(x) || seen.len() > 20_000 {
+                    continue;
+                }
+                match expr::node(x) {
+                    Node::Op(op::AND, v)
+                        if v.iter()
+                            .any(|m| expr::as_const(*m) == Some(expr::mask_bits(160))) =>
+                    {
+                        address(x);
+                    }
+                    Node::Op(op::EQ, v) => {
+                        let caller = |y: ExprId| matches!(expr::node(y), Node::Env(op::CALLER, _));
+                        if caller(v[0]) {
+                            address(v[1]);
+                        }
+                        if caller(v[1]) {
+                            address(v[0]);
+                        }
+                    }
+                    _ => {}
+                }
+                stack.extend(expr::children(x));
+            }
+        }
+    }
+    tys
+}
+
 /// Best-effort Solidity type of a value from the shape of its expression (`uint256` by default).
 pub fn type_of_value(e: ExprId) -> String {
     match expr::node(e) {

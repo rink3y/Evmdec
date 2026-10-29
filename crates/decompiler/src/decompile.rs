@@ -2,7 +2,7 @@
 
 use crate::cfg::{self, Program, Recovered};
 use crate::emit::{self, MappingLayout, Names};
-use crate::expr::{self, Node};
+use crate::expr::{self, ExprId, Node};
 use crate::function::{self, FnKind, Mutability, Param};
 use crate::lift::{self, Lifted, Lifter, Stmt, Term};
 use crate::metadata::{self, BytecodeInfo, CodeKind};
@@ -552,7 +552,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let mut returns = if matches!(kind, FnKind::External) {
             function::infer_returns(&l)
         } else {
-            vec![]
+            function::infer_internal_returns(&l, n_rets)
         };
         let signature = if opts.no_sigs {
             None
@@ -795,12 +795,13 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         })
         .is_some_and(|v| v >= (0, 8, 0));
     let Inventories {
-        storage,
+        mut storage,
         events,
         errors,
         mut strings,
         selectors: selectors_called,
     } = inventories(&functions, layout, &string_slots);
+    name_storage_from_getters(&functions, &mut storage);
     for st in scan_strings(code, code_end) {
         if !strings.iter().any(|x| x.contains(&st)) {
             strings.push(st);
@@ -821,9 +822,23 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
 
     tick("discover+inventories", &mut tt);
     // Render code for each function.
+    let pure_callees: HashSet<usize> = functions
+        .iter()
+        .filter(|f| {
+            f.kind == FnKind::Internal
+                && matches!(f.mutability, Mutability::View | Mutability::Pure)
+        })
+        .map(|f| f.pc)
+        .collect();
+    let callee_returns: HashMap<usize, Vec<String>> = functions
+        .iter()
+        .filter(|f| f.kind == FnKind::Internal)
+        .map(|f| (f.pc, f.returns.clone()))
+        .collect();
     for f in functions.iter_mut() {
-        let mut names = make_names(f, &storage, layout, &loaders);
+        let mut names = make_names(f, &storage, layout, &loaders, &callee_returns);
         names.hide_checked = solc08;
+        names.pure_callees = pure_callees.clone();
         let l = f
             .lifted
             .as_ref()
@@ -1008,13 +1023,128 @@ fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
     out
 }
 
+/// A public getter whose signature is known names the variable it returns: a function that only
+/// reads one slot (or one packed field, or one mapping entry keyed by its parameter) and returns
+/// it gives that slot its name.
+fn name_storage_from_getters(functions: &[Function], storage: &mut [StorageVar]) {
+    let mut taken: HashSet<String> = storage.iter().map(|s| s.name.clone()).collect();
+    for f in functions {
+        let (FnKind::External, Some(sig), Some(l)) = (f.kind, &f.signature, &f.lifted) else {
+            continue;
+        };
+        // `getSwapFee()` names the variable `swapFee`.
+        let raw = sigs::name_of(sig);
+        let name = match raw.strip_prefix("get") {
+            Some(rest) if rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
+                let mut cs = rest.chars();
+                let first = cs
+                    .next()
+                    .map(|c| c.to_ascii_lowercase())
+                    .unwrap_or_default();
+                format!("{first}{}", cs.as_str())
+            }
+            _ => raw.to_string(),
+        };
+        if name.is_empty()
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || taken.contains(&name)
+        {
+            continue;
+        }
+        let effectful = l.nodes.iter().any(|nd| {
+            nd.stmts.iter().any(|s| {
+                matches!(
+                    s,
+                    Stmt::SStore { .. }
+                        | Stmt::Log { .. }
+                        | Stmt::Create { .. }
+                        | Stmt::Internal { .. }
+                ) || matches!(s, Stmt::Call { kind, .. } if *kind != op::STATICCALL)
+            }) || matches!(nd.term, Term::SelfDestruct(_))
+        });
+        if effectful {
+            continue;
+        }
+        let mut returned: Vec<ExprId> = Vec::new();
+        for nd in &l.nodes {
+            if let Term::Return { data: Some(w), .. } = &nd.term {
+                if w.len() != 1 {
+                    returned.clear();
+                    break;
+                }
+                if !returned.contains(&w[0]) {
+                    returned.push(w[0]);
+                }
+            }
+        }
+        let [word] = returned.as_slice() else {
+            continue;
+        };
+        // Strip a type mask.
+        let word = match expr::node(*word) {
+            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
+            Node::Op(op::AND, v) if expr::as_const(v[0]).is_some_and(|m| m.is_low_mask()) => v[1],
+            _ => *word,
+        };
+        let field = emit::packed_read(word);
+        let root: Option<U256> = match (field, expr::node(word)) {
+            (Some((k, _, _)), _) => Some(k),
+            (None, Node::SLoad(key, false, _)) => match expr::node(key) {
+                Node::Const(k) => Some(k),
+                // A mapping entry: the small constant among the hashed words is the slot.
+                Node::Keccak(words, _) => words
+                    .iter()
+                    .filter_map(|w| expr::as_const(*w))
+                    .find(|c| c.bits() <= 32),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(root) = root else { continue };
+        let Some(var) = storage.iter_mut().find(|s| {
+            U256::from_hex_str(&s.slot).or_else(|| U256::from_dec_str(&s.slot)) == Some(root)
+        }) else {
+            continue;
+        };
+        match field {
+            Some((_, off, bits)) => {
+                let prefix = format!("{}_", var.name);
+                let Some(fld) = var
+                    .fields
+                    .iter_mut()
+                    .find(|x| x.offset == off && x.bits == bits)
+                else {
+                    continue;
+                };
+                if !fld.name.starts_with(&prefix) {
+                    continue;
+                }
+                fld.name = name.clone();
+            }
+            None => {
+                // A getter of the bare slot of an array returns its length, not the array.
+                if !var.name.starts_with("stor_")
+                    || !var.fields.is_empty()
+                    || var.ty.ends_with("[]")
+                {
+                    continue;
+                }
+                var.name = name.clone();
+            }
+        }
+        taken.insert(name);
+    }
+}
+
 /// Naming context for printing `f`: parameters, internal-unit arguments, storage variables and
-/// packed fields, plus aliases for the results of storage-string loaders.
+/// packed fields, aliases for the results of storage-string loaders, and the helper results
+/// known to be booleans (`callee_returns` maps a helper's entry pc to its return types).
 pub fn make_names(
     f: &Function,
     storage: &[StorageVar],
     layout: MappingLayout,
     loaders: &HashMap<usize, U256>,
+    callee_returns: &HashMap<usize, Vec<String>>,
 ) -> Names {
     let mut n = Names {
         layout,
@@ -1023,6 +1153,7 @@ pub fn make_names(
     for p in &f.params {
         n.params.insert(p.index, p.name.clone());
     }
+    n.bool_returns = f.returns.iter().map(|t| t == "bool").collect();
     if let Some(l) = &f.lifted {
         // Internal units: Arg(i) below the return slot k are the parameters, last pushed on top.
         let k = l.ret_slot.map(|k| k as usize).unwrap_or(l.n_args);
@@ -1049,6 +1180,9 @@ pub fn make_names(
             for fld in &s.fields {
                 n.fields
                     .insert((slot, fld.offset, fld.bits), fld.name.clone());
+                if fld.ty == "bool" {
+                    n.bool_fields.insert((slot, fld.offset, fld.bits));
+                }
             }
         }
     }
@@ -1066,6 +1200,13 @@ pub fn make_names(
                             .cloned()
                             .unwrap_or_else(|| format!("stor_{}", k.to_decimal()));
                         n.aliases.insert(*r, name);
+                    }
+                    if let Some(tys) = callee_returns.get(callee) {
+                        for (r, ty) in results.iter().zip(tys) {
+                            if ty == "bool" {
+                                n.bools.insert(*r);
+                            }
+                        }
                     }
                 }
             }
@@ -1878,7 +2019,14 @@ pub fn fmt_function_header(f: &Function) -> String {
         FnKind::Receive => s.push_str("    receive() external payable {\n"),
         FnKind::Constructor => s.push_str("    constructor() {\n"),
         FnKind::Internal => {
-            let params: Vec<String> = (0..f.n_args).map(|i| format!("uint256 arg{}", i)).collect();
+            let tys = f
+                .lifted
+                .as_ref()
+                .map(|l| function::internal_param_types(l, f.n_args))
+                .unwrap_or_else(|| vec!["uint256".to_string(); f.n_args]);
+            let params: Vec<String> = (0..f.n_args)
+                .map(|i| format!("{} arg{}", tys.get(i).map_or("uint256", String::as_str), i))
+                .collect();
             let m = match f.mutability {
                 Mutability::View | Mutability::Pure => mutability_str(f.mutability),
                 _ => "",
@@ -1890,10 +2038,12 @@ pub fn fmt_function_header(f: &Function) -> String {
                 m
             ));
             if f.n_rets > 0 {
-                s.push_str(&format!(
-                    " returns ({})",
-                    vec!["uint256"; f.n_rets].join(", ")
-                ));
+                let tys = if f.returns.len() == f.n_rets {
+                    f.returns.clone()
+                } else {
+                    vec!["uint256".to_string(); f.n_rets]
+                };
+                s.push_str(&format!(" returns ({})", tys.join(", ")));
             }
             s.push_str(" {\n");
         }

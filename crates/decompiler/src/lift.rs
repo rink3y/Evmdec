@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// A side-effecting statement of a lifted node.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stmt {
     /// `var = value` (phi copies live on edges; this is for explicit temporaries).
     Assign {
@@ -82,6 +82,9 @@ pub enum Stmt {
         input_head: Vec<ExprId>,
         /// The `CallResult(seq)` expression pushed as the success flag.
         result: ExprId,
+        /// Storage generation before the call when the call advances it (every call but
+        /// `STATICCALL`): loads of that generation or older read values from before the call.
+        gen: Option<u32>,
     },
     /// Contract creation (`CREATE` or `CREATE2`).
     Create {
@@ -101,6 +104,8 @@ pub enum Stmt {
         result: ExprId,
         /// Init code words, when `len` is constant and every byte is known.
         init: Option<Vec<ExprId>>,
+        /// Storage generation before the creation (which always advances it).
+        gen: u32,
     },
     /// CALLDATACOPY / CODECOPY / RETURNDATACOPY / EXTCODECOPY / MCOPY.
     Copy {
@@ -125,6 +130,9 @@ pub enum Stmt {
         args: Vec<ExprId>,
         /// Values the call leaves on the stack; empty when the callee was inlined.
         results: Vec<ExprId>,
+        /// Storage generation before the call when the callee has side effects (it then
+        /// advances the generation like an external call).
+        gen: Option<u32>,
     },
     /// Explicit `POP` of a value that had side effects (a call result that is ignored).
     Drop(ExprId),
@@ -141,7 +149,7 @@ pub enum Stmt {
 }
 
 /// How control leaves a lifted node.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Term {
     /// Unconditional jump to the lifted node.
     Jump(usize),
@@ -1707,10 +1715,15 @@ impl<'a> Lifter<'a> {
                 | op::PREVRANDAO
                 | op::GASLIMIT
                 | op::CHAINID
-                | op::SELFBALANCE
                 | op::BASEFEE
                 | op::BLOBBASEFEE => {
                     st.stack.push(expr::env(o));
+                }
+                // The balance changes whenever value moves, which the storage generation
+                // already tracks (external calls, creations, side-effecting helpers).
+                op::SELFBALANCE => {
+                    st.stack
+                        .push(expr::intern(Node::Env(op::SELFBALANCE, st.sgen)));
                 }
                 op::CALLDATALOAD => {
                     let off = pop!();
@@ -1718,7 +1731,13 @@ impl<'a> Lifter<'a> {
                 }
                 op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH | op::BLOCKHASH | op::BLOBHASH => {
                     let a = pop!();
-                    st.stack.push(expr::intern(Node::Op(o, vec![a])));
+                    let own =
+                        o == op::BALANCE && matches!(expr::node(a), Node::Env(op::ADDRESS, _));
+                    st.stack.push(if own {
+                        expr::intern(Node::Env(op::SELFBALANCE, st.sgen))
+                    } else {
+                        expr::intern(Node::Op(o, vec![a]))
+                    });
                 }
                 op::ISZERO | op::NOT => {
                     let a = pop!();
@@ -2161,6 +2180,7 @@ impl<'a> Lifter<'a> {
                     }
                     next_version(&mut st);
                     // Storage may change during an external call (reentrancy / callee effects).
+                    let gen = (o != op::STATICCALL).then_some(st.sgen);
                     if o != op::STATICCALL {
                         st.storage.clear();
                         st.sgen += 1;
@@ -2178,6 +2198,7 @@ impl<'a> Lifter<'a> {
                         input,
                         input_head,
                         result,
+                        gen,
                     });
                     st.stack.push(result);
                     st.called = true;
@@ -2194,6 +2215,7 @@ impl<'a> Lifter<'a> {
                         .and_then(|l| st.mem.read_region(off, l as u64, st.version))
                         .map(|(w, _)| w);
                     let result = expr::intern(Node::CreateResult(seq));
+                    let gen = st.sgen;
                     st.storage.clear();
                     st.sgen += 1;
                     next_version(&mut st);
@@ -2206,6 +2228,7 @@ impl<'a> Lifter<'a> {
                         salt,
                         result,
                         init,
+                        gen,
                     });
                     st.stack.push(result);
                     st.called = true;
@@ -2409,6 +2432,7 @@ impl<'a> Lifter<'a> {
         // and checks become statements of the caller and no call remains. Helpers with side
         // effects, or whose results could not be substituted, stay as calls.
         let transparent = inlined && summary.is_some_and(|s| !s.side_effects);
+        let gen_before = st.sgen;
         match summary {
             Some(sum) => {
                 // Replay the callee's memory writes; storage is untouched unless it has side effects.
@@ -2479,6 +2503,7 @@ impl<'a> Lifter<'a> {
                 callee: self.prog.blocks[call.callee].start,
                 args,
                 results: if inlined { vec![] } else { results },
+                gen: (st.sgen != gen_before).then_some(gen_before),
             });
         }
         let conts: Vec<usize> = un
@@ -2802,6 +2827,7 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             input,
             input_head,
             result,
+            gen,
         } => Stmt::Call {
             seq: *seq,
             kind: *kind,
@@ -2815,6 +2841,7 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             input: fo(input),
             input_head: fv(input_head),
             result: f(*result),
+            gen: *gen,
         },
         Stmt::Create {
             seq,
@@ -2825,6 +2852,7 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             salt,
             result,
             init,
+            gen,
         } => Stmt::Create {
             seq: *seq,
             kind: *kind,
@@ -2834,6 +2862,7 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             salt: salt.map(f),
             result: f(*result),
             init: fo(init),
+            gen: *gen,
         },
         Stmt::Copy {
             kind,
@@ -2853,11 +2882,13 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             callee,
             args,
             results,
+            gen,
         } => Stmt::Internal {
             seq: *seq,
             callee: *callee,
             args: fv(args),
             results: fv(results),
+            gen: *gen,
         },
         Stmt::Drop(e) => Stmt::Drop(f(*e)),
         Stmt::Require {
@@ -2912,94 +2943,105 @@ pub fn map_term(t: &Term, f: &dyn Fn(ExprId) -> ExprId) -> Term {
 
 /// Every expression referenced by the statements and terminator of `n` (not its stacks).
 pub fn node_exprs(n: &LNode) -> Vec<ExprId> {
+    let mut v: Vec<ExprId> = n.stmts.iter().flat_map(stmt_exprs).collect();
+    v.extend(term_exprs(&n.term));
+    v
+}
+
+/// Every expression referenced by one statement (assignment targets included).
+pub fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
     let mut v = Vec::new();
-    for s in &n.stmts {
-        match s {
-            Stmt::Assign { var, value } => {
-                v.push(*var);
-                v.push(*value);
+    match s {
+        Stmt::Assign { var, value } => {
+            v.push(*var);
+            v.push(*value);
+        }
+        Stmt::MStore { off, val, .. } => {
+            v.push(*off);
+            v.push(*val);
+        }
+        Stmt::SStore { key, val, .. } => {
+            v.push(*key);
+            v.push(*val);
+        }
+        Stmt::Log {
+            off,
+            len,
+            topics,
+            data,
+        } => {
+            v.push(*off);
+            v.push(*len);
+            v.extend(topics.iter().copied());
+            if let Some(d) = data {
+                v.extend(d.iter().copied());
             }
-            Stmt::MStore { off, val, .. } => {
-                v.push(*off);
-                v.push(*val);
+        }
+        Stmt::Call {
+            gas,
+            addr,
+            value,
+            in_off,
+            in_len,
+            out_off,
+            out_len,
+            input,
+            ..
+        } => {
+            v.push(*gas);
+            v.push(*addr);
+            if let Some(x) = value {
+                v.push(*x);
             }
-            Stmt::SStore { key, val, .. } => {
-                v.push(*key);
-                v.push(*val);
+            v.extend([*in_off, *in_len, *out_off, *out_len]);
+            if let Some(d) = input {
+                v.extend(d.iter().copied());
             }
-            Stmt::Log {
-                off,
-                len,
-                topics,
-                data,
-            } => {
-                v.push(*off);
-                v.push(*len);
-                v.extend(topics.iter().copied());
-                if let Some(d) = data {
-                    v.extend(d.iter().copied());
-                }
+        }
+        Stmt::Create {
+            value,
+            off,
+            len,
+            salt,
+            init,
+            ..
+        } => {
+            v.extend([*value, *off, *len]);
+            if let Some(s) = salt {
+                v.push(*s);
             }
-            Stmt::Call {
-                gas,
-                addr,
-                value,
-                in_off,
-                in_len,
-                out_off,
-                out_len,
-                input,
-                ..
-            } => {
-                v.push(*gas);
-                v.push(*addr);
-                if let Some(x) = value {
-                    v.push(*x);
-                }
-                v.extend([*in_off, *in_len, *out_off, *out_len]);
-                if let Some(d) = input {
-                    v.extend(d.iter().copied());
-                }
+            if let Some(d) = init {
+                v.extend(d.iter().copied());
             }
-            Stmt::Create {
-                value,
-                off,
-                len,
-                salt,
-                init,
-                ..
-            } => {
-                v.extend([*value, *off, *len]);
-                if let Some(s) = salt {
-                    v.push(*s);
-                }
-                if let Some(d) = init {
-                    v.extend(d.iter().copied());
-                }
+        }
+        Stmt::Copy {
+            dest,
+            src,
+            len,
+            addr,
+            ..
+        } => {
+            v.extend([*dest, *src, *len]);
+            if let Some(a) = addr {
+                v.push(*a);
             }
-            Stmt::Copy {
-                dest,
-                src,
-                len,
-                addr,
-                ..
-            } => {
-                v.extend([*dest, *src, *len]);
-                if let Some(a) = addr {
-                    v.push(*a);
-                }
-            }
-            Stmt::Internal { args, .. } => v.extend(args.iter().copied()),
-            Stmt::Drop(e) => v.push(*e),
-            Stmt::Require { cond, data, .. } => {
-                v.push(*cond);
-                if let Some(d) = data {
-                    v.extend(d.iter().copied());
-                }
+        }
+        Stmt::Internal { args, .. } => v.extend(args.iter().copied()),
+        Stmt::Drop(e) => v.push(*e),
+        Stmt::Require { cond, data, .. } => {
+            v.push(*cond);
+            if let Some(d) = data {
+                v.extend(d.iter().copied());
             }
         }
     }
-    match &n.term {
+    v
+}
+
+/// Every expression referenced by a terminator.
+pub fn term_exprs(t: &Term) -> Vec<ExprId> {
+    let mut v = Vec::new();
+    match t {
         Term::Branch { cond, .. } => v.push(*cond),
         Term::Switch { target, .. } => v.push(*target),
         Term::Return { off, len, data } | Term::Revert { off, len, data } => {

@@ -202,6 +202,20 @@ struct Ctx<'a> {
     inst_seq: std::cell::Cell<usize>,
     /// Whether an internal function (transitively) divides, by entry pc.
     divides: RefCell<HashMap<usize, bool>>,
+    /// Root slots of caller-keyed mappings that act as roles: every function writing them is
+    /// itself gated (by an owner comparison or by a role), or nothing writes them at runtime.
+    /// A test of `mapping[msg.sender]` is an access check only for these; for the others it is
+    /// a balance or stake check anyone can satisfy.
+    roles: HashSet<U256>,
+    /// Constant slots some runtime code writes whole.
+    slot_writes: HashSet<U256>,
+    /// Packed fields some runtime code writes: (slot, byte offset, bits).
+    field_writes: HashSet<(U256, u32, u32)>,
+    /// The bytecode uses transient storage (`TLOAD`/`TSTORE`).
+    transient_storage: bool,
+    /// An ordinary external function copies calldata to memory (calldata arrays or tuples
+    /// passed on, re-encoded).
+    calldata_copies: bool,
 }
 
 /// Constant-offset memory writes of a unit: `(offset, length)` with `None` for an unknown length.
@@ -299,7 +313,13 @@ fn reads_slot(e: ExprId, slot: ExprId) -> bool {
     mentions(e, &|n| matches!(n, Node::SLoad(k, false, _) if *k == slot))
 }
 
-fn collect_facts(f: &Function, events: &[Event], caller_checked: bool, names: &Names) -> FnFacts {
+fn collect_facts(
+    ctx: &Ctx,
+    f: &Function,
+    events: &[Event],
+    caller_checked: bool,
+    names: &Names,
+) -> FnFacts {
     let mut facts = FnFacts {
         name: fname(f),
         pc: f.pc,
@@ -318,7 +338,7 @@ fn collect_facts(f: &Function, events: &[Event], caller_checked: bool, names: &N
         init_guarded: false,
     };
     for cond in guard_conds(events) {
-        if is_auth_cond(cond) {
+        if is_auth_cond_in(cond, &ctx.roles) {
             let mut slots = HashSet::new();
             collect_sload_keys(cond, &mut slots);
             for k in slots {
@@ -340,7 +360,7 @@ fn collect_facts(f: &Function, events: &[Event], caller_checked: bool, names: &N
         ) && mentions(
             cond,
             &|n| matches!(n, Node::SLoad(k, false, _) if expr::is_const(*k)),
-        ) && !is_auth_cond(cond)
+        ) && !is_auth_cond_in(cond, &ctx.roles)
         {
             facts.init_guarded = true;
         }
@@ -512,6 +532,133 @@ fn from_caller(e: ExprId) -> bool {
 }
 fn is_const_addr(e: ExprId) -> bool {
     expr::as_const(e).is_some()
+}
+
+/// Is `e` an address read from storage that no runtime code writes (a slot or packed field set
+/// only at deployment)? Such a callee is fixed: calling it is a call into one known contract.
+fn fixed_in_storage(ctx: &Ctx, e: ExprId) -> bool {
+    let e = match expr::node(e) {
+        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
+        Node::Op(op::AND, v) if expr::as_const(v[0]).is_some_and(|m| m.is_low_mask()) => v[1],
+        _ => e,
+    };
+    if let Some((k, off, bits)) = emit::packed_read(e) {
+        let overlaps = |(k2, o2, b2): &(U256, u32, u32)| {
+            *k2 == k && o2 * 8 < off * 8 + bits && off * 8 < o2 * 8 + b2
+        };
+        return !ctx.slot_writes.contains(&k) && !ctx.field_writes.iter().any(overlaps);
+    }
+    match expr::node(e) {
+        Node::SLoad(key, false, _) => match expr::as_const(key) {
+            Some(k) => {
+                !ctx.slot_writes.contains(&k) && !ctx.field_writes.iter().any(|(k2, _, _)| *k2 == k)
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Does `e` mention a node matching `pred`, looking through helper results into the helper's
+/// returned expressions (and their helpers, to a small depth)?
+fn deep_mentions(
+    ctx: &Ctx,
+    events: &[Event],
+    e: ExprId,
+    pred: &dyn Fn(&Node) -> bool,
+    depth: usize,
+) -> bool {
+    if mentions(e, pred) {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let mut seqs: Vec<u32> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        if let Node::IntRet(sq, _) = expr::node(x) {
+            seqs.push(sq);
+        }
+        stack.extend(expr::children(x));
+    }
+    seqs.iter().any(|sq| {
+        events.iter().any(|ev| match &ev.stmt {
+            Some(Stmt::Internal {
+                seq, callee, args, ..
+            }) if seq == sq => {
+                args.iter()
+                    .any(|a| deep_mentions(ctx, events, *a, pred, depth - 1))
+                    || ctx.internals.get(callee).is_some_and(|cf| {
+                        cf.lifted.as_ref().is_some_and(|cl| {
+                            cl.nodes.iter().any(|nd| match &nd.term {
+                                Term::InternalReturn(vals) => vals
+                                    .iter()
+                                    .any(|v| graph_mentions(ctx, cl, *v, pred, depth - 1)),
+                                _ => false,
+                            })
+                        })
+                    })
+            }
+            _ => false,
+        })
+    })
+}
+
+/// `deep_mentions` inside one lifted graph (a helper body): helper results resolve through the
+/// graph's own internal calls.
+fn graph_mentions(
+    ctx: &Ctx,
+    l: &Lifted,
+    e: ExprId,
+    pred: &dyn Fn(&Node) -> bool,
+    depth: usize,
+) -> bool {
+    if mentions(e, pred) {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let mut seqs: Vec<u32> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        if let Node::IntRet(sq, _) = expr::node(x) {
+            seqs.push(sq);
+        }
+        stack.extend(expr::children(x));
+    }
+    seqs.iter().any(|sq| {
+        l.nodes.iter().any(|nd| {
+            nd.stmts.iter().any(|st| match st {
+                Stmt::Internal {
+                    seq, callee, args, ..
+                } if seq == sq => {
+                    args.iter()
+                        .any(|a| graph_mentions(ctx, l, *a, pred, depth - 1))
+                        || ctx.internals.get(callee).is_some_and(|cf| {
+                            cf.lifted.as_ref().is_some_and(|cl| {
+                                cl.nodes.iter().any(|nd2| match &nd2.term {
+                                    Term::InternalReturn(vals) => vals
+                                        .iter()
+                                        .any(|v| graph_mentions(ctx, cl, *v, pred, depth - 1)),
+                                    _ => false,
+                                })
+                            })
+                        })
+                }
+                _ => false,
+            })
+        })
+    })
 }
 
 /// Loop membership of nodes (back edges via DFS).
@@ -878,8 +1025,141 @@ fn push(
     });
 }
 
-/// Is `cond` an authorization check on msg.sender: `msg.sender == <storage or constant address>`,
-/// or a caller-keyed storage flag used directly as a boolean (`roles[msg.sender]`)?
+/// The root slot of a mapping key (`keccak256(k . slot)`, nested mappings included): the small
+/// constant among the hashed words, innermost first.
+fn mapping_root(key: ExprId) -> Option<U256> {
+    match expr::node(key) {
+        Node::Keccak(words, _) => {
+            for w in &words {
+                if let Node::Keccak(..) = expr::node(*w) {
+                    if let Some(r) = mapping_root(*w) {
+                        return Some(r);
+                    }
+                }
+            }
+            words
+                .iter()
+                .filter_map(|w| expr::as_const(*w))
+                .find(|c| c.bits() <= 32)
+        }
+        _ => None,
+    }
+}
+
+/// `msg.sender == <slot | constant | this | origin>`: the comparison shape of an access check.
+fn is_owner_cond(cond: ExprId) -> bool {
+    is_auth_cond(cond) && role_test_root(cond).is_none()
+}
+
+/// The mapping whose caller-keyed entry `cond` tests as a boolean (`require(roles[msg.sender])`,
+/// `if (!m[msg.sender])`): its root slot.
+fn role_test_root(cond: ExprId) -> Option<U256> {
+    fn strip(e: ExprId) -> ExprId {
+        match expr::node(e) {
+            Node::Op(op::ISZERO, v) => strip(v[0]),
+            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
+                strip(v[0])
+            }
+            _ => e,
+        }
+    }
+    match expr::node(strip(cond)) {
+        Node::SLoad(k, _, _) if from_caller(k) => mapping_root(k),
+        _ => None,
+    }
+}
+
+/// An access check in this contract: an owner comparison, or a test of a role mapping (see
+/// `Ctx::roles`). A test of any other caller-keyed mapping is accounting, not authorisation.
+fn is_auth_cond_in(cond: ExprId, roles: &HashSet<U256>) -> bool {
+    match role_test_root(cond) {
+        Some(root) => roles.contains(&root),
+        None => is_auth_cond(cond),
+    }
+}
+
+/// Which caller-keyed mappings are roles: iterate to a fixpoint from the mappings every writer
+/// of which compares msg.sender against a slot or constant, adding mappings whose writers are
+/// gated by an already known role (or by the mapping itself, as a multi-owner wallet is).
+fn role_mappings(ctx: &Ctx) -> HashSet<U256> {
+    struct Writer {
+        owner: bool,
+        tests: HashSet<U256>,
+        writes: HashSet<U256>,
+    }
+    let mut writers: Vec<Writer> = Vec::new();
+    let mut tested: HashSet<U256> = HashSet::new();
+    for f in ctx
+        .c
+        .functions
+        .iter()
+        .filter(|f| f.kind != FnKind::Internal && f.kind != FnKind::Orphan)
+    {
+        let Some(l) = &f.lifted else { continue };
+        let mut graphs: Vec<&Lifted> = vec![l];
+        graphs.extend(
+            transitive_callees(ctx, f)
+                .into_iter()
+                .filter_map(|cf| cf.lifted.as_ref()),
+        );
+        let mut w = Writer {
+            owner: false,
+            tests: HashSet::new(),
+            writes: HashSet::new(),
+        };
+        for g in graphs {
+            for nd in &g.nodes {
+                for cond in node_conds(nd) {
+                    if is_owner_cond(cond) {
+                        w.owner = true;
+                    }
+                    if let Some(r) = role_test_root(cond) {
+                        w.tests.insert(r);
+                        tested.insert(r);
+                    }
+                }
+                for st in &nd.stmts {
+                    if let Stmt::SStore {
+                        key,
+                        transient: false,
+                        ..
+                    } = st
+                    {
+                        if let Some(r) = mapping_root(*key) {
+                            w.writes.insert(r);
+                        }
+                    }
+                }
+            }
+        }
+        writers.push(w);
+    }
+    let mut roles: HashSet<U256> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for r in &tested {
+            if roles.contains(r) {
+                continue;
+            }
+            let gated = writers
+                .iter()
+                .filter(|w| w.writes.contains(r))
+                .all(|w| w.owner || w.tests.iter().any(|t| t == r || roles.contains(t)));
+            if gated {
+                roles.insert(*r);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    roles
+}
+
+/// Does `cond` have the shape of an authorization check on msg.sender: `msg.sender == <storage
+/// or constant address>`, or a caller-keyed storage flag used directly as a boolean
+/// (`roles[msg.sender]`)? Shape only: see [`is_auth_cond_in`] for the contract-aware test.
 pub fn is_auth_cond(cond: ExprId) -> bool {
     fn strip(e: ExprId) -> ExprId {
         match expr::node(e) {
@@ -941,9 +1221,11 @@ fn node_conds(nd: &lift::LNode) -> Vec<ExprId> {
     v
 }
 
-fn has_caller_check(l: &Lifted, before: Option<usize>) -> bool {
+fn has_caller_check(l: &Lifted, before: Option<usize>, roles: &HashSet<U256>) -> bool {
     for nd in &l.nodes {
-        if node_conds(nd).into_iter().any(is_auth_cond)
+        if node_conds(nd)
+            .into_iter()
+            .any(|c| is_auth_cond_in(c, roles))
             && before.is_none_or(|b| reaches(l, nd.id, b))
         {
             return true;
@@ -971,13 +1253,13 @@ fn transitive_callees<'a>(ctx: &'a Ctx, f: &Function) -> Vec<&'a Function> {
 
 fn any_caller_check(ctx: &Ctx, f: &Function) -> bool {
     let Some(l) = &f.lifted else { return false };
-    if has_caller_check(l, None) {
+    if has_caller_check(l, None, &ctx.roles) {
         return true;
     }
     transitive_callees(ctx, f).iter().any(|cf| {
         cf.lifted
             .as_ref()
-            .is_some_and(|cl| has_caller_check(cl, None))
+            .is_some_and(|cl| has_caller_check(cl, None, &ctx.roles))
     })
 }
 
@@ -988,7 +1270,7 @@ fn auth_slots(ctx: &Ctx) -> HashSet<ExprId> {
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
             for cond in node_conds(nd) {
-                if is_auth_cond(cond) {
+                if is_auth_cond_in(cond, &ctx.roles) {
                     collect_sload_keys(cond, &mut slots);
                 }
             }
@@ -1033,7 +1315,7 @@ pub fn analyze(c: &Contract) -> Report {
             None
         }
     });
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         c,
         internals,
         version,
@@ -1041,15 +1323,69 @@ pub fn analyze(c: &Contract) -> Report {
         callee_writes: Default::default(),
         inst_seq: std::cell::Cell::new(0),
         divides: Default::default(),
+        roles: HashSet::new(),
+        slot_writes: HashSet::new(),
+        field_writes: HashSet::new(),
+        transient_storage: false,
+        calldata_copies: false,
     };
+    ctx.roles = role_mappings(&ctx);
+    for f in &c.functions {
+        let Some(l) = &f.lifted else { continue };
+        for nd in &l.nodes {
+            for st in &nd.stmts {
+                match st {
+                    Stmt::SStore {
+                        key,
+                        val,
+                        transient: false,
+                        ..
+                    } => {
+                        if let Some(k) = expr::as_const(*key) {
+                            match emit::packed_write(*key, *val) {
+                                Some((k2, off, bits, _)) => {
+                                    ctx.field_writes.insert((k2, off, bits));
+                                }
+                                None => {
+                                    ctx.slot_writes.insert(k);
+                                }
+                            }
+                        }
+                    }
+                    Stmt::SStore {
+                        transient: true, ..
+                    } => ctx.transient_storage = true,
+                    Stmt::Copy {
+                        kind: op::CALLDATACOPY,
+                        ..
+                    } if f.kind == FnKind::External => ctx.calldata_copies = true,
+                    _ => {}
+                }
+            }
+            if lift::node_exprs(nd)
+                .iter()
+                .any(|e| mentions(*e, &|n| matches!(n, Node::SLoad(_, true, _))))
+            {
+                ctx.transient_storage = true;
+            }
+        }
+    }
+    let ctx = ctx;
     let mut findings: Vec<Finding> = Vec::new();
     let mut report = Report::default();
+    let callee_returns: HashMap<usize, Vec<String>> = c
+        .functions
+        .iter()
+        .filter(|f| f.kind == FnKind::Internal)
+        .map(|f| (f.pc, f.returns.clone()))
+        .collect();
     let names_for = |f: &Function| -> Names {
         decompile::make_names(
             f,
             &c.storage,
             MappingLayout::of_language(&c.language),
             &c.string_loaders,
+            &callee_returns,
         )
     };
 
@@ -1108,7 +1444,7 @@ pub fn analyze(c: &Contract) -> Report {
         let names = names_for(f);
         let events = events_of(&ctx, l, 5, false);
         let caller_checked = any_caller_check(&ctx, f);
-        facts.push(collect_facts(f, &events, caller_checked, &names));
+        facts.push(collect_facts(&ctx, f, &events, caller_checked, &names));
         // Loops (in the function or the helpers it inlines) whose every storage bound is a
         // counter the contract caps at a constant.
         let loop_cap: Option<u64> = {
@@ -1326,10 +1662,12 @@ pub fn analyze(c: &Contract) -> Report {
                             }
                             hit
                         });
+                        let hook = selector.is_some_and(|s| CALLBACK_SELECTORS.contains(&s));
                         if later_write && !precompile {
-                            let hook = selector.is_some_and(|s| CALLBACK_SELECTORS.contains(&s));
                             let (sev, conf, extra) = if guarded_slot(i).is_some() {
                                 (Severity::Info, Confidence::Medium, " A storage lock written before and after the call looks like a reentrancy guard, so this is reported for awareness only.")
+                            } else if fixed_in_storage(&ctx, *addr) && !hook {
+                                (Severity::Info, Confidence::Low, " The callee address is held in storage that no runtime code writes, so it was fixed at deployment: only that one contract could re-enter, and only if it is malicious or compromised.")
                             } else if gas_stipend {
                                 (Severity::Low, Confidence::Medium, " The call forwards only a 2300 gas stipend (`transfer`/`send`), which limits what a reentrant callee can do.")
                             } else if hook {
@@ -1341,7 +1679,15 @@ pub fn analyze(c: &Contract) -> Report {
                             } else {
                                 (Severity::Medium, Confidence::Low, "")
                             };
-                            push(&mut findings, "reentrancy", "State written after an external call (reentrancy)", sev, conf, Some(f), Some(ev.pc),
+                            let id = if sev == Severity::Info
+                                && fixed_in_storage(&ctx, *addr)
+                                && guarded_slot(i).is_none()
+                            {
+                                "reentrancy-fixed-callee"
+                            } else {
+                                "reentrancy"
+                            };
+                            push(&mut findings, id, "State written after an external call (reentrancy)", sev, conf, Some(f), Some(ev.pc),
                                 format!("`{}` performs an external call to `{}` and writes storage afterwards. A malicious callee can re-enter before the state update is applied (checks-effects-interactions violated).{}", f.name, target, extra),
                                 vec![line.clone()], "Apply the checks-effects-interactions pattern (update state before calling out) or use a reentrancy guard.");
                         }
@@ -1435,16 +1781,120 @@ pub fn analyze(c: &Contract) -> Report {
                                         .values()
                                         .flatten()
                                         .any(|(_, v)| ret_read(*v));
+                                    // Return data read through a copy (`(bool ok, bytes memory
+                                    // data) = token.call(...)` then `data.length == 0 ||
+                                    // abi.decode(data, (bool))`): the copy or the length test
+                                    // sits between this call and the next.
+                                    let window_end = events[i + 1..]
+                                        .iter()
+                                        .position(|e2| matches!(e2.stmt, Some(Stmt::Call { .. })))
+                                        .map_or(events.len(), |k| i + 1 + k);
+                                    // Only a copy made before the success test counts (the copy on
+                                    // the failing side of `if (success) … else { bubble revert }`
+                                    // is not a check), as does a test that looks at the size.
+                                    let mut copied = false;
+                                    for e2 in &events[i + 1..window_end] {
+                                        if matches!(
+                                            e2.stmt,
+                                            Some(Stmt::Copy {
+                                                kind: op::RETURNDATACOPY,
+                                                ..
+                                            })
+                                        ) {
+                                            copied = true;
+                                            break;
+                                        }
+                                        let cond = match (&e2.stmt, &e2.term) {
+                                            (Some(Stmt::Require { cond, .. }), _) => Some(*cond),
+                                            (_, Some(Term::Branch { cond, .. })) => Some(*cond),
+                                            _ => None,
+                                        };
+                                        if let Some(c) = cond {
+                                            if mentions(c, &|n| {
+                                                matches!(n, Node::Env(op::RETURNDATASIZE, _))
+                                            }) {
+                                                copied = true;
+                                                break;
+                                            }
+                                            if mentions(
+                                                c,
+                                                &|n| matches!(n, Node::CallResult(s2) if *s2 == *seq),
+                                            ) {
+                                                break;
+                                            }
+                                        }
+                                    }
                                     if out_zero
                                         && !decoded
+                                        && !copied
                                         && !matches!(expr::node(*addr), Node::Const(_))
                                     {
                                         let sig = sigs::function(sel);
                                         let name =
                                             sig.as_deref().map(sigs::name_of).unwrap_or("transfer");
-                                        push(&mut findings, "erc20-return-ignored", "ERC20 call result not checked", Severity::Low, Confidence::Medium, Some(f), Some(ev.pc),
-                                            format!("`{}` calls `{}` on `{}` and never reads the returned boolean. Tokens that return `false` instead of reverting (and tokens that return nothing) are treated as if the transfer succeeded.", f.name, name, target),
-                                            vec![line.clone()], "Use a SafeERC20-style wrapper: require the call to succeed and, when return data is present, require it to decode to true.");
+                                        // What the function gives in return for the unchecked pull.
+                                        let payout =
+                                            events[i + 1..].iter().find_map(|e2| match &e2.stmt {
+                                                Some(
+                                                    st2 @ Stmt::Call {
+                                                        value: Some(v),
+                                                        addr: a2,
+                                                        ..
+                                                    },
+                                                ) if expr::as_const(*v) != Some(U256::ZERO)
+                                                    && from_caller(*a2) =>
+                                                {
+                                                    Some((
+                                                        "sends ether to msg.sender",
+                                                        emit::fmt_stmt(st2, names),
+                                                    ))
+                                                }
+                                                Some(
+                                                    st2 @ Stmt::Call {
+                                                        input: Some(w2),
+                                                        in_len: l2,
+                                                        ..
+                                                    },
+                                                ) if w0_selector(&Some(w2.clone()), *l2)
+                                                    == Some(SEL_TRANSFER)
+                                                    && from_caller(emit::shifted_word_len(
+                                                        w2,
+                                                        0,
+                                                        expr::as_const(*l2)
+                                                            .and_then(|l| l.as_usize()),
+                                                    )) =>
+                                                {
+                                                    Some((
+                                                        "transfers tokens to msg.sender",
+                                                        emit::fmt_stmt(st2, names),
+                                                    ))
+                                                }
+                                                Some(st2 @ Stmt::SStore { key: k2, .. })
+                                                    if from_caller(*k2) =>
+                                                {
+                                                    Some((
+                                                        "credits a balance keyed by msg.sender",
+                                                        emit::fmt_stmt(st2, names),
+                                                    ))
+                                                }
+                                                _ => None,
+                                            });
+                                        if let (SEL_TRANSFER_FROM, Some((what, line2)), false) =
+                                            (sel, payout, caller_checked)
+                                        {
+                                            let sev = if what.starts_with("credits") {
+                                                Severity::Medium
+                                            } else {
+                                                Severity::High
+                                            };
+                                            push(&mut findings, "unchecked-token-pull", "Tokens pulled without checking the result, then paid for", sev, Confidence::Low, Some(f), Some(ev.pc),
+                                                format!("`{}` pulls tokens with `transferFrom` on `{}` without reading the result, then {}. With a token that returns `false` instead of reverting (or returns nothing and ignores the call), the pull does nothing and the payout is free. Whether that is possible depends on the token behind `{}`.", f.name, target, what, target),
+                                                vec![line.clone(), line2], "Require the call to succeed and its return data, when present, to decode to true (SafeERC20), or credit the balance actually received.");
+                                        } else {
+                                            push(&mut findings, "erc20-return-ignored", "ERC20 call result not checked", Severity::Low, Confidence::Medium, Some(f), Some(ev.pc),
+                                                format!("`{}` calls `{}` on `{}` and never reads the returned boolean. Tokens that return `false` instead of reverting (and tokens that return nothing) are treated as if the transfer succeeded.", f.name, name, target),
+                                                vec![line.clone()], "Use a SafeERC20-style wrapper: require the call to succeed and, when return data is present, require it to decode to true.");
+                                        }
                                     }
                                 }
                             }
@@ -1691,6 +2141,23 @@ pub fn analyze(c: &Contract) -> Report {
                                 (Some(Stmt::SStore { key, .. }), _) => from_caller(*key),
                                 (Some(Stmt::Require { cond, .. }), _) => caller_slot(*cond),
                                 (_, Some(Term::Branch { cond, .. })) => caller_slot(*cond),
+                                // A swap: tokens pulled from the caller pay for the ether.
+                                (
+                                    Some(Stmt::Call {
+                                        input: Some(w),
+                                        in_len,
+                                        ..
+                                    }),
+                                    _,
+                                ) => {
+                                    w0_selector(&Some(w.clone()), *in_len)
+                                        == Some(SEL_TRANSFER_FROM)
+                                        && from_caller(emit::shifted_word_len(
+                                            w,
+                                            0,
+                                            expr::as_const(*in_len).and_then(|l| l.as_usize()),
+                                        ))
+                                }
                                 _ => false,
                             });
                             if !from_caller(v) && !accounted {
@@ -2096,6 +2563,121 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
+        // Payouts to the caller: ether sent to msg.sender, or tokens transferred to it.
+        if f.kind == FnKind::External && !caller_checked {
+            let payouts: Vec<(ExprId, String, usize)> = events
+                .iter()
+                .filter_map(|ev| match &ev.stmt {
+                    Some(
+                        st @ Stmt::Call {
+                            value: Some(v),
+                            addr,
+                            ..
+                        },
+                    ) if from_caller(*addr) && expr::as_const(*v) != Some(U256::ZERO) => {
+                        Some((*v, emit::fmt_stmt(st, &names), ev.pc))
+                    }
+                    Some(
+                        st @ Stmt::Call {
+                            input: Some(w),
+                            in_len,
+                            ..
+                        },
+                    ) if w0_selector(&Some(w.clone()), *in_len) == Some(SEL_TRANSFER) => {
+                        let in_len_c = expr::as_const(*in_len).and_then(|l| l.as_usize());
+                        let to = emit::shifted_word_len(w, 0, in_len_c);
+                        let amount = emit::shifted_word_len(w, 1, in_len_c);
+                        from_caller(to).then(|| (amount, emit::fmt_stmt(st, &names), ev.pc))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let guards = guard_conds(&events);
+            // A computed price or share (balances or storage, and the caller's input, with a
+            // division) paid out with no caller-supplied bound.
+            for (amount, line, pc) in &payouts {
+                if expr::is_const(*amount) || from_calldata(*amount) && !from_storage(*amount) {
+                    continue;
+                }
+                let state = |n: &Node| {
+                    matches!(
+                        n,
+                        Node::SLoad(..) | Node::Env(op::SELFBALANCE, _) | Node::ReturnData(..)
+                    )
+                };
+                let input =
+                    |n: &Node| matches!(n, Node::CallDataLoad(_) | Node::Env(op::CALLVALUE, _));
+                if !deep_mentions(&ctx, &events, *amount, &state, 3)
+                    || !deep_mentions(&ctx, &events, *amount, &input, 3)
+                    || !computed_by_division(&ctx, &events, *amount)
+                {
+                    continue;
+                }
+                // Results the amount is built from: a guard on any of them against a calldata
+                // word is a bound the caller chose.
+                let mut parts: HashSet<ExprId> = HashSet::new();
+                let mut seen = HashSet::new();
+                let mut stack = vec![*amount];
+                while let Some(x) = stack.pop() {
+                    if !seen.insert(x) || seen.len() > 5000 {
+                        continue;
+                    }
+                    if matches!(expr::node(x), Node::IntRet(..) | Node::ReturnData(..)) {
+                        parts.insert(x);
+                    }
+                    stack.extend(expr::children(x));
+                }
+                parts.insert(*amount);
+                let bounded = guards
+                    .iter()
+                    .any(|c| from_calldata(*c) && parts.iter().any(|p| contains_expr(*c, *p)));
+                if !bounded {
+                    push(&mut findings, "no-slippage-bound", "Computed payout has no caller-supplied minimum", Severity::Low, Confidence::Low, Some(f), Some(*pc),
+                        format!("`{}` pays `{}` to msg.sender: an amount computed from balances or storage and the caller's input, with no check against a value the caller passes in. Whoever transacts first can move the price, so the caller may receive far less than expected (front-running, sandwiching).", f.name, emit::fmt_expr(*amount, &names)),
+                        vec![line.clone()], "Take a minimum acceptable output (and a deadline) as parameters and require them.");
+                }
+            }
+            // A required payment to a fixed address next to the caller's payout: that address
+            // can make the function unusable by rejecting ether.
+            if !payouts.is_empty() {
+                for ev in &events {
+                    let Some(
+                        st @ Stmt::Call {
+                            value: Some(v),
+                            addr,
+                            seq,
+                            ..
+                        },
+                    ) = &ev.stmt
+                    else {
+                        continue;
+                    };
+                    if expr::as_const(*v) == Some(U256::ZERO)
+                        || from_caller(*addr)
+                        || from_calldata(*addr)
+                        || !(from_storage(*addr) || expr::is_const(*addr))
+                    {
+                        continue;
+                    }
+                    let result_required = events.iter().any(|e2| match (&e2.stmt, &e2.term) {
+                        (Some(Stmt::Require { cond, .. }), _) => {
+                            mentions(*cond, &|n| matches!(n, Node::CallResult(s) if *s == *seq))
+                        }
+                        (_, Some(Term::Branch { cond, .. })) => {
+                            mentions(*cond, &|n| matches!(n, Node::CallResult(s) if *s == *seq))
+                        }
+                        _ => false,
+                    });
+                    if result_required {
+                        push(&mut findings, "fixed-payee-can-block", "A required payment to a fixed address can block the function", Severity::Low, Confidence::Low, Some(f), Some(ev.pc),
+                            format!("`{}` sends ether to `{}`, an address held in storage or in the code, and reverts unless that transfer succeeds, while also paying msg.sender. If that address rejects ether (a contract without a payable fallback, or one that reverts), nobody can use the function.", f.name, emit::fmt_expr(*addr, &names)),
+                            vec![emit::fmt_stmt(st, &names)], "Record what the payee is owed and let it withdraw, or do not revert when the fee transfer fails.");
+                        break;
+                    }
+                }
+            }
+        }
+
         // Unchecked arithmetic: pre-0.8 compilers wrap silently; on 0.8+ an operation without
         // the compiler's overflow guard sits in an `unchecked { }` block.
         let pre08 = match ctx.version {
@@ -2387,11 +2969,17 @@ pub fn analyze(c: &Contract) -> Report {
     if let Some(v) = ctx.version {
         for bug in COMPILER_BUGS {
             if v >= bug.first && v <= bug.last {
+                let sev = match bug.needs {
+                    BugNeeds::TransientStorage if !ctx.transient_storage => continue,
+                    BugNeeds::CalldataCopy if !ctx.calldata_copies => continue,
+                    BugNeeds::TransientStorage | BugNeeds::CalldataCopy => Severity::Low,
+                    BugNeeds::Unknowable => Severity::Info,
+                };
                 push(
                     &mut findings,
                     "compiler-bug",
                     bug.title,
-                    Severity::Low,
+                    sev,
                     Confidence::Low,
                     None,
                     None,
@@ -2458,6 +3046,14 @@ pub fn analyze(c: &Contract) -> Report {
     let mut seen = HashSet::new();
     findings.retain(|f| seen.insert((f.id.clone(), f.function.clone(), f.pc, f.title.clone())));
     let mut findings = merge_findings(findings);
+    // A call into a deployment-fixed contract is not worth a line next to a real reentrancy
+    // finding in the same function.
+    let reentrant: HashSet<Option<String>> = findings
+        .iter()
+        .filter(|f| f.id == "reentrancy")
+        .map(|f| f.function.clone())
+        .collect();
+    findings.retain(|f| f.id != "reentrancy-fixed-callee" || !reentrant.contains(&f.function));
     // Lock-protected call-then-write paths are one fact about the contract, not one per function.
     let locked: Vec<Finding> = findings
         .iter()
@@ -2925,6 +3521,7 @@ fn silent_guard_findings(ctx: &Ctx, findings: &mut Vec<Finding>) {
             &ctx.c.storage,
             MappingLayout::of_language(&ctx.c.language),
             &ctx.c.string_loaders,
+            &HashMap::new(),
         );
         for nd in &l.nodes {
             let Term::Branch {
@@ -2935,7 +3532,7 @@ fn silent_guard_findings(ctx: &Ctx, findings: &mut Vec<Finding>) {
             else {
                 continue;
             };
-            if !is_auth_cond(*cond) {
+            if !is_auth_cond_in(*cond, &ctx.roles) {
                 continue;
             }
             let (t, fnode) = (*t, *fnode);
@@ -3049,11 +3646,20 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
         return;
     }
     let follower_names: Vec<&str> = followers.iter().map(|g| g.name.as_str()).collect();
-    // Slots written only behind the policy check.
+    // Slots written only behind the policy check. An initializer's writes do not count: it sets
+    // up state that ordinary functions then maintain.
     let mut gated_slots: HashSet<ExprId> = HashSet::new();
-    for g in &followers {
+    for g in followers.iter().filter(|g| !g.init_guarded) {
         gated_slots.extend(g.const_writes.iter().map(|(s, _, _)| *s));
     }
+    // What the gated functions do beyond writing slots: only an action some gated function also
+    // takes is privileged by this contract's own standard.
+    let gated_pays_storage = followers
+        .iter()
+        .any(|g| g.ether_out.iter().any(|(a, _, _)| from_storage(*a)));
+    let gated_delegates = followers
+        .iter()
+        .any(|g| g.delegatecalls.iter().any(|(t, _)| from_storage(*t)));
     for x in facts
         .iter()
         .filter(|x| x.external && x.state_changing && !x.caller_checked)
@@ -3082,7 +3688,11 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
         // into a known contract (WETH.deposit). Ether to an address held in storage is a
         // treasury/owner payout, the kind the gated functions make.
         for (addr, _, line) in &x.ether_out {
-            if from_caller(*addr) || from_calldata(*addr) || !from_storage(*addr) {
+            if from_caller(*addr)
+                || from_calldata(*addr)
+                || !from_storage(*addr)
+                || !gated_pays_storage
+            {
                 continue;
             }
             does.push("sends ether to an address held in storage".into());
@@ -3110,7 +3720,7 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
         // A delegatecall to a constant address is a linked library; to a calldata address it is
         // `arbitrary-delegatecall`. One to a stored address is an upgrade path.
         for (t, line) in &x.delegatecalls {
-            if !from_storage(*t) || from_calldata(*t) || from_caller(*t) {
+            if !from_storage(*t) || from_calldata(*t) || from_caller(*t) || !gated_delegates {
                 continue;
             }
             does.push("delegatecalls an address held in storage".into());
@@ -3306,6 +3916,19 @@ fn w0_selector(input: &Option<Vec<ExprId>>, in_len: ExprId) -> Option<u32> {
         })
 }
 
+/// What a compiler bug needs in the code to matter; what the bytecode shows decides whether the
+/// bug is reported, and how loudly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BugNeeds {
+    /// Transient storage opcodes: the bug is dropped when the bytecode has none.
+    TransientStorage,
+    /// Calldata copied to memory by an ordinary function: dropped when none is.
+    CalldataCopy,
+    /// A compiler setting or source construct the bytecode cannot show (`--via-ir`, inline
+    /// assembly, optimizer internals): reported for information only.
+    Unknowable,
+}
+
 /// A solc release range affected by a notable compiler bug.
 struct CompilerBug {
     /// First affected version (inclusive).
@@ -3314,6 +3937,7 @@ struct CompilerBug {
     last: (u32, u32, u32),
     title: &'static str,
     description: &'static str,
+    needs: BugNeeds,
 }
 
 const COMPILER_BUGS: &[CompilerBug] = &[
@@ -3321,37 +3945,43 @@ const COMPILER_BUGS: &[CompilerBug] = &[
         first: (0, 8, 13),
         last: (0, 8, 16),
         title: "StorageWriteRemovalBeforeConditionalTermination",
-        description: "The Yul optimizer could remove storage writes preceding a conditional `return`/`stop` in inline assembly (SOL-2022-6).",
+        description: "The Yul optimizer could remove storage writes preceding a conditional `return`/`stop` in inline assembly (SOL-2022-6). Whether the source uses such assembly cannot be seen in the bytecode.",
+        needs: BugNeeds::Unknowable,
     },
     CompilerBug {
         first: (0, 5, 8),
         last: (0, 8, 15),
         title: "HeadOverflowCalldataTuplesABIReencoding",
-        description: "ABI re-encoding of calldata tuples ending in a statically-sized calldata array could corrupt data (SOL-2022-5).",
+        description: "ABI re-encoding of calldata tuples ending in a statically-sized calldata array could corrupt data (SOL-2022-5). This contract copies calldata to memory, so the pattern may be present.",
+        needs: BugNeeds::CalldataCopy,
     },
     CompilerBug {
         first: (0, 8, 13),
         last: (0, 8, 14),
         title: "InlineAssemblyMemorySideEffects",
-        description: "The optimizer could remove memory writes in inline assembly blocks whose results were only read by other assembly (SOL-2022-4).",
+        description: "The optimizer could remove memory writes in inline assembly blocks whose results were only read by other assembly (SOL-2022-4). Whether the source uses such assembly cannot be seen in the bytecode.",
+        needs: BugNeeds::Unknowable,
     },
     CompilerBug {
         first: (0, 8, 0),
         last: (0, 8, 2),
         title: "KeccakCaching",
-        description: "The optimizer could reuse a cached keccak256 result for a different input length (SOL-2021-1).",
+        description: "The optimizer could reuse a cached keccak256 result for a different input length (SOL-2021-1). Whether the optimizer took that path cannot be seen in the bytecode.",
+        needs: BugNeeds::Unknowable,
     },
     CompilerBug {
         first: (0, 6, 7),
         last: (0, 8, 20),
         title: "FullInlinerNonExpressionSplitArgumentEvaluationOrder",
-        description: "With viaIR, the full inliner could evaluate function arguments in the wrong order (SOL-2023-2, only affects --via-ir builds).",
+        description: "With viaIR, the full inliner could evaluate function arguments in the wrong order (SOL-2023-2, only affects --via-ir builds, which the bytecode does not reveal).",
+        needs: BugNeeds::Unknowable,
     },
     CompilerBug {
-        first: (0, 7, 0),
+        first: (0, 8, 24),
         last: (0, 8, 25),
         title: "TransientStorageReentrancy",
-        description: "Note: transient storage (0.8.24+) is not cleared across reentrant calls within a transaction; relevant only if TSTORE is used.",
+        description: "Transient storage is not cleared across reentrant calls within a transaction; this contract uses TSTORE/TLOAD.",
+        needs: BugNeeds::TransientStorage,
     },
 ];
 

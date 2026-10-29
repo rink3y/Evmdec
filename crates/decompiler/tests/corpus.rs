@@ -271,33 +271,68 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
     assert!(src.contains("require(msg.data.length >= 36);"));
     assert!(!src.contains("int256(msg.data.length"));
     assert!(!src.contains("address(arg0))"), "ABI validator printed");
-    // Unknown events are named by their topic, and the loop is a `while (cond)` whose parallel
-    // copies are ordered so that no copy reads a variable already overwritten above it.
+    // Unknown events are named by their topic.
     assert!(src.contains("emit Event_22e25c6d("));
-    assert!(src.contains("while (v8 < v3) {"));
-    let body = src
-        .split("while (v8 < v3) {")
+    // The loop is a `while (i < steps)` whose parallel copies are ordered so that no copy reads a
+    // variable already overwritten above it.
+    let helper = src
+        .split("function func_0x1331(")
         .nth(1)
-        .unwrap()
+        .expect("pricing helper");
+    let (head, rest) = helper.split_once("while (").expect("while loop");
+    assert!(!head.contains("while ("), "one loop expected");
+    let cond = rest.split(") {").next().unwrap();
+    assert!(
+        cond.split(" < ").count() == 2
+            && cond
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == ' ' || c == '<'),
+        "loop condition: {cond}"
+    );
+    let body = rest
+        .split_once(") {")
+        .expect("loop body opens")
+        .1
         .split('}')
         .next()
-        .unwrap();
+        .expect("loop body closes");
     let lines: Vec<&str> = body
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    assert_eq!(lines.len(), 4, "loop body: {body}");
-    let pos = |needle: &str| {
-        lines
-            .iter()
-            .position(|l| l.starts_with(needle))
-            .unwrap_or_else(|| panic!("no {needle} in {body}"))
+    // Two shared sub-expressions bound once each, then the four loop-carried updates.
+    assert_eq!(lines.len(), 6, "loop body: {body}");
+    let words = |s: &str| {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
     };
-    assert!(
-        pos("v7 = ") < pos("v5 = ") && pos("v5 = ") < pos("v4 = "),
-        "parallel copies out of order: {body}"
-    );
+    let parsed: Vec<(&str, &str)> = lines
+        .iter()
+        .map(|l| l.split_once(" = ").expect("an assignment"))
+        .collect();
+    // A loop-carried copy reads its variable before assigning it; the rest are bindings.
+    let is_copy = |i: usize| {
+        let var = parsed[i].0;
+        parsed[..=i]
+            .iter()
+            .any(|(_, rhs)| words(rhs).iter().any(|w| w == var))
+    };
+    let mut assigned: Vec<&str> = Vec::new();
+    for (i, (var, rhs)) in parsed.iter().enumerate() {
+        if !is_copy(i) {
+            continue;
+        }
+        for a in &assigned {
+            assert!(
+                !words(rhs).iter().any(|w| w == a),
+                "copy reads an overwritten variable: {body}"
+            );
+        }
+        assigned.push(var);
+    }
     // No string piece in the inventory.
     assert!(
         !c.strings
@@ -445,8 +480,8 @@ fn balancer_bpool_reads_as_source() {
         !src.contains("unknown signature"),
         "BPool selectors are in the dictionary"
     );
-    // The lock release prints as the field, not as a whole-slot mask.
-    assert!(src.contains("stor_5_1 = 0;"), "{src}");
+    // The lock release prints as the bool field, not as a whole-slot mask.
+    assert!(src.contains("stor_5_1 = false;"), "{src}");
     assert!(!src.contains("& 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00ff"));
     // `_logs_`: emit of the ABI-encoded calldata, with `msg.sig` as a topic.
     assert!(

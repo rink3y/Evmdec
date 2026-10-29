@@ -310,6 +310,11 @@ struct Printer<'a> {
     /// Per store statement `(node, index)`: loads of the same slot from before the store that
     /// are still used afterwards, each with the temporary that keeps the old value.
     stale_plan: HashMap<(usize, usize), Vec<(ExprId, String)>>,
+    /// Values stored to a slot, by the node that stored them: `(node, slot name, value)`.
+    /// Printed as the slot in the statements that follow (see `Names::forwarded`).
+    stored: Vec<(usize, String, ExprId)>,
+    /// Memory stores nothing reads before the function ends (not printed).
+    dead_stores: HashSet<(usize, usize)>,
 }
 
 /// A log whose data is the ABI encoding of a calldata range, with the stores that built it.
@@ -396,49 +401,99 @@ fn encoded_bytes_logs(stmts: &[Stmt]) -> Vec<FoldedLog> {
     out
 }
 
-/// Loads of persistent slot `key` with generation at most `gen` anywhere in `e`.
-fn stale_loads_in(e: ExprId, key: ExprId, gen: u32, out: &mut Vec<ExprId>) {
+/// What a statement overwrites, for the stale-load planner: a persistent storage slot, or the
+/// contract's own balance (every statement that advances the storage generation may move ether).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Overwritten {
+    Slot(ExprId),
+    Balance,
+}
+
+/// Loads of `what` with generation at most `gen` anywhere in `e`, outside `skip` (the value
+/// the statement stores, which later prints as the slot itself).
+fn stale_loads_in(
+    e: ExprId,
+    what: Overwritten,
+    gen: u32,
+    skip: Option<ExprId>,
+    out: &mut Vec<ExprId>,
+) {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
     while let Some(x) = stack.pop() {
-        if !seen.insert(x) || seen.len() > 20_000 {
+        if Some(x) == skip || !seen.insert(x) || seen.len() > 20_000 {
             continue;
         }
-        if let Node::SLoad(k, false, g) = expr::node(x) {
-            if k == key && g <= gen && !out.contains(&x) {
-                out.push(x);
-            }
+        let stale = match (expr::node(x), what) {
+            (Node::SLoad(k, false, g), Overwritten::Slot(key)) => k == key && g <= gen,
+            (Node::Env(op::SELFBALANCE, g), Overwritten::Balance) => g <= gen,
+            _ => false,
+        };
+        if stale && !out.contains(&x) {
+            out.push(x);
         }
         stack.extend(expr::children(x));
     }
 }
 
-/// For every store to a constant slot, the loads of that slot taken before the store and used
-/// after it (in the rest of the block or anywhere reachable from it). Printing those as the
-/// slot name would read the new value, so each gets a temporary saved just before the store.
+/// The slot or balance a statement overwrites, with the generation its stale loads carry.
+fn overwrites(st: &Stmt, names: &Names) -> Option<(Overwritten, u32)> {
+    match st {
+        Stmt::SStore {
+            key,
+            transient: false,
+            gen,
+            ..
+        } => Some((Overwritten::Slot(*key), *gen)),
+        Stmt::Call { gen: Some(g), .. } => Some((Overwritten::Balance, *g)),
+        Stmt::Internal {
+            gen: Some(g),
+            callee,
+            ..
+        } if !names.pure_callees.contains(callee) => Some((Overwritten::Balance, *g)),
+        Stmt::Create { gen, .. } => Some((Overwritten::Balance, *gen)),
+        _ => None,
+    }
+}
+
+/// A temporary name for the old value of a slot or of the balance: `prev_<name>`, with the
+/// characters of a mapping key folded into the identifier (`prev_stor_8_msg_sender`).
+fn prev_name(what: Overwritten, names: &Names) -> String {
+    let base = match what {
+        Overwritten::Slot(key) => emit::fmt_slot(key, names, emit::SlotSpace::Persistent),
+        Overwritten::Balance => "balance".to_string(),
+    };
+    let mut id = String::new();
+    for c in base.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            id.push(c);
+        } else if !id.ends_with('_') {
+            id.push('_');
+        }
+    }
+    format!("prev_{}", id.trim_end_matches('_'))
+}
+
+/// For every store to a slot and every call that may move ether, the loads of that slot (or of
+/// the balance) taken before the statement and used after it, in the rest of the block or
+/// anywhere reachable from it. Printing those as the slot name or `address(this).balance`
+/// would read the new value, so each gets a temporary saved just before the statement.
 fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(ExprId, String)>> {
     let mut plan: HashMap<(usize, usize), Vec<(ExprId, String)>> = HashMap::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
+    let mut found: Vec<(usize, usize, Overwritten, u32, Vec<ExprId>)> = Vec::new();
     for nd in &l.nodes {
         for (i, st) in nd.stmts.iter().enumerate() {
-            let Stmt::SStore {
-                key,
-                transient: false,
-                gen,
-                ..
-            } = st
-            else {
+            let Some((what, gen)) = overwrites(st, names) else {
                 continue;
             };
-            if !expr::is_const(*key) {
-                continue;
-            }
-            // Expressions evaluated after the store: the store's own value is evaluated before
-            // it, so it is excluded, as is everything on the path up to it.
+            // Expressions evaluated after the statement: its own operands are evaluated before
+            // it, so they are excluded, as is everything on the path up to it.
             let mut after: Vec<ExprId> = Vec::new();
-            let mut probe = nd.clone();
-            probe.stmts = nd.stmts[i + 1..].to_vec();
-            after.extend(crate::lift::node_exprs(&probe));
+            for later in &nd.stmts[i + 1..] {
+                after.extend(crate::lift::stmt_exprs(later));
+            }
+            after.extend(crate::lift::term_exprs(&nd.term));
             let mut seen = HashSet::new();
             let mut stack: Vec<usize> = nd.succs.clone();
             while let Some(x) = stack.pop() {
@@ -453,28 +508,1078 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
                     after.extend(assigns.iter().map(|(_, v)| *v));
                 }
             }
+            let forwarded = match st {
+                Stmt::SStore { val, .. } if !expr::is_const(*val) => Some(*val),
+                _ => None,
+            };
             let mut stale: Vec<ExprId> = Vec::new();
             for e in after {
-                stale_loads_in(e, *key, *gen, &mut stale);
+                stale_loads_in(e, what, gen, forwarded, &mut stale);
             }
             if stale.is_empty() {
                 continue;
             }
-            let base = emit::fmt_slot(*key, names, emit::SlotSpace::Persistent);
-            let n = counts.entry(base.clone()).or_insert(0);
-            *n += 1;
-            let tmp = if *n == 1 {
-                format!("prev_{}", base)
-            } else {
-                format!("prev{}_{}", n, base)
-            };
-            plan.insert(
-                (nd.id, i),
-                stale.into_iter().map(|e| (e, tmp.clone())).collect(),
-            );
+            found.push((nd.id, i, what, gen, stale));
         }
     }
+    // A load is saved at the first statement that overwrites it: of the candidates holding it,
+    // the one with the smallest generation (later overwrites see an already-saved value).
+    // Generations grow along a path, so overwrites sharing the minimal generation lie on
+    // different paths and each saves the value on its own.
+    let mut first_gen: HashMap<ExprId, u32> = HashMap::new();
+    for (_, _, _, gen, stale) in &found {
+        for e in stale {
+            let g = first_gen.entry(*e).or_insert(*gen);
+            *g = (*g).min(*gen);
+        }
+    }
+    for (node, i, what, gen, stale) in found {
+        let mine: Vec<ExprId> = stale
+            .into_iter()
+            .filter(|e| first_gen.get(e) == Some(&gen))
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let base = prev_name(what, names);
+        let n = counts.entry(base.clone()).or_insert(0);
+        *n += 1;
+        let tmp = if *n == 1 {
+            base
+        } else {
+            base.replacen("prev_", &format!("prev{}_", n), 1)
+        };
+        plan.insert(
+            (node, i),
+            mine.into_iter().map(|e| (e, tmp.clone())).collect(),
+        );
+    }
     plan
+}
+
+// ------------------------------------------------------------------------------------------
+// Peeled loops
+// ------------------------------------------------------------------------------------------
+
+/// A recognised peeled iteration: the phi copies `(loop variable, value)` that start the loop
+/// from the peeled state, and the `(copy node, loop node)` pairs.
+type Peel = (Vec<(ExprId, ExprId)>, Vec<(usize, usize)>);
+
+/// Substitute phi variables by their initial values.
+fn with_init(e: ExprId, init: &HashMap<ExprId, ExprId>) -> ExprId {
+    expr::substitute(
+        e,
+        &|n| match n {
+            Node::Var(_) => init.get(&expr::intern(n.clone())).copied(),
+            _ => None,
+        },
+        &mut HashMap::new(),
+    )
+}
+
+/// Control-flow recovery sometimes runs the first iteration of a loop on its own: the header, the
+/// body and the exit each get a copy specialised to the state before the loop (`i = 0`, a
+/// parameter still in its slot), and the loop proper starts at the second iteration. Printed as
+/// is, that reads as an unrolled iteration before a `while`. When the copy is provably one
+/// iteration of the loop (node for node, its statements, conditions and phi copies equal the
+/// loop's with the loop's variables replaced by the copy's values), the edges into the copied
+/// header are redirected to the real header, with those values as the phi copies.
+fn reroll_peeled_loops(l: &Lifted) -> Lifted {
+    let g = Graph::new(l);
+    let loops = find_loops(&g);
+    let debug = std::env::var("EVMDEC_DEBUG_PEEL").is_ok();
+    if debug && !loops.is_empty() {
+        for nd in &l.nodes {
+            eprintln!(
+                "[peel]   node {} block {} pc {:#x} succs {:?} stmts {} term {}",
+                nd.id,
+                nd.block,
+                nd.pc,
+                nd.succs,
+                nd.stmts.len(),
+                match &nd.term {
+                    Term::Jump(_) => "jump".to_string(),
+                    Term::Branch { .. } => "branch".to_string(),
+                    other => format!("{other:?}").chars().take(30).collect(),
+                }
+            );
+        }
+        for (h, lp) in &loops {
+            eprintln!("[peel]   loop {} body {:?}", h, lp.body);
+        }
+    }
+    let mut out = l.clone();
+    let mut changed = false;
+    let mut consumed: HashSet<usize> = HashSet::new();
+    let mut headers: Vec<usize> = loops.keys().copied().collect();
+    headers.sort_by_key(|h| g.rpo_index[*h]);
+    for h in headers {
+        let lp = &loops[&h];
+        // A copy of some loop node outside the loop, entered from outside the copy too.
+        let mut found: Option<(usize, usize, Peel)> = None;
+        'search: for hp in 0..l.nodes.len() {
+            if !g.reachable[hp] || consumed.contains(&hp) || lp.body.contains(&hp) {
+                continue;
+            }
+            for &q0 in &lp.body {
+                if l.nodes[hp].block != l.nodes[q0].block
+                    || l.nodes[hp].entry_stack.len() != l.nodes[q0].entry_stack.len()
+                    || g.preds[hp].iter().any(|p| lp.body.contains(p))
+                {
+                    continue;
+                }
+                if let Some(peel) = peel_of(l, lp, q0, hp) {
+                    found = Some((hp, q0, peel));
+                    break 'search;
+                }
+            }
+        }
+        let Some((hp, q0, (init, pairs))) = found else {
+            if debug {
+                eprintln!(
+                    "[peel] loop at {} (block {:#x}): no peeled iteration",
+                    h, l.nodes[h].pc
+                );
+            }
+            continue;
+        };
+        if debug {
+            eprintln!(
+                "[peel] loop at {} (block {:#x}): copy {} of node {} is one iteration ({} node pairs)",
+                h, l.nodes[h].pc, hp, q0, pairs.len()
+            );
+        }
+        let preds: Vec<usize> = g.preds[hp].clone();
+        for p in preds {
+            let m: HashMap<usize, usize> = HashMap::from([(hp, q0)]);
+            out.nodes[p].term = remap_term_nodes(&out.nodes[p].term, &m);
+            for sx in out.nodes[p].succs.iter_mut() {
+                if *sx == hp {
+                    *sx = q0;
+                }
+            }
+            let mut assigns = out.edge_assigns.remove(&(p, hp)).unwrap_or_default();
+            assigns.extend(init.iter().map(|(v, x)| (*v, *x)));
+            out.edge_assigns.insert((p, q0), assigns);
+        }
+        consumed.extend(pairs.iter().map(|(p, _)| *p));
+        changed = true;
+    }
+    if !changed {
+        return l.clone();
+    }
+    // Predecessor lists follow the rewired successors.
+    for nd in out.nodes.iter_mut() {
+        nd.preds.clear();
+    }
+    let edges: Vec<(usize, usize)> = out
+        .nodes
+        .iter()
+        .flat_map(|nd| nd.succs.iter().map(move |s| (nd.id, *s)))
+        .collect();
+    for (from, to) in edges {
+        if !out.nodes[to].preds.contains(&from) {
+            out.nodes[to].preds.push(from);
+        }
+    }
+    out
+}
+
+/// Is `hp` (outside the loop) a copy of loop node `q0` that runs one iteration of the loop
+/// specialised to the state before it? On success, the phi copies that start the loop from that
+/// state (`(loop variable, value)`) and the pairs `(copy node, loop node)`.
+fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
+    // Pair the copy's nodes with the loop's by walking both in step, until they converge on
+    // shared nodes (the loop itself, or a shared exit).
+    let debug = std::env::var("EVMDEC_DEBUG_PEEL").is_ok();
+    let fail = |why: &str| {
+        if debug {
+            eprintln!("[peel]     copy {} of {}: {}", hp, q0, why);
+        }
+    };
+    let mut pairs: Vec<(usize, usize)> = vec![(hp, q0)];
+    let mut i = 0;
+    while i < pairs.len() {
+        let (p, q) = pairs[i];
+        i += 1;
+        let (ps, qs) = (&l.nodes[p].succs, &l.nodes[q].succs);
+        if ps.len() != qs.len() {
+            fail("successor counts differ");
+            return None;
+        }
+        for (&a, &b) in ps.iter().zip(qs) {
+            if a == b {
+                continue;
+            }
+            if lp.body.contains(&a) || l.nodes[a].block != l.nodes[b].block {
+                fail(&format!("successors {a}/{b} are not copies"));
+                return None;
+            }
+            match pairs.iter().find(|(x, _)| *x == a) {
+                Some((_, y)) if *y != b => return None,
+                Some(_) => {}
+                None => pairs.push((a, b)),
+            }
+        }
+        if pairs.len() > 96 {
+            return None;
+        }
+    }
+    // The loop's variables as the copy knows them, from the paired nodes' entry stacks: the
+    // positions holding a variable define the substitution, the others must agree under it.
+    let mut sub: HashMap<ExprId, ExprId> = HashMap::new();
+    let mut derived: Vec<(usize, usize, ExprId, ExprId)> = Vec::new();
+    for (p, q) in &pairs {
+        let (sp, sq) = (&l.nodes[*p].entry_stack, &l.nodes[*q].entry_stack);
+        if sp.len() != sq.len() {
+            fail(&format!("stack heights of {p}/{q} differ"));
+            return None;
+        }
+        for (a, b) in sp.iter().zip(sq) {
+            if a == b {
+                continue;
+            }
+            if !matches!(expr::node(*b), Node::Var(_)) {
+                derived.push((*p, *q, *a, *b));
+                continue;
+            }
+            if sub.insert(*b, *a).is_some_and(|old| old != *a) {
+                fail("a loop variable has two initial values");
+                return None;
+            }
+        }
+    }
+    if sub.is_empty() {
+        fail("no variables differ");
+        return None;
+    }
+    for (p, q, a, b) in derived {
+        if with_init(b, &sub) != a {
+            fail(&format!(
+                "stack of {}/{} differs beyond the variables: {} vs {}",
+                p,
+                q,
+                emit::fmt_expr(a, &Names::default()),
+                emit::fmt_expr(b, &Names::default())
+            ));
+            return None;
+        }
+    }
+    let subst = |e: ExprId| with_init(e, &sub);
+    // The copy's statements are the loop's under the substitution; a guard the initial values
+    // satisfy outright (`0 + x >= 0`) has no counterpart in the copy.
+    let same_stmts = |p: usize, q: usize| {
+        let mut rest = l.nodes[p].stmts.iter();
+        let mut next = rest.next();
+        for sq in &l.nodes[q].stmts {
+            let mapped = lift::map_stmt(sq, &subst);
+            if next.is_some_and(|sp| mapped == *sp) {
+                next = rest.next();
+                continue;
+            }
+            let trivially_true = matches!(
+                mapped,
+                Stmt::Require { cond, .. } if expr::as_const(cond).is_some_and(|c| !c.is_zero())
+            );
+            if !trivially_true {
+                return false;
+            }
+        }
+        next.is_none()
+    };
+    let same_term = |p: usize, q: usize| match (&l.nodes[p].term, &l.nodes[q].term) {
+        (Term::Branch { cond: a, .. }, Term::Branch { cond: b, .. }) => subst(*b) == *a,
+        (Term::Jump(_), Term::Jump(_)) => true,
+        (ta, tb) if l.nodes[p].succs.is_empty() && l.nodes[q].succs.is_empty() => {
+            lift::map_term(tb, &subst) == *ta
+        }
+        _ => false,
+    };
+    let assigns_of = |x: usize, y: usize| -> HashMap<ExprId, ExprId> {
+        l.edge_assigns
+            .get(&(x, y))
+            .map(|v| v.iter().copied().collect())
+            .unwrap_or_default()
+    };
+    // Phi copies on corresponding edges. Into a shared node (the loop itself, a common exit) the
+    // copy assigns the loop's variables their values; the loop's own edge may leave a variable
+    // unchanged, which under the substitution is that variable's initial value. Into paired
+    // copy nodes both sides assign their own variables, related by the substitution.
+    let same_edges = |p: usize, q: usize| {
+        l.nodes[p]
+            .succs
+            .iter()
+            .zip(&l.nodes[q].succs)
+            .all(|(&a, &b)| {
+                let (ca, la) = (assigns_of(p, a), assigns_of(q, b));
+                if a == b {
+                    let mut vars: Vec<ExprId> = ca.keys().chain(la.keys()).copied().collect();
+                    vars.sort();
+                    vars.dedup();
+                    vars.iter().all(|var| {
+                        let from_copy = ca.get(var).copied().unwrap_or(*var);
+                        let from_loop = subst(la.get(var).copied().unwrap_or(*var));
+                        from_copy == from_loop
+                    })
+                } else {
+                    let norm = |m: &HashMap<ExprId, ExprId>, s: &dyn Fn(ExprId) -> ExprId| {
+                        let mut v: Vec<(ExprId, ExprId)> =
+                            m.iter().map(|(var, val)| (s(*var), s(*val))).collect();
+                        v.retain(|(var, val)| var != val);
+                        v.sort();
+                        v
+                    };
+                    norm(&ca, &|e| e) == norm(&la, &subst)
+                }
+            })
+    };
+    for (p, q) in &pairs {
+        if !same_stmts(*p, *q) {
+            fail(&format!("statements of {p}/{q} differ"));
+            return None;
+        }
+        if !same_term(*p, *q) {
+            fail(&format!("terminators of {p}/{q} differ"));
+            return None;
+        }
+        if !same_edges(*p, *q) {
+            fail(&format!("phi copies out of {p}/{q} differ"));
+            return None;
+        }
+    }
+    // The phi copies that start the loop from the peeled state: the entry node's variables.
+    let init: Vec<(ExprId, ExprId)> = l.nodes[q0]
+        .entry_stack
+        .iter()
+        .zip(&l.nodes[hp].entry_stack)
+        .filter(|(b, a)| a != b)
+        .map(|(b, a)| (*b, *a))
+        .collect();
+    if init.is_empty() {
+        return None;
+    }
+    Some((init, pairs))
+}
+
+/// Replace node ids in a terminator.
+fn remap_term_nodes(t: &Term, m: &HashMap<usize, usize>) -> Term {
+    let map = |x: usize| *m.get(&x).unwrap_or(&x);
+    match t {
+        Term::Jump(x) => Term::Jump(map(*x)),
+        Term::Branch { cond, t, f } => Term::Branch {
+            cond: *cond,
+            t: t.map(map),
+            f: map(*f),
+        },
+        Term::Switch { target, cases } => Term::Switch {
+            target: *target,
+            cases: cases.iter().map(|c| map(*c)).collect(),
+        },
+        other => other.clone(),
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// Dead stores
+// ------------------------------------------------------------------------------------------
+
+/// Memory stores (at any offset) after which nothing on any path to the end of the function
+/// reads memory: the returndata copies of a `(bool ok,) = x.call(...)` whose bytes are dropped,
+/// for instance. Keyed by `(node, statement index)`.
+fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
+    let mentions_memory = |e: ExprId| {
+        expr::contains(e, &|n| {
+            matches!(
+                n,
+                Node::MLoad(..) | Node::KeccakMem(..) | Node::CopiedWord(..)
+            )
+        })
+    };
+    let reads_memory = |s: &Stmt| match s {
+        // The offset of a store is pointer arithmetic (the free-memory pointer), not a data read.
+        Stmt::MStore { val, .. } => mentions_memory(*val),
+        Stmt::Copy { kind, .. } => *kind == op::MCOPY,
+        Stmt::SStore { .. } | Stmt::Assign { .. } | Stmt::Drop(_) | Stmt::Require { .. } => {
+            lift::stmt_exprs(s).iter().any(|e| mentions_memory(*e))
+        }
+        Stmt::Log { topics, data, .. } => match data {
+            None => true,
+            Some(d) => topics.iter().chain(d).any(|e| mentions_memory(*e)),
+        },
+        Stmt::Call { .. } | Stmt::Create { .. } | Stmt::Internal { .. } => true,
+    };
+    let term_reads_memory = |t: &Term| match t {
+        // Known payload words: only they matter, not the pointer they were encoded at.
+        Term::Return { data, .. } | Term::Revert { data, .. } => match data {
+            None => true,
+            Some(d) => d.iter().any(|e| mentions_memory(*e)),
+        },
+        Term::ReturnDyn { .. } | Term::Unresolved(_) | Term::Switch { .. } => true,
+        _ => lift::term_exprs(t).iter().any(|e| mentions_memory(*e)),
+    };
+    // Nodes from which some memory read is reachable (the node's own statements included).
+    let mut reads_ahead: Vec<bool> = vec![false; l.nodes.len()];
+    for nd in &l.nodes {
+        let own = nd.stmts.iter().any(&reads_memory)
+            || term_reads_memory(&nd.term)
+            || l.edge_assigns
+                .iter()
+                .any(|((from, _), a)| *from == nd.id && a.iter().any(|(_, v)| mentions_memory(*v)));
+        reads_ahead[nd.id] = own;
+    }
+    loop {
+        let mut changed = false;
+        for nd in &l.nodes {
+            if !reads_ahead[nd.id] && nd.succs.iter().any(|s| reads_ahead[*s]) {
+                reads_ahead[nd.id] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut dead = HashSet::new();
+    let debug = std::env::var("EVMDEC_DEBUG_DEAD").is_ok();
+    for nd in &l.nodes {
+        if debug && nd.stmts.iter().any(|s| matches!(s, Stmt::Copy { .. })) {
+            eprintln!(
+                "[dead] node {} succs {:?} reads_ahead_succ {} term_reads {} stmts {:?}",
+                nd.id,
+                nd.succs,
+                nd.succs.iter().any(|s| reads_ahead[*s]),
+                term_reads_memory(&nd.term),
+                nd.stmts
+                    .iter()
+                    .map(|s| emit::fmt_stmt(s, &Names::default()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        if nd.succs.iter().any(|s| reads_ahead[*s]) || term_reads_memory(&nd.term) {
+            continue;
+        }
+        if l.edge_assigns
+            .iter()
+            .any(|((from, _), a)| *from == nd.id && a.iter().any(|(_, v)| mentions_memory(*v)))
+        {
+            continue;
+        }
+        // Walk backwards: stores before the last memory read of the node stay.
+        for (i, s) in nd.stmts.iter().enumerate().rev() {
+            if reads_memory(s) {
+                break;
+            }
+            if matches!(s, Stmt::MStore { .. } | Stmt::Copy { .. }) {
+                dead.insert((nd.id, i));
+            }
+        }
+    }
+    dead
+}
+
+// ------------------------------------------------------------------------------------------
+// Shared sub-expressions
+// ------------------------------------------------------------------------------------------
+
+/// Where an expression occurs inside a node, in evaluation order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+enum Pos {
+    Stmt(usize),
+    Term,
+    Edge,
+}
+
+/// Operator nodes in `e` (leaves and masks do not count): the cost of reading it again.
+fn weight(e: ExprId) -> usize {
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    let mut w = 0;
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 2000 {
+            continue;
+        }
+        match expr::node(x) {
+            Node::Op(op::AND, v)
+                if v.iter()
+                    .any(|a| expr::as_const(*a).is_some_and(|m| m.is_low_mask())) => {}
+            Node::Op(..) => w += 1,
+            _ => {}
+        }
+        stack.extend(expr::children(x));
+    }
+    w
+}
+
+/// An expression worth a temporary when it is used more than once: some arithmetic over at
+/// least one non-constant input (storage, balance, return data, calldata, a parameter, a
+/// variable, the environment), not reading memory (whose version semantics a temporary would
+/// hide) and not a condition.
+fn bindable(e: ExprId) -> bool {
+    if expr::is_boolean(e) || expr::is_const(e) || weight(e) < 2 {
+        return false;
+    }
+    let reads_memory = expr::contains(e, &|n| {
+        matches!(
+            n,
+            Node::MLoad(..) | Node::KeccakMem(..) | Node::CopiedWord(..) | Node::Unknown(_)
+        )
+    });
+    !reads_memory
+}
+
+/// Sub-expressions of `e` that are worth binding, with the number of times each occurs,
+/// operands before the expression that uses them and left to right (the order the source would
+/// introduce locals in). An operand of a repeated sub-expression counts once per repetition.
+///
+/// Storage keys and hashes are left whole (a bound key would lose the slot's name), and so is
+/// the ABI packing of an `encoded` word: its shifts, ors and masks are what the printer undoes
+/// to show the arguments, so only the arguments themselves are candidates.
+fn bindable_subexprs(e: ExprId, encoded: bool, out: &mut Vec<(ExprId, usize)>) {
+    fn go(x: ExprId, encoded: bool, depth: usize, out: &mut Vec<(ExprId, usize)>) {
+        if depth > 64 {
+            return;
+        }
+        let packing = encoded
+            && matches!(expr::node(x), Node::Op(o, _) if matches!(o, op::OR | op::SHL | op::SHR | op::AND | op::MUL | op::DIV))
+            && expr::children(x)
+                .iter()
+                .any(|c| expr::as_const(*c).is_some());
+        match expr::node(x) {
+            Node::SLoad(..) | Node::Keccak(..) | Node::KeccakMem(..) => return,
+            _ => {}
+        }
+        for c in expr::children(x) {
+            go(c, packing, depth + 1, out);
+        }
+        if !packing && bindable(x) {
+            match out.iter_mut().find(|(y, _)| *y == x) {
+                Some((_, n)) => *n += 1,
+                None => out.push((x, 1)),
+            }
+        }
+    }
+    go(e, encoded, 0, out);
+}
+
+/// Expressions a terminator evaluates, apart from memory addressing: `(expression, encoded)`.
+fn term_reads(t: &Term) -> Vec<(ExprId, bool)> {
+    match t {
+        Term::Branch { cond, .. } => vec![(*cond, false)],
+        Term::Return { data: Some(d), .. } | Term::Revert { data: Some(d), .. } => {
+            d.iter().map(|w| (*w, true)).collect()
+        }
+        Term::SelfDestruct(a) => vec![(*a, false)],
+        Term::InternalReturn(vals) => vals.iter().map(|v| (*v, false)).collect(),
+        _ => vec![],
+    }
+}
+
+/// The `Var`s an expression reads.
+fn vars_in(e: ExprId) -> HashSet<ExprId> {
+    let mut out = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        if matches!(expr::node(x), Node::Var(_)) {
+            out.insert(x);
+        }
+        stack.extend(expr::children(x));
+    }
+    out
+}
+
+/// Expressions a statement evaluates, as `(expression, encoded)`: assignment targets, memory
+/// addressing, storage keys and packed-field writes are left out, as is a statement the printer
+/// drops. `encoded` marks ABI-packed payload words.
+fn stmt_reads(s: &Stmt, names: &Names) -> Vec<(ExprId, bool)> {
+    let plain = |v: &[ExprId]| v.iter().map(|e| (*e, false)).collect::<Vec<_>>();
+    let words = |v: &[ExprId]| v.iter().map(|e| (*e, true)).collect::<Vec<_>>();
+    match s {
+        Stmt::Assign { value, .. } => vec![(*value, false)],
+        Stmt::Drop(_) | Stmt::Copy { .. } => vec![],
+        Stmt::MStore { val, .. } => vec![(*val, true)],
+        Stmt::SStore { key, val, .. } => {
+            if emit::packed_write(*key, *val).is_some() {
+                vec![]
+            } else {
+                vec![(*val, false)]
+            }
+        }
+        Stmt::Log { topics, data, .. } => {
+            let mut v = plain(topics);
+            if let Some(d) = data {
+                v.extend(words(d));
+            }
+            v
+        }
+        Stmt::Call {
+            gas,
+            addr,
+            value,
+            input,
+            input_head,
+            ..
+        } => {
+            let mut v = vec![(*gas, false), (*addr, false)];
+            if let Some(x) = value {
+                v.push((*x, false));
+            }
+            match input {
+                Some(w) => v.extend(words(w)),
+                None => v.extend(words(input_head)),
+            }
+            v
+        }
+        Stmt::Create {
+            value, salt, init, ..
+        } => {
+            let mut v = vec![(*value, false)];
+            if let Some(x) = salt {
+                v.push((*x, false));
+            }
+            if let Some(d) = init {
+                v.extend(words(d));
+            }
+            v
+        }
+        Stmt::Internal { args, .. } => plain(args),
+        Stmt::Require { cond, data, .. } => {
+            if emit::is_hidden_require(*cond, data.as_deref(), names) {
+                vec![]
+            } else {
+                let mut v = vec![(*cond, false)];
+                if let Some(d) = data {
+                    v.extend(words(d));
+                }
+                v
+            }
+        }
+    }
+}
+
+/// Sequence numbers of the calls, creations and helper calls whose results `e` reads.
+fn result_seqs(e: ExprId) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        match expr::node(x) {
+            Node::CallResult(s)
+            | Node::CreateResult(s)
+            | Node::ReturnData(s, _)
+            | Node::IntRet(s, _) => {
+                out.insert(s);
+            }
+            _ => {}
+        }
+        stack.extend(expr::children(x));
+    }
+    out
+}
+
+/// Nearest common dominator of `nodes`.
+fn common_dominator(g: &Graph, nodes: &[usize]) -> usize {
+    let chain = |mut x: usize| -> Vec<usize> {
+        let mut v = vec![x];
+        while let Some(d) = g.idom[x] {
+            if d == x {
+                break;
+            }
+            v.push(d);
+            x = d;
+        }
+        v
+    };
+    let mut common = chain(nodes[0]);
+    for n in &nodes[1..] {
+        let c = chain(*n);
+        common.retain(|x| c.contains(x));
+    }
+    common[0]
+}
+
+/// The newest storage generation an expression's loads (of storage or of the balance) carry:
+/// the expression was evaluated while that generation was current.
+fn newest_gen(e: ExprId) -> u32 {
+    let mut g = 0;
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        match expr::node(x) {
+            Node::SLoad(_, _, v) | Node::Env(op::SELFBALANCE, v) => g = g.max(v),
+            _ => {}
+        }
+        stack.extend(expr::children(x));
+    }
+    g
+}
+
+/// Would evaluating `e` at the end of node `d` give the value every frontier use reads? True
+/// when nothing between `d` and those uses can change what `e` reads: every store or call on
+/// the way comes after the loads `e` carries (its generation is at least theirs, so the loaded
+/// values predate it), no variable `e` reads is assigned, and none of the results it reads is
+/// produced on the way.
+fn available_at(
+    l: &Lifted,
+    g: &Graph,
+    names: &Names,
+    d: usize,
+    frontier: &[(usize, Pos)],
+    e: ExprId,
+) -> bool {
+    let reads = vars_in(e);
+    let seqs = result_seqs(e);
+    let loaded = newest_gen(e);
+    // Nodes strictly between `d` and the frontier: reachable from `d`, reaching a frontier node.
+    let mut from_d = HashSet::new();
+    let mut stack: Vec<usize> = l.nodes[d].succs.clone();
+    while let Some(x) = stack.pop() {
+        if x == d || !from_d.insert(x) || from_d.len() > 5000 {
+            continue;
+        }
+        stack.extend(l.nodes[x].succs.iter().copied());
+    }
+    let mut to_front = HashSet::new();
+    let mut stack: Vec<usize> = frontier.iter().map(|(n, _)| *n).collect();
+    while let Some(x) = stack.pop() {
+        if !to_front.insert(x) || to_front.len() > 5000 {
+            continue;
+        }
+        if x != d {
+            stack.extend(g.preds[x].iter().copied());
+        }
+    }
+    let clean_stmt = |s: &Stmt| match s {
+        Stmt::SStore { gen, .. } | Stmt::Create { gen, .. } => *gen >= loaded,
+        Stmt::Call { gen, seq, .. } => gen.is_none_or(|g| g >= loaded) && !seqs.contains(seq),
+        Stmt::Internal {
+            callee, seq, gen, ..
+        } => {
+            (names.pure_callees.contains(callee) || gen.is_none_or(|g| g >= loaded))
+                && !seqs.contains(seq)
+        }
+        Stmt::Assign { var, .. } => !reads.contains(var),
+        _ => true,
+    };
+    let clean_edges = |x: usize| {
+        l.edge_assigns
+            .iter()
+            .filter(|((from, _), _)| *from == x)
+            .all(|(_, assigns)| assigns.iter().all(|(v, _)| !reads.contains(v)))
+    };
+    if !clean_edges(d) {
+        return false;
+    }
+    for &x in from_d.intersection(&to_front) {
+        if x == d {
+            continue;
+        }
+        let use_pos = frontier
+            .iter()
+            .filter(|(n, _)| *n == x)
+            .map(|(_, p)| *p)
+            .min();
+        let passes_on = frontier
+            .iter()
+            .any(|(u, _)| *u != x && from_d.contains(u) && reaches_within(l, x, *u, &from_d));
+        let limit = match (use_pos, passes_on) {
+            (Some(Pos::Stmt(i)), false) => i,
+            _ => l.nodes[x].stmts.len(),
+        };
+        if let Some(bad) = l.nodes[x].stmts[..limit].iter().find(|s| !clean_stmt(s)) {
+            if std::env::var("EVMDEC_DEBUG_BIND").is_ok() {
+                eprintln!(
+                    "[bind]   node {} blocks hoisting: {}",
+                    x,
+                    emit::fmt_stmt(bad, &Names::default())
+                );
+            }
+            return false;
+        }
+        if limit == l.nodes[x].stmts.len() && !clean_edges(x) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Does `a` reach `b` (through a's successors onward)?
+fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack: Vec<usize> = l.nodes[a].succs.clone();
+    while let Some(x) = stack.pop() {
+        if x == b {
+            return true;
+        }
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        stack.extend(l.nodes[x].succs.iter().copied());
+    }
+    false
+}
+
+/// Does `a` reach `b` through nodes of `within` (a's successors onward)?
+fn reaches_within(l: &Lifted, a: usize, b: usize, within: &HashSet<usize>) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack: Vec<usize> = l.nodes[a].succs.clone();
+    while let Some(x) = stack.pop() {
+        if x == b {
+            return true;
+        }
+        if !within.contains(&x) || !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        stack.extend(l.nodes[x].succs.iter().copied());
+    }
+    false
+}
+
+/// Bind sub-expressions that several statements evaluate to temporaries, defined where the first
+/// of them runs, the way the source held them in locals. A binding is made only where the
+/// first use dominates every other use and none of the variables it reads is reassigned on the
+/// way, so each use still denotes the same value; the printed code then also keeps the value a
+/// later store or call would otherwise appear to change.
+fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
+    let g = Graph::new(l);
+    let debug = std::env::var("EVMDEC_DEBUG_BIND").is_ok();
+    // Every bindable sub-expression with the positions that evaluate it, and the order in
+    // which the sub-expressions were first met.
+    let mut uses: HashMap<ExprId, Vec<(usize, Pos)>> = HashMap::new();
+    let mut count: HashMap<ExprId, usize> = HashMap::new();
+    let mut first_seen: HashMap<ExprId, usize> = HashMap::new();
+    let mut note = |(e, encoded): (ExprId, bool), at: (usize, Pos)| {
+        let mut subs = Vec::new();
+        bindable_subexprs(e, encoded, &mut subs);
+        for (x, k) in subs {
+            let n = first_seen.len();
+            first_seen.entry(x).or_insert(n);
+            *count.entry(x).or_default() += k;
+            let v = uses.entry(x).or_default();
+            if !v.contains(&at) {
+                v.push(at);
+            }
+        }
+    };
+    for nd in &l.nodes {
+        if !g.reachable[nd.id] {
+            continue;
+        }
+        for (i, st) in nd.stmts.iter().enumerate() {
+            for e in stmt_reads(st, names) {
+                note(e, (nd.id, Pos::Stmt(i)));
+            }
+        }
+        for e in term_reads(&nd.term) {
+            note(e, (nd.id, Pos::Term));
+        }
+    }
+    let mut edge_keys: Vec<(usize, usize)> = l.edge_assigns.keys().copied().collect();
+    edge_keys.sort_unstable();
+    for key in edge_keys {
+        if g.reachable[key.0] {
+            for (_, v) in &l.edge_assigns[&key] {
+                note((*v, false), (key.0, Pos::Edge));
+            }
+        }
+    }
+    // Variables assigned in each node: on its outgoing edges (phi copies), and by its explicit
+    // assignments with their statement index.
+    let mut edge_assigned: Vec<HashSet<ExprId>> = vec![HashSet::new(); l.nodes.len()];
+    for ((from, _), assigns) in &l.edge_assigns {
+        edge_assigned[*from].extend(assigns.iter().map(|(v, _)| *v));
+    }
+    let mut stmt_assigned: Vec<Vec<(usize, ExprId)>> = vec![Vec::new(); l.nodes.len()];
+    for nd in &l.nodes {
+        for (i, st) in nd.stmts.iter().enumerate() {
+            if let Stmt::Assign { var, .. } = st {
+                stmt_assigned[nd.id].push((i, *var));
+            }
+        }
+    }
+    let order = |at: &(usize, Pos)| (g.rpo_index[at.0], at.1);
+    let mut plan: Vec<(usize, Pos, ExprId)> = Vec::new();
+    for (e, mut at) in uses {
+        if count[&e] < 2 {
+            continue;
+        }
+        at.sort_by_key(order);
+        let dominated_by = |f: usize, pos: Pos, (u, p): &(usize, Pos)| {
+            (*u != f && g.dominates(f, *u)) || (*u == f && *p > pos)
+        };
+        let (f, pos) = at[0];
+        let (f, pos) = if at[1..].iter().all(|u| dominated_by(f, pos, u)) {
+            (f, pos)
+        } else {
+            // The first use does not reach every other use: bind at the end of the nearest
+            // common dominator when the value is the same there.
+            let nodes: Vec<usize> = at.iter().map(|(n, _)| *n).collect();
+            let d = common_dominator(&g, &nodes);
+            let frontier: Vec<(usize, Pos)> = at
+                .iter()
+                .copied()
+                .filter(|u| !at.iter().any(|v| v != u && dominated_by(v.0, v.1, u)))
+                .collect();
+            if d == f || !available_at(l, &g, names, d, &frontier, e) {
+                if debug {
+                    eprintln!(
+                        "[bind] skip {} (dominator {} not usable; uses {:?})",
+                        emit::fmt_expr(e, &Names::default()),
+                        d,
+                        at
+                    );
+                }
+                continue;
+            }
+            (d, Pos::Term)
+        };
+        // A variable the expression reads must not change between the binding and a use. An
+        // assignment in node `x` after the binding clobbers when a use follows it: later in `x`,
+        // or in another node reachable from `x` (the binding node itself excepted: a path back
+        // to it recomputes the binding before its uses run; phi copies on an edge are
+        // simultaneous with the uses on that edge).
+        let reads = vars_in(e);
+        if !reads.is_empty() {
+            let mut seen = HashSet::new();
+            let mut stack: Vec<usize> = vec![f];
+            let mut clobbered = false;
+            while let Some(x) = stack.pop() {
+                if !seen.insert(x) || seen.len() > 5000 {
+                    continue;
+                }
+                let later_use = |p: Pos| {
+                    at.iter().any(|(u, q)| {
+                        (*u == x && *q > p) || (*u != x && *u != f && reaches(l, x, *u))
+                    })
+                };
+                let by_stmt = stmt_assigned[x].iter().any(|(i, v)| {
+                    reads.contains(v)
+                        && (x != f || Pos::Stmt(*i) >= pos)
+                        && later_use(Pos::Stmt(*i))
+                });
+                let by_edge =
+                    edge_assigned[x].iter().any(|v| reads.contains(v)) && later_use(Pos::Edge);
+                if by_stmt || by_edge {
+                    clobbered = true;
+                    break;
+                }
+                stack.extend(l.nodes[x].succs.iter().copied());
+            }
+            if clobbered {
+                if debug {
+                    eprintln!(
+                        "[bind] skip {} (a variable it reads is reassigned before a use)",
+                        emit::fmt_expr(e, &Names::default())
+                    );
+                }
+                continue;
+            }
+        }
+        plan.push((f, pos, e));
+    }
+    if plan.is_empty() {
+        return l.clone();
+    }
+    plan.sort_by_key(|(f, pos, e)| (g.rpo_index[*f], *pos, first_seen[e]));
+    let mut out = l.clone();
+    let mut next_var: u32 = 0;
+    for nd in &l.nodes {
+        for e in crate::lift::node_exprs(nd) {
+            let mut seen = HashSet::new();
+            let mut stack = vec![e];
+            while let Some(x) = stack.pop() {
+                if !seen.insert(x) || seen.len() > 20_000 {
+                    continue;
+                }
+                if let Node::Var(v) = expr::node(x) {
+                    next_var = next_var.max(v + 1);
+                }
+                stack.extend(expr::children(x));
+            }
+        }
+    }
+    for assigns in l.edge_assigns.values() {
+        for (v, _) in assigns {
+            if let Node::Var(k) = expr::node(*v) {
+                next_var = next_var.max(k + 1);
+            }
+        }
+    }
+    // Original statement index -> number of bindings inserted before it, per node.
+    let mut inserted: Vec<Vec<usize>> = vec![Vec::new(); l.nodes.len()];
+    // Expressions already bound, in binding order: an expression bound later is rewritten with
+    // each earlier binding in turn, the way the statements were.
+    let mut bound: Vec<(Node, ExprId)> = Vec::new();
+    for (f, pos, e) in plan {
+        let mut e = e;
+        for (target, var) in &bound {
+            e = expr::substitute(
+                e,
+                &|n| if n == target { Some(*var) } else { None },
+                &mut HashMap::new(),
+            );
+        }
+        if bound.iter().any(|(t, _)| *t == expr::node(e)) || !bindable(e) {
+            continue;
+        }
+        if debug {
+            eprintln!(
+                "[bind] node {} {:?}: {}",
+                f,
+                pos,
+                emit::fmt_expr(e, &Names::default())
+            );
+        }
+        let var = expr::intern(Node::Var(next_var));
+        next_var += 1;
+        let at = match pos {
+            Pos::Stmt(i) => i + inserted[f].iter().filter(|k| **k <= i).count(),
+            Pos::Term | Pos::Edge => out.nodes[f].stmts.len(),
+        };
+        if let Pos::Stmt(i) = pos {
+            inserted[f].push(i);
+        }
+        out.nodes[f]
+            .stmts
+            .insert(at, Stmt::Assign { var, value: e });
+        let target = expr::node(e);
+        bound.push((target.clone(), var));
+        let sub = |x: ExprId| {
+            expr::substitute(
+                x,
+                &|n| if *n == target { Some(var) } else { None },
+                &mut HashMap::new(),
+            )
+        };
+        for u in 0..out.nodes.len() {
+            if !g.reachable[u] || !g.dominates(f, u) {
+                continue;
+            }
+            let first = if u == f { at + 1 } else { 0 };
+            let node = &mut out.nodes[u];
+            for st in node.stmts.iter_mut().skip(first) {
+                *st = crate::lift::map_stmt(st, &sub);
+            }
+            node.term = crate::lift::map_term(&node.term, &sub);
+        }
+        for ((from, _), assigns) in out.edge_assigns.iter_mut() {
+            if g.reachable[*from] && g.dominates(f, *from) {
+                for (_, v) in assigns.iter_mut() {
+                    *v = sub(*v);
+                }
+            }
+        }
+    }
+    out
 }
 
 const DUP_LIMIT: usize = 6;
@@ -657,9 +1762,27 @@ impl<'a> Printer<'a> {
         true
     }
 
+    /// Make the stored values of the nodes dominating `n` print as their slots in `n`.
+    fn refresh_forwarded(&self, n: usize) {
+        let mut fw = self.names.forwarded.borrow_mut();
+        fw.clear();
+        for (node, name, val) in &self.stored {
+            if *node != n && self.g.dominates(*node, n) {
+                fw.insert(*val, name.clone());
+            }
+        }
+    }
+
     fn stmts(&mut self, n: usize, depth: usize) {
         self.names.end_block();
+        self.refresh_forwarded(n);
         let mut dead = emit::dead_memory_stores(&self.l.nodes[n].stmts);
+        dead.extend(
+            self.dead_stores
+                .iter()
+                .filter(|(node, _)| *node == n)
+                .map(|(_, i)| *i),
+        );
         let folded = encoded_bytes_logs(&self.l.nodes[n].stmts);
         for f in &folded {
             dead.extend(f.hidden.iter().copied());
@@ -677,15 +1800,15 @@ impl<'a> Printer<'a> {
             // the old value in a temporary and print those reads under it from here on.
             if let Some(stale) = self.stale_plan.get(&(n, i)) {
                 let (loads, tmp) = (stale.clone(), stale[0].1.clone());
-                let key = match s {
-                    Stmt::SStore { key, .. } => *key,
-                    _ => unreachable!("stale plan entries are stores"),
+                let (what, _) =
+                    overwrites(s, self.names).expect("stale plan entries overwrite something");
+                let current = match what {
+                    Overwritten::Slot(key) => {
+                        emit::fmt_slot(key, self.names, emit::SlotSpace::Persistent)
+                    }
+                    Overwritten::Balance => "address(this).balance".to_string(),
                 };
-                let def = format!(
-                    "uint256 {} = {};",
-                    tmp,
-                    emit::fmt_slot(key, self.names, emit::SlotSpace::Persistent)
-                );
+                let def = format!("uint256 {} = {};", tmp, current);
                 self.line(depth, &def);
                 for (e, t) in loads {
                     self.names.stale.borrow_mut().insert(e, t);
@@ -710,6 +1833,23 @@ impl<'a> Printer<'a> {
             }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
+            // From here on the stored value reads as the slot (until the slot is stored again).
+            if let Stmt::SStore {
+                key,
+                val,
+                transient: false,
+                ..
+            } = s
+            {
+                let name = emit::fmt_slot(*key, self.names, emit::SlotSpace::Persistent);
+                self.stored.retain(|(_, nm, _)| *nm != name);
+                let mut fw = self.names.forwarded.borrow_mut();
+                fw.retain(|_, nm| *nm != name);
+                if !expr::is_const(*val) && weight(*val) >= 1 {
+                    self.stored.push((n, name.clone(), *val));
+                    fw.insert(*val, name);
+                }
+            }
         }
     }
 
@@ -1103,6 +2243,17 @@ impl<'a> Printer<'a> {
             self.transfer(n, f, stop, depth);
             return;
         };
+        // `if (c) { return true; } else { return false; }` of a bool function: `return c;`.
+        if let Some(txt) = self.try_bool_return(cond, t, f) {
+            self.line(depth, &txt);
+            return;
+        }
+        // Both sides do the same thing (the compiler split on returndatasize to copy return
+        // data nobody reads): print one of them, without the condition.
+        if self.same_side(t, f) {
+            self.transfer(n, t, stop, depth);
+            return;
+        }
         // Conditional assignment: `if (c) { v = X } else { v = Y }` with nothing else happening.
         if let Some(j) = join {
             if let Some(txt) = self.try_ternary(n, cond, t, f, j) {
@@ -1168,6 +2319,168 @@ impl<'a> Printer<'a> {
             }
         }
         self.active.remove(&n);
+    }
+
+    /// Statements of `n` the printer would show.
+    fn visible_stmts(&self, n: usize) -> Vec<&Stmt> {
+        let dead = emit::dead_memory_stores(&self.l.nodes[n].stmts);
+        self.l.nodes[n]
+            .stmts
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                !dead.contains(i)
+                    && !self.dead_stores.contains(&(n, *i))
+                    && !matches!(s, Stmt::Drop(_))
+                    && !matches!(s, Stmt::Require { cond, data, .. } if emit::is_hidden_require(*cond, data.as_deref(), self.names))
+            })
+            .map(|(_, s)| s)
+            .collect()
+    }
+
+    /// The node `n` stands for once empty nodes that only jump on are skipped.
+    fn skip_empty(&self, mut n: usize) -> usize {
+        for _ in 0..8 {
+            let has_edges = self
+                .l
+                .edge_assigns
+                .iter()
+                .any(|((from, _), a)| *from == n && !a.is_empty());
+            match self.l.nodes[n].term {
+                Term::Jump(t) if self.visible_stmts(n).is_empty() && !has_edges => n = t,
+                _ => break,
+            }
+        }
+        n
+    }
+
+    /// Do nodes `a` and `b` print the same and continue the same way?
+    fn same_side(&self, a: usize, b: usize) -> bool {
+        self.same_side_depth(a, b, 3)
+    }
+
+    fn same_side_depth(&self, a: usize, b: usize, depth: usize) -> bool {
+        let (a, b) = (self.skip_empty(a), self.skip_empty(b));
+        if a == b {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        let (na, nb) = (&self.l.nodes[a], &self.l.nodes[b]);
+        let same_term = match (&na.term, &nb.term) {
+            (Term::Jump(x), Term::Jump(y)) => x == y || self.same_side_depth(*x, *y, depth - 1),
+            // The same test with the same outcomes (copies of a revert node included).
+            (
+                Term::Branch {
+                    cond: c1,
+                    t: t1,
+                    f: f1,
+                },
+                Term::Branch {
+                    cond: c2,
+                    t: t2,
+                    f: f2,
+                },
+            ) => {
+                c1 == c2
+                    && match (t1, t2) {
+                        (Some(x), Some(y)) => x == y || self.same_side_depth(*x, *y, depth - 1),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                    && (f1 == f2 || self.same_side_depth(*f1, *f2, depth - 1))
+            }
+            (x, y) if na.succs.is_empty() && nb.succs.is_empty() => {
+                format!("{x:?}") == format!("{y:?}")
+            }
+            _ => false,
+        };
+        if !same_term {
+            return false;
+        }
+        let (sa, sb) = (self.visible_stmts(a), self.visible_stmts(b));
+        if sa.len() != sb.len()
+            || sa
+                .iter()
+                .zip(&sb)
+                .any(|(x, y)| format!("{x:?}") != format!("{y:?}"))
+        {
+            return false;
+        }
+        let edges = |x: usize| -> Vec<(ExprId, ExprId)> {
+            let mut v: Vec<(ExprId, ExprId)> = self
+                .l
+                .edge_assigns
+                .iter()
+                .filter(|((from, _), _)| *from == x)
+                .flat_map(|(_, a)| a.iter().copied())
+                .collect();
+            v.sort();
+            v
+        };
+        edges(a) == edges(b)
+    }
+
+    /// `return (c)` / `return (!c)` for a branch whose two sides return the constants of a
+    /// single `bool` result and nothing else.
+    fn try_bool_return(&self, cond: ExprId, t: usize, f: usize) -> Option<String> {
+        if self.names.bool_returns.as_slice() != [true] {
+            return None;
+        }
+        if std::env::var("EVMDEC_DEBUG_FOLD").is_ok() {
+            eprintln!(
+                "[fold] bool return sides {} {:?} {:?} / {} {:?} {:?}",
+                t,
+                self.l.nodes[t].stmts,
+                self.l.nodes[t].term,
+                f,
+                self.l.nodes[f].stmts,
+                self.l.nodes[f].term
+            );
+        }
+        let as_flag = |e: ExprId| match expr::as_const(e) {
+            Some(c) if c.is_zero() => Some(false),
+            Some(c) if c == U256::ONE => Some(true),
+            _ => None,
+        };
+        fn flag(
+            p: &Printer,
+            n: usize,
+            depth: usize,
+            as_flag: &dyn Fn(ExprId) -> Option<bool>,
+        ) -> Option<bool> {
+            if depth == 0 || !p.visible_stmts(n).is_empty() {
+                return None;
+            }
+            match &p.l.nodes[n].term {
+                Term::InternalReturn(v) if v.len() == 1 => as_flag(v[0]),
+                // An empty node jumping on to a return: the constant is handed over as a phi
+                // copy on the edge, or the return node holds it itself.
+                Term::Jump(x) => {
+                    let handed = match &p.l.nodes[*x].term {
+                        Term::InternalReturn(v) if v.len() == 1 => {
+                            p.l.edge_assigns
+                                .get(&(n, *x))
+                                .and_then(|a| a.iter().find(|(var, _)| *var == v[0]))
+                                .and_then(|(_, val)| as_flag(*val))
+                        }
+                        _ => None,
+                    };
+                    handed.or_else(|| flag(p, *x, depth - 1, as_flag))
+                }
+                _ => None,
+            }
+        }
+        let flag = |n: usize| flag(self, n, 3, &as_flag);
+        match (flag(t)?, flag(f)?) {
+            (true, false) => Some(format!("return ({});", emit::fmt_cond(cond, self.names))),
+            (false, true) => Some(format!(
+                "return ({});",
+                emit::fmt_cond(expr::op1(op::ISZERO, cond), self.names)
+            )),
+            _ => None,
+        }
     }
 
     /// Edge copies of a side that is either the join itself or a statement-free node jumping to it.
@@ -1341,6 +2654,8 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         used,
         facts: Vec::new(),
         stale_plan: plan_stale_loads(l, names),
+        stored: Vec::new(),
+        dead_stores: stores_dead_until_exit(l),
     };
     names.stale.borrow_mut().clear();
     p.go(l.entry, None, base_depth);
@@ -1387,6 +2702,8 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             active: HashSet::new(),
             facts: Vec::new(),
             stale_plan: std::mem::take(&mut p.stale_plan),
+            stored: Vec::new(),
+            dead_stores: std::mem::take(&mut p.dead_stores),
         };
         names.stale.borrow_mut().clear();
         p2.go(l.entry, None, base_depth);
@@ -1475,9 +2792,13 @@ fn drop_empty_once(text: &str) -> String {
 
 /// Structured rendering of `l`, indented by `indent` (a multiple of four spaces); the
 /// counterpart of [`emit::fmt_flat`].
+/// Structured rendering of a lifted unit, after re-rolling peeled first iterations and binding
+/// shared sub-expressions to temporaries (`structure` alone does neither).
 pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
     let depth = indent.len() / 4;
-    structure(l, n, depth).text
+    let rolled = reroll_peeled_loops(l);
+    let bound = bind_shared(&rolled, n);
+    structure(&bound, n, depth).text
 }
 
 #[allow(dead_code)]

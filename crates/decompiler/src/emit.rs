@@ -7,7 +7,7 @@ use crate::opcode as op;
 use crate::sigs;
 use crate::u256::U256;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// How many small slots the hashed-slot table covers.
@@ -152,6 +152,9 @@ pub struct Names {
     /// Loads that read a slot's value from before a store printed earlier on the path: printed
     /// under the temporary that saved that value. Filled by the structurer as it prints.
     pub stale: RefCell<HashMap<ExprId, String>>,
+    /// The value just stored to a slot, printed as the slot while no later store intervenes:
+    /// the compiler forwards the stored value instead of reloading it. Filled by the structurer.
+    pub forwarded: RefCell<HashMap<ExprId, String>>,
     /// Number of temporaries handed out so far (names stay unique across blocks).
     pub temp_seq: RefCell<u32>,
     /// Sequence numbers renamed to small indices.
@@ -166,6 +169,16 @@ pub struct Names {
     pub temps: RefCell<Vec<(String, String)>>,
     /// Expression -> temporary name, for expressions already hoisted.
     pub temp_of: RefCell<HashMap<ExprId, String>>,
+    /// Entry pcs of internal functions without side effects (view/pure): a call to one does
+    /// not move ether, whatever the lifter's conservative storage model assumed.
+    pub pure_callees: HashSet<usize>,
+    /// Expressions known to be booleans beyond their shape: results of helpers that return
+    /// `bool`.
+    pub bools: HashSet<ExprId>,
+    /// Packed storage fields of type `bool`: (slot, byte offset, bits).
+    pub bool_fields: HashSet<(U256, u32, u32)>,
+    /// Which of the current function's return positions (declaration order) are `bool`.
+    pub bool_returns: Vec<bool>,
     /// Rendered text and precedence of the expressions printed so far.
     pub memo: RefCell<HashMap<ExprId, (String, u8)>>,
 }
@@ -334,6 +347,9 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     if let Some(a) = n.stale.borrow().get(&e) {
         return a.clone();
     }
+    if let Some(a) = n.forwarded.borrow().get(&e) {
+        return a.clone();
+    }
     if let Some(t) = n.temp_of.borrow().get(&e) {
         return t.clone();
     }
@@ -493,9 +509,45 @@ fn is_abi_validator(cond: ExprId) -> bool {
     (is_param(v[0]) && cleaned(v[0], v[1])) || (is_param(v[1]) && cleaned(v[1], v[0]))
 }
 
+/// A `require` the printer leaves out: an ABI decoder validator (the parameter type says it),
+/// or, on solc >= 0.8, the compiler's own overflow / division-by-zero panic.
+pub fn is_hidden_require(cond: ExprId, data: Option<&[ExprId]>, n: &Names) -> bool {
+    if is_abi_validator(cond) {
+        return true;
+    }
+    if !n.hide_checked {
+        return false;
+    }
+    let Some(words) = data else {
+        return false;
+    };
+    if words.len() < 2 || leading_selector(words[0], None) != Some(SEL_PANIC) {
+        return false;
+    }
+    let len = 4 + 32 * (words.len() - 1);
+    matches!(
+        expr::as_const(shifted_word_len(words, 0, Some(len))),
+        Some(c) if c == U256::from_u64(PANIC_OVERFLOW) || c == U256::from_u64(PANIC_DIV_BY_ZERO)
+    )
+}
+
+/// Selector of `Panic(uint256)`.
+const SEL_PANIC: u32 = 0x4e487b71;
+/// `Panic` code for arithmetic overflow.
+const PANIC_OVERFLOW: u64 = 0x11;
+/// `Panic` code for division by zero.
+const PANIC_DIV_BY_ZERO: u64 = 0x12;
+
+/// Is `e` boolean-valued: by its shape, as a helper's `bool` result, or as a `bool` field?
+pub fn is_bool(e: ExprId, n: &Names) -> bool {
+    expr::is_boolean(e)
+        || n.bools.contains(&e)
+        || packed_read(e).is_some_and(|(k, off, bits)| n.bool_fields.contains(&(k, off, bits)))
+}
+
 /// A condition as a boolean: `x` when boolean-valued, `x != 0` otherwise.
 pub fn fmt_cond(cond: ExprId, n: &Names) -> String {
-    if expr::is_boolean(cond) {
+    if is_bool(cond, n) {
         fmt_expr(cond, n)
     } else {
         format!("{} != 0", fmt_prec(cond, P_EQ + 1, n))
@@ -885,6 +937,14 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             if let Node::Op(io, iv) = expr::node(a) {
                 match io {
                     op::EQ => {
+                        if let Some((b, truth)) = bool_against_const(iv[0], iv[1], n) {
+                            // `!(b == 1)` is `!b`; `!(b == 0)` is `b`.
+                            return if truth {
+                                (format!("!{}", fmt_prec(b, P_UNARY, n)), P_UNARY)
+                            } else {
+                                (fmt_prec(b, P_PRIMARY, n), P_PRIMARY)
+                            };
+                        }
                         return (
                             format!(
                                 "{} != {}",
@@ -892,7 +952,7 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                                 fmt_eq_rhs(iv[0], iv[1], P_EQ + 1, n)
                             ),
                             P_EQ,
-                        )
+                        );
                     }
                     op::LT => {
                         return (
@@ -943,11 +1003,13 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                 }
             }
             if let Node::Op(op::ISZERO, iv) = expr::node(a) {
-                if !expr::is_boolean(iv[0]) {
+                if !is_bool(iv[0], n) {
                     return (format!("{} != 0", fmt_prec(iv[0], P_EQ + 1, n)), P_EQ);
                 }
+                // `!!b` of a boolean is `b`.
+                return (fmt_prec(iv[0], P_PRIMARY, n), P_PRIMARY);
             }
-            if expr::is_boolean(a) {
+            if is_bool(a, n) {
                 (format!("!{}", fmt_prec(a, P_UNARY, n)), P_UNARY)
             } else {
                 (format!("{} == 0", fmt_prec(a, P_EQ + 1, n)), P_EQ)
@@ -1051,15 +1113,24 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                 P_CMP,
             ),
         },
-        (op::EQ, 2) => (
-            format!(
-                "{} == {}",
-                fmt_prec(v[0], P_EQ + 1, n),
-                fmt_eq_rhs(v[0], v[1], P_EQ + 1, n)
-            ),
-            P_EQ,
-        ),
-        (op::AND, 2) if expr::is_boolean(v[0]) && expr::is_boolean(v[1]) => (
+        (op::EQ, 2) => {
+            if let Some((b, truth)) = bool_against_const(v[0], v[1], n) {
+                return if truth {
+                    (fmt_prec(b, P_PRIMARY, n), P_PRIMARY)
+                } else {
+                    (format!("!{}", fmt_prec(b, P_UNARY, n)), P_UNARY)
+                };
+            }
+            (
+                format!(
+                    "{} == {}",
+                    fmt_prec(v[0], P_EQ + 1, n),
+                    fmt_eq_rhs(v[0], v[1], P_EQ + 1, n)
+                ),
+                P_EQ,
+            )
+        }
+        (op::AND, 2) if is_bool(v[0], n) && is_bool(v[1], n) => (
             format!(
                 "{} && {}",
                 fmt_prec(v[0], P_AND, n),
@@ -1067,7 +1138,7 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             ),
             P_AND,
         ),
-        (op::OR, 2) if expr::is_boolean(v[0]) && expr::is_boolean(v[1]) => (
+        (op::OR, 2) if is_bool(v[0], n) && is_bool(v[1], n) => (
             format!(
                 "{} || {}",
                 fmt_prec(v[0], P_OR, n),
@@ -1190,6 +1261,24 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
     }
 }
 
+/// `b == 1` / `b == 0` with `b` boolean-valued: the boolean and whether the comparison holds
+/// when it is true.
+fn bool_against_const(a: ExprId, b: ExprId, n: &Names) -> Option<(ExprId, bool)> {
+    for (x, c) in [(a, b), (b, a)] {
+        if let Some(k) = expr::as_const(c) {
+            if is_bool(x, n) && !expr::is_const(x) {
+                if k == U256::ONE {
+                    return Some((x, true));
+                }
+                if k.is_zero() {
+                    return Some((x, false));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Right-hand side of a comparison, annotating selectors.
 fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
     if is_selector_expr(lhs) {
@@ -1262,7 +1351,7 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, kind: Payload
                     return format!("\"{}\"", s);
                 }
             }
-            if sel == 0x4e487b71 && words.len() >= 2 {
+            if sel == SEL_PANIC && words.len() >= 2 {
                 if let Some(code) = expr::as_const(shifted_word_len(words, 0, lenu)) {
                     return format!("Panic({})", panic_name(code.low_u64()));
                 }
@@ -1480,7 +1569,18 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             if !n.fields.is_empty() && !*transient {
                 if let Some((k, off, bits, value)) = packed_write(*key, *val) {
                     if let Some(name) = n.fields.get(&(k, off, bits)) {
-                        return format!("{} = {};", name, fmt_expr(value, n));
+                        let shown = match expr::as_const(value) {
+                            Some(c) if n.bool_fields.contains(&(k, off, bits)) && c.is_zero() => {
+                                "false".to_string()
+                            }
+                            Some(c)
+                                if n.bool_fields.contains(&(k, off, bits)) && c == U256::ONE =>
+                            {
+                                "true".to_string()
+                            }
+                            _ => fmt_expr(value, n),
+                        };
+                        return format!("{} = {};", name, shown);
                     }
                 }
             }
@@ -1804,10 +1904,20 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
             if vals.is_empty() {
                 "return;".into()
             } else {
+                // Values are deepest first; `bool_returns` is in declaration order.
+                let k = vals.len();
                 format!(
                     "return ({});",
                     vals.iter()
-                        .map(|v| fmt_expr(*v, n))
+                        .enumerate()
+                        .map(|(j, v)| {
+                            let is_bool_pos = n.bool_returns.get(k - 1 - j).copied() == Some(true);
+                            match expr::as_const(*v) {
+                                Some(c) if is_bool_pos && c.is_zero() => "false".to_string(),
+                                Some(c) if is_bool_pos && c == U256::ONE => "true".to_string(),
+                                _ => fmt_expr(*v, n),
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join(", ")
                 )

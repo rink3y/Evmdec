@@ -56,11 +56,27 @@ oracle, so the accuracy claim below is measured, not asserted.
   pre-0.4 modified function, which the compiler reaches both by falling through and by a jump
   with a return address, is shown once, inline, not again as a helper. A constant that is a
   precomputed `keccak256(slot) ± k` resolves to that array (`tokens[tokens.length - 1]`), a
-  packed field cleared with a mask prints as `field = 0`, and an event whose data is the ABI
+  packed field cleared with a mask prints as `field = false`, and an event whose data is the ABI
   encoding of calldata prints as `emit E(..., abi.encode(msg.data))` with `msg.sig` named.
+  Values the source held in locals come back as locals: a sub-expression several statements
+  evaluate (`stake / 100 * percent`, a quoted amount used in a check, a transfer and an event)
+  is bound once to a temporary, at the first use or at the nearest point that dominates every
+  use when nothing in between can change what it reads, so the value a function computed before
+  an external call or a store is not re-read after it. `address(this).balance` carries the same
+  generation as storage, so a balance read before a payment stays the old balance afterwards
+  (`prev_balance`), and the value just stored to a slot prints as the slot while no later store
+  intervenes (`emit Updated(total)` rather than the expression stored). Helpers that return only
+  comparisons or the constants 0/1 return `bool` (`require(inBounds(x))`, `return a <= b;`),
+  parameters used as call targets are `address`, `bool` fields print `true`/`false` and `!flag`,
+  a public getter with a known signature names the variable it returns (`balanceOf`,
+  `totalSupply`, `swapFee`), two branches that do the same thing print once (the compiler's
+  `returndatasize` split around a dropped return value), and a first loop iteration that
+  control-flow recovery ran on its own is folded back into the loop when it provably is one
+  iteration (`for (i = 0; i < steps; i++)` instead of an unrolled copy before a `while`).
   A dictionary of ~1,280 function, event and error
   signatures (selectors computed with the built-in keccak, so every entry is correct) names what
-  it can; everything else is named by selector.
+  it can; the full public signature database can be installed as one local file (see *Quick
+  start*); everything else is named by selector.
 * **Security report.** 40+ rules over the lifted IR (not opcode patterns): reentrancy (ETH or
   token hook before a storage write; a guard counts only when a slot is tested before the call,
   set on entry and restored to a constant afterwards, whether the release writes the slot or
@@ -88,11 +104,26 @@ oracle, so the accuracy claim below is measured, not asserted.
   are ranked by severity and then confidence, a callee the function first looks up in storage
   (`require(isBound[token])`) is a registry entry rather than a caller-chosen contract, checking
   a token's `transfer` result is not "trusting the callee", loops over a storage counter the
-  contract caps at a constant are informational, and lock-protected call-then-write paths are
-  reported once for the contract rather than once per function, the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked
+  contract caps at a constant are informational, lock-protected call-then-write paths are
+  reported once for the contract rather than once per function, and a call into an address held
+  in storage that no runtime code writes (fixed at deployment) is informational rather than a
+  reentrancy risk. What counts as an access check is decided per contract: `msg.sender == owner`
+  always; a test of `mapping[msg.sender]` only when the mapping is a *role*, that is, every
+  function writing it is itself gated (by an owner comparison, by another role, or by the same
+  mapping, as a multi-owner wallet is) or nothing writes it at runtime. A test of a stake or
+  balance mapping anyone can fill is accounting, not authorisation, so the reentrancy behind it
+  stays at full severity and the function does not count as privileged. Also: a `transferFrom`
+  whose result is neither decoded nor read through a copy, followed in the same function by
+  ether or tokens to the caller or a credit to a caller-keyed balance (`unchecked-token-pull`:
+  with a token that returns `false` the payout is free), a payout computed from balances and the
+  caller's input with a division and no caller-supplied minimum (`no-slippage-bound`), a
+  required payment to a stored or constant address next to the caller's payout
+  (`fixed-payee-can-block`), the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked
   ether, unprotected upgrades,
   proxy detection (EIP-1967 / beacon / ZeppelinOS / EIP-1167 / storage-slot) with on-chain
-  implementation resolution, known compiler bugs for the detected solc version. Rules look
+  implementation resolution, known compiler bugs for the detected solc version (a bug that needs
+  transient storage or calldata copies is dropped when the bytecode has none, and one whose
+  trigger the bytecode cannot show, such as `--via-ir` or inline assembly, is informational). Rules look
   through internal helpers (a call in a shared `_safeTransfer` is attributed to every external
   function that reaches it, with the helper's arguments substituted and its memory replayed, so
   `transferFrom(arg1, …)` is seen with the caller's actual `from`), and findings are folded per
@@ -104,8 +135,9 @@ oracle, so the accuracy claim below is measured, not asserted.
   Two passes read across functions. *Access control by intent*: when several state-changing
   functions compare `msg.sender` against the same slot, that is the contract's policy, and a
   state-changing function without the check that still does what the gated ones do (sends ether
-  to a stored address, self-destructs, delegatecalls a stored address, writes a slot otherwise
-  written only behind the check) is reported as `inconsistent-access-control`. *Attack chains*:
+  to a stored address or delegatecalls one when some gated function does the same,
+  self-destructs, writes a slot otherwise written only behind the check; an initializer's writes
+  do not define the policy) is reported as `inconsistent-access-control`. *Attack chains*:
   a write anyone can make (`owner = msg.sender`, `payee = arg0`) is paired with the function
   that trusts the written slot (an owner-only drain, a payout to `payee`) into one
   `attack-chain` finding with the two steps spelled out; chains open only while a contract is
@@ -290,7 +322,7 @@ mainnet contracts above:
 | | |
 |---|---|
 | known bugs found | **23 / 23** (Nomad's bug is an upgrade-time state error outside bytecode patterns and is listed but not counted) |
-| high/critical findings on the 22 audited contracts | 34, almost all on contracts whose purpose is to execute caller-supplied calls (Multicall3, 1inch, Gnosis Safe, Seaport) |
+| high/critical findings on the 22 audited contracts | 29, almost all on contracts whose purpose is to execute caller-supplied calls (Multicall3, 1inch, Gnosis Safe, Seaport) |
 
 The analyzer is heuristic: findings are leads with a confidence level, and the audited corpus is
 the running false-positive budget for every rule change.

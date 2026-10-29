@@ -207,6 +207,8 @@ pub struct ProxyRef {
 /// the whole thing lands in `Contract::source`.
 pub fn decompile(code: &[u8], opts: &Options) -> Contract {
     let t0 = std::time::Instant::now();
+    // No code (an account without a contract) decompiles as a contract that only stops.
+    let code: &[u8] = if code.is_empty() { &[op::STOP] } else { code };
     let info = metadata::analyze(code);
     let mut c = decompile_runtime(&info.runtime, &info, opts);
     if info.kind == CodeKind::Creation && !info.constructor.is_empty() {
@@ -802,7 +804,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         selectors: selectors_called,
     } = inventories(&functions, layout, &string_slots);
     name_storage_from_getters(&functions, &mut storage);
-    for st in scan_strings(code, code_end) {
+    for st in scan_strings(code, code_end, &embedded_ranges) {
         if !strings.iter().any(|x| x.contains(&st)) {
             strings.push(st);
         }
@@ -835,10 +837,16 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         .filter(|f| f.kind == FnKind::Internal)
         .map(|f| (f.pc, f.returns.clone()))
         .collect();
+    let array_resizers: HashSet<usize> = functions
+        .iter()
+        .filter(|f| f.kind == FnKind::Internal && f.lifted.as_ref().is_some_and(is_array_resizer))
+        .map(|f| f.pc)
+        .collect();
     for f in functions.iter_mut() {
         let mut names = make_names(f, &storage, layout, &loaders, &callee_returns);
         names.hide_checked = solc08;
         names.pure_callees = pure_callees.clone();
+        names.array_resizers = array_resizers.clone();
         let l = f
             .lifted
             .as_ref()
@@ -1023,6 +1031,156 @@ fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
     out
 }
 
+/// Element value types of mappings and dynamic arrays, from how their entries are written and
+/// read: an entry written as `| 1` / `& ~0xff` and read through an 8-bit mask is a `bool`, one
+/// written or read through a 160-bit mask an `address`, a narrower one `uintN`.
+fn element_types(functions: &[Function]) -> HashMap<U256, String> {
+    // root -> (write widths, constants written, a non-0/1 write seen, read widths). Writes
+    // decide when there are any: a read mask may be ABI packing (`uint32(x)` of an address
+    // straddling two payload words), a write mask never is.
+    let mut seen: HashMap<U256, (BTreeSet<u32>, Vec<U256>, bool, BTreeSet<u32>)> = HashMap::new();
+    let width_of = |mask: U256| -> Option<u32> {
+        let cleared = !mask;
+        cleared.is_low_mask().then(|| cleared.bits())
+    };
+    for f in functions {
+        let Some(l) = &f.lifted else { continue };
+        for nd in &l.nodes {
+            for s in &nd.stmts {
+                let Stmt::SStore {
+                    key,
+                    val,
+                    transient: false,
+                    ..
+                } = s
+                else {
+                    continue;
+                };
+                let Some(root) = emit::element_root(*key) else {
+                    continue;
+                };
+                let keeps = |e: ExprId| -> Option<u32> {
+                    let Node::Op(op::AND, w) = expr::node(e) else {
+                        return None;
+                    };
+                    for (a, b) in [(w[0], w[1]), (w[1], w[0])] {
+                        if let (Node::SLoad(k, false, _), Some(m)) =
+                            (expr::node(a), expr::as_const(b))
+                        {
+                            if k == *key {
+                                return width_of(m);
+                            }
+                        }
+                    }
+                    None
+                };
+                let (bits, value) = match expr::node(*val) {
+                    Node::Op(op::OR, v) => match (keeps(v[1]), keeps(v[0])) {
+                        (Some(b), _) => (b, Some(v[0])),
+                        (_, Some(b)) => (b, Some(v[1])),
+                        _ => continue,
+                    },
+                    _ => match keeps(*val) {
+                        Some(b) => (b, None),
+                        None => continue,
+                    },
+                };
+                let e = seen.entry(root).or_default();
+                e.0.insert(bits);
+                match value.map(expr::as_const) {
+                    None => e.1.push(U256::ZERO),
+                    Some(Some(c)) if c.is_zero() || c == U256::ONE => e.1.push(c),
+                    Some(_) => e.2 = true,
+                }
+            }
+            for e in lift::node_exprs(nd) {
+                let mut stack = vec![e];
+                let mut visited = HashSet::new();
+                while let Some(x) = stack.pop() {
+                    if !visited.insert(x) || visited.len() > 20_000 {
+                        continue;
+                    }
+                    if let Node::Op(op::AND, v) = expr::node(x) {
+                        for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                            if let (Node::SLoad(k, false, _), Some(m)) =
+                                (expr::node(a), expr::as_const(b))
+                            {
+                                if m.is_low_mask() {
+                                    if let Some(root) = emit::element_root(k) {
+                                        seen.entry(root).or_default().3.insert(m.bits());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    stack.extend(expr::children(x));
+                }
+            }
+        }
+    }
+    seen.into_iter()
+        .filter_map(|(root, (writes, consts, other, reads))| {
+            let widths = if writes.is_empty() { reads } else { writes };
+            let w = *widths.iter().next()?;
+            if widths.len() != 1 {
+                return None;
+            }
+            let ty = if w == 8 && !other && consts.contains(&U256::ONE) {
+                "bool".to_string()
+            } else if w == 160 {
+                "address".to_string()
+            } else if w < 256 && w % 8 == 0 {
+                format!("uint{}", w)
+            } else {
+                return None;
+            };
+            Some((root, ty))
+        })
+        .collect()
+}
+
+/// Element type of an array or mapping type string (`address[]` -> `address`,
+/// `mapping(address => bool)` -> `bool`), when it is a concrete value type.
+fn element_type(ty: &str) -> Option<String> {
+    let t = if let Some(elem) = ty.strip_suffix("[]") {
+        elem
+    } else if ty.starts_with("mapping(") {
+        ty.rsplit("=> ").next()?.trim_end_matches(')')
+    } else {
+        return None;
+    };
+    (t == "bool" || t == "address" || (t.starts_with("uint") && t != "uint256"))
+        .then(|| t.to_string())
+}
+
+/// The compiler's array-resize helper: `old = sload(slot); sstore(slot, n);` then, when the
+/// array shrinks, the dropped elements are zeroed. Two parameters, the slot and the new length,
+/// the slot stored to directly.
+fn is_array_resizer(l: &Lifted) -> bool {
+    let k = l.ret_slot.map(|k| k as usize).unwrap_or(l.n_args);
+    let is_arg = |e: ExprId| matches!(expr::node(e), Node::Arg(i) if (i as usize) < k);
+    let mut stores_arg_to_arg = false;
+    let mut clears = false;
+    for nd in &l.nodes {
+        for s in &nd.stmts {
+            match s {
+                Stmt::SStore { key, val, .. } if is_arg(*key) && is_arg(*val) => {
+                    stores_arg_to_arg = true;
+                }
+                Stmt::SStore { key, val, .. }
+                    if expr::as_const(*val) == Some(U256::ZERO) && !expr::is_const(*key) =>
+                {
+                    clears = true;
+                }
+                Stmt::Internal { .. } => clears = true,
+                Stmt::Call { .. } | Stmt::Log { .. } | Stmt::Create { .. } => return false,
+                _ => {}
+            }
+        }
+    }
+    k == 2 && stores_arg_to_arg && clears
+}
+
 /// A public getter whose signature is known names the variable it returns: a function that only
 /// reads one slot (or one packed field, or one mapping entry keyed by its parameter) and returns
 /// it gives that slot its name.
@@ -1080,23 +1238,25 @@ fn name_storage_from_getters(functions: &[Function], storage: &mut [StorageVar])
         let [word] = returned.as_slice() else {
             continue;
         };
-        // Strip a type mask.
-        let word = match expr::node(*word) {
+        // Strip a bool test (`x != 0`) and a type mask.
+        let mut word = *word;
+        if let Node::Op(op::ISZERO, v) = expr::node(word) {
+            if let Node::Op(op::ISZERO, w) = expr::node(v[0]) {
+                word = w[0];
+            }
+        }
+        let word = match expr::node(word) {
             Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
             Node::Op(op::AND, v) if expr::as_const(v[0]).is_some_and(|m| m.is_low_mask()) => v[1],
-            _ => *word,
+            _ => word,
         };
         let field = emit::packed_read(word);
         let root: Option<U256> = match (field, expr::node(word)) {
             (Some((k, _, _)), _) => Some(k),
             (None, Node::SLoad(key, false, _)) => match expr::node(key) {
-                Node::Const(k) => Some(k),
-                // A mapping entry: the small constant among the hashed words is the slot.
-                Node::Keccak(words, _) => words
-                    .iter()
-                    .filter_map(|w| expr::as_const(*w))
-                    .find(|c| c.bits() <= 32),
-                _ => None,
+                Node::Const(k) => emit::hashed_slot(k).map(|(s, _)| s).or(Some(k)),
+                // A mapping entry or array element: the root slot of the key.
+                _ => emit::element_root(key),
             },
             _ => None,
         };
@@ -1123,9 +1283,11 @@ fn name_storage_from_getters(functions: &[Function], storage: &mut [StorageVar])
             }
             None => {
                 // A getter of the bare slot of an array returns its length, not the array.
+                let bare =
+                    matches!(expr::node(word), Node::SLoad(key, false, _) if expr::is_const(key));
                 if !var.name.starts_with("stor_")
                     || !var.fields.is_empty()
-                    || var.ty.ends_with("[]")
+                    || (bare && var.ty.ends_with("[]"))
                 {
                     continue;
                 }
@@ -1154,6 +1316,27 @@ pub fn make_names(
         n.params.insert(p.index, p.name.clone());
     }
     n.bool_returns = f.returns.iter().map(|t| t == "bool").collect();
+    // Call results are numbered by the order of their calls in the function, the same for every
+    // reader of these names (the printer and the analyzer's evidence lines).
+    if let Some(l) = &f.lifted {
+        let mut seqs: Vec<u32> = l
+            .nodes
+            .iter()
+            .flat_map(|nd| nd.stmts.iter())
+            .filter_map(|st| match st {
+                Stmt::Call { seq, .. } | Stmt::Create { seq, .. } | Stmt::Internal { seq, .. } => {
+                    Some(*seq)
+                }
+                _ => None,
+            })
+            .collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        let mut m = n.seqs.borrow_mut();
+        for (i, sq) in seqs.iter().enumerate() {
+            m.insert(*sq, i as u32 + 1);
+        }
+    }
     if let Some(l) = &f.lifted {
         // Internal units: Arg(i) below the return slot k are the parameters, last pushed on top.
         let k = l.ret_slot.map(|k| k as usize).unwrap_or(l.n_args);
@@ -1176,6 +1359,12 @@ pub fn make_names(
             n.storage.insert(slot, s.name.clone());
             if s.ty.ends_with("[]") && s.fixed_array {
                 n.array_bases.insert(slot);
+            }
+            if s.ty.ends_with("[]") && !s.fixed_array {
+                n.dyn_arrays.insert(slot);
+            }
+            if let Some(t) = element_type(&s.ty) {
+                n.elem_types.insert(slot, t);
             }
             for fld in &s.fields {
                 n.fields
@@ -1342,14 +1531,27 @@ fn inventories(
                     }
                 }
             }
+            // Init code of a deployed contract is bytes, not this contract's string constants.
+            let init_words: HashSet<expr::ExprId> = nd
+                .stmts
+                .iter()
+                .filter_map(|s| match s {
+                    Stmt::Create { init: Some(w), .. } => Some(w.iter().copied()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
             for e in lift::node_exprs(nd) {
                 collect_sloads(e, &mut slots, vyper, &bases);
-                collect_strings(e, &mut strings);
+                if !init_words.contains(&e) {
+                    collect_strings(e, &mut strings);
+                }
                 collect_fields(e, &mut fields);
             }
         }
     }
     let _ = names;
+    let elem_types = element_types(functions);
     let storage: Vec<StorageVar> = slots
         .into_iter()
         .map(|(slot, (reads, writes, tys))| {
@@ -1380,9 +1582,22 @@ fn inventories(
                         3
                     }
                 });
-                v.into_iter()
+                let picked = v
+                    .into_iter()
                     .next()
-                    .unwrap_or_else(|| "uint256".to_string())
+                    .unwrap_or_else(|| "uint256".to_string());
+                // The element type the accesses show (`bool` flags, `address` entries).
+                match elem_types.get(&slot) {
+                    Some(t) if picked.ends_with("[]") => format!("{}[]", t),
+                    Some(t) if picked.starts_with("mapping(") => {
+                        let head = picked.rsplit_once("=> ").map(|(h, _)| h.to_string());
+                        match head {
+                            Some(h) => format!("{}=> {})", h, t),
+                            None => picked,
+                        }
+                    }
+                    _ => picked,
+                }
             };
             let name = if slot.bits() <= 32 {
                 format!("stor_{}", slot.to_decimal())
@@ -1764,7 +1979,8 @@ fn collect_sloads(
 /// and loaded with CODECOPY by older compilers).
 /// Printable `PUSH` immediates (string constants a compiler placed in code), whole immediates
 /// only, so that fragments straddling instruction boundaries are not reported.
-fn scan_strings(code: &[u8], code_end: usize) -> Vec<String> {
+/// `skip` lists embedded code regions as `(offset, length)`.
+fn scan_strings(code: &[u8], code_end: usize, skip: &[(usize, usize)]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let end = code_end.min(code.len());
     // A string longer than 32 bytes is pushed in 32-byte pieces a few instructions apart: a
@@ -1772,6 +1988,10 @@ fn scan_strings(code: &[u8], code_end: usize) -> Vec<String> {
     let mut pending: Option<(String, usize)> = None;
     let insns = crate::disasm::disassemble(&code[..end]);
     for (idx, insn) in insns.iter().enumerate() {
+        // Embedded creation code (and its metadata) is data here, not this contract's strings.
+        if skip.iter().any(|(o, l)| insn.pc >= *o && insn.pc < *o + *l) {
+            continue;
+        }
         let Some(imm) = insn.imm else { continue };
         let mut size = insn.opcode as usize - 0x5f;
         // `PUSHn x; PUSH1 k; SHL`: the optimizer's form of a left-aligned short piece.

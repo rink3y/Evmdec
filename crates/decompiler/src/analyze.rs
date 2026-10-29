@@ -216,6 +216,12 @@ struct Ctx<'a> {
     /// An ordinary external function copies calldata to memory (calldata arrays or tuples
     /// passed on, re-encoded).
     calldata_copies: bool,
+    /// Constant slots written by external functions without an access check (helpers
+    /// included), with the names of those functions: what anyone can change.
+    unguarded_writers: HashMap<U256, Vec<String>>,
+    /// Of those, the slots some unguarded function increments (`length + 1`): arrays anyone
+    /// can add an entry to.
+    unguarded_extenders: HashMap<U256, Vec<String>>,
 }
 
 /// Constant-offset memory writes of a unit: `(offset, length)` with `None` for an unknown length.
@@ -532,6 +538,128 @@ fn from_caller(e: ExprId) -> bool {
 }
 fn is_const_addr(e: ExprId) -> bool {
     expr::as_const(e).is_some()
+}
+
+/// Does `e` depend on msg.sender: directly, through a phi variable whose every incoming value
+/// does, or through the result of a call whose payload named msg.sender (`crops(msg.sender)`,
+/// a registry mapping the caller to its account)?
+fn caller_derived(l: &Lifted, events: &[Event], e: ExprId, depth: usize) -> bool {
+    if from_caller(e) {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        match expr::node(x) {
+            Node::Var(_) => {
+                let incoming: Vec<ExprId> = l
+                    .edge_assigns
+                    .values()
+                    .flatten()
+                    .filter(|(v, _)| *v == x)
+                    .map(|(_, val)| *val)
+                    .collect();
+                if !incoming.is_empty()
+                    && incoming
+                        .iter()
+                        .all(|v| caller_derived(l, events, *v, depth - 1))
+                {
+                    return true;
+                }
+            }
+            Node::ReturnData(sq, _) => {
+                let fed_by_caller = events.iter().any(|ev| match &ev.stmt {
+                    Some(Stmt::Call {
+                        seq,
+                        input,
+                        input_head,
+                        ..
+                    }) if *seq == sq => input
+                        .as_ref()
+                        .map_or(input_head.as_slice(), |w| w.as_slice())
+                        .iter()
+                        .any(|w| from_caller(*w)),
+                    _ => false,
+                });
+                if fed_by_caller {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        stack.extend(expr::children(x));
+    }
+    false
+}
+
+/// Is `addr` a contract this function deployed from its own code (a `CREATE` whose init code
+/// was copied out of the running bytecode)? Such a callee is as trusted as the contract itself.
+fn self_deployed(events: &[Event], addr: ExprId) -> bool {
+    let addr = match expr::node(addr) {
+        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
+        Node::Op(op::AND, v) if expr::as_const(v[0]).is_some_and(|m| m.is_low_mask()) => v[1],
+        _ => addr,
+    };
+    let Node::CreateResult(sq) = expr::node(addr) else {
+        return false;
+    };
+    let created_at = events
+        .iter()
+        .position(|ev| matches!(&ev.stmt, Some(Stmt::Create { seq, .. }) if *seq == sq));
+    match created_at {
+        Some(i) => events[..i].iter().any(|ev| {
+            matches!(
+                &ev.stmt,
+                Some(Stmt::Copy {
+                    kind: op::CODECOPY,
+                    ..
+                })
+            )
+        }),
+        None => false,
+    }
+}
+
+/// The dynamic storage array an expression indexes into (`stor_4[i]` reads
+/// `sload(keccak256(4) + i)`): its root slot.
+fn array_root_of(e: ExprId) -> Option<U256> {
+    let mut found = None;
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if found.is_some() || !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        if let Node::SLoad(key, false, _) = expr::node(x) {
+            match expr::node(key) {
+                Node::Const(c) => found = emit::hashed_slot(c).map(|(s, _)| s),
+                Node::Op(op::ADD, v) => {
+                    for a in v {
+                        match expr::node(a) {
+                            Node::Keccak(w, _) if w.len() == 1 => {
+                                found = expr::as_const(w[0]).filter(|c| c.bits() <= 32)
+                            }
+                            Node::Const(c) => {
+                                if let Some((s, _)) = emit::hashed_slot(c) {
+                                    found = Some(s);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        stack.extend(expr::children(x));
+    }
+    found
 }
 
 /// Is `e` an address read from storage that no runtime code writes (a slot or packed field set
@@ -1328,8 +1456,49 @@ pub fn analyze(c: &Contract) -> Report {
         field_writes: HashSet::new(),
         transient_storage: false,
         calldata_copies: false,
+        unguarded_writers: HashMap::new(),
+        unguarded_extenders: HashMap::new(),
     };
     ctx.roles = role_mappings(&ctx);
+    for f in c
+        .functions
+        .iter()
+        .filter(|f| f.kind == FnKind::External && f.lifted.is_some())
+    {
+        if any_caller_check(&ctx, f) {
+            continue;
+        }
+        let Some(l) = &f.lifted else { continue };
+        let mut written: HashSet<U256> = HashSet::new();
+        let mut grown: HashSet<U256> = HashSet::new();
+        for ev in events_of(&ctx, l, 5, false) {
+            if let Some(Stmt::SStore {
+                key,
+                val,
+                transient: false,
+                ..
+            }) = &ev.stmt
+            {
+                if let Some(k) = expr::as_const(*key) {
+                    written.insert(k);
+                    // `slot = slot + c`: the slot grows (an array gets an entry).
+                    if let Node::Op(op::ADD, v) = expr::node(*val) {
+                        if v.iter().any(|x| reads_slot(*x, *key))
+                            && v.iter().any(|x| expr::as_const(*x).is_some())
+                        {
+                            grown.insert(k);
+                        }
+                    }
+                }
+            }
+        }
+        for k in written {
+            ctx.unguarded_writers.entry(k).or_default().push(fname(f));
+        }
+        for k in grown {
+            ctx.unguarded_extenders.entry(k).or_default().push(fname(f));
+        }
+    }
     for f in &c.functions {
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
@@ -1664,28 +1833,22 @@ pub fn analyze(c: &Contract) -> Report {
                         });
                         let hook = selector.is_some_and(|s| CALLBACK_SELECTORS.contains(&s));
                         if later_write && !precompile {
-                            let (sev, conf, extra) = if guarded_slot(i).is_some() {
-                                (Severity::Info, Confidence::Medium, " A storage lock written before and after the call looks like a reentrancy guard, so this is reported for awareness only.")
+                            let (id, sev, conf, extra) = if guarded_slot(i).is_some() {
+                                ("reentrancy", Severity::Info, Confidence::Medium, " A storage lock written before and after the call looks like a reentrancy guard, so this is reported for awareness only.")
                             } else if fixed_in_storage(&ctx, *addr) && !hook {
-                                (Severity::Info, Confidence::Low, " The callee address is held in storage that no runtime code writes, so it was fixed at deployment: only that one contract could re-enter, and only if it is malicious or compromised.")
+                                ("reentrancy-fixed-callee", Severity::Info, Confidence::Low, " The callee address is held in storage that no runtime code writes, so it was fixed at deployment: only that one contract could re-enter, and only if it is malicious or compromised.")
+                            } else if self_deployed(&events[..i], *addr) && !hook {
+                                ("reentrancy-fixed-callee", Severity::Info, Confidence::Low, " The callee is a contract this function has just deployed from the running contract's own code, so what it does is as fixed as this contract is.")
                             } else if gas_stipend {
-                                (Severity::Low, Confidence::Medium, " The call forwards only a 2300 gas stipend (`transfer`/`send`), which limits what a reentrant callee can do.")
+                                ("reentrancy", Severity::Low, Confidence::Medium, " The call forwards only a 2300 gas stipend (`transfer`/`send`), which limits what a reentrant callee can do.")
                             } else if hook {
-                                (Severity::High, Confidence::High, " The call is a token transfer with a receiver hook (ERC721/ERC1155/ERC777 `on…Received`/`tokensReceived`), so the recipient is called with the state not yet updated.")
+                                ("reentrancy", Severity::High, Confidence::High, " The call is a token transfer with a receiver hook (ERC721/ERC1155/ERC777 `on…Received`/`tokensReceived`), so the recipient is called with the state not yet updated.")
                             } else if (value_nonzero || user_target) && caller_checked {
-                                (Severity::Medium, Confidence::Medium, " The function is behind a msg.sender check, so the re-entering callee must be, or be controlled by, an authorised account (an owner-chosen payee that is itself an owner, for instance).")
+                                ("reentrancy", Severity::Medium, Confidence::Medium, " The function is behind a msg.sender check, so the re-entering callee must be, or be controlled by, an authorised account (an owner-chosen payee that is itself an owner, for instance).")
                             } else if value_nonzero || user_target {
-                                (Severity::High, Confidence::Medium, "")
+                                ("reentrancy", Severity::High, Confidence::Medium, "")
                             } else {
-                                (Severity::Medium, Confidence::Low, "")
-                            };
-                            let id = if sev == Severity::Info
-                                && fixed_in_storage(&ctx, *addr)
-                                && guarded_slot(i).is_none()
-                            {
-                                "reentrancy-fixed-callee"
-                            } else {
-                                "reentrancy"
+                                ("reentrancy", Severity::Medium, Confidence::Low, "")
                             };
                             push(&mut findings, id, "State written after an external call (reentrancy)", sev, conf, Some(f), Some(ev.pc),
                                 format!("`{}` performs an external call to `{}` and writes storage afterwards. A malicious callee can re-enter before the state update is applied (checks-effects-interactions violated).{}", f.name, target, extra),
@@ -2134,13 +2297,38 @@ pub fn analyze(c: &Contract) -> Report {
                         ) {
                             // Per-caller accounting before the transfer: a store to a caller-keyed
                             // slot, or a check against a caller-keyed balance (`balanceOf[msg.sender] >= wad`).
-                            let caller_slot = |e: ExprId| {
-                                mentions(e, &|n| matches!(n, Node::SLoad(k, ..) if from_caller(*k)))
+                            // Variables in an inlined helper's statement belong to that helper's graph.
+                            let graph_of = |ev2: &Event| -> &Lifted {
+                                ev2.callee
+                                    .and_then(|pc| ctx.internals.get(&pc))
+                                    .and_then(|cf| cf.lifted.as_ref())
+                                    .unwrap_or(l)
+                            };
+                            let caller_slot = |e: ExprId, g: &Lifted| {
+                                let mut keys = Vec::new();
+                                let mut seen = HashSet::new();
+                                let mut stack = vec![e];
+                                while let Some(x) = stack.pop() {
+                                    if !seen.insert(x) || seen.len() > 5000 {
+                                        continue;
+                                    }
+                                    if let Node::SLoad(k, ..) = expr::node(x) {
+                                        keys.push(k);
+                                    }
+                                    stack.extend(expr::children(x));
+                                }
+                                keys.iter().any(|k| caller_derived(g, &events, *k, 3))
                             };
                             let accounted = events[..i].iter().any(|e| match (&e.stmt, &e.term) {
-                                (Some(Stmt::SStore { key, .. }), _) => from_caller(*key),
-                                (Some(Stmt::Require { cond, .. }), _) => caller_slot(*cond),
-                                (_, Some(Term::Branch { cond, .. })) => caller_slot(*cond),
+                                (Some(Stmt::SStore { key, .. }), _) => {
+                                    caller_derived(graph_of(e), &events, *key, 3)
+                                }
+                                (Some(Stmt::Require { cond, .. }), _) => {
+                                    caller_slot(*cond, graph_of(e))
+                                }
+                                (_, Some(Term::Branch { cond, .. })) => {
+                                    caller_slot(*cond, graph_of(e))
+                                }
                                 // A swap: tokens pulled from the caller pay for the ether.
                                 (
                                     Some(Stmt::Call {
@@ -2212,12 +2400,36 @@ pub fn analyze(c: &Contract) -> Report {
                             }
                         }
                         if ev.in_loop && !precompile {
-                            let (sev, note) = match loop_cap {
-                                Some(cap) => (Severity::Info, format!(" The loop runs over a storage counter the contract caps at {}, so the iteration is bounded.", cap)),
-                                None => (Severity::Low, String::new()),
-                            };
-                            push(&mut findings, "call-in-loop", "External call inside a loop", sev, Confidence::Medium, Some(f), Some(ev.pc),
-                                format!("`{}` performs an external call to `{}` inside a loop; one failing or gas-hungry callee can block the whole iteration (denial of service).{}", f.name, target, note), vec![line.clone()], "Prefer pull-payments or bound the iteration.");
+                            // The loop pays every entry of a storage array and reverts unless each
+                            // call succeeds, and some function without access control adds
+                            // entries: one entry that rejects the call blocks everyone's payout.
+                            let required = events.iter().any(|e2| match (&e2.stmt, &e2.term) {
+                                (Some(Stmt::Require { cond, .. }), _)
+                                | (_, Some(Term::Branch { cond, .. })) => mentions(
+                                    *cond,
+                                    &|n| matches!(n, Node::CallResult(s) if *s == *seq),
+                                ),
+                                _ => false,
+                            });
+                            let array = array_root_of(*addr);
+                            let extenders = array.and_then(|a| ctx.unguarded_extenders.get(&a));
+                            if let (true, true, Some(a), Some(who)) =
+                                (value_nonzero, required, array, extenders)
+                            {
+                                let array_name =
+                                    emit::fmt_slot(expr::konst(a), names, SlotSpace::Persistent);
+                                let who: Vec<&str> = who.iter().map(String::as_str).collect();
+                                push(&mut findings, "blocking-payout-loop", "A single entry can block the payout loop", Severity::Medium, Confidence::Medium, Some(f), Some(ev.pc),
+                                    format!("`{}` sends ether to every address in `{}` and reverts unless each call succeeds. {} adds entries to that array without access control, so one entry that rejects the call (an account without code, a contract without the function, or one that reverts on purpose) blocks the payout for everyone.", f.name, array_name, join_names(&who, 3)),
+                                    vec![line.clone()], "Let each member pull its share, or skip failed calls and record what is owed.");
+                            } else {
+                                let (sev, note) = match loop_cap {
+                                    Some(cap) => (Severity::Info, format!(" The loop runs over a storage counter the contract caps at {}, so the iteration is bounded.", cap)),
+                                    None => (Severity::Low, String::new()),
+                                };
+                                push(&mut findings, "call-in-loop", "External call inside a loop", sev, Confidence::Medium, Some(f), Some(ev.pc),
+                                    format!("`{}` performs an external call to `{}` inside a loop; one failing or gas-hungry callee can block the whole iteration (denial of service).{}", f.name, target, note), vec![line.clone()], "Prefer pull-payments or bound the iteration.");
+                            }
                         }
                         // ecrecover
                         if expr::as_const(*addr) == Some(U256::ONE) {
@@ -2295,18 +2507,52 @@ pub fn analyze(c: &Contract) -> Report {
         }
 
         // Terminators: selfdestruct (in the function or an inlined helper), unresolved
-        for ev in &events {
+        for (si, ev) in events.iter().enumerate() {
             let Some(Term::SelfDestruct(a)) = &ev.term else {
                 continue;
             };
             let a = *a;
             let to_caller = from_caller(a) || from_calldata(a);
             let time_guard = guard_conds(&events).into_iter().find(|c| is_time_cond(*c));
+            // Ether leaves by calls on the way to the destruct: what it forwards is what is left.
+            let paid_before = events[..si].iter().any(|e2| {
+                matches!(&e2.stmt, Some(Stmt::Call { value: Some(v), .. })
+                    if expr::as_const(*v) != Some(U256::ZERO))
+                    && ev_reaches(&ctx, l, e2, ev)
+            });
+            // A condition on storage (not on the caller or the clock) stands in front of it.
+            let state_gate = events[..si]
+                .iter()
+                .filter(|e2| ev_reaches(&ctx, l, e2, ev))
+                .filter_map(|e2| match (&e2.stmt, &e2.term) {
+                    (Some(Stmt::Require { cond, .. }), _) => Some(*cond),
+                    (_, Some(Term::Branch { cond, .. })) => Some(*cond),
+                    _ => None,
+                })
+                .find(|c| {
+                    from_storage(*c)
+                        && !from_caller(*c)
+                        && !from_calldata(*c)
+                        && !is_time_cond(*c)
+                        && !mentions(*c, &|n| matches!(n, Node::Env(op::CALLVALUE, _)))
+                });
             let (sev, conf, title) = if caller_checked {
                 (
                     Severity::Medium,
                     Confidence::Medium,
                     "Contract can self-destruct",
+                )
+            } else if to_caller && paid_before {
+                (
+                    Severity::Low,
+                    Confidence::Medium,
+                    "Self-destruct after the payout forwards the remainder to the caller",
+                )
+            } else if to_caller && state_gate.is_some() {
+                (
+                    Severity::Medium,
+                    Confidence::Medium,
+                    "Contract self-destructs to the caller once a state condition holds",
                 )
             } else if to_caller {
                 (
@@ -2323,6 +2569,19 @@ pub fn analyze(c: &Contract) -> Report {
             };
             let guard_note = if caller_checked {
                 " (behind a msg.sender check)".to_string()
+            } else if to_caller && paid_before {
+                match state_gate {
+                    Some(g) => format!(
+                        ", but only after the calls above have paid the balance out and only when `{}`: what the caller collects is the remainder",
+                        emit::fmt_cond(g, &names)
+                    ),
+                    None => ", but only after the calls above have paid the balance out: what the caller collects is the remainder".to_string(),
+                }
+            } else if let Some(g) = state_gate.filter(|_| to_caller) {
+                format!(
+                    " with no access control, once `{}` holds; whether a caller can bring that about alone decides how serious this is",
+                    emit::fmt_cond(g, &names)
+                )
             } else if let Some(g) = time_guard {
                 format!(
                     " with no access control: the only guard is the time condition `{}`, so once it holds the first caller triggers it",

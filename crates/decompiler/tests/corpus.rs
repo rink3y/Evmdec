@@ -376,7 +376,7 @@ fn old_multiowned_wallet_reads_as_source() {
         "{src}"
     );
     assert!(
-        src.contains("stor_2[stor_258[address(arg0)]]"),
+        src.contains("stor_2[isOwner[address(arg0)]]"),
         "owners[ownerIndex]"
     );
     assert!(
@@ -384,19 +384,23 @@ fn old_multiowned_wallet_reads_as_source() {
         "pending index array"
     );
     assert!(
-        src.contains("stor_260[prev_stor_260]"),
+        src.contains("stor_260[prev_stor_260_length]"),
         "pendingIndex[pending.index]"
     );
     assert!(
         !src.contains("stor_0x4c0be602"),
         "precomputed hash printed as a variable"
     );
-    // A slot read before it is incremented keeps its old value under a temporary.
-    assert!(src.contains("uint256 prev_stor_260 = stor_260;"), "{src}");
-    assert!(src.contains("stor_260 = prev_stor_260 + 1;"));
-    assert!(src.contains("require(prev_stor_260 < stor_260);"));
+    // A slot read before it is incremented keeps its old value under a temporary; the bare slot
+    // of a dynamic array is its length.
     assert!(
-        !src.contains("require(stor_260 < stor_260)"),
+        src.contains("uint256 prev_stor_260_length = stor_260.length;"),
+        "{src}"
+    );
+    assert!(src.contains("stor_260.length = prev_stor_260_length + 1;"));
+    assert!(src.contains("require(prev_stor_260_length < stor_260.length);"));
+    assert!(
+        !src.contains("require(stor_260.length < stor_260.length)"),
         "stale read printed as the slot"
     );
     // The scratch loads of the precomputed hash and no-op stores are not printed.
@@ -493,7 +497,7 @@ fn balancer_bpool_reads_as_source() {
         "encoding stores printed"
     );
     // `_tokens[_tokens.length - 1]` through the folded hash constant.
-    assert!(src.contains("stor_9[stor_9 - 1]"), "{src}");
+    assert!(src.contains("stor_9[stor_9.length - 1]"), "{src}");
     assert!(!src.contains("0x6e1540171b6c0c960b71a7020d9f60077f6af931a8bbf590da0223dacf75c7ae"));
     let r = evmdec::analyze::analyze(&c);
     // The lock is recognised: every reentrancy entry is informational.
@@ -521,4 +525,79 @@ fn balancer_bpool_reads_as_source() {
         !rq.iter().any(|f| f.starts_with("joinswapExternAmountIn")),
         "forward-quoted join must not be flagged: {rq:?}"
     );
+}
+
+/// A solc 0.4 contract (a lobby-created "tribe" on Ethereum Classic) whose `BuyIn(address)`
+/// reassigns its parameter on one path: control-flow recovery used to duplicate the whole body
+/// per path. Its `members`/`waiting` state is an `address[]` and a `mapping(address => bool)`
+/// written through the compiler's resize helper and byte masks.
+#[test]
+fn tribe_reads_as_source_and_is_rated_by_its_logic() {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/tribe.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
+    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    let src = &c.source;
+    for s in [
+        "mapping(address => bool) stor_3;",
+        "address[] stor_4;",
+        "require(!stor_3[address(v1)]);",
+        "stor_4.push(address(v1));",
+        "stor_3[address(v1)] = true;",
+        "if (stor_4.length < stor_7) {",
+        // `find`: one loop, no peeled first iteration, parameters not turned into phis.
+        "while (v1 < stor[arg0]) {",
+    ] {
+        assert!(src.contains(s), "missing {s}\n{src}");
+    }
+    // One body per function: `BuyIn` and `Refund` each self-destruct once.
+    assert_eq!(src.matches("selfdestruct(msg.sender);").count(), 2, "{src}");
+    let r = evmdec::analyze::analyze(&c);
+    // The destructs come after the payout: no Critical. The real risk is the payout loop over an
+    // array anyone can extend.
+    assert!(
+        r.findings
+            .iter()
+            .all(|f| f.severity != evmdec::analyze::Severity::Critical),
+        "{:?}",
+        r.findings
+            .iter()
+            .map(|f| (&f.id, f.severity))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.id == "blocking-payout-loop"
+                && f.severity == evmdec::analyze::Severity::Medium)
+    );
+    assert!(r
+        .findings
+        .iter()
+        .any(|f| f.id == "selfdestruct" && f.severity == evmdec::analyze::Severity::Low));
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.id == "unprotected-ether-withdrawal"),
+        "waiting[user] is the caller's accounting"
+    );
+}
+
+/// The lobby that deploys tribes from its own embedded code and calls the new contract: that
+/// callee is as fixed as the contract itself, and the embedded code's metadata is not a string.
+#[test]
+fn lobby_calls_into_its_own_deployment() {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/lobby.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
+    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    let src = &c.source;
+    assert!(src.contains("deployed_2 = create("), "{src}");
+    // The mapping entry is an address: no preserving mask.
+    assert!(src.contains("stor_0[stor_1] = deployed_2;"), "{src}");
+    assert!(c.strings.is_empty(), "{:?}", c.strings);
+    let r = evmdec::analyze::analyze(&c);
+    assert!(r
+        .findings
+        .iter()
+        .all(|f| f.severity == evmdec::analyze::Severity::Info));
+    assert!(r.findings.iter().any(|f| f.id == "reentrancy-fixed-callee"));
 }

@@ -2577,22 +2577,40 @@ fn merge_into(
     let mut changed = false;
     let el = e.state.stack.len();
     let xl = exit.stack.len();
-    // Align from the top. If the exit stack is deeper, extend the entry at the bottom with phis.
+    // Align from the top. If the exit stack is deeper, the entry's slots below its known stack
+    // are the frame's entry slots it has not touched yet: materialise them as the `Arg`s they
+    // are (in consumption order, the slot just below the known stack first). The loop below then
+    // turns each into a phi only where the exit holds something else.
     if xl > el {
         let extra = xl - el;
+        // Only when the exit holds exactly those entry slots there (the other path merely
+        // touched deeper parameters); an unbalanced join keeps the old treatment: phis.
+        let as_args: Vec<ExprId> = (0..extra)
+            .map(|i| {
+                let from_top = xl - 1 - i;
+                expr::arg((e.state.args_used + (from_top - el)) as u32)
+            })
+            .collect();
+        let exit_matches = as_args.iter().enumerate().all(|(i, a)| exit.stack[i] == *a);
         let mut new_bottom = Vec::with_capacity(extra);
         let mut new_phis = Vec::with_capacity(extra);
-        for i in 0..extra {
-            // Position from top for these: el + (extra-1-i)... simpler: key by position from top.
-            let from_top = xl - 1 - i;
-            let var = *phi_ids.entry((node, from_top)).or_insert_with(|| {
-                *next_var += 1;
-                expr::var(((node as u32) << 10) | (*next_var & 0x3ff))
-            });
-            new_bottom.push(var);
-            new_phis.push(true);
+        for (i, a) in as_args.iter().enumerate() {
+            if exit_matches {
+                new_bottom.push(*a);
+                new_phis.push(false);
+            } else {
+                let from_top = xl - 1 - i;
+                let var = *phi_ids.entry((node, from_top)).or_insert_with(|| {
+                    *next_var += 1;
+                    expr::var(((node as u32) << 10) | (*next_var & 0x3ff))
+                });
+                new_bottom.push(var);
+                new_phis.push(true);
+            }
         }
-        // new_bottom currently ordered deepest-first? i=0 is the deepest (from_top largest). Yes.
+        if exit_matches {
+            e.state.args_used += extra;
+        }
         let mut stack = new_bottom;
         stack.extend(e.state.stack.iter().copied());
         let mut phis = new_phis;

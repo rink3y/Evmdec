@@ -419,6 +419,28 @@ pub struct Sig {
     mem: Vec<(u32, SigVal)>,
 }
 
+impl Sig {
+    /// Do the two signatures place the same code addresses, whatever entry tokens each still
+    /// holds on the stack or has copied into memory (a parameter hashed from scratch memory)?
+    fn same_code_shape(&self, other: &Sig) -> bool {
+        let code = |s: &Sig| -> Vec<(u16, SigVal)> {
+            s.items
+                .iter()
+                .filter(|(_, v)| !matches!(v, SigVal::Slot(_)))
+                .copied()
+                .collect()
+        };
+        let mem = |s: &Sig| -> Vec<(u32, SigVal)> {
+            s.mem
+                .iter()
+                .filter(|(_, v)| !matches!(v, SigVal::Slot(_)))
+                .copied()
+                .collect()
+        };
+        mem(self) == mem(other) && code(self) == code(other)
+    }
+}
+
 /// How control leaves a block.
 #[derive(Clone, Debug)]
 pub enum Flow {
@@ -1307,9 +1329,28 @@ impl<'a> Analysis<'a> {
                 return id;
             }
             let list = per_block.entry(blk).or_default();
+            // A context that differs from an existing one of this block only in which entry
+            // tokens still sit on the stack (a parameter reassigned on one path, a loop variable
+            // started from a parameter) is the same code: fold into that node and let the lifter
+            // merge the values. Code addresses and memory tokens must agree exactly.
+            let height = |a: &AState| a.stack.len() as isize - a.consumed as isize;
+            if let Some(&id) = list.iter().find(|id| {
+                let existing = &nodes[**id].entry;
+                height(existing) == height(st) && existing.sig(prog).same_code_shape(&key.1)
+            }) {
+                return id;
+            }
             if list.len() >= MAX_BLOCK_CONTEXTS {
                 // Context limit: fold into the first node of this block.
                 return list[0];
+            }
+            if std::env::var("EVMDEC_DEBUG_CTX").is_ok() && !list.is_empty() {
+                eprintln!(
+                    "[ctx] block {:#x}: new context {:?} vs existing {:?}",
+                    prog.blocks[blk].start,
+                    key.1,
+                    nodes[list[0]].entry.sig(prog)
+                );
             }
             let id = nodes.len();
             list.push(id);

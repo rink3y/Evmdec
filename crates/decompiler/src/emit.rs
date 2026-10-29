@@ -179,6 +179,13 @@ pub struct Names {
     pub bool_fields: HashSet<(U256, u32, u32)>,
     /// Which of the current function's return positions (declaration order) are `bool`.
     pub bool_returns: Vec<bool>,
+    /// Root slots of dynamic storage arrays: the bare slot is the array's length.
+    pub dyn_arrays: std::collections::HashSet<U256>,
+    /// Element value type of mappings and arrays, by root slot: `bool`, `address`, `uintN`.
+    pub elem_types: HashMap<U256, String>,
+    /// Entry pcs of the compiler's array-resize helpers (`slot.length = n`, clearing the
+    /// dropped elements).
+    pub array_resizers: std::collections::HashSet<usize>,
     /// Rendered text and precedence of the expressions printed so far.
     pub memo: RefCell<HashMap<ExprId, (String, u8)>>,
 }
@@ -543,6 +550,18 @@ pub fn is_bool(e: ExprId, n: &Names) -> bool {
     expr::is_boolean(e)
         || n.bools.contains(&e)
         || packed_read(e).is_some_and(|(k, off, bits)| n.bool_fields.contains(&(k, off, bits)))
+        || bool_element(e, n)
+}
+
+/// A read of a mapping or array element whose declared type is `bool` (masked or not).
+fn bool_element(e: ExprId, n: &Names) -> bool {
+    let load = element_typed_load(e, n).unwrap_or(e);
+    match expr::node(load) {
+        Node::SLoad(key, false, _) => element_root(key)
+            .and_then(|r| n.elem_types.get(&r))
+            .is_some_and(|t| t == "bool"),
+        _ => false,
+    }
 }
 
 /// A condition as a boolean: `x` when boolean-valued, `x != 0` otherwise.
@@ -740,6 +759,108 @@ pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)
     None
 }
 
+/// A write of a mapping or array element of known width that keeps the slot's other bytes
+/// (`x | slot & 0xff..00`, or `slot & 0xff..00` for zero): the root slot and the value written.
+/// Only when the element's declared type fills exactly the cleared bytes, so that the kept bytes
+/// are known to be zero and the mask is noise.
+pub fn element_write(key: ExprId, val: ExprId, n: &Names) -> Option<(U256, ExprId)> {
+    let root = element_root(key)?;
+    let ty = n.elem_types.get(&root)?;
+    let width_bits: u32 = match ty.as_str() {
+        "bool" => 8,
+        "address" => 160,
+        t => t.strip_prefix("uint")?.parse().ok()?,
+    };
+    let keeps = |e: ExprId| -> bool {
+        match expr::node(e) {
+            Node::Op(op::AND, w) => {
+                let (load, mask) = match (expr::node(w[0]), expr::as_const(w[1])) {
+                    (Node::SLoad(k, false, _), Some(m)) if k == key => (true, m),
+                    _ => match (expr::node(w[1]), expr::as_const(w[0])) {
+                        (Node::SLoad(k, false, _), Some(m)) if k == key => (true, m),
+                        _ => (false, U256::ZERO),
+                    },
+                };
+                load && !mask == expr::mask_bits(width_bits)
+            }
+            _ => false,
+        }
+    };
+    match expr::node(val) {
+        Node::Op(op::OR, v) if keeps(v[1]) => Some((root, v[0])),
+        Node::Op(op::OR, v) if keeps(v[0]) => Some((root, v[1])),
+        _ if keeps(val) => Some((root, expr::konst(U256::ZERO))),
+        _ => None,
+    }
+}
+
+/// `element & mask` where the element's declared type is exactly `mask` wide: the bare load.
+fn element_typed_load(e: ExprId, n: &Names) -> Option<ExprId> {
+    let Node::Op(op::AND, v) = expr::node(e) else {
+        return None;
+    };
+    for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+        let (Node::SLoad(key, false, _), Some(m)) = (expr::node(a), expr::as_const(b)) else {
+            continue;
+        };
+        if !m.is_low_mask() {
+            continue;
+        }
+        let root = element_root(key)?;
+        let ty = n.elem_types.get(&root)?;
+        let width: u32 = match ty.as_str() {
+            "bool" => 8,
+            "address" => 160,
+            t => t.strip_prefix("uint")?.parse().ok()?,
+        };
+        if m.bits() == width {
+            return Some(a);
+        }
+    }
+    None
+}
+
+/// Root slot of a mapping entry or dynamic array element key.
+pub fn element_root(key: ExprId) -> Option<U256> {
+    match expr::node(key) {
+        Node::Keccak(words, 0) if words.len() == 2 => words
+            .iter()
+            .find_map(|w| expr::as_const(*w).filter(|c| c.bits() <= 32)),
+        Node::Keccak(words, 0) if words.len() == 1 => expr::as_const(words[0]),
+        Node::Op(op::ADD, v) => v.iter().find_map(|a| match expr::node(*a) {
+            Node::Keccak(w, 0) if w.len() == 1 => expr::as_const(w[0]),
+            Node::Const(c) => hashed_slot(c).map(|(s, _)| s),
+            _ => None,
+        }),
+        Node::Const(c) => hashed_slot(c).map(|(s, _)| s),
+        _ => None,
+    }
+}
+
+/// The name of constant slot `s` as the base of an element access (never `.length`).
+fn slot_name(s: U256, n: &Names, prefix: &str) -> String {
+    if let Some(name) = n.storage.get(&s) {
+        return name.clone();
+    }
+    if s.bits() <= 32 {
+        format!("{}_{}", prefix, s.to_decimal())
+    } else {
+        format!("{}_{}", prefix, s.to_hex())
+    }
+}
+
+/// The base of an element access: a constant slot by name, anything else rendered as a slot.
+fn base_name(e: ExprId, n: &Names, space: SlotSpace) -> String {
+    let prefix = match space {
+        SlotSpace::Persistent => "stor",
+        SlotSpace::Transient => "tstor",
+    };
+    match expr::as_const(e) {
+        Some(c) if hashed_slot(c).is_none() => slot_name(c, n, prefix),
+        _ => fmt_slot(e, n, space),
+    }
+}
+
 /// Render a storage key: a named variable or `stor_N` for a constant, `name[key]` for mapping and
 /// array elements, `name.fieldN` for struct fields.
 pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
@@ -749,10 +870,13 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
     };
     if let Some(c) = expr::as_const(e) {
         if let Some(name) = n.storage.get(&c) {
+            if n.dyn_arrays.contains(&c) {
+                return format!("{}.length", name);
+            }
             return name.clone();
         }
         if let Some((s, k)) = hashed_slot(c) {
-            return format!("{}[{}]", fmt_slot(expr::konst(s), n, space), k.max(0));
+            return format!("{}[{}]", slot_name(s, n, prefix), k.max(0));
         }
         return if c.bits() <= 32 {
             format!("{}_{}", prefix, c.to_decimal())
@@ -770,10 +894,10 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
             } else {
                 (words[0], words[1])
             };
-            format!("{}[{}]", fmt_slot(slot, n, space), fmt_expr(key, n))
+            format!("{}[{}]", base_name(slot, n, space), fmt_expr(key, n))
         }
         Node::Keccak(words, 0) if words.len() == 1 => {
-            format!("{}[0]", fmt_slot(words[0], n, space))
+            format!("{}[0]", base_name(words[0], n, space))
         }
         Node::Op(op::ADD, v) => {
             // array element: keccak(slot) + i, or (base) + i for struct fields in mappings
@@ -783,7 +907,7 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
                 if let Some((s, k)) = expr::as_const(a).and_then(hashed_slot) {
                     return format!(
                         "{}[{}]",
-                        fmt_slot(expr::konst(s), n, space),
+                        slot_name(s, n, prefix),
                         offset_index(&fmt_expr(b, n), k)
                     );
                 }
@@ -797,13 +921,13 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
                         } else {
                             format!("{} + {}", fmt_expr(b, n), off.to_decimal())
                         };
-                        return format!("{}[{}]", fmt_slot(expr::konst(root), n, space), idx_s);
+                        return format!("{}[{}]", slot_name(root, n, prefix), idx_s);
                     }
                 }
             }
             match expr::node(base) {
                 Node::Keccak(words, 0) if words.len() == 1 => {
-                    format!("{}[{}]", fmt_slot(words[0], n, space), fmt_expr(idx, n))
+                    format!("{}[{}]", base_name(words[0], n, space), fmt_expr(idx, n))
                 }
                 Node::Keccak(words, 0) if words.len() == 2 => {
                     format!("{}.field{}", fmt_slot(base, n, space), fmt_expr(idx, n))
@@ -892,6 +1016,14 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             fmt_slot(key, n, SlotSpace::from_transient(transient)),
             P_PRIMARY,
         ),
+        // `uint8(stor_3[x])`, `address(stor_4[i])`: a typed element needs no cast.
+        Node::Op(op::AND, v)
+            if element_typed_load(expr::intern(Node::Op(op::AND, v.clone())), n).is_some() =>
+        {
+            let load = element_typed_load(expr::intern(Node::Op(op::AND, v.clone())), n)
+                .expect("checked by the guard");
+            (fmt_expr(load, n), P_PRIMARY)
+        }
         Node::Keccak(words, tail) => {
             let mut parts: Vec<String> = Vec::new();
             for (i, w) in words.iter().enumerate() {
@@ -1582,6 +1714,19 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                         };
                         return format!("{} = {};", name, shown);
                     }
+                }
+            }
+            if !*transient {
+                if let Some((root, value)) = element_write(*key, *val, n) {
+                    let shown = match (
+                        expr::as_const(value),
+                        n.elem_types.get(&root).map(String::as_str),
+                    ) {
+                        (Some(c), Some("bool")) if c.is_zero() => "false".to_string(),
+                        (Some(c), Some("bool")) if c == U256::ONE => "true".to_string(),
+                        _ => fmt_expr(value, n),
+                    };
+                    return format!("{} = {};", fmt_slot(*key, n, SlotSpace::Persistent), shown);
                 }
             }
             format!(

@@ -315,6 +315,8 @@ struct Printer<'a> {
     stored: Vec<(usize, String, ExprId)>,
     /// Memory stores nothing reads before the function ends (not printed).
     dead_stores: HashSet<(usize, usize)>,
+    /// Statements folded into an earlier line (the element store of a `push`): not printed.
+    skipped: std::cell::RefCell<HashSet<(usize, usize)>>,
 }
 
 /// A log whose data is the ABI encoding of a calldata range, with the stores that built it.
@@ -748,6 +750,10 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
                 return None;
             }
         }
+    }
+    if sub.is_empty() {
+        fail("no variables differ");
+        return None;
     }
     if sub.is_empty() {
         fail("no variables differ");
@@ -1762,6 +1768,87 @@ impl<'a> Printer<'a> {
         true
     }
 
+    /// Render a call of the array-resize helper on `slot` to `new_len`: `push` when the length
+    /// grows by one and the next statement stores the new last element (that store is then
+    /// skipped), `pop` when it shrinks by one, `length = n` otherwise. `None` when `slot` is
+    /// not a constant.
+    fn array_resize(
+        &self,
+        node: usize,
+        index: usize,
+        slot: ExprId,
+        new_len: ExprId,
+        skip_next: &mut bool,
+    ) -> Option<String> {
+        let c = expr::as_const(slot)?;
+        let name = self
+            .names
+            .storage
+            .get(&c)
+            .cloned()
+            .unwrap_or_else(|| format!("stor_{}", c.to_decimal()));
+        let reads_len = |e: ExprId| matches!(expr::node(e), Node::SLoad(k, false, _) if k == slot);
+        let delta = match expr::node(new_len) {
+            Node::Op(op::ADD, v) if reads_len(v[0]) && expr::as_const(v[1]) == Some(U256::ONE) => 1,
+            Node::Op(op::ADD, v) if reads_len(v[1]) && expr::as_const(v[0]) == Some(U256::ONE) => 1,
+            Node::Op(op::SUB, v) if reads_len(v[0]) && expr::as_const(v[1]) == Some(U256::ONE) => {
+                -1
+            }
+            _ => 0,
+        };
+        if delta == 1 {
+            // The element store at the old length, `sstore(keccak(slot) + old_len, value)`: the
+            // next statement, which sits in the continuation node when the call ends this one.
+            let next = if index + 1 < self.l.nodes[node].stmts.len() {
+                Some((node, index + 1))
+            } else {
+                match self.l.nodes[node].term {
+                    Term::Jump(t) if !self.l.nodes[t].stmts.is_empty() => Some((t, 0)),
+                    _ => None,
+                }
+            };
+            if let Some((nn, ni)) = next {
+                if let Stmt::SStore { key, val, .. } = &self.l.nodes[nn].stmts[ni] {
+                    let data_start = |a: ExprId| match expr::node(a) {
+                        Node::Keccak(w, 0) => w.len() == 1 && w[0] == slot,
+                        Node::Const(h) => emit::hashed_slot(h) == Some((c, 0)),
+                        _ => false,
+                    };
+                    let at_old_len = match expr::node(*key) {
+                        Node::Op(op::ADD, v) => {
+                            v.iter().any(|a| reads_len(*a)) && v.iter().any(|a| data_start(*a))
+                        }
+                        _ => false,
+                    };
+                    if at_old_len {
+                        let value = emit::element_write(*key, *val, self.names)
+                            .map(|(_, v)| v)
+                            .unwrap_or(*val);
+                        if nn == node {
+                            *skip_next = true;
+                        } else {
+                            self.skipped.borrow_mut().insert((nn, ni));
+                        }
+                        return Some(format!(
+                            "{}.push({});",
+                            name,
+                            emit::fmt_expr(value, self.names)
+                        ));
+                    }
+                }
+            }
+            return Some(format!("{}.length++;", name));
+        }
+        if delta == -1 {
+            return Some(format!("{}.pop();", name));
+        }
+        Some(format!(
+            "{}.length = {};",
+            name,
+            emit::fmt_expr(new_len, self.names)
+        ))
+    }
+
     /// Make the stored values of the nodes dominating `n` print as their slots in `n`.
     fn refresh_forwarded(&self, n: usize) {
         let mut fw = self.names.forwarded.borrow_mut();
@@ -1787,8 +1874,12 @@ impl<'a> Printer<'a> {
         for f in &folded {
             dead.extend(f.hidden.iter().copied());
         }
+        let mut skip_next = false;
         for (i, s) in self.l.nodes[n].stmts.iter().enumerate() {
-            if dead.contains(&i) {
+            if dead.contains(&i) || self.skipped.borrow().contains(&(n, i)) {
+                continue;
+            }
+            if std::mem::take(&mut skip_next) {
                 continue;
             }
             if let (Some(f), Stmt::Log { topics, .. }) = (folded.iter().find(|f| f.index == i), s) {
@@ -1819,6 +1910,16 @@ impl<'a> Printer<'a> {
                 if !results.is_empty() && results.iter().all(|r| self.names.aliases.contains_key(r))
                 {
                     continue;
+                }
+            }
+            // The compiler's array-resize helper: `a.length = n`, `a.push(x)` (with the element
+            // store that follows), `a.pop()`.
+            if let Stmt::Internal { callee, args, .. } = s {
+                if self.names.array_resizers.contains(callee) && args.len() == 2 {
+                    if let Some(txt) = self.array_resize(n, i, args[0], args[1], &mut skip_next) {
+                        self.line(depth, &txt);
+                        continue;
+                    }
                 }
             }
             if let Stmt::Drop(e) = s {
@@ -2656,6 +2757,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         stale_plan: plan_stale_loads(l, names),
         stored: Vec::new(),
         dead_stores: stores_dead_until_exit(l),
+        skipped: Default::default(),
     };
     names.stale.borrow_mut().clear();
     p.go(l.entry, None, base_depth);
@@ -2704,6 +2806,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             stale_plan: std::mem::take(&mut p.stale_plan),
             stored: Vec::new(),
             dead_stores: std::mem::take(&mut p.dead_stores),
+            skipped: Default::default(),
         };
         names.stale.borrow_mut().clear();
         p2.go(l.entry, None, base_depth);

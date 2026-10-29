@@ -69,10 +69,19 @@ oracle, so the accuracy claim below is measured, not asserted.
   comparisons or the constants 0/1 return `bool` (`require(inBounds(x))`, `return a <= b;`),
   parameters used as call targets are `address`, `bool` fields print `true`/`false` and `!flag`,
   a public getter with a known signature names the variable it returns (`balanceOf`,
-  `totalSupply`, `swapFee`), two branches that do the same thing print once (the compiler's
+  `totalSupply`, `swapFee`; a bool getter or an element getter names its mapping or array too),
+  two branches that do the same thing print once (the compiler's
   `returndatasize` split around a dropped return value), and a first loop iteration that
   control-flow recovery ran on its own is folded back into the loop when it provably is one
   iteration (`for (i = 0; i < steps; i++)` instead of an unrolled copy before a `while`).
+  Control-flow recovery no longer tells apart two contexts of one block that differ only in
+  which parameters are still untouched on the stack (a parameter reassigned on one path, a loop
+  counter started from a parameter), so a function body is printed once and its first loop
+  iteration is not split off. Dynamic arrays read as arrays: the bare slot is `members.length`,
+  the compiler's resize helper prints as `members.push(x)`, `members.pop()` or
+  `members.length = n`, and the element types of arrays and mappings come from how entries are
+  written and read (`mapping(address => bool) waiting`, `address[] members`), so entries print as
+  `waiting[user] = true`, `!waiting[user]` and `members[i]` without byte masks or casts.
   A dictionary of ~1,280 function, event and error
   signatures (selectors computed with the built-in keccak, so every entry is correct) names what
   it can; the full public signature database can be installed as one local file (see *Quick
@@ -95,7 +104,9 @@ oracle, so the accuracy claim below is measured, not asserted.
   without access control, ether withdrawable by anyone (caller-keyed accounting is recognised),
   state-changing functions callable by anyone, storage-bounded loops, calls in loops, `tx.origin`,
   `selfdestruct` (also when it sits in a helper behind a deadline, where the first caller after
-  the deadline collects the balance), payout amounts computed with wrapping arithmetic from an
+  the deadline collects the balance; a destruct that follows the calls paying the balance out
+  only forwards the remainder and is Low, one behind a storage condition the caller may not
+  control alone is Medium, one anyone can trigger cold is Critical), payout amounts computed with wrapping arithmetic from an
   unbounded parameter on pre-0.8 compilers, authorisation checks whose failing side returns
   normally instead of reverting (pre-0.4 modifiers, `if (!isOwner(msg.sender)) return;`),
   reverse-quoted amounts (the caller fixes the shares it mints or the tokens it withdraws while
@@ -106,8 +117,12 @@ oracle, so the accuracy claim below is measured, not asserted.
   a token's `transfer` result is not "trusting the callee", loops over a storage counter the
   contract caps at a constant are informational, lock-protected call-then-write paths are
   reported once for the contract rather than once per function, and a call into an address held
-  in storage that no runtime code writes (fixed at deployment) is informational rather than a
-  reentrancy risk. What counts as an access check is decided per contract: `msg.sender == owner`
+  in storage that no runtime code writes (fixed at deployment), or into a contract the function
+  has just deployed from the running contract's own code, is informational rather than a
+  reentrancy risk. Accounting keyed by an account derived from msg.sender (a phi of
+  `msg.sender` and a registry lookup of it) counts as the caller's accounting, evidence lines
+  use the same `success_N`/`deployed_N` numbering as the code, and the metadata of embedded
+  creation code is not reported as a string. What counts as an access check is decided per contract: `msg.sender == owner`
   always; a test of `mapping[msg.sender]` only when the mapping is a *role*, that is, every
   function writing it is itself gated (by an owner comparison, by another role, or by the same
   mapping, as a multi-owner wallet is) or nothing writes it at runtime. A test of a stake or
@@ -118,8 +133,10 @@ oracle, so the accuracy claim below is measured, not asserted.
   with a token that returns `false` the payout is free), a payout computed from balances and the
   caller's input with a division and no caller-supplied minimum (`no-slippage-bound`), a
   required payment to a stored or constant address next to the caller's payout
-  (`fixed-payee-can-block`), the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked
-  ether, unprotected upgrades,
+  (`fixed-payee-can-block`), a loop that pays every entry of a storage array and reverts unless
+  each call succeeds while some function without access control adds entries
+  (`blocking-payout-loop`: one entry that rejects the call blocks everyone), the Vyper
+  0.2.15–0.3.0 reentrancy-lock bug, locked ether, unprotected upgrades,
   proxy detection (EIP-1967 / beacon / ZeppelinOS / EIP-1167 / storage-slot) with on-chain
   implementation resolution, known compiler bugs for the detected solc version (a bug that needs
   transient storage or calldata copies is dropped when the bytecode has none, and one whose

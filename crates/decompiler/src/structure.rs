@@ -312,6 +312,90 @@ struct Printer<'a> {
     stale_plan: HashMap<(usize, usize), Vec<(ExprId, String)>>,
 }
 
+/// A log whose data is the ABI encoding of a calldata range, with the stores that built it.
+struct FoldedLog {
+    /// Index of the `Log` statement in the block.
+    index: usize,
+    /// Printed data argument (`abi.encode(msg.data)`).
+    text: String,
+    /// Indices of the encoding stores the printed form stands for.
+    hidden: Vec<usize>,
+}
+
+/// `emit E(..., bytes data)` where `data` is a calldata range: the compiler writes the ABI
+/// encoding of a `bytes` value (`0x20`, the length, the bytes, zero padding) at the free pointer
+/// and logs that region.
+fn encoded_bytes_logs(stmts: &[Stmt]) -> Vec<FoldedLog> {
+    let mut out = Vec::new();
+    for (i, s) in stmts.iter().enumerate() {
+        let Stmt::Log {
+            off, data: None, ..
+        } = s
+        else {
+            continue;
+        };
+        if i < 4 {
+            continue;
+        }
+        let (
+            Stmt::MStore {
+                off: o1,
+                val: v1,
+                width: 32,
+            },
+            Stmt::MStore {
+                off: o2,
+                val: len,
+                width: 32,
+            },
+            Stmt::Copy {
+                kind: op::CALLDATACOPY,
+                dest,
+                src,
+                len: clen,
+                ..
+            },
+            Stmt::MStore {
+                off: o4,
+                val: v4,
+                width: 32,
+            },
+        ) = (&stmts[i - 4], &stmts[i - 3], &stmts[i - 2], &stmts[i - 1])
+        else {
+            continue;
+        };
+        let fp = *o1;
+        let len_node = expr::node(*len);
+        if *off != fp
+            || expr::as_const(*v1) != Some(U256::from_u64(32))
+            || !emit::is_add_const(*o2, fp, 32)
+            || !emit::is_add_const(*dest, fp, 64)
+            || clen != len
+            || expr::as_const(*v4) != Some(U256::ZERO)
+            || !expr::contains(*o4, &|nd| *nd == len_node)
+        {
+            continue;
+        }
+        let whole = expr::as_const(*src) == Some(U256::ZERO)
+            && matches!(len_node, Node::Env(op::CALLDATASIZE, _));
+        let text = if whole {
+            "abi.encode(msg.data)".to_string()
+        } else {
+            format!(
+                "abi.encode(msg.data[{}:+{}])",
+                emit::fmt_expr(*src, &Names::default()),
+                emit::fmt_expr(*len, &Names::default())
+            )
+        };
+        out.push(FoldedLog {
+            index: i,
+            text,
+            hidden: vec![i - 4, i - 3, i - 2, i - 1],
+        });
+    }
+    out
+}
+
 /// Loads of persistent slot `key` with generation at most `gen` anywhere in `e`.
 fn stale_loads_in(e: ExprId, key: ExprId, gen: u32, out: &mut Vec<ExprId>) {
     let mut seen = HashSet::new();
@@ -575,9 +659,18 @@ impl<'a> Printer<'a> {
 
     fn stmts(&mut self, n: usize, depth: usize) {
         self.names.end_block();
-        let dead = emit::dead_memory_stores(&self.l.nodes[n].stmts);
+        let mut dead = emit::dead_memory_stores(&self.l.nodes[n].stmts);
+        let folded = encoded_bytes_logs(&self.l.nodes[n].stmts);
+        for f in &folded {
+            dead.extend(f.hidden.iter().copied());
+        }
         for (i, s) in self.l.nodes[n].stmts.iter().enumerate() {
             if dead.contains(&i) {
+                continue;
+            }
+            if let (Some(f), Stmt::Log { topics, .. }) = (folded.iter().find(|f| f.index == i), s) {
+                let txt = emit::fmt_log_parts(topics, vec![f.text.clone()], self.names);
+                self.line(depth, &txt);
                 continue;
             }
             // A slot about to be overwritten while an older read of it is still needed: keep

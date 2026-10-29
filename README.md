@@ -54,13 +54,17 @@ oracle, so the accuracy claim below is measured, not asserted.
   printing as the slot twice; memory scratch stores overwritten before anything reads them are
   not printed; temporaries are declared in the block that uses them; and the continuation of a
   pre-0.4 modified function, which the compiler reaches both by falling through and by a jump
-  with a return address, is shown once, inline, not again as a helper.
+  with a return address, is shown once, inline, not again as a helper. A constant that is a
+  precomputed `keccak256(slot) ± k` resolves to that array (`tokens[tokens.length - 1]`), a
+  packed field cleared with a mask prints as `field = 0`, and an event whose data is the ABI
+  encoding of calldata prints as `emit E(..., abi.encode(msg.data))` with `msg.sig` named.
   A dictionary of ~1,280 function, event and error
   signatures (selectors computed with the built-in keccak, so every entry is correct) names what
   it can; everything else is named by selector.
 * **Security report.** 40+ rules over the lifted IR (not opcode patterns): reentrancy (ETH or
   token hook before a storage write; a guard counts only when a slot is tested before the call,
-  set on entry and restored to a constant afterwards, storage or transient; ERC721/1155/777 hook
+  set on entry and restored to a constant afterwards, whether the release writes the slot or
+  clears a packed field of it, storage or transient; ERC721/1155/777 hook
   selectors raise confidence; "written after the call" is decided on the control flow of the
   helper the call sits in, not on the call site, and a function behind a msg.sender check is
   reported at medium severity with the exploit condition spelled out), ignored call results, ERC20 `transfer`/`transferFrom` results
@@ -77,7 +81,10 @@ oracle, so the accuracy claim below is measured, not asserted.
   `selfdestruct` (also when it sits in a helper behind a deadline, where the first caller after
   the deadline collects the balance), payout amounts computed with wrapping arithmetic from an
   unbounded parameter on pre-0.8 compilers, authorisation checks whose failing side returns
-  normally instead of reverting (pre-0.4 modifiers, `if (!isOwner(msg.sender)) return;`), the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked
+  normally instead of reverting (pre-0.4 modifiers, `if (!isOwner(msg.sender)) return;`),
+  reverse-quoted amounts (the caller fixes the shares it mints or the tokens it withdraws while
+  the amount it gives is computed through a division and only required to be nonzero: the
+  Balancer V1 `joinswapPoolAmountOut` drain; forward-quoted joins are not flagged), the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked
   ether, unprotected upgrades,
   proxy detection (EIP-1967 / beacon / ZeppelinOS / EIP-1167 / storage-slot) with on-chain
   implementation resolution, known compiler bugs for the detected solc version. Rules look
@@ -87,7 +94,7 @@ oracle, so the accuracy claim below is measured, not asserted.
   defect: one entry per rule and function, with the number of sites, and one entry for a helper
   shared by several functions. Each finding carries severity, confidence, the function and
   program counter, evidence lines and a recommendation; the risk score weighs the worst finding
-  by its confidence. Markdown and JSON. Recall is measured on 22 known-exploited contracts
+  by its confidence. Markdown and JSON. Recall is measured on 24 known-exploited contracts
   (see *Accuracy*).
   Two passes read across functions. *Access control by intent*: when several state-changing
   functions compare `msg.sender` against the same slot, that is the contract's policy, and a

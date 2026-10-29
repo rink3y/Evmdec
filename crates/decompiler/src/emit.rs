@@ -13,22 +13,45 @@ use std::sync::OnceLock;
 /// How many small slots the hashed-slot table covers.
 const HASHED_SLOTS: u64 = 4096;
 
-/// The slot `s` whose dynamic-array data lives at `c = keccak256(s)`, for small `s`. Compilers
-/// precompute that hash for state variables, so the constant shows up in the code as is.
-pub fn hashed_slot(c: U256) -> Option<U256> {
-    static TABLE: OnceLock<HashMap<U256, u64>> = OnceLock::new();
+/// Offsets around a precomputed hash that still count as that array (`keccak256(s) - 1` for
+/// `arr[arr.length - 1]`, `keccak256(s) + 2` for a struct field).
+const HASH_OFFSET_RANGE: i64 = 16;
+
+/// The slot `s` whose dynamic-array data lives at `keccak256(s)`, and the element offset `k`,
+/// for a constant `c = keccak256(s) + k` with small `s` and `|k| <= 16`. Compilers precompute
+/// that hash for state variables (and fold small offsets into it), so the constant shows up in
+/// the code as is.
+pub fn hashed_slot(c: U256) -> Option<(U256, i64)> {
+    static TABLE: OnceLock<HashMap<U256, (u64, i64)>> = OnceLock::new();
     let table = TABLE.get_or_init(|| {
-        (0..HASHED_SLOTS)
-            .map(|s| {
-                let h = keccak::keccak256(&U256::from_u64(s).to_be_bytes());
-                (U256::from_be_bytes(&h), s)
-            })
-            .collect()
+        let mut t = HashMap::new();
+        for s in 0..HASHED_SLOTS {
+            let h = U256::from_be_bytes(&keccak::keccak256(&U256::from_u64(s).to_be_bytes()));
+            for k in -HASH_OFFSET_RANGE..=HASH_OFFSET_RANGE {
+                let key = if k >= 0 {
+                    h.wrapping_add(U256::from_u64(k as u64))
+                } else {
+                    h.wrapping_sub(U256::from_u64((-k) as u64))
+                };
+                // The exact hash wins over a neighbour's offset.
+                t.entry(key).or_insert((s, k));
+            }
+        }
+        t
     });
     if c.bits() < 200 {
         return None;
     }
-    table.get(&c).map(|s| U256::from_u64(*s))
+    table.get(&c).map(|(s, k)| (U256::from_u64(*s), *k))
+}
+
+/// `idx + k` / `idx - k` for an element offset folded into a hash constant.
+fn offset_index(idx: &str, k: i64) -> String {
+    match k {
+        0 => idx.to_string(),
+        k if k > 0 => format!("{} + {}", idx, k),
+        k => format!("{} - {}", idx, -k),
+    }
 }
 
 /// An index into a storage array rather than a hashed slot: not a constant, not a
@@ -234,7 +257,9 @@ pub fn is_selector_expr(e: ExprId) -> bool {
                 && matches!(expr::node(v[1]), Node::CallDataLoad(o) if expr::as_const(o) == Some(U256::ZERO))
         }
         Node::Op(op::AND, v) => {
-            is_selector_expr(v[0]) && expr::as_const(v[1]) == Some(U256::from_u64(0xffffffff))
+            (is_selector_expr(v[0]) && expr::as_const(v[1]) == Some(U256::from_u64(0xffffffff)))
+                || (expr::as_const(v[1]) == Some(U256::from_u64(0xffffffff) << 224)
+                    && matches!(expr::node(v[0]), Node::CallDataLoad(o) if expr::as_const(o) == Some(U256::ZERO)))
         }
         Node::Op(op::DIV, v) => {
             expr::as_const(v[1]) == Some(U256::ONE << 224)
@@ -325,6 +350,45 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     }
     n.memo.borrow_mut().insert(e, (s.clone(), p));
     paren(s, p, outer)
+}
+
+/// An event emission from its topics and already-printed data arguments: `emit Name(...)` when
+/// topic0 is a known signature, a placeholder name for an unknown one, `logN(...)` otherwise.
+pub fn fmt_log_parts(topics: &[ExprId], data_args: Vec<String>, n: &Names) -> String {
+    let mut args: Vec<String> = Vec::new();
+    let mut name = None;
+    if let Some(t0) = topics.first().and_then(|t| expr::as_const(*t)) {
+        if let Some(sig) = sigs::event(&t0.to_be_bytes()) {
+            name = Some(sigs::name_of(sig).to_string());
+        }
+    }
+    let start = if name.is_some() { 1 } else { 0 };
+    for t in &topics[start..] {
+        args.push(fmt_expr(*t, n));
+    }
+    args.extend(data_args);
+    match name {
+        Some(nm) => format!("emit {}({});", nm, args.join(", ")),
+        None => match topics.first().and_then(|t| expr::as_const(*t)) {
+            Some(t0) => format!(
+                "emit {}({});",
+                event_placeholder_name(t0),
+                args[1..].join(", ")
+            ),
+            None => format!("log{}({});", topics.len(), args.join(", ")),
+        },
+    }
+}
+
+/// Is `e` the sum `base + k`?
+pub fn is_add_const(e: ExprId, base: ExprId, k: u64) -> bool {
+    match expr::node(e) {
+        Node::Op(op::ADD, v) => {
+            (v[0] == base && expr::as_const(v[1]) == Some(U256::from_u64(k)))
+                || (v[1] == base && expr::as_const(v[0]) == Some(U256::from_u64(k)))
+        }
+        _ => false,
+    }
 }
 
 /// Every expression a statement mentions.
@@ -559,6 +623,19 @@ pub fn packed_read(e: ExprId) -> Option<(U256, u32, u32)> {
 /// `(slot, byte offset, bits, value)`.
 pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)> {
     let k = expr::as_const(key)?;
+    // `slot = slot & ~mask`: the field under the mask is set to zero.
+    if let Node::Op(op::AND, w) = expr::node(val) {
+        if let (Node::SLoad(kk, false, _), Some(keep)) = (expr::node(w[0]), expr::as_const(w[1])) {
+            if expr::as_const(kk) == Some(k) {
+                let field = !keep;
+                let s = field.trailing_zeros();
+                let shifted = field >> s;
+                if !field.is_zero() && shifted.is_low_mask() && s % 8 == 0 {
+                    return Some((k, s / 8, shifted.bits(), expr::konst(U256::ZERO)));
+                }
+            }
+        }
+    }
     let Node::Op(op::OR, v) = expr::node(val) else {
         return None;
     };
@@ -622,8 +699,8 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
         if let Some(name) = n.storage.get(&c) {
             return name.clone();
         }
-        if let Some(s) = hashed_slot(c) {
-            return format!("{}[0]", fmt_slot(expr::konst(s), n, space));
+        if let Some((s, k)) = hashed_slot(c) {
+            return format!("{}[{}]", fmt_slot(expr::konst(s), n, space), k.max(0));
         }
         return if c.bits() <= 32 {
             format!("{}_{}", prefix, c.to_decimal())
@@ -651,8 +728,12 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
             let (base, idx) = (v[0], v[1]);
             // A precomputed `keccak256(slot)` on either side: element `idx` of that array.
             for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
-                if let Some(s) = expr::as_const(a).and_then(hashed_slot) {
-                    return format!("{}[{}]", fmt_slot(expr::konst(s), n, space), fmt_expr(b, n));
+                if let Some((s, k)) = expr::as_const(a).and_then(hashed_slot) {
+                    return format!(
+                        "{}[{}]",
+                        fmt_slot(expr::konst(s), n, space),
+                        offset_index(&fmt_expr(b, n), k)
+                    );
                 }
             }
             // `index + small constant`: a fixed-size array laid out from a known base slot.
@@ -995,6 +1076,9 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             P_OR,
         ),
         (op::AND, 2) => {
+            if is_selector_expr(expr::intern(Node::Op(op::AND, v.to_vec()))) {
+                return ("msg.sig".into(), P_PRIMARY);
+            }
             if let Some(m) = expr::as_const(v[1]) {
                 if m.is_low_mask() {
                     let bits = m.bits();
@@ -1412,44 +1496,16 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             topics,
             data,
         } => {
-            let mut args: Vec<String> = Vec::new();
-            let mut name = None;
-            if let Some(t0) = topics.first().and_then(|t| expr::as_const(*t)) {
-                if let Some(sig) = sigs::event(&t0.to_be_bytes()) {
-                    name = Some(sigs::name_of(sig).to_string());
-                }
-            }
-            let start = if name.is_some() { 1 } else { 0 };
-            for t in &topics[start..] {
-                args.push(fmt_expr(*t, n));
-            }
-            match data {
-                Some(words) => {
-                    for w in words {
-                        args.push(fmt_expr(*w, n));
-                    }
-                }
-                None => {
-                    if expr::as_const(*len) != Some(U256::ZERO) {
-                        args.push(format!(
-                            "mem[{}:{}]",
-                            fmt_expr(*off, n),
-                            fmt_expr(expr::op2(op::ADD, *off, *len), n)
-                        ));
-                    }
-                }
-            }
-            match name {
-                Some(nm) => format!("emit {}({});", nm, args.join(", ")),
-                None => match topics.first().and_then(|t| expr::as_const(*t)) {
-                    Some(t0) => format!(
-                        "emit {}({});",
-                        event_placeholder_name(t0),
-                        args[1..].join(", ")
-                    ),
-                    None => format!("log{}({});", topics.len(), args.join(", ")),
-                },
-            }
+            let data_args: Vec<String> = match data {
+                Some(words) => words.iter().map(|w| fmt_expr(*w, n)).collect(),
+                None if expr::as_const(*len) != Some(U256::ZERO) => vec![format!(
+                    "mem[{}:{}]",
+                    fmt_expr(*off, n),
+                    fmt_expr(expr::op2(op::ADD, *off, *len), n)
+                )],
+                None => Vec::new(),
+            };
+            fmt_log_parts(topics, data_args, n)
         }
         Stmt::Call {
             kind,

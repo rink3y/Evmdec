@@ -247,6 +247,16 @@
     "reentrancy"
    ],
    "min_severity": "medium"
+  },
+  "balancer_bpool": {
+   "address": "0x2257aaac34BcB27900291f7B84eE2565A6cbaC57",
+   "chain": "mainnet",
+   "year": 2026,
+   "bug": "Balancer V1 BPool: joinswapPoolAmountOut mints a caller-chosen BPT amount for a reverse-computed token amount that is only required to be nonzero; with the reserve compressed to dust the deposit floors to 1 unit",
+   "expected": [
+    "reverse-quote-rounding"
+   ],
+   "min_severity": "medium"
   }
  }
 }

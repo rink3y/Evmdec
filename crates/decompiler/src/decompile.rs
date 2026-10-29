@@ -1489,7 +1489,7 @@ fn slot_root(
     bases: &BTreeSet<U256>,
 ) -> (Option<U256>, Option<String>) {
     if let Some(c) = expr::as_const(key) {
-        if let Some(s) = emit::hashed_slot(c) {
+        if let Some((s, _)) = emit::hashed_slot(c) {
             return (Some(s), Some("uint256[]".into()));
         }
         return (Some(c), None);
@@ -1521,7 +1521,7 @@ fn slot_root(
         Node::Op(op::ADD, v) => {
             // `keccak256(slot) + i` with the hash precomputed by the compiler.
             for (a, _) in [(v[0], v[1]), (v[1], v[0])] {
-                if let Some(s) = expr::as_const(a).and_then(emit::hashed_slot) {
+                if let Some((s, _)) = expr::as_const(a).and_then(emit::hashed_slot) {
                     return (Some(s), Some("uint256[]".into()));
                 }
             }

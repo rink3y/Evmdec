@@ -200,6 +200,8 @@ struct Ctx<'a> {
     callee_writes: RefCell<HashMap<usize, Option<MemWrites>>>,
     /// Counter handing out `Event::inst` numbers.
     inst_seq: std::cell::Cell<usize>,
+    /// Whether an internal function (transitively) divides, by entry pc.
+    divides: RefCell<HashMap<usize, bool>>,
 }
 
 /// Constant-offset memory writes of a unit: `(offset, length)` with `None` for an unknown length.
@@ -1038,6 +1040,7 @@ pub fn analyze(c: &Contract) -> Report {
         vyper: c.language.starts_with("vyper"),
         callee_writes: Default::default(),
         inst_seq: std::cell::Cell::new(0),
+        divides: Default::default(),
     };
     let mut findings: Vec<Finding> = Vec::new();
     let mut report = Report::default();
@@ -1154,10 +1157,14 @@ pub fn analyze(c: &Contract) -> Report {
                 if let Some(Stmt::SStore { key, val, .. }) = &e.stmt {
                     if expr::is_const(*key) {
                         // Entering may store a caller-dependent marker (`lockedBy = msg.sender`,
-                        // `guard = accepting ? A : B`); leaving restores a constant.
+                        // `guard = accepting ? A : B`); leaving restores a constant, either the
+                        // whole slot or a packed field of it (`slot & ~mask` clears the field).
+                        let restores_const = expr::is_const(*val)
+                            || emit::packed_write(*key, *val)
+                                .is_some_and(|(_, _, _, v)| expr::is_const(v));
                         if j < i {
                             before.insert(*key);
-                        } else if j > i && expr::is_const(*val) {
+                        } else if j > i && restores_const {
                             after.insert(*key);
                         }
                     }
@@ -1605,6 +1612,17 @@ pub fn analyze(c: &Contract) -> Report {
                                         format!("`{}` pulls `{}` tokens with transferFrom and then books that same amount into storage. Fee-on-transfer, rebasing or non-standard tokens deliver a different amount than requested.", f.name, emit::fmt_expr(amount, names)),
                                         vec![line.clone()], "Credit `balanceOf(this)` after minus before, or restrict the accepted tokens.");
                                 }
+                            }
+                        }
+                        // Reverse-quoted amount: the caller fixes what it receives while what it
+                        // gives is computed with a division and only required to be nonzero.
+                        if let (Some(words), Some(sel)) = (words_view, selector) {
+                            if let Some((given, received, how)) =
+                                reverse_quote(&ctx, l, &events, words, sel, in_len_c)
+                            {
+                                push(&mut findings, "reverse-quote-rounding", "Caller-chosen output with a computed input bounded only by zero", Severity::Medium, Confidence::Medium, Some(f), Some(ev.pc),
+                                    format!("`{}` lets the caller fix the amount it receives ({}) while the amount it gives, `{}`, is computed with a division and only required to be nonzero{}. When the balance behind the computation is small relative to the arithmetic's precision, the computed amount floors to dust and the caller gets the full output for almost nothing (Balancer V1 `joinswapPoolAmountOut`, 2026).", f.name, received, emit::fmt_expr(given, names), how),
+                                    vec![line.clone()], "Round the computed input up and the output down, and require a minimum input relative to the output (or a minimum reserve) instead of a nonzero check.");
                             }
                         }
                         // Ether to caller without auth or balance accounting
@@ -2398,6 +2416,264 @@ pub fn analyze(c: &Contract) -> Report {
     report.external_calls = external_calls.into_iter().collect();
     report.summary = summary;
     report
+}
+
+/// Does the internal function at `pc` (or anything it calls) divide?
+fn callee_divides(ctx: &Ctx, pc: usize, seen: &mut HashSet<usize>) -> bool {
+    if !seen.insert(pc) {
+        return false;
+    }
+    if let Some(known) = ctx.divides.borrow().get(&pc) {
+        return *known;
+    }
+    let mut result = false;
+    if let Some(l) = ctx.internals.get(&pc).and_then(|f| f.lifted.as_ref()) {
+        'outer: for nd in &l.nodes {
+            for e in lift::node_exprs(nd) {
+                if mentions(e, &|n| matches!(n, Node::Op(op::DIV | op::SDIV, _))) {
+                    result = true;
+                    break 'outer;
+                }
+            }
+            for st in &nd.stmts {
+                if let Stmt::Internal { callee, .. } = st {
+                    if callee_divides(ctx, *callee, seen) {
+                        result = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    ctx.divides.borrow_mut().insert(pc, result);
+    result
+}
+
+/// Is `e` the result of a division, directly or through an internal call whose body divides?
+fn computed_by_division(ctx: &Ctx, events: &[Event], e: ExprId) -> bool {
+    if mentions(e, &|n| matches!(n, Node::Op(op::DIV | op::SDIV, _))) {
+        return true;
+    }
+    let mut seqs: Vec<u32> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        if let Node::IntRet(s, _) = expr::node(x) {
+            seqs.push(s);
+        }
+        stack.extend(expr::children(x));
+    }
+    seqs.iter().any(|s| {
+        events.iter().any(|ev| {
+            matches!(&ev.stmt, Some(Stmt::Internal { seq, callee, .. })
+                if seq == s && callee_divides(ctx, *callee, &mut HashSet::new()))
+        })
+    })
+}
+
+/// Every path from `start` ends in a revert or an invalid opcode.
+fn always_reverts(l: &Lifted, start: usize) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 2000 {
+            continue;
+        }
+        match &l.nodes[x].term {
+            Term::Revert { .. } | Term::Invalid => {}
+            Term::Return { .. }
+            | Term::ReturnDyn { .. }
+            | Term::Stop
+            | Term::InternalReturn(_)
+            | Term::SelfDestruct(_)
+            | Term::Unresolved(_) => return false,
+            _ => stack.extend(l.nodes[x].succs.iter().copied()),
+        }
+    }
+    true
+}
+
+/// Conditions that must hold for execution to go on, with their polarity: inlined helpers'
+/// guards (`Require`) hold as written; a branch (of the function or of an inlined body) whose
+/// one side only reverts holds in the polarity of the other side.
+fn require_conds(ctx: &Ctx, l: &Lifted, events: &[Event]) -> Vec<(ExprId, bool)> {
+    let mut out = Vec::new();
+    for e in events {
+        if let Some(Stmt::Require { cond, .. }) = &e.stmt {
+            out.push((*cond, true));
+        }
+        if let Some(Term::Branch {
+            cond,
+            t: Some(t),
+            f,
+        }) = &e.term
+        {
+            let graph = if e.inst == 0 {
+                Some(l)
+            } else {
+                e.callee
+                    .and_then(|pc| ctx.internals.get(&pc))
+                    .and_then(|f| f.lifted.as_ref())
+            };
+            let Some(g) = graph else { continue };
+            if always_reverts(g, *t) {
+                out.push((*cond, false));
+            } else if always_reverts(g, *f) {
+                out.push((*cond, true));
+            }
+        }
+    }
+    out
+}
+
+/// How the guards along the path bound `amt` from below: `Some(true)` when a nonzero test is
+/// the only lower bound (other direct comparisons are upper bounds or caller-supplied limits),
+/// `Some(false)` when another lower bound exists, `None` when nothing tests it for zero.
+fn only_nonzero_bound(ctx: &Ctx, l: &Lifted, events: &[Event], amt: ExprId) -> Option<bool> {
+    let mut zero_test = false;
+    for (c0, holds) in require_conds(ctx, l, events) {
+        if !contains_expr(c0, amt) {
+            continue;
+        }
+        let mut c = c0;
+        let mut pol = holds;
+        while let Node::Op(op::ISZERO, v) = expr::node(c) {
+            c = v[0];
+            pol = !pol;
+        }
+        let zero = |x: ExprId| expr::as_const(x) == Some(U256::ZERO);
+        let zero_cmp = c == amt
+            || matches!(expr::node(c), Node::Op(op::EQ, v) if (v[0] == amt && zero(v[1])) || (v[1] == amt && zero(v[0])))
+            || matches!(expr::node(c), Node::Op(op::GT, v) if v[0] == amt && zero(v[1]))
+            || matches!(expr::node(c), Node::Op(op::LT, v) if v[1] == amt && zero(v[0]));
+        if zero_cmp {
+            zero_test = true;
+            continue;
+        }
+        if from_calldata(c) {
+            continue;
+        }
+        // Only a comparison with `amt` as a direct operand says anything about its range;
+        // `amt + x >= x` is an overflow check, not a bound.
+        let lower = match expr::node(c) {
+            Node::Op(op::GT, v) if v[0] == amt => pol,
+            Node::Op(op::LT, v) if v[1] == amt => pol,
+            Node::Op(op::LT, v) if v[0] == amt => !pol,
+            Node::Op(op::GT, v) if v[1] == amt => !pol,
+            Node::Op(op::EQ, v) if v[0] == amt || v[1] == amt => pol,
+            _ => false,
+        };
+        if lower {
+            return Some(false);
+        }
+    }
+    if zero_test {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The caller names the amount it receives and the contract computes the amount it gives.
+/// Returns `(given amount, what the caller fixed, how the given amount is bounded)`.
+///
+/// Join shape: `transferFrom(caller, this, computed)` with a storage credit of a calldata word.
+/// Exit shape: `transfer(to, calldata)` with a storage debit of a computed amount.
+fn reverse_quote(
+    ctx: &Ctx,
+    l: &Lifted,
+    events: &[Event],
+    words: &[ExprId],
+    sel: u32,
+    in_len: Option<usize>,
+) -> Option<(ExprId, String, &'static str)> {
+    let direct = |e: ExprId| write_source(e) == WriteSource::Calldata;
+    let names = Names::default();
+    match sel {
+        SEL_TRANSFER_FROM => {
+            // Parameter words: 0 = from, 1 = to, 2 = amount.
+            let to = emit::shifted_word_len(words, 1, in_len);
+            let amt = emit::shifted_word_len(words, 2, in_len);
+            if std::env::var("EVMDEC_DEBUG_RQ").is_ok() {
+                eprintln!(
+                    "[rq] transferFrom to={} amt={} to_this={} div={} bound={:?} words={}",
+                    emit::fmt_expr(to, &names),
+                    emit::fmt_expr(amt, &names),
+                    mentions(to, &|n| matches!(n, Node::Env(op::ADDRESS, _))),
+                    computed_by_division(ctx, events, amt),
+                    only_nonzero_bound(ctx, l, events, amt),
+                    words.len()
+                );
+            }
+            if !mentions(to, &|n| matches!(n, Node::Env(op::ADDRESS, _))) {
+                return None;
+            }
+            if !computed_by_division(ctx, events, amt)
+                || only_nonzero_bound(ctx, l, events, amt) != Some(true)
+            {
+                return None;
+            }
+            let credit = events.iter().find_map(|ev| match &ev.stmt {
+                Some(st @ Stmt::SStore { val, .. }) => match expr::node(*val) {
+                    Node::Op(op::ADD, v) if v.iter().any(|x| direct(*x)) => {
+                        Some(emit::fmt_stmt(st, &names))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })?;
+            Some((
+                amt,
+                format!("`{}`", credit),
+                " or below a caller-supplied limit",
+            ))
+        }
+        SEL_TRANSFER => {
+            // Parameter words: 0 = to, 1 = amount.
+            let amt_out = emit::shifted_word_len(words, 1, in_len);
+            if !direct(amt_out) {
+                return None;
+            }
+            // The debit: `balance - computed`, or the result of a helper (`bsub`) that was
+            // handed the computed amount.
+            let computed_input = |x: ExprId| {
+                computed_by_division(ctx, events, x)
+                    && only_nonzero_bound(ctx, l, events, x) == Some(true)
+            };
+            let debit = events.iter().find_map(|ev| {
+                let Some(st @ Stmt::SStore { val, .. }) = &ev.stmt else {
+                    return None;
+                };
+                match expr::node(*val) {
+                    Node::Op(op::SUB, v) if computed_input(v[1]) => {
+                        Some((v[1], emit::fmt_stmt(st, &names)))
+                    }
+                    Node::IntRet(seq, _) => events.iter().find_map(|e2| match &e2.stmt {
+                        Some(Stmt::Internal { seq: s, args, .. }) if *s == seq => args
+                            .iter()
+                            .copied()
+                            .find(|a| computed_input(*a))
+                            .map(|a| (a, emit::fmt_stmt(st, &names))),
+                        _ => None,
+                    }),
+                    _ => None,
+                }
+            })?;
+            Some((
+                debit.0,
+                format!(
+                    "the transfer of `{}`, then `{}`",
+                    emit::fmt_expr(amt_out, &names),
+                    debit.1
+                ),
+                " or below a caller-supplied limit",
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// From `start`, every path halts normally (return/stop/internal return) without touching

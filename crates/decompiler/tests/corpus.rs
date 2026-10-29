@@ -422,3 +422,68 @@ fn old_multiowned_wallet_reads_as_source() {
         .all(|f| f.severity == evmdec::analyze::Severity::Medium && f.sites == 1));
     assert!(r.findings.iter().any(|f| f.id == "silent-auth-failure"));
 }
+
+/// Balancer V1 BPool (solc 0.5.12): a `_lock_` modifier released through a packed-field mask,
+/// a `_logs_` modifier that ABI-encodes `msg.data` into an event, pool-token list elements
+/// addressed as `keccak256(9) - 1`, and the 2026 reverse-quote rounding drain.
+#[test]
+fn balancer_bpool_reads_as_source() {
+    let p =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/balancer_bpool.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
+    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    let src = &c.source;
+    for s in [
+        "function joinswapPoolAmountOut(address arg0, uint256 arg1, uint256 arg2)",
+        "function swapExactAmountIn(",
+        "function calcSingleInGivenPoolOut(",
+        "event LOG_SWAP(",
+    ] {
+        assert!(src.contains(s), "missing {s}");
+    }
+    assert!(
+        !src.contains("unknown signature"),
+        "BPool selectors are in the dictionary"
+    );
+    // The lock release prints as the field, not as a whole-slot mask.
+    assert!(src.contains("stor_5_1 = 0;"), "{src}");
+    assert!(!src.contains("& 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00ff"));
+    // `_logs_`: emit of the ABI-encoded calldata, with `msg.sig` as a topic.
+    assert!(
+        src.contains("log2(msg.sig, msg.sender, abi.encode(msg.data));"),
+        "{src}"
+    );
+    assert!(
+        !src.contains("mem[mem[0x40] + 32] = msg.data.length;"),
+        "encoding stores printed"
+    );
+    // `_tokens[_tokens.length - 1]` through the folded hash constant.
+    assert!(src.contains("stor_9[stor_9 - 1]"), "{src}");
+    assert!(!src.contains("0x6e1540171b6c0c960b71a7020d9f60077f6af931a8bbf590da0223dacf75c7ae"));
+    let r = evmdec::analyze::analyze(&c);
+    // The lock is recognised: every reentrancy entry is informational.
+    assert!(r
+        .findings
+        .iter()
+        .filter(|f| f.id == "reentrancy")
+        .all(|f| f.severity == evmdec::analyze::Severity::Info));
+    // The reverse-quote rounding on both single-sided paths.
+    let rq: Vec<String> = r
+        .findings
+        .iter()
+        .filter(|f| f.id == "reverse-quote-rounding")
+        .map(|f| f.function.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        rq.iter().any(|f| f.starts_with("joinswapPoolAmountOut")),
+        "{rq:?}"
+    );
+    assert!(
+        rq.iter().any(|f| f.starts_with("exitswapExternAmountOut")),
+        "{rq:?}"
+    );
+    assert!(
+        !rq.iter().any(|f| f.starts_with("joinswapExternAmountIn")),
+        "forward-quoted join must not be flagged: {rq:?}"
+    );
+}

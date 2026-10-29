@@ -29,7 +29,7 @@ pub enum Severity {
 }
 
 /// How sure a rule is that its finding is real, given the lifted IR it had to work from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Confidence {
     /// The pattern is unambiguous in the bytecode.
@@ -1085,6 +1085,7 @@ pub fn analyze(c: &Contract) -> Report {
 
     // ---- per-function rules ----
     let auth = auth_slots(&ctx);
+    let caps = capped_slots(c);
     let mut external_calls: BTreeSet<String> = BTreeSet::new();
     let mut privileged: Vec<String> = Vec::new();
     let mut unauthenticated: Vec<String> = Vec::new();
@@ -1108,6 +1109,33 @@ pub fn analyze(c: &Contract) -> Report {
         let events = events_of(&ctx, l, 5, false);
         let caller_checked = any_caller_check(&ctx, f);
         facts.push(collect_facts(f, &events, caller_checked, &names));
+        // Loops (in the function or the helpers it inlines) whose every storage bound is a
+        // counter the contract caps at a constant.
+        let loop_cap: Option<u64> = {
+            let mut keys: Vec<U256> = Vec::new();
+            let mut graphs: Vec<&Lifted> = vec![l];
+            graphs.extend(
+                transitive_callees(&ctx, f)
+                    .into_iter()
+                    .filter_map(|cf| cf.lifted.as_ref()),
+            );
+            for g in graphs {
+                let lp = loop_nodes(g);
+                for nd in &g.nodes {
+                    if !lp.contains(&nd.id) {
+                        continue;
+                    }
+                    if let Term::Branch { cond, .. } = &nd.term {
+                        keys.extend(const_slot_keys(*cond));
+                    }
+                }
+            }
+            if keys.is_empty() || !keys.iter().all(|k| caps.contains_key(k)) {
+                None
+            } else {
+                keys.iter().filter_map(|k| caps.get(k).copied()).max()
+            }
+        };
         let state_changing = f.effects.writes_storage
             || f.effects.calls
             || f.effects.selfdestruct
@@ -1565,7 +1593,28 @@ pub fn analyze(c: &Contract) -> Report {
                                 }
                                 _ => false,
                             });
-                            if used_in_decision || used_in_effect {
+                            // The address was looked up in storage before the call
+                            // (`require(isBound[token])`): a registry, not an arbitrary contract.
+                            let registry_checked = events[..i].iter().any(|e| {
+                                let conds: Vec<ExprId> = match (&e.stmt, &e.term) {
+                                    (Some(Stmt::Require { cond, .. }), _) => vec![*cond],
+                                    (_, Some(Term::Branch { cond, .. })) => vec![*cond],
+                                    _ => vec![],
+                                };
+                                conds.into_iter().any(|c| {
+                                    mentions(c, &|n| matches!(n, Node::SLoad(k, _, _) if contains_expr(*k, *addr)))
+                                })
+                            });
+                            // Checking a token's transfer/approve result is the correct use of
+                            // its answer, not a decision an attacker-chosen callee can forge.
+                            let erc20_result_only = matches!(
+                                selector,
+                                Some(SEL_TRANSFER | SEL_TRANSFER_FROM | SEL_APPROVE)
+                            ) && !used_in_effect;
+                            if (used_in_decision || used_in_effect)
+                                && !registry_checked
+                                && !erc20_result_only
+                            {
                                 push(&mut findings, "untrusted-return-data", "Data returned by a caller-chosen contract drives a decision", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                     format!("`{}` calls `{}`, an address the caller supplies, and then {} what it returns. The callee can answer anything, so checks based on its answer (ownership, balances, transfer success) can be forged.", f.name, target, if used_in_decision && used_in_effect { "branches on and stores" } else if used_in_decision { "branches on" } else { "stores or forwards" }),
                                     vec![line.clone()], "Only trust return data from addresses taken from storage or a registry; measure effects (balance deltas) instead of believing the callee.");
@@ -1696,8 +1745,12 @@ pub fn analyze(c: &Contract) -> Report {
                             }
                         }
                         if ev.in_loop && !precompile {
-                            push(&mut findings, "call-in-loop", "External call inside a loop", Severity::Low, Confidence::Medium, Some(f), Some(ev.pc),
-                                format!("`{}` performs an external call to `{}` inside a loop; one failing or gas-hungry callee can block the whole iteration (denial of service).", f.name, target), vec![line.clone()], "Prefer pull-payments or bound the iteration.");
+                            let (sev, note) = match loop_cap {
+                                Some(cap) => (Severity::Info, format!(" The loop runs over a storage counter the contract caps at {}, so the iteration is bounded.", cap)),
+                                None => (Severity::Low, String::new()),
+                            };
+                            push(&mut findings, "call-in-loop", "External call inside a loop", sev, Confidence::Medium, Some(f), Some(ev.pc),
+                                format!("`{}` performs an external call to `{}` inside a loop; one failing or gas-hungry callee can block the whole iteration (denial of service).{}", f.name, target, note), vec![line.clone()], "Prefer pull-payments or bound the iteration.");
                         }
                         // ecrecover
                         if expr::as_const(*addr) == Some(U256::ONE) {
@@ -2156,6 +2209,15 @@ pub fn analyze(c: &Contract) -> Report {
                                 | Node::Op(op::EQ, _)
                         )
                     {
+                        let cap = const_slot_keys(*cond)
+                            .iter()
+                            .filter_map(|k| caps.get(k).copied())
+                            .max();
+                        if let Some(cap) = cap {
+                            push(&mut findings, "storage-bounded-loop", "Loop bounded by a capped storage counter", Severity::Info, Confidence::Medium, Some(f), Some(nd.pc),
+                                format!("`{}` loops while `{}`; the bound is a counter the contract never lets exceed {}, so the loop cannot grow without limit.", f.name, emit::fmt_expr(*cond, &names), cap), vec![], "Informational.");
+                            break;
+                        }
                         push(&mut findings, "storage-bounded-loop", "Loop bounded by a storage value", Severity::Low, Confidence::Medium, Some(f), Some(nd.pc),
                             format!("`{}` loops while `{}`; if the bound grows (e.g. an unbounded array) the function can exceed the block gas limit and become unusable.", f.name, emit::fmt_expr(*cond, &names)), vec![], "Bound the iteration or paginate.");
                         break;
@@ -2396,9 +2458,39 @@ pub fn analyze(c: &Contract) -> Report {
     let mut seen = HashSet::new();
     findings.retain(|f| seen.insert((f.id.clone(), f.function.clone(), f.pc, f.title.clone())));
     let mut findings = merge_findings(findings);
+    // Lock-protected call-then-write paths are one fact about the contract, not one per function.
+    let locked: Vec<Finding> = findings
+        .iter()
+        .filter(|f| f.id == "reentrancy" && f.severity == Severity::Info)
+        .cloned()
+        .collect();
+    if locked.len() >= 2 {
+        findings.retain(|f| !(f.id == "reentrancy" && f.severity == Severity::Info));
+        let names: Vec<String> = locked
+            .iter()
+            .map(|f| f.function.clone().unwrap_or_default())
+            .collect();
+        findings.push(Finding {
+            id: "reentrancy-locked".into(),
+            title: "Calls followed by state writes sit behind a reentrancy lock".into(),
+            severity: Severity::Info,
+            confidence: Confidence::Medium,
+            function: None,
+            pc: None,
+            description: format!(
+                "{} functions call out and write storage afterwards, each behind a lock that is tested before the call, set on entry and restored after it: {}. Reported for awareness: the lock protects these paths only while every function that writes the same state takes it too.",
+                locked.len(),
+                names.iter().map(|n| format!("`{}`", n)).collect::<Vec<_>>().join(", ")
+            ),
+            evidence: Vec::new(),
+            recommendation: "Make sure every state-changing entry point that touches the same storage takes the same lock.".into(),
+            sites: locked.len(),
+        });
+    }
     findings.sort_by(|a, b| {
         a.severity
             .cmp(&b.severity)
+            .then(a.confidence.cmp(&b.confidence))
             .then(a.function.cmp(&b.function))
     });
 
@@ -2472,6 +2564,114 @@ fn computed_by_division(ctx: &Ctx, events: &[Event], e: ExprId) -> bool {
                 if seq == s && callee_divides(ctx, *callee, &mut HashSet::new()))
         })
     })
+}
+
+/// Constant storage slots read anywhere in `e`.
+fn const_slot_keys(e: ExprId) -> Vec<U256> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        if let Node::SLoad(k, false, _) = expr::node(x) {
+            if let Some(c) = expr::as_const(k) {
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+        stack.extend(expr::children(x));
+    }
+    out
+}
+
+/// Storage counters the contract caps: every write to the slot is a reset to a constant, a
+/// decrement, or an increment by one guarded by `slot < C` (or `C > slot`) in the same
+/// function. Maps the slot to the largest such `C`.
+fn capped_slots(c: &Contract) -> HashMap<U256, u64> {
+    let mut writes: HashMap<U256, Vec<(usize, ExprId)>> = HashMap::new();
+    let mut bounds: HashMap<(usize, U256), u64> = HashMap::new();
+    for (fi, f) in c.functions.iter().enumerate() {
+        let Some(l) = &f.lifted else { continue };
+        for nd in &l.nodes {
+            for mut cond in node_conds(nd) {
+                while let Node::Op(op::ISZERO, v) = expr::node(cond) {
+                    cond = v[0];
+                }
+                let (slot, limit) = match expr::node(cond) {
+                    Node::Op(op::LT, v) => (v[0], v[1]),
+                    Node::Op(op::GT, v) => (v[1], v[0]),
+                    _ => continue,
+                };
+                if let (Node::SLoad(k, false, _), Some(c)) =
+                    (expr::node(slot), expr::as_const(limit))
+                {
+                    if let (Some(k), true) = (expr::as_const(k), c.bits() <= 16) {
+                        let e = bounds.entry((fi, k)).or_insert(0);
+                        *e = (*e).max(c.low_u64());
+                    }
+                }
+            }
+            for st in &nd.stmts {
+                if let Stmt::SStore {
+                    key,
+                    val,
+                    transient: false,
+                    ..
+                } = st
+                {
+                    if let Some(k) = expr::as_const(*key) {
+                        writes.entry(k).or_default().push((fi, *val));
+                    }
+                }
+            }
+        }
+    }
+    if std::env::var("EVMDEC_DEBUG_CAPS").is_ok() {
+        for (k, ws) in &writes {
+            eprintln!(
+                "[caps] slot {} writes: {:?} bounds: {:?}",
+                k.to_decimal(),
+                ws.iter()
+                    .map(|(fi, v)| format!("fn{}={}", fi, emit::fmt_expr(*v, &Names::default())))
+                    .collect::<Vec<_>>(),
+                bounds
+                    .iter()
+                    .filter(|((_, kk), _)| kk == k)
+                    .map(|((fi, _), c)| format!("fn{}<{}", fi, c))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    let mut out = HashMap::new();
+    'slots: for (k, ws) in writes {
+        let mut cap = 0u64;
+        for (fi, val) in ws {
+            if expr::is_const(val) {
+                continue;
+            }
+            let loads_k = |e: ExprId| matches!(expr::node(e), Node::SLoad(kk, false, _) if expr::as_const(kk) == Some(k));
+            match expr::node(val) {
+                Node::Op(op::SUB, v) if loads_k(v[0]) => {}
+                Node::Op(op::ADD, v)
+                    if (loads_k(v[0]) && expr::as_const(v[1]) == Some(U256::ONE))
+                        || (loads_k(v[1]) && expr::as_const(v[0]) == Some(U256::ONE)) =>
+                {
+                    match bounds.get(&(fi, k)) {
+                        Some(c) => cap = cap.max(*c),
+                        None => continue 'slots,
+                    }
+                }
+                _ => continue 'slots,
+            }
+        }
+        if cap > 0 {
+            out.insert(k, cap);
+        }
+    }
+    out
 }
 
 /// Every path from `start` ends in a revert or an invalid opcode.

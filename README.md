@@ -84,7 +84,12 @@ oracle, so the accuracy claim below is measured, not asserted.
   normally instead of reverting (pre-0.4 modifiers, `if (!isOwner(msg.sender)) return;`),
   reverse-quoted amounts (the caller fixes the shares it mints or the tokens it withdraws while
   the amount it gives is computed through a division and only required to be nonzero: the
-  Balancer V1 `joinswapPoolAmountOut` drain; forward-quoted joins are not flagged), the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked
+  Balancer V1 `joinswapPoolAmountOut` drain; forward-quoted joins are not flagged). Findings
+  are ranked by severity and then confidence, a callee the function first looks up in storage
+  (`require(isBound[token])`) is a registry entry rather than a caller-chosen contract, checking
+  a token's `transfer` result is not "trusting the callee", loops over a storage counter the
+  contract caps at a constant are informational, and lock-protected call-then-write paths are
+  reported once for the contract rather than once per function, the Vyper 0.2.15–0.3.0 reentrancy-lock bug, locked
   ether, unprotected upgrades,
   proxy detection (EIP-1967 / beacon / ZeppelinOS / EIP-1167 / storage-slot) with on-chain
   implementation resolution, known compiler bugs for the detected solc version. Rules look

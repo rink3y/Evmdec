@@ -1093,7 +1093,7 @@ fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
     false
 }
 
-fn fname(f: &Function) -> String {
+pub(crate) fn fname(f: &Function) -> String {
     match f.kind {
         FnKind::External => format!(
             "{}{}",
@@ -1109,7 +1109,7 @@ fn fname(f: &Function) -> String {
 
 // One positional constructor keeps the ~50 rule sites to a single call each.
 #[allow(clippy::too_many_arguments)]
-fn push(
+pub(crate) fn push(
     findings: &mut Vec<Finding>,
     id: &str,
     title: &str,
@@ -3101,6 +3101,11 @@ pub fn analyze(c: &Contract) -> Report {
     // ---- cross-function passes: inferred access policy, attack chains ----
     policy_findings(&facts, &mut findings);
     chain_findings(&facts, &auth, &mut findings);
+
+    // ---- widths, signedness and kinds of values ----
+    if let Some(env) = &c.types {
+        crate::type_rules::findings(c, env, &names_for, &mut findings);
+    }
 
     // ---- contract-level findings ----
     if std::env::var("EVMDEC_DEBUG_LOCKS").is_ok() {

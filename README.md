@@ -93,6 +93,13 @@ oracle, so the accuracy claim below is measured, not asserted.
   signatures (selectors computed with the built-in keccak, so every entry is correct) names what
   it can; the full public signature database can be installed as one local file (see *Quick
   start*); everything else is named by selector.
+* **Rules over types.** Five rules reason about the recovered widths and kinds of values,
+  which no opcode pattern can: a wide parameter or arithmetic result cut to `uintN` without a
+  range check before it is stored or passed on (`unchecked-downcast`), a value compared both as
+  signed and as unsigned (`signed-unsigned-confusion`), an account built by arithmetic
+  (`address-from-arithmetic`), a hash used as a number (`hash-as-number`), and a storage counter
+  or timestamp of 64 bits or less that the code advances (`narrow-counter`, wrapping before
+  solc 0.8 and reverting after). They stay silent on the 22 audited mainnet contracts.
 * **Compiler awareness.** The metadata trailer gives the exact compiler version; without it the
   bytecode's fingerprints bound it (the `0x60`/`0x80` free-memory pointer, `Panic(uint256)` and
   `Error(string)` reverts, calldata head-size checks, decoder validators, shifts, `PUSH0`, the

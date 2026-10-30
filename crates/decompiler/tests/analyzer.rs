@@ -384,3 +384,73 @@ fn wrapping_payout_arithmetic_needs_a_bound() {
         .iter()
         .any(|f| f.id == "unbounded-payout-parameter"));
 }
+
+fn finding<'a>(r: &'a evmdec::analyze::Report, id: &str) -> Option<&'a evmdec::analyze::Finding> {
+    r.findings.iter().find(|f| f.id == id)
+}
+
+#[test]
+fn unchecked_downcast_of_a_wide_parameter_is_reported_unless_range_checked() {
+    // x = arg0; slot1 = x + 1 (x is a number); slot0 = uint32(x) with no check.
+    let truncating = dispatcher(
+        "PUSH1 0x04 CALLDATALOAD DUP1 PUSH1 0x01 ADD PUSH1 0x01 SSTORE PUSH4 0xffffffff AND PUSH1 0x00 SSTORE STOP",
+    );
+    let r = analyze::analyze(&decompile::decompile(&truncating, &Options::default()));
+    let f = finding(&r, "unchecked-downcast").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium, "{f:?}");
+    assert!(f.description.contains("32 bits"), "{}", f.description);
+
+    // require(x < 2**32) first: a checked cast.
+    let checked = dispatcher(
+        "PUSH1 0x04 CALLDATALOAD DUP1 PUSH5 0x0100000000 GT PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST DUP1 PUSH1 0x01 ADD PUSH1 0x01 SSTORE PUSH4 0xffffffff AND PUSH1 0x00 SSTORE STOP",
+    );
+    let r = analyze::analyze(&decompile::decompile(&checked, &Options::default()));
+    assert!(finding(&r, "unchecked-downcast").is_none(), "{:?}", ids(&r));
+}
+
+#[test]
+fn a_value_compared_signed_and_unsigned_is_reported() {
+    // require(b <s a); require(b <u a); store both.
+    let code = dispatcher(
+        "PUSH1 0x04 CALLDATALOAD PUSH1 0x24 CALLDATALOAD DUP2 DUP2 SLT PUSH2 @s JUMPI PUSH1 0x00 DUP1 REVERT :s JUMPDEST DUP2 DUP2 LT PUSH2 @u JUMPI PUSH1 0x00 DUP1 REVERT :u JUMPDEST PUSH1 0x00 SSTORE PUSH1 0x01 SSTORE STOP",
+    );
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f = finding(&r, "signed-unsigned-confusion").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(f.description.contains("arg"), "{}", f.description);
+}
+
+#[test]
+fn narrow_storage_counter_is_reported() {
+    // slot0 = uint32(slot0 + 1)
+    let code =
+        dispatcher("PUSH1 0x00 SLOAD PUSH1 0x01 ADD PUSH4 0xffffffff AND PUSH1 0x00 SSTORE STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f = finding(&r, "narrow-counter").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(f.description.contains("uint32"), "{}", f.description);
+    assert!(f.description.contains("wraps"), "{}", f.description);
+}
+
+#[test]
+fn an_account_computed_with_arithmetic_is_reported() {
+    // call(slot0); slot0 = arg0 + 1 (the load comes first so it is not forwarded from the store)
+    let code = dispatcher(
+        "PUSH1 0x00 DUP1 DUP1 DUP1 DUP1 PUSH1 0x00 SLOAD GAS CALL POP PUSH1 0x04 CALLDATALOAD PUSH1 0x01 ADD PUSH1 0x00 SSTORE STOP",
+    );
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f = finding(&r, "address-from-arithmetic").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(
+        f.evidence.iter().any(|e| e.contains("+ 1")),
+        "{:?}",
+        f.evidence
+    );
+}
+
+#[test]
+fn a_hash_used_in_arithmetic_is_reported() {
+    // slot1 = slot0 + 1; slot0 = keccak256(arg0)
+    let code = dispatcher(
+        "PUSH1 0x00 SLOAD PUSH1 0x01 ADD PUSH1 0x01 SSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 KECCAK256 PUSH1 0x00 SSTORE STOP",
+    );
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    assert!(finding(&r, "hash-as-number").is_some(), "{:?}", ids(&r));
+}

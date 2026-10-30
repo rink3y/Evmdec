@@ -172,6 +172,13 @@ struct Flags {
     /// mask of the same width that follows is a checked narrowing cast of a wider value, not
     /// the value's own width.
     cast: u32,
+    /// Compared as a signed number (`slt`/`sgt` against something other than zero or a signed
+    /// bound) or divided as one.
+    signed_cmp: bool,
+    /// Compared as an unsigned number against a value that is not a power-of-two bound.
+    unsigned_cmp: bool,
+    /// Receives the result of arithmetic (`add`, `sub`, `mul`, `div`, `mod`, `exp`).
+    arith_def: bool,
 }
 
 impl Flags {
@@ -185,6 +192,36 @@ impl Flags {
         self.account |= other.account;
         self.tested |= other.tested;
         self.cast |= other.cast;
+        self.signed_cmp |= other.signed_cmp;
+        self.unsigned_cmp |= other.unsigned_cmp;
+    }
+}
+
+/// What the solver knows about one location, for rules that reason about widths and uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassInfo {
+    /// The reported type.
+    pub ty: Ty,
+    /// Used as an arithmetic operand.
+    pub arith: bool,
+    /// Used as an account.
+    pub account: bool,
+    /// Compared or divided as a signed number.
+    pub signed_cmp: bool,
+    /// Compared as an unsigned number.
+    pub unsigned_cmp: bool,
+    /// Receives the result of arithmetic.
+    pub arith_def: bool,
+    /// A storage slot, field or mapping key.
+    pub storage: bool,
+    /// Widths (bytes, as a bit set) the value was range-checked against before a cast.
+    cast: u32,
+}
+
+impl ClassInfo {
+    /// Was the value range-checked against `2^bits` (a checked cast to that width)?
+    pub fn checked(&self, bits: u32) -> bool {
+        bits.is_multiple_of(8) && bits / 8 < 32 && self.cast & (1 << (bits / 8)) != 0
     }
 }
 
@@ -225,7 +262,7 @@ const MAX_ROUNDS: usize = 8;
 const MAX_TYPE_DEPTH: u32 = 6;
 
 /// The solver and, once solved, the environment later passes query.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TypeEnv {
     layout: MappingLayout,
     /// Vyper validates decoded values by range checks (`x < 2^160`, `x >> 1 == 0`); solc masks
@@ -627,8 +664,12 @@ impl TypeEnv {
             }
             op::LT | op::GT => {
                 for (x, c, below) in [(v[0], v[1], o == op::LT), (v[1], v[0], o == op::GT)] {
-                    if let Some(c) = konst(c) {
-                        self.bound_use(x, c, below, o, scope);
+                    match konst(c) {
+                        Some(c) => self.bound_use(x, c, below, o, scope),
+                        None => {
+                            let loc = self.loc_of(x, scope);
+                            self.flag(loc, |f| f.unsigned_cmp = true);
+                        }
                     }
                 }
             }
@@ -638,9 +679,20 @@ impl TypeEnv {
                 // unsigned values cast for a check, so it does not flow back.
                 for (x, c) in [(v[0], v[1]), (v[1], v[0])] {
                     let loc = self.loc_of(x, scope);
-                    match konst(c).and_then(signed_bound) {
-                        Some(n) => self.hint(loc, Ty::Int(n)),
-                        None => self.weak(loc, Ty::Int(256)),
+                    match konst(c) {
+                        Some(c) => match signed_bound(c) {
+                            Some(n) => self.hint(loc, Ty::Int(n)),
+                            None => {
+                                self.weak(loc.clone(), Ty::Int(256));
+                                if !c.is_zero() {
+                                    self.flag(loc, |f| f.signed_cmp = true);
+                                }
+                            }
+                        },
+                        None => {
+                            self.weak(loc.clone(), Ty::Int(256));
+                            self.flag(loc, |f| f.signed_cmp = true);
+                        }
                     }
                 }
             }
@@ -648,7 +700,8 @@ impl TypeEnv {
                 for x in v {
                     if konst(*x).is_none() {
                         let loc = self.loc_of(*x, scope);
-                        self.hint(loc, Ty::Int(256));
+                        self.hint(loc.clone(), Ty::Int(256));
+                        self.flag(loc, |f| f.signed_cmp = true);
                     }
                 }
             }
@@ -726,7 +779,12 @@ impl TypeEnv {
                 self.flag(loc, |f| f.cast |= 1 << (n / 8));
                 self.arith(x, scope, by);
             }
-            _ => self.arith(x, scope, by),
+            Some(_) => self.arith(x, scope, by),
+            None => {
+                let loc = self.loc_of(x, scope);
+                self.flag(loc, |f| f.unsigned_cmp = true);
+                self.arith(x, scope, by);
+            }
         }
     }
 
@@ -774,6 +832,9 @@ impl TypeEnv {
                             let vt = self.type_of(*val, *scope);
                             if vt != Ty::Bool && !expr::is_boolean(*val) {
                                 flags.other = true;
+                            }
+                            if is_arithmetic(*val) {
+                                flags.arith_def = true;
                             }
                             t = t.join(vt);
                         }
@@ -959,6 +1020,39 @@ impl TypeEnv {
     pub fn var_is_bool(&self, pc: usize, id: u32) -> bool {
         self.final_of(&Loc::Var { scope: pc, id }) == Ty::Bool
     }
+
+    /// The location `e` reads in the function at `scope`, when it is a location read.
+    pub fn location(&self, e: ExprId, scope: usize) -> Option<Loc> {
+        self.loc_of(e, scope)
+    }
+
+    /// Every location the solver has a class for.
+    pub fn locations(&self) -> impl Iterator<Item = &Loc> {
+        self.ids.keys()
+    }
+
+    /// What is known about a location.
+    pub fn info(&self, loc: &Loc) -> Option<ClassInfo> {
+        let c = &self.classes[*self.ids.get(loc)?];
+        Some(ClassInfo {
+            ty: resolve(c, Evidence::Final),
+            arith: c.flags.arith,
+            account: c.flags.account,
+            signed_cmp: c.flags.signed_cmp,
+            unsigned_cmp: c.flags.unsigned_cmp,
+            arith_def: c.flags.arith_def,
+            storage: c.storage,
+            cast: c.flags.cast,
+        })
+    }
+
+    /// The values flowing into a location, each with the function it is read in.
+    pub fn defs(&self, loc: &Loc) -> &[(ExprId, usize)] {
+        match self.ids.get(loc) {
+            Some(i) => &self.classes[*i].defs,
+            None => &[],
+        }
+    }
 }
 
 fn persistent(root: U256, steps: &[ShapeStep]) -> Shape {
@@ -1012,6 +1106,20 @@ fn condition_exprs(nd: &lift::LNode) -> Vec<ExprId> {
         _ => {}
     }
     v
+}
+
+/// Arithmetic that produces a number: `add`, `sub`, `mul`, `div`, `mod`, `exp`, excluding the
+/// shapes compilers use for other things (byte shifts by powers of two, branchless selects).
+pub fn is_arithmetic(e: ExprId) -> bool {
+    match expr::node(e) {
+        Node::Op(op::MUL, v) => {
+            !v.iter().any(|x| expr::is_boolean(*x)) && !v.iter().any(|x| is_byte_shift(*x))
+        }
+        Node::Op(op::DIV, v) => !v.iter().any(|x| is_byte_shift(*x)),
+        Node::Op(op::ADD, v) => !v.iter().any(|x| is_masked_select(*x)),
+        Node::Op(op::SUB | op::MOD | op::EXP | op::ADDMOD | op::MULMOD, _) => true,
+        _ => false,
+    }
 }
 
 /// A power of two that moves a value by whole bytes.

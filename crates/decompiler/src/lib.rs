@@ -29,5 +29,6 @@ pub mod sigdb;
 pub mod sigs;
 pub mod ssa;
 pub mod structure;
+pub mod type_rules;
 pub mod types;
 pub mod verify;

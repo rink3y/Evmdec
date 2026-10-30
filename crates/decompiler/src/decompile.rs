@@ -153,6 +153,10 @@ pub struct Contract {
     pub language: String,
     /// The compiler profile: family, version bounds and code-generation features.
     pub compiler: compiler::Profile,
+    /// The solved types of every parameter, helper argument, storage slot and phi variable;
+    /// kept for the analyzer, not serialised.
+    #[serde(skip)]
+    pub types: Option<TypeEnv>,
     /// Every recovered function: external entries first, then internal helpers and orphans.
     pub functions: Vec<Function>,
     /// Storage variables, ordered by slot.
@@ -968,6 +972,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         kind: info.kind,
         language,
         compiler: profile,
+        types: Some(env),
         functions,
         storage,
         events,

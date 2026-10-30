@@ -11,12 +11,16 @@
 
 use crate::analyze::{display_name, Confidence, Finding};
 use crate::decompile::{Contract, Function};
-use crate::exec;
+use crate::exec::{self, FrameRun};
 use crate::function::FnKind;
 use crate::hex;
-use crate::interp::Host;
+use crate::interp::{CallRecord, Outcome};
+use crate::opcode as op;
 use crate::u256::U256;
 use std::collections::HashMap;
+
+/// Selector of `transferFrom(address,address,uint256)`.
+const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
 
 /// Finding ids whose claim is exactly "an arbitrary caller reaches the sink from a fresh state".
 /// For these a reached sink is a confirmation; other rules (reentrancy, which needs a seeded
@@ -39,12 +43,17 @@ const CONFIRMABLE: &[&str] = &[
 const STEP_BUDGET: usize = 120_000;
 /// Calldata shapes tried per finding before giving up.
 const MAX_ATTEMPTS: usize = 200;
-/// Attacker account: a non-zero address that holds no role in a fresh contract.
-const ATTACKER: u64 = 0xaaaa_aaaa_aaaa_aaaa;
-/// The executing contract's own address.
-const SELF: u64 = 0xcccc_cccc_cccc_cccc;
+/// Ether sent in the second round of attempts, for sinks behind a payment.
+const SOME_ETHER: U256 = U256::from_u64(100_000_000_000_000_000);
 
-/// Try to confirm the reachable findings of `c` in place.
+/// Appended to a confirmed finding's description.
+const CONFIRMED_NOTE: &str = concat!(
+    " Confirmed: a caller holding no role reaches this sink from a fresh state and the",
+    " transaction keeps its effect (a reproducing input is attached)."
+);
+
+/// Try to confirm the reachable findings of `c` in place. Setting `EVMDEC_NO_CONFIRM` in the
+/// environment skips the pass (the search runs the bytecode and costs time).
 pub fn confirm(c: &Contract, findings: &mut [Finding]) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() {
         return;
@@ -67,60 +76,38 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         else {
             continue;
         };
-        if let Some(witness) = reach(code, f, pc) {
+        if let Some(witness) = reach(code, f, pc, &finding.id) {
             finding.confirmed = true;
             finding.witness = Some(hex::encode(&witness));
             finding.confidence = Confidence::High;
-            finding
-                .description
-                .push_str(" Confirmed: an arbitrary caller reaches this sink from a fresh state (a reproducing input is attached).");
+            finding.description.push_str(CONFIRMED_NOTE);
         }
     }
 }
 
-/// Values tried in each calldata argument slot.
-fn candidates() -> [U256; 5] {
-    [
-        U256::ZERO,
-        U256::from_u64(ATTACKER),
-        U256::ONE,
-        U256::from_u64(1_000_000_000_000_000_000),
-        U256::MAX,
-    ]
-}
-
-/// Search a small calldata space for an input that reaches `pc` in `f`, as the attacker. Returns
+/// Search a small calldata space for an input under which `f`, called by the role-less account,
+/// enters the block at `pc`, ends normally and shows the effect the rule `id` claims. Returns
 /// the calldata on the first hit.
-fn reach(code: &[u8], f: &Function, pc: usize) -> Option<Vec<u8>> {
-    let selector = f
-        .selector
-        .as_deref()
-        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-    let cands = candidates();
+///
+/// A finding's `pc` is the start of the block holding the sink, so entering it is necessary but
+/// not sufficient: the block may still revert on a guard inlined ahead of the sink, and a frame
+/// that reverts later undoes the write or the call. The run must therefore end normally and
+/// leave the trace the claim is about ([`shows_effect`]).
+fn reach(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
+    let selector = exec::selector_of(f);
     let mut attempts = 0;
-    for callvalue in [U256::ZERO, U256::from_u64(100_000_000_000_000_000)] {
+    for callvalue in [U256::ZERO, SOME_ETHER] {
         for nargs in 0..=6usize {
-            // Uniform fillings: every argument the same candidate.
-            for cand in cands {
-                if try_calldata(
-                    code,
-                    selector,
-                    &vec![cand; nargs],
-                    callvalue,
-                    pc,
-                    &mut attempts,
-                ) {
-                    return Some(calldata(selector, &vec![cand; nargs]));
+            for args in exec::arg_shapes(nargs) {
+                if attempts >= MAX_ATTEMPTS {
+                    return None;
                 }
-            }
-            // One argument varied, the rest zero: reaches guards keyed on a single parameter.
-            for pos in 0..nargs {
-                for cand in cands {
-                    let mut args = vec![U256::ZERO; nargs];
-                    args[pos] = cand;
-                    if try_calldata(code, selector, &args, callvalue, pc, &mut attempts) {
-                        return Some(calldata(selector, &args));
-                    }
+                attempts += 1;
+                let data = exec::calldata(selector, &args);
+                let host = exec::caller_host(data.clone(), callvalue);
+                let run = exec::run_frame(code, &host, HashMap::new(), STEP_BUDGET);
+                if run.reached(pc) && run.succeeded() && shows_effect(id, &run) {
+                    return Some(data);
                 }
             }
         }
@@ -128,37 +115,26 @@ fn reach(code: &[u8], f: &Function, pc: usize) -> Option<Vec<u8>> {
     None
 }
 
-/// Run one calldata shape and report whether it reached `pc`; counts against the attempt cap.
-fn try_calldata(
-    code: &[u8],
-    selector: Option<u32>,
-    args: &[U256],
-    callvalue: U256,
-    pc: usize,
-    attempts: &mut usize,
-) -> bool {
-    if *attempts >= MAX_ATTEMPTS {
-        return false;
+/// Did the run leave the trace that the rule `id` claims a role-less caller can produce?
+fn shows_effect(id: &str, run: &FrameRun) -> bool {
+    let call_of = |pred: &dyn Fn(&CallRecord) -> bool| run.calls.iter().any(pred);
+    match id {
+        "selfdestruct" => matches!(run.outcome, Outcome::SelfDestruct(_)),
+        "unprotected-ether-withdrawal" => call_of(&|c| c.kind == op::CALL && !c.value.is_zero()),
+        "arbitrary-call" => call_of(&|c| matches!(c.kind, op::CALL | op::CALLCODE)),
+        "arbitrary-delegatecall" | "delegatecall-user-target" | "delegatecall-dynamic-target" => {
+            call_of(&|c| c.kind == op::DELEGATECALL)
+        }
+        "arbitrary-transferfrom" => {
+            call_of(&|c| c.input.starts_with(&SEL_TRANSFER_FROM.to_be_bytes()))
+        }
+        "unprotected-owner-write" | "unprotected-initializer" | "unprotected-upgrade" => {
+            !run.storage.is_empty()
+        }
+        // The claim is a normal return that did nothing: no write, no call, no event.
+        "silent-auth-failure" => {
+            run.storage.is_empty() && run.calls.is_empty() && run.logs.is_empty()
+        }
+        _ => false,
     }
-    *attempts += 1;
-    let data = calldata(selector, args);
-    let host = Host::controlled(
-        U256::from_u64(SELF),
-        U256::from_u64(ATTACKER),
-        data,
-        callvalue,
-    );
-    exec::run_frame(code, &host, &HashMap::new(), STEP_BUDGET).reached(pc)
-}
-
-/// `selector ++ args` as ABI-style calldata (each argument one 32-byte word).
-fn calldata(selector: Option<u32>, args: &[U256]) -> Vec<u8> {
-    let mut data = Vec::new();
-    if let Some(sel) = selector {
-        data.extend_from_slice(&sel.to_be_bytes());
-    }
-    for a in args {
-        data.extend_from_slice(&a.to_be_bytes());
-    }
-    data
 }

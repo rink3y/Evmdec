@@ -106,6 +106,9 @@ fn load_input(input: &str) -> Result<Vec<u8>> {
     anyhow::bail!("'{}' is neither a file, a hex string nor an address", input)
 }
 
+/// Hard-coded call targets fetched and decompiled alongside a contract, at most.
+const MAX_LINKED: usize = 8;
+
 fn fetch_and_decompile(
     address: &str,
     rpc: Option<&str>,
@@ -170,25 +173,36 @@ fn fetch_and_decompile(
             }
         }
         // Hard-coded external call targets: fetch and decompile each (one level deep).
-        let targets: Vec<String> = c.call_targets.clone();
-        for t in targets.iter().take(8) {
-            let full = format!("0x{}", t.trim_start_matches("0x"));
-            if Some(&full) == c.address.as_ref() {
+        if c.call_targets.len() > MAX_LINKED {
+            eprintln!(
+                "{} hard-coded call targets; fetching the first {}",
+                c.call_targets.len(),
+                MAX_LINKED
+            );
+        }
+        let mut linked = Vec::new();
+        for t in c.call_targets.iter().take(MAX_LINKED) {
+            let is_self = c
+                .address
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(t));
+            if is_self {
                 continue;
             }
-            match client.get_code(&full) {
+            eprintln!("call target {} — fetching...", t);
+            match client.get_code(t) {
                 Ok(tc) if !tc.is_empty() => {
-                    eprintln!("call target {} — fetching...", full);
                     let mut lc = evmdec::decompile::decompile(&tc, opts);
-                    lc.address = Some(full.clone());
+                    lc.address = Some(t.clone());
                     lc.chain = Some(chain.to_string());
                     lc.source = evmdec::decompile::render(&lc, "Linked");
-                    c.linked.push(lc);
+                    linked.push(lc);
                 }
-                Ok(_) => eprintln!("call target {} has no code (likely an EOA)", full),
-                Err(e) => eprintln!("could not fetch call target {}: {}", full, e),
+                Ok(_) => eprintln!("call target {} has no code (likely an EOA)", t),
+                Err(e) => eprintln!("could not fetch call target {}: {}", t, e),
             }
         }
+        c.linked = linked;
     }
     Ok(c)
 }

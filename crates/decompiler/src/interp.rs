@@ -144,8 +144,10 @@ impl Host {
 
     /// A controlled environment for a confirmation run: `caller` is both the immediate caller
     /// and the transaction origin (the account whose reach is being tested), `calldata` is the
-    /// input, storage reads as zero unless written, and the block values are fixed. Every field
-    /// is deterministic so a reached sink is reproducible.
+    /// input, storage reads as zero unless written, and the block values are fixed. External
+    /// calls succeed with empty return data (plain transfers land and the caller's own contracts
+    /// cooperate), which is the case a reachability witness is about. Every field is
+    /// deterministic so a reached sink is reproducible.
     pub fn controlled(address: U256, caller: U256, calldata: Vec<u8>, callvalue: U256) -> Host {
         Host {
             address,
@@ -165,7 +167,7 @@ impl Host {
             blobbasefee: U256::ONE,
             seed: 0x5eed,
             zero_storage: true,
-            force_calls: None,
+            force_calls: Some(true),
         }
     }
     /// Balance of account `a` (`BALANCE`): seed-derived, limited to 64 bits.
@@ -173,14 +175,22 @@ impl Host {
         h(&[&self.seed.to_be_bytes()[..], b"bal", &a.to_be_bytes()].concat())
             & U256::from_u64(u64::MAX)
     }
-    /// Code size of account `a` (`EXTCODESIZE`): seed-derived, below 300 bytes.
+    /// Code size of account `a` (`EXTCODESIZE`): seed-derived, below 300 bytes. The zero address
+    /// never holds code, so an unset storage slot read as an address has none.
     pub fn extcodesize(&self, a: U256) -> U256 {
+        if a.is_zero() {
+            return U256::ZERO;
+        }
         U256::from_u64(
             h(&[&self.seed.to_be_bytes()[..], b"size", &a.to_be_bytes()].concat()).low_u64() % 300,
         )
     }
-    /// Code hash of account `a` (`EXTCODEHASH`): seed-derived, not the hash of `extcode`.
+    /// Code hash of account `a` (`EXTCODEHASH`): seed-derived, not the hash of `extcode`; zero
+    /// for the zero address, which has no code.
     pub fn extcodehash(&self, a: U256) -> U256 {
+        if a.is_zero() {
+            return U256::ZERO;
+        }
         h(&[&self.seed.to_be_bytes()[..], b"hash", &a.to_be_bytes()].concat())
     }
     /// Code of account `a` (`EXTCODECOPY`): `extcodesize(a)` seed-derived bytes.

@@ -190,8 +190,9 @@ pub struct Contract {
     /// (1..=9) are excluded.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub call_targets: Vec<String>,
-    /// Contracts fetched and decompiled at this contract's external call targets, when following
-    /// links over RPC. Each carries its own address and report.
+    /// Contracts fetched and decompiled at this contract's hard-coded call targets, one level
+    /// deep, when following links over RPC. Each is taken as found: a target that is itself a
+    /// proxy appears as its stub, and the JSON output carries the contracts without reports.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub linked: Vec<Contract>,
     /// Filled when the contract was fetched by address.
@@ -967,12 +968,14 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                             }
                         }
                         // A literal address called with CALL/STATICCALL/CALLCODE: a hard-coded
-                        // dependency. Precompiles and the zero address are not contracts to link.
+                        // dependency. Precompiles (0x01 through 0x11 as of Prague) and the zero
+                        // address are not contracts to link.
                         Node::Const(c)
                             if matches!(*kind, op::CALL | op::STATICCALL | op::CALLCODE) =>
                         {
                             let low = c & expr::mask_bits(160);
-                            let is_precompile = low.fits_u64() && (1..=9).contains(&low.low_u64());
+                            let is_precompile =
+                                low.fits_u64() && (1..=0x11).contains(&low.low_u64());
                             if !low.is_zero() && !is_precompile {
                                 let h = low.to_hex_padded(20);
                                 if !call_targets.contains(&h) {

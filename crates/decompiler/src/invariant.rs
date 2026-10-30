@@ -14,7 +14,6 @@ use crate::exec;
 use crate::expr::{self, ExprId, Node};
 use crate::function::{FnKind, Mutability};
 use crate::hex;
-use crate::interp::Host;
 use crate::keccak;
 use crate::lift::{self, Stmt};
 use crate::opcode as op;
@@ -27,12 +26,9 @@ use std::collections::{HashMap, HashSet};
 const STEP_BUDGET: usize = 120_000;
 /// Calldata shapes tried per function.
 const MAX_ATTEMPTS: usize = 200;
-/// Attacker account holding no balance in a fresh contract.
-const ATTACKER: u64 = 0xaaaa_aaaa_aaaa_aaaa;
-/// The executing contract's own address.
-const SELF: u64 = 0xcccc_cccc_cccc_cccc;
 
-/// Run the invariant checks over `c`.
+/// Run the invariant checks over `c`. Setting `EVMDEC_NO_CONFIRM` in the environment skips the
+/// pass, as for [`crate::confirm`].
 pub fn findings(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return;
@@ -252,21 +248,21 @@ fn entry_key(root: U256, account: U256, layout: MappingLayout) -> U256 {
     U256::from_be_bytes(&keccak::keccak256(&pre))
 }
 
-/// Report any state-changing entry point that lets the attacker end a zero-value call with a
+/// Report any state-changing entry point that lets the role-less caller end a zero-value call with a
 /// non-zero balance in one of the ledgers.
 fn self_credit(c: &Contract, ledgers: &[Ledger], out: &mut Vec<Finding>) {
     let code = &c.info.runtime;
-    let attacker = U256::from_u64(ATTACKER);
+    let caller = exec::CALLER;
     let keys: Vec<(Ledger, U256)> = ledgers
         .iter()
-        .map(|l| (*l, entry_key(l.root, attacker, c.compiler.layout)))
+        .map(|l| (*l, entry_key(l.root, caller, c.compiler.layout)))
         .collect();
     for f in c.functions.iter().filter(|f| creditable(f)) {
         if let Some(Credit {
             witness,
             root,
             wrapped,
-        }) = search_credit(code, f, &keys, attacker)
+        }) = search_credit(code, f, &keys)
         {
             let how = if wrapped {
                 "A subtraction on that path wraps below zero, so the balance becomes a near-2^256 number: the debit is missing the check that other paths apply to this mapping."
@@ -298,7 +294,7 @@ fn creditable(f: &Function) -> bool {
     f.kind == FnKind::External && !matches!(f.mutability, Mutability::View | Mutability::Pure)
 }
 
-/// A call that left the attacker with a balance.
+/// A call that left the caller with a balance.
 struct Credit {
     /// The calldata that did it.
     witness: Vec<u8>,
@@ -308,46 +304,23 @@ struct Credit {
     wrapped: bool,
 }
 
-/// Search calldata for a zero-value call to `f` that leaves `attacker` with a balance; returns
+/// Search calldata for a zero-value call to `f` that leaves the caller with a balance; returns
 /// the first hit. A wrapped value (top bit set) counts only for a ledger the contract compares
 /// unsigned elsewhere: without that, the mapping may hold signed accounting that legitimately
 /// goes negative, and the bytecode gives no way to tell.
-fn search_credit(
-    code: &[u8],
-    f: &Function,
-    keys: &[(Ledger, U256)],
-    attacker: U256,
-) -> Option<Credit> {
-    let selector = f
-        .selector
-        .as_deref()
-        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-    let cands = [
-        U256::ZERO,
-        attacker,
-        U256::ONE,
-        U256::from_u64(1_000_000_000_000_000_000),
-        U256::MAX,
-    ];
+fn search_credit(code: &[u8], f: &Function, keys: &[(Ledger, U256)]) -> Option<Credit> {
+    let selector = exec::selector_of(f);
     let mut attempts = 0;
     for nargs in 0..=5usize {
-        let mut shapes: Vec<Vec<U256>> = cands.iter().map(|c| vec![*c; nargs]).collect();
-        for pos in 0..nargs {
-            for cand in cands {
-                let mut a = vec![U256::ZERO; nargs];
-                a[pos] = cand;
-                shapes.push(a);
-            }
-        }
-        for args in shapes {
+        for args in exec::arg_shapes(nargs) {
             if attempts >= MAX_ATTEMPTS {
                 return None;
             }
             attempts += 1;
-            let data = calldata(selector, &args);
+            let data = exec::calldata(selector, &args);
             // The host owns its calldata; `data` is kept as the witness of a hit.
-            let host = Host::controlled(U256::from_u64(SELF), attacker, data.clone(), U256::ZERO);
-            let run = exec::run_frame(code, &host, &HashMap::new(), STEP_BUDGET);
+            let host = exec::caller_host(data.clone(), U256::ZERO);
+            let run = exec::run_frame(code, &host, HashMap::new(), STEP_BUDGET);
             if !run.succeeded() {
                 continue;
             }
@@ -367,16 +340,4 @@ fn search_credit(
         }
     }
     None
-}
-
-/// `selector ++ args`, one 32-byte word per argument.
-fn calldata(selector: Option<u32>, args: &[U256]) -> Vec<u8> {
-    let mut data = Vec::new();
-    if let Some(sel) = selector {
-        data.extend_from_slice(&sel.to_be_bytes());
-    }
-    for a in args {
-        data.extend_from_slice(&a.to_be_bytes());
-    }
-    data
 }

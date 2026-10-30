@@ -80,9 +80,14 @@ comes from calldata and is not `msg.sender`, in a function without a caller chec
 
 Two passes run the bytecode rather than match it. The confirmation pass (`confirm.rs`) takes
 the findings whose sink is a concrete instruction (an open `selfdestruct`, an ether withdrawal,
-an owner write, an arbitrary call) and searches for calldata that reaches the sink from a fresh
-state as an arbitrary caller using the whole-frame executor (`exec.rs`); a hit marks the finding
-*Confirmed* and records the calldata as its witness. The invariant pass (`invariant.rs`) checks
+an owner write, an arbitrary call) and searches for calldata under which a caller holding no
+role, from a fresh state, enters the sink's block, ends the transaction normally and leaves the
+effect the rule describes (the destruct outcome, a value-bearing call, a delegatecall, a
+`transferFrom` payload, a storage write, or for a silent authorisation failure a normal return
+that did nothing), using the whole-frame executor (`exec.rs`); a hit marks the finding
+*Confirmed* and records the calldata as its witness. Entering the block alone is not enough: a
+guard inlined ahead of the sink or a revert after it leaves no effect. The fresh state is all
+zero, so a gate the constructor sets is open in this model; the zero address holds no code. The invariant pass (`invariant.rs`) checks
 a property of whole transactions instead of one sink: no unprivileged caller may raise its own
 entry in a balance ledger out of nothing. Ledgers are the `mapping(address => uint)` variables
 that are also debited or paid out somewhere (counters and nonces are not), whose entries never

@@ -21,7 +21,8 @@ pub struct FrameRun {
     pub visited: HashSet<usize>,
     /// Instructions executed.
     pub steps: usize,
-    /// Storage after the frame: keys written during it over the host's initial values.
+    /// Storage after the frame: `init_storage` plus every key written during it. Keys never
+    /// written do not appear (a controlled host reads them as zero).
     pub storage: HashMap<U256, U256>,
     /// Logs emitted, in order.
     pub logs: Vec<LogRecord>,
@@ -54,12 +55,12 @@ impl FrameRun {
 pub fn run_frame(
     code: &[u8],
     host: &Host,
-    init_storage: &HashMap<U256, U256>,
+    init_storage: HashMap<U256, U256>,
     budget: usize,
 ) -> FrameRun {
     let jumpdests: HashSet<usize> = disasm::jumpdests(code).into_iter().collect();
     let mut m = Machine::new(code, host);
-    m.storage = init_storage.clone();
+    m.storage = init_storage;
     let mut visited = HashSet::new();
     let mut steps = 0;
     let outcome = loop {
@@ -102,6 +103,60 @@ pub fn run_frame(
     }
 }
 
+/// The account whose reach is tested: a non-zero address holding no role in a fresh contract.
+pub const CALLER: U256 = U256::from_u64(0xaaaa_aaaa_aaaa_aaaa);
+/// The executing contract's own address in a controlled run.
+pub const SELF: U256 = U256::from_u64(0xcccc_cccc_cccc_cccc);
+
+/// A controlled host for a run by [`CALLER`] against [`SELF`] with `calldata` and `callvalue`.
+pub fn caller_host(calldata: Vec<u8>, callvalue: U256) -> Host {
+    Host::controlled(SELF, CALLER, calldata, callvalue)
+}
+
+/// Values tried in each calldata argument slot: zero, the caller's own address (for `to` and
+/// `owner` parameters), one, a round ether amount and the all-ones word.
+pub const CANDIDATES: [U256; 5] = [
+    U256::ZERO,
+    CALLER,
+    U256::ONE,
+    U256::from_u64(1_000_000_000_000_000_000),
+    U256::MAX,
+];
+
+/// The argument vectors tried for a function of `nargs` words, cheapest first: every argument
+/// the same candidate, then one argument varied with the rest zero (reaches guards keyed on a
+/// single parameter). The order is fixed so a witness is reproducible.
+pub fn arg_shapes(nargs: usize) -> Vec<Vec<U256>> {
+    let mut shapes: Vec<Vec<U256>> = CANDIDATES.iter().map(|c| vec![*c; nargs]).collect();
+    for pos in 0..nargs {
+        for cand in CANDIDATES {
+            let mut args = vec![U256::ZERO; nargs];
+            args[pos] = cand;
+            shapes.push(args);
+        }
+    }
+    shapes
+}
+
+/// `selector ++ args` as ABI-style calldata, each argument one 32-byte word.
+pub fn calldata(selector: Option<u32>, args: &[U256]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 32 * args.len());
+    if let Some(sel) = selector {
+        data.extend_from_slice(&sel.to_be_bytes());
+    }
+    for a in args {
+        data.extend_from_slice(&a.to_be_bytes());
+    }
+    data
+}
+
+/// The 4-byte selector of `f` as a number, when it has one.
+pub fn selector_of(f: &crate::decompile::Function) -> Option<u32> {
+    f.selector
+        .as_deref()
+        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+}
+
 /// A jump target as a code offset, when it names a `JUMPDEST`.
 fn jump_target(t: U256, jumpdests: &HashSet<usize>) -> Option<usize> {
     t.as_usize().filter(|pc| jumpdests.contains(pc))
@@ -112,60 +167,45 @@ mod tests {
     use super::*;
     use crate::hex;
 
-    /// `PUSH1 1 PUSH1 0 SSTORE` then a conditional loop and STOP, exercising jumps.
-    #[test]
-    fn runs_across_jumps_and_records_storage() {
-        // slot0 = 1; if calldata[0..32] != 0 { slot1 = 2 } ; stop
-        let code = hex::decode("6001600055600035156012576002600155005b00").expect("hex");
-        // calldata zero: the branch is not taken, slot1 stays unset.
-        let host = Host::controlled(
+    /// A controlled host with `calldata` and no value.
+    fn host(calldata: Vec<u8>) -> Host {
+        Host::controlled(
             U256::from_u64(0xc0),
             U256::from_u64(0xa),
-            vec![],
+            calldata,
             U256::ZERO,
-        );
-        let run = run_frame(&code, &host, &HashMap::new(), 10_000);
+        )
+    }
+
+    /// `slot0 = 1; if calldata[0..32] != 0 { slot1 = 2 }; stop`: a forward conditional branch.
+    #[test]
+    fn runs_across_jumps_and_records_storage() {
+        let code = hex::decode("6001600055600035156012576002600155005b00").expect("hex");
+        // calldata zero: the branch is not taken, slot1 stays unset.
+        let run = run_frame(&code, &host(vec![]), HashMap::new(), 10_000);
         assert!(run.succeeded(), "{:?}", run.outcome);
         assert_eq!(run.storage.get(&U256::ZERO), Some(&U256::ONE));
         assert_eq!(run.storage.get(&U256::ONE), None);
 
         // calldata non-zero: the branch runs, slot1 = 2.
-        let host = Host::controlled(
-            U256::from_u64(0xc0),
-            U256::from_u64(0xa),
-            vec![0xff; 32],
-            U256::ZERO,
-        );
-        let run = run_frame(&code, &host, &HashMap::new(), 10_000);
+        let run = run_frame(&code, &host(vec![0xff; 32]), HashMap::new(), 10_000);
         assert!(run.succeeded(), "{:?}", run.outcome);
         assert_eq!(run.storage.get(&U256::ONE), Some(&U256::from_u64(2)));
     }
 
     #[test]
     fn a_jump_to_a_non_jumpdest_halts() {
-        // PUSH1 0x05 JUMP (0x05 is the data byte of the PUSH, not a JUMPDEST)
-        let code = hex::decode("600556").expect("hex");
-        let host = Host::controlled(
-            U256::from_u64(0xc0),
-            U256::from_u64(0xa),
-            vec![],
-            U256::ZERO,
-        );
-        let run = run_frame(&code, &host, &HashMap::new(), 10_000);
+        // PUSH1 0x01 JUMP: offset 1 is the data byte of the PUSH, not a JUMPDEST.
+        let code = hex::decode("600156").expect("hex");
+        let run = run_frame(&code, &host(vec![]), HashMap::new(), 10_000);
         assert!(matches!(run.outcome, Outcome::Invalid));
     }
 
     #[test]
     fn an_infinite_loop_stops_at_the_budget() {
-        // JUMPDEST PUSH1 0x00 JUMP  (spins forever)
+        // JUMPDEST PUSH1 0x00 JUMP (spins forever)
         let code = hex::decode("5b600056").expect("hex");
-        let host = Host::controlled(
-            U256::from_u64(0xc0),
-            U256::from_u64(0xa),
-            vec![],
-            U256::ZERO,
-        );
-        let run = run_frame(&code, &host, &HashMap::new(), 500);
+        let run = run_frame(&code, &host(vec![]), HashMap::new(), 500);
         assert!(matches!(run.outcome, Outcome::Exception(_)));
         assert_eq!(run.steps, 500);
     }

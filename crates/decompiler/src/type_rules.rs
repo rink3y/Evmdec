@@ -7,7 +7,7 @@
 //! does a narrow storage counter advance. Every rule is stated in widths and uses, never in
 //! names, so it applies to any contract.
 
-use crate::analyze::{fname, push, Confidence, Finding, Severity};
+use crate::analyze::{display_name, push, Confidence, Finding, Severity};
 use crate::compiler::Kind;
 use crate::decompile::{Contract, Function, StorageVar};
 use crate::emit::{self, Names};
@@ -16,26 +16,30 @@ use crate::function::{self, FnKind};
 use crate::lift::{self, Stmt, Term};
 use crate::opcode as op;
 use crate::sigs;
+use crate::ssa;
 use crate::types::{self, Loc, Ty, TypeEnv};
 use crate::u256::U256;
 use std::collections::HashSet;
+
+/// Nodes visited per expression walk before giving up.
+const MAX_VISITED: usize = 20_000;
 
 /// Run every type-based rule.
 pub fn findings(
     c: &Contract,
     env: &TypeEnv,
-    names_for: &dyn Fn(&Function) -> Names,
+    names_for: impl Fn(&Function) -> Names,
     out: &mut Vec<Finding>,
 ) {
-    unchecked_downcasts(c, env, names_for, out);
+    unchecked_downcasts(c, env, &names_for, out);
     sign_confusion(c, env, out);
-    arithmetic_accounts(c, env, names_for, out);
+    arithmetic_accounts(c, env, &names_for, out);
     hashes_as_numbers(c, env, out);
     narrow_counters(c, env, out);
 }
 
 /// Where a narrowed value ends up.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sink {
     /// Written to storage.
     Stored,
@@ -43,6 +47,37 @@ enum Sink {
     Passed,
     /// Returned to the caller.
     Returned,
+}
+
+impl Sink {
+    fn fate(self) -> &'static str {
+        match self {
+            Sink::Stored => "stored",
+            Sink::Passed => "passed to another contract",
+            Sink::Returned => "returned",
+        }
+    }
+}
+
+/// A statement whose expressions are a sink for a narrowed value.
+struct SinkSite {
+    sink: Sink,
+    /// The expressions the statement consumes.
+    exprs: Vec<ExprId>,
+    /// The rendered statement, used as evidence.
+    line: String,
+}
+
+/// The function being judged and the body (itself or a helper it calls) being scanned.
+struct Downcast<'a> {
+    c: &'a Contract,
+    env: &'a TypeEnv,
+    /// The external function the finding is reported on.
+    f: &'a Function,
+    /// The body being scanned: `f` or one of its helpers.
+    body: &'a Function,
+    /// Declared parameter types of `f`, when its signature is known and has only value types.
+    declared: Option<&'a [String]>,
 }
 
 /// A `uint256` (or wider than the mask) value cut down to `N` bits with no range check first:
@@ -54,60 +89,35 @@ enum Sink {
 fn unchecked_downcasts(
     c: &Contract,
     env: &TypeEnv,
-    names_for: &dyn Fn(&Function) -> Names,
+    names_for: impl Fn(&Function) -> Names,
     out: &mut Vec<Finding>,
 ) {
     if c.compiler.kind == Kind::Vyper {
         return;
     }
-    let checked = c.compiler.checked_arithmetic;
     for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
         let declared = declared_param_types(f);
-        let mut seen_lines: HashSet<String> = HashSet::new();
-        for (body, scope) in bodies(c, f) {
+        let mut reported: HashSet<String> = HashSet::new();
+        for body in bodies(c, f) {
             let Some(l) = &body.lifted else { continue };
             let names = names_for(body);
+            let cx = Downcast {
+                c,
+                env,
+                f,
+                body,
+                declared: declared.as_deref(),
+            };
             for nd in &l.nodes {
                 let roots = lift::roots(nd);
                 let packing = function::packing_masks(&roots);
-                let sinks: Vec<(Sink, Vec<ExprId>, String)> = sink_statements(nd, &names);
-                for (sink, exprs, line) in sinks {
-                    for (x, bits) in masks_in(&exprs, &packing) {
-                        let Some((conf, what)) =
-                            downcast_source(x, bits, scope, f, body, env, &declared, checked)
-                        else {
-                            continue;
-                        };
-                        if !seen_lines.insert(line.clone()) {
-                            continue;
+                for site in sink_statements(nd, &names) {
+                    for (x, bits) in masks_in(&site.exprs, &packing) {
+                        if let Some((conf, what)) = cx.source(x, bits) {
+                            if reported.insert(site.line.clone()) {
+                                report_downcast(&cx, &site, nd.pc, bits, conf, &what, out);
+                            }
                         }
-                        let sev = match (sink, conf) {
-                            (
-                                Sink::Stored | Sink::Passed,
-                                Confidence::High | Confidence::Medium,
-                            ) => Severity::Medium,
-                            _ => Severity::Low,
-                        };
-                        let fate = match sink {
-                            Sink::Stored => "stored",
-                            Sink::Passed => "passed to another contract",
-                            Sink::Returned => "returned",
-                        };
-                        push(
-                            out,
-                            "unchecked-downcast",
-                            "Value narrowed to a smaller width without a range check",
-                            sev,
-                            conf,
-                            Some(f),
-                            Some(nd.pc),
-                            format!(
-                                "`{}` cuts {} down to {} bits (`uint{}`) and the result is {}. Nothing checks that the value fits first, so a larger value loses its high bits silently instead of reverting.",
-                                f.name, what, bits, bits, fate
-                            ),
-                            vec![line.clone()],
-                            "Check the range before narrowing (`require(x <= type(uintN).max)` or a SafeCast), or keep the wider type.",
-                        );
                     }
                 }
             }
@@ -115,9 +125,81 @@ fn unchecked_downcasts(
     }
 }
 
-/// The function and the internal helpers it calls, each with the pc that scopes its values.
-fn bodies<'a>(c: &'a Contract, f: &'a Function) -> Vec<(&'a Function, usize)> {
-    let mut out = vec![(f, f.pc)];
+fn report_downcast(
+    cx: &Downcast,
+    site: &SinkSite,
+    pc: usize,
+    bits: u32,
+    conf: Confidence,
+    what: &str,
+    out: &mut Vec<Finding>,
+) {
+    let sev = match (site.sink, conf) {
+        (Sink::Stored | Sink::Passed, Confidence::High | Confidence::Medium) => Severity::Medium,
+        _ => Severity::Low,
+    };
+    push(
+        out,
+        "unchecked-downcast",
+        "Value narrowed to a smaller width without a range check",
+        sev,
+        conf,
+        Some(cx.f),
+        Some(pc),
+        format!(
+            "`{}` cuts {} down to {} bits (`uint{}`) and the result is {}. Nothing checks that the value fits first, so a larger value loses its high bits silently instead of reverting.",
+            cx.f.name,
+            what,
+            bits,
+            bits,
+            site.sink.fate()
+        ),
+        vec![site.line.clone()],
+        "Check the range before narrowing (`require(x <= type(uintN).max)` or a SafeCast), or keep the wider type.",
+    );
+}
+
+impl Downcast<'_> {
+    /// Is the value masked to `bits` wider than that, and unchecked? Returns how sure the rule
+    /// is and a description of the value.
+    fn source(&self, x: ExprId, bits: u32) -> Option<(Confidence, String)> {
+        let info = self
+            .env
+            .location(x, self.body.pc)
+            .and_then(|l| self.env.info(&l));
+        if info.is_some_and(|i| i.checked(bits)) {
+            return None;
+        }
+        let checked_arithmetic = self.c.compiler.checked_arithmetic;
+        match expr::node(x) {
+            Node::CallDataLoad(off) if self.body.pc == self.f.pc => {
+                let word = emit::calldata_word_index(off)?;
+                let name = param_name(self.f, word);
+                if let Some(decl) = self.declared {
+                    let ty = decl.get(word as usize)?;
+                    return wider_than(ty, bits).then(|| {
+                        (
+                            Confidence::High,
+                            format!("the `{}` parameter `{}`", ty, name),
+                        )
+                    });
+                }
+                // No signature: the word is wide when the code also uses it unmasked.
+                info?
+                    .arith
+                    .then(|| (Confidence::Medium, format!("the parameter `{}`", name)))
+            }
+            _ if checked_arithmetic && types::is_arithmetic(x) => {
+                Some((Confidence::Low, "the result of arithmetic".to_string()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The function and the internal helpers it calls, transitively.
+fn bodies<'a>(c: &'a Contract, f: &'a Function) -> Vec<&'a Function> {
+    let mut out = vec![f];
     let mut seen: HashSet<usize> = HashSet::new();
     let mut stack: Vec<usize> = f.calls.clone();
     while let Some(pc) = stack.pop() {
@@ -129,7 +211,7 @@ fn bodies<'a>(c: &'a Contract, f: &'a Function) -> Vec<(&'a Function, usize)> {
             .iter()
             .find(|g| g.kind == FnKind::Internal && g.pc == pc)
         {
-            out.push((h, h.pc));
+            out.push(h);
             stack.extend(h.calls.iter().copied());
         }
     }
@@ -147,18 +229,21 @@ fn declared_param_types(f: &Function) -> Option<Vec<String>> {
     Some(params)
 }
 
-/// Statements of a node whose expressions are a sink for a narrowed value, with the rendered
-/// line used as evidence.
-fn sink_statements(nd: &lift::LNode, names: &Names) -> Vec<(Sink, Vec<ExprId>, String)> {
+/// The printed name of calldata head word `word` of `f`.
+fn param_name(f: &Function, word: u32) -> String {
+    f.params
+        .iter()
+        .find(|p| p.index == word)
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| format!("arg{}", word))
+}
+
+/// Statements of a node whose expressions are a sink for a narrowed value.
+fn sink_statements(nd: &lift::LNode, names: &Names) -> Vec<SinkSite> {
     let mut out = Vec::new();
     for s in &nd.stmts {
-        let sink = match s {
-            Stmt::SStore { .. } => Sink::Stored,
-            Stmt::Call { .. } => Sink::Passed,
-            _ => continue,
-        };
-        let exprs = match s {
-            Stmt::SStore { val, .. } => vec![*val],
+        let (sink, exprs) = match s {
+            Stmt::SStore { val, .. } => (Sink::Stored, vec![*val]),
             Stmt::Call {
                 value,
                 input,
@@ -170,18 +255,25 @@ fn sink_statements(nd: &lift::LNode, names: &Names) -> Vec<(Sink, Vec<ExprId>, S
                 if let Some(w) = input {
                     v.extend(w.iter().copied());
                 }
-                v
+                (Sink::Passed, v)
             }
-            _ => Vec::new(),
+            _ => continue,
         };
-        out.push((sink, exprs, emit::fmt_stmt(s, names)));
+        out.push(SinkSite {
+            sink,
+            exprs,
+            line: emit::fmt_stmt(s, names),
+        });
     }
     if let Term::Return {
         data: Some(words), ..
     } = &nd.term
     {
-        let line = emit::fmt_term_halt(&nd.term, names).unwrap_or_default();
-        out.push((Sink::Returned, words.clone(), line));
+        out.push(SinkSite {
+            sink: Sink::Returned,
+            exprs: words.clone(),
+            line: emit::fmt_term_halt(&nd.term, names).unwrap_or_default(),
+        });
     }
     out
 }
@@ -193,7 +285,7 @@ fn masks_in(roots: &[ExprId], packing: &HashSet<ExprId>) -> Vec<(ExprId, u32)> {
     let mut seen = HashSet::new();
     let mut stack: Vec<ExprId> = roots.to_vec();
     while let Some(x) = stack.pop() {
-        if !seen.insert(x) || seen.len() > 20_000 {
+        if !seen.insert(x) || seen.len() > MAX_VISITED {
             continue;
         }
         if let Node::Op(op::AND, v) = expr::node(x) {
@@ -213,53 +305,6 @@ fn masks_in(roots: &[ExprId], packing: &HashSet<ExprId>) -> Vec<(ExprId, u32)> {
     out
 }
 
-/// Is the value masked to `bits` wider than that, and unchecked? Returns how sure the rule is
-/// and a description of the value.
-#[allow(clippy::too_many_arguments)]
-fn downcast_source(
-    x: ExprId,
-    bits: u32,
-    scope: usize,
-    f: &Function,
-    body: &Function,
-    env: &TypeEnv,
-    declared: &Option<Vec<String>>,
-    checked_arithmetic: bool,
-) -> Option<(Confidence, String)> {
-    let info = env.location(x, scope).and_then(|l| env.info(&l));
-    if info.as_ref().is_some_and(|i| i.checked(bits)) {
-        return None;
-    }
-    match expr::node(x) {
-        Node::CallDataLoad(off) if body.pc == f.pc => {
-            let word = emit::calldata_word_index(off)?;
-            let name = f
-                .params
-                .iter()
-                .find(|p| p.index == word)
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| format!("arg{}", word));
-            if let Some(decl) = declared {
-                let ty = decl.get(word as usize)?;
-                return wider_than(ty, bits).then(|| {
-                    (
-                        Confidence::High,
-                        format!("the `{}` parameter `{}`", ty, name),
-                    )
-                });
-            }
-            // No signature: the word is wide when the code also uses it unmasked.
-            info?
-                .arith
-                .then(|| (Confidence::Medium, format!("the parameter `{}`", name)))
-        }
-        _ if checked_arithmetic && types::is_arithmetic(x) => {
-            Some((Confidence::Low, "the result of arithmetic".to_string()))
-        }
-        _ => None,
-    }
-}
-
 /// Does the declared ABI type hold more than `bits` bits?
 fn wider_than(ty: &str, bits: u32) -> bool {
     match ty {
@@ -272,42 +317,53 @@ fn wider_than(ty: &str, bits: u32) -> bool {
     }
 }
 
-/// Where a location lives, for the report: the function it belongs to (when any) and a phrase.
-fn describe<'a>(c: &'a Contract, loc: &Loc) -> Option<(Option<&'a Function>, String)> {
+/// Where a location lives, for the report.
+struct Place<'a> {
+    /// The function it belongs to, when any.
+    function: Option<&'a Function>,
+    /// A phrase naming it (`parameter \`arg0\` of \`transfer\``).
+    phrase: String,
+}
+
+fn describe<'a>(c: &'a Contract, loc: &Loc) -> Option<Place<'a>> {
     let func = |pc: usize| c.functions.iter().find(|f| f.pc == pc);
     let var = |root: U256| -> Option<&StorageVar> {
         c.storage
             .iter()
             .find(|v| U256::from_hex_str(&v.slot) == Some(root))
     };
+    let place = |function: Option<&'a Function>, phrase: String| Some(Place { function, phrase });
     match loc {
         Loc::Param { scope, word } => {
             let f = func(*scope)?;
-            let name = f
-                .params
-                .iter()
-                .find(|p| p.index == *word)
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| format!("arg{}", word));
-            Some((Some(f), format!("parameter `{}` of `{}`", name, fname(f))))
+            place(
+                Some(f),
+                format!(
+                    "parameter `{}` of `{}`",
+                    param_name(f, *word),
+                    display_name(f)
+                ),
+            )
         }
         Loc::Arg { unit, slot } => {
             let f = func(*unit)?;
-            let l = f.lifted.as_ref()?;
-            let k = crate::ssa::arity(l);
+            let k = ssa::arity(f.lifted.as_ref()?);
             let i = k.checked_sub(1 + *slot as usize)?;
-            Some((
+            place(
                 Some(f),
                 format!("parameter `arg{}` of helper `{}`", i, f.name),
-            ))
+            )
         }
         Loc::Ret { unit, .. } => {
             let f = func(*unit)?;
-            Some((Some(f), format!("the result of helper `{}`", f.name)))
+            place(Some(f), format!("the result of helper `{}`", f.name))
         }
         Loc::Var { scope, .. } => {
             let f = func(*scope)?;
-            Some((Some(f), format!("a value computed in `{}`", fname(f))))
+            place(
+                Some(f),
+                format!("a value computed in `{}`", display_name(f)),
+            )
         }
         Loc::Slot(shape) | Loc::Key(shape) => {
             let v = var(shape.root)?;
@@ -318,7 +374,7 @@ fn describe<'a>(c: &'a Contract, loc: &Loc) -> Option<(Option<&'a Function>, Str
             } else {
                 "the entries of"
             };
-            Some((None, format!("{} `{}`", what, v.name)))
+            place(None, format!("{} `{}`", what, v.name))
         }
         Loc::Field {
             shape, bit_offset, ..
@@ -330,7 +386,7 @@ fn describe<'a>(c: &'a Contract, loc: &Loc) -> Option<(Option<&'a Function>, Str
                 .find(|fl| fl.offset == bit_offset / 8)
                 .map(|fl| fl.name.clone())
                 .unwrap_or_else(|| v.name.clone());
-            Some((None, format!("storage field `{}`", field)))
+            place(None, format!("storage field `{}`", field))
         }
     }
 }
@@ -338,9 +394,7 @@ fn describe<'a>(c: &'a Contract, loc: &Loc) -> Option<(Option<&'a Function>, Str
 /// The same value compared as a signed number in one place and as an unsigned number in
 /// another: one of the two comparisons is wrong for every value with the top bit set.
 fn sign_confusion(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
-    let mut locs: Vec<&Loc> = env.locations().collect();
-    locs.sort_by_key(|l| format!("{:?}", l));
-    for loc in locs {
+    for loc in env.locations() {
         // Helper arguments are left out: solc's ABI decoders compare calldata offsets with
         // `slt` and `lt` by design.
         if !matches!(loc, Loc::Param { .. } | Loc::Slot(_) | Loc::Field { .. }) {
@@ -355,20 +409,18 @@ fn sign_confusion(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
         if matches!(info.ty, Ty::Int(n) if n < 256) {
             continue;
         }
-        let Some((f, what)) = describe(c, loc) else {
-            continue;
-        };
+        let Some(p) = describe(c, loc) else { continue };
         push(
             out,
             "signed-unsigned-confusion",
             "Value compared both as signed and as unsigned",
             Severity::Low,
             Confidence::Low,
-            f,
-            f.map(|f| f.pc),
+            p.function,
+            p.function.map(|f| f.pc),
             format!(
                 "{} is compared with signed comparisons (`slt`/`sgt`) in one place and with unsigned ones (`lt`/`gt`) in another. A value with its top bit set is negative to one check and huge to the other, so one of them accepts what the other was meant to reject.",
-                capitalise(&what)
+                capitalise(&p.phrase)
             ),
             Vec::new(),
             "Use one signedness for the value throughout; cast explicitly with a range check where the two meet.",
@@ -381,12 +433,10 @@ fn sign_confusion(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
 fn arithmetic_accounts(
     c: &Contract,
     env: &TypeEnv,
-    names_for: &dyn Fn(&Function) -> Names,
+    names_for: impl Fn(&Function) -> Names,
     out: &mut Vec<Finding>,
 ) {
-    let mut locs: Vec<&Loc> = env.locations().collect();
-    locs.sort_by_key(|l| format!("{:?}", l));
-    for loc in locs {
+    for loc in env.locations() {
         // Helper results are left out: a result position that is not aligned with the caller's
         // view would blame the wrong value.
         if matches!(loc, Loc::Ret { .. } | Loc::Key(_)) {
@@ -396,18 +446,15 @@ fn arithmetic_accounts(
         if !(info.account && info.arith_def) || info.ty != Ty::Address {
             continue;
         }
-        let arith: Vec<(ExprId, usize)> = env
+        let Some((e, scope)) = env
             .defs(loc)
             .iter()
             .copied()
-            .filter(|(e, _)| types::is_arithmetic(*e))
-            .collect();
-        let Some((e, scope)) = arith.first().copied() else {
+            .find(|(e, _)| types::is_arithmetic(*e))
+        else {
             continue;
         };
-        let Some((f, what)) = describe(c, loc) else {
-            continue;
-        };
+        let Some(p) = describe(c, loc) else { continue };
         let evidence = c
             .functions
             .iter()
@@ -420,11 +467,11 @@ fn arithmetic_accounts(
             "Account address computed with arithmetic",
             Severity::Low,
             Confidence::Low,
-            f,
-            f.map(|f| f.pc),
+            p.function,
+            p.function.map(|f| f.pc),
             format!(
                 "{} is used as an account (call target, balance query or comparison with `msg.sender`) but receives the result of arithmetic. Addresses are decoded, loaded or derived from a hash; one built by adding or multiplying numbers is either a packing mistake or an address the code means to construct.",
-                capitalise(&what)
+                capitalise(&p.phrase)
             ),
             evidence,
             "Check how the address is formed; if it is `CREATE2` or packing arithmetic, make the derivation explicit and test it.",
@@ -436,9 +483,7 @@ fn arithmetic_accounts(
 /// range (`% n`) is the weak-randomness rule's job; this covers hashes added to, subtracted
 /// from or multiplied (commitment arithmetic, hand-rolled identifiers).
 fn hashes_as_numbers(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
-    let mut locs: Vec<&Loc> = env.locations().collect();
-    locs.sort_by_key(|l| format!("{:?}", l));
-    for loc in locs {
+    for loc in env.locations() {
         // Stack values and helper arguments are left out: `keccak256(slot) + i` is how the
         // compiler addresses array elements, and resize helpers take that pointer as a parameter.
         if !matches!(loc, Loc::Param { .. } | Loc::Slot(_) | Loc::Field { .. }) {
@@ -448,20 +493,18 @@ fn hashes_as_numbers(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
         if info.ty != Ty::Bytes(32) || !info.arith {
             continue;
         }
-        let Some((f, what)) = describe(c, loc) else {
-            continue;
-        };
+        let Some(p) = describe(c, loc) else { continue };
         push(
             out,
             "hash-as-number",
             "Hash value used as a number",
             Severity::Info,
             Confidence::Low,
-            f,
-            f.map(|f| f.pc),
+            p.function,
+            p.function.map(|f| f.pc),
             format!(
                 "{} holds a `bytes32` hash and is used in arithmetic. A hash is an identifier: arithmetic on it has no meaning, and a result that depends on it is as controllable as the hash's input.",
-                capitalise(&what)
+                capitalise(&p.phrase)
             ),
             Vec::new(),
             "Treat hashes as opaque identifiers; if a numeric reading is intended (proof-of-work targets), document and bound it.",
@@ -469,12 +512,18 @@ fn hashes_as_numbers(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     }
 }
 
+/// The text of a narrow-counter finding.
+struct CounterMessage {
+    title: &'static str,
+    description: String,
+    recommendation: &'static str,
+    severity: Severity,
+}
+
 /// A storage counter or timestamp of 64 bits or less that advances: it wraps silently before
 /// solc 0.8 and reverts for good after it.
 fn narrow_counters(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
-    let mut locs: Vec<&Loc> = env.locations().collect();
-    locs.sort_by_key(|l| format!("{:?}", l));
-    for loc in locs {
+    for loc in env.locations() {
         if !matches!(loc, Loc::Slot(_) | Loc::Field { .. }) {
             continue;
         }
@@ -491,59 +540,59 @@ fn narrow_counters(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
         if !increments && !(clock && bits <= 32) {
             continue;
         }
-        let Some((_, what)) = describe(c, loc) else {
-            continue;
-        };
-        let (title, desc, rec) = if increments {
-            let fate = if c.compiler.checked_arithmetic {
-                "the increment reverts for good once the maximum is reached (every path through it stops working)"
-            } else {
-                "the counter wraps to zero once the maximum is reached (an identifier is reused, a cap is reset)"
-            };
-            (
-                "Narrow storage counter",
-                format!(
-                    "{} is a `uint{}` that the code increments. With {} values, {}.",
-                    capitalise(&what),
-                    bits,
-                    max_of(bits),
-                    fate
-                ),
-                "Use a wider type for anything that counts up over the contract's life, or make the cap explicit.",
-            )
-        } else {
-            (
-                "Narrow storage timestamp",
-                format!(
-                    "{} is a `uint{}` that receives `block.timestamp` or `block.number`. A {}-bit timestamp overflows {}.",
-                    capitalise(&what),
-                    bits,
-                    bits,
-                    if bits <= 32 {
-                        "in 2106 (and a block number sooner)"
-                    } else {
-                        "far in the future"
-                    }
-                ),
-                "Store timestamps in at least 40 bits (`uint40` lasts until the year 36812).",
-            )
-        };
+        let Some(p) = describe(c, loc) else { continue };
+        let m = counter_message(&p.phrase, bits, increments, c.compiler.checked_arithmetic);
         push(
             out,
             "narrow-counter",
-            title,
-            if increments {
-                Severity::Low
-            } else {
-                Severity::Info
-            },
+            m.title,
+            m.severity,
             Confidence::Medium,
             None,
             None,
-            desc,
+            m.description,
             Vec::new(),
-            rec,
+            m.recommendation,
         );
+    }
+}
+
+fn counter_message(
+    phrase: &str,
+    bits: u32,
+    increments: bool,
+    checked_arithmetic: bool,
+) -> CounterMessage {
+    if increments {
+        let fate = if checked_arithmetic {
+            "the increment reverts for good once the maximum is reached (every path through it stops working)"
+        } else {
+            "the counter wraps to zero once the maximum is reached (an identifier is reused, a cap is reset)"
+        };
+        CounterMessage {
+            title: "Narrow storage counter",
+            description: format!(
+                "{} is a `uint{}` that the code increments. Its maximum is {}; {}.",
+                capitalise(phrase),
+                bits,
+                max_value(bits),
+                fate
+            ),
+            recommendation: "Use a wider type for anything that counts up over the contract's life, or make the cap explicit.",
+            severity: Severity::Low,
+        }
+    } else {
+        CounterMessage {
+            title: "Narrow storage timestamp",
+            description: format!(
+                "{} is a `uint{}` that receives `block.timestamp` or `block.number`. A {}-bit timestamp overflows in 2106 (and a block number sooner).",
+                capitalise(phrase),
+                bits,
+                bits
+            ),
+            recommendation: "Store timestamps in at least 40 bits (`uint40` lasts until the year 36812).",
+            severity: Severity::Info,
+        }
     }
 }
 
@@ -572,21 +621,55 @@ fn mentions_clock(e: ExprId) -> bool {
     })
 }
 
-/// `2^bits` as prose.
-fn max_of(bits: u32) -> String {
+/// `2^bits - 1` as prose.
+fn max_value(bits: u32) -> String {
     match bits {
-        8 => "256".into(),
-        16 => "65,536".into(),
+        8 => "255".into(),
+        16 => "65,535".into(),
         32 => "about 4.3 billion".into(),
         64 => "about 1.8e19".into(),
-        n => format!("2^{}", n),
+        n => format!("2^{} - 1", n),
     }
 }
 
+/// The phrase with its first letter upper-cased, to start a sentence.
 fn capitalise(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
         Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declared_width_comparison() {
+        assert!(wider_than("uint256", 32));
+        assert!(wider_than("bytes32", 160));
+        assert!(wider_than("uint64", 32));
+        assert!(!wider_than("uint32", 32));
+        assert!(!wider_than("address", 160));
+        assert!(!wider_than("bool", 8));
+    }
+
+    #[test]
+    fn masks_are_found_and_packing_pieces_skipped() {
+        let x = expr::var(1);
+        let narrow = expr::op2(op::AND, x, expr::konst(expr::mask_bits(32)));
+        let piece = expr::op2(op::AND, x, expr::konst(expr::mask_bits(64)));
+        let packing: HashSet<ExprId> = [piece].into_iter().collect();
+        let found = masks_in(&[narrow, piece], &packing);
+        assert_eq!(found, vec![(x, 32)]);
+    }
+
+    #[test]
+    fn prose_helpers() {
+        assert_eq!(max_value(8), "255");
+        assert_eq!(max_value(24), "2^24 - 1");
+        assert_eq!(capitalise("storage field `x`"), "Storage field `x`");
+        assert_eq!(capitalise(""), "");
     }
 }

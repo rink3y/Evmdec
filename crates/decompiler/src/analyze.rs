@@ -8,6 +8,7 @@ use crate::function::FnKind;
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::sigs;
+use crate::type_rules;
 use crate::u256::U256;
 use serde::Serialize;
 use std::cell::RefCell;
@@ -229,7 +230,7 @@ type MemWrites = Vec<(ExprId, Option<u64>)>;
 /// What one entry point does, kept for the cross-function passes: the access-control policy
 /// the contract follows (and the functions that deviate from it) and multi-step attack chains.
 struct FnFacts {
-    /// Display name (`fname`).
+    /// Display name (`display_name`).
     name: String,
     /// Entry pc, used as the finding's location.
     pc: usize,
@@ -326,7 +327,7 @@ fn collect_facts(
     names: &Names,
 ) -> FnFacts {
     let mut facts = FnFacts {
-        name: fname(f),
+        name: display_name(f),
         pc: f.pc,
         external: f.kind == FnKind::External,
         state_changing: f.effects.writes_storage
@@ -1093,7 +1094,7 @@ fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
     false
 }
 
-pub(crate) fn fname(f: &Function) -> String {
+pub(crate) fn display_name(f: &Function) -> String {
     match f.kind {
         FnKind::External => format!(
             "{}{}",
@@ -1107,7 +1108,7 @@ pub(crate) fn fname(f: &Function) -> String {
     }
 }
 
-// One positional constructor keeps the ~50 rule sites to a single call each.
+/// Append a finding. One positional constructor keeps the ~50 rule sites to a single call each.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push(
     findings: &mut Vec<Finding>,
@@ -1126,7 +1127,7 @@ pub(crate) fn push(
         title: title.into(),
         severity: sev,
         confidence: conf,
-        function: f.map(fname),
+        function: f.map(display_name),
         pc,
         description: desc,
         evidence,
@@ -1468,7 +1469,10 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
         for k in grown {
-            ctx.unguarded_extenders.entry(k).or_default().push(fname(f));
+            ctx.unguarded_extenders
+                .entry(k)
+                .or_default()
+                .push(display_name(f));
         }
     }
     for f in &c.functions {
@@ -1618,9 +1622,9 @@ pub fn analyze(c: &Contract) -> Report {
             || f.effects.selfdestruct
             || f.effects.creates;
         if caller_checked && state_changing {
-            privileged.push(fname(f));
+            privileged.push(display_name(f));
         } else if state_changing && f.kind == FnKind::External {
-            unauthenticated.push(fname(f));
+            unauthenticated.push(display_name(f));
         }
         if f.mutability == crate::function::Mutability::Payable {
             any_payable = true;
@@ -1720,7 +1724,11 @@ pub fn analyze(c: &Contract) -> Report {
                 } => {
                     let target = emit::fmt_expr(*addr, names);
                     let line = emit::fmt_stmt(stmt, names);
-                    external_calls.insert(format!("{}: {}", fname(f), line.trim_end_matches(';')));
+                    external_calls.insert(format!(
+                        "{}: {}",
+                        display_name(f),
+                        line.trim_end_matches(';')
+                    ));
                     let in_len_c = expr::as_const(*in_len).and_then(|l| l.as_usize());
                     // The selector of the payload, from the decoded words or from the first memory word.
                     let selector: Option<u32> = input
@@ -3103,9 +3111,7 @@ pub fn analyze(c: &Contract) -> Report {
     chain_findings(&facts, &auth, &mut findings);
 
     // ---- widths, signedness and kinds of values ----
-    if let Some(env) = &c.types {
-        crate::type_rules::findings(c, env, &names_for, &mut findings);
-    }
+    type_rules::findings(c, &c.types, names_for, &mut findings);
 
     // ---- contract-level findings ----
     if std::env::var("EVMDEC_DEBUG_LOCKS").is_ok() {
@@ -3124,7 +3130,7 @@ pub fn analyze(c: &Contract) -> Report {
         let mut fns: Vec<String> = lock_slots
             .values()
             .flatten()
-            .filter_map(|pc| c.functions.iter().find(|f| f.pc == *pc).map(fname))
+            .filter_map(|pc| c.functions.iter().find(|f| f.pc == *pc).map(display_name))
             .collect();
         fns.sort();
         push(&mut findings, "vyper-reentrancy-lock-bug", "Each @nonreentrant function uses its own lock slot (Vyper 0.2.15 – 0.3.0 codegen bug)", Severity::High, Confidence::Medium, None, None,

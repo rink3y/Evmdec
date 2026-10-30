@@ -34,7 +34,7 @@ pub struct SlotPath {
 }
 
 /// A path step without its key or index value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ShapeStep {
     /// Some mapping entry.
     Key,
@@ -46,7 +46,7 @@ pub enum ShapeStep {
 
 /// What every element of one declared storage variable shares: the root and the kinds of
 /// steps, which is the unit of typing (all entries of a mapping have the value type).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Shape {
     /// Slot of the declared variable.
     pub root: U256,

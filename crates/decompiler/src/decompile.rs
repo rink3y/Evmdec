@@ -156,7 +156,7 @@ pub struct Contract {
     /// The solved types of every parameter, helper argument, storage slot and phi variable;
     /// kept for the analyzer, not serialised.
     #[serde(skip)]
-    pub types: Option<TypeEnv>,
+    pub types: TypeEnv,
     /// Every recovered function: external entries first, then internal helpers and orphans.
     pub functions: Vec<Function>,
     /// Storage variables, ordered by slot.
@@ -972,7 +972,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         kind: info.kind,
         language,
         compiler: profile,
-        types: Some(env),
+        types: env,
         functions,
         storage,
         events,

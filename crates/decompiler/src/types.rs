@@ -101,7 +101,7 @@ impl Ty {
 }
 
 /// A typed location.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Loc {
     /// A phi variable of one function.
     Var {
@@ -181,9 +181,14 @@ struct Flags {
     arith_def: bool,
 }
 
+/// Is width `bits` in the `cast` bit set (bit `bits / 8` for whole-byte widths)?
+fn cast_checked(cast: u32, bits: u32) -> bool {
+    bits.is_multiple_of(8) && bits / 8 < 32 && cast & (1 << (bits / 8)) != 0
+}
+
 impl Flags {
     fn checked(&self, bits: u32) -> bool {
-        bits.is_multiple_of(8) && bits / 8 < 32 && self.cast & (1 << (bits / 8)) != 0
+        cast_checked(self.cast, bits)
     }
 
     /// Merge the use evidence of a class into one of its sources.
@@ -198,7 +203,7 @@ impl Flags {
 }
 
 /// What the solver knows about one location, for rules that reason about widths and uses.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ClassInfo {
     /// The reported type.
     pub ty: Ty,
@@ -212,16 +217,15 @@ pub struct ClassInfo {
     pub unsigned_cmp: bool,
     /// Receives the result of arithmetic.
     pub arith_def: bool,
-    /// A storage slot, field or mapping key.
-    pub storage: bool,
     /// Widths (bytes, as a bit set) the value was range-checked against before a cast.
     cast: u32,
 }
 
 impl ClassInfo {
     /// Was the value range-checked against `2^bits` (a checked cast to that width)?
+    #[must_use]
     pub fn checked(&self, bits: u32) -> bool {
-        bits.is_multiple_of(8) && bits / 8 < 32 && self.cast & (1 << (bits / 8)) != 0
+        cast_checked(self.cast, bits)
     }
 }
 
@@ -356,7 +360,7 @@ impl TypeEnv {
 
     /// Record an arithmetic use of `e`.
     fn arith(&mut self, e: ExprId, scope: usize, by: u8) {
-        let loc = self.loc_of(e, scope);
+        let loc = self.location(e, scope);
         if self.debug {
             if let Some(l) = &loc {
                 eprintln!("[types] arith on {:?} by {}", l, op::name(by));
@@ -408,14 +412,14 @@ impl TypeEnv {
     /// The location `e` reads, if it is a plain read of one (a masked read counts: the mask is a
     /// cleanup of the same value and a width hint for it).
     fn copy_source(&mut self, e: ExprId, scope: usize) -> Option<Loc> {
-        if let Some(loc) = self.loc_of(e, scope) {
+        if let Some(loc) = self.location(e, scope) {
             return Some(loc);
         }
         if let Node::Op(op::AND, v) = expr::node(e) {
             for (x, m) in [(v[0], v[1]), (v[1], v[0])] {
                 if let Some(m) = expr::as_const(m) {
                     if m.is_low_mask() {
-                        let loc = self.loc_of(x, scope)?;
+                        let loc = self.location(x, scope)?;
                         self.hint(Some(loc.clone()), Ty::of_mask(m.bits()));
                         return Some(loc);
                     }
@@ -425,8 +429,10 @@ impl TypeEnv {
         None
     }
 
-    /// The location `e` denotes, when it is a location read.
-    fn loc_of(&self, e: ExprId, scope: usize) -> Option<Loc> {
+    /// The location `e` denotes when it is a location read: a phi variable, an entry stack
+    /// slot, a calldata word, a storage slot or packed field, or a helper result.
+    #[must_use]
+    pub fn location(&self, e: ExprId, scope: usize) -> Option<Loc> {
         if let Some(field) = ssa::field_read(e) {
             let path = ssa::slot_path(field.key, self.layout)?;
             return Some(Loc::Field {
@@ -583,7 +589,7 @@ impl TypeEnv {
             Node::Op(op::AND, v) if expr::as_const(v[0]) == Some(expr::mask_bits(160)) => v[1],
             _ => e,
         };
-        let loc = self.loc_of(inner, scope);
+        let loc = self.location(inner, scope);
         self.hint(loc.clone(), Ty::Address);
         self.flag(loc, |f| f.account = true);
     }
@@ -639,14 +645,14 @@ impl TypeEnv {
             op::SIGNEXTEND => {
                 if let Some(k) = konst(v[0]) {
                     if k < U256::from_u64(31) {
-                        let loc = self.loc_of(v[1], scope);
+                        let loc = self.location(v[1], scope);
                         self.hint(loc, Ty::Int(8 * (k.low_u64() as u32 + 1)));
                     }
                 }
             }
             op::ISZERO => match expr::node(v[0]) {
                 Node::Op(op::ISZERO, w) => {
-                    let loc = self.loc_of(w[0], scope);
+                    let loc = self.location(w[0], scope);
                     self.flag(loc, |f| f.tested = true);
                 }
                 Node::Op(op::SHR, _) => self.shift_validator(v[0], scope),
@@ -667,7 +673,7 @@ impl TypeEnv {
                     match konst(c) {
                         Some(c) => self.bound_use(x, c, below, o, scope),
                         None => {
-                            let loc = self.loc_of(x, scope);
+                            let loc = self.location(x, scope);
                             self.flag(loc, |f| f.unsigned_cmp = true);
                         }
                     }
@@ -678,20 +684,16 @@ impl TypeEnv {
                 // comparison (`x < 0`) treats the value as signed here, which also happens to
                 // unsigned values cast for a check, so it does not flow back.
                 for (x, c) in [(v[0], v[1]), (v[1], v[0])] {
-                    let loc = self.loc_of(x, scope);
-                    match konst(c) {
-                        Some(c) => match signed_bound(c) {
-                            Some(n) => self.hint(loc, Ty::Int(n)),
-                            None => {
-                                self.weak(loc.clone(), Ty::Int(256));
-                                if !c.is_zero() {
-                                    self.flag(loc, |f| f.signed_cmp = true);
-                                }
-                            }
-                        },
+                    let loc = self.location(x, scope);
+                    let bound = konst(c);
+                    match bound.and_then(signed_bound) {
+                        Some(n) => self.hint(loc, Ty::Int(n)),
                         None => {
+                            // Cloned: the location is used for two records.
                             self.weak(loc.clone(), Ty::Int(256));
-                            self.flag(loc, |f| f.signed_cmp = true);
+                            if bound.is_none_or(|c| !c.is_zero()) {
+                                self.flag(loc, |f| f.signed_cmp = true);
+                            }
                         }
                     }
                 }
@@ -699,7 +701,7 @@ impl TypeEnv {
             op::SDIV | op::SMOD | op::SAR => {
                 for x in v {
                     if konst(*x).is_none() {
-                        let loc = self.loc_of(*x, scope);
+                        let loc = self.location(*x, scope);
                         self.hint(loc.clone(), Ty::Int(256));
                         self.flag(loc, |f| f.signed_cmp = true);
                     }
@@ -739,7 +741,7 @@ impl TypeEnv {
                 if packing {
                     continue;
                 }
-                let loc = self.loc_of(x, scope);
+                let loc = self.location(x, scope);
                 if self.debug {
                     if let Some(l) = &loc {
                         eprintln!(
@@ -753,7 +755,7 @@ impl TypeEnv {
                 }
                 self.hint(loc, Ty::of_mask(m.bits()));
             } else if let Some(bytes) = high_mask_bytes(m) {
-                let loc = self.loc_of(x, scope);
+                let loc = self.location(x, scope);
                 self.hint(loc, Ty::Bytes(bytes));
             }
         }
@@ -771,17 +773,17 @@ impl TypeEnv {
         let typed_width = |n: u32| n == 1 || n == 160 || (n.is_multiple_of(8) && n > 0 && n < 256);
         match bound {
             Some(n) if self.vyper && typed_width(n) => {
-                let loc = self.loc_of(x, scope);
+                let loc = self.location(x, scope);
                 self.hint(loc, Ty::of_mask(n));
             }
             Some(n) if n > 0 && n < 256 && n.is_multiple_of(8) => {
-                let loc = self.loc_of(x, scope);
+                let loc = self.location(x, scope);
                 self.flag(loc, |f| f.cast |= 1 << (n / 8));
                 self.arith(x, scope, by);
             }
             Some(_) => self.arith(x, scope, by),
             None => {
-                let loc = self.loc_of(x, scope);
+                let loc = self.location(x, scope);
                 self.flag(loc, |f| f.unsigned_cmp = true);
                 self.arith(x, scope, by);
             }
@@ -805,7 +807,7 @@ impl TypeEnv {
         }
         let n = n.low_u64() as u32;
         if n == 1 || n == 160 || (n.is_multiple_of(8) && n > 0) {
-            let loc = self.loc_of(w[1], scope);
+            let loc = self.location(w[1], scope);
             self.hint(loc, Ty::of_mask(n));
         }
     }
@@ -896,7 +898,7 @@ impl TypeEnv {
         if depth > MAX_TYPE_DEPTH {
             return Ty::Unknown;
         }
-        if let Some(loc) = self.loc_of(e, scope) {
+        if let Some(loc) = self.location(e, scope) {
             let own = self.resolved_of(&loc);
             // A field read carries its width in the mask.
             return match loc {
@@ -1021,17 +1023,17 @@ impl TypeEnv {
         self.final_of(&Loc::Var { scope: pc, id }) == Ty::Bool
     }
 
-    /// The location `e` reads in the function at `scope`, when it is a location read.
-    pub fn location(&self, e: ExprId, scope: usize) -> Option<Loc> {
-        self.loc_of(e, scope)
-    }
-
-    /// Every location the solver has a class for.
-    pub fn locations(&self) -> impl Iterator<Item = &Loc> {
-        self.ids.keys()
+    /// Every location the solver has a class for, in a deterministic order (the classes live in
+    /// a hash map; reports must not depend on its iteration order).
+    #[must_use]
+    pub fn locations(&self) -> Vec<&Loc> {
+        let mut locs: Vec<&Loc> = self.ids.keys().collect();
+        locs.sort();
+        locs
     }
 
     /// What is known about a location.
+    #[must_use]
     pub fn info(&self, loc: &Loc) -> Option<ClassInfo> {
         let c = &self.classes[*self.ids.get(loc)?];
         Some(ClassInfo {
@@ -1041,12 +1043,12 @@ impl TypeEnv {
             signed_cmp: c.flags.signed_cmp,
             unsigned_cmp: c.flags.unsigned_cmp,
             arith_def: c.flags.arith_def,
-            storage: c.storage,
             cast: c.flags.cast,
         })
     }
 
     /// The values flowing into a location, each with the function it is read in.
+    #[must_use]
     pub fn defs(&self, loc: &Loc) -> &[(ExprId, usize)] {
         match self.ids.get(loc) {
             Some(i) => &self.classes[*i].defs,
@@ -1110,6 +1112,7 @@ fn condition_exprs(nd: &lift::LNode) -> Vec<ExprId> {
 
 /// Arithmetic that produces a number: `add`, `sub`, `mul`, `div`, `mod`, `exp`, excluding the
 /// shapes compilers use for other things (byte shifts by powers of two, branchless selects).
+#[must_use]
 pub fn is_arithmetic(e: ExprId) -> bool {
     match expr::node(e) {
         Node::Op(op::MUL, v) => {

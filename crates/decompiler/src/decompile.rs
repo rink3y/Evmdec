@@ -2313,12 +2313,6 @@ pub fn render(c: &Contract, name: &str) -> String {
         "// Decompiled by evmdec. Compiler: {}.\n",
         c.language
     ));
-    if c.compiler.version.is_none() && !c.compiler.evidence.is_empty() {
-        out.push_str(&format!(
-            "// Compiler fingerprints: {}.\n",
-            c.compiler.evidence.join("; ")
-        ));
-    }
     if let Some(m) = &c.info.metadata {
         if let Some(h) = &m.ipfs {
             match m.ipfs_cid() {

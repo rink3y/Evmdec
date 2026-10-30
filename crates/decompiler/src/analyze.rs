@@ -1420,6 +1420,17 @@ const EIP1967_IMPL: &str = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920
 const EIP1967_ADMIN: &str = "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
 const EIP1967_BEACON: &str = "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50";
 
+/// What a pre-0.8 compiler leaves out, for the `legacy-compiler` finding: overflow checks
+/// always, and before 0.5 also the validation of the upper bits of `address` and `bool`
+/// arguments during ABI decoding.
+fn legacy_consequence(before_0_5: bool) -> &'static str {
+    if before_0_5 {
+        "Arithmetic does not check for overflow and ABI decoding does not validate the upper bits of address and bool arguments."
+    } else {
+        "Arithmetic does not check for overflow."
+    }
+}
+
 /// Run every rule over a decompiled contract and assemble the [`Report`].
 pub fn analyze(c: &Contract) -> Report {
     let internals: HashMap<usize, &Function> = c
@@ -3245,14 +3256,46 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
         if v.1 < 8 {
-            push(&mut findings, "legacy-compiler", "Compiled with a pre-0.8 compiler", Severity::Info, Confidence::High, None, None, format!("solc {}.{}.{} has no built-in overflow checks and older ABI decoding (no validation of address/bool upper bits before 0.5).", v.0, v.1, v.2), vec![], "Prefer >= 0.8 for new deployments.");
+            push(
+                &mut findings,
+                "legacy-compiler",
+                "Compiled with a pre-0.8 compiler",
+                Severity::Info,
+                Confidence::High,
+                None,
+                None,
+                format!(
+                    "Compiled with solc {}.{}.{}. {}",
+                    v.0,
+                    v.1,
+                    v.2,
+                    legacy_consequence(v.1 < 5)
+                ),
+                vec![],
+                "Prefer >= 0.8 for new deployments.",
+            );
         }
     } else if c.compiler.kind == compiler::Kind::Solc
         && c.compiler.is_below(compiler::Version::new(0, 8, 0))
     {
-        push(&mut findings, "legacy-compiler", "Compiled with a pre-0.8 compiler", Severity::Info, Confidence::High, None, None,
-            format!("The bytecode's fingerprints pin the compiler below 0.8: {}. Such compilers have no built-in overflow checks and, before 0.5, do not validate address/bool upper bits during ABI decoding.", c.compiler.evidence.join("; ")),
-            vec![], "Prefer >= 0.8 for new deployments.");
+        let bound = c.compiler.bounds().unwrap_or_else(|| "< 0.8.0".to_string());
+        let before_5 = c.compiler.is_below(compiler::Version::new(0, 5, 0));
+        push(
+            &mut findings,
+            "legacy-compiler",
+            "Compiled with a pre-0.8 compiler",
+            Severity::Info,
+            Confidence::High,
+            None,
+            None,
+            format!(
+                "Compiled with solc {}. {}",
+                bound,
+                legacy_consequence(before_5)
+            ),
+            vec![],
+            "Prefer >= 0.8 for new deployments.",
+        );
     }
     if c.info.metadata.is_none() && !ctx.vyper {
         let bounds = match c.compiler.bounds() {

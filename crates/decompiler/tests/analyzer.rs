@@ -483,3 +483,88 @@ fn an_unguarded_selfdestruct_is_confirmed_but_a_guarded_one_is_not() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn a_free_self_credit_is_reported_and_a_paid_one_is_not() {
+    // balances[msg.sender] on the stack as `key`, then `key = key + 1` / `key = key - 1`.
+    const ENTRY: &str =
+        "CALLER PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
+    let credit = format!("{ENTRY} DUP1 SLOAD PUSH1 0x01 ADD SWAP1 SSTORE STOP");
+    // burn(amount): require(balance >= amount) then subtract. The comparison against a value
+    // (not a constant) is what pins the ledger as unsigned.
+    let debit = format!(
+        "{ENTRY} PUSH1 0x04 CALLDATALOAD DUP2 SLOAD DUP2 GT ISZERO PUSH2 @okb JUMPI PUSH1 0x00 DUP1 REVERT :okb JUMPDEST DUP2 SLOAD SUB SWAP1 SSTORE STOP"
+    );
+    let hits = |code: &[u8]| -> Vec<String> {
+        let r = analyze::analyze(&decompile::decompile(code, &Options::default()));
+        r.findings
+            .iter()
+            .filter(|f| f.id == "unprivileged-balance-credit")
+            .map(|f| f.function.as_deref().unwrap_or_default().to_owned())
+            .collect()
+    };
+
+    // mint(): a free credit with no payment and no access check, next to burn().
+    let free = dispatcher3(&credit, &debit, "STOP");
+    let r = analyze::analyze(&decompile::decompile(&free, &Options::default()));
+    let f = finding(&r, "unprivileged-balance-credit").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High);
+    assert!(
+        f.function
+            .as_deref()
+            .is_some_and(|n| n.contains("aaaaaaaa")),
+        "{f:?}"
+    );
+    assert!(f
+        .evidence
+        .iter()
+        .any(|e| e.starts_with("witness calldata: 0xaaaaaaaa")));
+    assert_eq!(
+        hits(&free).len(),
+        1,
+        "burn() is checked and must not be reported"
+    );
+
+    // deposit(): the same credit behind require(msg.value > 0). A zero-value call reverts, so
+    // the caller cannot end with a balance it did not pay for.
+    let paid = dispatcher3(
+        &format!("CALLVALUE PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST {credit}"),
+        &debit,
+        "STOP",
+    );
+    assert!(
+        hits(&paid).is_empty(),
+        "a paid credit must not be reported: {:?}",
+        hits(&paid)
+    );
+
+    // An unchecked burn wraps 0 - 1 to 2^256 - 1 while the checked burn next to it shows the
+    // ledger is unsigned: the unchecked debit path itself mints the balance.
+    let unchecked = format!("{ENTRY} DUP1 SLOAD PUSH1 0x01 SWAP1 SUB SWAP1 SSTORE STOP");
+    let wrapping = dispatcher3(
+        &format!("CALLVALUE PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST {credit}"),
+        &unchecked,
+        &debit,
+    );
+    assert_eq!(
+        hits(&wrapping),
+        vec!["func_bbbbbbbb [0xbbbbbbbb]".to_string()]
+    );
+
+    // The same wrap on a mapping nothing ever compares unsigned may be signed accounting that
+    // legitimately goes negative, so it is not reported.
+    let signed_like = dispatcher3(
+        &format!("CALLVALUE PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST {credit}"),
+        &unchecked,
+        "STOP",
+    );
+    assert!(hits(&signed_like).is_empty(), "{:?}", hits(&signed_like));
+
+    // nonces[msg.sender] += 1 with no debit anywhere: a counter, not a ledger.
+    let counter = dispatcher3(&credit, "STOP", "STOP");
+    assert!(
+        hits(&counter).is_empty(),
+        "a counter must not be reported: {:?}",
+        hits(&counter)
+    );
+}

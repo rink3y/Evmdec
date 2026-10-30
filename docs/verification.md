@@ -78,6 +78,20 @@ that stream (an external call whose payload word 0 is `transferFrom` and whose `
 comes from calldata and is not `msg.sender`, in a function without a caller check, is
 `arbitrary-transferfrom`).
 
+Two passes run the bytecode rather than match it. The confirmation pass (`confirm.rs`) takes
+the findings whose sink is a concrete instruction (an open `selfdestruct`, an ether withdrawal,
+an owner write, an arbitrary call) and searches for calldata that reaches the sink from a fresh
+state as an arbitrary caller using the whole-frame executor (`exec.rs`); a hit marks the finding
+*Confirmed* and records the calldata as its witness. The invariant pass (`invariant.rs`) checks
+a property of whole transactions instead of one sink: no unprivileged caller may raise its own
+entry in a balance ledger out of nothing. Ledgers are the `mapping(address => uint)` variables
+that are also debited or paid out somewhere (counters and nonces are not), whose entries never
+feed signed arithmetic (dividend offsets are not), and each state-changing entry point is run
+from an empty state with zero value; a run that ends with the caller holding a balance is
+`unprivileged-balance-credit`, with the calldata as witness. A balance that is the wrap of a
+subtraction counts only when the contract compares that ledger unsigned elsewhere, since the
+bytecode otherwise cannot tell an underflow from signed accounting going negative.
+
 ## 5. Coverage and control flow
 
 Each contract reports the number of *potential code* blocks covered by some function (external,

@@ -3125,6 +3125,9 @@ pub fn analyze(c: &Contract) -> Report {
     // ---- confirm reachable findings by execution ----
     crate::confirm::confirm(c, &mut findings);
 
+    // ---- invariant violations found by execution ----
+    crate::invariant::findings(c, &c.types, &mut findings);
+
     // ---- contract-level findings ----
     if std::env::var("EVMDEC_DEBUG_LOCKS").is_ok() {
         for (slot, fs) in &lock_slots {

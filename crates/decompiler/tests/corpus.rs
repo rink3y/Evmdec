@@ -380,8 +380,8 @@ fn old_multiowned_wallet_reads_as_source() {
         "owners[ownerIndex]"
     );
     assert!(
-        src.contains("uint256[] stor_260; // slot 0x104"),
-        "pending index array"
+        src.contains("bytes32[] stor_260; // slot 0x104"),
+        "pending index array of hashes"
     );
     assert!(
         src.contains("stor_260[prev_stor_260_length]"),
@@ -398,6 +398,16 @@ fn old_multiowned_wallet_reads_as_source() {
         "{src}"
     );
     assert!(src.contains("stor_260.length = prev_stor_260_length + 1;"));
+    // The type solver: `execute` returns the operation hash it computes, `hasConfirmed` a flag,
+    // and the pending-operation mappings are keyed by hash.
+    assert!(
+        src.contains("function execute(address arg0, uint256 arg1, bytes arg2) external payable returns (bytes32)"),
+        "{src}"
+    );
+    assert!(src.contains(
+        "function hasConfirmed(bytes32 arg0, address arg1) external payable returns (bool)"
+    ));
+    assert!(src.contains("mapping(bytes32 => uint256) stor_259;"));
     assert!(src.contains("require(prev_stor_260_length < stor_260.length);"));
     assert!(
         !src.contains("require(stor_260.length < stor_260.length)"),
@@ -600,4 +610,43 @@ fn lobby_calls_into_its_own_deployment() {
         .iter()
         .all(|f| f.severity == evmdec::analyze::Severity::Info));
     assert!(r.findings.iter().any(|f| f.id == "reentrancy-fixed-callee"));
+}
+
+#[test]
+fn types_follow_values_through_helpers_and_range_checks() {
+    // Vyper validates decoded values by range checks; solc helpers decode and mask them. With the
+    // dictionary disabled every type below comes from the solver.
+    let opts = evmdec::decompile::Options {
+        no_sigs: true,
+        ..evmdec::decompile::Options::default()
+    };
+    let by_name = |name: &str| -> Vec<u8> {
+        corpus()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, code)| code)
+            .expect("fixture present")
+    };
+    let curve = evmdec::decompile::decompile(&by_name("curve_3pool_vyper"), &opts).source;
+    assert!(
+        curve.contains(
+            "function func_3df02124(int128 arg0, int128 arg1, uint256 arg2, uint256 arg3)"
+        ),
+        "{curve}"
+    );
+    assert!(curve.contains("function func_6b441a40(address arg0) external"));
+    assert!(curve.contains("function func_8da5cb5b() external view returns (address)"));
+    let compound = evmdec::decompile::decompile(&by_name("compound_ceth"), &opts).source;
+    // The 4-byte tail of a call payload is a bare `& 0xffffffff`, not a uint32 parameter.
+    assert!(
+        compound
+            .contains("function func_a9059cbb(address arg0, uint256 arg1) external returns (bool)"),
+        "{compound}"
+    );
+    assert!(
+        compound.contains("function func_0xe3c(address arg0, address arg1, uint256 arg2) internal")
+    );
+    let ens = evmdec::decompile::decompile(&by_name("ens_registry"), &opts).source;
+    assert!(ens.contains("mapping(bytes32 => "), "{ens}");
+    assert!(ens.contains("external returns (bytes32)"), "{ens}");
 }

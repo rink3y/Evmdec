@@ -25,7 +25,14 @@ oracle, so the accuracy claim below is measured, not asserted.
 * **Real decompilation.** Function dispatcher recovery (linear, binary-search, `XOR`/`SUB`
   compare, Vyper jump tables), parameter and return types inferred from use (ABI head checks,
   masks, sign extension, dynamic offsets — including decoding done in solc 0.8 helper functions,
-  which are summarised and seen through), `view`/`pure`/`payable` from effects, storage layout
+  which are summarised and seen through) and then refined by a type solver that follows every
+  value through phi merges, internal calls and storage: a mask applied after a merge, a Vyper
+  range check (`x >> 160 == 0`, `x < 2**160`), a `keccak256` result, a call target or a
+  comparison with `msg.sender` types the parameter, helper argument, storage slot or mapping key
+  it came from (`mapping(bytes32 => address)`, `function execute(…) returns (bytes32)`,
+  `int128` Vyper parameters, `address` helper arguments), while packing masks in ABI payloads,
+  checked casts (`require(x < 2**96); uint96(x)`) and stack slots that merge unrelated values are
+  recognised and left alone, `view`/`pure`/`payable` from effects, storage layout
   with mappings and arrays (`stor_3[msg.sender][spender]`), events and custom errors by
   signature, `require(cond, "reason")`, `Panic(…)`, `if`/`else`/`while`/`break`/`continue`,
   ternaries and short-circuits, ABI-encoded external calls shown as `IERC20(t).transfer(to, amt)`
@@ -86,6 +93,12 @@ oracle, so the accuracy claim below is measured, not asserted.
   signatures (selectors computed with the built-in keccak, so every entry is correct) names what
   it can; the full public signature database can be installed as one local file (see *Quick
   start*); everything else is named by selector.
+* **Compiler awareness.** The metadata trailer gives the exact compiler version; without it the
+  bytecode's fingerprints bound it (the `0x60`/`0x80` free-memory pointer, `Panic(uint256)` and
+  `Error(string)` reverts, calldata head-size checks, decoder validators, shifts, `PUSH0`, the
+  via-IR prologue, the metadata hash kind), so a stripped contract still prints as
+  `solc >= 0.8.0 (no metadata)`, has its checked-arithmetic panics folded, is judged by the
+  right compiler era in the report, and gets the Vyper mapping layout when it is Vyper.
 * **Security report.** 40+ rules over the lifted IR (not opcode patterns): reentrancy (ETH or
   token hook before a storage write; a guard counts only when a slot is tested before the call,
   set on entry and restored to a constant afterwards, whether the release writes the slot or
@@ -277,6 +290,8 @@ deployer, UNI). Everything is reproducible with `corpus/bench.py`, `corpus/verif
 | state mutability (view/pure vs payable vs nonpayable) | 509 / 515 = **98.8 %** |
 | parameter count | 513 / 515 = **99.6 %** |
 | return count | 514 / 515 = **99.8 %** |
+| parameter types (every head word of a function with the right count, exact Solidity type) | 840 / 955 = **88.0 %** |
+| return types (static returns of a function with the right count) | 339 / 380 = **89.2 %** |
 | events | 119 / 121 = **98.3 %** |
 | code blocks covered by some function | 10,810 / 10,810 = **100 %** |
 | unresolved jumps | **0** |
@@ -289,7 +304,12 @@ construction, and embedded creation code (`CREATE2` payloads) and metadata are e
 The six mutability misses are `view` functions that make external calls on a pre-0.5 compiler
 (no `STATICCALL`) or `view` getters of transparent proxies that fall through to `delegatecall`;
 the two parameter misses are in MakerDAO Vat (a `LogNote`-style modifier reading raw calldata
-words) and Curve 3pool, the one return miss in Gnosis Safe.
+words) and Curve 3pool, the one return miss in Gnosis Safe. Of the type misses, most are
+`bytes32` declared where the code treats the word as a number (nothing in the bytecode tells
+them apart), `uint160` amounts that look exactly like addresses, constants returned from
+getters (`decimals()`), and values stored as `uint96` and widened on return; the type solver
+took these figures from 81.6 % and 86.1 % by seeing through helpers, merges and Vyper's range
+checks.
 
 ### 2. Block-level semantics oracle (`evmdec verify`, 8 random states per block)
 
@@ -358,7 +378,8 @@ functions; it does not influence recovery.
 * Memory accesses through different symbolic bases are assumed not to alias (true for compiler
   output; a hand-written contract that relies on aliasing will decompile imprecisely — the
   oracle reports such states as inconclusive rather than hiding them).
-* Internal functions are named `func_<pc>`; their parameter types are shown as `uint256`.
+* Internal functions are named `func_<pc>`; their parameter types come from the type solver
+  (`address`, `bool`, `uintN`, `intN`, `bytesN`) and are `uint256` when nothing narrows them.
 * Dynamic-type ABI encoding is folded where the compiler's idiom is recognised (`string`
   literals and storage strings print as `return "…"` / `return name;`, copy loops become
   `mem[a:+n] = mem[b:+n]`); other dynamic encodings are shown as the memory operations the

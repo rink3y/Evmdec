@@ -1,0 +1,1078 @@
+//! Type recovery as constraint solving.
+//!
+//! Every typed location (phi variable, internal parameter or result, calldata parameter, storage
+//! slot, packed field, mapping key) is a class. Values flow forward along copies (phi edges,
+//! assignments, argument passing, result binding, storage writes): the type of a class is the
+//! join of the types of the values flowing in. Evidence from uses (a mask, a comparison with an
+//! address, a call target, a power-of-two bound, arithmetic) is a hint on the class and flows
+//! backward along the same copies, since a use after a merge applies to every value that
+//! reaches it. The two directions are kept apart on purpose: a stack slot that holds unrelated
+//! values on different paths joins to a conflict instead of leaking one value's type into the
+//! other's origin. The pseudo-Solidity printer turns the result into `address`, `bool`, `uintN`,
+//! `intN` or `bytesN`; a class with no evidence, or contradictory evidence, keeps `uint256`.
+//!
+//! The solver refines the direct heuristics (masks on calldata words, return constants): it
+//! fills in what they leave at `uint256` by following values through phis, helpers and storage,
+//! which is where a mask applied to a merged value or a bound checked by a Vyper decoder would
+//! otherwise be lost.
+
+use crate::emit::{calldata_word_index, MappingLayout, SlotSpace};
+use crate::expr::{self, ExprId, Node};
+use crate::lift::{self, Lifted, Stmt, Term};
+use crate::opcode as op;
+use crate::ssa::{self, Shape, ShapeStep};
+use crate::u256::U256;
+use std::collections::{HashMap, HashSet};
+
+/// A recovered type, as a lattice: `Unknown` below everything, `Conflict` above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Ty {
+    /// No evidence yet.
+    #[default]
+    Unknown,
+    /// Only ever 0 or 1.
+    Bool,
+    /// A 160-bit value used as an account.
+    Address,
+    /// Unsigned integer of this many bits.
+    Uint(u32),
+    /// Signed integer of this many bits.
+    Int(u32),
+    /// Left-aligned byte string of this many bytes (`bytes32` for hashes).
+    Bytes(u32),
+    /// Evidence that cannot be reconciled.
+    Conflict,
+}
+
+impl Ty {
+    /// Least upper bound.
+    pub fn join(self, other: Ty) -> Ty {
+        match (self, other) {
+            (Ty::Unknown, x) | (x, Ty::Unknown) => x,
+            (Ty::Conflict, _) | (_, Ty::Conflict) => Ty::Conflict,
+            (Ty::Bool, Ty::Bool) => Ty::Bool,
+            // A flag stored in a byte.
+            (Ty::Bool, Ty::Uint(n)) | (Ty::Uint(n), Ty::Bool) => {
+                if n <= 8 {
+                    Ty::Bool
+                } else {
+                    Ty::Uint(n)
+                }
+            }
+            (Ty::Address, Ty::Address) => Ty::Address,
+            (Ty::Address, Ty::Uint(n)) | (Ty::Uint(n), Ty::Address) => {
+                if n <= 160 {
+                    Ty::Address
+                } else {
+                    Ty::Conflict
+                }
+            }
+            (Ty::Uint(a), Ty::Uint(b)) => Ty::Uint(a.max(b)),
+            (Ty::Int(a), Ty::Int(b)) => Ty::Int(a.max(b)),
+            (Ty::Int(a), Ty::Uint(b)) | (Ty::Uint(b), Ty::Int(a)) => Ty::Int(a.max(b)),
+            (Ty::Bytes(a), Ty::Bytes(b)) => Ty::Bytes(a.max(b)),
+            _ => Ty::Conflict,
+        }
+    }
+
+    /// The Solidity spelling, or `None` when the type is unknown, contradictory or has a width
+    /// no declaration can have (a `uint255` is a flag-stripped `uint256`).
+    pub fn solidity(&self) -> Option<String> {
+        match *self {
+            Ty::Bool => Some("bool".into()),
+            Ty::Address => Some("address".into()),
+            Ty::Uint(1) => Some("bool".into()),
+            Ty::Uint(n) if n.is_multiple_of(8) && n < 256 => Some(format!("uint{}", n)),
+            Ty::Int(n) if n.is_multiple_of(8) && n <= 256 => Some(format!("int{}", n)),
+            Ty::Bytes(n) if (1..=32).contains(&n) => Some(format!("bytes{}", n)),
+            _ => None,
+        }
+    }
+
+    /// The type a low mask of `bits` bits cleans a value to.
+    pub fn of_mask(bits: u32) -> Ty {
+        match bits {
+            0 => Ty::Unknown,
+            1 => Ty::Bool,
+            160 => Ty::Address,
+            n => Ty::Uint(n),
+        }
+    }
+}
+
+/// A typed location.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Loc {
+    /// A phi variable of one function.
+    Var {
+        /// Entry pc of the function.
+        scope: usize,
+        /// The `Var` id.
+        id: u32,
+    },
+    /// An entry stack slot of an internal unit (`Arg(slot)`; parameter `k - 1 - slot` in
+    /// declaration order for a unit with `k` parameters).
+    Arg {
+        /// Entry pc of the unit.
+        unit: usize,
+        /// Stack slot from the top at entry.
+        slot: u32,
+    },
+    /// A result of an internal unit.
+    Ret {
+        /// Entry pc of the unit.
+        unit: usize,
+        /// Result index, deepest first.
+        index: u16,
+    },
+    /// A calldata head word of one function.
+    Param {
+        /// Entry pc of the function.
+        scope: usize,
+        /// Head word index.
+        word: u32,
+    },
+    /// The value of every element of a storage variable (whole slots).
+    Slot(Shape),
+    /// A packed field of every element of a storage variable.
+    Field {
+        /// The elements' shape.
+        shape: Shape,
+        /// Bit offset of the field within the slot.
+        bit_offset: u32,
+        /// Width of the field in bits.
+        bits: u32,
+    },
+    /// The keys of a mapping: the shape of the entries it selects.
+    Key(Shape),
+}
+
+impl Loc {
+    /// Storage locations hold a declared type; a cast at a reader says nothing about it.
+    fn is_storage(&self) -> bool {
+        matches!(self, Loc::Slot(_) | Loc::Field { .. } | Loc::Key(_))
+    }
+}
+
+/// Evidence about one class beyond the lattice value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Flags {
+    /// Used as an arithmetic operand: not a `bool`, and a 160-bit value that is a number rather
+    /// than an account.
+    arith: bool,
+    /// Used as an account: call target, compared with `msg.sender`, balance queried.
+    account: bool,
+    /// `x != 0` was tested on it.
+    tested: bool,
+    /// A constant `1` flows in.
+    one: bool,
+    /// A value that is neither a flag constant nor boolean-shaped flows in.
+    other: bool,
+    /// Widths (in bytes, as a bit set) the value was range-checked against by solc output: a
+    /// mask of the same width that follows is a checked narrowing cast of a wider value, not
+    /// the value's own width.
+    cast: u32,
+}
+
+impl Flags {
+    fn checked(&self, bits: u32) -> bool {
+        bits.is_multiple_of(8) && bits / 8 < 32 && self.cast & (1 << (bits / 8)) != 0
+    }
+
+    /// Merge the use evidence of a class into one of its sources.
+    fn absorb(&mut self, other: Flags) {
+        self.arith |= other.arith;
+        self.account |= other.account;
+        self.tested |= other.tested;
+        self.cast |= other.cast;
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Class {
+    /// Use evidence that flows back to the values reaching this class.
+    hints: Ty,
+    /// Use evidence that stays with this class: a signed comparison with zero says the value is
+    /// treated as signed here, not that everything stored into it is signed.
+    weak: Ty,
+    flags: Flags,
+    /// A storage slot, field or mapping key.
+    storage: bool,
+    /// Values flowing in, with the function they are read in.
+    defs: Vec<(ExprId, usize)>,
+    /// Classes whose values flow in (location-valued defs): hints flow back to them.
+    sources: Vec<usize>,
+    /// Current type from the defs (recomputed every round).
+    from_defs: Ty,
+    /// The type that flows out to readers: strong evidence only.
+    resolved: Ty,
+}
+
+/// Which evidence a resolution may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Evidence {
+    /// Values and strong uses: what flows on to other classes.
+    Flowing,
+    /// Also the weak uses: what is reported for the class itself.
+    Final,
+}
+
+/// Nodes visited per expression walk before giving up.
+const MAX_VISITED: usize = 50_000;
+/// Rounds of the def-type fixpoint.
+const MAX_ROUNDS: usize = 8;
+/// Nesting followed when typing an expression structurally.
+const MAX_TYPE_DEPTH: u32 = 6;
+
+/// The solver and, once solved, the environment later passes query.
+#[derive(Debug)]
+pub struct TypeEnv {
+    layout: MappingLayout,
+    /// Vyper validates decoded values by range checks (`x < 2^160`, `x >> 1 == 0`); solc masks
+    /// them, so a range check in solc output is a cast or a user `require`.
+    vyper: bool,
+    debug: bool,
+    ids: HashMap<Loc, usize>,
+    classes: Vec<Class>,
+    /// `(function, sequence number of an internal call)` -> callee pc, for `IntRet(seq, j)`.
+    /// Sequence numbers are per lifted graph, so the function scopes them.
+    callee_of: HashMap<(usize, u32), usize>,
+    /// Callee pc -> number of results its call sites consume, when every site agrees. A unit
+    /// whose `InternalReturn`s list a different number of values (pass-through stack slots)
+    /// cannot be aligned with `IntRet` positions.
+    results_len: HashMap<usize, Option<usize>>,
+}
+
+/// Build the environment: index every function, then solve.
+pub fn solve(functions: &[(usize, &Lifted)], layout: MappingLayout) -> TypeEnv {
+    let mut env = TypeEnv {
+        layout,
+        vyper: layout == MappingLayout::Vyper,
+        debug: std::env::var("EVMDEC_DEBUG_TYPES").is_ok(),
+        ids: HashMap::new(),
+        classes: Vec::new(),
+        callee_of: HashMap::new(),
+        results_len: HashMap::new(),
+    };
+    let units: HashMap<usize, &Lifted> = functions.iter().copied().collect();
+    let arity = |pc: usize| units.get(&pc).map(|l| ssa::arity(l));
+    for (pc, l) in functions {
+        for site in ssa::call_sites(l, arity) {
+            env.callee_of.insert((*pc, site.seq), site.callee);
+            let n = site.results.len();
+            env.results_len
+                .entry(site.callee)
+                .and_modify(|m| {
+                    if *m != Some(n) {
+                        *m = None;
+                    }
+                })
+                .or_insert(Some(n));
+        }
+    }
+    for (pc, l) in functions {
+        env.index(*pc, l, arity);
+    }
+    env.propagate();
+    env.run();
+    if env.debug {
+        env.debug_dump();
+    }
+    env
+}
+
+impl TypeEnv {
+    /// The class of `loc`, created on first sight.
+    fn intern(&mut self, loc: Loc) -> usize {
+        if let Some(i) = self.ids.get(&loc) {
+            return *i;
+        }
+        let i = self.classes.len();
+        self.classes.push(Class {
+            storage: loc.is_storage(),
+            ..Class::default()
+        });
+        self.ids.insert(loc, i);
+        i
+    }
+
+    fn hint(&mut self, loc: Option<Loc>, t: Ty) {
+        if let Some(loc) = loc {
+            let i = self.intern(loc);
+            self.classes[i].hints = self.classes[i].hints.join(t);
+        }
+    }
+
+    fn weak(&mut self, loc: Option<Loc>, t: Ty) {
+        if let Some(loc) = loc {
+            let i = self.intern(loc);
+            self.classes[i].weak = self.classes[i].weak.join(t);
+        }
+    }
+
+    fn flag(&mut self, loc: Option<Loc>, f: impl Fn(&mut Flags)) {
+        if let Some(loc) = loc {
+            let i = self.intern(loc);
+            f(&mut self.classes[i].flags);
+        }
+    }
+
+    /// Record an arithmetic use of `e`.
+    fn arith(&mut self, e: ExprId, scope: usize, by: u8) {
+        let loc = self.loc_of(e, scope);
+        if self.debug {
+            if let Some(l) = &loc {
+                eprintln!("[types] arith on {:?} by {}", l, op::name(by));
+            }
+        }
+        self.flag(loc, |f| f.arith = true);
+    }
+
+    /// Record that `val` (read in `scope`) flows into `loc`.
+    fn def(&mut self, loc: Loc, val: ExprId, scope: usize) {
+        let i = self.intern(loc);
+        if let Some(src) = self.copy_source(val, scope) {
+            let j = self.intern(src);
+            if i != j && !self.classes[i].sources.contains(&j) {
+                self.classes[i].sources.push(j);
+            }
+        }
+        self.classes[i].defs.push((val, scope));
+    }
+
+    /// Flow use evidence backward: what is known about a class holds for every value that
+    /// flows into it. Weak evidence stops at storage, whose declared type is what the values
+    /// stored into it are cast to, not what a reader casts them to.
+    fn propagate(&mut self) {
+        let mut work: Vec<usize> = (0..self.classes.len()).collect();
+        while let Some(i) = work.pop() {
+            let (hints, weak, flags) = (
+                self.classes[i].hints,
+                self.classes[i].weak,
+                self.classes[i].flags,
+            );
+            // Cloned: the loop below mutates other classes.
+            let sources = self.classes[i].sources.clone();
+            for j in sources {
+                let c = &mut self.classes[j];
+                let before = (c.hints, c.weak, c.flags);
+                c.hints = c.hints.join(hints);
+                if !c.storage {
+                    c.weak = c.weak.join(weak);
+                }
+                c.flags.absorb(flags);
+                if (c.hints, c.weak, c.flags) != before {
+                    work.push(j);
+                }
+            }
+        }
+    }
+
+    /// The location `e` reads, if it is a plain read of one (a masked read counts: the mask is a
+    /// cleanup of the same value and a width hint for it).
+    fn copy_source(&mut self, e: ExprId, scope: usize) -> Option<Loc> {
+        if let Some(loc) = self.loc_of(e, scope) {
+            return Some(loc);
+        }
+        if let Node::Op(op::AND, v) = expr::node(e) {
+            for (x, m) in [(v[0], v[1]), (v[1], v[0])] {
+                if let Some(m) = expr::as_const(m) {
+                    if m.is_low_mask() {
+                        let loc = self.loc_of(x, scope)?;
+                        self.hint(Some(loc.clone()), Ty::of_mask(m.bits()));
+                        return Some(loc);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The location `e` denotes, when it is a location read.
+    fn loc_of(&self, e: ExprId, scope: usize) -> Option<Loc> {
+        if let Some(field) = ssa::field_read(e) {
+            let path = ssa::slot_path(field.key, self.layout)?;
+            return Some(Loc::Field {
+                shape: path.shape(SlotSpace::Persistent),
+                bit_offset: field.bit_offset,
+                bits: field.bits,
+            });
+        }
+        match expr::node(e) {
+            Node::Var(id) => Some(Loc::Var { scope, id }),
+            Node::Arg(slot) => Some(Loc::Arg { unit: scope, slot }),
+            Node::CallDataLoad(off) => {
+                calldata_word_index(off).map(|word| Loc::Param { scope, word })
+            }
+            Node::SLoad(key, transient, _) => {
+                let path = ssa::slot_path(key, self.layout)?;
+                Some(Loc::Slot(path.shape(ssa::space_of(transient))))
+            }
+            Node::IntRet(seq, index) => self
+                .callee_of
+                .get(&(scope, seq))
+                .map(|unit| Loc::Ret { unit: *unit, index }),
+            _ => None,
+        }
+    }
+
+    /// Index one function: copies, definitions and use evidence.
+    fn index(&mut self, pc: usize, l: &Lifted, arity: impl Fn(usize) -> Option<usize>) {
+        for (var, vals) in ssa::phi_defs(l) {
+            let Node::Var(id) = expr::node(var) else {
+                continue;
+            };
+            for val in vals {
+                self.def(Loc::Var { scope: pc, id }, val, pc);
+            }
+        }
+        // The parameters of this unit, so that callers' values and uses inside the body meet in
+        // one class even when the body never reads some parameter.
+        if l.ret_slot.is_some() {
+            for slot in 0..ssa::arity(l) {
+                self.intern(Loc::Arg {
+                    unit: pc,
+                    slot: slot as u32,
+                });
+            }
+        }
+        for site in ssa::call_sites(l, &arity) {
+            let k = arity(site.callee).unwrap_or(0);
+            for (idx, val) in site.args {
+                // Parameter `idx` in declaration order is `Arg(k - 1 - idx)` of the callee.
+                if (idx as usize) < k {
+                    let slot = (k - 1 - idx as usize) as u32;
+                    self.def(
+                        Loc::Arg {
+                            unit: site.callee,
+                            slot,
+                        },
+                        val,
+                        pc,
+                    );
+                }
+            }
+        }
+        let consumed = self.results_len.get(&pc).copied().flatten();
+        for vals in ssa::returns(l) {
+            if consumed != Some(vals.len()) {
+                continue;
+            }
+            for (j, val) in vals.iter().enumerate() {
+                self.def(
+                    Loc::Ret {
+                        unit: pc,
+                        index: j as u16,
+                    },
+                    *val,
+                    pc,
+                );
+            }
+        }
+        // Values assigned on edges (phi copies) are used nowhere else: walk them too.
+        for assigns in l.edge_assigns.values() {
+            for (_, val) in assigns {
+                self.uses(*val, pc, None);
+            }
+        }
+        for nd in &l.nodes {
+            for s in &nd.stmts {
+                self.index_stmt(s, pc);
+            }
+            if let Term::SelfDestruct(a) = &nd.term {
+                self.account(*a, pc);
+            }
+            let conds: HashSet<ExprId> = condition_exprs(nd).into_iter().collect();
+            for root in lift::roots(nd) {
+                let context = if root.payload {
+                    Some(op::OR)
+                } else if conds.contains(&root.expr) {
+                    Some(op::ISZERO)
+                } else {
+                    None
+                };
+                self.uses(root.expr, pc, context);
+            }
+        }
+    }
+
+    /// Definitions and account uses a statement makes.
+    fn index_stmt(&mut self, s: &Stmt, pc: usize) {
+        match s {
+            Stmt::SStore {
+                key,
+                val,
+                transient,
+                ..
+            } => {
+                let Some(path) = ssa::slot_path(*key, self.layout) else {
+                    return;
+                };
+                let space = ssa::space_of(*transient);
+                let shape = path.shape(space);
+                self.note_keys(&path, space, pc);
+                match ssa::field_write(*key, *val) {
+                    Some(w) => self.def(
+                        Loc::Field {
+                            shape,
+                            bit_offset: w.bit_offset,
+                            bits: w.bits,
+                        },
+                        w.value,
+                        pc,
+                    ),
+                    None => self.def(Loc::Slot(shape), *val, pc),
+                }
+            }
+            Stmt::Call { addr, value, .. } => {
+                self.account(*addr, pc);
+                if let Some(v) = value {
+                    self.arith(*v, pc, op::CALLVALUE);
+                }
+            }
+            Stmt::Copy {
+                kind: op::EXTCODECOPY,
+                addr: Some(a),
+                ..
+            } => self.account(*a, pc),
+            _ => {}
+        }
+    }
+
+    /// `e` is used as an account (through a 160-bit cleanup or not).
+    fn account(&mut self, e: ExprId, scope: usize) {
+        let inner = match expr::node(e) {
+            Node::Op(op::AND, v) if expr::as_const(v[1]) == Some(expr::mask_bits(160)) => v[0],
+            Node::Op(op::AND, v) if expr::as_const(v[0]) == Some(expr::mask_bits(160)) => v[1],
+            _ => e,
+        };
+        let loc = self.loc_of(inner, scope);
+        self.hint(loc.clone(), Ty::Address);
+        self.flag(loc, |f| f.account = true);
+    }
+
+    /// Record the key types of every mapping step on `path`.
+    fn note_keys(&mut self, path: &ssa::SlotPath, space: SlotSpace, scope: usize) {
+        for (n, step) in path.steps.iter().enumerate() {
+            if let ssa::Step::Key(k) = step {
+                let prefix = ssa::SlotPath {
+                    root: path.root,
+                    steps: path.steps[..=n].to_vec(),
+                };
+                self.def(Loc::Key(prefix.shape(space)), *k, scope);
+            }
+        }
+    }
+
+    /// Walk the expression DAG under `root` and record what each use says about its operands.
+    /// `context` stands in for the root's parent: a payload word is a packing context from its
+    /// root (its 4-byte tail is a bare mask), a branch condition a truth test (`a - b` as a
+    /// condition is `a != b`).
+    fn uses(&mut self, root: ExprId, scope: usize, context: Option<u8>) {
+        let mut seen: HashSet<ExprId> = HashSet::new();
+        let mut stack = vec![(root, context)];
+        while let Some((x, parent)) = stack.pop() {
+            if !seen.insert(x) || seen.len() > MAX_VISITED {
+                continue;
+            }
+            let n = expr::node(x);
+            match &n {
+                Node::SLoad(key, transient, _) => {
+                    if let Some(path) = ssa::slot_path(*key, self.layout) {
+                        self.note_keys(&path, ssa::space_of(*transient), scope);
+                    }
+                }
+                Node::Op(o, v) => self.op_use(*o, v, parent, scope),
+                _ => {}
+            }
+            // Hash preimages are packed words: shifts and masks in them are encoding.
+            let o = match &n {
+                Node::Op(o, _) => Some(*o),
+                Node::Keccak(..) => Some(op::OR),
+                _ => None,
+            };
+            stack.extend(expr::children(x).into_iter().map(|c| (c, o)));
+        }
+    }
+
+    fn op_use(&mut self, o: u8, v: &[ExprId], parent: Option<u8>, scope: usize) {
+        let konst = |e: ExprId| expr::as_const(e);
+        match o {
+            op::AND => self.mask_use(v, parent, scope),
+            op::SIGNEXTEND => {
+                if let Some(k) = konst(v[0]) {
+                    if k < U256::from_u64(31) {
+                        let loc = self.loc_of(v[1], scope);
+                        self.hint(loc, Ty::Int(8 * (k.low_u64() as u32 + 1)));
+                    }
+                }
+            }
+            op::ISZERO => match expr::node(v[0]) {
+                Node::Op(op::ISZERO, w) => {
+                    let loc = self.loc_of(w[0], scope);
+                    self.flag(loc, |f| f.tested = true);
+                }
+                Node::Op(op::SHR, _) => self.shift_validator(v[0], scope),
+                _ => {}
+            },
+            op::EQ => {
+                for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                    if is_account(b) {
+                        self.account(a, scope);
+                    }
+                    if konst(b).is_some_and(|c| c.is_zero()) {
+                        self.shift_validator(a, scope);
+                    }
+                }
+            }
+            op::LT | op::GT => {
+                for (x, c, below) in [(v[0], v[1], o == op::LT), (v[1], v[0], o == op::GT)] {
+                    if let Some(c) = konst(c) {
+                        self.bound_use(x, c, below, o, scope);
+                    }
+                }
+            }
+            op::SLT | op::SGT => {
+                // `x <= 2^(n-1) - 1`, `x >= -2^(n-1)`: the range of an `intN`. Any other signed
+                // comparison (`x < 0`) treats the value as signed here, which also happens to
+                // unsigned values cast for a check, so it does not flow back.
+                for (x, c) in [(v[0], v[1]), (v[1], v[0])] {
+                    let loc = self.loc_of(x, scope);
+                    match konst(c).and_then(signed_bound) {
+                        Some(n) => self.hint(loc, Ty::Int(n)),
+                        None => self.weak(loc, Ty::Int(256)),
+                    }
+                }
+            }
+            op::SDIV | op::SMOD | op::SAR => {
+                for x in v {
+                    if konst(*x).is_none() {
+                        let loc = self.loc_of(*x, scope);
+                        self.hint(loc, Ty::Int(256));
+                    }
+                }
+            }
+            // `iszero(sub(a, b))` is `a == b`; so is a bare `sub`/`xor` as a branch condition.
+            op::SUB | op::XOR if parent == Some(op::ISZERO) => {
+                for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                    if is_account(b) {
+                        self.account(a, scope);
+                    }
+                }
+            }
+            // `cond * a + b` is a branchless select, not arithmetic on `a` and `b`.
+            op::MUL if v.iter().any(|x| expr::is_boolean(*x)) => {}
+            // `x * 2^(8k)` and `x / 2^(8k)` are byte shifts: packing, like `SHL`/`SHR`.
+            op::MUL | op::DIV if v.iter().any(|x| is_byte_shift(*x)) => {}
+            op::ADD if v.iter().any(|x| is_masked_select(*x)) => {}
+            op::ADD | op::SUB | op::MUL | op::DIV | op::MOD | op::EXP | op::ADDMOD | op::MULMOD => {
+                for x in v {
+                    self.arith(*x, scope, o);
+                }
+            }
+            op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH => self.account(v[0], scope),
+            _ => {}
+        }
+    }
+
+    /// `x & mask`: a low mask is a cleanup to a width, unless it carves a piece of a value for a
+    /// packed payload word (`x & 0xffffffff << 224 | y >> 32`), which says nothing; a high
+    /// mask keeps the top bytes of a `bytesN`.
+    fn mask_use(&mut self, v: &[ExprId], parent: Option<u8>, scope: usize) {
+        let packing = matches!(parent, Some(op::OR) | Some(op::SHL) | Some(op::MUL));
+        for (x, m) in [(v[0], v[1]), (v[1], v[0])] {
+            let Some(m) = expr::as_const(m) else { continue };
+            if m.is_low_mask() {
+                if packing {
+                    continue;
+                }
+                let loc = self.loc_of(x, scope);
+                if self.debug {
+                    if let Some(l) = &loc {
+                        eprintln!(
+                            "[types] mask {} on {:?} under {:?}: {:?}",
+                            m.bits(),
+                            l,
+                            parent.map(op::name),
+                            expr::node(x)
+                        );
+                    }
+                }
+                self.hint(loc, Ty::of_mask(m.bits()));
+            } else if let Some(bytes) = high_mask_bytes(m) {
+                let loc = self.loc_of(x, scope);
+                self.hint(loc, Ty::Bytes(bytes));
+            }
+        }
+    }
+
+    /// `x < 2^n` (`below`) or `x > 2^n - 1`: Vyper's decoder validates an n-bit type this way.
+    /// In solc output the same check is a cast (`safe96`) or a user `require` on a wider value,
+    /// and any other bound is an ordering of numbers.
+    fn bound_use(&mut self, x: ExprId, c: U256, below: bool, by: u8, scope: usize) {
+        let bound = if below {
+            c.is_power_of_two().then(|| c.trailing_zeros())
+        } else {
+            c.is_low_mask().then(|| c.bits())
+        };
+        let typed_width = |n: u32| n == 1 || n == 160 || (n.is_multiple_of(8) && n > 0 && n < 256);
+        match bound {
+            Some(n) if self.vyper && typed_width(n) => {
+                let loc = self.loc_of(x, scope);
+                self.hint(loc, Ty::of_mask(n));
+            }
+            Some(n) if n > 0 && n < 256 && n.is_multiple_of(8) => {
+                let loc = self.loc_of(x, scope);
+                self.flag(loc, |f| f.cast |= 1 << (n / 8));
+                self.arith(x, scope, by);
+            }
+            _ => self.arith(x, scope, by),
+        }
+    }
+
+    /// `x >> n == 0`: the value fits in n bits (Vyper's decoder validation of `address`, `bool`
+    /// and narrow integers).
+    fn shift_validator(&mut self, e: ExprId, scope: usize) {
+        if !self.vyper {
+            return;
+        }
+        let Node::Op(op::SHR, w) = expr::node(e) else {
+            return;
+        };
+        let Some(n) = expr::as_const(w[0]) else {
+            return;
+        };
+        if !n.fits_u64() || n.low_u64() >= 256 {
+            return;
+        }
+        let n = n.low_u64() as u32;
+        if n == 1 || n == 160 || (n.is_multiple_of(8) && n > 0) {
+            let loc = self.loc_of(w[1], scope);
+            self.hint(loc, Ty::of_mask(n));
+        }
+    }
+
+    /// Iterate the def types to a fixpoint and resolve every class.
+    fn run(&mut self) {
+        for _round in 0..MAX_ROUNDS {
+            let mut changed = false;
+            for i in 0..self.classes.len() {
+                let defs = std::mem::take(&mut self.classes[i].defs);
+                let mut t = Ty::Unknown;
+                let mut flags = self.classes[i].flags;
+                flags.one = false;
+                flags.other = false;
+                for (val, scope) in &defs {
+                    match expr::as_const(*val) {
+                        Some(c) if c.is_zero() => {}
+                        Some(c) if c == U256::ONE => flags.one = true,
+                        Some(c) => {
+                            flags.other = true;
+                            t = t.join(const_type(c));
+                        }
+                        None => {
+                            let vt = self.type_of(*val, *scope);
+                            if vt != Ty::Bool && !expr::is_boolean(*val) {
+                                flags.other = true;
+                            }
+                            t = t.join(vt);
+                        }
+                    }
+                }
+                let c = &mut self.classes[i];
+                c.defs = defs;
+                c.flags = flags;
+                c.from_defs = t;
+                let resolved = resolve(c, Evidence::Flowing);
+                if resolved != c.resolved {
+                    c.resolved = resolved;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// Print every class with evidence (`EVMDEC_DEBUG_TYPES`).
+    fn debug_dump(&self) {
+        let mut locs: Vec<(&Loc, &usize)> = self.ids.iter().collect();
+        locs.sort_by_key(|(_, i)| **i);
+        for (loc, i) in locs {
+            let c = &self.classes[*i];
+            if c.resolved == Ty::Unknown && c.hints == Ty::Unknown && c.weak == Ty::Unknown {
+                continue;
+            }
+            let defs: Vec<String> = c
+                .defs
+                .iter()
+                .take(4)
+                .map(|(e, _)| format!("{:?}", expr::node(*e)))
+                .collect();
+            eprintln!(
+                "[types] #{} {:?}: {:?} (defs {:?} x{} {:?}, hints {:?}, weak {:?}, {:?}, from {:?})",
+                i,
+                loc,
+                c.resolved,
+                c.from_defs,
+                c.defs.len(),
+                defs,
+                c.hints,
+                c.weak,
+                c.flags,
+                c.sources
+            );
+        }
+    }
+
+    /// The type of an expression read in `scope`, from the classes it reads and its shape.
+    pub fn type_of(&self, e: ExprId, scope: usize) -> Ty {
+        self.type_of_at(e, scope, 0)
+    }
+
+    fn type_of_at(&self, e: ExprId, scope: usize, depth: u32) -> Ty {
+        if depth > MAX_TYPE_DEPTH {
+            return Ty::Unknown;
+        }
+        if let Some(loc) = self.loc_of(e, scope) {
+            let own = self.resolved_of(&loc);
+            // A field read carries its width in the mask.
+            return match loc {
+                Loc::Field { bits, .. } if matches!(expr::node(e), Node::Op(op::AND, _)) => {
+                    own.join(Ty::of_mask(bits))
+                }
+                _ => own,
+            };
+        }
+        match expr::node(e) {
+            Node::Const(c) => const_type(c),
+            Node::Env(o, _) => match o {
+                op::CALLER | op::ADDRESS | op::ORIGIN | op::COINBASE => Ty::Address,
+                op::BLOCKHASH => Ty::Bytes(32),
+                _ => Ty::Unknown,
+            },
+            Node::Keccak(..) | Node::KeccakMem(..) => Ty::Bytes(32),
+            Node::CallResult(_) => Ty::Bool,
+            Node::CreateResult(_) => Ty::Address,
+            Node::Op(op::AND, v) => self.masked_type(&v, scope, depth),
+            Node::Op(op::SIGNEXTEND, v) => match expr::as_const(v[0]) {
+                Some(k) if k < U256::from_u64(31) => Ty::Int(8 * (k.low_u64() as u32 + 1)),
+                _ => Ty::Int(256),
+            },
+            Node::Op(op::ISZERO | op::LT | op::GT | op::SLT | op::SGT | op::EQ, _) => Ty::Bool,
+            Node::Op(op::SHR | op::DIV | op::BYTE, _) => {
+                let b = expr::value_bits(e);
+                if b > 0 && b < 256 && b.is_multiple_of(8) {
+                    Ty::Uint(b)
+                } else {
+                    Ty::Unknown
+                }
+            }
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// The type of `x & mask`: the mask narrows what is known about `x`.
+    fn masked_type(&self, v: &[ExprId], scope: usize, depth: u32) -> Ty {
+        for (x, m) in [(v[0], v[1]), (v[1], v[0])] {
+            let Some(m) = expr::as_const(m) else { continue };
+            if m.is_low_mask() {
+                let inner = self.type_of_at(x, scope, depth + 1);
+                let masked = Ty::of_mask(m.bits());
+                // `uint32(x)` of an address is a uint32.
+                return match (inner, masked) {
+                    (Ty::Address, Ty::Uint(n)) if n < 160 => Ty::Uint(n),
+                    (Ty::Bool, Ty::Uint(_)) => Ty::Bool,
+                    (Ty::Unknown, m) | (Ty::Conflict, m) => m,
+                    (i, m) => i.join(m),
+                };
+            }
+            if let Some(bytes) = high_mask_bytes(m) {
+                return Ty::Bytes(bytes);
+            }
+        }
+        Ty::Unknown
+    }
+
+    /// The type that flows out of a location to its readers: the strong evidence only.
+    fn resolved_of(&self, loc: &Loc) -> Ty {
+        match self.ids.get(loc) {
+            Some(i) => self.classes[*i].resolved,
+            None => Ty::Unknown,
+        }
+    }
+
+    /// The type reported for a location: the weak evidence decides when nothing else does.
+    fn final_of(&self, loc: &Loc) -> Ty {
+        match self.ids.get(loc) {
+            Some(i) => resolve(&self.classes[*i], Evidence::Final),
+            None => Ty::Unknown,
+        }
+    }
+
+    /// The Solidity type of a location, when the evidence names one.
+    pub fn solidity(&self, loc: &Loc) -> Option<String> {
+        self.final_of(loc).solidity()
+    }
+
+    /// The Solidity type of calldata head word `word` of the function at `pc`.
+    pub fn param_type(&self, pc: usize, word: u32) -> Option<String> {
+        self.solidity(&Loc::Param { scope: pc, word })
+    }
+
+    /// Is calldata head word `word` of the function at `pc` used in arithmetic (so not a `bool`)?
+    pub fn param_is_numeric(&self, pc: usize, word: u32) -> bool {
+        self.ids
+            .get(&Loc::Param { scope: pc, word })
+            .is_some_and(|c| self.classes[*c].flags.arith)
+    }
+
+    /// The Solidity type of parameter `i` (declaration order) of the internal unit at `pc`
+    /// with `arity` parameters.
+    pub fn arg_type(&self, pc: usize, arity: usize, i: usize) -> Option<String> {
+        if i >= arity {
+            return None;
+        }
+        self.solidity(&Loc::Arg {
+            unit: pc,
+            slot: (arity - 1 - i) as u32,
+        })
+    }
+
+    /// The Solidity type of result `index` (deepest first) of the internal unit at `pc`.
+    pub fn result_type(&self, pc: usize, index: u16) -> Option<String> {
+        self.solidity(&Loc::Ret { unit: pc, index })
+    }
+
+    /// The element type of the storage variable at `root` reached through `steps`.
+    pub fn slot_type(&self, root: U256, steps: &[ShapeStep]) -> Option<String> {
+        self.solidity(&Loc::Slot(persistent(root, steps)))
+    }
+
+    /// The key type of the mapping step ending `steps` under `root`.
+    pub fn key_type(&self, root: U256, steps: &[ShapeStep]) -> Option<String> {
+        self.solidity(&Loc::Key(persistent(root, steps)))
+    }
+
+    /// Is the phi variable `id` of the function at `pc` a boolean?
+    pub fn var_is_bool(&self, pc: usize, id: u32) -> bool {
+        self.final_of(&Loc::Var { scope: pc, id }) == Ty::Bool
+    }
+}
+
+fn persistent(root: U256, steps: &[ShapeStep]) -> Shape {
+    Shape {
+        root,
+        steps: steps.to_vec(),
+        space: SlotSpace::Persistent,
+    }
+}
+
+/// The resolved type of a class from its evidence. Weak evidence only decides when the values
+/// and the strong uses say nothing, and never flows to other classes.
+fn resolve(c: &Class, evidence: Evidence) -> Ty {
+    let f = c.flags;
+    let mut t = match c.from_defs.join(c.hints) {
+        // `require(x < 2^n); uint<n>(x)`: a checked cast of a wider value.
+        Ty::Uint(n) if f.checked(n) => Ty::Unknown,
+        Ty::Address if f.checked(160) => Ty::Unknown,
+        t => t,
+    };
+    if t == Ty::Unknown && evidence == Evidence::Final {
+        t = c.weak;
+    }
+    // `x != 0` on a value that is never a number and gets no other value is a flag; a storage
+    // slot holding 1 and tested for zero is as often a `uint256` used as one.
+    if t == Ty::Unknown && f.tested && !f.arith && !f.other && !c.storage {
+        t = Ty::Bool;
+    }
+    match t {
+        // A byte that only ever holds 0 and 1 is a flag.
+        Ty::Uint(n) if n <= 8 && f.one && !f.other && !f.arith => Ty::Bool,
+        // A 160-bit number that is never an account.
+        Ty::Address if f.arith && !f.account => Ty::Uint(160),
+        Ty::Bool if f.arith => Ty::Unknown,
+        t => t,
+    }
+}
+
+/// The expressions a node tests for truth: branch and guard conditions.
+fn condition_exprs(nd: &lift::LNode) -> Vec<ExprId> {
+    let mut v: Vec<ExprId> = nd
+        .stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Require { cond, .. } => Some(*cond),
+            _ => None,
+        })
+        .collect();
+    match &nd.term {
+        Term::Branch { cond, .. } | Term::CondJump { cond, .. } => v.push(*cond),
+        _ => {}
+    }
+    v
+}
+
+/// A power of two that moves a value by whole bytes.
+fn is_byte_shift(e: ExprId) -> bool {
+    expr::as_const(e).is_some_and(|c| {
+        c.is_power_of_two() && c.trailing_zeros() > 0 && c.trailing_zeros().is_multiple_of(8)
+    })
+}
+
+/// `cond * x`: one arm of a branchless select.
+fn is_masked_select(e: ExprId) -> bool {
+    matches!(expr::node(e), Node::Op(op::MUL, v) if v.iter().any(|x| expr::is_boolean(*x)))
+}
+
+/// A 20-byte constant with its top bits set: an account rather than a number.
+fn looks_like_account(c: U256) -> bool {
+    c.byte_len() == 20 && (150..=160).contains(&c.bits())
+}
+
+/// `CALLER`, `ADDRESS`, `ORIGIN` or a constant that looks like an account.
+fn is_account(e: ExprId) -> bool {
+    match expr::node(e) {
+        Node::Env(o, _) => matches!(o, op::CALLER | op::ADDRESS | op::ORIGIN),
+        Node::Const(c) => looks_like_account(c),
+        _ => false,
+    }
+}
+
+/// The type a constant value suggests: an account for 20-byte constants, `bytesN` for a short
+/// left-aligned value (a selector), nothing otherwise.
+fn const_type(c: U256) -> Ty {
+    if looks_like_account(c) {
+        return Ty::Address;
+    }
+    let tz = c.trailing_zeros();
+    if !c.is_zero() && (192..256).contains(&tz) {
+        return Ty::Bytes((256 - tz).div_ceil(8));
+    }
+    Ty::Unknown
+}
+
+/// `n` for a mask keeping the top `n` bytes (`bytesN` cleanup), else `None`.
+fn high_mask_bytes(m: U256) -> Option<u32> {
+    let tz = m.trailing_zeros();
+    if tz == 0 || !tz.is_multiple_of(8) || tz >= 256 {
+        return None;
+    }
+    ((m >> tz).is_low_mask() && m.bits() == 256).then(|| (256 - tz) / 8)
+}
+
+/// `n` such that `c` is `2^(n-1) - 1` or `-2^(n-1)` (two's complement), the bounds of `intN`.
+fn signed_bound(c: U256) -> Option<u32> {
+    let pos = c.wrapping_add(U256::ONE);
+    if pos.is_power_of_two() && pos.trailing_zeros() >= 7 && pos.trailing_zeros() < 256 {
+        let n = pos.trailing_zeros() + 1;
+        return n.is_multiple_of(8).then_some(n);
+    }
+    let neg = (!c).wrapping_add(U256::ONE);
+    if neg.is_power_of_two() && c.bits() == 256 {
+        let n = neg.trailing_zeros() + 1;
+        return n.is_multiple_of(8).then_some(n);
+    }
+    None
+}

@@ -1,7 +1,8 @@
 //! Security analysis over the lifted IR: a rule engine producing findings with evidence.
 
+use crate::compiler;
 use crate::decompile::{self, Contract, Function};
-use crate::emit::{self, MappingLayout, Names, SlotSpace};
+use crate::emit::{self, Names, SlotSpace};
 use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
 use crate::lift::{self, Lifted, Stmt, Term};
@@ -1523,7 +1524,7 @@ pub fn analyze(c: &Contract) -> Report {
         decompile::make_names(
             f,
             &c.storage,
-            MappingLayout::of_language(&c.language),
+            c.compiler.layout,
             &c.string_loaders,
             &callee_returns,
         )
@@ -2328,11 +2329,8 @@ pub fn analyze(c: &Contract) -> Report {
                         // Pre-0.8: a payout amount computed with `-` or `*` from a parameter that
                         // no earlier comparison bounds wraps silently (accounting error).
                         if let (Some(v), true) = (*value, value_nonzero) {
-                            let wrapping = ctx.version.is_some_and(|ver| ver < (0, 8, 0))
-                                || c.info
-                                    .metadata
-                                    .as_ref()
-                                    .is_some_and(|m| m.implies_pre_0_5_9());
+                            let wrapping = c.compiler.kind == compiler::Kind::Solc
+                                && c.compiler.is_below(compiler::Version::new(0, 8, 0));
                             let unbounded_param = |e: ExprId| -> bool {
                                 mentions(
                                     e,
@@ -2910,12 +2908,9 @@ pub fn analyze(c: &Contract) -> Report {
 
         // Unchecked arithmetic: pre-0.8 compilers wrap silently; on 0.8+ an operation without
         // the compiler's overflow guard sits in an `unchecked { }` block.
-        let pre08 = match ctx.version {
-            Some((0, minor, _)) => minor < 8,
-            None => !ctx.vyper && c.language.starts_with("solc"),
-            _ => false,
-        };
-        let post08 = matches!(ctx.version, Some((0, minor, _)) if minor >= 8);
+        let solc = c.compiler.kind == compiler::Kind::Solc;
+        let pre08 = solc && !c.compiler.checked_arithmetic;
+        let post08 = solc && c.compiler.checked_arithmetic;
         if (pre08 || post08) && f.kind == FnKind::External {
             let mut flagged = 0;
             let mut ev_lines = Vec::new();
@@ -3121,11 +3116,12 @@ pub fn analyze(c: &Contract) -> Report {
     // A correct compile shares one slot per lock key (one or two keys in practice); the buggy
     // versions gave each function its own slot (default-argument variants of a function share).
     if ctx.vyper && lock_slots.len() >= 3 {
-        let fns: Vec<String> = lock_slots
+        let mut fns: Vec<String> = lock_slots
             .values()
             .flatten()
             .filter_map(|pc| c.functions.iter().find(|f| f.pc == *pc).map(fname))
             .collect();
+        fns.sort();
         push(&mut findings, "vyper-reentrancy-lock-bug", "Each @nonreentrant function uses its own lock slot (Vyper 0.2.15 – 0.3.0 codegen bug)", Severity::High, Confidence::Medium, None, None,
             format!("{} functions implement a reentrancy lock, and every one of them locks a different storage slot, so none of them excludes the others. Vyper 0.2.15, 0.2.16 and 0.3.0 compiled `@nonreentrant(\"key\")` this way (Curve pools, July 2023). Functions: {}.", lock_slots.len(), fns.join(", ")),
             vec![], "Recompile with a fixed compiler; until then treat every locked function as re-enterable from the others.");
@@ -3225,15 +3221,23 @@ pub fn analyze(c: &Contract) -> Report {
         if v.1 < 8 {
             push(&mut findings, "legacy-compiler", "Compiled with a pre-0.8 compiler", Severity::Info, Confidence::High, None, None, format!("solc {}.{}.{} has no built-in overflow checks and older ABI decoding (no validation of address/bool upper bits before 0.5).", v.0, v.1, v.2), vec![], "Prefer >= 0.8 for new deployments.");
         }
-    } else if c
-        .info
-        .metadata
-        .as_ref()
-        .is_some_and(|m| m.implies_pre_0_5_9())
+    } else if c.compiler.kind == compiler::Kind::Solc
+        && c.compiler.is_below(compiler::Version::new(0, 8, 0))
     {
-        push(&mut findings, "legacy-compiler", "Compiled with a pre-0.8 compiler", Severity::Info, Confidence::High, None, None, "The metadata trailer carries a bzzr0 hash and no version field, which solc only emitted before 0.5.9. Such compilers have no built-in overflow checks and do not validate address/bool upper bits during ABI decoding (before 0.5).".into(), vec![], "Prefer >= 0.8 for new deployments.");
-    } else if c.info.metadata.is_none() && !ctx.vyper {
-        push(&mut findings, "no-metadata", "No compiler metadata", Severity::Info, Confidence::High, None, None, "The bytecode carries no CBOR metadata trailer (stripped, hand-written, or a very old compiler). Source verification is not possible by hash.".into(), vec![], "Informational.");
+        push(&mut findings, "legacy-compiler", "Compiled with a pre-0.8 compiler", Severity::Info, Confidence::High, None, None,
+            format!("The bytecode's fingerprints pin the compiler below 0.8: {}. Such compilers have no built-in overflow checks and, before 0.5, do not validate address/bool upper bits during ABI decoding.", c.compiler.evidence.join("; ")),
+            vec![], "Prefer >= 0.8 for new deployments.");
+    }
+    if c.info.metadata.is_none() && !ctx.vyper {
+        let bounds = match c.compiler.bounds() {
+            None => String::new(),
+            Some(b) => format!(
+                " The fingerprints place the compiler at solc {}: {}.",
+                b,
+                c.compiler.evidence.join("; ")
+            ),
+        };
+        push(&mut findings, "no-metadata", "No compiler metadata", Severity::Info, Confidence::High, None, None, format!("The bytecode carries no CBOR metadata trailer (stripped, hand-written, or a very old compiler). Source verification is not possible by hash.{}", bounds), vec![], "Informational.");
     }
     if c.stats.unresolved_jumps > 0 {
         push(&mut findings, "coverage", "Some code could not be reached by the analysis", Severity::Info, Confidence::High, None, None, format!("{} jump(s) have unresolved targets and {} of {} code blocks were covered. Findings may be incomplete.", c.stats.unresolved_jumps, c.stats.covered_blocks, c.stats.code_blocks), vec![], "Informational.");
@@ -3749,7 +3753,7 @@ fn silent_guard_findings(ctx: &Ctx, findings: &mut Vec<Finding>) {
         let names = decompile::make_names(
             f,
             &ctx.c.storage,
-            MappingLayout::of_language(&ctx.c.language),
+            ctx.c.compiler.layout,
             &ctx.c.string_loaders,
             &HashMap::new(),
         );

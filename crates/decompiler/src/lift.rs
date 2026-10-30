@@ -2966,6 +2966,54 @@ pub fn node_exprs(n: &LNode) -> Vec<ExprId> {
     v
 }
 
+/// An expression root of a node, tagged with whether it is a word of an ABI-encoded payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Root {
+    /// The expression.
+    pub expr: ExprId,
+    /// A payload word (call input, event data, init code, revert data): pieces of values packed
+    /// at 4-byte offsets, so a mask or shift found at its root is encoding, not a type.
+    pub payload: bool,
+}
+
+/// Every expression root of a node, tagged (see [`Root`]).
+pub fn roots(n: &LNode) -> Vec<Root> {
+    let payload: HashSet<ExprId> = payload_exprs(n).into_iter().collect();
+    node_exprs(n)
+        .into_iter()
+        .map(|expr| Root {
+            expr,
+            payload: payload.contains(&expr),
+        })
+        .collect()
+}
+
+/// The expression roots of a node that are words of an ABI-encoded payload (call input, event
+/// data, init code, revert data).
+pub fn payload_exprs(n: &LNode) -> Vec<ExprId> {
+    let mut v = Vec::new();
+    for s in &n.stmts {
+        match s {
+            Stmt::Call {
+                input, input_head, ..
+            } => {
+                v.extend(input_head.iter().copied());
+                if let Some(d) = input {
+                    v.extend(d.iter().copied());
+                }
+            }
+            Stmt::Log { data: Some(d), .. }
+            | Stmt::Create { init: Some(d), .. }
+            | Stmt::Require { data: Some(d), .. } => v.extend(d.iter().copied()),
+            _ => {}
+        }
+    }
+    if let Term::Revert { data: Some(d), .. } = &n.term {
+        v.extend(d.iter().copied());
+    }
+    v
+}
+
 /// Every expression referenced by one statement (assignment targets included).
 pub fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
     let mut v = Vec::new();

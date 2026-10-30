@@ -1,6 +1,7 @@
 //! Whole-contract decompilation: orchestration and the output model.
 
 use crate::cfg::{self, Program, Recovered};
+use crate::compiler;
 use crate::emit::{self, MappingLayout, Names};
 use crate::expr::{self, ExprId, Node};
 use crate::function::{self, FnKind, Mutability, Param};
@@ -8,6 +9,8 @@ use crate::lift::{self, Lifted, Lifter, Stmt, Term};
 use crate::metadata::{self, BytecodeInfo, CodeKind};
 use crate::opcode as op;
 use crate::sigs;
+use crate::ssa::{self, ShapeStep};
+use crate::types::{self, TypeEnv};
 use crate::u256::U256;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -66,6 +69,9 @@ pub struct Function {
     /// Internal helper whose every call site was inlined: not printed.
     #[serde(default)]
     pub inlined: bool,
+    /// Phi variables the type solver found to be booleans.
+    #[serde(skip)]
+    pub bool_vars: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -142,8 +148,11 @@ pub struct Contract {
     pub info: BytecodeInfo,
     /// Whether the input was runtime code or creation (deployment) code.
     pub kind: CodeKind,
-    /// Compiler and version (`solc 0.8.19`), or a guess from the prologue without metadata.
+    /// Compiler and version (`solc 0.8.19`), or the bounds the bytecode fingerprints give
+    /// without metadata (`solc >= 0.8.0 (no metadata)`).
     pub language: String,
+    /// The compiler profile: family, version bounds and code-generation features.
+    pub compiler: compiler::Profile,
     /// Every recovered function: external entries first, then internal helpers and orphans.
     pub functions: Vec<Function>,
     /// Storage variables, ordered by slot.
@@ -236,29 +245,6 @@ pub fn decompile(code: &[u8], opts: &Options) -> Contract {
     c.stats.time_ms = t0.elapsed().as_millis();
     c.source = render(&c, "Contract");
     c
-}
-
-fn detect_language(info: &BytecodeInfo, code: &[u8]) -> String {
-    if let Some(m) = &info.metadata {
-        return match m.version.as_ref() {
-            Some(v) => format!("{} {}", m.compiler, v),
-            None => m.compiler.clone(),
-        };
-    }
-    // Vyper (< 0.3.10) has no metadata; solc runtime starts with the free-memory-pointer setup.
-    let solc_prologue = code.len() > 4
-        && code[0] == 0x60
-        && (code[1] == 0x80 || code[1] == 0x60)
-        && code[2] == 0x60
-        && code[3] == 0x40
-        && code[4] == 0x52;
-    if solc_prologue {
-        return "solc (unknown version, no metadata)".into();
-    }
-    if code.len() > 2 && code[0] == 0x60 && code[1] == 0x04 && code[2] == 0x36 {
-        return "vyper (< 0.3.10, no metadata)".into();
-    }
-    "unknown".into()
 }
 
 /// Decompile one code body (`info` says how it sits in the input) into a [`Contract`].
@@ -397,8 +383,9 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             }
         }
     }
-    let language = detect_language(info, code);
-    let layout = MappingLayout::of_language(&language);
+    let profile = compiler::profile(code, info.metadata.as_ref());
+    let language = profile.to_string();
+    let layout = profile.layout;
 
     let tick = |label: &str, t: &mut std::time::Instant| {
         if timing {
@@ -546,7 +533,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let calls = eff.internal_callees.clone();
         let eff = transitive(&eff, &int_effects);
         let mut params = if matches!(kind, FnKind::External) {
-            let exprs = function::exprs_with_callees(&l, &resolve, 2);
+            let exprs = function::exprs_with_callees_tagged(&l, &resolve, 2);
             function::infer_params_from(&exprs)
         } else {
             vec![]
@@ -625,6 +612,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             n_args,
             n_rets,
             inlined: false,
+            bool_vars: Vec::new(),
         }
     };
 
@@ -783,19 +771,21 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     }
 
+    // Types: follow values through phis, helpers and storage to fill in what the direct
+    // heuristics leave at `uint256`.
+    let env = {
+        let units: Vec<(usize, &Lifted)> = functions
+            .iter()
+            .filter_map(|f| f.lifted.as_ref().map(|l| (f.pc, l)))
+            .collect();
+        types::solve(&units, layout)
+    };
+    refine_types(&mut functions, &env);
+    tick("types", &mut tt);
+
     // Inventories.
     let string_slots: HashSet<U256> = loaders.values().copied().collect();
-    let solc08 = info
-        .metadata
-        .as_ref()
-        .and_then(|m| {
-            if m.compiler == "solc" {
-                m.version_tuple()
-            } else {
-                None
-            }
-        })
-        .is_some_and(|v| v >= (0, 8, 0));
+    let solc08 = profile.kind == compiler::Kind::Solc && profile.checked_arithmetic;
     let Inventories {
         mut storage,
         events,
@@ -803,6 +793,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         mut strings,
         selectors: selectors_called,
     } = inventories(&functions, layout, &string_slots);
+    refine_storage_types(&mut storage, &env);
     name_storage_from_getters(&functions, &mut storage);
     for st in scan_strings(code, code_end, &embedded_ranges) {
         if !strings.iter().any(|x| x.contains(&st)) {
@@ -976,6 +967,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         info: info.clone(),
         kind: info.kind,
         language,
+        compiler: profile,
         functions,
         storage,
         events,
@@ -1102,11 +1094,16 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
                     Some(_) => e.other_write = true,
                 }
             }
-            for e in lift::node_exprs(nd) {
-                let mut stack = vec![e];
+            for root in lift::roots(nd) {
+                let mut stack = vec![root.expr];
                 let mut visited = HashSet::new();
                 while let Some(x) = stack.pop() {
                     if !visited.insert(x) || visited.len() > 20_000 {
+                        continue;
+                    }
+                    // The 4-byte tail of a payload is a bare mask of its last value.
+                    if x == root.expr && root.payload {
+                        stack.extend(expr::children(x));
                         continue;
                     }
                     if let Node::Op(op::AND, v) = expr::node(x) {
@@ -1326,10 +1323,13 @@ pub fn make_names(
         layout,
         ..Default::default()
     };
-    for p in &f.params {
-        n.params.insert(p.index, p.name.clone());
+    if f.kind != FnKind::Internal {
+        for p in &f.params {
+            n.params.insert(p.index, p.name.clone());
+        }
     }
     n.bool_returns = f.returns.iter().map(|t| t == "bool").collect();
+    n.bools.extend(f.bool_vars.iter().map(|v| expr::var(*v)));
     // Call results are numbered by the order of their calls in the function, the same for every
     // reader of these names (the printer and the analyzer's evidence lines).
     if let Some(l) = &f.lifted {
@@ -1416,6 +1416,181 @@ pub fn make_names(
         }
     }
     n
+}
+
+/// Fill in the types the direct heuristics left at `uint256` from the solved environment:
+/// calldata parameters, return words, internal parameters and results, and the phi variables
+/// that are booleans.
+fn refine_types(functions: &mut [Function], env: &TypeEnv) {
+    let debug = std::env::var("EVMDEC_DEBUG_TYPES").is_ok();
+    for f in functions.iter_mut() {
+        let Some(l) = &f.lifted else { continue };
+        match f.kind {
+            FnKind::External => {
+                refine_params(f.pc, &mut f.params, env);
+                refine_returns(&mut f.returns, l, f.pc, &f.name, env, debug);
+            }
+            FnKind::Internal => {
+                f.params = internal_params(l, f.pc, f.n_args, env);
+                refine_results(&mut f.returns, f.pc, env);
+            }
+            _ => {}
+        }
+        f.bool_vars = bool_vars(f.pc, l, env);
+    }
+}
+
+/// Calldata parameters: the solver sees the same decoder masks as the direct inference plus
+/// every use of the word, so it decides integer widths and `address`; the direct inference still
+/// decides dynamic types and the words decoded in helpers it sees through.
+fn refine_params(pc: usize, params: &mut [Param], env: &TypeEnv) {
+    for p in params.iter_mut() {
+        if p.ty == "address" || p.ty.starts_with("uint") {
+            if let Some(t) = env.param_type(pc, p.index) {
+                p.ty = t;
+            }
+        } else if p.ty == "bool" && env.param_is_numeric(pc, p.index) {
+            // `x != 0` on a word that helpers further down do arithmetic on.
+            p.ty = env
+                .param_type(pc, p.index)
+                .unwrap_or_else(|| "uint256".to_string());
+        }
+    }
+}
+
+/// Return words of an external function: every `return` must agree on the shape for a position
+/// to be typed.
+fn refine_returns(
+    returns: &mut [String],
+    l: &Lifted,
+    pc: usize,
+    name: &str,
+    env: &TypeEnv,
+    debug: bool,
+) {
+    let rets: Vec<&[ExprId]> = l
+        .nodes
+        .iter()
+        .filter_map(|nd| match &nd.term {
+            Term::Return { data: Some(w), .. } => Some(w.as_slice()),
+            _ => None,
+        })
+        .collect();
+    if rets.is_empty() || rets.iter().any(|w| w.len() != returns.len()) {
+        return;
+    }
+    for (i, ty) in returns.iter_mut().enumerate() {
+        if ty != "uint256" {
+            continue;
+        }
+        let t = rets
+            .iter()
+            .fold(types::Ty::Unknown, |t, w| t.join(env.type_of(w[i], pc)));
+        if debug {
+            eprintln!(
+                "[types] return {} of {} (pc {:#x}): {:?} from {:?}",
+                i,
+                name,
+                pc,
+                t,
+                rets.iter().map(|w| expr::node(w[i])).collect::<Vec<_>>()
+            );
+        }
+        if let Some(t) = t.solidity() {
+            *ty = t;
+        }
+    }
+}
+
+/// Parameters of an internal unit: the direct address heuristic first, the solver otherwise.
+fn internal_params(l: &Lifted, pc: usize, n_args: usize, env: &TypeEnv) -> Vec<Param> {
+    let arity = ssa::arity(l);
+    let direct = function::internal_param_types(l, n_args);
+    (0..n_args)
+        .map(|i| {
+            let ty = match direct.get(i) {
+                Some(t) if t != "uint256" => t.clone(),
+                _ => env
+                    .arg_type(pc, arity, i)
+                    .unwrap_or_else(|| "uint256".to_string()),
+            };
+            Param {
+                index: i as u32,
+                ty,
+                name: format!("arg{}", i),
+            }
+        })
+        .collect()
+}
+
+/// Results of an internal unit: declaration position `i` is result `n - 1 - i` (deepest first).
+fn refine_results(returns: &mut [String], pc: usize, env: &TypeEnv) {
+    let n = returns.len();
+    for (i, ty) in returns.iter_mut().enumerate() {
+        if ty == "uint256" {
+            if let Some(t) = env.result_type(pc, (n - 1 - i) as u16) {
+                *ty = t;
+            }
+        }
+    }
+}
+
+/// The phi variables of a function the solver found to be booleans.
+fn bool_vars(pc: usize, l: &Lifted, env: &TypeEnv) -> Vec<u32> {
+    let mut vars: Vec<u32> = ssa::phi_defs(l)
+        .keys()
+        .filter_map(|var| match expr::node(*var) {
+            Node::Var(v) if env.var_is_bool(pc, v) => Some(v),
+            _ => None,
+        })
+        .collect();
+    vars.sort_unstable();
+    vars
+}
+
+/// Replace the `uint256` leaves and keys of the storage declarations by what the solver found
+/// for the corresponding element and key shapes.
+fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv) {
+    fn refine(ty: &str, root: U256, steps: &mut Vec<ShapeStep>, env: &TypeEnv) -> String {
+        if let Some(inner) = ty
+            .strip_prefix("mapping(")
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            let Some((k, v)) = inner.split_once(" => ") else {
+                return ty.to_string();
+            };
+            steps.push(ShapeStep::Key);
+            let kt = if k == "uint256" {
+                env.key_type(root, steps).unwrap_or_else(|| k.to_string())
+            } else {
+                k.to_string()
+            };
+            let vt = refine(v, root, steps, env);
+            steps.pop();
+            return format!("mapping({} => {})", kt, vt);
+        }
+        if let Some(elem) = ty.strip_suffix("[]") {
+            steps.push(ShapeStep::Index);
+            let et = refine(elem, root, steps, env);
+            steps.pop();
+            return format!("{}[]", et);
+        }
+        if ty == "uint256" {
+            if let Some(t) = env.slot_type(root, steps) {
+                return t;
+            }
+        }
+        ty.to_string()
+    }
+    for var in storage.iter_mut() {
+        if !var.fields.is_empty() {
+            continue;
+        }
+        let Some(root) = U256::from_hex_str(&var.slot) else {
+            continue;
+        };
+        var.ty = refine(&var.ty, root, &mut Vec::new(), env);
+    }
 }
 
 /// Packed storage fields: slot -> (byte offset, bits) -> constant values written (for typing).
@@ -1529,7 +1704,7 @@ fn inventories(
                 if let Some(c0) = words.first().and_then(|w| expr::as_const(*w)) {
                     if (c0 & expr::mask_bits(224)).is_zero() {
                         let sel = (c0 >> 224).low_u64() as u32;
-                        if sel == 0x08c379a0 {
+                        if sel == emit::SEL_ERROR {
                             if let Some(s) = emit::decode_string_payload(
                                 words,
                                 expr::as_const(*len).and_then(|l| l.as_usize()),
@@ -1555,12 +1730,12 @@ fn inventories(
                 })
                 .flatten()
                 .collect();
-            for e in lift::node_exprs(nd) {
-                collect_sloads(e, &mut slots, vyper, &bases);
-                if !init_words.contains(&e) {
-                    collect_strings(e, &mut strings);
+            for root in lift::roots(nd) {
+                collect_sloads(root.expr, &mut slots, vyper, &bases);
+                if !init_words.contains(&root.expr) {
+                    collect_strings(root.expr, &mut strings);
                 }
-                collect_fields(e, &mut fields);
+                collect_fields(root, &mut fields);
             }
         }
     }
@@ -1918,11 +2093,16 @@ fn slot_root(
 }
 
 /// Packed-field reads anywhere in `e` (see `emit::packed_read`).
-fn collect_fields(e: expr::ExprId, fields: &mut PackedFields) {
+fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
     let mut seen = HashSet::new();
-    let mut stack = vec![e];
+    let mut stack = vec![root.expr];
     while let Some(x) = stack.pop() {
         if !seen.insert(x) || seen.len() > 50_000 {
+            continue;
+        }
+        // The 4-byte tail of a payload is a bare mask of its last value, not a field read.
+        if x == root.expr && root.payload {
+            stack.extend(expr::children(x));
             continue;
         }
         if let Some((k, off, bits)) = emit::packed_read(x) {
@@ -2107,6 +2287,12 @@ pub fn render(c: &Contract, name: &str) -> String {
         "// Decompiled by evmdec. Compiler: {}.\n",
         c.language
     ));
+    if c.compiler.version.is_none() && !c.compiler.evidence.is_empty() {
+        out.push_str(&format!(
+            "// Compiler fingerprints: {}.\n",
+            c.compiler.evidence.join("; ")
+        ));
+    }
     if let Some(m) = &c.info.metadata {
         if let Some(h) = &m.ipfs {
             match m.ipfs_cid() {
@@ -2253,13 +2439,12 @@ pub fn fmt_function_header(f: &Function) -> String {
         FnKind::Receive => s.push_str("    receive() external payable {\n"),
         FnKind::Constructor => s.push_str("    constructor() {\n"),
         FnKind::Internal => {
-            let tys = f
-                .lifted
-                .as_ref()
-                .map(|l| function::internal_param_types(l, f.n_args))
-                .unwrap_or_else(|| vec!["uint256".to_string(); f.n_args]);
+            // `refine_types` fills the parameters of every lifted internal unit.
             let params: Vec<String> = (0..f.n_args)
-                .map(|i| format!("{} arg{}", tys.get(i).map_or("uint256", String::as_str), i))
+                .map(|i| {
+                    let ty = f.params.get(i).map_or("uint256", |p| p.ty.as_str());
+                    format!("{} arg{}", ty, i)
+                })
                 .collect();
             let m = match f.mutability {
                 Mutability::View | Mutability::Pure => mutability_str(f.mutability),

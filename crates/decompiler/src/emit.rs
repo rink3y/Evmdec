@@ -93,17 +93,6 @@ pub enum MappingLayout {
     Vyper,
 }
 
-impl MappingLayout {
-    /// The layout used by the compiler a [`Contract::language`](crate::decompile::Contract) names.
-    pub fn of_language(language: &str) -> MappingLayout {
-        if language.starts_with("vyper") {
-            MappingLayout::Vyper
-        } else {
-            MappingLayout::Solidity
-        }
-    }
-}
-
 /// Which storage a slot expression addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SlotSpace {
@@ -539,7 +528,9 @@ pub fn is_hidden_require(cond: ExprId, data: Option<&[ExprId]>, n: &Names) -> bo
 }
 
 /// Selector of `Panic(uint256)`.
-const SEL_PANIC: u32 = 0x4e487b71;
+pub const SEL_PANIC: u32 = 0x4e487b71;
+/// Selector of `Error(string)`.
+pub const SEL_ERROR: u32 = 0x08c379a0;
 /// `Panic` code for arithmetic overflow.
 const PANIC_OVERFLOW: u64 = 0x11;
 /// `Panic` code for division by zero.
@@ -1471,7 +1462,7 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, kind: Payload
             |l| l >= 4 && (l - 4) % 32 == 0,
         );
         if kind == PayloadKind::Revert && top4_only {
-            if sel == 0x08c379a0 {
+            if sel == SEL_ERROR {
                 if let Some(s) = decode_string_payload(words, lenu) {
                     return format!("\"{}\"", s);
                 }

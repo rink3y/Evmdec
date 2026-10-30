@@ -2,7 +2,7 @@
 
 use crate::emit::{self, calldata_word_index};
 use crate::expr::{self, ExprId, Node};
-use crate::lift::{self, Lifted, Stmt, Term};
+use crate::lift::{self, Lifted, Root, Stmt, Term};
 use crate::opcode as op;
 use crate::u256::U256;
 use serde::Serialize;
@@ -420,9 +420,22 @@ pub fn exprs_with_callees<'a>(
     resolve: &dyn Fn(usize) -> Option<&'a Lifted>,
     depth: usize,
 ) -> Vec<ExprId> {
-    let mut out: Vec<ExprId> = Vec::new();
+    exprs_with_callees_tagged(l, resolve, depth)
+        .into_iter()
+        .map(|r| r.expr)
+        .collect()
+}
+
+/// [`exprs_with_callees`], each root tagged with whether it is a payload word (see
+/// [`lift::Root`]).
+pub fn exprs_with_callees_tagged<'a>(
+    l: &Lifted,
+    resolve: &dyn Fn(usize) -> Option<&'a Lifted>,
+    depth: usize,
+) -> Vec<Root> {
+    let mut out: Vec<Root> = Vec::new();
     for nd in &l.nodes {
-        out.extend(lift::node_exprs(nd));
+        out.extend(lift::roots(nd));
         if depth == 0 {
             continue;
         }
@@ -437,11 +450,11 @@ pub fn exprs_with_callees<'a>(
                             map.insert((k - 1 - j) as u32, *a);
                         }
                     }
-                    let inner = exprs_with_callees(cl, resolve, depth - 1);
+                    let inner = exprs_with_callees_tagged(cl, resolve, depth - 1);
                     let mut memo = HashMap::new();
-                    for e in inner {
+                    for root in inner {
                         let sub = expr::substitute(
-                            e,
+                            root.expr,
                             &|n| {
                                 if let Node::Arg(i) = n {
                                     map.get(i).copied()
@@ -451,7 +464,10 @@ pub fn exprs_with_callees<'a>(
                             },
                             &mut memo,
                         );
-                        out.push(sub);
+                        out.push(Root {
+                            expr: sub,
+                            payload: root.payload,
+                        });
                     }
                 }
             }
@@ -462,19 +478,52 @@ pub fn exprs_with_callees<'a>(
 
 /// Infer calldata parameters from usage.
 pub fn infer_params(l: &Lifted) -> Vec<Param> {
-    let exprs: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
-    infer_params_from(&exprs)
+    let roots: Vec<Root> = l.nodes.iter().flat_map(lift::roots).collect();
+    infer_params_from(&roots)
 }
 
-/// Infers calldata parameters from a set of expressions.
+/// Masks and shifts that carve a piece of a value for a packed payload word (`x & 0xffffffff
+/// << 224 | y >> 32`): the operands of an `OR`, `SHL` or power-of-two `MUL`, and the root of a
+/// payload word (the 4-byte tail of a `4 + 32n` payload is `x & 0xffffffff` on its own). They
+/// say nothing about the type of what they mask.
+pub fn packing_masks(roots: &[Root]) -> HashSet<ExprId> {
+    let mut out = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack: Vec<ExprId> = Vec::new();
+    for r in roots {
+        stack.push(r.expr);
+        if r.payload && matches!(expr::node(r.expr), Node::Op(op::AND | op::SHR | op::DIV, _)) {
+            out.insert(r.expr);
+        }
+    }
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 200_000 {
+            continue;
+        }
+        let kids = expr::children(x);
+        if matches!(expr::node(x), Node::Op(op::OR | op::SHL | op::MUL, _)) {
+            for k in &kids {
+                if matches!(expr::node(*k), Node::Op(op::AND | op::SHR | op::DIV, _)) {
+                    out.insert(*k);
+                }
+            }
+        }
+        stack.extend(kids);
+    }
+    out
+}
+
+/// Infers calldata parameters from a set of expression roots, each tagged with whether it is a
+/// payload word.
 ///
 /// Masks and sign-extensions give the types; the ABI head-size check (or, failing that, the
 /// highest calldata word read) gives the count.
-pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
+pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
     let mut max_idx: Option<u32> = None;
     let mut types: HashMap<u32, String> = HashMap::new();
     let mut dynamic: HashSet<u32> = HashSet::new();
     let mut head_words: Option<u32> = None;
+    let packing = packing_masks(roots);
     let mut visit = |e: ExprId| {
         let mut seen = HashSet::new();
         let mut stack = vec![e];
@@ -499,7 +548,7 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
                         }
                     }
                 }
-                Node::Op(op::AND, v) => {
+                Node::Op(op::AND, v) if !packing.contains(&x) => {
                     if let (Node::CallDataLoad(off), Some(m)) =
                         (expr::node(v[0]), expr::as_const(v[1]))
                     {
@@ -507,13 +556,18 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
                             if m.is_low_mask() {
                                 let bits = m.bits();
                                 let ty = if bits == 160 {
-                                    "address".to_string()
+                                    Some("address".to_string())
                                 } else if bits == 1 {
-                                    "bool".to_string()
+                                    Some("bool".to_string())
+                                } else if bits % 8 == 0 {
+                                    Some(format!("uint{}", bits))
                                 } else {
-                                    format!("uint{}", bits)
+                                    // `x & (2^255 - 1)` strips a flag bit from a uint256.
+                                    None
                                 };
-                                types.entry(i).or_insert(ty);
+                                if let Some(ty) = ty {
+                                    types.entry(i).or_insert(ty);
+                                }
                             }
                         }
                     }
@@ -569,8 +623,8 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
             stack.extend(expr::children(x));
         }
     };
-    for e in exprs {
-        visit(*e);
+    for r in roots {
+        visit(r.expr);
     }
     // `iszero(iszero(x))` is both the bool cleanup and `x != 0`: a word is a bool only when it
     // is never used raw anywhere else (arithmetic, comparison, call argument, hash input).
@@ -583,7 +637,7 @@ pub fn infer_params_from(exprs: &[ExprId]) -> Vec<Param> {
         if !bool_words.is_empty() {
             let mut raw: HashSet<u32> = HashSet::new();
             let mut seen = HashSet::new();
-            let mut stack: Vec<ExprId> = exprs.to_vec();
+            let mut stack: Vec<ExprId> = roots.iter().map(|r| r.expr).collect();
             while let Some(x) = stack.pop() {
                 if !seen.insert(x) || seen.len() > 200_000 {
                     continue;

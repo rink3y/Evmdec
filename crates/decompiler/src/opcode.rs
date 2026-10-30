@@ -167,6 +167,8 @@ pub const MCOPY: u8 = 0x5e;
 pub const PUSH0: u8 = 0x5f;
 /// `PUSH1` (0x60): Pushes a 1-byte immediate; `PUSH1..=PUSH32` are consecutive.
 pub const PUSH1: u8 = 0x60;
+/// `PUSH4`: the width of a selector.
+pub const PUSH4: u8 = 0x63;
 /// `PUSH32` (0x7f): Pushes a 32-byte immediate.
 pub const PUSH32: u8 = 0x7f;
 /// `DUP1` (0x80): Duplicates the top stack item; `DUP1..=DUP16` are consecutive.

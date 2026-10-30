@@ -65,6 +65,9 @@ def main():
     ap.add_argument('-v', action='store_true')
     a = ap.parse_args()
     tot = dict(abi=0, found=0, match=0, mut_ok=0, mut_n=0, par_ok=0, par_n=0, ret_ok=0, ret_n=0, ev=0, ev_found=0, time=0.0, blocks=0, covered=0, unresolved=0)
+    # Type accuracy: ABI head words whose inferred Solidity type equals the declared one.
+    ty = dict(par_words=0, par_exact=0, ret_words=0, ret_exact=0)
+    wrong = []
     rows = []
     for f in sorted(os.listdir(a.dir)):
         if not f.endswith('.hex'): continue
@@ -119,6 +122,33 @@ def main():
                 return 1
             hw = sum(head_words(x) for x in it.get('inputs', []))
             par_ok += (len(fx['params']) == hw)
+            def word_types(t):
+                # Declared type of every head word of `t`; dynamic values are one word.
+                if is_dynamic(t): return ['dynamic']
+                tt = t['type']
+                if tt.startswith('tuple') and not tt.endswith(']'):
+                    return [w for c in t['components'] for w in word_types(c)]
+                import re
+                m2 = re.match(r'(.*)\[(\d+)\]$', tt)
+                if m2:
+                    base = dict(t); base['type'] = m2.group(1)
+                    return word_types(base) * int(m2.group(2))
+                return [{'uint': 'uint256', 'int': 'int256'}.get(tt, tt)]
+            def same(decl, ours):
+                if decl == 'dynamic': return ours in ('bytes', 'string') or ours.endswith('[]')
+                return decl == ours
+            decl_in = [w for x in it.get('inputs', []) for w in word_types(x)]
+            if len(decl_in) == len(fx['params']):
+                for d, p in zip(decl_in, fx['params']):
+                    ty['par_words'] += 1
+                    if same(d, p['ty']): ty['par_exact'] += 1
+                    else: wrong.append(f"{name} {sig(it)} param {p['name']}: abi={d} ours={p['ty']}")
+            decl_out = [w for x in it.get('outputs', []) for w in word_types(x)]
+            if decl_out and len(decl_out) == len(fx['returns']) and 'dynamic' not in decl_out:
+                for d, r in zip(decl_out, fx['returns']):
+                    ty['ret_words'] += 1
+                    if same(d, r): ty['ret_exact'] += 1
+                    else: wrong.append(f"{name} {sig(it)} return: abi={d} ours={r}")
             n_out = len(it.get('outputs', []))
             ret_ok += (len(fx['returns']) == n_out) or (n_out > 0 and any(o['type'] in ('string', 'bytes') or o['type'].endswith(']') for o in it['outputs']) and len(fx['returns']) >= 1)
             if a.v and (not ok or len(fx['params']) != hw):
@@ -152,6 +182,9 @@ def main():
     n = tot['match'] or 1
     print(f"\nselectors: recall {tot['match']}/{tot['abi']} = {100*tot['match']/max(1,tot['abi']):.1f}%  precision {tot['match']}/{tot['found']} = {100*tot['match']/max(1,tot['found']):.1f}%")
     print(f"mutability: {tot['mut_ok']}/{n} = {100*tot['mut_ok']/n:.1f}%   params: {tot['par_ok']}/{n} = {100*tot['par_ok']/n:.1f}%   returns: {tot['ret_ok']}/{n} = {100*tot['ret_ok']/n:.1f}%")
+    print(f"param types: {ty['par_exact']}/{ty['par_words']} = {100*ty['par_exact']/max(1,ty['par_words']):.1f}%   return types: {ty['ret_exact']}/{ty['ret_words']} = {100*ty['ret_exact']/max(1,ty['ret_words']):.1f}%")
+    if a.v:
+        for w in wrong: print('   ' + w)
     print(f"events: {tot['ev_found']}/{tot['ev']} = {100*tot['ev_found']/max(1,tot['ev']):.1f}%   blocks covered: {tot['covered']}/{tot['blocks']} = {100*tot['covered']/max(1,tot['blocks']):.2f}%   unresolved jumps: {tot['unresolved']}   total time {tot['time']:.2f}s")
 
 if __name__ == '__main__':

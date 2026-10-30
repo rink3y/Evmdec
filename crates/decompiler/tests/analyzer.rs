@@ -454,3 +454,32 @@ fn a_hash_used_in_arithmetic_is_reported() {
     let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
     assert!(finding(&r, "hash-as-number").is_some(), "{:?}", ids(&r));
 }
+
+#[test]
+fn an_unguarded_selfdestruct_is_confirmed_but_a_guarded_one_is_not() {
+    // kill(): selfdestruct(msg.sender) with no access check.
+    let open = dispatcher("CALLER SELFDESTRUCT");
+    let r = analyze::analyze(&decompile::decompile(&open, &Options::default()));
+    let f = finding(&r, "selfdestruct").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(
+        f.confirmed,
+        "an open selfdestruct should be confirmed: {f:?}"
+    );
+    assert!(f.witness.as_ref().is_some_and(|w| w.starts_with("0x")));
+
+    // require(msg.sender == slot0) first. In a fresh state slot0 == 0 and the attacker is
+    // non-zero, so the sink is unreachable and nothing is confirmed.
+    let guarded = dispatcher(
+        "PUSH1 0x00 SLOAD CALLER EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST CALLER SELFDESTRUCT",
+    );
+    let r = analyze::analyze(&decompile::decompile(&guarded, &Options::default()));
+    assert!(
+        !r.findings.iter().any(|f| f.confirmed),
+        "a guarded selfdestruct must not be confirmed: {:?}",
+        r.findings
+            .iter()
+            .filter(|f| f.confirmed)
+            .map(|f| &f.id)
+            .collect::<Vec<_>>()
+    );
+}

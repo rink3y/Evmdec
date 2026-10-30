@@ -185,6 +185,15 @@ pub struct Contract {
     /// Constant addresses used as DELEGATECALL targets.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub delegatecall_targets: Vec<String>,
+    /// Constant addresses this contract calls (`CALL`/`STATICCALL`/`CALLCODE` to a literal
+    /// address): hard-coded dependencies such as tokens, oracles and registries. Precompiles
+    /// (1..=9) are excluded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub call_targets: Vec<String>,
+    /// Contracts fetched and decompiled at this contract's external call targets, when following
+    /// links over RPC. Each carries its own address and report.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub linked: Vec<Contract>,
     /// Filled when the contract was fetched by address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
@@ -932,22 +941,18 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     // Delegatecall targets (proxy resolution).
     let mut dc_slots: Vec<String> = Vec::new();
     let mut dc_targets: Vec<String> = Vec::new();
+    let mut call_targets: Vec<String> = Vec::new();
     for f in &functions {
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
             for st in &nd.stmts {
-                if let Stmt::Call {
-                    kind: op::DELEGATECALL,
-                    addr,
-                    ..
-                } = st
-                {
+                if let Stmt::Call { kind, addr, .. } = st {
                     let a = match expr::node(*addr) {
                         Node::Op(op::AND, v) => v[0],
                         _ => *addr,
                     };
                     match expr::node(a) {
-                        Node::SLoad(k, false, _) => {
+                        Node::SLoad(k, false, _) if *kind == op::DELEGATECALL => {
                             if let Some(c) = expr::as_const(k) {
                                 let h = c.to_hex_padded(32);
                                 if !dc_slots.contains(&h) {
@@ -955,10 +960,24 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                                 }
                             }
                         }
-                        Node::Const(c) => {
+                        Node::Const(c) if *kind == op::DELEGATECALL => {
                             let h = c.to_hex_padded(20);
                             if !dc_targets.contains(&h) {
                                 dc_targets.push(h);
+                            }
+                        }
+                        // A literal address called with CALL/STATICCALL/CALLCODE: a hard-coded
+                        // dependency. Precompiles and the zero address are not contracts to link.
+                        Node::Const(c)
+                            if matches!(*kind, op::CALL | op::STATICCALL | op::CALLCODE) =>
+                        {
+                            let low = c & expr::mask_bits(160);
+                            let is_precompile = low.fits_u64() && (1..=9).contains(&low.low_u64());
+                            if !low.is_zero() && !is_precompile {
+                                let h = low.to_hex_padded(20);
+                                if !call_targets.contains(&h) {
+                                    call_targets.push(h);
+                                }
                             }
                         }
                         _ => {}
@@ -985,6 +1004,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         constructor: None,
         delegatecall_slots: dc_slots,
         delegatecall_targets: dc_targets,
+        call_targets,
+        linked: Vec::new(),
         address: None,
         chain: None,
         proxy: None,

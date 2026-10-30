@@ -100,6 +100,13 @@ pub struct Host {
     /// Seed from which every external effect (balances, code, storage, call and create results)
     /// is derived, so two machines sharing a host observe the same world.
     pub seed: u64,
+    /// When set, `storage` reads as zero for every key not written in the frame (a freshly
+    /// deployed, empty contract), instead of the seed-derived value. Used by the executor so a
+    /// confirmation run starts from a clean, chosen state.
+    pub zero_storage: bool,
+    /// When set, every external call returns this success flag with empty data, instead of the
+    /// seed-derived outcome. Lets a confirmation run assume the worst (or best) case of a callee.
+    pub force_calls: Option<bool>,
 }
 
 impl Host {
@@ -130,6 +137,35 @@ impl Host {
             basefee: U256::from_u64(rng.below(1 << 36)),
             blobbasefee: U256::from_u64(rng.below(1 << 20)),
             seed: rng.next_u64(),
+            zero_storage: false,
+            force_calls: None,
+        }
+    }
+
+    /// A controlled environment for a confirmation run: `caller` is both the immediate caller
+    /// and the transaction origin (the account whose reach is being tested), `calldata` is the
+    /// input, storage reads as zero unless written, and the block values are fixed. Every field
+    /// is deterministic so a reached sink is reproducible.
+    pub fn controlled(address: U256, caller: U256, calldata: Vec<u8>, callvalue: U256) -> Host {
+        Host {
+            address,
+            caller,
+            origin: caller,
+            callvalue,
+            calldata,
+            gasprice: U256::from_u64(1_000_000_000),
+            coinbase: U256::from_u64(0xc0),
+            timestamp: U256::from_u64(1_700_000_000),
+            number: U256::from_u64(18_000_000),
+            prevrandao: U256::from_u64(0x1234_5678_9abc_def0),
+            gaslimit: U256::from_u64(30_000_000),
+            chainid: U256::ONE,
+            selfbalance: U256::from_u64(1_000_000_000_000_000_000),
+            basefee: U256::from_u64(1_000_000_000),
+            blobbasefee: U256::ONE,
+            seed: 0x5eed,
+            zero_storage: true,
+            force_calls: None,
         }
     }
     /// Balance of account `a` (`BALANCE`): seed-derived, limited to 64 bits.
@@ -185,6 +221,9 @@ impl Host {
     }
     /// Initial storage value of a key (random but deterministic).
     pub fn storage(&self, k: U256) -> U256 {
+        if self.zero_storage {
+            return U256::ZERO;
+        }
         let r = h(&[&self.seed.to_be_bytes()[..], b"stor", &k.to_be_bytes()].concat());
         if r.low_u64().is_multiple_of(3) {
             U256::ZERO
@@ -194,6 +233,9 @@ impl Host {
     }
     /// Outcome of the i-th external call: (success, return data).
     pub fn call_result(&self, i: usize) -> (bool, Vec<u8>) {
+        if let Some(b) = self.force_calls {
+            return (b, Vec::new());
+        }
         let r = keccak::keccak256(
             &[
                 &self.seed.to_be_bytes()[..],

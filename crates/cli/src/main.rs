@@ -169,6 +169,26 @@ fn fetch_and_decompile(
                 Err(e) => eprintln!("proxy resolution failed: {}", e),
             }
         }
+        // Hard-coded external call targets: fetch and decompile each (one level deep).
+        let targets: Vec<String> = c.call_targets.clone();
+        for t in targets.iter().take(8) {
+            let full = format!("0x{}", t.trim_start_matches("0x"));
+            if Some(&full) == c.address.as_ref() {
+                continue;
+            }
+            match client.get_code(&full) {
+                Ok(tc) if !tc.is_empty() => {
+                    eprintln!("call target {} — fetching...", full);
+                    let mut lc = evmdec::decompile::decompile(&tc, opts);
+                    lc.address = Some(full.clone());
+                    lc.chain = Some(chain.to_string());
+                    lc.source = evmdec::decompile::render(&lc, "Linked");
+                    c.linked.push(lc);
+                }
+                Ok(_) => eprintln!("call target {} has no code (likely an EOA)", full),
+                Err(e) => eprintln!("could not fetch call target {}: {}", full, e),
+            }
+        }
     }
     Ok(c)
 }
@@ -388,6 +408,20 @@ fn main() -> Result<()> {
                                 )
                             );
                         }
+                    }
+                    for lc in &c.linked {
+                        let lr = evmdec::analyze::analyze(lc);
+                        println!(
+                            "\n/*\n{}*/",
+                            evmdec::analyze::render_markdown(
+                                lc,
+                                &lr,
+                                &format!(
+                                    "linked contract {}",
+                                    lc.address.as_deref().unwrap_or("?")
+                                )
+                            )
+                        );
                     }
                 }
             }

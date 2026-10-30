@@ -69,6 +69,13 @@ pub struct Finding {
     /// Number of code sites folded into this finding (same rule, same function).
     #[serde(skip_serializing_if = "is_one")]
     pub sites: usize,
+    /// The confirmation pass reached this finding's sink from a fresh state with an arbitrary
+    /// caller: the vulnerability is not merely a pattern but reachable.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub confirmed: bool,
+    /// The calldata (0x-prefixed) that reached the sink, when `confirmed`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub witness: Option<String>,
 }
 
 fn is_one(n: &usize) -> bool {
@@ -1133,6 +1140,8 @@ pub(crate) fn push(
         evidence,
         sites: 1,
         recommendation: rec.into(),
+        confirmed: false,
+        witness: None,
     });
 }
 
@@ -3113,6 +3122,9 @@ pub fn analyze(c: &Contract) -> Report {
     // ---- widths, signedness and kinds of values ----
     type_rules::findings(c, &c.types, names_for, &mut findings);
 
+    // ---- confirm reachable findings by execution ----
+    crate::confirm::confirm(c, &mut findings);
+
     // ---- contract-level findings ----
     if std::env::var("EVMDEC_DEBUG_LOCKS").is_ok() {
         for (slot, fs) in &lock_slots {
@@ -3326,6 +3338,8 @@ pub fn analyze(c: &Contract) -> Report {
             evidence: Vec::new(),
             recommendation: "Make sure every state-changing entry point that touches the same storage takes the same lock.".into(),
             sites: locked.len(),
+            confirmed: false,
+            witness: None,
         });
     }
     findings.sort_by(|a, b| {
@@ -3838,6 +3852,8 @@ fn push_fact(
         evidence,
         recommendation: rec.into(),
         sites: 1,
+        confirmed: false,
+        witness: None,
     });
 }
 
@@ -4387,10 +4403,14 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
             }
             out.push('\n');
         }
-        out.push_str(&format!(
-            "- Confidence: {:?}\n\n{}\n\n",
-            f.confidence, f.description
-        ));
+        out.push_str(&format!("- Confidence: {:?}\n", f.confidence));
+        if f.confirmed {
+            out.push_str("- Confirmed: reached from a fresh state by an arbitrary caller\n");
+            if let Some(w) = &f.witness {
+                out.push_str(&format!("- Witness calldata: `{}`\n", w));
+            }
+        }
+        out.push_str(&format!("\n{}\n\n", f.description));
         if !f.evidence.is_empty() {
             out.push_str("```solidity\n");
             for e in &f.evidence {
@@ -4419,6 +4439,14 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         out.push_str("## External calls\n\n");
         for e in &r.external_calls {
             out.push_str(&format!("- `{}`\n", e));
+        }
+        out.push('\n');
+    }
+    if !c.call_targets.is_empty() {
+        out.push_str("## Hard-coded dependencies\n\n");
+        out.push_str("Addresses this contract calls as literals (fetched and reported separately when following links on-chain):\n\n");
+        for t in &c.call_targets {
+            out.push_str(&format!("- `0x{}`\n", t.trim_start_matches("0x")));
         }
         out.push('\n');
     }

@@ -124,15 +124,15 @@ pub const CHAINS: &[Chain] = &[
         name: "classic",
         id: 61,
         endpoints: &[
-            "https://etc.etcdesktop.com",
-            "https://etc.rivet.link",
-            "https://besu-at.etc-network.info",
-            "https://0xrpc.io/etc",
             "https://rpc.etcmc.xyz",
+            "https://ethereum-classic-mainnet.gateway.tatum.io",
+            "https://0xrpc.io/etc",
             "https://rpc.swiftnodes.io/rpc/etc",
             "https://lb.routeme.sh/rpc/evm/61",
             "https://geth-at.etc-network.info",
-            "https://ethereum-classic-mainnet.gateway.tatum.io",
+            "https://etc.rivet.link",
+            "https://besu-at.etc-network.info",
+            "https://etc.etcdesktop.com",
         ],
     },
 ];
@@ -190,8 +190,23 @@ impl Client {
     /// A JSON-RPC `error`, a transport failure or a malformed body all move on to the next
     /// endpoint; the error reported is the last one seen.
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.call_where(method, params, |_| true)
+    }
+
+    /// Like [`Client::call`], but a `result` that `conclusive` rejects also moves on to the
+    /// next endpoint: a node that is behind, pruned or on the wrong network answers "no code"
+    /// or "zero" for an account that exists, and only agreement across the endpoints makes such
+    /// an empty answer believable. The first accepted result wins; when every endpoint that
+    /// answered gave a rejected result, the first of those is returned.
+    pub fn call_where(
+        &self,
+        method: &str,
+        params: Value,
+        conclusive: impl Fn(&Value) -> bool,
+    ) -> Result<Value, String> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let mut last_err = String::new();
+        let mut inconclusive: Option<Value> = None;
         for ep in &self.endpoints {
             let agent = ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(self.timeout_secs))
@@ -207,15 +222,21 @@ impl Client {
                             last_err = format!("{}: {}", ep, err);
                             continue;
                         }
-                        if let Some(res) = v.get("result") {
-                            return Ok(res.clone());
+                        match v.get("result") {
+                            Some(res) if conclusive(res) => return Ok(res.clone()),
+                            Some(res) => {
+                                inconclusive.get_or_insert_with(|| res.clone());
+                            }
+                            None => last_err = format!("{}: malformed response", ep),
                         }
-                        last_err = format!("{}: malformed response", ep);
                     }
                     Err(e) => last_err = format!("{}: {}", ep, e),
                 },
                 Err(e) => last_err = format!("{}: {}", ep, e),
             }
+        }
+        if let Some(v) = inconclusive {
+            return Ok(v);
         }
         Err(format!(
             "all RPC endpoints failed; last error: {}",
@@ -223,16 +244,31 @@ impl Client {
         ))
     }
 
-    /// `eth_getCode` at the latest block, decoded from hex.
+    /// `eth_getCode` at the latest block, decoded from hex. An empty answer is accepted only
+    /// when no endpoint returns code.
     pub fn get_code(&self, address: &str) -> Result<Vec<u8>, String> {
-        let v = self.call("eth_getCode", json!([address, "latest"]))?;
+        let has_code = |v: &Value| {
+            v.as_str()
+                .is_some_and(|s| s.trim_start_matches("0x").len() > 1)
+        };
+        let v = self.call_where("eth_getCode", json!([address, "latest"]), has_code)?;
         let s = v.as_str().ok_or("eth_getCode: result is not a string")?;
         hex::decode(s)
     }
 
-    /// `eth_getStorageAt` for a hex `slot` at the latest block.
+    /// `eth_getStorageAt` for a hex `slot` at the latest block. A zero answer is accepted only
+    /// when no endpoint returns a value.
     pub fn get_storage(&self, address: &str, slot: &str) -> Result<U256, String> {
-        let v = self.call("eth_getStorageAt", json!([address, slot, "latest"]))?;
+        let non_zero = |v: &Value| {
+            v.as_str()
+                .and_then(U256::from_hex_str)
+                .is_some_and(|x| !x.is_zero())
+        };
+        let v = self.call_where(
+            "eth_getStorageAt",
+            json!([address, slot, "latest"]),
+            non_zero,
+        )?;
         let s = v
             .as_str()
             .ok_or("eth_getStorageAt: result is not a string")?;

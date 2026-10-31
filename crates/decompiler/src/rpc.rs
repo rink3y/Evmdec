@@ -127,6 +127,12 @@ pub const CHAINS: &[Chain] = &[
             "https://etc.etcdesktop.com",
             "https://etc.rivet.link",
             "https://besu-at.etc-network.info",
+            "https://0xrpc.io/etc",
+            "https://rpc.etcmc.xyz",
+            "https://rpc.swiftnodes.io/rpc/etc",
+            "https://lb.routeme.sh/rpc/evm/61",
+            "https://geth-at.etc-network.info",
+            "https://ethereum-classic-mainnet.gateway.tatum.io",
         ],
     },
 ];

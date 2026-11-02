@@ -153,6 +153,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .finding .sev{grid-area:s;font:600 12px/1.5 var(--cond);letter-spacing:.1em;text-transform:uppercase}
 .finding .ftitle{grid-area:t;overflow-wrap:anywhere;font-weight:500}
 .finding .fmeta{grid-area:m;color:var(--muted);font-size:12.5px;overflow-wrap:anywhere}
+.fbody{overflow-wrap:anywhere}
 .finding .fmeta code{font:12px/1.5 var(--mono)}
 .fbody{padding:0 12px 14px 50px}
 .fbody p{margin:6px 0;max-width:70ch}
@@ -165,7 +166,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .report table{border-collapse:collapse;font-size:13px;width:100%}
 .report th,.report td{border:1px solid var(--hair);padding:4px 8px;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}
 .report th{color:var(--muted);font:600 12px/1.4 var(--cond);letter-spacing:.08em;text-transform:uppercase}
-.report .tscroll{overflow-x:auto;max-width:100%;margin:8px 0 16px;border:1px solid var(--hair)}
+.report .tscroll{overflow-x:auto;max-width:100%;margin:8px 0 16px;border:1px solid var(--hair);background:linear-gradient(90deg,var(--bg) 30%,transparent),linear-gradient(90deg,transparent,var(--bg) 70%) 100% 0,radial-gradient(farthest-side at 0 50%,rgba(0,0,0,.18),transparent),radial-gradient(farthest-side at 100% 50%,rgba(0,0,0,.18),transparent) 100% 0;background-repeat:no-repeat;background-size:40px 100%,40px 100%,14px 100%,14px 100%;background-attachment:local,local,scroll,scroll}
 .report .tscroll table{margin:0;width:100%}
 .report .tscroll th,.report .tscroll td{border-width:0 0 1px 1px}.report .tscroll th:first-child,.report .tscroll td:first-child{border-left:0}.report .tscroll tr:last-child td{border-bottom:0}
 .report td code{font:12.5px/1.5 var(--mono);white-space:nowrap}
@@ -395,7 +396,7 @@ document.addEventListener('click',e=>{const ref=e.target.closest('a.fnref');if(r
  const a=e.target.closest('a[href^="#"]');if(!a)return;const id=a.getAttribute('href').slice(1);if(/^(F|L)\d+$/.test(id)){e.preventDefault();if(a.classList.contains('back'))a.remove();if(/^L/.test(id)&&CUR!=null&&!document.getElementById(id)){CUR=null;renderFns();renderCode()}light(id)}});
 
 function storagePanel(c){const comp=!!(c.parts&&c.parts.length);const pcol=s=>comp?'<td role="cell" data-label="Parts">'+esc(partsOf(c,s.slot))+'</td>':'';
- const cell=(slot,name,ty,s)=>'<tr role="row"><td role="cell" data-label="Slot"><code class="'+(slot.length>24?'hash':'')+'">'+esc(slot)+'</code></td><td role="cell" data-label="Name"><code>'+esc(name)+'</code></td><td role="cell" data-label="Type"><code>'+fmtType(ty)+'</code></td><td role="cell" data-label="Reads" class="num">'+s.reads+'</td><td role="cell" data-label="Writes" class="num">'+s.writes+'</td>'+pcol(s)+'</tr>';
+ const cell=(slot,name,ty,s)=>'<tr role="row"><td role="cell" data-label="Slot">'+hashCell(slot)+'</td><td role="cell" data-label="Name">'+hashCell(name)+'</td><td role="cell" data-label="Type"><code>'+fmtType(ty)+'</code></td><td role="cell" data-label="Reads" class="num">'+s.reads+'</td><td role="cell" data-label="Writes" class="num">'+s.writes+'</td>'+pcol(s)+'</tr>';
  const rows=c.storage.flatMap(s=>(s.fields&&s.fields.length)?s.fields.map(f=>cell(s.slot+' bytes '+f.offset+'..'+(f.offset+Math.ceil(f.bits/8)),f.name,f.ty,s)):[cell(s.slot,s.name,s.ty,s)]).join('');
  const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
  const table=rows?scrollTable('Storage layout','<table class="stack" role="table"><thead role="rowgroup"><tr role="row"><th role="columnheader" scope="col">Slot</th><th role="columnheader" scope="col">Name</th><th role="columnheader" scope="col">Type</th><th role="columnheader" scope="col">Reads</th><th role="columnheader" scope="col">Writes</th>'+(comp?'<th role="columnheader" scope="col">Parts</th>':'')+'</tr></thead><tbody role="rowgroup">'+rows+'</tbody></table>'):'<p>No storage accessed.</p>';
@@ -413,7 +414,9 @@ function partsTable(c){const parts=c.parts||[];if(!parts.length)return '';const 
 function scrollTable(label,inner){return '<div class="tscroll" role="region" aria-label="'+esc(label)+'" tabindex="0">'+inner+'</div>'}
 /* a Solidity type wraps only between mapping levels: `mapping(address =>` then `mapping(address => uint256))` */
 function fmtType(t){return esc(t).split(' =&gt; ').join(' =&gt;<wbr> ')}
-function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';const a=p.address||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
+/* a 32-byte hash is shown short with the full value kept for assistive tech and copying */
+function hashCell(t){if(t.length<=24)return '<code>'+esc(t).split('_').join('_<wbr>')+'</code>';const m=t.match(/^(.*?)(0x[0-9a-fA-F]{40,})(.*)$/);if(!m)return '<code class="hash">'+esc(t)+'</code>';const short=m[2].slice(0,6)+'…'+m[2].slice(-4);return '<code><span aria-hidden="true">'+esc(m[1]+short+m[3])+'</span><span class="sr">'+esc(t)+'</span></code>'}
+function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.role==='implementation')return 'impl';const a=p.address||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
 function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(shortAddr).join(', ')}
 function renderAll(){const c=DATA.contract;renderCode();renderFindings();$('#panel-report').innerHTML=reportPanel(DATA.report,c);
  $('#panel-storage').innerHTML=storagePanel(c);

@@ -32,6 +32,7 @@ pub mod lift;
 pub mod rpc;
 pub mod sigdb;
 pub mod sigs;
+pub mod slots;
 pub mod ssa;
 pub mod structure;
 pub mod type_rules;

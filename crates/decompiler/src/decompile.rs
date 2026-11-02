@@ -2228,10 +2228,10 @@ fn inventories(
                     _ => picked,
                 }
             };
-            let name = if slot.bits() <= 32 {
-                format!("stor_{}", slot.to_decimal())
-            } else {
-                format!("stor_{}", slot.to_hex())
+            let name = match crate::slots::well_known(slot) {
+                Some(known) => known.to_string(),
+                None if slot.bits() <= 32 => format!("stor_{}", slot.to_decimal()),
+                None => format!("stor_{}", slot.to_hex()),
             };
             // A slot is packed when a field starts past byte 0 or several fields share it.
             let mut fs: Vec<StorageField> = Vec::new();

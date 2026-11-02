@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use evmdec::decompile::{Contract, Options};
+use evmdec::fetch::{CodeCache, Policy};
+use evmdec::rpc::Client;
 #[allow(unused_imports)]
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -106,21 +109,26 @@ fn load_input(input: &str) -> Result<Vec<u8>> {
     anyhow::bail!("'{}' is neither a file, a hex string nor an address", input)
 }
 
+/// Fetch the contract at `address` on `chain` and, under `policy`, resolve and compose it with
+/// the code it forwards to. Progress goes to stderr.
 fn fetch_and_decompile(
     address: &str,
     rpc: Option<&str>,
     chain: &str,
-    follow: bool,
-    opts: &evmdec::decompile::Options,
-) -> Result<evmdec::decompile::Contract> {
-    let client = evmdec::rpc::Client::new(rpc, chain).map_err(|e| anyhow::anyhow!(e))?;
-    let policy = evmdec::fetch::Policy {
-        follow,
-        ..evmdec::fetch::Policy::default()
-    };
-    evmdec::fetch::fetch(&client, address, chain, opts, policy, &mut |line| {
-        eprintln!("{}", line)
-    })
+    policy: Policy,
+    opts: &Options,
+) -> Result<Contract> {
+    let client = Client::new(rpc, chain).map_err(|e| anyhow::anyhow!(e))?;
+    let mut cache = CodeCache::new();
+    evmdec::fetch::fetch(
+        &client,
+        address,
+        chain,
+        opts,
+        policy,
+        &mut cache,
+        &mut |line| eprintln!("{}", line),
+    )
     .map_err(|e| anyhow::anyhow!(e))
 }
 
@@ -290,9 +298,16 @@ fn main() -> Result<()> {
                 }
             }
             let c = match code {
-                None => {
-                    fetch_and_decompile(&input, rpc.as_deref(), &chain, !no_follow_proxy, &opts)?
-                }
+                None => fetch_and_decompile(
+                    &input,
+                    rpc.as_deref(),
+                    &chain,
+                    Policy {
+                        follow: !no_follow_proxy,
+                        ..Policy::default()
+                    },
+                    &opts,
+                )?,
                 Some(code) => {
                     let opts2 = opts.clone();
                     // Defense in depth only: the decompiler is written to never panic (the

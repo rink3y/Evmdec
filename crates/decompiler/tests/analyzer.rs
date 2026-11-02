@@ -571,7 +571,7 @@ fn a_free_self_credit_is_reported_and_a_paid_one_is_not() {
 
 #[test]
 fn a_composite_merges_facets_and_keeps_their_functions_apart() {
-    use evmdec::decompile::{compose, PartRole};
+    use evmdec::decompile::{compose, PartInput, PartRole};
     // Shell: a router is not needed for composition; a contract with no functions will do
     // (a shell that answered a routed selector itself would shadow the facet's function).
     let shell_code = asm("PUSH1 0x00 DUP1 REVERT");
@@ -594,18 +594,18 @@ fn a_composite_merges_facets_and_keeps_their_functions_apart() {
         "EIP-2535 diamond (2 facets)",
         None,
         vec![
-            (
-                PartRole::Facet,
-                "0x000000000000000000000000000000000000000a".into(),
-                vec!["0xaaaaaaaa".into()],
-                a,
-            ),
-            (
-                PartRole::Facet,
-                "0x000000000000000000000000000000000000000b".into(),
-                vec!["0xbbbbbbbb".into()],
-                b,
-            ),
+            PartInput {
+                role: PartRole::Facet,
+                address: "0x000000000000000000000000000000000000000a".into(),
+                selectors: vec!["0xaaaaaaaa".into()],
+                contract: a,
+            },
+            PartInput {
+                role: PartRole::Facet,
+                address: "0x000000000000000000000000000000000000000b".into(),
+                selectors: vec!["0xbbbbbbbb".into()],
+                contract: b,
+            },
         ],
     );
     assert_eq!(c.parts.len(), 3);
@@ -654,7 +654,7 @@ fn a_composite_merges_facets_and_keeps_their_functions_apart() {
 
 #[test]
 fn a_proxy_composite_takes_every_implementation_function_and_flags_slot_collisions() {
-    use evmdec::decompile::{compose, PartRole};
+    use evmdec::decompile::{compose, PartInput, PartRole};
     // Shell: writes slot 0 as an address (an owner). Implementation: slot 0 is a balance
     // mapping (its entry key hashes slot 0), and slot 1 is read narrow where the shell reads
     // it wide, which is not a collision.
@@ -671,12 +671,12 @@ fn a_proxy_composite_takes_every_implementation_function_and_flags_slot_collisio
         shell,
         "EIP-1967 proxy",
         Some("0x00000000000000000000000000000000000000ad".into()),
-        vec![(
-            PartRole::Implementation,
-            "0x000000000000000000000000000000000000001".into(),
-            Vec::new(),
-            im,
-        )],
+        vec![PartInput {
+            role: PartRole::Implementation,
+            address: "0x0000000000000000000000000000000000000001".into(),
+            selectors: Vec::new(),
+            contract: im,
+        }],
     );
     // Every implementation external comes across except the one the shell answers itself.
     let sels: Vec<(&str, usize)> = c

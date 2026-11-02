@@ -1,12 +1,13 @@
 //! evmdec web service: decompile by address or bytecode, serve the single-page UI.
 
-use axum::{
-    extract::{Path, State},
-    http::{header, StatusCode},
-    response::{Html, IntoResponse},
-    routing::{get, post},
-    Json, Router,
-};
+use axum::extract::{Path, State};
+use axum::http::{header, StatusCode};
+use axum::response::{Html, IntoResponse};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use evmdec::decompile::{Contract, Options};
+use evmdec::fetch::{CodeCache, Policy};
+use evmdec::rpc::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -39,7 +40,7 @@ fn error(status: StatusCode, msg: impl Into<String>) -> axum::response::Response
 }
 
 /// Selectors of `c` and its parts that have no known signature, for an online lookup.
-fn unknown_selectors(c: &evmdec::decompile::Contract) -> Vec<u32> {
+fn unknown_selectors(c: &Contract) -> Vec<u32> {
     c.functions
         .iter()
         .filter(|f| f.signature.is_none())
@@ -48,59 +49,72 @@ fn unknown_selectors(c: &evmdec::decompile::Contract) -> Vec<u32> {
         .collect()
 }
 
-/// Decompile pasted bytecode, or fetch, resolve and compose the contract at `address`.
-fn obtain(
-    code: Option<&[u8]>,
-    address: Option<&str>,
-    chain: Option<&str>,
-    rpc: Option<&str>,
-    follow: bool,
-    opts: &evmdec::decompile::Options,
-) -> Result<evmdec::decompile::Contract, String> {
-    match (code, address, chain) {
-        (Some(code), _, _) => {
-            let mut c = evmdec::decompile::decompile(code, opts);
-            c.address = address.map(|s| s.to_string());
-            c.chain = chain.map(|s| s.to_string());
-            Ok(c)
+/// Whether unknown selectors are looked up online.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lookup {
+    /// The built-in dictionary only.
+    Offline,
+    /// Ask openchain.xyz and 4byte.directory, then decompile again with what they return.
+    Online,
+}
+
+/// What a request decompiles: pasted bytecode, or the contract at an address.
+enum Source<'a> {
+    /// Bytecode as given.
+    Bytecode(&'a [u8]),
+    /// The contract at `address` on `chain`, fetched under `policy` through `rpc` (or the
+    /// chain's public endpoints).
+    Address {
+        address: &'a str,
+        chain: &'a str,
+        rpc: Option<&'a str>,
+        policy: Policy,
+    },
+}
+
+impl Source<'_> {
+    /// The address shown in titles.
+    fn title(&self) -> &str {
+        match self {
+            Source::Bytecode(_) => "bytecode",
+            Source::Address { address, .. } => address,
         }
-        (None, Some(addr), Some(ch)) => {
-            let client = evmdec::rpc::Client::new(rpc, ch)?;
-            let policy = evmdec::fetch::Policy {
-                follow,
-                ..evmdec::fetch::Policy::default()
-            };
-            evmdec::fetch::fetch(&client, addr, ch, opts, policy, &mut |_| {})
+    }
+
+    /// Decompile, resolving and composing the contract at an address. `cache` keeps the code
+    /// fetched so a second pass does not ask the node again.
+    fn obtain(&self, opts: &Options, cache: &mut CodeCache) -> Result<Contract, String> {
+        match self {
+            Source::Bytecode(code) => Ok(evmdec::decompile::decompile(code, opts)),
+            Source::Address {
+                address,
+                chain,
+                rpc,
+                policy,
+            } => {
+                let client = Client::new(*rpc, chain)?;
+                evmdec::fetch::fetch(&client, address, chain, opts, *policy, cache, &mut |_| {})
+            }
         }
-        _ => Err("nothing to decompile".into()),
     }
 }
 
-/// Run the decompiler and analyzer; returns the JSON document the UI consumes. With `code`
-/// the bytecode is taken as given; otherwise the contract at `address` is fetched, its proxy
-/// or diamond resolved and composed with the code it forwards to, and its hard-coded
-/// dependencies fetched.
-fn run(
-    code: Option<&[u8]>,
-    address: Option<&str>,
-    chain: Option<&str>,
-    rpc: Option<&str>,
-    follow: bool,
-    lookup: bool,
-) -> Result<Value, String> {
-    let mut opts = evmdec::decompile::Options::default();
-    let mut c = obtain(code, address, chain, rpc, follow, &opts)?;
-    if lookup {
+/// Run the decompiler and analyzer; returns the JSON document the UI consumes.
+fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
+    let mut opts = Options::default();
+    let mut cache = CodeCache::new();
+    let mut c = source.obtain(&opts, &mut cache)?;
+    if lookup == Lookup::Online {
         let sels = unknown_selectors(&c);
         if !sels.is_empty() {
             opts.extra_sigs = evmdec::sigs::lookup_online(&sels);
             if !opts.extra_sigs.is_empty() {
-                c = obtain(code, address, chain, rpc, follow, &opts)?;
+                c = source.obtain(&opts, &mut cache)?;
             }
         }
     }
     let r = evmdec::analyze::analyze(&c);
-    let md = evmdec::analyze::render_markdown(&c, &r, address.unwrap_or("bytecode"));
+    let md = evmdec::analyze::render_markdown(&c, &r, source.title());
     let disasm: Vec<String> = evmdec::disasm::disassemble(&c.info.runtime)
         .iter()
         .map(evmdec::disasm::format_instruction)
@@ -148,20 +162,26 @@ async fn api_decompile(
         return Json((*v).clone()).into_response();
     }
     let result = tokio::task::spawn_blocking(move || -> Result<Value, (StatusCode, String)> {
+        let lookup = if req.lookup {
+            Lookup::Online
+        } else {
+            Lookup::Offline
+        };
         if let Some(addr) = req.address.as_deref().filter(|a| !a.trim().is_empty()) {
             let addr = addr.trim().to_string();
             if !evmdec::rpc::is_address(&addr) {
                 return Err((StatusCode::BAD_REQUEST, "invalid address".into()));
             }
-            return run(
-                None,
-                Some(&addr),
-                Some(&chain),
-                req.rpc.as_deref(),
-                !req.no_follow_proxy,
-                req.lookup,
-            )
-            .map_err(|e| {
+            let source = Source::Address {
+                address: &addr,
+                chain: &chain,
+                rpc: req.rpc.as_deref(),
+                policy: Policy {
+                    follow: !req.no_follow_proxy,
+                    ..Policy::default()
+                },
+            };
+            return run(&source, lookup).map_err(|e| {
                 let status = if e.contains("has no code") {
                     StatusCode::NOT_FOUND
                 } else {
@@ -178,8 +198,7 @@ async fn api_decompile(
         if code.len() > 1 << 20 {
             return Err((StatusCode::BAD_REQUEST, "bytecode too large".into()));
         }
-        run(Some(&code), None, None, None, false, req.lookup)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        run(&Source::Bytecode(&code), lookup).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
     })
     .await;
     match result {

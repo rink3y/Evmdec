@@ -1,8 +1,12 @@
 //! Minimal JSON-RPC client (eth_getCode, eth_getStorageAt, eth_call, eth_chainId) with endpoint
+//! Besides fetching code and storage, this module resolves proxies to their implementation and
+//! EIP-2535 diamonds to their facets (through the loupe, or the reference storage layout).
 //! fallback, and proxy resolution (EIP-1967, EIP-1167, beacon, storage-slot delegatecall).
 
+use crate::decompile::DiamondLookup;
 use crate::hex;
 use crate::u256::U256;
+use crate::{expr, keccak};
 use serde_json::{json, Value};
 
 /// A known network with the public endpoints to try when the user gives none.
@@ -450,7 +454,9 @@ pub struct DiamondInfo {
 }
 
 /// `facets()` of `IDiamondLoupe`.
-const SEL_FACETS: &str = "0x7a0ed627";
+pub(crate) const SEL_FACETS: &str = "0x7a0ed627";
+/// `diamondCut((address,uint8,bytes4[])[],address,bytes)` of `IDiamondCut`.
+pub(crate) const SEL_DIAMOND_CUT: &str = "0x1f931c1c";
 /// `facetAddresses()` of `IDiamondLoupe`.
 const SEL_FACET_ADDRESSES: &str = "0x52ef6b2c";
 /// `facetFunctionSelectors(address)` of `IDiamondLoupe`.
@@ -465,7 +471,7 @@ const MAX_FACETS: usize = 128;
 pub fn resolve_diamond(
     client: &Client,
     address: &str,
-    lookup: Option<&crate::decompile::DiamondLookup>,
+    lookup: Option<&DiamondLookup>,
 ) -> Result<Option<DiamondInfo>, String> {
     if let Some(facets) = loupe_facets(client, address) {
         return Ok(Some(DiamondInfo {
@@ -495,7 +501,7 @@ pub fn resolve_diamond(
 /// `facets()`: `(address facetAddress, bytes4[] functionSelectors)[]`.
 fn loupe_facets(client: &Client, address: &str) -> Option<Vec<Facet>> {
     let data = client.eth_call(address, SEL_FACETS).ok()?;
-    let mut r = AbiReader::new(&data);
+    let r = AbiReader::new(&data);
     let array = r.offset(0)?;
     let n = r.word(array)?.as_usize()?;
     if n == 0 || n > MAX_FACETS {
@@ -503,12 +509,12 @@ fn loupe_facets(client: &Client, address: &str) -> Option<Vec<Facet>> {
     }
     let mut facets = Vec::with_capacity(n);
     for i in 0..n {
-        let tuple = array + 32 + r.word(array + 32 + 32 * i)?.as_usize()?;
+        let tuple = r.offset_from(array + 32, array + 32 + 32 * i)?;
         let facet = r.word(tuple)?;
-        let sels = tuple + r.word(tuple + 32)?.as_usize()?;
+        let sels = r.offset_from(tuple, tuple + 32)?;
         let selectors = r.selectors(sels)?;
         facets.push(Facet {
-            address: addr_to_string(facet & crate::expr::mask_bits(160)),
+            address: addr_to_string(facet & expr::mask_bits(160)),
             selectors,
         });
     }
@@ -519,7 +525,7 @@ fn loupe_facets(client: &Client, address: &str) -> Option<Vec<Facet>> {
 /// `facets()` is missing or fails.
 fn loupe_facets_by_address(client: &Client, address: &str) -> Option<Vec<Facet>> {
     let data = client.eth_call(address, SEL_FACET_ADDRESSES).ok()?;
-    let mut r = AbiReader::new(&data);
+    let r = AbiReader::new(&data);
     let array = r.offset(0)?;
     let n = r.word(array)?.as_usize()?;
     if n == 0 || n > MAX_FACETS {
@@ -534,7 +540,7 @@ fn loupe_facets_by_address(client: &Client, address: &str) -> Option<Vec<Facet>>
             facet.trim_start_matches("0x")
         );
         let data = client.eth_call(address, &arg).ok()?;
-        let mut rr = AbiReader::new(&data);
+        let rr = AbiReader::new(&data);
         let sels = rr.offset(0)?;
         let selectors = rr.selectors(sels)?;
         facets.push(Facet {
@@ -555,7 +561,7 @@ fn storage_facets(client: &Client, address: &str, root: U256) -> Result<Vec<Face
     if addresses_len == 0 || addresses_len > MAX_FACETS {
         return Ok(Vec::new());
     }
-    let addresses_data = U256::from_be_bytes(&crate::keccak::keccak256(
+    let addresses_data = U256::from_be_bytes(&keccak::keccak256(
         &(root + U256::from_u64(2)).to_be_bytes(),
     ));
     let mut facets = Vec::new();
@@ -570,13 +576,13 @@ fn storage_facets(client: &Client, address: &str, root: U256) -> Result<Vec<Face
         let mut pre = Vec::with_capacity(64);
         pre.extend_from_slice(&facet.to_be_bytes());
         pre.extend_from_slice(&(root + U256::ONE).to_be_bytes());
-        let entry = U256::from_be_bytes(&crate::keccak::keccak256(&pre));
+        let entry = U256::from_be_bytes(&keccak::keccak256(&pre));
         let n = client
             .get_storage(address, &slot(entry))?
             .as_usize()
             .unwrap_or(0)
             .min(4096);
-        let data = U256::from_be_bytes(&crate::keccak::keccak256(&entry.to_be_bytes()));
+        let data = U256::from_be_bytes(&keccak::keccak256(&entry.to_be_bytes()));
         let mut selectors = Vec::with_capacity(n);
         let mut word = U256::ZERO;
         for j in 0..n {
@@ -610,19 +616,24 @@ impl<'a> AbiReader<'a> {
     }
 
     /// The 32-byte word at byte offset `at`.
-    fn word(&mut self, at: usize) -> Option<U256> {
+    fn word(&self, at: usize) -> Option<U256> {
         let end = at.checked_add(32)?;
         (end <= self.data.len()).then(|| U256::from_be_bytes(&self.data[at..end]))
     }
 
     /// The offset word at `at`, as an absolute position.
-    fn offset(&mut self, at: usize) -> Option<usize> {
-        let off = self.word(at)?.as_usize()?;
+    fn offset(&self, at: usize) -> Option<usize> {
+        self.offset_from(0, at)
+    }
+
+    /// The offset word at `at`, relative to `base`, as an absolute position inside the data.
+    fn offset_from(&self, base: usize, at: usize) -> Option<usize> {
+        let off = base.checked_add(self.word(at)?.as_usize()?)?;
         (off < self.data.len()).then_some(off)
     }
 
     /// A `bytes4[]` whose length word sits at `at`.
-    fn selectors(&mut self, at: usize) -> Option<Vec<String>> {
+    fn selectors(&self, at: usize) -> Option<Vec<String>> {
         let n = self.word(at)?.as_usize()?;
         if n > 4096 {
             return None;

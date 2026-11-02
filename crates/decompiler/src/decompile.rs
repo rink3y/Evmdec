@@ -9,11 +9,12 @@ use crate::lift::{self, Lifted, Lifter, Stmt, Term};
 use crate::metadata::{self, BytecodeInfo, CodeKind};
 use crate::opcode as op;
 use crate::sigs;
-use crate::ssa::{self, ShapeStep};
+use crate::ssa::{self, ShapeStep, Step};
 use crate::types::{self, TypeEnv};
 use crate::u256::U256;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 
 #[derive(Clone, Debug, Default)]
 /// Knobs for one decompilation run.
@@ -234,7 +235,7 @@ pub struct Contract {
 }
 
 /// Where a diamond shell keeps its selector-to-facet mapping.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct DiamondLookup {
     /// Root slot of the `mapping(bytes4 => ...)`, as 32-byte hex.
     pub slot: String,
@@ -245,11 +246,11 @@ pub struct DiamondLookup {
 
 /// A storage read whose key is a mapping entry under the call's own selector: the facet lookup
 /// of a diamond shell. Returns the mapping's root and the struct offset of the entry read.
-fn selector_lookup(key: ExprId, layout: emit::MappingLayout) -> Option<DiamondLookup> {
-    let path = crate::ssa::slot_path(key, layout)?;
+fn selector_lookup(key: ExprId, layout: MappingLayout) -> Option<DiamondLookup> {
+    let path = ssa::slot_path(key, layout)?;
     let (k, offset) = match &path.steps[..] {
-        [crate::ssa::Step::Key(k)] => (*k, 0),
-        [crate::ssa::Step::Key(k), crate::ssa::Step::Offset(n)] => (*k, *n),
+        [Step::Key(k)] => (*k, 0),
+        [Step::Key(k), Step::Offset(n)] => (*k, *n),
         _ => return None,
     };
     reads_selector(k).then(|| DiamondLookup {
@@ -258,12 +259,16 @@ fn selector_lookup(key: ExprId, layout: emit::MappingLayout) -> Option<DiamondLo
     })
 }
 
+/// Nodes visited when looking for the selector under a mapping key; a key is a small
+/// expression, so a larger one is not a selector lookup.
+const SELECTOR_SEARCH_LIMIT: usize = 2_000;
+
 /// Does `e` derive from the first calldata word, which holds the selector?
 fn reads_selector(e: ExprId) -> bool {
     let mut stack = vec![e];
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     while let Some(x) = stack.pop() {
-        if !seen.insert(x) || seen.len() > 2_000 {
+        if !seen.insert(x) || seen.len() > SELECTOR_SEARCH_LIMIT {
             continue;
         }
         if let Node::CallDataLoad(off) = expr::node(x) {
@@ -322,15 +327,14 @@ pub struct Composite {
     /// Admin address, for patterns that have one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin: Option<String>,
-    /// Storage slots declared with different types by different parts: `(slot, part index,
-    /// type, part index, type)`.
+    /// Storage slots two parts declare with incompatible types (see [`StorageCollision`]).
     pub collisions: Vec<StorageCollision>,
     /// Routed selectors the shell answers itself as well, so the shell wins.
     pub shadowed: Vec<String>,
 }
 
 /// Two parts declaring the same storage slot with different types.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct StorageCollision {
     /// The slot.
     pub slot: String,
@@ -366,50 +370,65 @@ impl Contract {
 /// Distance between the pc ranges of consecutive parts; EVM code is below 2^15 bytes.
 pub const PART_STRIDE: usize = 1 << 24;
 
-/// Add `base` to every program counter in `c` so its functions can sit next to another
-/// contract's without colliding: function entries, callee lists, lifted node pcs, internal call
-/// targets, string loaders and the type environment's scopes.
-pub fn rebase(c: &mut Contract, base: usize) {
-    if base == 0 {
-        return;
-    }
-    for f in &mut c.functions {
-        f.pc += base;
-        for pc in &mut f.calls {
-            *pc += base;
+impl Contract {
+    /// Add `base` to every program counter so this contract's functions can sit next to
+    /// another's without colliding: function entries, callee lists, lifted node pcs, internal
+    /// call targets, string loaders and the type environment's scopes.
+    pub fn rebase(&mut self, base: usize) {
+        if base == 0 {
+            return;
         }
-        for pc in &mut f.effects.internal_callees {
-            *pc += base;
-        }
-        if let Some(l) = &mut f.lifted {
-            for nd in &mut l.nodes {
-                nd.pc += base;
-                for st in &mut nd.stmts {
-                    if let Stmt::Internal { callee, .. } = st {
-                        *callee += base;
+        for f in &mut self.functions {
+            f.pc += base;
+            for pc in &mut f.calls {
+                *pc += base;
+            }
+            for pc in &mut f.effects.internal_callees {
+                *pc += base;
+            }
+            if let Some(l) = &mut f.lifted {
+                for nd in &mut l.nodes {
+                    nd.pc += base;
+                    for st in &mut nd.stmts {
+                        if let Stmt::Internal { callee, .. } = st {
+                            *callee += base;
+                        }
                     }
                 }
             }
         }
+        self.string_loaders = self
+            .string_loaders
+            .drain()
+            .map(|(pc, slot)| (pc + base, slot))
+            .collect();
+        self.types.rebase(base);
     }
-    c.string_loaders = c
-        .string_loaders
-        .drain()
-        .map(|(pc, slot)| (pc + base, slot))
-        .collect();
-    c.types.rebase(base);
+}
+
+/// A code unit to compose with a shell.
+#[derive(Debug)]
+pub struct PartInput {
+    /// What the unit is to the contract.
+    pub role: PartRole,
+    /// The unit's address.
+    pub address: String,
+    /// Selectors the shell routes to it; empty for an implementation that receives every
+    /// selector the shell does not answer.
+    pub selectors: Vec<String>,
+    /// The unit's own decompilation.
+    pub contract: Contract,
 }
 
 /// Assemble a proxy or diamond and the code it forwards to into one contract: the shell's
 /// functions, every routed function of every other part and the parts' internal helpers in one
 /// list, their storage layouts and type environments merged, so the analyzer sees the contract
-/// users call rather than its pieces. `parts` are `(role, address, routed selectors, contract)`;
-/// an implementation with no selector list receives every selector the shell does not answer.
+/// users call rather than its pieces.
 pub fn compose(
     mut shell: Contract,
     kind: &str,
     admin: Option<String>,
-    parts: Vec<(PartRole, String, Vec<String>, Contract)>,
+    parts: Vec<PartInput>,
 ) -> Contract {
     let mut all_parts = vec![Part {
         role: PartRole::Shell,
@@ -427,21 +446,30 @@ pub fn compose(
         .iter()
         .filter_map(|f| f.selector.clone())
         .collect();
+    // Which part first declared each slot, for naming both sides of a collision.
+    let mut declared: HashMap<String, usize> =
+        shell.storage.iter().map(|v| (v.slot.clone(), 0)).collect();
     let mut shadowed = Vec::new();
     let mut collisions = Vec::new();
-    for (role, address, selectors, mut part) in parts {
+    for PartInput {
+        role,
+        address,
+        selectors,
+        contract: mut part,
+    } in parts
+    {
         let index = all_parts.len();
         let base = index * PART_STRIDE;
-        rebase(&mut part, base);
+        part.rebase(base);
         all_parts.push(Part {
             role,
             address: address.clone(),
             selectors: selectors.clone(),
             base,
-            runtime: part.info.runtime.clone(),
+            runtime: std::mem::take(&mut part.info.runtime),
             compiler: part.language.clone(),
             storage: part.storage.clone(),
-            source: part.source.clone(),
+            source: std::mem::take(&mut part.source),
             stats: part.stats.clone(),
         });
         for mut f in part.functions {
@@ -449,14 +477,14 @@ pub fn compose(
                 (Some(sel), false) => selectors.iter().any(|s| s.eq_ignore_ascii_case(sel)),
                 _ => true,
             };
+            if f.kind == FnKind::External && !routed {
+                continue;
+            }
             if let Some(sel) = &f.selector {
                 if shell_selectors.iter().any(|s| s.eq_ignore_ascii_case(sel)) {
                     shadowed.push(sel.clone());
                     continue;
                 }
-            }
-            if f.kind == FnKind::External && !routed {
-                continue;
             }
             f.part = index;
             f.origin = Some(address.clone());
@@ -464,16 +492,22 @@ pub fn compose(
         }
         for var in part.storage {
             match shell.storage.iter().position(|v| v.slot == var.slot) {
-                None => shell.storage.push(var),
+                None => {
+                    declared.insert(var.slot.clone(), index);
+                    shell.storage.push(var);
+                }
                 Some(i) => {
-                    let mine = &shell.storage[i];
+                    let mine = &mut shell.storage[i];
                     if !compatible(&type_family(&mine.ty), &type_family(&var.ty)) {
+                        let first = declared.get(&var.slot).copied().unwrap_or(0);
                         collisions.push(StorageCollision {
                             slot: var.slot.clone(),
-                            first: (0, mine.ty.clone()),
+                            first: (first, mine.ty.clone()),
                             second: (index, var.ty.clone()),
                         });
                     }
+                    mine.reads += var.reads;
+                    mine.writes += var.writes;
                 }
             }
         }
@@ -504,14 +538,18 @@ pub fn compose(
         }
         shell.string_loaders.extend(part.string_loaders);
         shell.types.absorb(part.types);
-        shell.stats.code_bytes += part.stats.code_bytes;
-        shell.stats.instructions += part.stats.instructions;
-        shell.stats.blocks += part.stats.blocks;
-        shell.stats.code_blocks += part.stats.code_blocks;
-        shell.stats.covered_blocks += part.stats.covered_blocks;
-        shell.stats.unresolved_jumps += part.stats.unresolved_jumps;
-        shell.stats.external_functions += part.stats.external_functions;
-        shell.stats.internal_functions += part.stats.internal_functions;
+        let s = &mut shell.stats;
+        s.code_bytes += part.stats.code_bytes;
+        s.instructions += part.stats.instructions;
+        s.blocks += part.stats.blocks;
+        s.code_blocks += part.stats.code_blocks;
+        s.covered_blocks += part.stats.covered_blocks;
+        s.unresolved_jumps += part.stats.unresolved_jumps;
+        s.unresolved_jump_pcs.extend(part.stats.unresolved_jump_pcs);
+        s.budget_exhausted |= part.stats.budget_exhausted;
+        s.external_functions += part.stats.external_functions;
+        s.internal_functions += part.stats.internal_functions;
+        s.orphans += part.stats.orphans;
     }
     shadowed.sort();
     shadowed.dedup();
@@ -2809,7 +2847,7 @@ fn composite_header(c: &Contract) -> String {
             (PartRole::Implementation, _) => "implementation (every unrouted selector)".to_string(),
             (PartRole::Facet, n) => format!("facet ({} selectors)", n),
         };
-        out.push_str(&format!("//   {} — {}, {}\n", p.address, what, p.compiler));
+        let _ = writeln!(out, "//   {} — {}, {}", p.address, what, p.compiler);
     }
     out
 }

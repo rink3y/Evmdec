@@ -172,6 +172,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .report td code{font:12.5px/1.5 var(--mono);white-space:nowrap}
 .report td code.hash{white-space:normal;overflow-wrap:anywhere}
 .report td.num{text-align:right}
+.report td .pt{white-space:nowrap;font:12.5px/1.5 var(--mono)}
 .report .tscroll:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
 .report ul{margin:0;padding:0;list-style:none}
 .report li{margin:0;padding:3px 0;border-bottom:1px solid var(--hair)}
@@ -200,6 +201,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
  .report .stack td{display:flex;gap:10px;border:0;padding:2px 8px;text-align:left}
  .report .stack td::before{content:attr(data-label);flex:0 0 5.5em;color:var(--muted);font:600 11px/1.7 var(--cond);letter-spacing:.08em;text-transform:uppercase}
  .report .stack td code{white-space:normal;overflow-wrap:anywhere}
+ .report .stack td br{display:none}.report .stack td .pt{margin-right:8px}
 }
 </style>
 </head>
@@ -327,7 +329,7 @@ async function go(){const q=$('#q').value.trim();if(!q)return;const btn=$('#go')
 function riskWord(s){return s>=80?'Critical':s>=40?'High':s>=20?'Medium':s>=8?'Low':'Minimal'}
 function summaryText(sum){return ['critical','high','medium','low','info'].filter(k=>sum[k]).map(k=>sum[k]+' '+SEVL[k].toLowerCase()).join(', ')||'no findings'}
 function titleBlock(){const c=DATA.contract,s=c.stats,rep=DATA.report;const meta=(c.info&&c.info.metadata)||{};
- $('#tb-sheet').textContent=c.proxy?'Proxy, '+c.proxy.kind:(c.kind&&c.kind!=='unclassified'?c.kind.charAt(0).toUpperCase()+c.kind.slice(1)+' code':'Contract');
+ $('#tb-sheet').textContent=c.composite?c.composite.kind.charAt(0).toUpperCase()+c.composite.kind.slice(1):c.proxy?'Proxy, '+c.proxy.kind:(c.kind&&c.kind!=='unclassified'?c.kind.charAt(0).toUpperCase()+c.kind.slice(1)+' code':'Contract');
  $('#tb-chain').textContent=c.chain||$('#chain').selectedOptions[0].textContent;
  const a=c.address||'';$('#tb-address').textContent=a?a.slice(0,10)+'…'+a.slice(-6):'pasted bytecode';$('#tb-address').title=a;
  $('#tb-compiler').textContent=c.language||(meta.compiler?meta.compiler+' '+(meta.version||''):'unknown');
@@ -349,7 +351,7 @@ function prepareFindings(){const f=(DATA.report.findings||[]).slice();f.sort((a,
 function hl(src){const KW=/^(function|contract|if|else|while|return|revert|require|assert|emit|event|error|external|internal|view|pure|payable|returns|mapping|fallback|receive|constructor|break|continue|switch|case|goto|true|false|unchecked|delete|new)$/,TY=/^(address|uint\d*|int\d*|bool|bytes\d*|string)$/;
  return esc(src).replace(/(\/\/[^\n]*)|(&quot;(?:[^\\\n]|\\.)*?&quot;)|\b(0x[0-9a-fA-F]+|\d+)\b|\b([A-Za-z_]\w*)\b/g,(m,cm,st,nu,id)=>{if(cm)return '<span class="cm">'+cm+'</span>';if(st)return '<span class="st">'+st+'</span>';if(nu)return '<span class="nu">'+nu+'</span>';if(KW.test(id))return '<span class="kw">'+id+'</span>';if(TY.test(id))return '<span class="ty">'+id+'</span>';return id}).replace(/(<span class="kw">function<\/span>) ([A-Za-z_]\w*)/g,'$1 <span class="fnname">$2</span>').replace(/(<span class="fnname">)?\b(func_0x[0-9a-f]+)(?=\()/g,(m,def,name)=>def?m:'<a class="fnref" href="#fn-'+name+'" data-fn="'+name+'" aria-label="Go to the definition of '+name+'">'+name+'</a>')}
 
-function renderFns(){if(!DATA)return;const q=$('#filter').value.toLowerCase();const fs=DATA.contract.functions.filter(x=>!x.inlined);let out='<li><button type="button" data-pc="-1" aria-current="'+(CUR==null?'true':'false')+'"><span class="sheet-no">F-00</span><span class="name">Whole contract</span><span class="mut">'+SRC_LINES.length+' lines</span></button></li>',sheet=0,lastKind='';
+function renderFns(){if(!DATA)return;const q=$('#filter').value.toLowerCase();const order={external:0,fallback:1,receive:2,constructor:3,internal:4,orphan:5};const fs=DATA.contract.functions.filter(x=>!x.inlined).sort((a,b)=>((order[a.kind]??9)-(order[b.kind]??9)));let out='<li><button type="button" data-pc="-1" aria-current="'+(CUR==null?'true':'false')+'"><span class="sheet-no">F-00</span><span class="name">Whole contract</span><span class="mut">'+SRC_LINES.length+' lines</span></button></li>',sheet=0,lastKind='';
  fs.forEach(x=>{sheet++;if(x.kind!==lastKind){lastKind=x.kind;const n=fs.filter(y=>y.kind===x.kind).length;out+='<li class="grp" role="presentation">'+esc(x.kind)+' · '+n+'</li>'}
   const sig=x.kind==='external'?x.name+'('+x.params.map(p=>p.ty).join(',')+')':x.name+'('+Array.from({length:x.n_args},()=>'uint256').join(',')+')';
   const mut=x.kind==='external'?x.mutability.replace('_',''):x.kind;
@@ -395,7 +397,7 @@ window.addEventListener('popstate',e=>{if(e.state&&e.state.line&&document.getEle
 document.addEventListener('click',e=>{const ref=e.target.closest('a.fnref');if(ref){e.preventDefault();gotoHelper(ref);return}
  const a=e.target.closest('a[href^="#"]');if(!a)return;const id=a.getAttribute('href').slice(1);if(/^(F|L)\d+$/.test(id)){e.preventDefault();if(a.classList.contains('back'))a.remove();if(/^L/.test(id)&&CUR!=null&&!document.getElementById(id)){CUR=null;renderFns();renderCode()}light(id)}});
 
-function storagePanel(c){const comp=!!(c.parts&&c.parts.length);const pcol=s=>comp?'<td role="cell" data-label="Parts">'+esc(partsOf(c,s.slot))+'</td>':'';
+function storagePanel(c){const comp=!!(c.parts&&c.parts.length);const pcol=s=>comp?'<td role="cell" data-label="Parts">'+partsOf(c,s.slot)+'</td>':'';
  const cell=(slot,name,ty,s)=>'<tr role="row"><td role="cell" data-label="Slot">'+hashCell(slot)+'</td><td role="cell" data-label="Name">'+hashCell(name)+'</td><td role="cell" data-label="Type"><code>'+fmtType(ty)+'</code></td><td role="cell" data-label="Reads" class="num">'+s.reads+'</td><td role="cell" data-label="Writes" class="num">'+s.writes+'</td>'+pcol(s)+'</tr>';
  const rows=c.storage.flatMap(s=>(s.fields&&s.fields.length)?s.fields.map(f=>cell(s.slot+' bytes '+f.offset+'..'+(f.offset+Math.ceil(f.bits/8)),f.name,f.ty,s)):[cell(s.slot,s.name,s.ty,s)]).join('');
  const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
@@ -407,17 +409,19 @@ function reportPanel(rep,c){const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code
 function partsTable(c){const parts=c.parts||[];if(!parts.length)return '';const comp=c.composite||{};
  const role=p=>p.role==='shell'?'shell (routes calls)':p.role==='implementation'?'implementation':'facet';
  const sels=p=>p.role==='shell'?'router':(p.selectors.length?p.selectors.length+' selectors':'all unrouted');
- const rows=parts.map(p=>'<tr role="row"><td role="cell" data-label="Role">'+esc(role(p))+'</td><td role="cell" data-label="Address"><code class="hash">'+esc(p.address)+'</code></td><td role="cell" data-label="Selectors">'+esc(sels(p))+'</td><td role="cell" data-label="Compiler">'+esc(p.compiler||'')+'</td><td role="cell" data-label="Code">'+(p.stats?p.stats.code_bytes.toLocaleString()+' bytes':'')+'</td></tr>').join('');
+ const rows=parts.map(p=>'<tr role="row"><td role="cell" data-label="Part"><code>'+esc(partLabel(c,p))+'</code></td><td role="cell" data-label="Role">'+esc(role(p))+'</td><td role="cell" data-label="Address"><code class="hash">'+esc(p.address)+'</code></td><td role="cell" data-label="Selectors">'+esc(sels(p))+'</td><td role="cell" data-label="Compiler">'+esc(p.compiler||'')+'</td><td role="cell" data-label="Code">'+(p.stats?p.stats.code_bytes.toLocaleString()+' bytes':'')+'</td></tr>').join('');
  const coll=(comp.collisions||[]).map(x=>'<li>slot <code>'+esc(x.slot)+'</code>: '+esc(x.first[1])+' in '+esc(shortAddr(parts[x.first[0]]))+', '+esc(x.second[1])+' in '+esc(shortAddr(parts[x.second[0]]))+'</li>').join('');
- return '<h2>'+esc(comp.kind||'Composite')+'</h2><p>Every part runs in this contract\'s storage through delegatecall; the code and the report cover them as one contract.</p>'+scrollTable('Parts','<table class="stack" role="table"><thead role="rowgroup"><tr role="row"><th role="columnheader" scope="col">Role</th><th role="columnheader" scope="col">Address</th><th role="columnheader" scope="col">Selectors</th><th role="columnheader" scope="col">Compiler</th><th role="columnheader" scope="col">Code</th></tr></thead><tbody role="rowgroup">'+rows+'</tbody></table>')+(coll?'<h2>Storage collisions</h2><ul>'+coll+'</ul>':'')}
+ return '<h2>'+esc(comp.kind||'Composite')+'</h2><p>Every part runs in this contract\'s storage through delegatecall; the code and the report cover them as one contract.</p>'+scrollTable('Parts','<table class="stack" role="table"><thead role="rowgroup"><tr role="row"><th role="columnheader" scope="col">Part</th><th role="columnheader" scope="col">Role</th><th role="columnheader" scope="col">Address</th><th role="columnheader" scope="col">Selectors</th><th role="columnheader" scope="col">Compiler</th><th role="columnheader" scope="col">Code</th></tr></thead><tbody role="rowgroup">'+rows+'</tbody></table>')+(coll?'<h2>Storage collisions</h2><ul>'+coll+'</ul>':'')}
 /* wide tables scroll sideways inside a labelled region the keyboard can focus (WCAG 1.4.10 allows two-way scrolling for data tables; 2.1.1 needs the scroller reachable) */
 function scrollTable(label,inner){return '<div class="tscroll" role="region" aria-label="'+esc(label)+'" tabindex="0">'+inner+'</div>'}
 /* a Solidity type wraps only between mapping levels: `mapping(address =>` then `mapping(address => uint256))` */
 function fmtType(t){return esc(t).split(' =&gt; ').join(' =&gt;<wbr> ')}
 /* a 32-byte hash is shown short with the full value kept for assistive tech and copying */
 function hashCell(t){if(t.length<=24)return '<code>'+esc(t).split('_').join('_<wbr>')+'</code>';const m=t.match(/^(.*?)(0x[0-9a-fA-F]{40,})(.*)$/);if(!m)return '<code class="hash">'+esc(t)+'</code>';const short=m[2].slice(0,6)+'…'+m[2].slice(-4);return '<code><span aria-hidden="true">'+esc(m[1]+short+m[3])+'</span><span class="sr">'+esc(t)+'</span></code>'}
+/* short label of a part: the parts table above the layout shows which address each one is */
+function partLabel(c,p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.role==='implementation')return 'impl';const i=(c.parts||[]).indexOf(p);return 'facet '+(i<0?'?':i)}
 function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.role==='implementation')return 'impl';const a=p.address||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
-function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(shortAddr).join(', ')}
+function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(p=>'<span class="pt">'+esc(partLabel(c,p))+'</span>').join('<br>')}
 function renderAll(){const c=DATA.contract;renderCode();renderFindings();$('#panel-report').innerHTML=reportPanel(DATA.report,c);
  $('#panel-storage').innerHTML=storagePanel(c);
  $('#panel-disasm').innerHTML='<pre>'+esc((DATA.disassembly||[]).join('\n'))+'</pre>';

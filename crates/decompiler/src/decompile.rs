@@ -2804,9 +2804,14 @@ pub fn render(c: &Contract, name: &str) -> String {
         }
         out.push('\n');
     }
+    let mut current_part: Option<usize> = None;
     for f in &c.functions {
         if f.inlined {
             continue;
+        }
+        if !c.parts.is_empty() && current_part != Some(f.part) {
+            current_part = Some(f.part);
+            out.push_str(&part_banner(c, f.part));
         }
         out.push_str(&fmt_function_header(f));
         out.push_str(&f.code);
@@ -2833,6 +2838,22 @@ pub fn render(c: &Contract, name: &str) -> String {
         }
     }
     out
+}
+
+/// The banner that opens the functions of part `index` in a composite's source.
+fn part_banner(c: &Contract, index: usize) -> String {
+    let Some(p) = c.parts.get(index) else {
+        return String::new();
+    };
+    let what = match (p.role, p.selectors.len()) {
+        (PartRole::Shell, _) => "shell: routes calls".to_string(),
+        (PartRole::Implementation, _) => "implementation: every unrouted selector".to_string(),
+        (PartRole::Facet, n) => format!("facet: {} selectors", n),
+    };
+    format!(
+        "    // ==== {} — {}, {} ====\n\n",
+        p.address, what, p.compiler
+    )
 }
 
 /// The header comment of a composite: what it is and which parts it was assembled from.
@@ -2863,17 +2884,13 @@ pub fn fmt_function_header(f: &Function) -> String {
                 .map(|p| format!("{} {}", p.ty, p.name))
                 .collect();
             s.push_str(&format!(
-                "    // selector {}{}{}\n",
+                "    // selector {}{}\n",
                 f.selector.clone().unwrap_or_default(),
                 if f.signature.is_none() {
                     " (unknown signature)"
                 } else {
                     ""
-                },
-                f.origin
-                    .as_ref()
-                    .map(|a| format!(", code at {}", a))
-                    .unwrap_or_default()
+                }
             ));
             s.push_str(&format!(
                 "    function {}({}) external{}",

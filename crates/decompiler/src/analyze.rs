@@ -1101,6 +1101,15 @@ fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
     false
 }
 
+/// `0x1234…cdef`: an address shortened for a table cell.
+fn short_address(a: &str) -> String {
+    if a.len() > 12 {
+        format!("{}…{}", &a[..6], &a[a.len() - 4..])
+    } else {
+        a.to_string()
+    }
+}
+
 pub(crate) fn display_name(f: &Function) -> String {
     let origin = f
         .origin
@@ -4574,30 +4583,60 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         out.push('\n');
     }
     if !c.storage.is_empty() {
-        out.push_str(
-            "## Storage layout\n\n| slot | name | type | reads | writes |\n|---|---|---|---|---|\n",
-        );
+        // In a composite, which parts touch each slot: shared state is where facets meet.
+        let composite = !c.parts.is_empty();
+        let parts_of = |slot: &str| -> String {
+            c.parts
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.storage.iter().any(|v| v.slot == slot))
+                .map(|(i, p)| {
+                    if i == 0 {
+                        "shell".to_string()
+                    } else {
+                        short_address(&p.address)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if composite {
+            out.push_str("## Storage layout\n\n| slot | name | type | reads | writes | parts |\n|---|---|---|---|---|---|\n");
+        } else {
+            out.push_str(
+                "## Storage layout\n\n| slot | name | type | reads | writes |\n|---|---|---|---|---|\n",
+            );
+        }
+        let tail = |slot: &str| {
+            if composite {
+                format!(" {} |", parts_of(slot))
+            } else {
+                String::new()
+            }
+        };
         for s in &c.storage {
             if s.fields.is_empty() {
                 out.push_str(&format!(
-                    "| {} | {} | {} | {} | {} |\n",
+                    "| {} | {} | {} | {} | {} |{}\n",
                     s.slot,
                     s.name,
                     s.ty.replace('|', "\\|"),
                     s.reads,
-                    s.writes
+                    s.writes,
+                    tail(&s.slot)
                 ));
             } else {
                 for fld in &s.fields {
                     out.push_str(&format!(
-                        "| {} bytes {}..{} | {} | {} | {} | {} |\n",
+                        "| {} bytes {}..{} | {} | {} | {} | {} |{}\n",
                         s.slot,
                         fld.offset,
                         fld.offset + fld.bits.div_ceil(8),
                         fld.name,
                         fld.ty,
                         s.reads,
-                        s.writes
+                        s.writes,
+                        tail(&s.slot)
                     ));
                 }
             }

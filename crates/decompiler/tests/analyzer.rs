@@ -630,9 +630,12 @@ fn a_composite_merges_facets_and_keeps_their_functions_apart() {
     assert_eq!(fa.pc, a_pc + evmdec::decompile::PART_STRIDE);
     assert_eq!(c.local_pc(fa, fa.pc), a_pc);
     assert_eq!(c.code_of(fa), &a_code[..]);
-    assert!(c
-        .source
-        .contains("code at 0x000000000000000000000000000000000000000a"));
+    assert!(
+        c.source
+            .contains("// ==== 0x000000000000000000000000000000000000000a — facet: 1 selectors"),
+        "{}",
+        c.source
+    );
 
     let r = analyze::analyze(&c);
     assert!(finding(&r, "composite").is_some(), "{:?}", ids(&r));

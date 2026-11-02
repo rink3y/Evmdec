@@ -233,7 +233,6 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
     <div role="tablist" class="tabs" id="tabs" aria-label="Views">
       <button role="tab" id="tab-code" aria-controls="panel-code" aria-selected="true" tabindex="0">Code</button>
       <button role="tab" id="tab-report" aria-controls="panel-report" aria-selected="false" tabindex="-1">Report</button>
-      <button role="tab" id="tab-impl" aria-controls="panel-impl" aria-selected="false" tabindex="-1" hidden>Parts</button>
       <button role="tab" id="tab-storage" aria-controls="panel-storage" aria-selected="false" tabindex="-1">Storage &amp; events</button>
       <button role="tab" id="tab-disasm" aria-controls="panel-disasm" aria-selected="false" tabindex="-1">Disassembly</button>
       <button role="tab" id="tab-json" aria-controls="panel-json" aria-selected="false" tabindex="-1">JSON</button>
@@ -243,7 +242,6 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
     <div class="scale" id="scale" hidden></div>
     <div role="tabpanel" id="panel-code" aria-labelledby="tab-code"></div>
     <div role="tabpanel" id="panel-report" aria-labelledby="tab-report" hidden></div>
-    <div role="tabpanel" id="panel-impl" aria-labelledby="tab-impl" hidden></div>
     <div role="tabpanel" id="panel-storage" aria-labelledby="tab-storage" hidden></div>
     <div role="tabpanel" id="panel-disasm" aria-labelledby="tab-disasm" hidden></div>
     <div role="tabpanel" id="panel-json" aria-labelledby="tab-json" hidden></div>
@@ -321,7 +319,7 @@ function titleBlock(){const c=DATA.contract,s=c.stats,rep=DATA.report;const meta
  $('#tb-coverage').textContent=s.covered_blocks+'/'+s.code_blocks+' blocks · '+s.unresolved_jumps+' unresolved · '+s.time_ms+' ms';
  $('#tb-findings').textContent=summaryText(rep.summary);
  const r=$('#tb-risk');r.textContent=rep.risk_score+'/100 · '+riskWord(rep.risk_score);r.classList.toggle('calm',rep.risk_score<8);
- $('#tab-impl').hidden=!(DATA.contract.parts&&DATA.contract.parts.length)}
+}
 
 /* findings and callouts: evidence lines are matched to source lines */
 function prepareFindings(){const f=(DATA.report.findings||[]).slice();f.sort((a,b)=>(SEV[a.severity]-SEV[b.severity])||((a.function?0:1)-(b.function?0:1)));FINDINGS=f;
@@ -381,21 +379,22 @@ window.addEventListener('popstate',e=>{if(e.state&&e.state.line&&document.getEle
 document.addEventListener('click',e=>{const ref=e.target.closest('a.fnref');if(ref){e.preventDefault();gotoHelper(ref);return}
  const a=e.target.closest('a[href^="#"]');if(!a)return;const id=a.getAttribute('href').slice(1);if(/^(F|L)\d+$/.test(id)){e.preventDefault();if(a.classList.contains('back'))a.remove();if(/^L/.test(id)&&CUR!=null&&!document.getElementById(id)){CUR=null;renderFns();renderCode()}light(id)}});
 
-function storagePanel(c){const rows=c.storage.flatMap(s=>(s.fields&&s.fields.length)?s.fields.map(f=>'<tr><td>'+s.slot+' bytes '+f.offset+'..'+(f.offset+Math.ceil(f.bits/8))+'</td><td>'+esc(f.name)+'</td><td>'+esc(f.ty)+'</td><td>'+s.reads+'</td><td>'+s.writes+'</td></tr>'):['<tr><td>'+s.slot+'</td><td>'+esc(s.name)+'</td><td>'+esc(s.ty)+'</td><td>'+s.reads+'</td><td>'+s.writes+'</td></tr>']).join('');
- const list=(a,empty)=>a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>'+empty+'</p>';
- return '<div class="report"><h2>Storage layout</h2>'+(rows?'<table><thead><tr><th scope="col">Slot</th><th scope="col">Name</th><th scope="col">Type</th><th scope="col">Reads</th><th scope="col">Writes</th></tr></thead><tbody>'+rows+'</tbody></table>':'<p>No storage accessed.</p>')+'<h2>Events</h2>'+list(c.events,'No events emitted.')+'<h2>Custom errors</h2>'+list(c.errors,'None.')+'<h2>Strings</h2>'+(c.strings.length?'<ul>'+c.strings.map(e=>'<li>'+esc(e)+'</li>').join('')+'</ul>':'<p>None.</p>')+'<h2>Selectors called on other contracts</h2>'+list(c.selectors_called,'None.')+'</div>'}
+function storagePanel(c){const comp=!!(c.parts&&c.parts.length);const pcol=s=>comp?'<td>'+esc(partsOf(c,s.slot))+'</td>':'';
+ const rows=c.storage.flatMap(s=>(s.fields&&s.fields.length)?s.fields.map(f=>'<tr><td>'+s.slot+' bytes '+f.offset+'..'+(f.offset+Math.ceil(f.bits/8))+'</td><td>'+esc(f.name)+'</td><td>'+esc(f.ty)+'</td><td>'+s.reads+'</td><td>'+s.writes+'</td>'+pcol(s)+'</tr>'):['<tr><td>'+s.slot+'</td><td>'+esc(s.name)+'</td><td>'+esc(s.ty)+'</td><td>'+s.reads+'</td><td>'+s.writes+'</td>'+pcol(s)+'</tr>']).join('');
+ const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
+ return '<div class="report">'+partsTable(c)+'<h2>Storage layout</h2>'+(rows?'<table><thead><tr><th scope="col">Slot</th><th scope="col">Name</th><th scope="col">Type</th><th scope="col">Reads</th><th scope="col">Writes</th>'+(comp?'<th scope="col">Parts</th>':'')+'</tr></thead><tbody>'+rows+'</tbody></table>':'<p>No storage accessed.</p>')+'<h2>Events</h2>'+list(c.events,'No events emitted.')+'<h2>Custom errors</h2>'+list(c.errors,'None.')+'<h2>Strings</h2>'+(c.strings.length?'<ul>'+c.strings.map(e=>'<li>'+esc(e)+'</li>').join('')+'</ul>':'<p>None.</p>')+'<h2>Selectors called on other contracts</h2>'+list(c.selectors_called,'None.')+'</div>'}
 function reportPanel(rep,c){const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
  return '<div class="report"><h2>Summary</h2><p>Risk score <b class="'+(rep.risk_score>=8?'sev-high':'')+'">'+rep.risk_score+'/100</b> ('+riskWord(rep.risk_score).toLowerCase()+'). '+summaryText(rep.summary)+((typeof rep.contract_kind==='string'&&rep.contract_kind.trim()&&rep.contract_kind.trim()!=='unclassified')?'. Kind: '+esc(rep.contract_kind.trim()):'')+'. Findings are leads with a confidence level; coverage and unresolved jumps are in the title block.</p><h2>Privileged functions</h2>'+list(rep.privileged_functions)+'<h2>State-changing functions callable by anyone</h2>'+list(rep.unauthenticated_state_changers)+'<h2>External calls</h2>'+list(rep.external_calls)+'<h2>All findings</h2><ol class="findings">'+FINDINGS.map((f,i)=>findingItem(i+1,f,true).replace(' id="F'+(i+1)+'"',' id="R'+(i+1)+'"').replace('id="FB'+(i+1)+'"','id="RB'+(i+1)+'"').replace('aria-controls="FB'+(i+1)+'"','aria-controls="RB'+(i+1)+'"')).join('')+'</ol></div>'}
-/* parts of a composite (proxy + implementation, diamond + facets): routing table, then each part's own source */
-function partsPanel(c){const parts=c.parts||[];if(!parts.length)return '';const comp=c.composite||{};
+/* parts of a composite (proxy + implementation, diamond + facets): the routing table */
+function partsTable(c){const parts=c.parts||[];if(!parts.length)return '';const comp=c.composite||{};
  const role=p=>p.role==='shell'?'shell (routes calls)':p.role==='implementation'?'implementation':'facet';
  const sels=p=>p.role==='shell'?'router':(p.selectors.length?p.selectors.length+' selectors':'all unrouted');
- const rows=parts.map((p,i)=>'<tr><td>'+esc(role(p))+'</td><td><code>'+esc(p.address)+'</code></td><td>'+esc(sels(p))+'</td><td>'+esc(p.compiler||'')+'</td><td>'+(p.stats?p.stats.code_bytes.toLocaleString()+' bytes':'')+'</td></tr>').join('');
- const coll=(comp.collisions||[]).map(x=>'<li>slot <code>'+esc(x.slot)+'</code>: '+esc(x.first[1])+' in part '+x.first[0]+', '+esc(x.second[1])+' in part '+x.second[0]+'</li>').join('');
- const srcs=parts.map(p=>'<h2>'+esc(role(p))+' <code>'+esc(p.address)+'</code></h2><pre>'+hl(p.source||'')+'</pre>').join('');
- return '<div class="report"><h2>'+esc(comp.kind||'Composite')+'</h2><p>The code tab and the report cover every part as one contract: each part runs in this contract\'s storage through delegatecall. Below, the routing table and each part\'s own source.</p><table><thead><tr><th scope="col">Role</th><th scope="col">Address</th><th scope="col">Selectors</th><th scope="col">Compiler</th><th scope="col">Code</th></tr></thead><tbody>'+rows+'</tbody></table>'+(coll?'<h2>Storage collisions</h2><ul>'+coll+'</ul>':'')+'</div>'+srcs}
+ const rows=parts.map(p=>'<tr><td>'+esc(role(p))+'</td><td><code>'+esc(p.address)+'</code></td><td>'+esc(sels(p))+'</td><td>'+esc(p.compiler||'')+'</td><td>'+(p.stats?p.stats.code_bytes.toLocaleString()+' bytes':'')+'</td></tr>').join('');
+ const coll=(comp.collisions||[]).map(x=>'<li>slot <code>'+esc(x.slot)+'</code>: '+esc(x.first[1])+' in '+esc(shortAddr(parts[x.first[0]]))+', '+esc(x.second[1])+' in '+esc(shortAddr(parts[x.second[0]]))+'</li>').join('');
+ return '<h2>'+esc(comp.kind||'Composite')+'</h2><p>Every part runs in this contract\'s storage through delegatecall; the code and the report cover them as one contract.</p><table><thead><tr><th scope="col">Role</th><th scope="col">Address</th><th scope="col">Selectors</th><th scope="col">Compiler</th><th scope="col">Code</th></tr></thead><tbody>'+rows+'</tbody></table>'+(coll?'<h2>Storage collisions</h2><ul>'+coll+'</ul>':'')}
+function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';const a=p.address||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
+function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(shortAddr).join(', ')}
 function renderAll(){const c=DATA.contract;renderCode();renderFindings();$('#panel-report').innerHTML=reportPanel(DATA.report,c);
- $('#panel-impl').innerHTML=partsPanel(c);
  $('#panel-storage').innerHTML=storagePanel(c);
  $('#panel-disasm').innerHTML='<pre>'+esc((DATA.disassembly||[]).join('\n'))+'</pre>';
  const j=JSON.parse(JSON.stringify(DATA));delete j.disassembly;$('#panel-json').innerHTML='<pre>'+esc(JSON.stringify(j,null,2))+'</pre>';

@@ -1023,6 +1023,66 @@ impl TypeEnv {
         self.final_of(&Loc::Var { scope: pc, id }) == Ty::Bool
     }
 
+    /// Add `base` to every function scope so this environment can sit next to another
+    /// contract's without colliding (see [`crate::decompile::rebase`]).
+    pub fn rebase(&mut self, base: usize) {
+        if base == 0 {
+            return;
+        }
+        let shift = |loc: Loc| match loc {
+            Loc::Var { scope, id } => Loc::Var {
+                scope: scope + base,
+                id,
+            },
+            Loc::Arg { unit, slot } => Loc::Arg {
+                unit: unit + base,
+                slot,
+            },
+            Loc::Ret { unit, index } => Loc::Ret {
+                unit: unit + base,
+                index,
+            },
+            Loc::Param { scope, word } => Loc::Param {
+                scope: scope + base,
+                word,
+            },
+            other => other,
+        };
+        self.ids = self.ids.drain().map(|(loc, id)| (shift(loc), id)).collect();
+        self.callee_of = self
+            .callee_of
+            .drain()
+            .map(|((pc, seq), callee)| ((pc + base, seq), callee + base))
+            .collect();
+        self.results_len = self
+            .results_len
+            .drain()
+            .map(|(pc, n)| (pc + base, n))
+            .collect();
+        for c in &mut self.classes {
+            for d in &mut c.defs {
+                d.1 += base;
+            }
+        }
+    }
+
+    /// Take over every class of `other`, whose scopes must not overlap this environment's
+    /// (rebase it first). A storage location both know keeps this environment's class.
+    pub fn absorb(&mut self, other: TypeEnv) {
+        let offset = self.classes.len();
+        for mut c in other.classes {
+            for s in &mut c.sources {
+                *s += offset;
+            }
+            self.classes.push(c);
+        }
+        for (loc, id) in other.ids {
+            self.ids.entry(loc).or_insert(id + offset);
+        }
+        self.callee_of.extend(other.callee_of);
+        self.results_len.extend(other.results_len);
+    }
+
     /// Every location the solver has a class for, in a deterministic order (the classes live in
     /// a hash map; reports must not depend on its iteration order).
     #[must_use]

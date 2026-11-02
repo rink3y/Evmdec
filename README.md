@@ -157,8 +157,8 @@ oracle, so the accuracy claim below is measured, not asserted.
   each call succeeds while some function without access control adds entries
   (`blocking-payout-loop`: one entry that rejects the call blocks everyone), the Vyper
   0.2.15–0.3.0 reentrancy-lock bug, locked ether, unprotected upgrades,
-  proxy detection (EIP-1967 / beacon / ZeppelinOS / EIP-1167 / storage-slot) with on-chain
-  implementation resolution, known compiler bugs for the detected solc version (a bug that needs
+  proxy and diamond detection (EIP-1967 / beacon / ZeppelinOS / EIP-1167 / storage-slot /
+  EIP-2535) with on-chain resolution, known compiler bugs for the detected solc version (a bug that needs
   transient storage or calldata copies is dropped when the bytecode has none, and one whose
   trigger the bytecode cannot show, such as `--via-ir` or inline assembly, is informational). Rules look
   through internal helpers (a call in a shared `_safeTransfer` is attributed to every external
@@ -229,10 +229,21 @@ before committing Rust changes.
 ```sh
 cargo build --release
 
-# by address (public RPC endpoints of the chain are tried in order; proxies are followed)
+# by address (public RPC endpoints of the chain are tried in order; proxies and diamonds are
+# assembled with their implementation or facets and analysed as one contract)
 ./target/release/evmdec decompile 0xdAC17F958D2ee523a2206206994597C13D831ec7 --report
-./target/release/evmdec decompile 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --chain mainnet   # USDC proxy → implementation
+./target/release/evmdec decompile 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --chain mainnet   # USDC proxy + implementation
+./target/release/evmdec decompile 0xC1E088fC1323b20BCBee9bd1B9fC9546db5624C5 --report          # a diamond and its facets
 ./target/release/evmdec decompile 0x... --chain arbitrum --rpc https://my.node/      # or EVMDEC_RPC_URL=url1,url2
+
+# What an address resolves to: a proxy's implementation (EIP-1967, beacon, ZeppelinOS,
+# EIP-1167, storage slot) or a diamond's facets (EIP-2535, through the loupe or the reference
+# storage layout) is fetched and composed with the shell into one contract: one function list
+# with each function marked by the address whose code holds it, one storage layout (slots two
+# parts type differently are reported as storage collisions), one report. Hard-coded call
+# targets of every part are fetched one level further and resolved the same way, so a
+# dependency that is itself a proxy appears as its implementation. --no-follow-proxy turns
+# all of this off.
 
 # pre-deployment review: paste the compiled bytecode (creation or runtime)
 solc --bin MyContract.sol | tail -1 > my.hex

@@ -1102,16 +1102,22 @@ fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
 }
 
 pub(crate) fn display_name(f: &Function) -> String {
+    let origin = f
+        .origin
+        .as_ref()
+        .map(|a| format!(" @ {}", a))
+        .unwrap_or_default();
     match f.kind {
         FnKind::External => format!(
-            "{}{}",
+            "{}{}{}",
             f.name,
             f.selector
                 .as_ref()
                 .map(|s| format!(" [{}]", s))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            origin
         ),
-        _ => f.name.clone(),
+        _ => format!("{}{}", f.name, origin),
     }
 }
 
@@ -1597,6 +1603,7 @@ pub fn analyze(c: &Contract) -> Report {
     let mut any_payable = false;
     let mut any_ether_out = false;
     let mut fallback_delegatecall = false;
+    let mut diamond_router = false;
     let mut eip1967 = false;
     let mut delegatecall_targets_storage = false;
 
@@ -1800,7 +1807,14 @@ pub fn analyze(c: &Contract) -> Report {
                         if storage_target {
                             delegatecall_targets_storage = true;
                         }
-                        if from_calldata(*addr) && !caller_checked && always_reverts {
+                        // A diamond's fallback reads the facet from storage under the call's
+                        // selector: the caller picks which stored address runs, not the address.
+                        let router = storage_target
+                            && ctx.c.diamond_lookup.is_some()
+                            && f.kind == FnKind::Fallback;
+                        if router {
+                            diamond_router = true;
+                        } else if from_calldata(*addr) && !caller_checked && always_reverts {
                             push(&mut findings, "delegatecall-simulation", "Delegatecall to a caller-controlled address in an always-reverting function", Severity::Info, Confidence::Medium, Some(f), Some(ev.pc),
                                 format!("`{}` delegatecalls to `{}` from calldata, but every path of the function reverts, so the call's effects are rolled back (simulation helper).", f.name, target),
                                 vec![line.clone()], "Make sure no path can return successfully.");
@@ -3186,7 +3200,47 @@ pub fn analyze(c: &Contract) -> Report {
         push(&mut findings, "locked-ether", "Ether can be received but never sent out", Severity::Low, Confidence::Medium, None, None,
             "At least one function is payable, yet no code path transfers ether out (no call with value, no selfdestruct, no delegatecall). Ether sent to this contract is stuck.".into(), vec![], "Add a withdrawal path or reject ether (remove payable).");
     }
-    if fallback_delegatecall {
+    if let Some(comp) = &c.composite {
+        kinds.push(comp.kind.clone());
+        let routed: usize = c.parts.iter().skip(1).map(|p| p.selectors.len()).sum();
+        let parts: Vec<String> = c
+            .parts
+            .iter()
+            .skip(1)
+            .map(|p| match p.selectors.len() {
+                0 => format!("`{}` (every unrouted selector)", p.address),
+                n => format!("`{}` ({} selectors)", p.address, n),
+            })
+            .collect();
+        let shadow = if comp.shadowed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " The shell answers {} routed selector(s) itself, so those facet functions are unreachable: {}.",
+                comp.shadowed.len(),
+                comp.shadowed.join(", ")
+            )
+        };
+        push(&mut findings, "composite", "Analysed as one contract with the code it forwards to", Severity::Info, Confidence::High, None, None,
+            format!("{}: {} part(s) besides the shell, {} routed selector(s). Their functions run in this contract's storage through `DELEGATECALL` and are reported here under the address they come from: {}.{}", comp.kind, c.parts.len().saturating_sub(1), routed, parts.join(", "), shadow),
+            vec![], "Review the parts as one system: access control, storage layout and upgrade rights are shared.");
+        for col in &comp.collisions {
+            let name = |i: usize| {
+                c.parts
+                    .get(i)
+                    .map(|p| p.address.clone())
+                    .unwrap_or_default()
+            };
+            push(&mut findings, "storage-collision", "Two parts use the same storage slot with different types", Severity::High, Confidence::Medium, None, None,
+                format!("Slot {} is `{}` in `{}` and `{}` in `{}`. Parts of a proxy or diamond share one storage; a slot two of them read differently is overwritten by whichever runs, which corrupts state or hands over a role.", col.slot, col.first.1, name(col.first.0), col.second.1, name(col.second.0)),
+                vec![], "Give every part the same storage layout, or keep each part's state under its own hashed position (diamond storage).");
+        }
+    } else if diamond_router {
+        kinds.push("EIP-2535 diamond".to_string());
+        push(&mut findings, "diamond", "This contract is a diamond shell", Severity::Info, Confidence::High, None, None,
+            "The fallback looks the facet up in storage under the call's selector and delegatecalls it (EIP-2535). The logic lives in the facets; decompile by address to assemble them with the shell.".to_string(),
+            vec![], "Review who can cut facets (diamondCut) and the facets themselves.");
+    } else if fallback_delegatecall {
         let kind = if eip1967 {
             "EIP-1967 upgradeable proxy"
         } else if c.info.runtime.len() < 100 {
@@ -4445,7 +4499,13 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         if let Some(func) = &f.function {
             out.push_str(&format!("- Function: `{}`", func));
             if let Some(pc) = f.pc {
-                out.push_str(&format!(" at pc {:#x}", pc));
+                // In a composite the pc is shown as an offset into the part's own code.
+                let local = c
+                    .functions
+                    .iter()
+                    .find(|g| display_name(g) == *func)
+                    .map_or(pc, |g| c.local_pc(g, pc));
+                out.push_str(&format!(" at pc {:#x}", local));
             }
             out.push('\n');
         }
@@ -4485,6 +4545,23 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         out.push_str("## External calls\n\n");
         for e in &r.external_calls {
             out.push_str(&format!("- `{}`\n", e));
+        }
+        out.push('\n');
+    }
+    if let Some(comp) = &c.composite {
+        out.push_str("## Parts\n\n");
+        out.push_str(&format!("{}. Functions are listed under the address whose code holds them; all of them run in this contract's storage.\n\n", comp.kind));
+        out.push_str("| role | address | selectors | compiler | code |\n|---|---|---|---|---|\n");
+        for p in &c.parts {
+            let sels = match (p.role, p.selectors.len()) {
+                (crate::decompile::PartRole::Shell, _) => "router".to_string(),
+                (_, 0) => "all unrouted".to_string(),
+                (_, n) => n.to_string(),
+            };
+            out.push_str(&format!(
+                "| {:?} | `{}` | {} | {} | {} bytes |\n",
+                p.role, p.address, sels, p.compiler, p.stats.code_bytes
+            ));
         }
         out.push('\n');
     }

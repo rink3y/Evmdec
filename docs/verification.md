@@ -78,6 +78,17 @@ that stream (an external call whose payload word 0 is `transferFrom` and whose `
 comes from calldata and is not `msg.sender`, in a function without a caller check, is
 `arbitrary-transferfrom`).
 
+A contract fetched by address is analysed as what it resolves to. A proxy is composed with its
+implementation and a diamond with its facets (`fetch.rs`, `decompile::compose`): the parts'
+functions join one list, each tagged with the address whose code holds it and given a distinct
+pc range, their storage layouts and type environments are merged, and the analyzer runs once
+over the whole. Rules that reason across functions (access-control policy, attack chains,
+reentrancy locks) therefore see every entry point of the system, and the two execution passes
+run each function's own code in the composite's storage, as `DELEGATECALL` does. A slot two
+parts type differently is a `storage-collision` finding; a routed selector the shell answers
+itself is reported as shadowed. Hard-coded call targets of every part are fetched one level
+further and resolved the same way.
+
 Two passes run the bytecode rather than match it. The confirmation pass (`confirm.rs`) takes
 the findings whose sink is a concrete instruction (an open `selfdestruct`, an ether withdrawal,
 an owner write, an arbitrary call) and searches for calldata under which a caller holding no

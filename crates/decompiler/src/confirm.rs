@@ -58,8 +58,7 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() {
         return;
     }
-    let code = &c.info.runtime;
-    if code.is_empty() {
+    if c.info.runtime.is_empty() {
         return;
     }
     for finding in findings.iter_mut() {
@@ -76,7 +75,10 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         else {
             continue;
         };
-        if let Some(witness) = reach(code, f, pc, &finding.id) {
+        // In a composite the function's code is its part's, run in the composite's storage as
+        // `DELEGATECALL` would; the finding's pc is translated back into that code.
+        let witness = reach(c.code_of(f), f, c.local_pc(f, pc), &finding.id);
+        if let Some(witness) = witness {
             finding.confirmed = true;
             finding.witness = Some(hex::encode(&witness));
             finding.confidence = Confidence::High;
@@ -89,6 +91,7 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
 /// enters the block at `pc`, ends normally and shows the effect the rule `id` claims. Returns
 /// the calldata on the first hit.
 ///
+/// `pc` is an offset into `code` (a composite's finding pcs are translated first).
 /// A finding's `pc` is the start of the block holding the sink, so entering it is necessary but
 /// not sufficient: the block may still revert on a guard inlined ahead of the sink, and a frame
 /// that reverts later undoes the write or the call. The run must therefore end normally and

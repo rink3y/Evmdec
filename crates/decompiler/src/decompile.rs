@@ -72,6 +72,18 @@ pub struct Function {
     /// Phi variables the type solver found to be booleans.
     #[serde(skip)]
     pub bool_vars: Vec<u32>,
+    /// Index into [`Contract::parts`] of the part whose code holds this function; 0 is the
+    /// contract's own code.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub part: usize,
+    /// Address of the part whose code holds this function, when it is not the contract's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+/// Serde helper: skip a zero.
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -207,6 +219,359 @@ pub struct Contract {
     /// Internal helpers that copy a storage string to memory: entry pc -> slot.
     #[serde(skip)]
     pub string_loaders: HashMap<usize, U256>,
+    /// The code units this contract is assembled from, when it is a composite ([`compose`]):
+    /// index 0 is the contract's own code (the proxy or diamond shell), the rest the
+    /// implementation or facets whose code runs in its storage through `DELEGATECALL`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<Part>,
+    /// How the composite was assembled, when it is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composite: Option<Composite>,
+    /// The selector-keyed storage lookup the fallback delegatecalls through, when the code is
+    /// an EIP-2535 diamond shell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diamond_lookup: Option<DiamondLookup>,
+}
+
+/// Where a diamond shell keeps its selector-to-facet mapping.
+#[derive(Clone, Debug, Serialize)]
+pub struct DiamondLookup {
+    /// Root slot of the `mapping(bytes4 => ...)`, as 32-byte hex.
+    pub slot: String,
+    /// Slots past the mapping entry at which the facet address sits (0 for a plain mapping or
+    /// a struct whose first member is the address).
+    pub offset: u64,
+}
+
+/// A storage read whose key is a mapping entry under the call's own selector: the facet lookup
+/// of a diamond shell. Returns the mapping's root and the struct offset of the entry read.
+fn selector_lookup(key: ExprId, layout: emit::MappingLayout) -> Option<DiamondLookup> {
+    let path = crate::ssa::slot_path(key, layout)?;
+    let (k, offset) = match &path.steps[..] {
+        [crate::ssa::Step::Key(k)] => (*k, 0),
+        [crate::ssa::Step::Key(k), crate::ssa::Step::Offset(n)] => (*k, *n),
+        _ => return None,
+    };
+    reads_selector(k).then(|| DiamondLookup {
+        slot: path.root.to_hex_padded(32),
+        offset,
+    })
+}
+
+/// Does `e` derive from the first calldata word, which holds the selector?
+fn reads_selector(e: ExprId) -> bool {
+    let mut stack = vec![e];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 2_000 {
+            continue;
+        }
+        if let Node::CallDataLoad(off) = expr::node(x) {
+            if expr::as_const(off).is_some_and(|c| c.is_zero()) {
+                return true;
+            }
+        }
+        stack.extend(expr::children(x));
+    }
+    false
+}
+
+/// One code unit of a composite contract.
+#[derive(Clone, Debug, Serialize)]
+pub struct Part {
+    /// What the unit is to the contract.
+    pub role: PartRole,
+    /// The unit's address.
+    pub address: String,
+    /// Selectors the shell routes to this unit, as `0x`-prefixed 4-byte hex. Empty for the
+    /// shell and for an implementation that receives every call the shell does not answer.
+    pub selectors: Vec<String>,
+    /// Offset added to every pc of this unit so pcs are unique across the composite.
+    #[serde(skip)]
+    pub base: usize,
+    /// The unit's runtime code, which the executor runs in the composite's storage.
+    #[serde(skip)]
+    pub runtime: Vec<u8>,
+    /// Compiler of the unit, as the header prints it.
+    pub compiler: String,
+    /// The unit's own storage layout.
+    pub storage: Vec<StorageVar>,
+    /// The unit's own decompiled source.
+    pub source: String,
+    /// Size and coverage of the unit.
+    pub stats: Stats,
+}
+
+/// The role of a part in a composite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartRole {
+    /// The contract's own code: the proxy or diamond shell that routes calls.
+    Shell,
+    /// The single implementation a proxy forwards to.
+    Implementation,
+    /// One facet of a diamond.
+    Facet,
+}
+
+/// How a composite was assembled.
+#[derive(Clone, Debug, Serialize)]
+pub struct Composite {
+    /// The routing pattern, e.g. `EIP-1967 proxy` or `EIP-2535 diamond`.
+    pub kind: String,
+    /// Admin address, for patterns that have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin: Option<String>,
+    /// Storage slots declared with different types by different parts: `(slot, part index,
+    /// type, part index, type)`.
+    pub collisions: Vec<StorageCollision>,
+    /// Routed selectors the shell answers itself as well, so the shell wins.
+    pub shadowed: Vec<String>,
+}
+
+/// Two parts declaring the same storage slot with different types.
+#[derive(Clone, Debug, Serialize)]
+pub struct StorageCollision {
+    /// The slot.
+    pub slot: String,
+    /// The first part and the type it uses.
+    pub first: (usize, String),
+    /// The second part and the type it uses.
+    pub second: (usize, String),
+}
+
+impl Contract {
+    /// The runtime code that holds `f`: its part's code in a composite, else the contract's.
+    #[must_use]
+    pub fn code_of(&self, f: &Function) -> &[u8] {
+        match self.parts.get(f.part) {
+            Some(p) => &p.runtime,
+            None => &self.info.runtime,
+        }
+    }
+
+    /// The pc offset of the part that holds `f` (0 outside a composite).
+    #[must_use]
+    pub fn base_of(&self, f: &Function) -> usize {
+        self.parts.get(f.part).map_or(0, |p| p.base)
+    }
+
+    /// The pc `pc` of `f` as an offset into the part's own code.
+    #[must_use]
+    pub fn local_pc(&self, f: &Function, pc: usize) -> usize {
+        pc.saturating_sub(self.base_of(f))
+    }
+}
+
+/// Distance between the pc ranges of consecutive parts; EVM code is below 2^15 bytes.
+pub const PART_STRIDE: usize = 1 << 24;
+
+/// Add `base` to every program counter in `c` so its functions can sit next to another
+/// contract's without colliding: function entries, callee lists, lifted node pcs, internal call
+/// targets, string loaders and the type environment's scopes.
+pub fn rebase(c: &mut Contract, base: usize) {
+    if base == 0 {
+        return;
+    }
+    for f in &mut c.functions {
+        f.pc += base;
+        for pc in &mut f.calls {
+            *pc += base;
+        }
+        for pc in &mut f.effects.internal_callees {
+            *pc += base;
+        }
+        if let Some(l) = &mut f.lifted {
+            for nd in &mut l.nodes {
+                nd.pc += base;
+                for st in &mut nd.stmts {
+                    if let Stmt::Internal { callee, .. } = st {
+                        *callee += base;
+                    }
+                }
+            }
+        }
+    }
+    c.string_loaders = c
+        .string_loaders
+        .drain()
+        .map(|(pc, slot)| (pc + base, slot))
+        .collect();
+    c.types.rebase(base);
+}
+
+/// Assemble a proxy or diamond and the code it forwards to into one contract: the shell's
+/// functions, every routed function of every other part and the parts' internal helpers in one
+/// list, their storage layouts and type environments merged, so the analyzer sees the contract
+/// users call rather than its pieces. `parts` are `(role, address, routed selectors, contract)`;
+/// an implementation with no selector list receives every selector the shell does not answer.
+pub fn compose(
+    mut shell: Contract,
+    kind: &str,
+    admin: Option<String>,
+    parts: Vec<(PartRole, String, Vec<String>, Contract)>,
+) -> Contract {
+    let mut all_parts = vec![Part {
+        role: PartRole::Shell,
+        address: shell.address.clone().unwrap_or_default(),
+        selectors: Vec::new(),
+        base: 0,
+        runtime: shell.info.runtime.clone(),
+        compiler: shell.language.clone(),
+        storage: shell.storage.clone(),
+        source: shell.source.clone(),
+        stats: shell.stats.clone(),
+    }];
+    let shell_selectors: Vec<String> = shell
+        .functions
+        .iter()
+        .filter_map(|f| f.selector.clone())
+        .collect();
+    let mut shadowed = Vec::new();
+    let mut collisions = Vec::new();
+    for (role, address, selectors, mut part) in parts {
+        let index = all_parts.len();
+        let base = index * PART_STRIDE;
+        rebase(&mut part, base);
+        all_parts.push(Part {
+            role,
+            address: address.clone(),
+            selectors: selectors.clone(),
+            base,
+            runtime: part.info.runtime.clone(),
+            compiler: part.language.clone(),
+            storage: part.storage.clone(),
+            source: part.source.clone(),
+            stats: part.stats.clone(),
+        });
+        for mut f in part.functions {
+            let routed = match (&f.selector, selectors.is_empty()) {
+                (Some(sel), false) => selectors.iter().any(|s| s.eq_ignore_ascii_case(sel)),
+                _ => true,
+            };
+            if let Some(sel) = &f.selector {
+                if shell_selectors.iter().any(|s| s.eq_ignore_ascii_case(sel)) {
+                    shadowed.push(sel.clone());
+                    continue;
+                }
+            }
+            if f.kind == FnKind::External && !routed {
+                continue;
+            }
+            f.part = index;
+            f.origin = Some(address.clone());
+            shell.functions.push(f);
+        }
+        for var in part.storage {
+            match shell.storage.iter().position(|v| v.slot == var.slot) {
+                None => shell.storage.push(var),
+                Some(i) => {
+                    let mine = &shell.storage[i];
+                    if !compatible(&type_family(&mine.ty), &type_family(&var.ty)) {
+                        collisions.push(StorageCollision {
+                            slot: var.slot.clone(),
+                            first: (0, mine.ty.clone()),
+                            second: (index, var.ty.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        for v in part.events {
+            if !shell.events.contains(&v) {
+                shell.events.push(v);
+            }
+        }
+        for v in part.errors {
+            if !shell.errors.contains(&v) {
+                shell.errors.push(v);
+            }
+        }
+        for v in part.strings {
+            if !shell.strings.contains(&v) {
+                shell.strings.push(v);
+            }
+        }
+        for v in part.selectors_called {
+            if !shell.selectors_called.contains(&v) {
+                shell.selectors_called.push(v);
+            }
+        }
+        for v in part.call_targets {
+            if !shell.call_targets.contains(&v) && !v.eq_ignore_ascii_case(&address) {
+                shell.call_targets.push(v);
+            }
+        }
+        shell.string_loaders.extend(part.string_loaders);
+        shell.types.absorb(part.types);
+        shell.stats.code_bytes += part.stats.code_bytes;
+        shell.stats.instructions += part.stats.instructions;
+        shell.stats.blocks += part.stats.blocks;
+        shell.stats.code_blocks += part.stats.code_blocks;
+        shell.stats.covered_blocks += part.stats.covered_blocks;
+        shell.stats.unresolved_jumps += part.stats.unresolved_jumps;
+        shell.stats.external_functions += part.stats.external_functions;
+        shell.stats.internal_functions += part.stats.internal_functions;
+    }
+    shadowed.sort();
+    shadowed.dedup();
+    shell.parts = all_parts;
+    shell.composite = Some(Composite {
+        kind: kind.to_string(),
+        admin,
+        collisions,
+        shadowed,
+    });
+    shell.source = render(&shell, "Contract");
+    shell
+}
+
+/// Do two type families agree wherever both say something? `*` matches anything at its level,
+/// so `mapping(address => *)` agrees with `mapping(address => uint)` but not with `address`.
+fn compatible(a: &str, b: &str) -> bool {
+    if a == "*" || b == "*" || a == b {
+        return true;
+    }
+    let inner = |t: &str| {
+        t.strip_prefix("mapping(")
+            .and_then(|r| r.strip_suffix(')'))
+            .and_then(|r| r.split_once(" => "))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+    };
+    match (inner(a), inner(b)) {
+        (Some((ka, va)), Some((kb, vb))) => compatible(&ka, &kb) && compatible(&va, &vb),
+        (None, None) => match (a.strip_suffix("[]"), b.strip_suffix("[]")) {
+            (Some(ea), Some(eb)) => compatible(ea, eb),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// A storage type with its widths erased, for the collision check: two parts that read the
+/// same mapping as `uint16` and `uint256` values agree on its shape, while `address` against
+/// `mapping(...)` or `bool` against `address` do not. A full word (`uint256`, `bytes32`, an
+/// unknown type) says nothing about the shape and becomes `*`, which never collides.
+fn type_family(ty: &str) -> String {
+    let ty = ty.trim();
+    if let Some(inner) = ty
+        .strip_prefix("mapping(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        if let Some((k, v)) = inner.split_once(" => ") {
+            return format!("mapping({} => {})", type_family(k), type_family(v));
+        }
+    }
+    if let Some(base) = ty.strip_suffix("[]") {
+        return format!("{}[]", type_family(base));
+    }
+    match ty {
+        "" | "unknown" | "uint256" | "int256" | "bytes32" => "*".into(),
+        "address" | "bool" | "string" | "bytes" => ty.into(),
+        t if t.starts_with("uint") || t.starts_with("int") => "uint".into(),
+        t if t.starts_with("bytes") => "bytes".into(),
+        t => t.into(),
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -627,6 +992,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             n_rets,
             inlined: false,
             bool_vars: Vec::new(),
+            part: 0,
+            origin: None,
         }
     };
 
@@ -943,6 +1310,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     let mut dc_slots: Vec<String> = Vec::new();
     let mut dc_targets: Vec<String> = Vec::new();
     let mut call_targets: Vec<String> = Vec::new();
+    let mut diamond_lookup: Option<DiamondLookup> = None;
     for f in &functions {
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
@@ -959,6 +1327,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                                 if !dc_slots.contains(&h) {
                                     dc_slots.push(h);
                                 }
+                            } else if diamond_lookup.is_none() {
+                                diamond_lookup = selector_lookup(k, layout);
                             }
                         }
                         Node::Const(c) if *kind == op::DELEGATECALL => {
@@ -1013,6 +1383,9 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         chain: None,
         proxy: None,
         string_loaders: loaders,
+        parts: Vec::new(),
+        composite: None,
+        diamond_lookup,
     };
     c.source = render(&c, "Contract");
     c
@@ -2316,6 +2689,7 @@ pub fn render(c: &Contract, name: &str) -> String {
         "// Decompiled by evmdec. Compiler: {}.\n",
         c.language
     ));
+    out.push_str(&composite_header(c));
     if let Some(m) = &c.info.metadata {
         if let Some(h) = &m.ipfs {
             match m.ipfs_cid() {
@@ -2410,13 +2784,32 @@ pub fn render(c: &Contract, name: &str) -> String {
         out.push_str(&ctor.source);
     }
     if let Some(p) = &c.proxy {
-        out.push_str(&format!(
-            "\n// ---- {}: implementation {} ----\n",
-            p.kind, p.implementation
-        ));
-        if let Some(ic) = &p.contract {
-            out.push_str(&ic.source);
+        if c.composite.is_none() {
+            out.push_str(&format!(
+                "\n// ---- {}: implementation {} ----\n",
+                p.kind, p.implementation
+            ));
+            if let Some(ic) = &p.contract {
+                out.push_str(&ic.source);
+            }
         }
+    }
+    out
+}
+
+/// The header comment of a composite: what it is and which parts it was assembled from.
+fn composite_header(c: &Contract) -> String {
+    let Some(comp) = &c.composite else {
+        return String::new();
+    };
+    let mut out = format!("// Composite: {}. Parts:\n", comp.kind);
+    for p in &c.parts {
+        let what = match (p.role, p.selectors.len()) {
+            (PartRole::Shell, _) => "shell (routes calls)".to_string(),
+            (PartRole::Implementation, _) => "implementation (every unrouted selector)".to_string(),
+            (PartRole::Facet, n) => format!("facet ({} selectors)", n),
+        };
+        out.push_str(&format!("//   {} — {}, {}\n", p.address, what, p.compiler));
     }
     out
 }
@@ -2432,13 +2825,17 @@ pub fn fmt_function_header(f: &Function) -> String {
                 .map(|p| format!("{} {}", p.ty, p.name))
                 .collect();
             s.push_str(&format!(
-                "    // selector {}{}\n",
+                "    // selector {}{}{}\n",
                 f.selector.clone().unwrap_or_default(),
                 if f.signature.is_none() {
                     " (unknown signature)"
                 } else {
                     ""
-                }
+                },
+                f.origin
+                    .as_ref()
+                    .map(|a| format!(", code at {}", a))
+                    .unwrap_or_default()
             ));
             s.push_str(&format!(
                 "    function {}({}) external{}",

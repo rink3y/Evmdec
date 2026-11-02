@@ -38,9 +38,50 @@ fn error(status: StatusCode, msg: impl Into<String>) -> axum::response::Response
     (status, Json(json!({"error": msg.into()}))).into_response()
 }
 
-/// Run the decompiler and analyzer; returns the JSON document the UI consumes.
+/// Selectors of `c` and its parts that have no known signature, for an online lookup.
+fn unknown_selectors(c: &evmdec::decompile::Contract) -> Vec<u32> {
+    c.functions
+        .iter()
+        .filter(|f| f.signature.is_none())
+        .filter_map(|f| f.selector.as_ref())
+        .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
+/// Decompile pasted bytecode, or fetch, resolve and compose the contract at `address`.
+fn obtain(
+    code: Option<&[u8]>,
+    address: Option<&str>,
+    chain: Option<&str>,
+    rpc: Option<&str>,
+    follow: bool,
+    opts: &evmdec::decompile::Options,
+) -> Result<evmdec::decompile::Contract, String> {
+    match (code, address, chain) {
+        (Some(code), _, _) => {
+            let mut c = evmdec::decompile::decompile(code, opts);
+            c.address = address.map(|s| s.to_string());
+            c.chain = chain.map(|s| s.to_string());
+            Ok(c)
+        }
+        (None, Some(addr), Some(ch)) => {
+            let client = evmdec::rpc::Client::new(rpc, ch)?;
+            let policy = evmdec::fetch::Policy {
+                follow,
+                ..evmdec::fetch::Policy::default()
+            };
+            evmdec::fetch::fetch(&client, addr, ch, opts, policy, &mut |_| {})
+        }
+        _ => Err("nothing to decompile".into()),
+    }
+}
+
+/// Run the decompiler and analyzer; returns the JSON document the UI consumes. With `code`
+/// the bytecode is taken as given; otherwise the contract at `address` is fetched, its proxy
+/// or diamond resolved and composed with the code it forwards to, and its hard-coded
+/// dependencies fetched.
 fn run(
-    code: &[u8],
+    code: Option<&[u8]>,
     address: Option<&str>,
     chain: Option<&str>,
     rpc: Option<&str>,
@@ -48,65 +89,13 @@ fn run(
     lookup: bool,
 ) -> Result<Value, String> {
     let mut opts = evmdec::decompile::Options::default();
-    let mut c = evmdec::decompile::decompile(code, &opts);
+    let mut c = obtain(code, address, chain, rpc, follow, &opts)?;
     if lookup {
-        let sels: Vec<u32> = c
-            .functions
-            .iter()
-            .filter(|f| f.signature.is_none())
-            .filter_map(|f| f.selector.as_ref())
-            .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            .collect();
+        let sels = unknown_selectors(&c);
         if !sels.is_empty() {
             opts.extra_sigs = evmdec::sigs::lookup_online(&sels);
             if !opts.extra_sigs.is_empty() {
-                c = evmdec::decompile::decompile(code, &opts);
-            }
-        }
-    }
-    c.address = address.map(|s| s.to_string());
-    c.chain = chain.map(|s| s.to_string());
-    let mut implementation: Option<Value> = None;
-    if let (Some(addr), Some(ch), true) = (address, chain, follow) {
-        if let Ok(client) = evmdec::rpc::Client::new(rpc, ch) {
-            let slots: Vec<evmdec::U256> = c
-                .delegatecall_slots
-                .iter()
-                .filter_map(|s| evmdec::U256::from_hex_str(s))
-                .collect();
-            let targets: Vec<evmdec::U256> = c
-                .delegatecall_targets
-                .iter()
-                .filter_map(|s| evmdec::U256::from_hex_str(s))
-                .collect();
-            if !slots.is_empty() || !targets.is_empty() || code.len() < 100 {
-                if let Ok(Some(p)) =
-                    evmdec::rpc::resolve_proxy(&client, addr, code, &slots, &targets)
-                {
-                    if let Ok(ic) = client.get_code(&p.implementation) {
-                        if !ic.is_empty() {
-                            let mut icon = evmdec::decompile::decompile(&ic, &opts);
-                            icon.address = Some(p.implementation.clone());
-                            icon.chain = Some(ch.to_string());
-                            icon.source = evmdec::decompile::render(&icon, "Implementation");
-                            let ir = evmdec::analyze::analyze(&icon);
-                            let imd = evmdec::analyze::render_markdown(
-                                &icon,
-                                &ir,
-                                &format!("implementation {}", p.implementation),
-                            );
-                            implementation = Some(
-                                json!({"contract": icon, "report": ir, "report_markdown": imd, "proxy_kind": p.kind, "admin": p.admin}),
-                            );
-                        }
-                    }
-                    c.proxy = Some(evmdec::decompile::ProxyRef {
-                        kind: p.kind,
-                        implementation: p.implementation,
-                        admin: p.admin,
-                        contract: None,
-                    });
-                }
+                c = obtain(code, address, chain, rpc, follow, &opts)?;
             }
         }
     }
@@ -116,9 +105,22 @@ fn run(
         .iter()
         .map(evmdec::disasm::format_instruction)
         .collect();
+    let linked: Vec<Value> = c
+        .linked
+        .iter()
+        .map(|lc| {
+            let lr = evmdec::analyze::analyze(lc);
+            let lmd = evmdec::analyze::render_markdown(
+                lc,
+                &lr,
+                &format!("linked contract {}", lc.address.as_deref().unwrap_or("?")),
+            );
+            json!({"contract": lc, "report": lr, "report_markdown": lmd})
+        })
+        .collect();
     let mut v = json!({"contract": c, "report": r, "report_markdown": md, "disassembly": disasm});
-    if let Some(i) = implementation {
-        v["implementation"] = i;
+    if !linked.is_empty() {
+        v["linked"] = Value::Array(linked);
     }
     Ok(v)
 }
@@ -151,26 +153,22 @@ async fn api_decompile(
             if !evmdec::rpc::is_address(&addr) {
                 return Err((StatusCode::BAD_REQUEST, "invalid address".into()));
             }
-            let client = evmdec::rpc::Client::new(req.rpc.as_deref(), &chain)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-            let code = client
-                .get_code(&addr)
-                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
-            if code.is_empty() {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    format!("{} has no code on {}", addr, chain),
-                ));
-            }
             return run(
-                &code,
+                None,
                 Some(&addr),
                 Some(&chain),
                 req.rpc.as_deref(),
                 !req.no_follow_proxy,
                 req.lookup,
             )
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e));
+            .map_err(|e| {
+                let status = if e.contains("has no code") {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                (status, e)
+            });
         }
         let hex = req.bytecode.unwrap_or_default();
         let code = evmdec::hex::decode(&hex).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -180,7 +178,7 @@ async fn api_decompile(
         if code.len() > 1 << 20 {
             return Err((StatusCode::BAD_REQUEST, "bytecode too large".into()));
         }
-        run(&code, None, None, None, false, req.lookup)
+        run(Some(&code), None, None, None, false, req.lookup)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
     })
     .await;

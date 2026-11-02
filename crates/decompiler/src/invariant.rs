@@ -251,7 +251,6 @@ fn entry_key(root: U256, account: U256, layout: MappingLayout) -> U256 {
 /// Report any state-changing entry point that lets the role-less caller end a zero-value call with a
 /// non-zero balance in one of the ledgers.
 fn self_credit(c: &Contract, ledgers: &[Ledger], out: &mut Vec<Finding>) {
-    let code = &c.info.runtime;
     let caller = exec::CALLER;
     let keys: Vec<(Ledger, U256)> = ledgers
         .iter()
@@ -262,7 +261,7 @@ fn self_credit(c: &Contract, ledgers: &[Ledger], out: &mut Vec<Finding>) {
             witness,
             root,
             wrapped,
-        }) = search_credit(code, f, &keys)
+        }) = search_credit(c.code_of(f), f, &keys)
         {
             let how = if wrapped {
                 "A subtraction on that path wraps below zero, so the balance becomes a near-2^256 number: the debit is missing the check that other paths apply to this mapping."

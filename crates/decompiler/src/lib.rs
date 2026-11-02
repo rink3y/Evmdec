@@ -22,6 +22,8 @@ pub mod decompile;
 pub mod emit;
 pub mod exec;
 pub mod expr;
+#[cfg(feature = "rpc")]
+pub mod fetch;
 pub mod function;
 pub mod interp;
 pub mod invariant;

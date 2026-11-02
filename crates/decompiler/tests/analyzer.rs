@@ -568,3 +568,132 @@ fn a_free_self_credit_is_reported_and_a_paid_one_is_not() {
         hits(&counter)
     );
 }
+
+#[test]
+fn a_composite_merges_facets_and_keeps_their_functions_apart() {
+    use evmdec::decompile::{compose, PartRole};
+    // Shell: a router is not needed for composition; a contract with no functions will do
+    // (a shell that answered a routed selector itself would shadow the facet's function).
+    let shell_code = asm("PUSH1 0x00 DUP1 REVERT");
+    // Facet A at selector 0xaaaaaaaa: an open selfdestruct (confirmable sink).
+    let a_code = dispatcher("CALLER SELFDESTRUCT");
+    // Facet B at selector 0xbbbbbbbb: writes slot 0 with the caller (an address).
+    let b_code = dispatcher3("STOP", "CALLER PUSH1 0x00 SSTORE STOP", "STOP");
+    let mut shell = decompile::decompile(&shell_code, &Options::default());
+    shell.address = Some("0x00000000000000000000000000000000000000d1".into());
+    let a = decompile::decompile(&a_code, &Options::default());
+    let b = decompile::decompile(&b_code, &Options::default());
+    let a_pc = a
+        .functions
+        .iter()
+        .find(|f| f.selector.is_some())
+        .map(|f| f.pc)
+        .unwrap();
+    let c = compose(
+        shell,
+        "EIP-2535 diamond (2 facets)",
+        None,
+        vec![
+            (
+                PartRole::Facet,
+                "0x000000000000000000000000000000000000000a".into(),
+                vec!["0xaaaaaaaa".into()],
+                a,
+            ),
+            (
+                PartRole::Facet,
+                "0x000000000000000000000000000000000000000b".into(),
+                vec!["0xbbbbbbbb".into()],
+                b,
+            ),
+        ],
+    );
+    assert_eq!(c.parts.len(), 3);
+    // Only routed externals come across: facet B's 0xaaaaaaaa and 0xcccccccc are dropped.
+    let externals: Vec<(&str, usize)> = c
+        .functions
+        .iter()
+        .filter(|f| f.selector.is_some())
+        .map(|f| (f.selector.as_deref().unwrap(), f.part))
+        .collect();
+    assert_eq!(
+        externals,
+        vec![("0xaaaaaaaa", 1), ("0xbbbbbbbb", 2)],
+        "{externals:?}"
+    );
+    // pcs are unique across parts and translate back to the part's own code.
+    let fa = c
+        .functions
+        .iter()
+        .find(|f| f.part == 1 && f.selector.is_some())
+        .unwrap();
+    assert_eq!(fa.pc, a_pc + evmdec::decompile::PART_STRIDE);
+    assert_eq!(c.local_pc(fa, fa.pc), a_pc);
+    assert_eq!(c.code_of(fa), &a_code[..]);
+    assert!(c
+        .source
+        .contains("code at 0x000000000000000000000000000000000000000a"));
+
+    let r = analyze::analyze(&c);
+    assert!(finding(&r, "composite").is_some(), "{:?}", ids(&r));
+    // The facet's sink is confirmed by running the facet's code, and the finding names the facet.
+    let sd = finding(&r, "selfdestruct").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(sd.confirmed, "{sd:?}");
+    assert!(sd
+        .function
+        .as_deref()
+        .unwrap()
+        .ends_with("@ 0x000000000000000000000000000000000000000a"));
+    let md = analyze::render_markdown(&c, &r, "diamond");
+    assert!(md.contains("## Parts"), "{md}");
+    assert!(md.contains(&format!(
+        "at pc {:#x}",
+        sd.pc.map(|p| c.local_pc(fa, p)).unwrap()
+    )));
+}
+
+#[test]
+fn a_proxy_composite_takes_every_implementation_function_and_flags_slot_collisions() {
+    use evmdec::decompile::{compose, PartRole};
+    // Shell: writes slot 0 as an address (an owner). Implementation: slot 0 is a balance
+    // mapping (its entry key hashes slot 0), and slot 1 is read narrow where the shell reads
+    // it wide, which is not a collision.
+    let shell_code = dispatcher("CALLER PUSH1 0x00 SSTORE PUSH1 0x01 SLOAD POP STOP");
+    let impl_code = dispatcher3(
+        "STOP",
+        "CALLER PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD PUSH1 0x01 ADD SWAP1 SSTORE STOP",
+        "PUSH1 0x01 SLOAD PUSH1 0xff AND PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN",
+    );
+    let mut shell = decompile::decompile(&shell_code, &Options::default());
+    shell.address = Some("0x00000000000000000000000000000000000000d1".into());
+    let im = decompile::decompile(&impl_code, &Options::default());
+    let c = compose(
+        shell,
+        "EIP-1967 proxy",
+        Some("0x00000000000000000000000000000000000000ad".into()),
+        vec![(
+            PartRole::Implementation,
+            "0x000000000000000000000000000000000000001".into(),
+            Vec::new(),
+            im,
+        )],
+    );
+    // Every implementation external comes across except the one the shell answers itself.
+    let sels: Vec<(&str, usize)> = c
+        .functions
+        .iter()
+        .filter(|f| f.selector.is_some())
+        .map(|f| (f.selector.as_deref().unwrap(), f.part))
+        .collect();
+    assert_eq!(
+        sels,
+        vec![("0xaaaaaaaa", 0), ("0xbbbbbbbb", 1), ("0xcccccccc", 1)],
+        "{sels:?}"
+    );
+    let comp = c.composite.as_ref().unwrap();
+    assert_eq!(comp.shadowed, vec!["0xaaaaaaaa".to_string()]);
+    assert_eq!(comp.collisions.len(), 1, "{:?}", comp.collisions);
+    assert_eq!(comp.collisions[0].slot, "0x0");
+    let r = analyze::analyze(&c);
+    assert!(finding(&r, "storage-collision").is_some(), "{:?}", ids(&r));
+}

@@ -429,3 +429,212 @@ pub fn resolve_proxy(
     }
     Ok(None)
 }
+
+/// One facet of a diamond with the selectors routed to it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Facet {
+    /// Facet address.
+    pub address: String,
+    /// Selectors routed to it, as `0x`-prefixed 4-byte hex.
+    pub selectors: Vec<String>,
+}
+
+/// A resolved EIP-2535 diamond: its facets and how they were found.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DiamondInfo {
+    /// The facets, in the order the diamond lists them.
+    pub facets: Vec<Facet>,
+    /// `loupe` when read through `IDiamondLoupe`, `storage` when read from the reference
+    /// layout of the diamond storage struct.
+    pub source: &'static str,
+}
+
+/// `facets()` of `IDiamondLoupe`.
+const SEL_FACETS: &str = "0x7a0ed627";
+/// `facetAddresses()` of `IDiamondLoupe`.
+const SEL_FACET_ADDRESSES: &str = "0x52ef6b2c";
+/// `facetFunctionSelectors(address)` of `IDiamondLoupe`.
+const SEL_FACET_SELECTORS: &str = "0xadfca15e";
+/// Facets read at most, a bound on a hostile or broken loupe.
+const MAX_FACETS: usize = 128;
+
+/// Resolve the facets of the diamond at `address`: through the loupe when the diamond has one,
+/// else from storage when `lookup` names the selector mapping of the reference layout
+/// (`selectorToFacetAndPosition` at the diamond storage position, `facetFunctionSelectors` one
+/// slot further and `facetAddresses` two slots further). `None` when neither works.
+pub fn resolve_diamond(
+    client: &Client,
+    address: &str,
+    lookup: Option<&crate::decompile::DiamondLookup>,
+) -> Result<Option<DiamondInfo>, String> {
+    if let Some(facets) = loupe_facets(client, address) {
+        return Ok(Some(DiamondInfo {
+            facets,
+            source: "loupe",
+        }));
+    }
+    if let Some(facets) = loupe_facets_by_address(client, address) {
+        return Ok(Some(DiamondInfo {
+            facets,
+            source: "loupe",
+        }));
+    }
+    let Some(lookup) = lookup else {
+        return Ok(None);
+    };
+    let Some(root) = U256::from_hex_str(&lookup.slot) else {
+        return Ok(None);
+    };
+    let facets = storage_facets(client, address, root)?;
+    Ok((!facets.is_empty()).then_some(DiamondInfo {
+        facets,
+        source: "storage",
+    }))
+}
+
+/// `facets()`: `(address facetAddress, bytes4[] functionSelectors)[]`.
+fn loupe_facets(client: &Client, address: &str) -> Option<Vec<Facet>> {
+    let data = client.eth_call(address, SEL_FACETS).ok()?;
+    let mut r = AbiReader::new(&data);
+    let array = r.offset(0)?;
+    let n = r.word(array)?.as_usize()?;
+    if n == 0 || n > MAX_FACETS {
+        return None;
+    }
+    let mut facets = Vec::with_capacity(n);
+    for i in 0..n {
+        let tuple = array + 32 + r.word(array + 32 + 32 * i)?.as_usize()?;
+        let facet = r.word(tuple)?;
+        let sels = tuple + r.word(tuple + 32)?.as_usize()?;
+        let selectors = r.selectors(sels)?;
+        facets.push(Facet {
+            address: addr_to_string(facet & crate::expr::mask_bits(160)),
+            selectors,
+        });
+    }
+    Some(facets)
+}
+
+/// `facetAddresses()` then `facetFunctionSelectors(address)` for each, for a loupe whose
+/// `facets()` is missing or fails.
+fn loupe_facets_by_address(client: &Client, address: &str) -> Option<Vec<Facet>> {
+    let data = client.eth_call(address, SEL_FACET_ADDRESSES).ok()?;
+    let mut r = AbiReader::new(&data);
+    let array = r.offset(0)?;
+    let n = r.word(array)?.as_usize()?;
+    if n == 0 || n > MAX_FACETS {
+        return None;
+    }
+    let mut facets = Vec::with_capacity(n);
+    for i in 0..n {
+        let facet = addr_to_string(r.word(array + 32 + 32 * i)? & crate::expr::mask_bits(160));
+        let arg = format!(
+            "{}{:0>64}",
+            SEL_FACET_SELECTORS,
+            facet.trim_start_matches("0x")
+        );
+        let data = client.eth_call(address, &arg).ok()?;
+        let mut rr = AbiReader::new(&data);
+        let sels = rr.offset(0)?;
+        let selectors = rr.selectors(sels)?;
+        facets.push(Facet {
+            address: facet,
+            selectors,
+        });
+    }
+    Some(facets)
+}
+
+/// Facets from the reference diamond storage layout rooted at `root`.
+fn storage_facets(client: &Client, address: &str, root: U256) -> Result<Vec<Facet>, String> {
+    let slot = |k: U256| k.to_hex_padded(32);
+    let addresses_len = client
+        .get_storage(address, &slot(root + U256::from_u64(2)))?
+        .as_usize()
+        .unwrap_or(0);
+    if addresses_len == 0 || addresses_len > MAX_FACETS {
+        return Ok(Vec::new());
+    }
+    let addresses_data = U256::from_be_bytes(&crate::keccak::keccak256(
+        &(root + U256::from_u64(2)).to_be_bytes(),
+    ));
+    let mut facets = Vec::new();
+    for i in 0..addresses_len {
+        let facet = client
+            .get_storage(address, &slot(addresses_data + U256::from_u64(i as u64)))?
+            & crate::expr::mask_bits(160);
+        if facet.is_zero() {
+            continue;
+        }
+        // facetFunctionSelectors[facet].functionSelectors: a bytes4[] at the entry's first slot.
+        let mut pre = Vec::with_capacity(64);
+        pre.extend_from_slice(&facet.to_be_bytes());
+        pre.extend_from_slice(&(root + U256::ONE).to_be_bytes());
+        let entry = U256::from_be_bytes(&crate::keccak::keccak256(&pre));
+        let n = client
+            .get_storage(address, &slot(entry))?
+            .as_usize()
+            .unwrap_or(0)
+            .min(4096);
+        let data = U256::from_be_bytes(&crate::keccak::keccak256(&entry.to_be_bytes()));
+        let mut selectors = Vec::with_capacity(n);
+        let mut word = U256::ZERO;
+        for j in 0..n {
+            if j % 8 == 0 {
+                word = client.get_storage(address, &slot(data + U256::from_u64((j / 8) as u64)))?;
+            }
+            // `bytes4` elements pack eight to a slot from the low-order end.
+            let bytes = word.to_be_bytes();
+            let lo = 32 - 4 * (j % 8 + 1);
+            selectors.push(format!(
+                "0x{}",
+                hex::encode(&bytes[lo..lo + 4]).trim_start_matches("0x")
+            ));
+        }
+        facets.push(Facet {
+            address: addr_to_string(facet),
+            selectors,
+        });
+    }
+    Ok(facets)
+}
+
+/// A bounds-checked reader over ABI-encoded return data.
+struct AbiReader<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> AbiReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        AbiReader { data }
+    }
+
+    /// The 32-byte word at byte offset `at`.
+    fn word(&mut self, at: usize) -> Option<U256> {
+        let end = at.checked_add(32)?;
+        (end <= self.data.len()).then(|| U256::from_be_bytes(&self.data[at..end]))
+    }
+
+    /// The offset word at `at`, as an absolute position.
+    fn offset(&mut self, at: usize) -> Option<usize> {
+        let off = self.word(at)?.as_usize()?;
+        (off < self.data.len()).then_some(off)
+    }
+
+    /// A `bytes4[]` whose length word sits at `at`.
+    fn selectors(&mut self, at: usize) -> Option<Vec<String>> {
+        let n = self.word(at)?.as_usize()?;
+        if n > 4096 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let w = self.word(at + 32 + 32 * i)?.to_be_bytes();
+            out.push(format!(
+                "0x{}",
+                hex::encode(&w[..4]).trim_start_matches("0x")
+            ));
+        }
+        Some(out)
+    }
+}

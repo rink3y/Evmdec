@@ -106,9 +106,6 @@ fn load_input(input: &str) -> Result<Vec<u8>> {
     anyhow::bail!("'{}' is neither a file, a hex string nor an address", input)
 }
 
-/// Hard-coded call targets fetched and decompiled alongside a contract, at most.
-const MAX_LINKED: usize = 8;
-
 fn fetch_and_decompile(
     address: &str,
     rpc: Option<&str>,
@@ -117,94 +114,14 @@ fn fetch_and_decompile(
     opts: &evmdec::decompile::Options,
 ) -> Result<evmdec::decompile::Contract> {
     let client = evmdec::rpc::Client::new(rpc, chain).map_err(|e| anyhow::anyhow!(e))?;
-    eprintln!("fetching code of {} on {}...", address, chain);
-    let code = client.get_code(address).map_err(|e| anyhow::anyhow!(e))?;
-    if code.is_empty() {
-        anyhow::bail!(
-            "{} has no code on {} (not a contract, or wrong chain)",
-            address,
-            chain
-        );
-    }
-    let mut c = evmdec::decompile::decompile(&code, opts);
-    c.address = Some(address.to_string());
-    c.chain = Some(chain.to_string());
-    if follow {
-        let slots: Vec<evmdec::U256> = c
-            .delegatecall_slots
-            .iter()
-            .filter_map(|s| evmdec::U256::from_hex_str(s))
-            .collect();
-        let targets: Vec<evmdec::U256> = c
-            .delegatecall_targets
-            .iter()
-            .filter_map(|s| evmdec::U256::from_hex_str(s))
-            .collect();
-        let is_proxy = !slots.is_empty() || !targets.is_empty() || code.len() < 100;
-        if is_proxy {
-            match evmdec::rpc::resolve_proxy(&client, address, &code, &slots, &targets) {
-                Ok(Some(p)) => {
-                    eprintln!(
-                        "{}: implementation {} — fetching...",
-                        p.kind, p.implementation
-                    );
-                    let impl_code = client
-                        .get_code(&p.implementation)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    let ic = if impl_code.is_empty() {
-                        None
-                    } else {
-                        let mut ic = evmdec::decompile::decompile(&impl_code, opts);
-                        ic.address = Some(p.implementation.clone());
-                        ic.chain = Some(chain.to_string());
-                        ic.source = evmdec::decompile::render(&ic, "Implementation");
-                        Some(Box::new(ic))
-                    };
-                    c.proxy = Some(evmdec::decompile::ProxyRef {
-                        kind: p.kind,
-                        implementation: p.implementation,
-                        admin: p.admin,
-                        contract: ic,
-                    });
-                    c.source = evmdec::decompile::render(&c, "Proxy");
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("proxy resolution failed: {}", e),
-            }
-        }
-        // Hard-coded external call targets: fetch and decompile each (one level deep).
-        if c.call_targets.len() > MAX_LINKED {
-            eprintln!(
-                "{} hard-coded call targets; fetching the first {}",
-                c.call_targets.len(),
-                MAX_LINKED
-            );
-        }
-        let mut linked = Vec::new();
-        for t in c.call_targets.iter().take(MAX_LINKED) {
-            let is_self = c
-                .address
-                .as_deref()
-                .is_some_and(|a| a.eq_ignore_ascii_case(t));
-            if is_self {
-                continue;
-            }
-            eprintln!("call target {} — fetching...", t);
-            match client.get_code(t) {
-                Ok(tc) if !tc.is_empty() => {
-                    let mut lc = evmdec::decompile::decompile(&tc, opts);
-                    lc.address = Some(t.clone());
-                    lc.chain = Some(chain.to_string());
-                    lc.source = evmdec::decompile::render(&lc, "Linked");
-                    linked.push(lc);
-                }
-                Ok(_) => eprintln!("call target {} has no code (likely an EOA)", t),
-                Err(e) => eprintln!("could not fetch call target {}: {}", t, e),
-            }
-        }
-        c.linked = linked;
-    }
-    Ok(c)
+    let policy = evmdec::fetch::Policy {
+        follow,
+        ..evmdec::fetch::Policy::default()
+    };
+    evmdec::fetch::fetch(&client, address, chain, opts, policy, &mut |line| {
+        eprintln!("{}", line)
+    })
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 fn main() -> Result<()> {

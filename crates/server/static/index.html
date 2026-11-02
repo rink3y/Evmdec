@@ -165,6 +165,13 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .report table{border-collapse:collapse;font-size:13px;width:100%}
 .report th,.report td{border:1px solid var(--hair);padding:4px 8px;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}
 .report th{color:var(--muted);font:600 12px/1.4 var(--cond);letter-spacing:.08em;text-transform:uppercase}
+.report .tscroll{overflow-x:auto;max-width:100%;margin:8px 0 16px;border:1px solid var(--hair)}
+.report .tscroll table{margin:0;width:100%}
+.report .tscroll th,.report .tscroll td{border-width:0 0 1px 1px}.report .tscroll th:first-child,.report .tscroll td:first-child{border-left:0}.report .tscroll tr:last-child td{border-bottom:0}
+.report td code{font:12.5px/1.5 var(--mono);white-space:nowrap}
+.report td code.hash{white-space:normal;overflow-wrap:anywhere}
+.report td.num{text-align:right}
+.report .tscroll:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
 .report ul{margin:0;padding:0;list-style:none}
 .report li{margin:0;padding:3px 0;border-bottom:1px solid var(--hair)}
 .report code{font:12.5px/1.5 var(--mono)}
@@ -180,10 +187,18 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
  .theme{flex:1 1 100%;justify-content:center;border:0;border-top:1px solid var(--band-line);padding:10px}
  .tb{grid-template-columns:repeat(2,minmax(0,1fr))}
  main{display:block}main>*{overflow:visible;max-height:none;height:auto;border:0}
- .drawing [role=tabpanel]{max-height:70vh;overflow:auto}.drawing .tabs{position:static}
+ .drawing [role=tabpanel]{max-height:70vh;overflow:auto}.drawing .tabs{position:relative}
  .index{border-bottom:1px solid var(--line)}.index #fns{max-height:40vh;overflow:auto}
  .details{border-top:1px solid var(--line)}
  #landing{padding:24px 16px 40px}.sheet{padding:24px 20px}.sheet h1{font-size:28px}
+ /* data tables stack one row per card on narrow screens instead of scrolling sideways (WCAG 1.4.10); roles keep the table semantics */
+ .report .tscroll{overflow:visible;border:0}
+ .report .stack thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+ .report .stack,.report .stack tbody{display:block;width:100%}
+ .report .stack tr{display:block;padding:8px 0;border-bottom:1px solid var(--hair)}.report .stack tr:last-child{border-bottom:0}
+ .report .stack td{display:flex;gap:10px;border:0;padding:2px 8px;text-align:left}
+ .report .stack td::before{content:attr(data-label);flex:0 0 5.5em;color:var(--muted);font:600 11px/1.7 var(--cond);letter-spacing:.08em;text-transform:uppercase}
+ .report .stack td code{white-space:normal;overflow-wrap:anywhere}
 }
 </style>
 </head>
@@ -379,19 +394,25 @@ window.addEventListener('popstate',e=>{if(e.state&&e.state.line&&document.getEle
 document.addEventListener('click',e=>{const ref=e.target.closest('a.fnref');if(ref){e.preventDefault();gotoHelper(ref);return}
  const a=e.target.closest('a[href^="#"]');if(!a)return;const id=a.getAttribute('href').slice(1);if(/^(F|L)\d+$/.test(id)){e.preventDefault();if(a.classList.contains('back'))a.remove();if(/^L/.test(id)&&CUR!=null&&!document.getElementById(id)){CUR=null;renderFns();renderCode()}light(id)}});
 
-function storagePanel(c){const comp=!!(c.parts&&c.parts.length);const pcol=s=>comp?'<td>'+esc(partsOf(c,s.slot))+'</td>':'';
- const rows=c.storage.flatMap(s=>(s.fields&&s.fields.length)?s.fields.map(f=>'<tr><td>'+s.slot+' bytes '+f.offset+'..'+(f.offset+Math.ceil(f.bits/8))+'</td><td>'+esc(f.name)+'</td><td>'+esc(f.ty)+'</td><td>'+s.reads+'</td><td>'+s.writes+'</td>'+pcol(s)+'</tr>'):['<tr><td>'+s.slot+'</td><td>'+esc(s.name)+'</td><td>'+esc(s.ty)+'</td><td>'+s.reads+'</td><td>'+s.writes+'</td>'+pcol(s)+'</tr>']).join('');
+function storagePanel(c){const comp=!!(c.parts&&c.parts.length);const pcol=s=>comp?'<td role="cell" data-label="Parts">'+esc(partsOf(c,s.slot))+'</td>':'';
+ const cell=(slot,name,ty,s)=>'<tr role="row"><td role="cell" data-label="Slot"><code class="'+(slot.length>24?'hash':'')+'">'+esc(slot)+'</code></td><td role="cell" data-label="Name"><code>'+esc(name)+'</code></td><td role="cell" data-label="Type"><code>'+fmtType(ty)+'</code></td><td role="cell" data-label="Reads" class="num">'+s.reads+'</td><td role="cell" data-label="Writes" class="num">'+s.writes+'</td>'+pcol(s)+'</tr>';
+ const rows=c.storage.flatMap(s=>(s.fields&&s.fields.length)?s.fields.map(f=>cell(s.slot+' bytes '+f.offset+'..'+(f.offset+Math.ceil(f.bits/8)),f.name,f.ty,s)):[cell(s.slot,s.name,s.ty,s)]).join('');
  const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
- return '<div class="report">'+partsTable(c)+'<h2>Storage layout</h2>'+(rows?'<table><thead><tr><th scope="col">Slot</th><th scope="col">Name</th><th scope="col">Type</th><th scope="col">Reads</th><th scope="col">Writes</th>'+(comp?'<th scope="col">Parts</th>':'')+'</tr></thead><tbody>'+rows+'</tbody></table>':'<p>No storage accessed.</p>')+'<h2>Events</h2>'+list(c.events,'No events emitted.')+'<h2>Custom errors</h2>'+list(c.errors,'None.')+'<h2>Strings</h2>'+(c.strings.length?'<ul>'+c.strings.map(e=>'<li>'+esc(e)+'</li>').join('')+'</ul>':'<p>None.</p>')+'<h2>Selectors called on other contracts</h2>'+list(c.selectors_called,'None.')+'</div>'}
+ const table=rows?scrollTable('Storage layout','<table class="stack" role="table"><thead role="rowgroup"><tr role="row"><th role="columnheader" scope="col">Slot</th><th role="columnheader" scope="col">Name</th><th role="columnheader" scope="col">Type</th><th role="columnheader" scope="col">Reads</th><th role="columnheader" scope="col">Writes</th>'+(comp?'<th role="columnheader" scope="col">Parts</th>':'')+'</tr></thead><tbody role="rowgroup">'+rows+'</tbody></table>'):'<p>No storage accessed.</p>';
+ return '<div class="report">'+partsTable(c)+'<h2>Storage layout</h2>'+table+'<h2>Events</h2>'+list(c.events,'No events emitted.')+'<h2>Custom errors</h2>'+list(c.errors,'None.')+'<h2>Strings</h2>'+(c.strings.length?'<ul>'+c.strings.map(e=>'<li>'+esc(e)+'</li>').join('')+'</ul>':'<p>None.</p>')+'<h2>Selectors called on other contracts</h2>'+list(c.selectors_called,'None.')+'</div>'}
 function reportPanel(rep,c){const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
  return '<div class="report"><h2>Summary</h2><p>Risk score <b class="'+(rep.risk_score>=8?'sev-high':'')+'">'+rep.risk_score+'/100</b> ('+riskWord(rep.risk_score).toLowerCase()+'). '+summaryText(rep.summary)+((typeof rep.contract_kind==='string'&&rep.contract_kind.trim()&&rep.contract_kind.trim()!=='unclassified')?'. Kind: '+esc(rep.contract_kind.trim()):'')+'. Findings are leads with a confidence level; coverage and unresolved jumps are in the title block.</p><h2>Privileged functions</h2>'+list(rep.privileged_functions)+'<h2>State-changing functions callable by anyone</h2>'+list(rep.unauthenticated_state_changers)+'<h2>External calls</h2>'+list(rep.external_calls)+'<h2>All findings</h2><ol class="findings">'+FINDINGS.map((f,i)=>findingItem(i+1,f,true).replace(' id="F'+(i+1)+'"',' id="R'+(i+1)+'"').replace('id="FB'+(i+1)+'"','id="RB'+(i+1)+'"').replace('aria-controls="FB'+(i+1)+'"','aria-controls="RB'+(i+1)+'"')).join('')+'</ol></div>'}
 /* parts of a composite (proxy + implementation, diamond + facets): the routing table */
 function partsTable(c){const parts=c.parts||[];if(!parts.length)return '';const comp=c.composite||{};
  const role=p=>p.role==='shell'?'shell (routes calls)':p.role==='implementation'?'implementation':'facet';
  const sels=p=>p.role==='shell'?'router':(p.selectors.length?p.selectors.length+' selectors':'all unrouted');
- const rows=parts.map(p=>'<tr><td>'+esc(role(p))+'</td><td><code>'+esc(p.address)+'</code></td><td>'+esc(sels(p))+'</td><td>'+esc(p.compiler||'')+'</td><td>'+(p.stats?p.stats.code_bytes.toLocaleString()+' bytes':'')+'</td></tr>').join('');
+ const rows=parts.map(p=>'<tr role="row"><td role="cell" data-label="Role">'+esc(role(p))+'</td><td role="cell" data-label="Address"><code class="hash">'+esc(p.address)+'</code></td><td role="cell" data-label="Selectors">'+esc(sels(p))+'</td><td role="cell" data-label="Compiler">'+esc(p.compiler||'')+'</td><td role="cell" data-label="Code">'+(p.stats?p.stats.code_bytes.toLocaleString()+' bytes':'')+'</td></tr>').join('');
  const coll=(comp.collisions||[]).map(x=>'<li>slot <code>'+esc(x.slot)+'</code>: '+esc(x.first[1])+' in '+esc(shortAddr(parts[x.first[0]]))+', '+esc(x.second[1])+' in '+esc(shortAddr(parts[x.second[0]]))+'</li>').join('');
- return '<h2>'+esc(comp.kind||'Composite')+'</h2><p>Every part runs in this contract\'s storage through delegatecall; the code and the report cover them as one contract.</p><table><thead><tr><th scope="col">Role</th><th scope="col">Address</th><th scope="col">Selectors</th><th scope="col">Compiler</th><th scope="col">Code</th></tr></thead><tbody>'+rows+'</tbody></table>'+(coll?'<h2>Storage collisions</h2><ul>'+coll+'</ul>':'')}
+ return '<h2>'+esc(comp.kind||'Composite')+'</h2><p>Every part runs in this contract\'s storage through delegatecall; the code and the report cover them as one contract.</p>'+scrollTable('Parts','<table class="stack" role="table"><thead role="rowgroup"><tr role="row"><th role="columnheader" scope="col">Role</th><th role="columnheader" scope="col">Address</th><th role="columnheader" scope="col">Selectors</th><th role="columnheader" scope="col">Compiler</th><th role="columnheader" scope="col">Code</th></tr></thead><tbody role="rowgroup">'+rows+'</tbody></table>')+(coll?'<h2>Storage collisions</h2><ul>'+coll+'</ul>':'')}
+/* wide tables scroll sideways inside a labelled region the keyboard can focus (WCAG 1.4.10 allows two-way scrolling for data tables; 2.1.1 needs the scroller reachable) */
+function scrollTable(label,inner){return '<div class="tscroll" role="region" aria-label="'+esc(label)+'" tabindex="0">'+inner+'</div>'}
+/* a Solidity type wraps only between mapping levels: `mapping(address =>` then `mapping(address => uint256))` */
+function fmtType(t){return esc(t).split(' =&gt; ').join(' =&gt;<wbr> ')}
 function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';const a=p.address||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
 function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(shortAddr).join(', ')}
 function renderAll(){const c=DATA.contract;renderCode();renderFindings();$('#panel-report').innerHTML=reportPanel(DATA.report,c);

@@ -158,7 +158,12 @@ oracle, so the accuracy claim below is measured, not asserted.
   (`blocking-payout-loop`: one entry that rejects the call blocks everyone), the Vyper
   0.2.15–0.3.0 reentrancy-lock bug, locked ether, unprotected upgrades,
   proxy and diamond detection (EIP-1967 / beacon / ZeppelinOS / EIP-1167 / storage-slot /
-  EIP-2535) with on-chain resolution, known compiler bugs for the detected solc version (a bug that needs
+  EIP-2535) with on-chain resolution, a role check that trusts a contract the token itself
+  calls on a public path (`trusted-callee-loop`: the gate authenticates a hook that acts for
+  any caller, confirmed when the fetched hook forwards calls), a balance lowered on an account
+  the caller neither owns nor has an allowance for (`third-party-balance-debit`, critical when
+  the account is the stored liquidity pair), a pair `sync()` reachable after balances or other
+  contracts were changed (`pair-sync-after-state-change`), known compiler bugs for the detected solc version (a bug that needs
   transient storage or calldata copies is dropped when the bytecode has none, and one whose
   trigger the bytecode cannot show, such as `--via-ir` or inline assembly, is informational). Rules look
   through internal helpers (a call in a shared `_safeTransfer` is attributed to every external
@@ -242,8 +247,9 @@ cargo build --release
 # with each function marked by the address whose code holds it, one storage layout (slots two
 # parts type differently are reported as storage collisions), one report. Hard-coded call
 # targets of every part are fetched one level further and resolved the same way, so a
-# dependency that is itself a proxy appears as its implementation. --no-follow-proxy turns
-# all of this off.
+# dependency that is itself a proxy appears as its implementation. Call targets held in
+# storage (a controller, a router set by the owner) are read from the chain and linked the
+# same way. --no-follow-proxy turns all of this off.
 
 # pre-deployment review: paste the compiled bytecode (creation or runtime)
 solc --bin MyContract.sol | tail -1 > my.hex

@@ -700,3 +700,96 @@ fn a_proxy_composite_takes_every_implementation_function_and_flags_slot_collisio
     let r = analyze::analyze(&c);
     assert!(finding(&r, "storage-collision").is_some(), "{:?}", ids(&r));
 }
+
+/// `CALL(gas, SLOAD(slot), 0, mem[0..len], out 0)` with the 4-byte `selector` at memory 0 and
+/// `extra` assembled before the call (for payload words after the selector).
+fn call_stored(slot: u8, selector: u32, extra: &str, len: u8) -> String {
+    format!(
+        "PUSH4 {selector:#010x} PUSH1 0xe0 SHL PUSH1 0x00 MSTORE {extra} PUSH1 0x00 PUSH1 0x00 PUSH1 {len:#04x} PUSH1 0x00 PUSH1 0x00 PUSH1 {slot:#04x} SLOAD GAS CALL POP STOP"
+    )
+}
+
+#[test]
+fn a_debit_of_the_stored_pair_is_critical_and_own_or_allowed_debits_are_not() {
+    // balanceOf[SLOAD(9)] -= calldata[4] in a function anyone can call; another function
+    // calls sync() on SLOAD(9), which marks slot 9 as the pair.
+    let debit_pair = "PUSH1 0x09 SLOAD PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD PUSH1 0x04 CALLDATALOAD SWAP1 SUB SWAP1 SSTORE STOP";
+    let sync_pair = call_stored(9, 0xfff6cae9, "", 4);
+    let code = dispatcher3(debit_pair, &sync_pair, "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f = finding(&r, "third-party-balance-debit").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Critical, "{f:?}");
+    assert!(
+        f.description.contains("liquidity pair"),
+        "{}",
+        f.description
+    );
+
+    // balanceOf[msg.sender] -= amount: the caller's own balance.
+    let debit_self = "CALLER PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD PUSH1 0x04 CALLDATALOAD SWAP1 SUB SWAP1 SSTORE STOP";
+    let code = dispatcher3(debit_self, "STOP", "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    assert!(
+        finding(&r, "third-party-balance-debit").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+
+    // balanceOf[from] -= amount after reading allowance[from][msg.sender]: a transferFrom.
+    let debit_allowed = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x04 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 PUSH1 0x20 MSTORE CALLER PUSH1 0x00 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 SLOAD PUSH1 0x24 CALLDATALOAD GT ISZERO PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD PUSH1 0x24 CALLDATALOAD SWAP1 SUB SWAP1 SSTORE STOP";
+    let code = dispatcher3(debit_allowed, "STOP", "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    assert!(
+        finding(&r, "third-party-balance-debit").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+}
+
+#[test]
+fn a_gate_on_an_address_the_contract_calls_publicly_is_a_trust_loop() {
+    // x: require(msg.sender == SLOAD(11)); slot1 = 1.  y: calls SLOAD(11) with msg.sender.
+    let gated = "PUSH1 0x0b SLOAD CALLER EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST PUSH1 0x01 PUSH1 0x01 SSTORE STOP";
+    let hook = call_stored(11, 0x11111111, "CALLER PUSH1 0x04 MSTORE", 0x24);
+    let code = dispatcher3(gated, &hook, "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f = finding(&r, "trusted-callee-loop").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium);
+    assert!(f.function.as_deref().unwrap().contains("aaaaaaaa"), "{f:?}");
+    assert!(
+        f.description.contains("passing the sender"),
+        "{}",
+        f.description
+    );
+
+    // The same gate without any public call to that address is an ordinary privileged function.
+    let code = dispatcher3(gated, "STOP", "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    assert!(
+        finding(&r, "trusted-callee-loop").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+}
+
+#[test]
+fn a_sync_after_a_state_changing_call_is_reported() {
+    // transfer(...) on SLOAD(10), then sync() on SLOAD(9).
+    let first = call_stored(10, 0xa9059cbb, "", 4)
+        .trim_end_matches(" STOP")
+        .to_string();
+    let then_sync = call_stored(9, 0xfff6cae9, "", 4);
+    let code = dispatcher3(&format!("{first} {then_sync}"), "STOP", "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f = finding(&r, "pair-sync-after-state-change").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High);
+
+    // sync() alone, nothing moved before it: not reported.
+    let code = dispatcher3(&then_sync, "STOP", "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    assert!(
+        finding(&r, "pair-sync-after-state-change").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+}

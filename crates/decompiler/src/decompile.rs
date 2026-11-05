@@ -203,6 +203,13 @@ pub struct Contract {
     /// (1..=9) are excluded.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub call_targets: Vec<String>,
+    /// Storage slots whose value is called with `CALL`/`STATICCALL`/`CALLCODE`: dependencies
+    /// chosen at run time, read and linked when the contract is fetched by address.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub call_target_slots: Vec<String>,
+    /// The addresses found in `call_target_slots` when fetched: `(slot, address)`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stored_targets: Vec<(String, String)>,
     /// Contracts fetched and decompiled at this contract's hard-coded call targets, one level
     /// deep, when following links over RPC. Each is taken as found: a target that is itself a
     /// proxy appears as its stub, and the JSON output carries the contracts without reports.
@@ -1348,6 +1355,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     let mut dc_slots: Vec<String> = Vec::new();
     let mut dc_targets: Vec<String> = Vec::new();
     let mut call_targets: Vec<String> = Vec::new();
+    let mut call_target_slots: Vec<String> = Vec::new();
     let mut diamond_lookup: Option<DiamondLookup> = None;
     for f in &functions {
         let Some(l) = &f.lifted else { continue };
@@ -1359,6 +1367,16 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                         _ => *addr,
                     };
                     match expr::node(a) {
+                        Node::SLoad(k, false, _)
+                            if matches!(*kind, op::CALL | op::STATICCALL | op::CALLCODE) =>
+                        {
+                            if let Some(c) = expr::as_const(k) {
+                                let h = c.to_hex_padded(32);
+                                if !call_target_slots.contains(&h) {
+                                    call_target_slots.push(h);
+                                }
+                            }
+                        }
                         Node::SLoad(k, false, _) if *kind == op::DELEGATECALL => {
                             if let Some(c) = expr::as_const(k) {
                                 let h = c.to_hex_padded(32);
@@ -1416,6 +1434,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         delegatecall_slots: dc_slots,
         delegatecall_targets: dc_targets,
         call_targets,
+        call_target_slots,
+        stored_targets: Vec::new(),
         linked: Vec::new(),
         address: None,
         chain: None,

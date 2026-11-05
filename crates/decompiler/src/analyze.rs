@@ -8,6 +8,7 @@ use crate::function::FnKind;
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::sigs;
+use crate::ssa;
 use crate::type_rules;
 use crate::u256::U256;
 use serde::Serialize;
@@ -162,6 +163,20 @@ fn mentions_returndata(e: ExprId, seq: u32) -> bool {
 
 const SEL_TRANSFER: u32 = 0xa9059cbb;
 const SEL_TRANSFER_FROM: u32 = 0x23b872dd;
+/// `sync()` of a Uniswap V2 pair.
+const SEL_SYNC: u32 = 0xfff6cae9;
+/// `skim(address)` of a Uniswap V2 pair.
+const SEL_SKIM: u32 = 0xbc25cf77;
+/// `getReserves()` of a Uniswap V2 pair.
+const SEL_GET_RESERVES: u32 = 0x0902f1ac;
+/// `token0()` of a Uniswap V2 pair.
+const SEL_TOKEN0: u32 = 0x0dfe1681;
+/// `token1()` of a Uniswap V2 pair.
+const SEL_TOKEN1: u32 = 0xd21220a7;
+/// `getPair(address,address)` of a Uniswap V2 factory.
+const SEL_GET_PAIR: u32 = 0xe6a43905;
+/// `createPair(address,address)` of a Uniswap V2 factory.
+const SEL_CREATE_PAIR: u32 = 0xc9c65396;
 const SEL_APPROVE: u32 = 0x095ea7b3;
 const SEL_BALANCE_OF: u32 = 0x70a08231;
 const SEL_LATEST_ROUND_DATA: u32 = 0xfeaf968c;
@@ -263,6 +278,54 @@ struct FnFacts {
     /// Some guard tests a constant slot for "not yet set" (`require(owner == 0)`): an
     /// initializer, reachable only while the contract is uninitialised.
     init_guarded: bool,
+    /// Calls whose target is an address held in a constant storage slot: the slot, the
+    /// payload selector when known, whether the call is static, and whether the payload
+    /// carries `msg.sender`.
+    stored_callees: Vec<StoredCall>,
+    /// Writes that subtract from a balance entry: the ledger root, the entry key, the printed
+    /// statement.
+    debits: Vec<Debit>,
+    /// Mapping keys whose allowance for `msg.sender` the function reads (`allowance[k][sender]`).
+    allowance_of: Vec<ExprId>,
+    /// `sync()`/`skim()` calls on a pair: the printed target, whether a storage write or a
+    /// state-changing call precedes them in the function, the printed statement.
+    syncs: Vec<(String, bool, String)>,
+    /// Constant slots written with the result of `getPair`/`createPair`: they hold a pair.
+    pair_slots: Vec<ExprId>,
+    /// The function (or a helper it calls) authorises per account: it reads an entry keyed by
+    /// `msg.sender` under another account (`allowance[owner][sender]`, operator approvals) or
+    /// compares `msg.sender` with a mapping value (`approved[tokenId]`, `owners[id]`).
+    account_authorised: bool,
+    /// The function recovers a signer (`ecrecover`): accounts may be authorised by signature.
+    signature_authorised: bool,
+}
+
+/// A call to an address held in a constant storage slot.
+#[derive(Clone, Debug)]
+struct StoredCall {
+    /// The constant slot key.
+    slot: ExprId,
+    /// Selector of the payload, when it is known.
+    selector: Option<u32>,
+    /// `STATICCALL`.
+    is_static: bool,
+    /// The payload mentions `msg.sender`.
+    passes_sender: bool,
+    /// Printed statement.
+    line: String,
+}
+
+/// A write that lowers a balance entry.
+#[derive(Clone, Debug)]
+struct Debit {
+    /// Root slot of the ledger mapping.
+    root: U256,
+    /// The entry key (the account).
+    key: ExprId,
+    /// The account as printed.
+    account: String,
+    /// Printed statement.
+    line: String,
 }
 
 /// Where the value stored into a constant slot comes from.
@@ -349,8 +412,18 @@ fn collect_facts(
         delegatecalls: Vec::new(),
         time_gated: false,
         init_guarded: false,
+        stored_callees: Vec::new(),
+        debits: Vec::new(),
+        allowance_of: Vec::new(),
+        syncs: Vec::new(),
+        pair_slots: Vec::new(),
+        account_authorised: false,
+        signature_authorised: false,
     };
     for cond in guard_conds(events) {
+        if compares_sender_with_entry(cond) {
+            facts.account_authorised = true;
+        }
         if is_auth_cond_in(cond, &ctx.roles) {
             let mut slots = HashSet::new();
             collect_sload_keys(cond, &mut slots);
@@ -378,6 +451,11 @@ fn collect_facts(
             facts.init_guarded = true;
         }
     }
+    let layout = ctx.c.compiler.layout;
+    let mut mutated_before = false;
+    // Selector of each call by sequence number, so a value stored from a call's return data
+    // can be traced to what was asked.
+    let mut call_selector: HashMap<u32, u32> = HashMap::new();
     for ev in events {
         match &ev.stmt {
             Some(
@@ -391,10 +469,46 @@ fn collect_facts(
                 facts
                     .const_writes
                     .push((*key, write_source(*val), emit::fmt_stmt(st, names)));
+                let from_pair_lookup = mentions(*val, &|n| {
+                    matches!(n, Node::ReturnData(seq, _)
+                        if matches!(call_selector.get(seq), Some(&SEL_GET_PAIR | &SEL_CREATE_PAIR)))
+                });
+                if from_pair_lookup {
+                    facts.pair_slots.push(*key);
+                }
+                mutated_before = true;
+            }
+            Some(
+                st @ Stmt::SStore {
+                    key,
+                    val,
+                    transient: false,
+                    ..
+                },
+            ) => {
+                if let Some((root, account)) = ledger_entry(*key, layout) {
+                    // A fixed amount (an NFT's one unit) is bookkeeping, not a chosen debit.
+                    if subtracts_from(*val, *key).is_some_and(|amount| !expr::is_const(amount)) {
+                        facts.debits.push(Debit {
+                            root,
+                            key: account,
+                            account: emit::fmt_expr(account, names),
+                            line: emit::fmt_stmt(st, names),
+                        });
+                    }
+                }
+                mutated_before = true;
             }
             Some(
                 st @ Stmt::Call {
-                    kind, addr, value, ..
+                    kind,
+                    addr,
+                    value,
+                    input,
+                    input_head,
+                    in_len,
+                    seq,
+                    ..
                 },
             ) => {
                 if *kind == op::DELEGATECALL || *kind == op::CALLCODE {
@@ -405,13 +519,77 @@ fn collect_facts(
                         facts.ether_out.push((*addr, *v, emit::fmt_stmt(st, names)));
                     }
                 }
+                let selector = input
+                    .as_ref()
+                    .and_then(|w| w.first().copied())
+                    .or(input_head.first().copied())
+                    .and_then(|w0| {
+                        emit::leading_selector(
+                            w0,
+                            expr::as_const(*in_len).and_then(|l| l.as_usize()),
+                        )
+                    });
+                if let Some(sel) = selector {
+                    call_selector.insert(*seq, sel);
+                }
+                let is_static = *kind == op::STATICCALL;
+                if let Some(slot) = stored_address_slot(*addr) {
+                    let words: Vec<ExprId> = input.clone().unwrap_or_else(|| input_head.clone());
+                    facts.stored_callees.push(StoredCall {
+                        slot,
+                        selector,
+                        is_static,
+                        passes_sender: words.iter().any(|w| from_caller(*w)),
+                        line: emit::fmt_stmt(st, names),
+                    });
+                }
+                if matches!(selector, Some(SEL_SYNC | SEL_SKIM)) {
+                    facts.syncs.push((
+                        emit::fmt_expr(*addr, names),
+                        mutated_before,
+                        emit::fmt_stmt(st, names),
+                    ));
+                }
+                if !is_static {
+                    mutated_before = true;
+                }
             }
             _ => {}
+        }
+        let exprs: Vec<ExprId> = ev
+            .stmt
+            .iter()
+            .flat_map(lift::stmt_exprs)
+            .chain(ev.term.iter().flat_map(lift::term_exprs))
+            .collect();
+        for e in &exprs {
+            collect_allowance_keys(*e, layout, &mut facts.allowance_of);
+            if reads_under_sender(*e, layout) {
+                facts.account_authorised = true;
+            }
+        }
+        if let Some(Stmt::Call { addr, .. }) = &ev.stmt {
+            if expr::as_const(*addr) == Some(U256::ONE) {
+                facts.signature_authorised = true;
+            }
         }
         if let Some(Term::SelfDestruct(a)) = &ev.term {
             facts
                 .selfdestructs
                 .push((*a, format!("selfdestruct({});", emit::fmt_expr(*a, names))));
+        }
+    }
+    if !facts.account_authorised {
+        'callees: for cf in transitive_callees(ctx, f) {
+            let Some(l) = &cf.lifted else { continue };
+            for nd in &l.nodes {
+                for e in lift::node_exprs(nd) {
+                    if reads_under_sender(e, layout) || compares_sender_with_entry(e) {
+                        facts.account_authorised = true;
+                        break 'callees;
+                    }
+                }
+            }
         }
     }
     if std::env::var("EVMDEC_DEBUG_FACTS").is_ok() {
@@ -537,6 +715,122 @@ fn from_calldata(e: ExprId) -> bool {
         )
     })
 }
+/// `e` without an address mask (`x & (2^160 - 1)`), so the same account compares equal
+/// whether or not a cast was printed around it.
+fn unmask(e: ExprId) -> ExprId {
+    match expr::node(e) {
+        Node::Op(op::AND, v) if expr::as_const(v[1]) == Some(expr::mask_bits(160)) => unmask(v[0]),
+        _ => e,
+    }
+}
+
+/// The constant slot an address expression is loaded from (`SLOAD(k)`, possibly masked).
+fn stored_address_slot(e: ExprId) -> Option<ExprId> {
+    let inner = match expr::node(e) {
+        Node::Op(op::AND, v) => v[0],
+        _ => e,
+    };
+    match expr::node(inner) {
+        Node::SLoad(k, false, _) if expr::is_const(k) => Some(k),
+        _ => None,
+    }
+}
+
+/// `(root, account)` when `key` is an entry of a single-level mapping: `keccak(account . root)`.
+fn ledger_entry(key: ExprId, layout: emit::MappingLayout) -> Option<(U256, ExprId)> {
+    let path = ssa::slot_path(key, layout)?;
+    match path.steps[..] {
+        [ssa::Step::Key(k)] => Some((path.root, k)),
+        _ => None,
+    }
+}
+
+/// `Some(amount)` when `val` is `SLOAD(key) - amount`: the entry lowered rather than set.
+fn subtracts_from(val: ExprId, key: ExprId) -> Option<ExprId> {
+    match expr::node(val) {
+        Node::Op(op::SUB, v) if matches!(expr::node(v[0]), Node::SLoad(k, false, _) if k == key) => {
+            Some(v[1])
+        }
+        _ => None,
+    }
+}
+
+/// Does `e` read a mapping entry keyed by `msg.sender` under another key (`x[a][sender]`)?
+fn reads_under_sender(e: ExprId, layout: emit::MappingLayout) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 20_000 {
+            continue;
+        }
+        if let Node::SLoad(k, false, _) = expr::node(x) {
+            if let Some(path) = ssa::slot_path(k, layout) {
+                if path.steps.len() >= 2
+                    && matches!(path.steps.last(), Some(ssa::Step::Key(s)) if from_caller(*s))
+                {
+                    return true;
+                }
+            }
+        }
+        stack.extend(expr::children(x));
+    }
+    false
+}
+
+/// Does `e` compare `msg.sender` with a value loaded from a mapping entry (`approved[id] ==
+/// sender`, `owner[id] == sender`)?
+fn compares_sender_with_entry(e: ExprId) -> bool {
+    let entry_load = |x: ExprId| {
+        let x = unmask(x);
+        matches!(expr::node(x), Node::SLoad(k, false, _) if !expr::is_const(k))
+    };
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 20_000 {
+            continue;
+        }
+        if let Node::Op(op::EQ, v) = expr::node(x) {
+            let sender = |y: ExprId| matches!(expr::node(unmask(y)), Node::Env(op::CALLER, _));
+            if (sender(v[0]) && entry_load(v[1])) || (sender(v[1]) && entry_load(v[0])) {
+                return true;
+            }
+        }
+        stack.extend(expr::children(x));
+    }
+    false
+}
+
+/// Record the outer keys of two-level mapping reads whose inner key is `msg.sender`:
+/// `allowance[owner][msg.sender]`.
+fn collect_allowance_keys(e: ExprId, layout: emit::MappingLayout, out: &mut Vec<ExprId>) {
+    // Every loaded key, including the ones that mention msg.sender (which
+    // `collect_sload_keys` leaves out on purpose): the allowance key does.
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 20_000 {
+            continue;
+        }
+        if let Node::SLoad(k, false, _) = expr::node(x) {
+            keys.push(k);
+        }
+        stack.extend(expr::children(x));
+    }
+    for k in keys {
+        let Some(path) = ssa::slot_path(k, layout) else {
+            continue;
+        };
+        if let [ssa::Step::Key(owner), ssa::Step::Key(spender)] = path.steps[..] {
+            let owner = unmask(owner);
+            if from_caller(spender) && !out.contains(&owner) {
+                out.push(owner);
+            }
+        }
+    }
+}
+
 fn from_storage(e: ExprId) -> bool {
     mentions(e, &|n| matches!(n, Node::SLoad(..)))
 }
@@ -3152,6 +3446,7 @@ pub fn analyze(c: &Contract) -> Report {
     // ---- cross-function passes: inferred access policy, attack chains ----
     policy_findings(&facts, &mut findings);
     chain_findings(&facts, &auth, &mut findings);
+    trust_findings(c, &facts, &mut findings);
 
     // ---- widths, signedness and kinds of values ----
     type_rules::findings(c, &c.types, names_for, &mut findings);
@@ -3979,6 +4274,266 @@ fn join_names(names: &[&str], max: usize) -> String {
 /// the same slot, that is the contract's policy. A state-changing function without the check
 /// that still does what the gated ones do (moves ether, self-destructs, delegatecalls, or writes
 /// a configuration slot otherwise written only behind the check) is reported as a deviation.
+/// Rules about what a contract hands to the addresses it stores: a role that is also a callee
+/// on a public path (the gate authenticates a contract this contract drives), a balance taken
+/// from an account the caller does not own, and a pair synchronised after state was moved.
+fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) {
+    let slot_const = |e: ExprId| expr::as_const(e);
+    // Slots that hold a pair: called with a pair selector somewhere, or returned by a getter
+    // whose known name says so.
+    let mut pair_slots: HashSet<U256> = HashSet::new();
+    for x in facts {
+        for sc in &x.stored_callees {
+            if matches!(
+                sc.selector,
+                Some(SEL_SYNC | SEL_SKIM | SEL_GET_RESERVES | SEL_TOKEN0 | SEL_TOKEN1)
+            ) {
+                if let Some(k) = slot_const(sc.slot) {
+                    pair_slots.insert(k);
+                }
+            }
+        }
+    }
+    for x in facts {
+        for k in &x.pair_slots {
+            if let Some(kc) = slot_const(*k) {
+                pair_slots.insert(kc);
+            }
+        }
+    }
+    for f in &c.functions {
+        let named_pair = f.signature.as_deref().is_some_and(|s| {
+            let l = s.to_ascii_lowercase();
+            l.contains("pair") || l.contains("pool") || l.contains("lp")
+        });
+        if !named_pair || f.kind != FnKind::External {
+            continue;
+        }
+        if let Some(l) = &f.lifted {
+            for nd in &l.nodes {
+                for e in lift::node_exprs(nd) {
+                    let mut keys = HashSet::new();
+                    collect_sload_keys(e, &mut keys);
+                    for k in keys {
+                        if let Some(kc) = expr::as_const(k) {
+                            pair_slots.insert(kc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Rule: a gate slot that is also a callee on a public path.
+    let mut open_gates: HashMap<usize, Vec<String>> = HashMap::new();
+    for x in facts
+        .iter()
+        .filter(|x| x.external && x.state_changing && x.caller_checked)
+    {
+        for (slot, slot_name) in &x.auth_slots {
+            let Some(sk) = slot_const(*slot) else {
+                continue;
+            };
+            let callers: Vec<(&FnFacts, &StoredCall)> = facts
+                .iter()
+                .filter(|y| y.external && !y.caller_checked && y.pc != x.pc)
+                .flat_map(|y| {
+                    y.stored_callees
+                        .iter()
+                        .filter(|sc| !sc.is_static && slot_const(sc.slot) == Some(sk))
+                        .map(move |sc| (y, sc))
+                })
+                .collect();
+            if callers.is_empty() {
+                continue;
+            }
+            let (y, sc) = callers[0];
+            let via: Vec<String> = callers.iter().map(|(y, _)| y.name.clone()).collect();
+            let forwarded = linked_forwards(c, sk, x, sc.selector);
+            let (sev, tail) = match &forwarded {
+                Some(note) => (Severity::Critical, note.clone()),
+                None => (
+                    Severity::Medium,
+                    "If that contract forwards calls it receives (a sell hook, a router, a controller), the gate is open to every caller; decompile by address to have it fetched and checked.".to_string(),
+                ),
+            };
+            push_fact(findings, "trusted-callee-loop", "A role check trusts a contract this contract calls on a public path", sev, Confidence::Medium, x,
+                format!(
+                    "`{}` is gated on the address in `{}`, but `{}` calls that same address on a path anyone can take{}. The check authenticates a contract this contract itself drives rather than a person. {}",
+                    x.name, slot_name, y.name,
+                    if sc.passes_sender { ", passing the sender along" } else { "" },
+                    tail
+                ),
+                vec![sc.line.clone()],
+                "Gate the function on the account that may use it, not on a contract that acts for arbitrary callers, and never let a hook re-enter privileged paths.");
+            open_gates.entry(x.pc).or_default().extend(via);
+        }
+    }
+
+    // Rule: a balance lowered on an account the caller neither owns nor has an allowance for.
+    // Only ledgers count (address-keyed numeric mappings that are moved between accounts), only
+    // accounts the bytecode names (a stored address or a calldata word), and not where the
+    // function authorises per account, by signature, or debits the very account its gate
+    // compares the caller to.
+    let ledgers: HashSet<U256> = crate::invariant::balance_mappings(&c.types)
+        .into_iter()
+        .map(|l| l.root)
+        .filter(|r| crate::invariant::is_ledger(c, *r))
+        .collect();
+    for x in facts {
+        if x.account_authorised || x.signature_authorised {
+            continue;
+        }
+        for d in &x.debits {
+            if !ledgers.contains(&d.root) {
+                continue;
+            }
+            let target_slot = stored_address_slot(d.key).and_then(slot_const);
+            let gate_target = target_slot
+                .is_some_and(|k| x.auth_slots.iter().any(|(s, _)| slot_const(*s) == Some(k)));
+            if gate_target || (target_slot.is_none() && !from_calldata(unmask(d.key))) {
+                continue;
+            }
+            if std::env::var("EVMDEC_DEBUG_TRUST").is_ok() {
+                eprintln!(
+                    "[trust] {} debit {} key={:?} allowances={:?}",
+                    x.name,
+                    d.account,
+                    unmask(d.key),
+                    x.allowance_of
+                );
+            }
+            if from_caller(d.key)
+                || x.allowance_of.contains(&unmask(d.key))
+                || mentions(d.key, &|n| matches!(n, Node::Env(op::ADDRESS, _)))
+            {
+                continue;
+            }
+            let target_slot = stored_address_slot(d.key).and_then(slot_const);
+            let is_pool = target_slot.is_some_and(|k| pair_slots.contains(&k));
+            let (what, sev) = if is_pool {
+                ("the stored liquidity pair", Severity::Critical)
+            } else if target_slot.is_some() {
+                ("an address held in storage", Severity::High)
+            } else {
+                (
+                    "an account chosen by the caller",
+                    if x.caller_checked {
+                        Severity::Medium
+                    } else {
+                        Severity::High
+                    },
+                )
+            };
+            let open = open_gates.get(&x.pc);
+            let gate = match (x.caller_checked, open) {
+                (true, Some(via)) => format!(" The function is gated, but the gate is open through {} (see the trusted-callee finding).", via.iter().map(|v| format!("`{}`", v)).collect::<Vec<_>>().join(", ")),
+                (true, None) => " The function is gated, so this is what the role holder can do to other accounts.".to_string(),
+                (false, _) => " Anyone can call it.".to_string(),
+            };
+            let pool_note = if is_pool {
+                " Removing tokens from the pair without moving its reserves leaves the pair pricing against a balance that is gone; a `sync()` then collapses the recorded reserve and the next swap takes the other asset."
+            } else {
+                ""
+            };
+            push_fact(findings, "third-party-balance-debit", "A balance is taken from an account the caller does not own", sev, Confidence::Medium, x,
+                format!(
+                    "`{}` lowers `{}` on {}: the entry `{}` in the mapping at slot {} is reduced by a chosen amount, with no transfer from the caller and no allowance check.{}{}",
+                    x.name, d.account, what, d.account, d.root.to_hex(), gate, pool_note
+                ),
+                vec![d.line.clone()],
+                "Only debit `msg.sender` or an account whose allowance for the caller is checked; never debit the pair.");
+        }
+    }
+
+    // Rule: a pair synchronised after this function moved state.
+    for x in facts {
+        for (addr, after, line) in &x.syncs {
+            if !after {
+                continue;
+            }
+            let sev = if x.caller_checked {
+                Severity::Medium
+            } else {
+                Severity::High
+            };
+            push_fact(findings, "pair-sync-after-state-change", "A pair is synchronised after balances or other contracts were changed", sev, Confidence::Medium, x,
+                format!(
+                    "`{}` calls `sync()`/`skim()` on `{}` after writing storage or calling another contract in the same path. `sync()` makes the pair adopt its current token balances as reserves, so any balance moved beforehand is priced in at once.{}",
+                    x.name, addr,
+                    if x.caller_checked { "" } else { " Anyone can trigger this." }
+                ),
+                vec![line.clone()],
+                "Do not let callers reach a pair's `sync()` after state that affects the pair's balances has been changed in the same transaction.");
+        }
+    }
+}
+
+/// When the contract was fetched with its dependencies, does the contract held in slot `slot`
+/// expose a function anyone can call that calls out again (the loop that opens `gated`)? A
+/// note for the finding when it does.
+fn linked_forwards(
+    c: &Contract,
+    slot: U256,
+    gated: &FnFacts,
+    called: Option<u32>,
+) -> Option<String> {
+    let slot_hex = slot.to_hex_padded(32);
+    let address = c
+        .stored_targets
+        .iter()
+        .find(|(s, _)| s.eq_ignore_ascii_case(&slot_hex))
+        .map(|(_, a)| a.clone())?;
+    let lc = c.linked.iter().find(|lc| {
+        lc.address
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&address))
+    })?;
+    let sel = gated
+        .name
+        .split('[')
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .map(|s| s.trim().to_string());
+    let report = analyze(lc);
+    let calls_back = sel.as_deref().is_some_and(|s| {
+        lc.selectors_called
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(s))
+    });
+    let mut forwarders: Vec<&String> = report
+        .unauthenticated_state_changers
+        .iter()
+        .filter(|name| {
+            report
+                .external_calls
+                .iter()
+                .any(|line| line.starts_with(name.as_str()) && !line.contains("staticcall"))
+        })
+        .collect();
+    // The function this contract calls comes first, when it is among them.
+    if let Some(sel) = called {
+        let tag = format!("{:#010x}", sel);
+        forwarders.sort_by_key(|name| !name.contains(&tag));
+    }
+    if forwarders.is_empty() && !calls_back {
+        return None;
+    }
+    Some(format!(
+        "The contract at `{}` was fetched: {}{} so the loop is open to every caller.",
+        address,
+        match forwarders.first() {
+            Some(f) => format!("`{}` there can be called by anyone and calls out again", f),
+            None => "it calls out from its functions".to_string(),
+        },
+        if calls_back {
+            " (it calls this function's selector),"
+        } else {
+            ","
+        }
+    ))
+}
+
 fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let gated: Vec<&FnFacts> = facts
         .iter()

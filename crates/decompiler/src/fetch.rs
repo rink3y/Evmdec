@@ -9,6 +9,7 @@
 //! dependency that is itself a proxy appears as its implementation.
 
 use crate::decompile::{self, Contract, Options, PartInput, PartRole, ProxyRef};
+use crate::expr;
 use crate::rpc::{self, Client};
 use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
@@ -134,19 +135,34 @@ impl Fetcher<'_> {
         Ok(c)
     }
 
-    /// Fetch the hard-coded call targets of `c` (every part's) into `c.linked`.
+    /// Fetch the call targets of `c` (every part's hard-coded ones, then the ones held in
+    /// storage, read from the chain) into `c.linked`.
     fn link(&mut self, c: &mut Contract, address: &str, depth: usize) {
         let own: Vec<String> = c
             .parts
             .iter()
             .map(|p| p.address.to_ascii_lowercase())
             .collect();
-        let targets: Vec<String> = c
-            .call_targets
-            .iter()
+        let mut targets: Vec<String> = c.call_targets.clone();
+        for slot in c.call_target_slots.clone() {
+            match self.client.get_storage(address, &slot) {
+                Ok(v) => {
+                    let a = v & expr::mask_bits(160);
+                    if !a.is_zero() {
+                        let t = rpc::addr_to_string(a);
+                        c.stored_targets.push((slot, t.clone()));
+                        if !targets.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+                            targets.push(t);
+                        }
+                    }
+                }
+                Err(e) => (self.log)(&format!("slot {}: {}", slot, e)),
+            }
+        }
+        let targets: Vec<String> = targets
+            .into_iter()
             .filter(|t| !own.contains(&t.to_ascii_lowercase()))
             .filter(|t| !t.eq_ignore_ascii_case(address))
-            .cloned()
             .collect();
         if targets.len() > self.policy.max_linked {
             (self.log)(&format!(

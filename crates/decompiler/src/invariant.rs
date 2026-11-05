@@ -45,19 +45,19 @@ pub fn findings(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
 
 /// A `mapping(address => uint)` that behaves like a balance ledger.
 #[derive(Clone, Copy, Debug)]
-struct Ledger {
+pub(crate) struct Ledger {
     /// Slot of the declared mapping.
-    root: U256,
+    pub(crate) root: U256,
     /// Some entry is compared as an unsigned number (a solvency check such as
     /// `require(balance >= amount)`), which pins the values as non-negative.
-    compared_unsigned: bool,
+    pub(crate) compared_unsigned: bool,
 }
 
 /// Is the `mapping(address => uint)` at `root` a ledger rather than a counter? A ledger is
 /// debited somewhere (an entry is written with a value that subtracts from a read of the same
 /// mapping) or pays out (an entry is read into the value or payload of an outgoing call). A
 /// nonce or counter mapping only ever grows and never leaves the contract.
-fn is_ledger(c: &Contract, root: U256) -> bool {
+pub(crate) fn is_ledger(c: &Contract, root: U256) -> bool {
     let layout = c.compiler.layout;
     let entry_of = |key: ExprId| is_entry_of(key, root, layout);
     // `slot_path` interns constants, so it must not run inside an arena borrow: collect the
@@ -94,7 +94,7 @@ fn is_ledger(c: &Contract, root: U256) -> bool {
 /// The `mapping(address => uintN)` variables: candidate balance ledgers. The value is a
 /// number: a resolved unsigned width, or an untyped word that only ever meets arithmetic (a
 /// full-width `uint256` has no narrowing evidence to resolve from).
-fn balance_mappings(env: &TypeEnv) -> Vec<Ledger> {
+pub(crate) fn balance_mappings(env: &TypeEnv) -> Vec<Ledger> {
     let mut out: Vec<Ledger> = Vec::new();
     for loc in env.locations() {
         let Loc::Slot(shape) = loc else { continue };

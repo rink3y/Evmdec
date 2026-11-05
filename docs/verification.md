@@ -89,6 +89,24 @@ parts type differently is a `storage-collision` finding; a routed selector the s
 itself is reported as shadowed. Hard-coded call targets of every part are fetched one level
 further and resolved the same way.
 
+Three rules look at what a contract hands to the addresses it keeps in storage, since a sender
+check is only as strong as the party it names. `trusted-callee-loop` fires when the slot a role
+check compares `msg.sender` against is also the target of a call made on a path anyone can
+take: the gate authenticates a contract this contract drives (a sell hook, a controller), not
+a person; when the contract was fetched by address the slot is read, the callee fetched, and
+the finding becomes critical if the callee exposes a function anyone can call that calls out
+again. `third-party-balance-debit` fires when a function lowers an entry of a balance ledger
+(an address-keyed numeric mapping moved between accounts) on an account that is neither the
+caller nor covered by an allowance or per-account approval the function reads, nor the very
+account its gate compares the caller to; the account must be one the bytecode names, a stored
+address or a calldata word, and it is critical when that address is the stored liquidity pair
+(a slot written from `getPair`/`createPair`, called with `sync`/`getReserves`, or returned by a
+getter named for it). `pair-sync-after-state-change` fires when `sync()` or `skim()` on a pair
+is reached after storage was written or another contract was called in the same path. The
+TENDRIL token (BSC, November 2026) is the reference case: its `controlburn` debited the pair
+behind a check for a controller the token itself called on every sell, and the controller's
+public `sellToken` closed the loop and called `sync()`.
+
 Two passes run the bytecode rather than match it. The confirmation pass (`confirm.rs`) takes
 the findings whose sink is a concrete instruction (an open `selfdestruct`, an ether withdrawal,
 an owner write, an arbitrary call) and searches for calldata under which a caller holding no

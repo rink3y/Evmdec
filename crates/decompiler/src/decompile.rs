@@ -543,6 +543,12 @@ pub fn compose(
                 shell.call_targets.push(v);
             }
         }
+        // The part's code calls through slots of the shell's storage.
+        for v in part.call_target_slots {
+            if !shell.call_target_slots.contains(&v) {
+                shell.call_target_slots.push(v);
+            }
+        }
         shell.string_loaders.extend(part.string_loaders);
         shell.types.absorb(part.types);
         let s = &mut shell.stats;

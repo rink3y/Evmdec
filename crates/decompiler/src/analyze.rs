@@ -254,6 +254,8 @@ type MemWrites = Vec<(ExprId, Option<u64>)>;
 struct FnFacts {
     /// Display name (`display_name`).
     name: String,
+    /// The 4-byte selector as `0x`-prefixed hex, for external functions.
+    selector: Option<String>,
     /// Entry pc, used as the finding's location.
     pc: usize,
     /// An externally callable function (not fallback/receive/constructor).
@@ -287,9 +289,8 @@ struct FnFacts {
     debits: Vec<Debit>,
     /// Mapping keys whose allowance for `msg.sender` the function reads (`allowance[k][sender]`).
     allowance_of: Vec<ExprId>,
-    /// `sync()`/`skim()` calls on a pair: the printed target, whether a storage write or a
-    /// state-changing call precedes them in the function, the printed statement.
-    syncs: Vec<(String, bool, String)>,
+    /// `sync()`/`skim()` calls on a pair.
+    syncs: Vec<PairSync>,
     /// Constant slots written with the result of `getPair`/`createPair`: they hold a pair.
     pair_slots: Vec<ExprId>,
     /// The function (or a helper it calls) authorises per account: it reads an entry keyed by
@@ -322,8 +323,19 @@ struct Debit {
     root: U256,
     /// The entry key (the account).
     key: ExprId,
-    /// The account as printed.
-    account: String,
+    /// The account as the printer shows it.
+    account_text: String,
+    /// Printed statement.
+    line: String,
+}
+
+/// A `sync()`/`skim()` call on a pair.
+#[derive(Clone, Debug)]
+struct PairSync {
+    /// The pair as the printer shows it.
+    target: String,
+    /// A storage write or a state-changing call on a path that reaches this call precedes it.
+    after_mutation: bool,
     /// Printed statement.
     line: String,
 }
@@ -398,6 +410,7 @@ fn collect_facts(
 ) -> FnFacts {
     let mut facts = FnFacts {
         name: display_name(f),
+        selector: f.selector.clone(),
         pc: f.pc,
         external: f.kind == FnKind::External,
         state_changing: f.effects.writes_storage
@@ -452,7 +465,9 @@ fn collect_facts(
         }
     }
     let layout = ctx.c.compiler.layout;
-    let mut mutated_before = false;
+    // Events that write storage or call out, so a later `sync()` can be checked against the
+    // ones that actually reach it (not merely precede it in the stream).
+    let mut mutations: Vec<&Event> = Vec::new();
     // Selector of each call by sequence number, so a value stored from a call's return data
     // can be traced to what was asked.
     let mut call_selector: HashMap<u32, u32> = HashMap::new();
@@ -476,7 +491,7 @@ fn collect_facts(
                 if from_pair_lookup {
                     facts.pair_slots.push(*key);
                 }
-                mutated_before = true;
+                mutations.push(ev);
             }
             Some(
                 st @ Stmt::SStore {
@@ -492,12 +507,12 @@ fn collect_facts(
                         facts.debits.push(Debit {
                             root,
                             key: account,
-                            account: emit::fmt_expr(account, names),
+                            account_text: emit::fmt_expr(account, names),
                             line: emit::fmt_stmt(st, names),
                         });
                     }
                 }
-                mutated_before = true;
+                mutations.push(ev);
             }
             Some(
                 st @ Stmt::Call {
@@ -533,8 +548,8 @@ fn collect_facts(
                     call_selector.insert(*seq, sel);
                 }
                 let is_static = *kind == op::STATICCALL;
-                if let Some(slot) = stored_address_slot(*addr) {
-                    let words: Vec<ExprId> = input.clone().unwrap_or_else(|| input_head.clone());
+                if let Some(slot) = ssa::stored_address_slot(*addr) {
+                    let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
                     facts.stored_callees.push(StoredCall {
                         slot,
                         selector,
@@ -544,14 +559,18 @@ fn collect_facts(
                     });
                 }
                 if matches!(selector, Some(SEL_SYNC | SEL_SKIM)) {
-                    facts.syncs.push((
-                        emit::fmt_expr(*addr, names),
-                        mutated_before,
-                        emit::fmt_stmt(st, names),
-                    ));
+                    let after_mutation = f
+                        .lifted
+                        .as_ref()
+                        .is_some_and(|l| mutations.iter().any(|m| ev_reaches(ctx, l, m, ev)));
+                    facts.syncs.push(PairSync {
+                        target: emit::fmt_expr(*addr, names),
+                        after_mutation,
+                        line: emit::fmt_stmt(st, names),
+                    });
                 }
                 if !is_static {
-                    mutated_before = true;
+                    mutations.push(ev);
                 }
             }
             _ => {}
@@ -724,18 +743,6 @@ fn unmask(e: ExprId) -> ExprId {
     }
 }
 
-/// The constant slot an address expression is loaded from (`SLOAD(k)`, possibly masked).
-fn stored_address_slot(e: ExprId) -> Option<ExprId> {
-    let inner = match expr::node(e) {
-        Node::Op(op::AND, v) => v[0],
-        _ => e,
-    };
-    match expr::node(inner) {
-        Node::SLoad(k, false, _) if expr::is_const(k) => Some(k),
-        _ => None,
-    }
-}
-
 /// `(root, account)` when `key` is an entry of a single-level mapping: `keccak(account . root)`.
 fn ledger_entry(key: ExprId, layout: emit::MappingLayout) -> Option<(U256, ExprId)> {
     let path = ssa::slot_path(key, layout)?;
@@ -747,12 +754,11 @@ fn ledger_entry(key: ExprId, layout: emit::MappingLayout) -> Option<(U256, ExprI
 
 /// `Some(amount)` when `val` is `SLOAD(key) - amount`: the entry lowered rather than set.
 fn subtracts_from(val: ExprId, key: ExprId) -> Option<ExprId> {
-    match expr::node(val) {
-        Node::Op(op::SUB, v) if matches!(expr::node(v[0]), Node::SLoad(k, false, _) if k == key) => {
-            Some(v[1])
-        }
-        _ => None,
-    }
+    let Node::Op(op::SUB, v) = expr::node(val) else {
+        return None;
+    };
+    let reads_entry = matches!(expr::node(v[0]), Node::SLoad(k, false, _) if k == key);
+    reads_entry.then_some(v[1])
 }
 
 /// Does `e` read a mapping entry keyed by `msg.sender` under another key (`x[a][sender]`)?
@@ -4270,18 +4276,17 @@ fn join_names(names: &[&str], max: usize) -> String {
     }
 }
 
-/// Access control by intent: when several state-changing functions compare msg.sender against
-/// the same slot, that is the contract's policy. A state-changing function without the check
-/// that still does what the gated ones do (moves ether, self-destructs, delegatecalls, or writes
-/// a configuration slot otherwise written only behind the check) is reported as a deviation.
-/// Rules about what a contract hands to the addresses it stores: a role that is also a callee
-/// on a public path (the gate authenticates a contract this contract drives), a balance taken
-/// from an account the caller does not own, and a pair synchronised after state was moved.
+/// Rules about what a contract hands to the addresses it stores. A role that is also a callee
+/// on a public path means the gate authenticates a contract this contract drives; a balance
+/// taken from an account the caller does not own is a confiscation primitive; a pair
+/// synchronised after state was moved prices that move in at once.
 fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let slot_const = |e: ExprId| expr::as_const(e);
     // Slots that hold a pair: called with a pair selector somewhere, or returned by a getter
     // whose known name says so.
-    let mut pair_slots: HashSet<U256> = HashSet::new();
+    // Slots shown to hold a pair by what the code does with them: called with a pair
+    // selector, or written from a factory's `getPair`/`createPair` result.
+    let mut pair_slots_called: HashSet<U256> = HashSet::new();
     for x in facts {
         for sc in &x.stored_callees {
             if matches!(
@@ -4289,24 +4294,28 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
                 Some(SEL_SYNC | SEL_SKIM | SEL_GET_RESERVES | SEL_TOKEN0 | SEL_TOKEN1)
             ) {
                 if let Some(k) = slot_const(sc.slot) {
-                    pair_slots.insert(k);
+                    pair_slots_called.insert(k);
                 }
             }
         }
-    }
-    for x in facts {
         for k in &x.pair_slots {
             if let Some(kc) = slot_const(*k) {
-                pair_slots.insert(kc);
+                pair_slots_called.insert(kc);
             }
         }
     }
+    // Slots a zero-argument getter named for a pair returns (`pair()`, `uniswapV2Pair()`,
+    // `lpToken()`): weaker evidence, from the dictionary name rather than from use.
+    let mut pair_slots: HashSet<U256> = pair_slots_called.clone();
     for f in &c.functions {
-        let named_pair = f.signature.as_deref().is_some_and(|s| {
-            let l = s.to_ascii_lowercase();
-            l.contains("pair") || l.contains("pool") || l.contains("lp")
-        });
-        if !named_pair || f.kind != FnKind::External {
+        let getter_name = f
+            .signature
+            .as_deref()
+            .and_then(|s| s.strip_suffix("()"))
+            .map(|n| n.to_ascii_lowercase());
+        let named_pair = getter_name
+            .is_some_and(|n| n.ends_with("pair") || n.ends_with("pool") || n.ends_with("lptoken"));
+        if !named_pair || f.kind != FnKind::External || f.returns.len() != 1 {
             continue;
         }
         if let Some(l) = &f.lifted {
@@ -4326,6 +4335,7 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
 
     // Rule: a gate slot that is also a callee on a public path.
     let mut open_gates: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut linked_cache: HashMap<String, LinkedSummary> = HashMap::new();
     for x in facts
         .iter()
         .filter(|x| x.external && x.state_changing && x.caller_checked)
@@ -4349,7 +4359,7 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
             }
             let (y, sc) = callers[0];
             let via: Vec<String> = callers.iter().map(|(y, _)| y.name.clone()).collect();
-            let forwarded = linked_forwards(c, sk, x, sc.selector);
+            let forwarded = linked_forwards(c, sk, x, sc.selector, &mut linked_cache);
             let (sev, tail) = match &forwarded {
                 Some(note) => (Severity::Critical, note.clone()),
                 None => (
@@ -4388,7 +4398,7 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
             if !ledgers.contains(&d.root) {
                 continue;
             }
-            let target_slot = stored_address_slot(d.key).and_then(slot_const);
+            let target_slot = ssa::stored_address_slot(d.key).and_then(slot_const);
             let gate_target = target_slot
                 .is_some_and(|k| x.auth_slots.iter().any(|(s, _)| slot_const(*s) == Some(k)));
             if gate_target || (target_slot.is_none() && !from_calldata(unmask(d.key))) {
@@ -4398,7 +4408,7 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
                 eprintln!(
                     "[trust] {} debit {} key={:?} allowances={:?}",
                     x.name,
-                    d.account,
+                    d.account_text,
                     unmask(d.key),
                     x.allowance_of
                 );
@@ -4409,8 +4419,8 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
             {
                 continue;
             }
-            let target_slot = stored_address_slot(d.key).and_then(slot_const);
             let is_pool = target_slot.is_some_and(|k| pair_slots.contains(&k));
+            let name_only = is_pool && !target_slot.is_some_and(|k| pair_slots_called.contains(&k));
             let (what, sev) = if is_pool {
                 ("the stored liquidity pair", Severity::Critical)
             } else if target_slot.is_some() {
@@ -4436,10 +4446,15 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
             } else {
                 ""
             };
-            push_fact(findings, "third-party-balance-debit", "A balance is taken from an account the caller does not own", sev, Confidence::Medium, x,
+            let conf = if name_only {
+                Confidence::Low
+            } else {
+                Confidence::Medium
+            };
+            push_fact(findings, "third-party-balance-debit", "A balance is taken from an account the caller does not own", sev, conf, x,
                 format!(
                     "`{}` lowers `{}` on {}: the entry `{}` in the mapping at slot {} is reduced by a chosen amount, with no transfer from the caller and no allowance check.{}{}",
-                    x.name, d.account, what, d.account, d.root.to_hex(), gate, pool_note
+                    x.name, d.account_text, what, d.account_text, d.root.to_hex(), gate, pool_note
                 ),
                 vec![d.line.clone()],
                 "Only debit `msg.sender` or an account whose allowance for the caller is checked; never debit the pair.");
@@ -4448,8 +4463,8 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
 
     // Rule: a pair synchronised after this function moved state.
     for x in facts {
-        for (addr, after, line) in &x.syncs {
-            if !after {
+        for sync in &x.syncs {
+            if !sync.after_mutation {
                 continue;
             }
             let sev = if x.caller_checked {
@@ -4460,57 +4475,76 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
             push_fact(findings, "pair-sync-after-state-change", "A pair is synchronised after balances or other contracts were changed", sev, Confidence::Medium, x,
                 format!(
                     "`{}` calls `sync()`/`skim()` on `{}` after writing storage or calling another contract in the same path. `sync()` makes the pair adopt its current token balances as reserves, so any balance moved beforehand is priced in at once.{}",
-                    x.name, addr,
+                    x.name, sync.target,
                     if x.caller_checked { "" } else { " Anyone can trigger this." }
                 ),
-                vec![line.clone()],
+                vec![sync.line.clone()],
                 "Do not let callers reach a pair's `sync()` after state that affects the pair's balances has been changed in the same transaction.");
         }
     }
 }
 
+/// What a fetched dependency exposes, computed once per contract.
+struct LinkedSummary {
+    /// Functions anyone can call that make a state-changing call out.
+    forwarders: Vec<String>,
+    /// Selectors the contract calls on other contracts.
+    selectors_called: Vec<String>,
+}
+
 /// When the contract was fetched with its dependencies, does the contract held in slot `slot`
 /// expose a function anyone can call that calls out again (the loop that opens `gated`)? A
-/// note for the finding when it does.
+/// note for the finding when it does. `called` is the selector this contract sends it.
 fn linked_forwards(
     c: &Contract,
     slot: U256,
     gated: &FnFacts,
     called: Option<u32>,
+    cache: &mut HashMap<String, LinkedSummary>,
 ) -> Option<String> {
     let slot_hex = slot.to_hex_padded(32);
     let address = c
         .stored_targets
         .iter()
         .find(|(s, _)| s.eq_ignore_ascii_case(&slot_hex))
-        .map(|(_, a)| a.clone())?;
-    let lc = c.linked.iter().find(|lc| {
-        lc.address
-            .as_deref()
-            .is_some_and(|a| a.eq_ignore_ascii_case(&address))
-    })?;
-    let sel = gated
-        .name
-        .split('[')
-        .nth(1)
-        .and_then(|s| s.split(']').next())
-        .map(|s| s.trim().to_string());
-    let report = analyze(lc);
-    let calls_back = sel.as_deref().is_some_and(|s| {
-        lc.selectors_called
+        .map(|(_, a)| a.to_ascii_lowercase())?;
+    if !cache.contains_key(&address) {
+        let lc = c.linked.iter().find(|lc| {
+            lc.address
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(&address))
+        })?;
+        let report = analyze(lc);
+        let forwarders = report
+            .unauthenticated_state_changers
             .iter()
-            .any(|x| x.eq_ignore_ascii_case(s))
-    });
-    let mut forwarders: Vec<&String> = report
-        .unauthenticated_state_changers
-        .iter()
-        .filter(|name| {
-            report
-                .external_calls
-                .iter()
-                .any(|line| line.starts_with(name.as_str()) && !line.contains("staticcall"))
+            .filter(|name| {
+                report.external_calls.iter().any(|line| {
+                    line.strip_prefix(name.as_str())
+                        .is_some_and(|rest| rest.starts_with(": ") && !rest.contains("staticcall"))
+                })
+            })
+            .cloned()
+            .collect();
+        cache.insert(
+            address.clone(),
+            LinkedSummary {
+                forwarders,
+                selectors_called: lc.selectors_called.clone(),
+            },
+        );
+    }
+    let summary = &cache[&address];
+    // `selectors_called` entries read `0xselector signature` when the signature is known.
+    let calls_back = gated.selector.as_deref().is_some_and(|sel| {
+        summary.selectors_called.iter().any(|entry| {
+            entry
+                .split_whitespace()
+                .next()
+                .is_some_and(|tok| tok.eq_ignore_ascii_case(sel))
         })
-        .collect();
+    });
+    let mut forwarders: Vec<&String> = summary.forwarders.iter().collect();
     // The function this contract calls comes first, when it is among them.
     if let Some(sel) = called {
         let tag = format!("{:#010x}", sel);
@@ -4534,6 +4568,10 @@ fn linked_forwards(
     ))
 }
 
+/// Access control by intent: when several state-changing functions compare msg.sender against
+/// the same slot, that is the contract's policy. A state-changing function without the check
+/// that still does what the gated ones do (moves ether, self-destructs, delegatecalls, or writes
+/// a configuration slot otherwise written only behind the check) is reported as a deviation.
 fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let gated: Vec<&FnFacts> = facts
         .iter()

@@ -96,6 +96,10 @@ header{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-ite
 .sheet .examples button:hover{background:var(--well)}
 .sheet .err{margin:18px 0 0}
 .sheet .foot{margin:28px 0 0;padding-top:10px;border-top:1px solid var(--hair);font:500 12px/1.4 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);display:flex;gap:18px;flex-wrap:wrap}
+.sheet .foot-support{margin-top:10px;border-top:0;padding-top:0;align-items:center}
+.sup-foot{display:inline-flex;align-items:center;gap:8px;min-height:28px;padding:3px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:500 12px/1 var(--cond);letter-spacing:.1em;text-transform:uppercase;cursor:pointer}
+.sup-foot code{font:12px/1 var(--mono);text-transform:none;letter-spacing:0}.sup-foot code.a,.sup-foot .hint{color:var(--muted)}.sup-foot .hint{font-size:11px}
+.sup-foot:hover{border-color:var(--fg)}.sup-foot.done{color:#2e7d32;border-color:#2e7d32}.sup-foot.done .hint{visibility:hidden}
 
 /* three columns */
 main{display:grid;grid-template-columns:280px minmax(0,1fr) 380px;min-height:0;min-width:0}
@@ -258,6 +262,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
     </ul>
     <div id="landing-err"></div>
     <div class="foot"><span>Proxies and diamonds assembled with their implementation and facets</span><span>Every block checked against a concrete EVM</span><span>Findings carry a confidence</span></div>
+    <div class="foot foot-support"><span>Free to use, built in the open</span><button type="button" class="sup-foot" aria-label="Support evmdec: copy the address notevil.eth, 0x1a8553a290EeD8B9Bd7dD54E1D116FA48d334978" data-addr="0x1a8553a290EeD8B9Bd7dD54E1D116FA48d334978"><span aria-hidden="true">♥</span><span class="w">Support it</span><code>notevil.eth</code><code class="a">0x1a85…4978</code><span class="hint">click to copy</span></button></div>
   </div>
 </section>
 <div class="tb" id="tb" aria-label="Title block">
@@ -343,11 +348,11 @@ async function copyShown(){const text=shownText();if(!text)return;const btn=$('#
  btn.querySelector('span').textContent=ok?'Copied':'Copy failed';btn.classList.toggle('done',ok);say(ok?'Copied '+what+', '+n+' lines':'Copy failed; select the code and copy it by hand');
  clearTimeout(btn._t);btn._t=setTimeout(()=>{btn.querySelector('span').textContent='Copy';btn.classList.remove('done')},1600)}
 $('#copy').addEventListener('click',copyShown);
-async function copySupport(){const btn=$('#support');const addr=btn.dataset.addr;let ok=false;
+async function copySupport(btn){const addr=btn.dataset.addr;let ok=false;
  try{await navigator.clipboard.writeText(addr);ok=true}catch(e){const ta=document.createElement('textarea');ta.value=addr;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{ok=document.execCommand('copy')}catch(e2){}ta.remove()}
- btn.querySelector('.w').textContent=ok?'✓ Copied':'Copy failed';btn.classList.toggle('done',ok);say(ok?'Copied the support address '+addr:'Copy failed; the address is '+addr);
- clearTimeout(btn._t);btn._t=setTimeout(()=>{btn.querySelector('.w').textContent='Support';btn.classList.remove('done')},1800)}
-$('#support').addEventListener('click',copySupport);
+ const w=btn.querySelector('.w');const was=w.dataset.was||(w.dataset.was=w.textContent);w.textContent=ok?'✓ Copied':'Copy failed';btn.classList.toggle('done',ok);say(ok?'Copied the support address '+addr:'Copy failed; the address is '+addr);
+ clearTimeout(btn._t);btn._t=setTimeout(()=>{w.textContent=was;btn.classList.remove('done')},1800)}
+document.querySelectorAll('#support,.sup-foot').forEach(b=>b.addEventListener('click',()=>copySupport(b)));
 $('#dl').addEventListener('click',()=>{if(!DATA)return;const blob=new Blob([DATA.contract.source],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(DATA.contract.address||'contract')+'.sol';a.click();say('Downloaded '+a.download)});
 function fromUrl(){const p=new URLSearchParams(location.search);const a=p.get('address');if(a&&/^0x[0-9a-fA-F]{40}$/.test(a)){$('#q').value=a;const sel=$('#chain'),c=p.get('chain');if(c&&[...sel.options].some(o=>o.value===c))sel.value=c;go()}}
 

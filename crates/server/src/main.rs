@@ -136,9 +136,22 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
             json!({"contract": lc, "report": lr, "report_markdown": lmd, "disassembly": ldis})
         })
         .collect();
+    let parts_disassembly: Vec<Vec<String>> = c
+        .parts
+        .iter()
+        .map(|p| {
+            evmdec::disasm::disassemble(&p.runtime)
+                .iter()
+                .map(evmdec::disasm::format_instruction)
+                .collect()
+        })
+        .collect();
     let mut v = json!({"contract": c, "report": r, "report_markdown": md, "disassembly": disasm});
     if !linked.is_empty() {
         v["linked"] = Value::Array(linked);
+    }
+    if !parts_disassembly.is_empty() {
+        v["parts_disassembly"] = json!(parts_disassembly);
     }
     Ok(v)
 }

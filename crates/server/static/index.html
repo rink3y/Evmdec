@@ -186,6 +186,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .dep .tag{font:700 11px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;color:var(--danger)}
 .dep.loop{border-color:var(--danger)}
 .dep.back{border-style:dashed}
+.dep.part.cur{background:var(--fg);color:var(--bg);border-color:var(--fg);cursor:default}.dep.part.cur code{color:var(--bg)}
 /* trust graph: a list with the edge written above each node */
 .graph{padding:16px;max-width:720px}.graph ol,.graph ul{list-style:none;margin:0;padding:0}
 .graph .node{border:1px solid var(--line);border-radius:6px;padding:8px 12px;background:var(--bg);display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:start}
@@ -363,7 +364,7 @@ async function go(){const q=$('#q').value.trim();if(!q)return;const btn=$('#go')
   const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);
   DATA=j;CUR=null;document.body.dataset.state='loaded';$('#landing-err').innerHTML='';
   if(isAddr){history.replaceState(null,'','?chain='+encodeURIComponent($('#chain').value)+'&address='+q)}
-  VIEW_STACK=[];titleBlock();prepareFindings();renderFns();renderAll();depsBand();selectTab($('#tab-code'));
+  VIEW_STACK=[];setView(j,-1);
   document.title=(isAddr?q.slice(0,10)+'…'+q.slice(-4)+' on '+$('#chain').value:'pasted bytecode')+' · evmdec: risk '+j.report.risk_score+'/100';
   say('Decompiled: '+j.contract.stats.external_functions+' external functions, '+FINDINGS.length+' findings, risk '+j.report.risk_score+' of 100');
  }catch(e){const msg='<div class="err" role="alert"><b>Could not decompile.</b> '+esc(e.message||e)+' Check the address and chain, or paste the bytecode directly.</div>';if(DATA)$('#panel-code').innerHTML=msg;else $('#landing-err').innerHTML=msg;say('Failed: '+(e.message||e))}
@@ -373,38 +374,54 @@ function riskWord(s){return s>=80?'Critical':s>=40?'High':s>=20?'Medium':s>=8?'L
 function summaryText(sum){return ['critical','high','medium','low','info'].filter(k=>sum[k]).map(k=>sum[k]+' '+SEVL[k].toLowerCase()).join(', ')||'no findings'}
 /* linked and part contracts: the band under the title block, the Graph tab, and navigation
    into a linked contract's own view with a way back */
-let VIEW_STACK=[];
+let VIEW_STACK=[];let FULL=null,PART=0;
+/* A composite (proxy + implementation, diamond + facets) is shown one part at a time: the shell
+   first, each part reachable from the band. The report was computed over the whole, so a part
+   view keeps the findings that belong to that part's functions plus the contract-level ones. */
+function partOf(f){return f.part||0}
+function findingPart(f,full){const fn=f.function||'';const m=/ @ (0x[0-9a-fA-F]{40})/.exec(fn);if(!m)return fn?0:-1;const i=(full.contract.parts||[]).findIndex(p=>p.address.toLowerCase()===m[1].toLowerCase());return i<0?0:i}
+function partView(full,i){const c=full.contract;const parts=c.parts||[];if(!parts.length||i<0)return full;const p=parts[i];
+ const contract=Object.assign({},c,{source:p.source,functions:c.functions.filter(f=>partOf(f)===i),storage:p.storage,stats:p.stats,language:p.compiler,address:p.address,view_part:i});
+ const findings=(full.report.findings||[]).filter(f=>{const k=findingPart(f,full);return k===-1||k===i});
+ const report=Object.assign({},full.report,{findings});
+ return {contract,report,report_markdown:full.report_markdown,disassembly:(full.parts_disassembly||[])[i]||[],linked:full.linked||[],parts_disassembly:full.parts_disassembly}}
+function partCount(full,i){return (full.report.findings||[]).filter(f=>findingPart(f,full)===i).length}
+function setView(full,i){FULL=full;PART=i;DATA=partView(full,i);CUR=null;rerender()}
 function shortA(a){a=a||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
 function riskClass(r){return r>=50?'hi':r>=20?'md':''}
 function kindOf(entry){const k=entry.report&&entry.report.contract_kind;const s=Array.isArray(k)?k[0]:(typeof k==='string'?k:'');return s&&s!=='unclassified'?s:'contract'}
 function loopWith(addr){const a=(addr||'').toLowerCase();return (DATA.report.findings||[]).some(f=>f.id==='trusted-callee-loop'&&f.severity==='critical'&&(f.description||'').toLowerCase().includes(a))}
 function howLinked(c,addr){const a=(addr||'').toLowerCase();const st=(c.stored_targets||[]).find(([,x])=>x.toLowerCase()===a);if(st)return 'held in storage slot '+(st[0].replace(/^0x0*/,'0x')||'0x0');if((c.call_targets||[]).some(x=>x.toLowerCase()===a))return 'hard-coded in the code';return 'linked'}
 function worstOf(entry){const f=(entry.report&&entry.report.findings||[]).filter(x=>x.severity!=='info')[0];return f?f.title:'no findings'}
-function depsBand(){const c=DATA.contract;const linked=DATA.linked||[];const parts=(c.parts||[]).slice(1);const el=$('#deps');
+function depsBand(){const linked=DATA.linked||[];const parts=((FULL&&FULL.contract.parts)||[]).slice(1);const el=$('#deps');
  if(!linked.length&&!parts.length&&!VIEW_STACK.length){el.hidden=true;return}
  let out='';
  if(VIEW_STACK.length){const prev=VIEW_STACK[VIEW_STACK.length-1];out+='<button type="button" class="dep back" data-back="1" aria-label="Back to '+esc(prev.contract.address||'the contract')+'">← back to <code>'+esc(shortA(prev.contract.address))+'</code></button>'}
- parts.forEach(p=>{out+='<span class="dep" aria-label="'+esc(p.role+' '+p.address)+'"><b>'+esc(p.role)+'</b><code>'+esc(shortA(p.address))+'</code></span>'});
+ const allParts=(FULL&&FULL.contract.parts)||[];
+ if(allParts.length){const cur=PART<0;const n=(FULL.report.findings||[]).length;out+='<button type="button" class="dep part'+(cur?' cur':'')+'" data-part="-1"'+(cur?' aria-current="true"':'')+' aria-label="whole contract, every part, '+n+' finding'+(n===1?'':'s')+(cur?', shown':'')+'"><b>whole</b><span class="r md">'+n+'</span></button>'}
+ allParts.forEach((p,i)=>{const cur=i===PART;const n=partCount(FULL,i);const label=i===0?'shell':(p.role==='implementation'?'impl':'facet '+i);out+='<button type="button" class="dep part'+(cur?' cur':'')+'" data-part="'+i+'"'+(cur?' aria-current="true"':'')+' aria-label="'+esc(label+' '+p.address+', '+n+' finding'+(n===1?'':'s')+(cur?', shown':''))+'"><b>'+esc(label)+'</b><code>'+esc(shortA(p.address))+'</code>'+(n?'<span class="r md">'+n+'</span>':'')+'</button>'});
  // The riskiest first, a trust loop before anything else, so the chip that matters is the one a narrow screen shows.
  const order=linked.map((e,i)=>i).sort((i,j)=>{const li=loopWith(linked[i].contract.address),lj=loopWith(linked[j].contract.address);if(li!==lj)return li?-1:1;return linked[j].report.risk_score-linked[i].report.risk_score});
  order.forEach(i=>{const e=linked[i];const a=e.contract.address||'';const r=e.report.risk_score;const loop=loopWith(a);out+='<button type="button" class="dep'+(loop?' loop':'')+'" data-linked="'+i+'" aria-label="'+esc(kindOf(e)+' '+a+', risk '+r+(loop?', trust loop':''))+'"><b>'+esc(kindOf(e))+'</b><code>'+esc(shortA(a))+'</code><span class="r '+riskClass(r)+'">'+r+'</span>'+(loop?'<span class="tag">loop</span>':'')+'</button>'});
- const n=linked.length+parts.length;$('#deps-lbl').textContent=VIEW_STACK.length?'Viewing a linked contract':('Trusts '+n+(n===1?' contract':' contracts'));
+ const np=Math.max(allParts.length-1,0),nl=linked.length;const words=[];if(np)words.push(np+(np===1?' part':' parts'));if(nl)words.push('trusts '+nl+(nl===1?' contract':' contracts'));
+ $('#deps-lbl').textContent=VIEW_STACK.length?'Linked contract'+(words.length?' · '+words.join(' · '):''):words.join(' · ');
  $('#deps-list').innerHTML=out;el.hidden=false;
+ el.querySelectorAll('button[data-part]').forEach(b=>b.addEventListener('click',()=>{if(+b.dataset.part!==PART)setView(FULL,+b.dataset.part)}));
  el.querySelectorAll('button[data-linked]').forEach(b=>b.addEventListener('click',()=>openLinked(+b.dataset.linked)));
  const back=el.querySelector('button[data-back]');if(back)back.addEventListener('click',goBack)}
-function openLinked(i){const e=(DATA.linked||[])[i];if(!e)return;VIEW_STACK.push(DATA);DATA={contract:e.contract,report:e.report,report_markdown:e.report_markdown,disassembly:e.disassembly||[],linked:[]};CUR=null;rerender();say('Showing linked contract '+(e.contract.address||''));}
-function goBack(){if(!VIEW_STACK.length)return;DATA=VIEW_STACK.pop();CUR=null;rerender();say('Back to '+(DATA.contract.address||'the contract'))}
+function openLinked(i){const e=(DATA.linked||[])[i];if(!e)return;VIEW_STACK.push({full:FULL,part:PART});setView({contract:e.contract,report:e.report,report_markdown:e.report_markdown,disassembly:e.disassembly||[],linked:[],parts_disassembly:e.parts_disassembly||[]},-1);say('Showing linked contract '+(e.contract.address||''));}
+function goBack(){if(!VIEW_STACK.length)return;const v=VIEW_STACK.pop();setView(v.full,v.part);say('Back to '+(DATA.contract.address||'the contract'))}
 function rerender(){titleBlock();prepareFindings();renderFns();renderAll();depsBand();selectTab($('#tab-code'));$('#panel-code').scrollTop=0}
 function graphPanel(){const c=DATA.contract;const linked=DATA.linked||[];const parts=(c.parts||[]).slice(1);
  if(!linked.length&&!parts.length)return '<div class="graph"><p>This contract was analysed on its own: no implementation, facets or linked contracts were fetched. Decompile by address to have them fetched.</p></div>';
  const node=(cls,title,addr,risk,why,openIdx)=>'<div class="node '+cls+'"><div><b>'+esc(title)+'</b><code>'+esc(addr)+'</code></div>'+(risk==null?'<span></span>':'<span class="r '+riskClass(risk)+'" aria-label="risk '+risk+' of 100">'+risk+'</span>')+(why?'<div class="why">'+why+'</div>':'')+(openIdx==null?'':'<button type="button" class="open" data-linked="'+openIdx+'">Open</button>')+'</div>';
  let out='<div class="graph"><ol><li>'+node('me','this contract'+(c.composite?' · '+c.composite.kind:''),c.address||'pasted bytecode',DATA.report.risk_score,'',null)+'</li>';
- if(parts.length){out+='<li><h2>Runs in this contract\'s storage</h2><ul>';parts.forEach(p=>{out+='<li><div class="edge">delegatecall · '+esc(p.role)+(p.selectors.length?' · '+p.selectors.length+' selectors':'')+'</div>'+node('',p.role,p.address,null,esc(p.compiler||''),null)+'</li>'});out+='</ul></li>'}
+ if(parts.length){out+='<li><h2>Runs in this contract\'s storage</h2><ul>';parts.forEach((p,i)=>{out+='<li><div class="edge">delegatecall · '+esc(p.role)+(p.selectors.length?' · '+p.selectors.length+' selectors':'')+'</div>'+node('',p.role,p.address,null,esc(p.compiler||'')+' · '+partCount(FULL,i+1)+' findings',null).replace(/<\/div>$/,'<button type="button" class="open" data-part="'+(i+1)+'">Open</button></div>')+'</li>'});out+='</ul></li>'}
  if(linked.length){out+='<li><h2>Contracts it calls</h2><ul>';linked.forEach((e,i)=>{const a=e.contract.address||'';const loop=loopWith(a);const lf=(DATA.report.findings||[]).find(f=>f.id==='trusted-callee-loop'&&(f.description||'').toLowerCase().includes(a.toLowerCase()));
    out+='<li><div class="edge'+(loop?' red':'')+'">'+esc(howLinked(c,a))+(lf?' · called on a path anyone can take':'')+'</div>'+node(loop?'loop':'',kindOf(e),a,e.report.risk_score,esc(worstOf(e))+(loop?' · <b style="color:var(--danger)">calls back into a gated function: trust loop</b>':''),i)+'</li>'});out+='</ul></li>'}
  out+='</ol></div>';return out}
 function titleBlock(){const c=DATA.contract,s=c.stats,rep=DATA.report;const meta=(c.info&&c.info.metadata)||{};
- $('#tb-sheet').textContent=c.composite?c.composite.kind.charAt(0).toUpperCase()+c.composite.kind.slice(1):c.proxy?'Proxy, '+c.proxy.kind:(c.kind&&c.kind!=='unclassified'?c.kind.charAt(0).toUpperCase()+c.kind.slice(1)+' code':'Contract');
+ const vp=c.view_part,pp=vp==null?null:(c.parts||[])[vp];$('#tb-sheet').textContent=c.composite?((vp==null?'':vp===0?'Shell of ':(pp&&pp.role==='implementation'?'Implementation of ':'Facet '+vp+' of '))+c.composite.kind.charAt(0).toUpperCase()+c.composite.kind.slice(1)):c.proxy?'Proxy, '+c.proxy.kind:(c.kind&&c.kind!=='unclassified'?c.kind.charAt(0).toUpperCase()+c.kind.slice(1)+' code':'Contract');
  $('#tb-chain').textContent=c.chain||$('#chain').selectedOptions[0].textContent;
  const a=c.address||'';$('#tb-address').textContent=a?a.slice(0,10)+'…'+a.slice(-6):'pasted bytecode';$('#tb-address').title=a;
  $('#tb-compiler').textContent=c.language||(meta.compiler?meta.compiler+' '+(meta.version||''):'unknown');
@@ -499,7 +516,7 @@ function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.r
 function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(p=>'<span class="pt">'+esc(partLabel(c,p))+'</span>').join('<br>')}
 function renderAll(){const c=DATA.contract;renderCode();renderFindings();$('#panel-report').innerHTML=reportPanel(DATA.report,c);
  $('#panel-storage').innerHTML=storagePanel(c);
- $('#panel-graph').innerHTML=graphPanel();$('#panel-graph').querySelectorAll('button[data-linked]').forEach(b=>b.addEventListener('click',()=>openLinked(+b.dataset.linked)));
+ $('#panel-graph').innerHTML=graphPanel();$('#panel-graph').querySelectorAll('button[data-linked]').forEach(b=>b.addEventListener('click',()=>openLinked(+b.dataset.linked)));$('#panel-graph').querySelectorAll('button[data-part]').forEach(b=>b.addEventListener('click',()=>setView(FULL,+b.dataset.part)));
  $('#panel-disasm').innerHTML='<pre>'+esc((DATA.disassembly||[]).join('\n'))+'</pre>';
  const j=JSON.parse(JSON.stringify(DATA));delete j.disassembly;$('#panel-json').innerHTML='<pre>'+esc(JSON.stringify(j,null,2))+'</pre>';
  document.querySelectorAll('#panel-report .finding>button').forEach(b=>b.addEventListener('click',()=>{const on=b.getAttribute('aria-expanded')!=='true';b.setAttribute('aria-expanded',on?'true':'false');document.getElementById(b.getAttribute('aria-controls')).hidden=!on}))}

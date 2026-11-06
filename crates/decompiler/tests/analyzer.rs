@@ -725,6 +725,22 @@ fn a_debit_of_the_stored_pair_is_critical_and_own_or_allowed_debits_are_not() {
         f.description
     );
 
+    // The same debit, but the pool is known only from the token singling the address out in a
+    // transfer guard (`to == SLOAD(9)` in the fee path), no pool selector anywhere: the shape a
+    // token trading on V3, V4 or any other venue has.
+    const MASK: &str = "PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND";
+    let fee_guard = format!(
+        "PUSH1 0x04 CALLDATALOAD {MASK} PUSH1 0x09 SLOAD {MASK} EQ ISZERO PUSH2 @nofee JUMPI PUSH1 0x01 PUSH1 0x02 SSTORE :nofee JUMPDEST STOP"
+    );
+    let debit_masked = format!(
+        "PUSH1 0x09 SLOAD {MASK} PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD PUSH1 0x04 CALLDATALOAD SWAP1 SUB SWAP1 SSTORE STOP"
+    );
+    let code = dispatcher3(&debit_masked, &fee_guard, "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f = finding(&r, "third-party-balance-debit").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Critical, "{f:?}");
+    assert_eq!(f.confidence, evmdec::analyze::Confidence::Medium, "{f:?}");
+
     // balanceOf[msg.sender] -= amount: the caller's own balance.
     let debit_self = "CALLER PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD PUSH1 0x04 CALLDATALOAD SWAP1 SUB SWAP1 SSTORE STOP";
     let code = dispatcher3(debit_self, "STOP", "STOP");

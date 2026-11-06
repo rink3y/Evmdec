@@ -162,8 +162,11 @@ oracle, so the accuracy claim below is measured, not asserted.
   calls on a public path (`trusted-callee-loop`: the gate authenticates a hook that acts for
   any caller, confirmed when the fetched hook forwards calls), a balance lowered on an account
   the caller neither owns nor has an allowance for (`third-party-balance-debit`, critical when
-  the account is the stored liquidity pair), a pair `sync()` reachable after balances or other
-  contracts were changed (`pair-sync-after-state-change`), known compiler bugs for the detected solc version (a bug that needs
+  the account is the token's market counterparty: an address its transfer guards single out,
+  that another contract returned to it, whose ledger balance it reads, or that it calls with a
+  pool interface, whatever the venue, V2, V3, V4, Curve or Balancer), a pair `sync()` reachable
+  after balances or other contracts were changed (`pair-sync-after-state-change`), known
+  compiler bugs for the detected solc version (a bug that needs
   transient storage or calldata copies is dropped when the bytecode has none, and one whose
   trigger the bytecode cannot show, such as `--via-ir` or inline assembly, is informational). Rules look
   through internal helpers (a call in a shared `_safeTransfer` is attributed to every external

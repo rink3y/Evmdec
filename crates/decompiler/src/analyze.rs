@@ -173,10 +173,35 @@ const SEL_GET_RESERVES: u32 = 0x0902f1ac;
 const SEL_TOKEN0: u32 = 0x0dfe1681;
 /// `token1()` of a Uniswap V2 pair.
 const SEL_TOKEN1: u32 = 0xd21220a7;
-/// `getPair(address,address)` of a Uniswap V2 factory.
-const SEL_GET_PAIR: u32 = 0xe6a43905;
-/// `createPair(address,address)` of a Uniswap V2 factory.
-const SEL_CREATE_PAIR: u32 = 0xc9c65396;
+/// Selectors only a pool-type contract answers, a secondary sign that a stored address is one:
+/// Uniswap V2 pairs, V3 pools, the V4 manager, Curve pools and Balancer vaults.
+const POOL_SELECTORS: &[u32] = &[
+    SEL_SYNC,
+    SEL_SKIM,
+    SEL_GET_RESERVES,
+    SEL_TOKEN0,
+    SEL_TOKEN1,
+    0x3850c7bd, // slot0()
+    0x1a686502, // liquidity()
+    0x128acb08, // swap(address,bool,int256,uint160,bytes), V3
+    0x3c8a7d8d, // mint(address,int24,int24,uint128,bytes), V3
+    0xa34123a7, // burn(int24,int24,uint128), V3
+    0x4f1eb3d8, // collect(address,int24,int24,uint128,uint128), V3
+    0x883bdbfd, // observe(uint32[]), V3
+    0x48c89491, // unlock(bytes), V4
+    0x11da60b4, // settle(), V4
+    0x0b0d9c09, // take(address,address,uint256), V4
+    0x5a6bcfda, // modifyLiquidity(PoolKey,ModifyLiquidityParams,bytes), V4
+    0xf3cd914c, // swap(PoolKey,SwapParams,bytes), V4
+    0x5e0d443f, // get_dy(int128,int128,uint256), Curve
+    0x3df02124, // exchange(int128,int128,uint256,uint256), Curve
+    0x0b4c7e4d, // add_liquidity(uint256[2],uint256), Curve
+    0x5b36389c, // remove_liquidity(uint256,uint256[2]), Curve
+    0x52bbbe29, // swap(SingleSwap,FundManagement,uint256,uint256), Balancer
+    0xb95cac28, // joinPool(bytes32,address,address,JoinPoolRequest), Balancer
+    0x8bdb3913, // exitPool(bytes32,address,address,ExitPoolRequest), Balancer
+    0xf6c00927, // getPoolTokens(bytes32), Balancer
+];
 const SEL_APPROVE: u32 = 0x095ea7b3;
 const SEL_BALANCE_OF: u32 = 0x70a08231;
 const SEL_LATEST_ROUND_DATA: u32 = 0xfeaf968c;
@@ -291,8 +316,16 @@ struct FnFacts {
     allowance_of: Vec<ExprId>,
     /// `sync()`/`skim()` calls on a pair.
     syncs: Vec<PairSync>,
-    /// Constant slots written with the result of `getPair`/`createPair`: they hold a pair.
-    pair_slots: Vec<ExprId>,
+    /// Constant slots written with an address another contract returned: a factory-made pool,
+    /// a router's pair, a manager, whatever the design calls it.
+    factory_slots: Vec<ExprId>,
+    /// Constant slots whose address the function's guards compare with a transfer party (a
+    /// calldata word, the caller, an argument): the token singles this address out, as every
+    /// pool-aware token does for fees, limits or cooldowns.
+    compared_slots: Vec<ExprId>,
+    /// `(ledger root, slot)`: ledger entries read under an address held in a constant slot,
+    /// the way a token prices or limits against its pool's balance.
+    ledger_reads: Vec<(U256, ExprId)>,
     /// The function (or a helper it calls) authorises per account: it reads an entry keyed by
     /// `msg.sender` under another account (`allowance[owner][sender]`, operator approvals) or
     /// compares `msg.sender` with a mapping value (`approved[tokenId]`, `owners[id]`).
@@ -429,13 +462,20 @@ fn collect_facts(
         debits: Vec::new(),
         allowance_of: Vec::new(),
         syncs: Vec::new(),
-        pair_slots: Vec::new(),
+        factory_slots: Vec::new(),
+        compared_slots: Vec::new(),
+        ledger_reads: Vec::new(),
         account_authorised: false,
         signature_authorised: false,
     };
     for cond in guard_conds(events) {
         if compares_sender_with_entry(cond) {
             facts.account_authorised = true;
+        }
+        for slot in slots_compared_with_party(cond) {
+            if !facts.compared_slots.contains(&slot) {
+                facts.compared_slots.push(slot);
+            }
         }
         if is_auth_cond_in(cond, &ctx.roles) {
             let mut slots = HashSet::new();
@@ -484,12 +524,10 @@ fn collect_facts(
                 facts
                     .const_writes
                     .push((*key, write_source(*val), emit::fmt_stmt(st, names)));
-                let from_pair_lookup = mentions(*val, &|n| {
-                    matches!(n, Node::ReturnData(seq, _)
-                        if matches!(call_selector.get(seq), Some(&SEL_GET_PAIR | &SEL_CREATE_PAIR)))
-                });
-                if from_pair_lookup {
-                    facts.pair_slots.push(*key);
+                // An address another contract returned, stored as is: a factory result.
+                let from_return = matches!(expr::node(unmask(*val)), Node::ReturnData(..));
+                if from_return && !facts.factory_slots.contains(key) {
+                    facts.factory_slots.push(*key);
                 }
                 mutations.push(ev);
             }
@@ -586,6 +624,7 @@ fn collect_facts(
             if reads_under_sender(*e, layout) {
                 facts.account_authorised = true;
             }
+            collect_ledger_reads_under_slots(*e, layout, &mut facts.ledger_reads);
         }
         if let Some(Stmt::Call { addr, .. }) = &ev.stmt {
             if expr::as_const(*addr) == Some(U256::ONE) {
@@ -805,6 +844,62 @@ fn compares_sender_with_entry(e: ExprId) -> bool {
         stack.extend(expr::children(x));
     }
     false
+}
+
+/// Constant slots whose stored address `cond` compares with a transfer party: `to == pair`,
+/// `from != pair` (also written `from - pair` as a branch condition).
+fn slots_compared_with_party(cond: ExprId) -> Vec<ExprId> {
+    let party = |e: ExprId| {
+        let e = unmask(e);
+        from_calldata(e)
+            || from_caller(e)
+            || matches!(expr::node(e), Node::Arg(_) | Node::Var(_) | Node::MLoad(..))
+    };
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![cond];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 20_000 {
+            continue;
+        }
+        if let Node::Op(op::EQ | op::SUB | op::XOR, v) = expr::node(x) {
+            for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                if let Some(slot) = ssa::stored_address_slot(a) {
+                    if party(b) && !out.contains(&slot) {
+                        out.push(slot);
+                    }
+                }
+            }
+        }
+        stack.extend(expr::children(x));
+    }
+    out
+}
+
+/// Record `(root, slot)` for every single-level mapping entry read under an address held in a
+/// constant slot (`balanceOf[pair]`).
+fn collect_ledger_reads_under_slots(
+    e: ExprId,
+    layout: emit::MappingLayout,
+    out: &mut Vec<(U256, ExprId)>,
+) {
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 20_000 {
+            continue;
+        }
+        if let Node::SLoad(k, false, _) = expr::node(x) {
+            if let Some((root, account)) = ledger_entry(k, layout) {
+                if let Some(slot) = ssa::stored_address_slot(account) {
+                    if !out.contains(&(root, slot)) {
+                        out.push((root, slot));
+                    }
+                }
+            }
+        }
+        stack.extend(expr::children(x));
+    }
 }
 
 /// Record the outer keys of two-level mapping reads whose inner key is `msg.sender`:
@@ -4284,29 +4379,42 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
     let slot_const = |e: ExprId| expr::as_const(e);
     // Slots that hold a pair: called with a pair selector somewhere, or returned by a getter
     // whose known name says so.
-    // Slots shown to hold a pair by what the code does with them: called with a pair
-    // selector, or written from a factory's `getPair`/`createPair` result.
-    let mut pair_slots_called: HashSet<U256> = HashSet::new();
+    // Ledgers: address-keyed numeric mappings moved between accounts.
+    let ledgers: HashSet<U256> = crate::invariant::balance_mappings(&c.types)
+        .into_iter()
+        .map(|l| l.root)
+        .filter(|r| crate::invariant::is_ledger(c, *r))
+        .collect();
+    // Slots that hold the token's market counterparty, by how the token treats the address
+    // rather than by which DEX it is: its transfer guards single the address out, it came from
+    // another contract's return value, its ledger balance is read as a quantity, or the token
+    // calls it with a pool interface selector. Any of these is the shape a pool-aware token has
+    // whatever the pool's design.
+    let mut pool_slots: HashSet<U256> = HashSet::new();
     for x in facts {
         for sc in &x.stored_callees {
-            if matches!(
-                sc.selector,
-                Some(SEL_SYNC | SEL_SKIM | SEL_GET_RESERVES | SEL_TOKEN0 | SEL_TOKEN1)
-            ) {
+            if sc.selector.is_some_and(|sel| POOL_SELECTORS.contains(&sel)) {
                 if let Some(k) = slot_const(sc.slot) {
-                    pair_slots_called.insert(k);
+                    pool_slots.insert(k);
                 }
             }
         }
-        for k in &x.pair_slots {
+        for k in x.factory_slots.iter().chain(&x.compared_slots) {
             if let Some(kc) = slot_const(*k) {
-                pair_slots_called.insert(kc);
+                pool_slots.insert(kc);
+            }
+        }
+        for (root, k) in &x.ledger_reads {
+            if ledgers.contains(root) {
+                if let Some(kc) = slot_const(*k) {
+                    pool_slots.insert(kc);
+                }
             }
         }
     }
-    // Slots a zero-argument getter named for a pair returns (`pair()`, `uniswapV2Pair()`,
-    // `lpToken()`): weaker evidence, from the dictionary name rather than from use.
-    let mut pair_slots: HashSet<U256> = pair_slots_called.clone();
+    // Slots a zero-argument getter named for a pair or pool returns: weaker evidence, from the
+    // dictionary name rather than from use.
+    let mut named_slots: HashSet<U256> = HashSet::new();
     for f in &c.functions {
         let getter_name = f
             .signature
@@ -4325,7 +4433,7 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
                     collect_sload_keys(e, &mut keys);
                     for k in keys {
                         if let Some(kc) = expr::as_const(k) {
-                            pair_slots.insert(kc);
+                            named_slots.insert(kc);
                         }
                     }
                 }
@@ -4385,11 +4493,6 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
     // accounts the bytecode names (a stored address or a calldata word), and not where the
     // function authorises per account, by signature, or debits the very account its gate
     // compares the caller to.
-    let ledgers: HashSet<U256> = crate::invariant::balance_mappings(&c.types)
-        .into_iter()
-        .map(|l| l.root)
-        .filter(|r| crate::invariant::is_ledger(c, *r))
-        .collect();
     for x in facts {
         if x.account_authorised || x.signature_authorised {
             continue;
@@ -4419,8 +4522,10 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
             {
                 continue;
             }
-            let is_pool = target_slot.is_some_and(|k| pair_slots.contains(&k));
-            let name_only = is_pool && !target_slot.is_some_and(|k| pair_slots_called.contains(&k));
+            let by_use = target_slot.is_some_and(|k| pool_slots.contains(&k));
+            let by_name = target_slot.is_some_and(|k| named_slots.contains(&k));
+            let is_pool = by_use || by_name;
+            let name_only = by_name && !by_use;
             let (what, sev) = if is_pool {
                 ("the stored liquidity pair", Severity::Critical)
             } else if target_slot.is_some() {

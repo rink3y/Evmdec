@@ -99,9 +99,13 @@ again. `third-party-balance-debit` fires when a function lowers an entry of a ba
 (an address-keyed numeric mapping moved between accounts) on an account that is neither the
 caller nor covered by an allowance or per-account approval the function reads, nor the very
 account its gate compares the caller to; the account must be one the bytecode names, a stored
-address or a calldata word, and it is critical when that address is the stored liquidity pair
-(a slot written from `getPair`/`createPair`, called with `sync`/`getReserves`, or returned by a
-getter named for it). `pair-sync-after-state-change` fires when `sync()` or `skim()` on a pair
+address or a calldata word, and it is critical when that address is the token's market counterparty. That is decided by
+how the token treats the address, not by which venue it is: its transfer guards compare a
+transfer party with it (the fee, limit or cooldown logic every pool-aware token has), another
+contract returned it and the token stored it (a factory result), the token reads its own ledger
+entry for it as a quantity, or the token calls it with a pool interface selector (V2 pair, V3
+pool, V4 manager, Curve pool, Balancer vault). A getter named for a pair is the weakest
+evidence and findings resting on it alone are low confidence. `pair-sync-after-state-change` fires when `sync()` or `skim()` on a pair
 is reached after storage was written or another contract was called in the same path. The
 TENDRIL token (BSC, November 2026) is the reference case: its `controlburn` debited the pair
 behind a check for a controller the token itself called on every sell, and the controller's

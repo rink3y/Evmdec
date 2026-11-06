@@ -59,7 +59,7 @@ header :focus-visible,.tb :focus-visible{outline-color:var(--band-rubric);outlin
 .lbl{display:block;font:500 12px/1.3 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--band-muted)}
 
 /* ink band: header strip and title block */
-header{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:stretch;background:var(--band);color:var(--band-fg);border-bottom:1px solid var(--band-line)}
+header{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:stretch;background:var(--band);color:var(--band-fg);border-bottom:1px solid var(--band-line)}
 .brand{display:flex;align-items:center;padding:0 18px;border-right:1px solid var(--band-line);font:700 20px/1 var(--cond);letter-spacing:.02em;text-transform:lowercase;color:inherit;text-decoration:none}.brand:hover{color:var(--band-rubric)}
 .query{display:flex;min-width:0;align-items:stretch}
 .query input{flex:1;min-width:0;height:44px;border:0;border-right:1px solid var(--band-line);background:var(--field);color:var(--field-fg);padding:0 14px;font:14px/1.5 var(--mono)}
@@ -70,6 +70,9 @@ header{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:st
 .query .primary{height:44px;border:0;background:var(--rubric);color:var(--on-rubric);padding:0 22px;font:600 15px/1 var(--cond);letter-spacing:.14em;text-transform:uppercase}
 .query .primary:hover{filter:brightness(1.08)}
 .theme{border:0;border-left:1px solid var(--band-line);background:transparent;color:var(--band-fg);padding:0 16px;display:flex;gap:8px;align-items:center;white-space:nowrap;font:500 13px/1 var(--cond);letter-spacing:.06em;text-transform:uppercase}
+.support{border:0;border-left:1px solid var(--band-line);background:transparent;color:#a9bbd3;padding:0 12px;display:flex;gap:6px;align-items:center;white-space:nowrap;font:500 11px/1 var(--cond);letter-spacing:.06em;text-transform:uppercase;cursor:pointer}
+.support code{font:11px/1 var(--mono);text-transform:none;letter-spacing:0;color:var(--band-fg)}.support code.a{color:#a9bbd3}
+.support:hover{color:var(--band-fg)}.support.done{color:#9be7a3}.support.done code{color:#9be7a3}
 .theme svg{flex:none}
 .theme:hover{background:var(--field)}
 
@@ -212,6 +215,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
  header{display:flex;flex-wrap:wrap}.brand{border:0;padding:12px 16px;width:100%;border-bottom:1px solid var(--band-line)}
  .query{flex:1 1 100%;flex-wrap:wrap}.query input{flex-basis:100%;border-right:0;border-bottom:1px solid var(--band-line)}.chainwrap{flex:1;border-right:1px solid var(--band-line)}.query select{width:100%;max-width:none}.query .primary{flex:1}
  .theme{flex:1 1 100%;justify-content:center;border:0;border-top:1px solid var(--band-line);padding:10px}
+ .support{flex:1 1 100%;justify-content:center;border:0;border-top:1px solid var(--band-line);padding:8px;min-height:32px}
  .tb{grid-template-columns:repeat(2,minmax(0,1fr))}
  main{display:block}main>*{overflow:visible;max-height:none;height:auto;border:0}
  .drawing [role=tabpanel]{max-height:70vh;overflow:auto}.drawing .tabs{position:relative}
@@ -241,6 +245,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
     <button class="primary" id="go" type="submit">Decompile</button>
   </form>
   <button id="theme" type="button" class="theme" aria-pressed="false"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.5v13A6.5 6.5 0 0 0 8 1.5z" fill="currentColor"/></svg><span>Light theme</span></button>
+  <button id="support" type="button" class="support" aria-label="Support evmdec: copy the address notevil.eth, 0x1a8553a290EeD8B9Bd7dD54E1D116FA48d334978" data-addr="0x1a8553a290EeD8B9Bd7dD54E1D116FA48d334978"><span aria-hidden="true">♥</span><span class="w">Support</span><code>notevil.eth</code><code class="a">0x1a85…4978</code></button>
 </header>
 <section id="landing" aria-label="Start">
   <div class="sheet">
@@ -338,6 +343,11 @@ async function copyShown(){const text=shownText();if(!text)return;const btn=$('#
  btn.querySelector('span').textContent=ok?'Copied':'Copy failed';btn.classList.toggle('done',ok);say(ok?'Copied '+what+', '+n+' lines':'Copy failed; select the code and copy it by hand');
  clearTimeout(btn._t);btn._t=setTimeout(()=>{btn.querySelector('span').textContent='Copy';btn.classList.remove('done')},1600)}
 $('#copy').addEventListener('click',copyShown);
+async function copySupport(){const btn=$('#support');const addr=btn.dataset.addr;let ok=false;
+ try{await navigator.clipboard.writeText(addr);ok=true}catch(e){const ta=document.createElement('textarea');ta.value=addr;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{ok=document.execCommand('copy')}catch(e2){}ta.remove()}
+ btn.querySelector('.w').textContent=ok?'✓ Copied':'Copy failed';btn.classList.toggle('done',ok);say(ok?'Copied the support address '+addr:'Copy failed; the address is '+addr);
+ clearTimeout(btn._t);btn._t=setTimeout(()=>{btn.querySelector('.w').textContent='Support';btn.classList.remove('done')},1800)}
+$('#support').addEventListener('click',copySupport);
 $('#dl').addEventListener('click',()=>{if(!DATA)return;const blob=new Blob([DATA.contract.source],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(DATA.contract.address||'contract')+'.sol';a.click();say('Downloaded '+a.download)});
 function fromUrl(){const p=new URLSearchParams(location.search);const a=p.get('address');if(a&&/^0x[0-9a-fA-F]{40}$/.test(a)){$('#q').value=a;const sel=$('#chain'),c=p.get('chain');if(c&&[...sel.options].some(o=>o.value===c))sel.value=c;go()}}
 

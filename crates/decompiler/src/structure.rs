@@ -10,12 +10,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 struct Graph {
-    #[allow(dead_code)]
-    n: usize,
     succs: Vec<Vec<usize>>,
     preds: Vec<Vec<usize>>,
-    #[allow(dead_code)]
-    rpo: Vec<usize>,
     rpo_index: Vec<usize>,
     idom: Vec<Option<usize>>,
     ipdom: Vec<Option<usize>>,
@@ -190,10 +186,8 @@ impl Graph {
             .map(|x| ipdom_full[x].filter(|d| *d != n && *d != x))
             .collect();
         Graph {
-            n,
             succs,
             preds,
-            rpo,
             rpo_index,
             idom,
             ipdom,
@@ -236,8 +230,6 @@ fn is_noreturn_leaf(l: &Lifted, mut x: usize) -> bool {
 }
 
 struct Loop {
-    #[allow(dead_code)]
-    header: usize,
     body: HashSet<usize>,
     /// Nodes outside the loop that are jumped to from inside.
     exits: Vec<usize>,
@@ -245,7 +237,7 @@ struct Loop {
 
 fn find_loops(g: &Graph) -> HashMap<usize, Loop> {
     let mut loops: HashMap<usize, Loop> = HashMap::new();
-    for x in 0..g.n {
+    for x in 0..g.succs.len() {
         if !g.reachable[x] {
             continue;
         }
@@ -253,7 +245,6 @@ fn find_loops(g: &Graph) -> HashMap<usize, Loop> {
             if g.dominates(s, x) {
                 // Back edge x -> s. Natural loop body: nodes reaching x without passing s.
                 let entry = loops.entry(s).or_insert(Loop {
-                    header: s,
                     body: HashSet::new(),
                     exits: Vec::new(),
                 });
@@ -495,16 +486,16 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
             // it, so they are excluded, as is everything on the path up to it.
             let mut after: Vec<ExprId> = Vec::new();
             for later in &nd.stmts[i + 1..] {
-                after.extend(crate::lift::stmt_exprs(later));
+                after.extend(lift::stmt_exprs(later));
             }
-            after.extend(crate::lift::term_exprs(&nd.term));
+            after.extend(lift::term_exprs(&nd.term));
             let mut seen = HashSet::new();
             let mut stack: Vec<usize> = nd.succs.clone();
             while let Some(x) = stack.pop() {
                 if !seen.insert(x) || seen.len() > 5000 {
                     continue;
                 }
-                after.extend(crate::lift::node_exprs(&l.nodes[x]));
+                after.extend(lift::node_exprs(&l.nodes[x]));
                 stack.extend(l.nodes[x].succs.iter().copied());
             }
             for ((from, _), assigns) in &l.edge_assigns {
@@ -1497,7 +1488,7 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
     let mut out = l.clone();
     let mut next_var: u32 = 0;
     for nd in &l.nodes {
-        for e in crate::lift::node_exprs(nd) {
+        for e in lift::node_exprs(nd) {
             let mut seen = HashSet::new();
             let mut stack = vec![e];
             while let Some(x) = stack.pop() {
@@ -1571,9 +1562,9 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
             let first = if u == f { at + 1 } else { 0 };
             let node = &mut out.nodes[u];
             for st in node.stmts.iter_mut().skip(first) {
-                *st = crate::lift::map_stmt(st, &sub);
+                *st = lift::map_stmt(st, &sub);
             }
-            node.term = crate::lift::map_term(&node.term, &sub);
+            node.term = lift::map_term(&node.term, &sub);
         }
         for ((from, _), assigns) in out.edge_assigns.iter_mut() {
             if g.reachable[*from] && g.dominates(f, *from) {
@@ -2726,7 +2717,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     for nd in &l.nodes {
         let mut probe = nd.clone();
         probe.stmts.retain(|s| !matches!(s, Stmt::Drop(_)));
-        used.extend(crate::lift::node_exprs(&probe));
+        used.extend(lift::node_exprs(&probe));
     }
     used.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
     let mut p = Printer {
@@ -2892,11 +2883,6 @@ pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
     let bound = bind_shared(&rolled, n);
     structure(&bound, n, depth).text
 }
-
-#[allow(dead_code)]
-fn unused(_: &Node) {}
-#[allow(dead_code)]
-fn unused2(_: &dyn Fn(&lift::LNode)) {}
 
 /// The memory image at `ptr` written by constant word stores, as 32-byte words plus its length.
 fn payload_from_stores(stores: &[(ExprId, ExprId)], ptr: ExprId) -> Option<(Vec<ExprId>, u64)> {

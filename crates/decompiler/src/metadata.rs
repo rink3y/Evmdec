@@ -65,7 +65,7 @@ impl Metadata {
 #[derive(Clone, Debug)]
 enum Cbor {
     UInt(u64),
-    NegInt(#[allow(dead_code)] i64),
+    NegInt,
     Bytes(Vec<u8>),
     Text(String),
     Array(Vec<Cbor>),
@@ -109,7 +109,7 @@ fn cbor_read(data: &[u8], pos: &mut usize, depth: u32) -> Option<Cbor> {
     };
     Some(match major {
         0 => Cbor::UInt(arg),
-        1 => Cbor::NegInt(-1 - arg as i64),
+        1 => Cbor::NegInt,
         2 => {
             let b = data.get(*pos..*pos + arg as usize)?.to_vec();
             *pos += arg as usize;

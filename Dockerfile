@@ -3,10 +3,8 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release -p evmdec-cli -p evmdec-server
 
-# Full signature database (10.7M entries, ~470 MB), built once from Sourcify's export.
-# Build with --build-arg SIGS=0 to skip it; the built-in dictionary is then the only one.
 FROM python:3.12-slim AS sigs
-ARG SIGS=1
+ARG SIGS=0
 WORKDIR /sigs
 COPY corpus/build_sigs.py .
 RUN if [ "$SIGS" = "1" ]; then pip install --no-cache-dir pyarrow numpy \

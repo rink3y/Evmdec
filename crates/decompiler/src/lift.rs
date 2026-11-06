@@ -253,7 +253,6 @@ pub struct Lifted {
     /// Stack slot (from the top at entry) holding the return address, for internal units.
     pub ret_slot: Option<u32>,
     /// Entry state of every node (indexed by the *unit* node id), for re-lifting sub-regions.
-    #[allow(dead_code)]
     pub(crate) entry_states: Vec<Option<State>>,
     /// Map from unit node id to lifted node id.
     pub node_map: HashMap<usize, usize>,
@@ -1090,7 +1089,7 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                 match t {
                     Some(t) if rev(*t) && !rev(*f) => {
                         let (d, inv) = payload(*t);
-                        sum.guards.push((expr::op1(op::ISZERO, *cond), d, inv));
+                        sum.guards.push((op1(op::ISZERO, *cond), d, inv));
                         n = *f;
                     }
                     Some(t) if rev(*f) && !rev(*t) => {
@@ -1099,7 +1098,7 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                         n = *t;
                     }
                     None => {
-                        sum.guards.push((expr::op1(op::ISZERO, *cond), None, true));
+                        sum.guards.push((op1(op::ISZERO, *cond), None, true));
                         n = *f;
                     }
                     _ => return fail_summary(204),

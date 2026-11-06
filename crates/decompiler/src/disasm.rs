@@ -34,7 +34,7 @@ impl Instruction {
     }
 }
 
-impl serde::Serialize for U256 {
+impl Serialize for U256 {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&self.to_hex())
     }

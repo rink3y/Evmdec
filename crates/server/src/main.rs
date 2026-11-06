@@ -12,15 +12,33 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 const INDEX: &str = include_str!("../static/index.html");
 const OG_PNG: &[u8] = include_bytes!("../static/og.png");
 const FAVICON: &str = include_str!("../static/favicon.svg");
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct AppState {
     cache: Arc<Mutex<HashMap<String, Arc<Value>>>>,
+    /// Decompilations in flight at once; the rest wait their turn.
+    slots: Arc<Semaphore>,
 }
+
+impl Default for AppState {
+    fn default() -> Self {
+        AppState {
+            cache: Arc::default(),
+            slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        }
+    }
+}
+
+/// Decompilations run at once per process.
+const MAX_IN_FLIGHT: usize = 4;
+/// Time a single request may take, fetching and analysing included.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Deserialize, Default)]
 struct DecompileReq {
@@ -178,7 +196,10 @@ async fn api_decompile(
     {
         return Json((*v).clone()).into_response();
     }
-    let result = tokio::task::spawn_blocking(move || -> Result<Value, (StatusCode, String)> {
+    let Ok(_slot) = st.slots.clone().acquire_owned().await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "server is shutting down").into_response();
+    };
+    let work = tokio::task::spawn_blocking(move || -> Result<Value, (StatusCode, String)> {
         let lookup = if req.lookup {
             Lookup::Online
         } else {
@@ -216,8 +237,17 @@ async fn api_decompile(
             return Err((StatusCode::BAD_REQUEST, "bytecode too large".into()));
         }
         run(&Source::Bytecode(&code), lookup).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
-    })
-    .await;
+    });
+    let result = match tokio::time::timeout(REQUEST_TIMEOUT, work).await {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                "the request took longer than the server allows",
+            )
+                .into_response()
+        }
+    };
     match result {
         Ok(Ok(v)) => {
             let v = Arc::new(v);

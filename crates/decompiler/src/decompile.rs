@@ -2381,10 +2381,10 @@ fn with_indexed(sig: &str, n: usize) -> String {
 }
 
 fn note_slot(
-    key: expr::ExprId,
+    key: ExprId,
     slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>,
     read: bool,
-    val: Option<expr::ExprId>,
+    val: Option<ExprId>,
     vyper: bool,
     bases: &BTreeSet<U256>,
 ) {
@@ -2412,13 +2412,13 @@ fn note_slot(
 fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
     let mut seen: BTreeSet<U256> = BTreeSet::new();
     // (key, index expressions bounded by `index < N` in the same function)
-    let mut keys: Vec<(expr::ExprId, usize)> = Vec::new();
-    let mut bounded: Vec<HashSet<expr::ExprId>> = Vec::new();
+    let mut keys: Vec<(ExprId, usize)> = Vec::new();
+    let mut bounded: Vec<HashSet<ExprId>> = Vec::new();
     for (fi, f) in functions.iter().enumerate() {
         let Some(l) = &f.lifted else { continue };
-        let mut bounds: HashSet<expr::ExprId> = HashSet::new();
+        let mut bounds: HashSet<ExprId> = HashSet::new();
         for nd in &l.nodes {
-            let mut conds: Vec<expr::ExprId> = nd
+            let mut conds: Vec<ExprId> = nd
                 .stmts
                 .iter()
                 .filter_map(|st| match st {
@@ -2494,11 +2494,7 @@ fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
 }
 
 /// Root slot of a storage key and the shape of the variable it implies.
-fn slot_root(
-    key: expr::ExprId,
-    vyper: bool,
-    bases: &BTreeSet<U256>,
-) -> (Option<U256>, Option<String>) {
+fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>, Option<String>) {
     if let Some(c) = expr::as_const(key) {
         if let Some((s, _)) = emit::hashed_slot(c) {
             return (Some(s), Some("uint256[]".into()));
@@ -2585,7 +2581,7 @@ fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
 }
 
 fn collect_sloads(
-    e: expr::ExprId,
+    e: ExprId,
     slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>,
     vyper: bool,
     bases: &BTreeSet<U256>,
@@ -2723,7 +2719,7 @@ fn scan_strings(code: &[u8], code_end: usize, skip: &[(usize, usize)]) -> Vec<St
     out
 }
 
-fn collect_strings(e: expr::ExprId, out: &mut BTreeSet<String>) {
+fn collect_strings(e: ExprId, out: &mut BTreeSet<String>) {
     if let Some(c) = expr::as_const(e) {
         let b = c.to_be_bytes();
         // Left-aligned ASCII (string constants are stored left-aligned).

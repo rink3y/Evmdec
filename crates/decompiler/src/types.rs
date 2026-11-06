@@ -1024,7 +1024,7 @@ impl TypeEnv {
     }
 
     /// Add `base` to every function scope so this environment can sit next to another
-    /// contract's without colliding (see [`crate::decompile::rebase`]).
+    /// contract's without colliding (see [`crate::decompile::Contract::rebase`]).
     pub fn rebase(&mut self, base: usize) {
         if base == 0 {
             return;

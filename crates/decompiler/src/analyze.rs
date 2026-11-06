@@ -1363,7 +1363,7 @@ fn events_of_in(
                         eprintln!(
                             "memview store [{}] = {} (callee={:?} node={} pc={})",
                             want,
-                            emit::fmt_expr(*val, &emit::Names::default()),
+                            emit::fmt_expr(*val, &Names::default()),
                             callee,
                             nid,
                             nd.pc
@@ -1689,7 +1689,7 @@ fn role_mappings(ctx: &Ctx) -> HashSet<U256> {
 
 /// Does `cond` have the shape of an authorization check on msg.sender: `msg.sender == <storage
 /// or constant address>`, or a caller-keyed storage flag used directly as a boolean
-/// (`roles[msg.sender]`)? Shape only: see [`is_auth_cond_in`] for the contract-aware test.
+/// (`roles[msg.sender]`)? Shape only: see `is_auth_cond_in` for the contract-aware test.
 pub fn is_auth_cond(cond: ExprId) -> bool {
     fn strip(e: ExprId) -> ExprId {
         match expr::node(e) {
@@ -5261,7 +5261,7 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         out.push_str("| role | address | selectors | compiler | code |\n|---|---|---|---|---|\n");
         for p in &c.parts {
             let sels = match (p.role, p.selectors.len()) {
-                (crate::decompile::PartRole::Shell, _) => "router".to_string(),
+                (decompile::PartRole::Shell, _) => "router".to_string(),
                 (_, 0) => "all unrouted".to_string(),
                 (_, n) => n.to_string(),
             };

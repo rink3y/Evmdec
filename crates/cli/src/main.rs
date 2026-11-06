@@ -3,7 +3,6 @@ use clap::{Parser, Subcommand};
 use evmdec::decompile::{Contract, Options};
 use evmdec::fetch::{CodeCache, Policy};
 use evmdec::rpc::Client;
-#[allow(unused_imports)]
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -262,7 +261,7 @@ fn main() -> Result<()> {
             report,
             lookup,
         } => {
-            let mut opts = evmdec::decompile::Options {
+            let mut opts = Options {
                 flat,
                 pcs: false,
                 embedded,
@@ -456,7 +455,7 @@ fn main() -> Result<()> {
         }
         Cmd::Analyze { file, json } => {
             let code = load(&file)?;
-            let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+            let c = evmdec::decompile::decompile(&code, &Options::default());
             let r = evmdec::analyze::analyze(&c);
             if json {
                 println!("{}", serde_json::to_string_pretty(&r)?);

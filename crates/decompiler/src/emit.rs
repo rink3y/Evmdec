@@ -450,8 +450,8 @@ fn reads_memory(s: &Stmt) -> bool {
 /// Statements of one block that store to memory and are overwritten by a later store of the
 /// same block before anything could read them, plus `mem[x] = mem[x]` no-ops. The lifted IR is
 /// left as is (the oracle checks it); only the printout drops them.
-pub fn dead_memory_stores(stmts: &[Stmt]) -> std::collections::HashSet<usize> {
-    let mut dead = std::collections::HashSet::new();
+pub fn dead_memory_stores(stmts: &[Stmt]) -> HashSet<usize> {
+    let mut dead = HashSet::new();
     for (i, s) in stmts.iter().enumerate() {
         if let Stmt::MStore {
             off,
@@ -2069,13 +2069,8 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     let reach = crate::lift::reachable(l);
     let mut order: Vec<usize> = Vec::new();
     // Reverse post-order from entry.
-    let mut seen = std::collections::HashSet::new();
-    fn dfs(
-        l: &Lifted,
-        x: usize,
-        seen: &mut std::collections::HashSet<usize>,
-        order: &mut Vec<usize>,
-    ) {
+    let mut seen = HashSet::new();
+    fn dfs(l: &Lifted, x: usize, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
         if !seen.insert(x) {
             return;
         }
@@ -2088,7 +2083,7 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     order.reverse();
     // A node needs a label unless its only predecessor is the node printed just before it and
     // that predecessor falls through with a plain jump.
-    let mut needs_label: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut needs_label: HashSet<usize> = HashSet::new();
     for (idx, &nid) in order.iter().enumerate() {
         let nd = &l.nodes[nid];
         if !reach.contains(&nid) {

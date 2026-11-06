@@ -57,7 +57,7 @@ impl Accesses {
         if len == 0 {
             return;
         }
-        let (base, _) = crate::expr::split_offset(off);
+        let (base, _) = expr::split_offset(off);
         if let Some(s) = start.as_usize() {
             self.ranges.push((base, s as u64, s as u64 + len as u64));
         }

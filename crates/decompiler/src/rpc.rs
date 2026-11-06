@@ -415,7 +415,7 @@ pub fn resolve_proxy(
     // Storage slots used as delegatecall targets in the code.
     for slot in delegatecall_slots {
         let v = client.get_storage(address, &slot.to_hex_padded(32))?;
-        let a = v & crate::expr::mask_bits(160);
+        let a = v & expr::mask_bits(160);
         if !a.is_zero() {
             return Ok(Some(ProxyInfo {
                 kind: format!("proxy (implementation in storage slot {})", slot.to_hex()),
@@ -533,7 +533,7 @@ fn loupe_facets_by_address(client: &Client, address: &str) -> Option<Vec<Facet>>
     }
     let mut facets = Vec::with_capacity(n);
     for i in 0..n {
-        let facet = addr_to_string(r.word(array + 32 + 32 * i)? & crate::expr::mask_bits(160));
+        let facet = addr_to_string(r.word(array + 32 + 32 * i)? & expr::mask_bits(160));
         let arg = format!(
             "{}{:0>64}",
             SEL_FACET_SELECTORS,
@@ -568,7 +568,7 @@ fn storage_facets(client: &Client, address: &str, root: U256) -> Result<Vec<Face
     for i in 0..addresses_len {
         let facet = client
             .get_storage(address, &slot(addresses_data + U256::from_u64(i as u64)))?
-            & crate::expr::mask_bits(160);
+            & expr::mask_bits(160);
         if facet.is_zero() {
             continue;
         }

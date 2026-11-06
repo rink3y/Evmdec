@@ -703,7 +703,7 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
                         }) =>
                 {
                     // Printable constant text is a `string`; anything else stays `bytes`.
-                    let text = crate::emit::decode_plain_string(&words[1..]).is_some_and(|t| {
+                    let text = emit::decode_plain_string(&words[1..]).is_some_and(|t| {
                         !t.is_empty() && t.chars().all(|c| !c.is_control() && c != '\u{fffd}')
                     });
                     vec![if text {

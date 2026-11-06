@@ -290,7 +290,7 @@ pub fn is_boolean(e: ExprId) -> bool {
 }
 
 thread_local! {
-    static BOOL_VARS: std::cell::RefCell<std::collections::HashSet<ExprId>> = std::cell::RefCell::new(std::collections::HashSet::new());
+    static BOOL_VARS: RefCell<std::collections::HashSet<ExprId>> = RefCell::new(std::collections::HashSet::new());
 }
 
 /// Record that a phi variable only ever holds boolean values (found while printing).

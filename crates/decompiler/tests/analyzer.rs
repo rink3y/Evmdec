@@ -125,7 +125,7 @@ fn report_renders() {
     let code = dispatcher("CALLER SELFDESTRUCT");
     let c = decompile::decompile(&code, &Options::default());
     let r = analyze::analyze(&c);
-    let md = evmdec::analyze::render_markdown(&c, &r, "test");
+    let md = analyze::render_markdown(&c, &r, "test");
     assert!(md.contains("[CRITICAL]"));
     assert!(serde_json::to_string(&r).is_ok());
 }
@@ -231,7 +231,7 @@ fn dispatcher3(a: &str, b: &str, c: &str) -> Vec<u8> {
 const OWNER_GATE: &str =
     "PUSH1 0x00 SLOAD CALLER EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST";
 
-fn ids(r: &evmdec::analyze::Report) -> Vec<String> {
+fn ids(r: &analyze::Report) -> Vec<String> {
     r.findings.iter().map(|f| f.id.clone()).collect()
 }
 
@@ -385,7 +385,7 @@ fn wrapping_payout_arithmetic_needs_a_bound() {
         .any(|f| f.id == "unbounded-payout-parameter"));
 }
 
-fn finding<'a>(r: &'a evmdec::analyze::Report, id: &str) -> Option<&'a evmdec::analyze::Finding> {
+fn finding<'a>(r: &'a analyze::Report, id: &str) -> Option<&'a analyze::Finding> {
     r.findings.iter().find(|f| f.id == id)
 }
 
@@ -627,7 +627,7 @@ fn a_composite_merges_facets_and_keeps_their_functions_apart() {
         .iter()
         .find(|f| f.part == 1 && f.selector.is_some())
         .unwrap();
-    assert_eq!(fa.pc, a_pc + evmdec::decompile::PART_STRIDE);
+    assert_eq!(fa.pc, a_pc + decompile::PART_STRIDE);
     assert_eq!(c.local_pc(fa, fa.pc), a_pc);
     assert_eq!(c.code_of(fa), &a_code[..]);
     assert!(
@@ -739,7 +739,7 @@ fn a_debit_of_the_stored_pair_is_critical_and_own_or_allowed_debits_are_not() {
     let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
     let f = finding(&r, "third-party-balance-debit").unwrap_or_else(|| panic!("{:?}", ids(&r)));
     assert_eq!(f.severity, Severity::Critical, "{f:?}");
-    assert_eq!(f.confidence, evmdec::analyze::Confidence::Medium, "{f:?}");
+    assert_eq!(f.confidence, analyze::Confidence::Medium, "{f:?}");
 
     // balanceOf[msg.sender] -= amount: the caller's own balance.
     let debit_self = "CALLER PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD PUSH1 0x04 CALLDATALOAD SWAP1 SUB SWAP1 SSTORE STOP";

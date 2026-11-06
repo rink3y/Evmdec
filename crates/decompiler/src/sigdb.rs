@@ -16,7 +16,7 @@
 //!
 //! A 4-byte selector selects the entries whose prefix starts with it; a 32-byte topic selects
 //! the entries with the same 8-byte prefix and the candidate is confirmed by hashing it.
-//! `corpus/build_sigs.py` builds the file from the Parquet export; [`write`] builds one from
+//! `corpus/build_sigs.py` builds the file from the Parquet export; [`write()`] builds one from
 //! memory (tests, small custom dictionaries).
 
 use crate::keccak;

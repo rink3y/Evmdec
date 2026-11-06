@@ -68,11 +68,10 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
     const RATE: usize = 136;
     let mut st = [0u64; 25];
     let mut block = [0u8; RATE];
-    let mut chunks = data.chunks_exact(RATE);
-    for chunk in &mut chunks {
+    let (chunks, rem) = data.as_chunks::<RATE>();
+    for chunk in chunks {
         absorb(&mut st, chunk);
     }
-    let rem = chunks.remainder();
     block[..rem.len()].copy_from_slice(rem);
     block[rem.len()] ^= 0x01;
     block[RATE - 1] ^= 0x80;

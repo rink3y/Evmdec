@@ -2798,7 +2798,7 @@ fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
 /// Apply `f` to every expression of a statement.
 pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
     let fv = |v: &Vec<ExprId>| v.iter().map(|e| f(*e)).collect::<Vec<_>>();
-    let fo = |v: &Option<Vec<ExprId>>| v.as_ref().map(&fv);
+    let fo = |v: &Option<Vec<ExprId>>| v.as_ref().map(fv);
     match s {
         Stmt::Assign { var, value } => Stmt::Assign {
             var: f(*var),
@@ -2937,13 +2937,13 @@ pub fn map_term(t: &Term, f: &dyn Fn(ExprId) -> ExprId) -> Term {
         Term::Return { off, len, data } => Term::Return {
             off: f(*off),
             len: f(*len),
-            data: data.as_ref().map(&fv),
+            data: data.as_ref().map(fv),
         },
         Term::ReturnDyn { ptr } => Term::ReturnDyn { ptr: f(*ptr) },
         Term::Revert { off, len, data } => Term::Revert {
             off: f(*off),
             len: f(*len),
-            data: data.as_ref().map(&fv),
+            data: data.as_ref().map(fv),
         },
         Term::Stop => Term::Stop,
         Term::Invalid => Term::Invalid,

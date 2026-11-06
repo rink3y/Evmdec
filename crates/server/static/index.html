@@ -30,15 +30,15 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@500;600;700&family=Source+Code+Pro:wght@400;600&display=swap">
 <style>
 /* Drawing set: an ink band holds the title block; the sheet below is the drawing; findings are keyed callouts. */
-:root{
+:root{--danger:#b3261e;
  --bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--sel:#dbe8ff;--lit:#fff1c2;
  --band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;
  --critical:#8f1a12;--high:#b3261e;--medium:#8a5a00;--low:#1a5fb4;--info:#5a6069;
  --kw:#1a1d21;--ty:#1a1d21;--str:#365b1e;--num:#1a1d21;--cm:#5a6069;--fn:#1a1d21;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");
  --sans:"Barlow",ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;--cond:"Barlow Condensed","Barlow",ui-sans-serif,system-ui,sans-serif;--mono:"Source Code Pro",ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
  color-scheme:light}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--on-rubric:#0f2340;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--band:#081829;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#27416a;--band-rubric:#ffd27a;--field:#0c1f38;--field-fg:#e6eef8;--critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;--kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");color-scheme:dark}}
-:root[data-theme="dark"]{--bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--on-rubric:#0f2340;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--band:#081829;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#27416a;--band-rubric:#ffd27a;--field:#0c1f38;--field-fg:#e6eef8;--critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;--kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");color-scheme:dark}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--danger:#ff8a80;--bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--on-rubric:#0f2340;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--band:#081829;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#27416a;--band-rubric:#ffd27a;--field:#0c1f38;--field-fg:#e6eef8;--critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;--kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");color-scheme:dark}}
+:root[data-theme="dark"]{--danger:#ff8a80;--bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--on-rubric:#0f2340;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--band:#081829;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#27416a;--band-rubric:#ffd27a;--field:#0c1f38;--field-fg:#e6eef8;--critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;--kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");color-scheme:dark}
 
 *{box-sizing:border-box}
 [hidden]{display:none!important}
@@ -168,15 +168,16 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .report th,.report td{border:1px solid var(--hair);padding:4px 8px;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}
 .report th{color:var(--muted);font:600 12px/1.4 var(--cond);letter-spacing:.08em;text-transform:uppercase}
 /* trusted-contracts band: one line, scrolls sideways in a focusable region when it does not fit */
-.deps{border-bottom:2px solid var(--rubric);background:var(--well)}
-.deps-scroll{display:flex;align-items:center;gap:8px;padding:6px 16px;overflow-x:auto;white-space:nowrap;scrollbar-width:thin}
+.deps{border-bottom:1px solid var(--line);background:var(--well)}
+.deps-scroll{overflow-x:auto;white-space:nowrap;scrollbar-width:thin;padding:6px 16px}
+.deps-inner{display:flex;align-items:center;gap:8px;width:max-content;max-width:100%;margin:0 auto}
 .deps-scroll:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
 .deps-lbl{flex:none;font:600 12px/1 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-right:4px}
 .dep{flex:none;display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:2px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:13px/1 var(--sans);cursor:pointer}
 .dep:hover{border-color:var(--fg)}.dep b{font:600 12px/1 var(--cond);letter-spacing:.06em;text-transform:uppercase}.dep code{font:12px/1 var(--mono);color:var(--muted)}
 .dep .r{font:700 11px/1 var(--cond);padding:3px 5px;border-radius:4px;background:var(--muted);color:var(--bg)}.dep .r.hi{background:var(--rubric);color:var(--on-rubric)}.dep .r.md{background:#8a6d00;color:#fff}
-.dep .tag{font:700 11px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;color:var(--rubric)}
-.dep.loop{border-color:var(--rubric);box-shadow:0 0 0 1px var(--rubric) inset}
+.dep .tag{font:700 11px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;color:var(--danger)}
+.dep.loop{border-color:var(--danger)}
 .dep.back{border-style:dashed}
 /* trust graph: a list with the edge written above each node */
 .graph{padding:16px;max-width:720px}.graph ol,.graph ul{list-style:none;margin:0;padding:0}
@@ -186,8 +187,8 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .graph .node .r{font:700 12px/1 var(--cond);padding:4px 6px;border-radius:4px;background:var(--muted);color:var(--bg);align-self:center}.graph .node .r.hi{background:var(--rubric);color:var(--on-rubric)}.graph .node .r.md{background:#8a6d00;color:#fff}
 .graph .node .why{grid-column:1/-1;font-size:12.5px;color:var(--muted)}.graph .node.me .why{color:#a9bbd3}
 .graph .node .open{grid-column:1/-1;justify-self:start;border:1px solid var(--line);border-radius:4px;background:transparent;color:var(--fg);padding:4px 8px;font:600 12px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;min-height:24px;cursor:pointer}
-.graph .node.loop{border-color:var(--rubric);box-shadow:0 0 0 1px var(--rubric) inset}
-.graph .edge{margin:6px 0 6px 18px;padding:2px 0 2px 12px;border-left:2px solid var(--line);font-size:12.5px;color:var(--muted)}.graph .edge.red{border-left-color:var(--rubric);color:var(--rubric);font-weight:600}
+.graph .node.loop{border-color:var(--danger)}
+.graph .edge{margin:6px 0 6px 18px;padding:2px 0 2px 12px;border-left:2px solid var(--line);font-size:12.5px;color:var(--muted)}.graph .edge.red{border-left-color:var(--danger);color:var(--danger);font-weight:600}
 .graph h2{font:600 12px/1.4 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 8px}
 @media (max-width:720px){.deps-scroll{padding:6px 12px}}
 .report .tscroll{overflow-x:auto;max-width:100%;margin:8px 0 16px;border:1px solid var(--hair);background:linear-gradient(90deg,var(--bg) 30%,transparent),linear-gradient(90deg,transparent,var(--bg) 70%) 100% 0,radial-gradient(farthest-side at 0 50%,rgba(0,0,0,.18),transparent),radial-gradient(farthest-side at 100% 50%,rgba(0,0,0,.18),transparent) 100% 0;background-repeat:no-repeat;background-size:40px 100%,40px 100%,14px 100%,14px 100%;background-attachment:local,local,scroll,scroll}
@@ -264,7 +265,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
   <div><span class="lbl">Findings</span><b id="tb-findings"></b></div>
   <div class="risk"><span class="lbl">Risk</span><b id="tb-risk" class="calm"></b></div>
 </div>
-<nav id="deps" class="deps" aria-label="Trusted contracts" hidden><div class="deps-scroll" role="region" aria-label="Contracts this contract trusts" tabindex="0"><span class="deps-lbl" id="deps-lbl"></span><span id="deps-list"></span></div></nav>
+<nav id="deps" class="deps" aria-label="Trusted contracts" hidden><div class="deps-scroll" role="region" aria-label="Contracts this contract trusts" tabindex="0"><div class="deps-inner"><span class="deps-lbl" id="deps-lbl"></span><span id="deps-list"></span></div></div></nav>
 <main>
   <aside class="index" aria-label="Function index">
     <h2 class="col-h">Function index</h2>
@@ -385,7 +386,7 @@ function graphPanel(){const c=DATA.contract;const linked=DATA.linked||[];const p
  let out='<div class="graph"><ol><li>'+node('me','this contract'+(c.composite?' · '+c.composite.kind:''),c.address||'pasted bytecode',DATA.report.risk_score,'',null)+'</li>';
  if(parts.length){out+='<li><h2>Runs in this contract\'s storage</h2><ul>';parts.forEach(p=>{out+='<li><div class="edge">delegatecall · '+esc(p.role)+(p.selectors.length?' · '+p.selectors.length+' selectors':'')+'</div>'+node('',p.role,p.address,null,esc(p.compiler||''),null)+'</li>'});out+='</ul></li>'}
  if(linked.length){out+='<li><h2>Contracts it calls</h2><ul>';linked.forEach((e,i)=>{const a=e.contract.address||'';const loop=loopWith(a);const lf=(DATA.report.findings||[]).find(f=>f.id==='trusted-callee-loop'&&(f.description||'').toLowerCase().includes(a.toLowerCase()));
-   out+='<li><div class="edge'+(loop?' red':'')+'">'+esc(howLinked(c,a))+(lf?' · called on a path anyone can take':'')+'</div>'+node(loop?'loop':'',kindOf(e),a,e.report.risk_score,esc(worstOf(e))+(loop?' · <b style="color:var(--rubric)">calls back into a gated function: trust loop</b>':''),i)+'</li>'});out+='</ul></li>'}
+   out+='<li><div class="edge'+(loop?' red':'')+'">'+esc(howLinked(c,a))+(lf?' · called on a path anyone can take':'')+'</div>'+node(loop?'loop':'',kindOf(e),a,e.report.risk_score,esc(worstOf(e))+(loop?' · <b style="color:var(--danger)">calls back into a gated function: trust loop</b>':''),i)+'</li>'});out+='</ul></li>'}
  out+='</ol></div>';return out}
 function titleBlock(){const c=DATA.contract,s=c.stats,rep=DATA.report;const meta=(c.info&&c.info.metadata)||{};
  $('#tb-sheet').textContent=c.composite?c.composite.kind.charAt(0).toUpperCase()+c.composite.kind.slice(1):c.proxy?'Proxy, '+c.proxy.kind:(c.kind&&c.kind!=='unclassified'?c.kind.charAt(0).toUpperCase()+c.kind.slice(1)+' code':'Contract');

@@ -129,7 +129,11 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
                 &lr,
                 &format!("linked contract {}", lc.address.as_deref().unwrap_or("?")),
             );
-            json!({"contract": lc, "report": lr, "report_markdown": lmd})
+            let ldis: Vec<String> = evmdec::disasm::disassemble(&lc.info.runtime)
+                .iter()
+                .map(evmdec::disasm::format_instruction)
+                .collect();
+            json!({"contract": lc, "report": lr, "report_markdown": lmd, "disassembly": ldis})
         })
         .collect();
     let mut v = json!({"contract": c, "report": r, "report_markdown": md, "disassembly": disasm});

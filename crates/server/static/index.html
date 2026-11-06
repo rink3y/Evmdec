@@ -43,8 +43,9 @@
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans);display:grid;grid-template-rows:auto auto minmax(0,1fr);grid-template-columns:minmax(0,1fr)}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans);display:grid;grid-template-rows:auto auto auto minmax(0,1fr);grid-template-columns:minmax(0,1fr)}
 body[data-state="empty"]{grid-template-rows:auto minmax(0,1fr)}
+body[data-state="empty"] #deps{display:none}
 body[data-state="empty"] .tb,body[data-state="empty"] main{display:none}
 body[data-state="loaded"] #landing{display:none}
 button,input,select{font:inherit;color:inherit}
@@ -166,6 +167,29 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .report table{border-collapse:collapse;font-size:13px;width:100%}
 .report th,.report td{border:1px solid var(--hair);padding:4px 8px;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}
 .report th{color:var(--muted);font:600 12px/1.4 var(--cond);letter-spacing:.08em;text-transform:uppercase}
+/* trusted-contracts band: one line, scrolls sideways in a focusable region when it does not fit */
+.deps{border-bottom:2px solid var(--rubric);background:var(--well)}
+.deps-scroll{display:flex;align-items:center;gap:8px;padding:6px 16px;overflow-x:auto;white-space:nowrap;scrollbar-width:thin}
+.deps-scroll:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+.deps-lbl{flex:none;font:600 12px/1 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-right:4px}
+.dep{flex:none;display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:2px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:13px/1 var(--sans);cursor:pointer}
+.dep:hover{border-color:var(--fg)}.dep b{font:600 12px/1 var(--cond);letter-spacing:.06em;text-transform:uppercase}.dep code{font:12px/1 var(--mono);color:var(--muted)}
+.dep .r{font:700 11px/1 var(--cond);padding:3px 5px;border-radius:4px;background:var(--muted);color:var(--bg)}.dep .r.hi{background:var(--rubric);color:var(--on-rubric)}.dep .r.md{background:#8a6d00;color:#fff}
+.dep .tag{font:700 11px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;color:var(--rubric)}
+.dep.loop{border-color:var(--rubric);box-shadow:0 0 0 1px var(--rubric) inset}
+.dep.back{border-style:dashed}
+/* trust graph: a list with the edge written above each node */
+.graph{padding:16px;max-width:720px}.graph ol,.graph ul{list-style:none;margin:0;padding:0}
+.graph .node{border:1px solid var(--line);border-radius:6px;padding:8px 12px;background:var(--bg);display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:start}
+.graph .node.me{background:var(--band);color:var(--band-fg);border-color:var(--band)}.graph .node.me code{color:#a9bbd3}
+.graph .node b{font:600 12px/1.4 var(--cond);letter-spacing:.06em;text-transform:uppercase;display:block}.graph .node code{font:12px var(--mono);color:var(--muted)}
+.graph .node .r{font:700 12px/1 var(--cond);padding:4px 6px;border-radius:4px;background:var(--muted);color:var(--bg);align-self:center}.graph .node .r.hi{background:var(--rubric);color:var(--on-rubric)}.graph .node .r.md{background:#8a6d00;color:#fff}
+.graph .node .why{grid-column:1/-1;font-size:12.5px;color:var(--muted)}.graph .node.me .why{color:#a9bbd3}
+.graph .node .open{grid-column:1/-1;justify-self:start;border:1px solid var(--line);border-radius:4px;background:transparent;color:var(--fg);padding:4px 8px;font:600 12px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;min-height:24px;cursor:pointer}
+.graph .node.loop{border-color:var(--rubric);box-shadow:0 0 0 1px var(--rubric) inset}
+.graph .edge{margin:6px 0 6px 18px;padding:2px 0 2px 12px;border-left:2px solid var(--line);font-size:12.5px;color:var(--muted)}.graph .edge.red{border-left-color:var(--rubric);color:var(--rubric);font-weight:600}
+.graph h2{font:600 12px/1.4 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 8px}
+@media (max-width:720px){.deps-scroll{padding:6px 12px}}
 .report .tscroll{overflow-x:auto;max-width:100%;margin:8px 0 16px;border:1px solid var(--hair);background:linear-gradient(90deg,var(--bg) 30%,transparent),linear-gradient(90deg,transparent,var(--bg) 70%) 100% 0,radial-gradient(farthest-side at 0 50%,rgba(0,0,0,.18),transparent),radial-gradient(farthest-side at 100% 50%,rgba(0,0,0,.18),transparent) 100% 0;background-repeat:no-repeat;background-size:40px 100%,40px 100%,14px 100%,14px 100%;background-attachment:local,local,scroll,scroll}
 .report .tscroll table{margin:0;width:100%}
 .report .tscroll th,.report .tscroll td{border-width:0 0 1px 1px}.report .tscroll th:first-child,.report .tscroll td:first-child{border-left:0}.report .tscroll tr:last-child td{border-bottom:0}
@@ -240,6 +264,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
   <div><span class="lbl">Findings</span><b id="tb-findings"></b></div>
   <div class="risk"><span class="lbl">Risk</span><b id="tb-risk" class="calm"></b></div>
 </div>
+<nav id="deps" class="deps" aria-label="Trusted contracts" hidden><div class="deps-scroll" role="region" aria-label="Contracts this contract trusts" tabindex="0"><span class="deps-lbl" id="deps-lbl"></span><span id="deps-list"></span></div></nav>
 <main>
   <aside class="index" aria-label="Function index">
     <h2 class="col-h">Function index</h2>
@@ -253,6 +278,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
       <button role="tab" id="tab-report" aria-controls="panel-report" aria-selected="false" tabindex="-1">Report</button>
       <button role="tab" id="tab-storage" aria-controls="panel-storage" aria-selected="false" tabindex="-1">Storage &amp; events</button>
       <button role="tab" id="tab-disasm" aria-controls="panel-disasm" aria-selected="false" tabindex="-1">Disassembly</button>
+      <button role="tab" id="tab-graph" aria-controls="panel-graph" aria-selected="false" tabindex="-1">Graph</button>
       <button role="tab" id="tab-json" aria-controls="panel-json" aria-selected="false" tabindex="-1">JSON</button>
       <button id="copy" class="copy" type="button" title="Copy the code shown"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.5 5.5v-3a1.5 1.5 0 0 0-1.5-1.5h-6A1.5 1.5 0 0 0 1.5 2.5v6A1.5 1.5 0 0 0 3 10h2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg><span>Copy</span></button>
       <button id="dl" class="dl" type="button">Download .sol</button>
@@ -260,6 +286,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
     <div class="scale" id="scale" hidden></div>
     <div role="tabpanel" id="panel-code" aria-labelledby="tab-code"></div>
     <div role="tabpanel" id="panel-report" aria-labelledby="tab-report" hidden></div>
+    <div role="tabpanel" id="panel-graph" aria-labelledby="tab-graph" hidden></div>
     <div role="tabpanel" id="panel-storage" aria-labelledby="tab-storage" hidden></div>
     <div role="tabpanel" id="panel-disasm" aria-labelledby="tab-disasm" hidden></div>
     <div role="tabpanel" id="panel-json" aria-labelledby="tab-json" hidden></div>
@@ -320,7 +347,7 @@ async function go(){const q=$('#q').value.trim();if(!q)return;const btn=$('#go')
   const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);
   DATA=j;CUR=null;document.body.dataset.state='loaded';$('#landing-err').innerHTML='';
   if(isAddr){history.replaceState(null,'','?chain='+encodeURIComponent($('#chain').value)+'&address='+q)}
-  titleBlock();prepareFindings();renderFns();renderAll();selectTab($('#tab-code'));
+  VIEW_STACK=[];titleBlock();prepareFindings();renderFns();renderAll();depsBand();selectTab($('#tab-code'));
   document.title=(isAddr?q.slice(0,10)+'…'+q.slice(-4)+' on '+$('#chain').value:'pasted bytecode')+' · evmdec: risk '+j.report.risk_score+'/100';
   say('Decompiled: '+j.contract.stats.external_functions+' external functions, '+FINDINGS.length+' findings, risk '+j.report.risk_score+' of 100');
  }catch(e){const msg='<div class="err" role="alert"><b>Could not decompile.</b> '+esc(e.message||e)+' Check the address and chain, or paste the bytecode directly.</div>';if(DATA)$('#panel-code').innerHTML=msg;else $('#landing-err').innerHTML=msg;say('Failed: '+(e.message||e))}
@@ -328,6 +355,38 @@ async function go(){const q=$('#q').value.trim();if(!q)return;const btn=$('#go')
 
 function riskWord(s){return s>=80?'Critical':s>=40?'High':s>=20?'Medium':s>=8?'Low':'Minimal'}
 function summaryText(sum){return ['critical','high','medium','low','info'].filter(k=>sum[k]).map(k=>sum[k]+' '+SEVL[k].toLowerCase()).join(', ')||'no findings'}
+/* linked and part contracts: the band under the title block, the Graph tab, and navigation
+   into a linked contract's own view with a way back */
+let VIEW_STACK=[];
+function shortA(a){a=a||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
+function riskClass(r){return r>=50?'hi':r>=20?'md':''}
+function kindOf(entry){const k=entry.report&&entry.report.contract_kind;const s=Array.isArray(k)?k[0]:(typeof k==='string'?k:'');return s&&s!=='unclassified'?s:'contract'}
+function loopWith(addr){const a=(addr||'').toLowerCase();return (DATA.report.findings||[]).some(f=>f.id==='trusted-callee-loop'&&f.severity==='critical'&&(f.description||'').toLowerCase().includes(a))}
+function howLinked(c,addr){const a=(addr||'').toLowerCase();const st=(c.stored_targets||[]).find(([,x])=>x.toLowerCase()===a);if(st)return 'held in storage slot '+(st[0].replace(/^0x0*/,'0x')||'0x0');if((c.call_targets||[]).some(x=>x.toLowerCase()===a))return 'hard-coded in the code';return 'linked'}
+function worstOf(entry){const f=(entry.report&&entry.report.findings||[]).filter(x=>x.severity!=='info')[0];return f?f.title:'no findings'}
+function depsBand(){const c=DATA.contract;const linked=DATA.linked||[];const parts=(c.parts||[]).slice(1);const el=$('#deps');
+ if(!linked.length&&!parts.length&&!VIEW_STACK.length){el.hidden=true;return}
+ let out='';
+ if(VIEW_STACK.length){const prev=VIEW_STACK[VIEW_STACK.length-1];out+='<button type="button" class="dep back" data-back="1" aria-label="Back to '+esc(prev.contract.address||'the contract')+'">← back to <code>'+esc(shortA(prev.contract.address))+'</code></button>'}
+ parts.forEach(p=>{out+='<span class="dep" aria-label="'+esc(p.role+' '+p.address)+'"><b>'+esc(p.role)+'</b><code>'+esc(shortA(p.address))+'</code></span>'});
+ // The riskiest first, a trust loop before anything else, so the chip that matters is the one a narrow screen shows.
+ const order=linked.map((e,i)=>i).sort((i,j)=>{const li=loopWith(linked[i].contract.address),lj=loopWith(linked[j].contract.address);if(li!==lj)return li?-1:1;return linked[j].report.risk_score-linked[i].report.risk_score});
+ order.forEach(i=>{const e=linked[i];const a=e.contract.address||'';const r=e.report.risk_score;const loop=loopWith(a);out+='<button type="button" class="dep'+(loop?' loop':'')+'" data-linked="'+i+'" aria-label="'+esc(kindOf(e)+' '+a+', risk '+r+(loop?', trust loop':''))+'"><b>'+esc(kindOf(e))+'</b><code>'+esc(shortA(a))+'</code><span class="r '+riskClass(r)+'">'+r+'</span>'+(loop?'<span class="tag">loop</span>':'')+'</button>'});
+ const n=linked.length+parts.length;$('#deps-lbl').textContent=VIEW_STACK.length?'Viewing a linked contract':('Trusts '+n+(n===1?' contract':' contracts'));
+ $('#deps-list').innerHTML=out;el.hidden=false;
+ el.querySelectorAll('button[data-linked]').forEach(b=>b.addEventListener('click',()=>openLinked(+b.dataset.linked)));
+ const back=el.querySelector('button[data-back]');if(back)back.addEventListener('click',goBack)}
+function openLinked(i){const e=(DATA.linked||[])[i];if(!e)return;VIEW_STACK.push(DATA);DATA={contract:e.contract,report:e.report,report_markdown:e.report_markdown,disassembly:e.disassembly||[],linked:[]};CUR=null;rerender();say('Showing linked contract '+(e.contract.address||''));}
+function goBack(){if(!VIEW_STACK.length)return;DATA=VIEW_STACK.pop();CUR=null;rerender();say('Back to '+(DATA.contract.address||'the contract'))}
+function rerender(){titleBlock();prepareFindings();renderFns();renderAll();depsBand();selectTab($('#tab-code'));$('#panel-code').scrollTop=0}
+function graphPanel(){const c=DATA.contract;const linked=DATA.linked||[];const parts=(c.parts||[]).slice(1);
+ if(!linked.length&&!parts.length)return '<div class="graph"><p>This contract was analysed on its own: no implementation, facets or linked contracts were fetched. Decompile by address to have them fetched.</p></div>';
+ const node=(cls,title,addr,risk,why,openIdx)=>'<div class="node '+cls+'"><div><b>'+esc(title)+'</b><code>'+esc(addr)+'</code></div>'+(risk==null?'<span></span>':'<span class="r '+riskClass(risk)+'" aria-label="risk '+risk+' of 100">'+risk+'</span>')+(why?'<div class="why">'+why+'</div>':'')+(openIdx==null?'':'<button type="button" class="open" data-linked="'+openIdx+'">Open</button>')+'</div>';
+ let out='<div class="graph"><ol><li>'+node('me','this contract'+(c.composite?' · '+c.composite.kind:''),c.address||'pasted bytecode',DATA.report.risk_score,'',null)+'</li>';
+ if(parts.length){out+='<li><h2>Runs in this contract\'s storage</h2><ul>';parts.forEach(p=>{out+='<li><div class="edge">delegatecall · '+esc(p.role)+(p.selectors.length?' · '+p.selectors.length+' selectors':'')+'</div>'+node('',p.role,p.address,null,esc(p.compiler||''),null)+'</li>'});out+='</ul></li>'}
+ if(linked.length){out+='<li><h2>Contracts it calls</h2><ul>';linked.forEach((e,i)=>{const a=e.contract.address||'';const loop=loopWith(a);const lf=(DATA.report.findings||[]).find(f=>f.id==='trusted-callee-loop'&&(f.description||'').toLowerCase().includes(a.toLowerCase()));
+   out+='<li><div class="edge'+(loop?' red':'')+'">'+esc(howLinked(c,a))+(lf?' · called on a path anyone can take':'')+'</div>'+node(loop?'loop':'',kindOf(e),a,e.report.risk_score,esc(worstOf(e))+(loop?' · <b style="color:var(--rubric)">calls back into a gated function: trust loop</b>':''),i)+'</li>'});out+='</ul></li>'}
+ out+='</ol></div>';return out}
 function titleBlock(){const c=DATA.contract,s=c.stats,rep=DATA.report;const meta=(c.info&&c.info.metadata)||{};
  $('#tb-sheet').textContent=c.composite?c.composite.kind.charAt(0).toUpperCase()+c.composite.kind.slice(1):c.proxy?'Proxy, '+c.proxy.kind:(c.kind&&c.kind!=='unclassified'?c.kind.charAt(0).toUpperCase()+c.kind.slice(1)+' code':'Contract');
  $('#tb-chain').textContent=c.chain||$('#chain').selectedOptions[0].textContent;
@@ -424,6 +483,7 @@ function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.r
 function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(p=>'<span class="pt">'+esc(partLabel(c,p))+'</span>').join('<br>')}
 function renderAll(){const c=DATA.contract;renderCode();renderFindings();$('#panel-report').innerHTML=reportPanel(DATA.report,c);
  $('#panel-storage').innerHTML=storagePanel(c);
+ $('#panel-graph').innerHTML=graphPanel();$('#panel-graph').querySelectorAll('button[data-linked]').forEach(b=>b.addEventListener('click',()=>openLinked(+b.dataset.linked)));
  $('#panel-disasm').innerHTML='<pre>'+esc((DATA.disassembly||[]).join('\n'))+'</pre>';
  const j=JSON.parse(JSON.stringify(DATA));delete j.disassembly;$('#panel-json').innerHTML='<pre>'+esc(JSON.stringify(j,null,2))+'</pre>';
  document.querySelectorAll('#panel-report .finding>button').forEach(b=>b.addEventListener('click',()=>{const on=b.getAttribute('aria-expanded')!=='true';b.setAttribute('aria-expanded',on?'true':'false');document.getElementById(b.getAttribute('aria-controls')).hidden=!on}))}

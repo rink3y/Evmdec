@@ -5216,8 +5216,6 @@ fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<
     }
 }
 
-/// 0..100: the worst finding sets the level (weighted by its confidence), the rest add a little.
-/// A single confirmed critical scores higher than twenty informational notes.
 /// Functions that release value must agree on what the shared balance already owes. When one
 /// function limits a transfer by `deposits - liabilities` over some storage, and another limits
 /// a transfer over the same deposits while subtracting strictly more liability fields, the first
@@ -5277,6 +5275,8 @@ fn accounting_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     }
 }
 
+/// 0..100: the worst finding sets the level (weighted by its confidence), the rest add a little.
+/// A single confirmed critical scores higher than twenty informational notes.
 fn risk_score(findings: &[Finding]) -> u32 {
     let weight = |f: &Finding| -> f64 {
         let base = match f.severity {

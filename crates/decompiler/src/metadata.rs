@@ -306,8 +306,32 @@ pub fn constant_stack(insns: &[disasm::Instruction]) -> Vec<Option<U256>> {
 
 /// Detect creation code of the shape `... CODECOPY(dest, offset, len) ... RETURN(dest, len)` where the
 /// copied region lies after the constructor, and split it.
+///
+/// Runtime code can show the same shape: a contract that keeps constants in a data area after
+/// its code loads them with `CODECOPY`, and when such a load sits in a block that returns, the
+/// block looks like a deploy prologue. Two facts tell the cases apart. A constructor never reads
+/// calldata, because a creation transaction carries none, so calldata reads before the copied
+/// region mean runtime code. And a metadata trailer at the very end of the code belongs to the
+/// code as a whole: creation code ends in the runtime's trailer followed by the constructor
+/// arguments, so a trailer the candidate region does not contain means runtime code too.
 fn detect_creation(code: &[u8]) -> Option<(usize, usize)> {
     let insns = disasm::disassemble(code);
+    let (off, len) = creation_split(code, &insns)?;
+    let reads_calldata = insns
+        .iter()
+        .take_while(|i| i.pc < off)
+        .any(|i| i.opcode == opcode::CALLDATALOAD || i.opcode == opcode::CALLDATACOPY);
+    if reads_calldata {
+        return None;
+    }
+    if off + len < code.len() && parse_metadata(code).is_some() {
+        return None;
+    }
+    Some((off, len))
+}
+
+/// The copy-and-return split of `code`, before the checks in [`detect_creation`].
+fn creation_split(code: &[u8], insns: &[disasm::Instruction]) -> Option<(usize, usize)> {
     // Walk block by block; within each block simulate the constant stack to find CODECOPY args.
     let mut block_start = 0;
     let mut i = 0;
@@ -452,5 +476,49 @@ mod tests {
             Some("QmZvnoMz7Fa2K3yc1J3yBH4DvE7z96jKVVFyiTvQWCNnCT")
         );
         assert_eq!(Metadata::default().ipfs_cid(), None);
+    }
+
+    /// `PUSH1 len PUSH1 off PUSH1 0 CODECOPY PUSH1 len PUSH1 0 RETURN` around `runtime`.
+    fn wrap(runtime: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x60, runtime.len() as u8, 0x60, 0x0c, 0x60, 0x00, 0x39];
+        v.extend_from_slice(&[0x60, runtime.len() as u8, 0x60, 0x00, 0xf3]);
+        v.extend_from_slice(runtime);
+        v
+    }
+
+    #[test]
+    fn creation_code_is_split() {
+        let info = analyze(&wrap(&[0x5f, 0x35, 0x00]));
+        assert_eq!(info.kind, CodeKind::Creation);
+        assert_eq!(info.runtime, [0x5f, 0x35, 0x00]);
+    }
+
+    #[test]
+    fn runtime_loading_a_constant_from_code_is_not_creation_code() {
+        // PUSH0 CALLDATALOAD POP; PUSH1 32 PUSH1 off PUSH0 CODECOPY PUSH0 MLOAD PUSH0 MSTORE
+        // PUSH1 32 PUSH0 RETURN; then 32 bytes of data.
+        let mut code = vec![0x5f, 0x35, 0x50, 0x60, 0x20, 0x60, 0x13, 0x5f, 0x39];
+        code.extend_from_slice(&[0x5f, 0x51, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3, 0x00, 0x00]);
+        assert_eq!(code.len(), 0x13);
+        code.extend_from_slice(&[0xab; 32]);
+        assert_eq!(analyze(&code).kind, CodeKind::Runtime);
+    }
+
+    #[test]
+    fn code_ending_in_its_own_metadata_is_runtime() {
+        // CODECOPY(0, off, 32) and RETURN(0, 32) with no calldata read, then 32 bytes of data,
+        // then a valid solc metadata trailer that the copied region does not contain.
+        let mut code = vec![
+            0x60, 0x20, 0x60, 0x0c, 0x5f, 0x39, 0x60, 0x20, 0x5f, 0xf3, 0x00, 0x00,
+        ];
+        code.extend_from_slice(&[0xab; 32]);
+        let trailer = hex::decode("a164736f6c6343000823000a").unwrap();
+        code.extend_from_slice(&trailer);
+        assert!(parse_metadata(&code).is_some());
+        assert_eq!(analyze(&code).kind, CodeKind::Runtime);
+        // The same prefix with constructor arguments instead of a trailer is creation code.
+        let mut creation = code[..12 + 32].to_vec();
+        creation.extend_from_slice(&[0u8; 32]);
+        assert_eq!(analyze(&creation).kind, CodeKind::Creation);
     }
 }

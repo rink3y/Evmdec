@@ -100,6 +100,7 @@ substituted. No rule names a contract, a protocol, a token or an address.
 | value | reverse-quoted amounts, payouts without a slippage bound, spot balances as a price, fee-on-transfer assumptions, division before multiplication, `msg.value` reused in loops and multicalls, unbounded payout parameters, wrapping arithmetic on pre-0.8 compilers and inside `unchecked` blocks |
 | authority | owner and initializer writes without access control, silent authorisation failures, `tx.origin`, `selfdestruct` by reachability, unprotected upgrades, ether withdrawable by anyone, access control by intent (`inconsistent-access-control`), attack chains (a write anyone can make paired with the function that trusts it) |
 | trust | a gate that trusts a contract the token itself calls on a public path (`trusted-callee-loop`), a balance lowered on an account the caller neither owns nor has an allowance for (`third-party-balance-debit`, critical when the account is a market counterparty recognised by behaviour: singled out by transfer guards, returned by a factory, read as a ledger, or called with a pool interface), a pair `sync()` reachable after balances changed (`pair-sync-after-state-change`) |
+| accounting | two functions that each limit an outgoing transfer by `deposits - liabilities` over the same pooled storage, where one subtracts a proper subset of the liability fields the other subtracts (`inconsistent-liability-accounting`): the path subtracting fewer can release more than the shared balance backs |
 | types | wide values cut to `uintN` without a check, signed and unsigned comparison of one value, addresses built by arithmetic, hashes used as numbers, narrow counters |
 | signatures and randomness | `ecrecover` zero address and malleability, signatures without a domain or a nonce, block attributes as randomness, Chainlink answers without staleness or positivity checks |
 | compiler | known solc and Vyper bugs for the detected version, with triggers the bytecode cannot show marked informational; the Vyper 0.2.15 to 0.3.0 lock bug |
@@ -287,6 +288,10 @@ root turns on `#![warn(missing_docs)]`, and clippy is kept at zero warnings.
   stays unconfirmed, not refuted.
 - `pair-sync-after-state-change` looks for the Uniswap V2 `sync()` call; V3 and later pools
   have no equivalent, and the third-party debit rule covers them.
+- `inconsistent-liability-accounting` compares the liability fields two payout limits subtract
+  over one pooled struct; it identifies a field by its slot path, so two liabilities packed into
+  one slot read through different masks are not told apart, and a deliberate difference between
+  two unrelated limits can read as an omission.
 - Findings are heuristic and should be read as leads with a confidence level.
 
 ## License

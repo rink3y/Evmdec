@@ -809,3 +809,65 @@ fn a_sync_after_a_state_changing_call_is_reported() {
         ids(&r)
     );
 }
+
+/// `mapping[slot][calldata[4]]` read, ending in SLOAD. Key is a calldata word so the entry is
+/// pooled (a `ShapeStep::Key`), the shape the rule looks for.
+fn mread(slot: u8) -> String {
+    format!(
+        "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x{slot:02x} PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 SLOAD"
+    )
+}
+
+/// A payout limited by `avail >= calldata[0x24]`, then `calldata[0x24]` wei sent to the caller.
+fn bounded_payout(avail: &str, bad: &str) -> String {
+    format!(
+        "{avail} PUSH1 0x24 CALLDATALOAD GT PUSH2 @{bad} JUMPI \
+         PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 PUSH1 0x24 CALLDATALOAD CALLER GAS CALL POP STOP \
+         :{bad} JUMPDEST PUSH1 0x00 DUP1 REVERT"
+    )
+}
+
+#[test]
+fn payout_omitting_a_liability_another_path_subtracts_is_flagged() {
+    // deposits = slot 0, borrowed = slot 1, matured = slot 2, all keyed by calldata[4].
+    // draw() (0xaaaaaaaa): avail = deposits - borrowed            (omits matured)
+    // exit() (0xbbbbbbbb): avail = deposits - (borrowed + matured)
+    let draw = bounded_payout(&format!("{} {} SUB", mread(1), mread(0)), "bad_a");
+    let exit = bounded_payout(
+        &format!("{} {} ADD {} SUB", mread(2), mread(1), mread(0)),
+        "bad_b",
+    );
+    let code = dispatcher3(&draw, &exit, "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f =
+        finding(&r, "inconsistent-liability-accounting").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    // The deficient path is the one subtracting fewer liabilities (draw), not exit.
+    assert_eq!(
+        f.function.as_deref(),
+        Some("func_aaaaaaaa [0xaaaaaaaa]"),
+        "{f:?}"
+    );
+
+    // Both paths subtract the same set: no inconsistency.
+    let draw2 = bounded_payout(
+        &format!("{} {} ADD {} SUB", mread(2), mread(1), mread(0)),
+        "bad_c",
+    );
+    let code = dispatcher3(&draw2, &exit, "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    assert!(
+        finding(&r, "inconsistent-liability-accounting").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+
+    // A single payout path has nothing to disagree with.
+    let code = dispatcher3(&draw, "STOP", "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    assert!(
+        finding(&r, "inconsistent-liability-accounting").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+}

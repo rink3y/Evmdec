@@ -332,6 +332,10 @@ struct FnFacts {
     account_authorised: bool,
     /// The function recovers a signer (`ecrecover`): accounts may be authorised by signature.
     signature_authorised: bool,
+    /// Payout limits of the shape `deposits - liabilities` that gate value leaving this function.
+    avail_bounds: Vec<AvailBound>,
+    /// The function lets value leave: an ether call, a token transfer, or a ledger debit.
+    moves_value: bool,
 }
 
 /// A call to an address held in a constant storage slot.
@@ -359,6 +363,22 @@ struct Debit {
     /// The account as the printer shows it.
     account_text: String,
     /// Printed statement.
+    line: String,
+}
+
+/// A payout limit of the form `deposits - liabilities`: the storage fields a function adds up
+/// as credit and the fields it subtracts as owed, before it lets value leave. Two functions that
+/// limit transfers over the same storage must subtract the same owed fields; one that subtracts a
+/// proper subset lets more leave than the balance supports.
+#[derive(Clone, Debug)]
+struct AvailBound {
+    /// Storage fields summed as available credit.
+    added: BTreeSet<ssa::Shape>,
+    /// Storage fields subtracted as owed.
+    subbed: BTreeSet<ssa::Shape>,
+    /// A readable name for each field, for the finding's evidence.
+    names: HashMap<ssa::Shape, String>,
+    /// The printed guard the limit came from.
     line: String,
 }
 
@@ -467,6 +487,8 @@ fn collect_facts(
         ledger_reads: Vec::new(),
         account_authorised: false,
         signature_authorised: false,
+        avail_bounds: Vec::new(),
+        moves_value: false,
     };
     for cond in guard_conds(events) {
         if compares_sender_with_entry(cond) {
@@ -650,6 +672,25 @@ fn collect_facts(
             }
         }
     }
+    facts.moves_value = !facts.ether_out.is_empty()
+        || !facts.debits.is_empty()
+        || call_selector
+            .values()
+            .any(|s| *s == SEL_TRANSFER || *s == SEL_TRANSFER_FROM);
+    for cond in guard_conds(events) {
+        let mut added = BTreeSet::new();
+        let mut subbed = BTreeSet::new();
+        let mut name_map = HashMap::new();
+        signed_storage_terms(cond, layout, names, &mut added, &mut subbed, &mut name_map);
+        if !added.is_empty() && !subbed.is_empty() {
+            facts.avail_bounds.push(AvailBound {
+                added,
+                subbed,
+                names: name_map,
+                line: emit::fmt_cond(cond, names),
+            });
+        }
+    }
     if std::env::var("EVMDEC_DEBUG_FACTS").is_ok() {
         eprintln!(
             "[facts] {} checked={} init={} time={} auth={:?} writes={} ether={} sd={} dc={} guards={:?}",
@@ -788,6 +829,59 @@ fn ledger_entry(key: ExprId, layout: emit::MappingLayout) -> Option<(U256, ExprI
     match path.steps[..] {
         [ssa::Step::Key(k)] => Some((path.root, k)),
         _ => None,
+    }
+}
+
+/// Walk `e` and record the storage fields it adds and the ones it subtracts, as canonical
+/// shapes. Only `SUB` flips a term's sign; masks, shifts and comparisons are transparent, so a
+/// packed field read through a mask keeps the sign of the term it sits in. Reads whose key does
+/// not decompose to a slot path are ignored. The names map gets a readable label per field.
+fn signed_storage_terms(
+    e: ExprId,
+    layout: emit::MappingLayout,
+    names: &Names,
+    added: &mut BTreeSet<ssa::Shape>,
+    subbed: &mut BTreeSet<ssa::Shape>,
+    name_map: &mut HashMap<ssa::Shape, String>,
+) {
+    let mut seen: HashSet<(ExprId, bool)> = HashSet::new();
+    let mut stack = vec![(e, false)];
+    while let Some((x, neg)) = stack.pop() {
+        if !seen.insert((x, neg)) || seen.len() > 50_000 {
+            continue;
+        }
+        match expr::node(x) {
+            Node::SLoad(k, false, _) => {
+                if let Some(p) = ssa::slot_path(k, layout) {
+                    // Only pooled state (a mapping entry or array element) is a shared balance;
+                    // a global scalar slot (an interpolation parameter, a config value) is not.
+                    let pooled = p
+                        .steps
+                        .iter()
+                        .any(|st| matches!(st, ssa::Step::Key(_) | ssa::Step::Index(_)));
+                    if pooled {
+                        let sh = p.shape(SlotSpace::Persistent);
+                        if neg {
+                            subbed.insert(sh.clone());
+                        } else {
+                            added.insert(sh.clone());
+                        }
+                        name_map
+                            .entry(sh)
+                            .or_insert_with(|| emit::fmt_expr(x, names));
+                    }
+                }
+            }
+            Node::Op(op::SUB, v) if v.len() == 2 => {
+                stack.push((v[0], neg));
+                stack.push((v[1], !neg));
+            }
+            _ => {
+                for c in expr::children(x) {
+                    stack.push((c, neg));
+                }
+            }
+        }
     }
 }
 
@@ -3547,6 +3641,7 @@ pub fn analyze(c: &Contract) -> Report {
     // ---- cross-function passes: inferred access policy, attack chains ----
     policy_findings(&facts, &mut findings);
     chain_findings(&facts, &auth, &mut findings);
+    accounting_findings(&facts, &mut findings);
     trust_findings(c, &facts, &mut findings);
 
     // ---- widths, signedness and kinds of values ----
@@ -4936,6 +5031,65 @@ fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<
 
 /// 0..100: the worst finding sets the level (weighted by its confidence), the rest add a little.
 /// A single confirmed critical scores higher than twenty informational notes.
+/// Functions that release value must agree on what the shared balance already owes. When one
+/// function limits a transfer by `deposits - liabilities` over some storage, and another limits
+/// a transfer over the same deposits while subtracting strictly more liability fields, the first
+/// treats as free balance what the second counts as owed, so it can release more than the pool
+/// holds. The rule is a bytecode fact: it compares the sets of storage fields the two limits add
+/// and subtract, and names no contract, token or protocol.
+fn accounting_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
+    let mut flagged: HashSet<usize> = HashSet::new();
+    for (i, f) in facts.iter().enumerate() {
+        if !f.moves_value || flagged.contains(&i) {
+            continue;
+        }
+        for fb in &f.avail_bounds {
+            if fb.subbed.is_empty() {
+                continue;
+            }
+            let stronger = facts.iter().enumerate().find_map(|(j, g)| {
+                if i == j || !g.moves_value {
+                    return None;
+                }
+                g.avail_bounds.iter().find_map(|gb| {
+                    (fb.subbed.is_subset(&gb.subbed)
+                        && fb.subbed != gb.subbed
+                        && !fb.added.is_disjoint(&gb.added))
+                    .then_some((g, gb))
+                })
+            });
+            let Some((g, gb)) = stronger else { continue };
+            let missing: Vec<String> = gb
+                .subbed
+                .difference(&fb.subbed)
+                .map(|sh| gb.names.get(sh).cloned().unwrap_or_default())
+                .filter(|n| !n.is_empty())
+                .collect();
+            push_fact(
+                findings,
+                "inconsistent-liability-accounting",
+                "A payout limit omits a liability another path subtracts",
+                Severity::High,
+                Confidence::Medium,
+                f,
+                format!(
+                    "`{}` limits how much may leave by subtracting {} outstanding-liability field(s) from the pooled deposits, while `{}` subtracts {} over the same deposits. The field(s) {} are not subtracted here, so once they hold a value this path counts as available what `{}` already counts as owed, and releases more than the shared balance backs.",
+                    f.name,
+                    fb.subbed.len(),
+                    g.name,
+                    gb.subbed.len(),
+                    if missing.is_empty() { "it omits".to_string() } else { missing.join(", ") },
+                    g.name,
+                ),
+                vec![fb.line.clone(), format!("vs {}: {}", g.name, gb.line)],
+                "Subtract the same set of outstanding-liability fields in every function that releases value from the shared balance.",
+            );
+            flagged.insert(i);
+            break;
+        }
+    }
+}
+
 fn risk_score(findings: &[Finding]) -> u32 {
     let weight = |f: &Finding| -> f64 {
         let base = match f.severity {

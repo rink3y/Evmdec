@@ -29,7 +29,6 @@ impl U256 {
     /// Builds a value from big-endian bytes, left-padding shorter inputs with zero.
     /// Only the last 32 bytes of a longer slice are used.
     pub fn from_be_bytes(bytes: &[u8]) -> U256 {
-        // Accepts up to 32 bytes, big-endian, left-padded with zero.
         let mut buf = [0u8; 32];
         let n = bytes.len().min(32);
         buf[32 - n..].copy_from_slice(&bytes[bytes.len() - n..]);
@@ -228,7 +227,6 @@ impl U256 {
             );
         }
         if rhs.fits_u64() {
-            // Short division by a single limb.
             let d = rhs.0[0] as u128;
             let mut q = [0u64; 4];
             let mut rem = 0u128;
@@ -239,7 +237,6 @@ impl U256 {
             }
             return (U256(q), U256::from_u64(rem as u64));
         }
-        // Binary long division (shift-subtract). 256 iterations at most; fine for our use.
         let shift = rhs.leading_zeros() - self.leading_zeros();
         let mut divisor = rhs << shift;
         let mut q = U256::ZERO;
@@ -314,14 +311,10 @@ impl U256 {
         if !carry {
             return s % m;
         }
-        // 257-bit sum: 2^256 + s. Compute (2^256 mod m + s mod m) mod m.
         let two256_mod = ((U256::MAX % m).wrapping_add(U256::ONE)) % m;
         let sm = s % m;
         let (t, c) = two256_mod.overflowing_add(sm);
-        if c {
-            // t + 2^256 ; both < m <= 2^256 so sum < 2m; subtract m once (wrapping handles 2^256).
-            t.wrapping_sub(m)
-        } else if t >= m {
+        if c || t >= m {
             t.wrapping_sub(m)
         } else {
             t
@@ -338,11 +331,9 @@ impl U256 {
         if hi.is_zero() {
             return lo % m;
         }
-        // 512-bit modulo via binary long division on (hi, lo).
         let mut rem = U256::ZERO;
         for i in (0..512).rev() {
             let bit = if i >= 256 { hi.bit(i - 256) } else { lo.bit(i) };
-            // rem = rem*2 + bit, reduce mod m. rem < m <= 2^256-1 so rem*2+1 < 2^257.
             let (r2, carry) = rem.overflowing_add(rem);
             let (r3, carry2) = r2.overflowing_add(U256::from_u64(bit as u64));
             rem = r3;
@@ -688,7 +679,7 @@ mod tests {
         assert_eq!(x.sar(255), U256::MAX);
         assert_eq!((U256::ONE << 255), x);
         assert_eq!((x << 1), U256::ZERO);
-        assert_eq!(U256::MAX.sdiv(U256::from_u64(2)), U256::ZERO); // -1 / 2 == 0
+        assert_eq!(U256::MAX.sdiv(U256::from_u64(2)), U256::ZERO);
         assert_eq!((-U256::MAX), U256::ONE);
         assert_eq!(
             (-U256::from_u64(7)).sdiv(U256::from_u64(2)),
@@ -717,7 +708,6 @@ mod tests {
             U256::MAX.addmod(U256::MAX, m),
             ((U256::MAX % m).wrapping_add(U256::MAX % m) % m)
         );
-        // (2^255)*(2^255) mod (2^255+1): 2^510 mod (2^255+1). Let x = 2^255, x ≡ -1 => x^2 ≡ 1.
         let x = U256::ONE << 255;
         assert_eq!(x.mulmod(x, x.wrapping_add(U256::ONE)), U256::ONE);
         assert_eq!(

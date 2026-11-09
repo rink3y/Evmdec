@@ -27,7 +27,6 @@ BASE = "https://export.sourcify.dev/"
 MAGIC = b"EVMSIG1\n"
 HEADER = 24
 ENTRY = 12
-# Signatures longer than this are not useful to a decompiler and bloat the pool.
 MAX_SIG = 4096
 
 

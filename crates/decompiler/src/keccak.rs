@@ -121,7 +121,6 @@ mod tests {
             hex(&keccak256(b"Transfer(address,address,uint256)")),
             "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
         );
-        // Long input crossing several rate blocks.
         let long = vec![0x61u8; 300];
         assert_eq!(hex(&keccak256(&long)).len(), 64);
         assert_eq!(

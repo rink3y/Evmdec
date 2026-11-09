@@ -25,8 +25,9 @@ with a positive case and the nearest legitimate pattern as a negative case.
 ## Style
 
 Google's Rust style guide, `rustfmt.toml` as committed, `#![warn(missing_docs)]`: every item
-has a doc comment. Named-field structs over tuples of more than two elements. No `allow`
-attributes without a reason in the same line.
+has a doc comment. Named-field structs over tuples of more than two elements. No inline `//`
+comments: names and structure say what the code does, and the item's doc comment says why. An
+`allow` attribute states its `reason` inside the attribute.
 
 ## Commits
 

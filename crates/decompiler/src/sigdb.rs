@@ -75,7 +75,6 @@ fn read_at(file: &File, off: u64, buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-// Other targets: a seek on a cloned handle per read. Only correctness matters there.
 #[cfg(not(any(unix, windows)))]
 fn read_at(file: &File, off: u64, buf: &mut [u8]) -> io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
@@ -323,7 +322,6 @@ mod tests {
     fn selector_and_topic_lookups_round_trip() {
         let dir = TempDir::new("sigdb");
         let path = dir.0.join("sigs.idx");
-        // A forged collision on the selector of transfer(address,uint256) with a longer name.
         let mut forged = h("transfer(address,uint256)");
         forged[4] ^= 0xff;
         write(

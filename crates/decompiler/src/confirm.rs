@@ -75,8 +75,6 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         else {
             continue;
         };
-        // In a composite the function's code is its part's, run in the composite's storage as
-        // `DELEGATECALL` would; the finding's pc is translated back into that code.
         let witness = reach(c.code_of(f), f, c.local_pc(f, pc), &finding.id);
         if let Some(witness) = witness {
             finding.confirmed = true;
@@ -134,7 +132,6 @@ fn shows_effect(id: &str, run: &FrameRun) -> bool {
         "unprotected-owner-write" | "unprotected-initializer" | "unprotected-upgrade" => {
             !run.storage.is_empty()
         }
-        // The claim is a normal return that did nothing: no write, no call, no event.
         "silent-auth-failure" => {
             run.storage.is_empty() && run.calls.is_empty() && run.logs.is_empty()
         }

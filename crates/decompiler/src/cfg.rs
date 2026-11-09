@@ -179,8 +179,6 @@ impl AVal {
 }
 
 #[derive(Clone)]
-// The three maps are shared between the states of a walk and only replaced on write
-// (`Rc::make_mut`), so cloning a state at every branch stays cheap.
 struct AMem {
     /// Known 32-byte words at constant offsets (word writes only).
     words: Rc<BTreeMap<u32, AVal>>,
@@ -222,7 +220,6 @@ impl AMem {
         if off > MAX_AMEM {
             return;
         }
-        // Invalidate overlapping words.
         let w = Rc::make_mut(&mut self.words);
         let lo = off.saturating_sub(31) as u32;
         let keys: Vec<u32> = w.range(lo..=(off as u32 + 31)).map(|(k, _)| *k).collect();
@@ -338,7 +335,6 @@ impl AState {
         }
     }
     fn peek(&mut self, n: usize) -> AVal {
-        // n = 1 is the top.
         while self.stack.len() < n {
             if self.consumed >= 1023 {
                 return AVal::Unk;
@@ -615,8 +611,6 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                             } else if st.root && !st.mem.clobbered {
                                 AVal::Const(U256::ZERO)
                             } else if o % 32 == 0 {
-                                // Optimistic even after writes to unknown offsets: compilers keep
-                                // return addresses in dedicated slots, and targets are validated.
                                 AVal::Mem(o as u32)
                             } else {
                                 AVal::Unk
@@ -648,8 +642,6 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         }
                     }
                     _ => {
-                        // Unknown offset: entry-relative memory tokens are no longer trustworthy,
-                        // but known constants are kept (targets are validated against JUMPDESTs).
                         st.mem.clobbered = true;
                         mem_clobbered = true;
                     }
@@ -768,7 +760,6 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                                 })
                             }
                             (AVal::Const(a), AVal::Const(b)) if matches!(o, op::ADD | op::SUB) => {
-                                // Folded only when the result is a code address, so loop counters stay unknown.
                                 let r = if o == op::ADD {
                                     a.wrapping_add(b)
                                 } else {
@@ -854,10 +845,6 @@ fn table_targets(prog: &Program, mem: &AMem) -> Vec<usize> {
     out
 }
 
-// ---------------------------------------------------------------------------------------------
-// Summaries
-// ---------------------------------------------------------------------------------------------
-
 /// One way control can leave the region reachable from a block, with its net stack effect.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Exit {
@@ -898,8 +885,6 @@ enum Memo {
 pub struct Analysis<'a> {
     /// The program being analysed.
     pub prog: &'a Program,
-    // Memo tables and counters live behind `RefCell` because the walk recurses through `&self`
-    // (summaries of callees are computed on demand while a caller is being walked).
     summaries: RefCell<Vec<Summary>>,
     memo: RefCell<Vec<Option<Memo>>>,
     stack_depth: RefCell<usize>,
@@ -943,10 +928,8 @@ fn resolve(v: AVal, st: &mut AState) -> AVal {
 
 /// Apply an exit's stack effect to the caller state.
 fn apply_exit(ex: &Exit, st: &mut AState) {
-    // Materialise and remove `consumed` entries, then push `pushed` resolved against the pre-pop stack.
     let mut pre = st.clone();
     let resolved: Vec<AVal> = ex.pushed.iter().map(|v| resolve(*v, &mut pre)).collect();
-    // pre may have materialised more slots; adopt them
     *st = pre;
     for _ in 0..ex.consumed {
         st.pop();
@@ -965,7 +948,6 @@ fn join_vals(a: AVal, b: AVal) -> AVal {
 }
 
 fn add_exit(exits: &mut Vec<Exit>, ex: Exit) -> bool {
-    // Merge with an exit of the same shape (same via, consumed, pushed length).
     for e in exits.iter_mut() {
         if e.via == ex.via && e.consumed == ex.consumed && e.pushed.len() == ex.pushed.len() {
             let mut changed = false;
@@ -1037,7 +1019,6 @@ impl<'a> Analysis<'a> {
                 s[b] = summary;
                 changed
             };
-            // A self-dependent region (loop) iterates to a fixpoint; otherwise one pass suffices.
             if !changed || !dep || iterations >= 8 {
                 break;
             }
@@ -1102,8 +1083,6 @@ impl<'a> Analysis<'a> {
                                  mem_written: &mut HashSet<u32>| {
                 for &t in targets {
                     if t == b {
-                        // Back to our own entry: a loop over the region. The exits of the
-                        // continuation are our own exits composed with the current effect.
                         *depends = true;
                         let cur = self.summaries.borrow()[b].clone();
                         for ex in &cur.exits {
@@ -1134,7 +1113,6 @@ impl<'a> Analysis<'a> {
                         let via = resolve(ex.via, &mut s2);
                         apply_exit(ex, &mut s2);
                         if let Some(pc) = to_usize(via) {
-                            // Internal call: continue at the constant continuation.
                             if let Some(cb) = prog.target_block(pc) {
                                 self.call_targets.borrow_mut().insert(t);
                                 work.push_back((cb, s2));
@@ -1172,7 +1150,6 @@ impl<'a> Analysis<'a> {
                 }
                 Flow::Fallthrough(f) => work.push_back((f, st.clone())),
                 Flow::Return(v) => {
-                    // `v` is already relative to this region's entry.
                     self.record_exit(&mut summary, v, &st, &mut work);
                 }
                 Flow::BranchUnresolved { fallthrough, .. } => {
@@ -1199,7 +1176,6 @@ impl<'a> Analysis<'a> {
         work: &mut VecDeque<(usize, AState)>,
     ) {
         if let Some(pc) = to_usize(via) {
-            // A constant produced inside the region (e.g. a loop whose continuation resolved).
             if let Some(cb) = self.prog.target_block(pc) {
                 work.push_back((cb, st.clone()));
             }
@@ -1219,10 +1195,6 @@ impl<'a> Analysis<'a> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------------------------
-// Units: explicit graphs for the lifter
-// ---------------------------------------------------------------------------------------------
 
 /// Kind of a successor edge in a `Unit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1329,10 +1301,6 @@ impl<'a> Analysis<'a> {
                 return id;
             }
             let list = per_block.entry(blk).or_default();
-            // A context that differs from an existing one of this block only in which entry
-            // tokens still sit on the stack (a parameter reassigned on one path, a loop variable
-            // started from a parameter) is the same code: fold into that node and let the lifter
-            // merge the values. Code addresses and memory tokens must agree exactly.
             let height = |a: &AState| a.stack.len() as isize - a.consumed as isize;
             if let Some(&id) = list.iter().find(|id| {
                 let existing = &nodes[**id].entry;
@@ -1341,7 +1309,6 @@ impl<'a> Analysis<'a> {
                 return id;
             }
             if list.len() >= MAX_BLOCK_CONTEXTS {
-                // Context limit: fold into the first node of this block.
                 return list[0];
             }
             if std::env::var("EVMDEC_DEBUG_CTX").is_ok() && !list.is_empty() {
@@ -1399,7 +1366,6 @@ impl<'a> Analysis<'a> {
             nodes[n].computed_cut = cut;
             let st = exit.state;
             if st.underflowed() {
-                // Infeasible path in a real frame (stack underflow): no successors.
                 nodes[n].infeasible = true;
                 continue;
             }
@@ -1414,7 +1380,6 @@ impl<'a> Analysis<'a> {
                  succs: &mut Vec<(usize, Edge)>,
                  call: &mut Option<CallInfo>| {
                     for &t in targets {
-                        // Is this an internal call? Only JUMPs (not JUMPIs) can be calls.
                         if kind == Edge::Jump {
                             let sub = self.summary(t);
                             let mut call_conts: Vec<(usize, Exit, AVal)> = Vec::new();
@@ -1442,7 +1407,6 @@ impl<'a> Analysis<'a> {
                                 for (cb, ex, _) in &call_conts {
                                     let mut s2 = st.clone();
                                     apply_exit(ex, &mut s2);
-                                    // The callee may have written memory: forget those words.
                                     for &o in &sub.mem_written {
                                         Rc::make_mut(&mut s2.mem.words).remove(&o);
                                     }
@@ -1619,7 +1583,6 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
     let _ = an.summary(0);
     let main = an.build_unit(0, AState::root());
     let mut functions = BTreeMap::new();
-    // Internal functions: call targets discovered while building units, transitively.
     let mut pending: Vec<usize> = an.call_targets.borrow().iter().copied().collect();
     pending.sort_unstable();
     let mut done: HashSet<usize> = HashSet::new();
@@ -1637,7 +1600,6 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
         }
         functions.insert(f, unit);
     }
-    // Also units for call targets referenced from main
     for n in &main.nodes {
         if let Some(c) = &n.call {
             if !done.contains(&c.callee) {
@@ -1647,7 +1609,6 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
             }
         }
     }
-    // Coverage: which blocks appear in some unit.
     let mut covered: HashSet<usize> = HashSet::new();
     for n in &main.nodes {
         covered.insert(n.block);
@@ -1666,7 +1627,6 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
         }
         if !covered.contains(&b.id) && b.is_jumpdest {
             if orphan_nodes > MAX_ORPHAN_NODES {
-                // Budget: remaining unreached blocks stay uncovered (reported in the statistics).
                 break;
             }
             let unit =

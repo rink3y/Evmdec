@@ -402,7 +402,6 @@ pub fn profile(code: &[u8], md: Option<&Metadata>) -> Profile {
         free_memory_pointer: p.free_pointer.filter(|_| kind == Kind::Solc),
         ..Default::default()
     };
-    // The `vyper` metadata key appeared in 0.3.10.
     if kind == Kind::Vyper && prof.version.is_none() {
         if md.is_some() {
             prof.at_least = Some(Version::new(0, 3, 10));
@@ -478,7 +477,6 @@ mod tests {
 
     #[test]
     fn an_old_contract_is_bounded_from_above() {
-        // 0x60 free-memory pointer and division-based selector extraction: solc 0.4.
         let code = crate::hex::decode(
             "6060604052600436106100405763ffffffff7c01000000000000000000000000000000000000000000000000000000006000350416631a2b3c4d8114610045575b5bfd",
         )

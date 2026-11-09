@@ -343,7 +343,6 @@ pub fn minimal_proxy_target(code: &[u8]) -> Option<String> {
             return Some(hex::encode(&code[p.len()..p.len() + 20]));
         }
     }
-    // Generic: short runtime with a single PUSH20 followed by DELEGATECALL somewhere.
     if code.len() < 120 {
         let mut i = 0;
         while i < code.len() {
@@ -392,7 +391,6 @@ pub fn resolve_proxy(
         }));
     }
     if let Some(beacon) = nonzero(client.get_storage(address, EIP1967_BEACON)?) {
-        // implementation() on the beacon
         let data = client.eth_call(&beacon, "0x5c60da1b")?;
         if data.len() >= 32 {
             let impl_ = U256::from_be_bytes(&data[..32]);
@@ -412,7 +410,6 @@ pub fn resolve_proxy(
             admin: None,
         }));
     }
-    // Storage slots used as delegatecall targets in the code.
     for slot in delegatecall_slots {
         let v = client.get_storage(address, &slot.to_hex_padded(32))?;
         let a = v & expr::mask_bits(160);
@@ -572,7 +569,6 @@ fn storage_facets(client: &Client, address: &str, root: U256) -> Result<Vec<Face
         if facet.is_zero() {
             continue;
         }
-        // facetFunctionSelectors[facet].functionSelectors: a bytes4[] at the entry's first slot.
         let mut pre = Vec::with_capacity(64);
         pre.extend_from_slice(&facet.to_be_bytes());
         pre.extend_from_slice(&(root + U256::ONE).to_be_bytes());
@@ -589,7 +585,6 @@ fn storage_facets(client: &Client, address: &str, root: U256) -> Result<Vec<Face
             if j % 8 == 0 {
                 word = client.get_storage(address, &slot(data + U256::from_u64((j / 8) as u64)))?;
             }
-            // `bytes4` elements pack eight to a slot from the low-order end.
             let bytes = word.to_be_bytes();
             let lo = 32 - 4 * (j % 8 + 1);
             selectors.push(format!(

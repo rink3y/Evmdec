@@ -181,13 +181,11 @@ mod tests {
     #[test]
     fn runs_across_jumps_and_records_storage() {
         let code = hex::decode("6001600055600035156012576002600155005b00").expect("hex");
-        // calldata zero: the branch is not taken, slot1 stays unset.
         let run = run_frame(&code, &host(vec![]), HashMap::new(), 10_000);
         assert!(run.succeeded(), "{:?}", run.outcome);
         assert_eq!(run.storage.get(&U256::ZERO), Some(&U256::ONE));
         assert_eq!(run.storage.get(&U256::ONE), None);
 
-        // calldata non-zero: the branch runs, slot1 = 2.
         let run = run_frame(&code, &host(vec![0xff; 32]), HashMap::new(), 10_000);
         assert!(run.succeeded(), "{:?}", run.outcome);
         assert_eq!(run.storage.get(&U256::ONE), Some(&U256::from_u64(2)));
@@ -195,7 +193,6 @@ mod tests {
 
     #[test]
     fn a_jump_to_a_non_jumpdest_halts() {
-        // PUSH1 0x01 JUMP: offset 1 is the data byte of the PUSH, not a JUMPDEST.
         let code = hex::decode("600156").expect("hex");
         let run = run_frame(&code, &host(vec![]), HashMap::new(), 10_000);
         assert!(matches!(run.outcome, Outcome::Invalid));
@@ -203,7 +200,6 @@ mod tests {
 
     #[test]
     fn an_infinite_loop_stops_at_the_budget() {
-        // JUMPDEST PUSH1 0x00 JUMP (spins forever)
         let code = hex::decode("5b600056").expect("hex");
         let run = run_frame(&code, &host(vec![]), HashMap::new(), 500);
         assert!(matches!(run.outcome, Outcome::Exception(_)));

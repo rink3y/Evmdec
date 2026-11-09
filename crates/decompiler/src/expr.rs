@@ -251,18 +251,15 @@ pub fn op1(o: u8, a: ExprId) -> ExprId {
     }
     match o {
         op::ISZERO => {
-            // ISZERO(a - b) / ISZERO(a ^ b) -> a == b
             if let Node::Op(io, v) = node(a) {
                 if io == op::SUB || io == op::XOR {
                     return op2(op::EQ, v[0], v[1]);
                 }
             }
-            // ISZERO(ISZERO(ISZERO(x))) -> ISZERO(x)
             if let Node::Op(op::ISZERO, v) = node(a) {
                 if let Node::Op(op::ISZERO, w) = node(v[0]) {
                     return op1(op::ISZERO, w[0]);
                 }
-                // ISZERO(ISZERO(cmp)) -> cmp for boolean-valued comparisons
                 if is_boolean(v[0]) {
                     return v[0];
                 }
@@ -340,7 +337,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             return konst(r);
         }
     }
-    // Canonical operand order for commutative ops: constant on the right.
     let (a, b, ca, cb) = if is_commutative(o) && ca.is_some() && cb.is_none() {
         (b, a, cb, ca)
     } else {
@@ -351,7 +347,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             if cb == Some(U256::ZERO) {
                 return a;
             }
-            // x + (y - x) -> y ; (y - x) + x -> y
             if let Node::Op(op::SUB, v) = node(b) {
                 if v[1] == a {
                     return v[0];
@@ -362,7 +357,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                     return v[0];
                 }
             }
-            // (x + c1) + c2 -> x + (c1+c2)
             if let Some(c2) = cb {
                 if let Node::Op(op::ADD, v) = node(a) {
                     if let Some(c1) = as_const(v[1]) {
@@ -371,7 +365,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                 }
                 if let Node::Op(op::SUB, v) = node(a) {
                     if let Some(c1) = as_const(v[1]) {
-                        // (x - c1) + c2
                         return if c2 >= c1 {
                             op2(op::ADD, v[0], konst(c2.wrapping_sub(c1)))
                         } else {
@@ -379,7 +372,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                         };
                     }
                 }
-                // Negative constant: x + (2^256 - k) -> x - k, for small k (nicer output)
                 if c2.is_negative() && (-c2) < U256::from_u64(1 << 32) {
                     return intern(Node::Op(op::SUB, vec![a, konst(-c2)]));
                 }
@@ -392,7 +384,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             if a == b {
                 return konst(U256::ZERO);
             }
-            // (x + y) - x -> y ; (x + y) - y -> x
             if let Node::Op(op::ADD, v) = node(a) {
                 if v[0] == b {
                     return v[1];
@@ -400,7 +391,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                 if v[1] == b {
                     return v[0];
                 }
-                // (x + c1) - (x + c2) -> c1 - c2
                 if let Node::Op(op::ADD, w) = node(b) {
                     if v[0] == w[0] {
                         if let (Some(c1), Some(c2)) = (as_const(v[1]), as_const(w[1])) {
@@ -409,7 +399,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                     }
                 }
             }
-            // x - (x - y) -> y
             if let Node::Op(op::SUB, v) = node(b) {
                 if v[0] == a {
                     return v[1];
@@ -447,7 +436,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             if cb == Some(U256::ZERO) {
                 return konst(U256::ZERO);
             }
-            // x / 2^k -> x >> k
             if let Some(c) = cb {
                 if c.is_power_of_two() {
                     return op2(op::SHR, konst_u64(c.trailing_zeros() as u64), a);
@@ -478,17 +466,14 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                 return a;
             }
             if let Some(m) = cb {
-                // AND(AND(x, m1), m2) -> AND(x, m1&m2)
                 if let Node::Op(op::AND, v) = node(a) {
                     if let Some(m1) = as_const(v[1]) {
                         return op2(op::AND, v[0], konst(m1 & m));
                     }
                 }
-                // Masking a boolean or a value already narrower than the mask is a no-op.
                 if m.is_low_mask() && m.bits() >= value_bits(a) {
                     return a;
                 }
-                // Bits that can never be set need no mask; a mask that keeps none of them is zero.
                 let may = may_bits(a);
                 if (may & !m).is_zero() {
                     return a;
@@ -496,7 +481,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                 if (may & m).is_zero() {
                     return konst(U256::ZERO);
                 }
-                // AND(OR(x, y), m) where one side has no bits under the mask -> AND(other, m)
                 if let Node::Op(op::OR, v) = node(a) {
                     if (may_bits(v[0]) & m).is_zero() {
                         return op2(op::AND, v[1], konst(m));
@@ -517,7 +501,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             if a == b {
                 return a;
             }
-            // OR(AND(x, m1), AND(x, m2)) -> AND(x, m1 | m2)  (complementary masks reassemble x)
             if let (Node::Op(op::AND, v), Node::Op(op::AND, w)) = (node(a), node(b)) {
                 if v[0] == w[0] {
                     if let (Some(m1), Some(m2)) = (as_const(v[1]), as_const(w[1])) {
@@ -535,7 +518,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             }
         }
         op::SHL => {
-            // SHL(shift, value): a is shift
             if ca == Some(U256::ZERO) {
                 return b;
             }
@@ -543,13 +525,11 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                 if s >= U256::from_u64(256) {
                     return konst(U256::ZERO);
                 }
-                // SHL(k, SHL(j, x)) -> SHL(k+j, x)
                 if let Node::Op(op::SHL, v) = node(b) {
                     if let Some(j) = as_const(v[0]) {
                         return op2(op::SHL, konst(s.wrapping_add(j)), v[1]);
                     }
                 }
-                // Distribute over OR when one side vanishes (packed ABI words).
                 if let Node::Op(op::OR, v) = node(b) {
                     let l = op2(op::SHL, a, v[0]);
                     let r = op2(op::SHL, a, v[1]);
@@ -560,7 +540,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                         return l;
                     }
                 }
-                // SHL(k, SHR(k, x)) -> AND(x, ~mask)
                 if let Node::Op(op::SHR, v) = node(b) {
                     if as_const(v[0]) == Some(s) {
                         return op2(op::AND, v[1], konst(!mask_bits(s.low_u64() as u32)));
@@ -576,7 +555,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                 if s >= U256::from_u64(256) {
                     return konst(U256::ZERO);
                 }
-                // SHR(k, SHR(j, x)) -> SHR(k+j, x)
                 if let Node::Op(op::SHR, v) = node(b) {
                     if let Some(j) = as_const(v[0]) {
                         return op2(op::SHR, konst(s.wrapping_add(j)), v[1]);
@@ -592,14 +570,11 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                         return l;
                     }
                 }
-                // SHR(k, AND(x, m)) with m's low k bits clear and x narrower than 256: keep.
-                // SHR(k, SHL(k, x)) -> AND(x, mask(256-k))
                 if let Node::Op(op::SHL, v) = node(b) {
                     if as_const(v[0]) == Some(s) {
                         return op2(op::AND, v[1], konst(mask_bits(256 - s.low_u64() as u32)));
                     }
                 }
-                // SHR(k, AND(x, m)) where m has no bits below k... keep as is.
             }
         }
         op::SAR => {
@@ -611,11 +586,9 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             if a == b {
                 return konst(U256::ONE);
             }
-            // EQ(x, 0) -> ISZERO(x)
             if cb == Some(U256::ZERO) {
                 return op1(op::ISZERO, a);
             }
-            // EQ(ISZERO(x), 0)... handled above. EQ(bool, 1) -> bool
             if cb == Some(U256::ONE) && is_boolean(a) {
                 return a;
             }
@@ -624,11 +597,9 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             if a == b {
                 return konst(U256::ZERO);
             }
-            // LT(x, 0) is false; GT(0, x) is false
             if (o == op::LT && cb == Some(U256::ZERO)) || (o == op::GT && ca == Some(U256::ZERO)) {
                 return konst(U256::ZERO);
             }
-            // GT(x, 0) -> ISZERO(ISZERO(x)); LT(0, x) likewise
             if o == op::GT && cb == Some(U256::ZERO) {
                 return op1(op::ISZERO, op1(op::ISZERO, a));
             }

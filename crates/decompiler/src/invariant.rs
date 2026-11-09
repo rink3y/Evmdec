@@ -60,8 +60,6 @@ pub(crate) struct Ledger {
 pub(crate) fn is_ledger(c: &Contract, root: U256) -> bool {
     let layout = c.compiler.layout;
     let entry_of = |key: ExprId| is_entry_of(key, root, layout);
-    // `slot_path` interns constants, so it must not run inside an arena borrow: collect the
-    // loaded keys first, then classify them.
     let reads_entry = |e: ExprId| -> bool { sload_keys(e).into_iter().any(entry_of) };
     for f in &c.functions {
         let Some(l) = &f.lifted else { continue };
@@ -155,7 +153,6 @@ fn is_signed(c: &Contract, env: &TypeEnv, root: U256) -> bool {
             }
         }
         for site in ssa::call_sites(l, arity) {
-            // `call_sites` only yields sites whose callee has a known arity.
             let Some(k) = arity(site.callee) else {
                 continue;
             };
@@ -317,7 +314,6 @@ fn search_credit(code: &[u8], f: &Function, keys: &[(Ledger, U256)]) -> Option<C
             }
             attempts += 1;
             let data = exec::calldata(selector, &args);
-            // The host owns its calldata; `data` is kept as the witness of a hit.
             let host = exec::caller_host(data.clone(), U256::ZERO);
             let run = exec::run_frame(code, &host, HashMap::new(), STEP_BUDGET);
             if !run.succeeded() {

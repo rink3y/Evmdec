@@ -144,7 +144,6 @@ impl Fetcher<'_> {
             .map(|p| p.address.to_ascii_lowercase())
             .collect();
         let mut targets: Vec<String> = c.call_targets.clone();
-        // Cloned: the loop appends to `c.stored_targets` while the slots are read.
         for slot in c.call_target_slots.clone() {
             match self.client.get_storage(address, &slot) {
                 Ok(v) => {
@@ -197,8 +196,6 @@ impl Fetcher<'_> {
                     .is_some_and(|s| s.eq_ignore_ascii_case(sel))
             })
         };
-        // A diamond: the fallback looks the facet up under the selector, or the loupe or cut
-        // function is present.
         let looks_like_diamond = c.diamond_lookup.is_some()
             || has_selector(rpc::SEL_FACETS)
             || has_selector(rpc::SEL_DIAMOND_CUT);
@@ -209,7 +206,6 @@ impl Fetcher<'_> {
                 Err(e) => (self.log)(&format!("diamond resolution failed: {}", e)),
             }
         }
-        // A proxy: a single implementation behind a known slot, a clone or a hard-coded target.
         let slots: Vec<U256> = c
             .delegatecall_slots
             .iter()

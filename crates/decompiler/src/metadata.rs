@@ -105,7 +105,7 @@ fn cbor_read(data: &[u8], pos: &mut usize, depth: u32) -> Option<Cbor> {
             *pos += 8;
             u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
         }
-        _ => return None, // indefinite lengths are not used by compilers
+        _ => return None,
     };
     Some(match major {
         0 => Cbor::UInt(arg),
@@ -332,7 +332,6 @@ fn detect_creation(code: &[u8]) -> Option<(usize, usize)> {
 
 /// The copy-and-return split of `code`, before the checks in [`detect_creation`].
 fn creation_split(code: &[u8], insns: &[disasm::Instruction]) -> Option<(usize, usize)> {
-    // Walk block by block; within each block simulate the constant stack to find CODECOPY args.
     let mut block_start = 0;
     let mut i = 0;
     let mut best: Option<(usize, usize)> = None;
@@ -346,12 +345,10 @@ fn creation_split(code: &[u8], insns: &[disasm::Instruction]) -> Option<(usize, 
                     if let (Some(dest), Some(offset), Some(len)) =
                         (dest.as_usize(), offset.as_usize(), len.as_usize())
                     {
-                        // Must copy a region that starts after this CODECOPY and is non-trivial.
                         if offset > insns[i].pc
                             && len >= 1
                             && offset.checked_add(len).is_some_and(|e| e <= code.len())
                         {
-                            // Look for a RETURN later in the same block (before next terminator) that returns from `dest`.
                             let mut j = i + 1;
                             let mut found = false;
                             while j < insns.len() {
@@ -379,11 +376,8 @@ fn creation_split(code: &[u8], insns: &[disasm::Instruction]) -> Option<(usize, 
                                 }
                                 j += 1;
                             }
-                            if found {
-                                // Prefer the largest region (the runtime) when several copies exist (immutables are smaller).
-                                if best.is_none_or(|(_, bl)| len > bl) {
-                                    best = Some((offset, len));
-                                }
+                            if found && best.is_none_or(|(_, bl)| len > bl) {
+                                best = Some((offset, len));
                             }
                         }
                     }
@@ -394,7 +388,6 @@ fn creation_split(code: &[u8], insns: &[disasm::Instruction]) -> Option<(usize, 
             block_start = if op == opcode::JUMPDEST { i } else { i + 1 };
         }
         i += 1;
-        // Only the constructor prefix matters; the runtime itself is never scanned past its start.
         if let Some((off, _)) = best {
             if insns[i.min(insns.len() - 1)].pc >= off {
                 break;
@@ -495,8 +488,6 @@ mod tests {
 
     #[test]
     fn runtime_loading_a_constant_from_code_is_not_creation_code() {
-        // PUSH0 CALLDATALOAD POP; PUSH1 32 PUSH1 off PUSH0 CODECOPY PUSH0 MLOAD PUSH0 MSTORE
-        // PUSH1 32 PUSH0 RETURN; then 32 bytes of data.
         let mut code = vec![0x5f, 0x35, 0x50, 0x60, 0x20, 0x60, 0x13, 0x5f, 0x39];
         code.extend_from_slice(&[0x5f, 0x51, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3, 0x00, 0x00]);
         assert_eq!(code.len(), 0x13);
@@ -506,8 +497,6 @@ mod tests {
 
     #[test]
     fn code_ending_in_its_own_metadata_is_runtime() {
-        // CODECOPY(0, off, 32) and RETURN(0, 32) with no calldata read, then 32 bytes of data,
-        // then a valid solc metadata trailer that the copied region does not contain.
         let mut code = vec![
             0x60, 0x20, 0x60, 0x0c, 0x5f, 0x39, 0x60, 0x20, 0x5f, 0xf3, 0x00, 0x00,
         ];
@@ -516,7 +505,6 @@ mod tests {
         code.extend_from_slice(&trailer);
         assert!(parse_metadata(&code).is_some());
         assert_eq!(analyze(&code).kind, CodeKind::Runtime);
-        // The same prefix with constructor arguments instead of a trailer is creation code.
         let mut creation = code[..12 + 32].to_vec();
         creation.extend_from_slice(&[0u8; 32]);
         assert_eq!(analyze(&creation).kind, CodeKind::Creation);

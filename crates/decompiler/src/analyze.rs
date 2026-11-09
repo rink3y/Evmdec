@@ -181,26 +181,26 @@ const POOL_SELECTORS: &[u32] = &[
     SEL_GET_RESERVES,
     SEL_TOKEN0,
     SEL_TOKEN1,
-    0x3850c7bd, // slot0()
-    0x1a686502, // liquidity()
-    0x128acb08, // swap(address,bool,int256,uint160,bytes), V3
-    0x3c8a7d8d, // mint(address,int24,int24,uint128,bytes), V3
-    0xa34123a7, // burn(int24,int24,uint128), V3
-    0x4f1eb3d8, // collect(address,int24,int24,uint128,uint128), V3
-    0x883bdbfd, // observe(uint32[]), V3
-    0x48c89491, // unlock(bytes), V4
-    0x11da60b4, // settle(), V4
-    0x0b0d9c09, // take(address,address,uint256), V4
-    0x5a6bcfda, // modifyLiquidity(PoolKey,ModifyLiquidityParams,bytes), V4
-    0xf3cd914c, // swap(PoolKey,SwapParams,bytes), V4
-    0x5e0d443f, // get_dy(int128,int128,uint256), Curve
-    0x3df02124, // exchange(int128,int128,uint256,uint256), Curve
-    0x0b4c7e4d, // add_liquidity(uint256[2],uint256), Curve
-    0x5b36389c, // remove_liquidity(uint256,uint256[2]), Curve
-    0x52bbbe29, // swap(SingleSwap,FundManagement,uint256,uint256), Balancer
-    0xb95cac28, // joinPool(bytes32,address,address,JoinPoolRequest), Balancer
-    0x8bdb3913, // exitPool(bytes32,address,address,ExitPoolRequest), Balancer
-    0xf6c00927, // getPoolTokens(bytes32), Balancer
+    0x3850c7bd,
+    0x1a686502,
+    0x128acb08,
+    0x3c8a7d8d,
+    0xa34123a7,
+    0x4f1eb3d8,
+    0x883bdbfd,
+    0x48c89491,
+    0x11da60b4,
+    0x0b0d9c09,
+    0x5a6bcfda,
+    0xf3cd914c,
+    0x5e0d443f,
+    0x3df02124,
+    0x0b4c7e4d,
+    0x5b36389c,
+    0x52bbbe29,
+    0xb95cac28,
+    0x8bdb3913,
+    0xf6c00927,
 ];
 const SEL_APPROVE: u32 = 0x095ea7b3;
 const SEL_BALANCE_OF: u32 = 0x70a08231;
@@ -420,7 +420,6 @@ enum WriteSource {
 }
 
 fn write_source(val: ExprId) -> WriteSource {
-    // A packed address write keeps the slot's other bytes: `x | slot & 0xffff…0000`.
     let keeps_old_bytes = |e: ExprId| {
         matches!(expr::node(e), Node::Op(op::AND, w)
             if w.iter().any(|x| matches!(expr::node(*x), Node::SLoad(..)))
@@ -529,8 +528,6 @@ fn collect_facts(
         if is_time_cond(cond) {
             facts.time_gated = true;
         }
-        // `require(slot == 0)`, `if (!slot)`, a branch on the bare slot or on a masked byte of
-        // it: the shapes an "already initialised?" test takes in solc and Vyper output.
         if matches!(
             expr::node(cond),
             Node::Op(op::ISZERO | op::EQ | op::AND, _) | Node::SLoad(..)
@@ -543,11 +540,7 @@ fn collect_facts(
         }
     }
     let layout = ctx.c.compiler.layout;
-    // Events that write storage or call out, so a later `sync()` can be checked against the
-    // ones that actually reach it (not merely precede it in the stream).
     let mut mutations: Vec<&Event> = Vec::new();
-    // Selector of each call by sequence number, so a value stored from a call's return data
-    // can be traced to what was asked.
     let mut call_selector: HashMap<u32, u32> = HashMap::new();
     for ev in events {
         match &ev.stmt {
@@ -562,7 +555,6 @@ fn collect_facts(
                 facts
                     .const_writes
                     .push((*key, write_source(*val), emit::fmt_stmt(st, names)));
-                // An address another contract returned, stored as is: a factory result.
                 let from_return = matches!(expr::node(unmask(*val)), Node::ReturnData(..));
                 if from_return && !facts.factory_slots.contains(key) {
                     facts.factory_slots.push(*key);
@@ -578,7 +570,6 @@ fn collect_facts(
                 },
             ) => {
                 if let Some((root, account)) = ledger_entry(*key, layout) {
-                    // A fixed amount (an NFT's one unit) is bookkeeping, not a chosen debit.
                     if subtracts_from(*val, *key).is_some_and(|amount| !expr::is_const(amount)) {
                         facts.debits.push(Debit {
                             root,
@@ -691,7 +682,6 @@ fn collect_facts(
     facts.moves_value = !facts.ether_out.is_empty()
         || !facts.debits.is_empty()
         || call_selector.values().any(|s| *s == SEL_TRANSFER);
-    // Amounts that leave: ether call values, `transfer` amounts, ledger debits.
     let mut outflows: Vec<ExprId> = facts.ether_out.iter().map(|(_, v, _)| *v).collect();
     let mut candidates: Vec<(AvailBound, ExprId)> = Vec::new();
     let mut seen = HashSet::new();
@@ -764,7 +754,6 @@ fn collect_facts(
             }
         }
     }
-    // A limit counts only when what it is compared with is the amount that leaves.
     facts.avail_bounds = candidates
         .into_iter()
         .filter(|(_, other)| limits_outflow(*other, &outflows))
@@ -860,7 +849,6 @@ fn callee_writes(
         return w.clone();
     }
     if !visited.insert(target) {
-        // Recursion: nothing new beyond what the outer frame collects.
         return Some(Vec::new());
     }
     let r = match ctx.internals.get(&target).and_then(|f| f.lifted.as_ref()) {
@@ -936,8 +924,6 @@ fn pooled_field(e: ExprId, layout: emit::MappingLayout) -> Option<Field> {
     let mut width = 256u32;
     let mut lo = 0u32;
     if let Node::Op(op::AND, v) = expr::node(x) {
-        // A contiguous mask: `0x..ff` keeps the low bits, `0xff..00` a field higher up that is
-        // read in place without a shift.
         let masked = [(v[0], v[1]), (v[1], v[0])].into_iter().find_map(|(m, o)| {
             let c = expr::as_const(m)?;
             let tz = c.trailing_zeros();
@@ -1164,7 +1150,6 @@ fn limits_in(
         }
         if let Node::Op(op::LT | op::GT | op::SLT | op::SGT, v) = expr::node(x) {
             for (side, other) in [(v[0], v[1]), (v[1], v[0])] {
-                // Against a constant it is a range or overflow check, not a payout limit.
                 if expr::is_const(other) {
                     continue;
                 }
@@ -1297,8 +1282,6 @@ fn collect_ledger_reads_under_slots(
 /// Record the outer keys of two-level mapping reads whose inner key is `msg.sender`:
 /// `allowance[owner][msg.sender]`.
 fn collect_allowance_keys(e: ExprId, layout: emit::MappingLayout, out: &mut Vec<ExprId>) {
-    // Every loaded key, including the ones that mention msg.sender (which
-    // `collect_sload_keys` leaves out on purpose): the allowance key does.
     let mut keys = Vec::new();
     let mut seen = HashSet::new();
     let mut stack = vec![e];
@@ -1569,7 +1552,6 @@ fn graph_mentions(
 /// Loop membership of nodes (back edges via DFS).
 fn loop_nodes(l: &Lifted) -> HashSet<usize> {
     let mut in_loop = HashSet::new();
-    // Simple: node x is in a loop if x can reach itself.
     let n = l.nodes.len();
     for x in 0..n {
         let mut seen = HashSet::new();
@@ -1614,7 +1596,6 @@ fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Ev
 fn ev_reaches(ctx: &Ctx, l: &Lifted, a: &Event, b: &Event) -> bool {
     for (i, ((ia, ca, na), (ib, _, nb))) in a.path.iter().zip(b.path.iter()).enumerate() {
         if ia != ib {
-            // Two helpers inlined from the same node of the parent body: event order decides.
             return true;
         }
         if na == nb {
@@ -1635,9 +1616,10 @@ fn ev_reaches(ctx: &Ctx, l: &Lifted, a: &Event, b: &Event) -> bool {
 /// in the caller's terms (`msg.sender` rather than `arg1`). `mem` replays the memory writes seen
 /// so far; inside a helper, reads of memory the helper could not know (a payload the caller
 /// built and passed by pointer) are resolved through it.
-// The call-site parameters mirror the recursion state; a struct would be built and torn
-// apart at every level for no reader benefit.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the replay threads the inlining path, substitution and memory view through every level"
+)]
 fn events_of_in(
     ctx: &Ctx,
     l: &Lifted,
@@ -1650,11 +1632,6 @@ fn events_of_in(
     subst: &HashMap<u32, ExprId>,
     mem: &mut lift::MemView,
 ) -> Vec<Event> {
-    // Memory reads are resolved through the replayed memory at every level: the lifter forgets
-    // memory across internal calls it could not summarise, while the replay has seen the
-    // callee's writes (and, for Vyper, the argument slots the caller filled). The free-memory
-    // pointer stays symbolic: its loads carry version stamps (a stale `mem[0x40]` means the value
-    // before a bump) that a sequential replay cannot honour.
     let free_ptr = expr::konst(U256::from_u64(0x40));
     let apply = |e: ExprId, mem: &lift::MemView| -> ExprId {
         let mut memo = HashMap::new();
@@ -1689,7 +1666,6 @@ fn events_of_in(
     let dbg_memview = std::env::var("EVMDEC_DEBUG_MEMVIEW").ok();
     let dbg_unfresh = std::env::var("EVMDEC_DEBUG_UNFRESH").is_ok();
     let mut out = Vec::new();
-    // RPO order
     let mut order = Vec::new();
     let mut seen = HashSet::new();
     fn dfs(l: &Lifted, x: usize, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
@@ -1703,8 +1679,6 @@ fn events_of_in(
     }
     dfs(l, l.entry, &mut seen, &mut order);
     order.reverse();
-    // Bytes written inside loops hold no single value: forget them up front, and keep loop
-    // writes from making them known again.
     if !loops.is_empty() {
         let w = writes_of(ctx, loops.iter().map(|n| &l.nodes[*n]), &mut HashSet::new());
         if dbg_unfresh {
@@ -1730,7 +1704,6 @@ fn events_of_in(
         for s in &nd.stmts {
             let s = lift::map_stmt(s, &|e| apply(e, mem));
             if let Stmt::Internal { callee: t, .. } = &s {
-                // Resolved below when the callee is inlined; otherwise forget what it writes.
                 let inlined = depth > 0 && ctx.internals.get(t).is_some_and(|f| f.lifted.is_some());
                 if !inlined {
                     let w = callee_writes(ctx, *t, &mut HashSet::new());
@@ -1805,7 +1778,6 @@ fn events_of_in(
                 if depth > 0 {
                     if let Some(f) = ctx.internals.get(target) {
                         if let Some(cl) = &f.lifted {
-                            // Arg(i) (i < k) of the callee is argument k-1-i in natural order.
                             let k = cl.ret_slot.map(|k| k as usize).unwrap_or(usize::MAX);
                             let mut inner: HashMap<u32, ExprId> = HashMap::new();
                             if k != usize::MAX {
@@ -1918,7 +1890,10 @@ pub(crate) fn display_name(f: &Function) -> String {
 }
 
 /// Append a finding. One positional constructor keeps the ~50 rule sites to a single call each.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a finding is built from its fields in one call at every rule site"
+)]
 pub(crate) fn push(
     findings: &mut Vec<Finding>,
     id: &str,
@@ -2117,7 +2092,6 @@ pub fn is_auth_cond(cond: ExprId) -> bool {
             }
             false
         }
-        // roles[msg.sender] used as a boolean
         Node::SLoad(k, _, _) => from_caller(k),
         _ => false,
     }
@@ -2209,7 +2183,6 @@ fn collect_sload_keys(e: ExprId, out: &mut HashSet<ExprId>) {
             continue;
         }
         if let Node::SLoad(k, false, _) = expr::node(x) {
-            // Only constant slots / mapping roots, not keys that include msg.sender themselves
             if !from_caller(k) {
                 out.insert(k);
             }
@@ -2279,7 +2252,6 @@ pub fn analyze(c: &Contract) -> Report {
             }) = &ev.stmt
             {
                 if let Some(k) = expr::as_const(*key) {
-                    // `slot = slot + c`: the slot grows (an array gets an entry).
                     if let Node::Op(op::ADD, v) = expr::node(*val) {
                         if v.iter().any(|x| reads_slot(*x, *key))
                             && v.iter().any(|x| expr::as_const(*x).is_some())
@@ -2356,7 +2328,6 @@ pub fn analyze(c: &Contract) -> Report {
         )
     };
 
-    // ---- contract kind ----
     let sels: HashSet<String> = c
         .functions
         .iter()
@@ -2386,16 +2357,13 @@ pub fn analyze(c: &Contract) -> Report {
         kinds.push("Upgradeable (UUPS/transparent admin)".to_string());
     }
 
-    // ---- per-function rules ----
     let auth = auth_slots(&ctx);
     let caps = capped_slots(c);
     let mut external_calls: BTreeSet<String> = BTreeSet::new();
     let mut privileged: Vec<String> = Vec::new();
     let mut unauthenticated: Vec<String> = Vec::new();
     let mut facts: Vec<FnFacts> = Vec::new();
-    // Reentrancy lock slots and the functions that use them (Vyper lock-slot bug detection).
     let mut lock_slots: HashMap<ExprId, HashSet<usize>> = HashMap::new();
-    // Contract-wide: does anything ever send ether out?
     let mut any_payable = false;
     let mut any_ether_out = false;
     let mut fallback_delegatecall = false;
@@ -2413,8 +2381,6 @@ pub fn analyze(c: &Contract) -> Report {
         let events = events_of(&ctx, l, 5, false);
         let caller_checked = any_caller_check(&ctx, f);
         facts.push(collect_facts(&ctx, f, &events, caller_checked, &names));
-        // Loops (in the function or the helpers it inlines) whose every storage bound is a
-        // counter the contract caps at a constant.
         let loop_cap: Option<u64> = {
             let mut keys: Vec<U256> = Vec::new();
             let mut graphs: Vec<&Lifted> = vec![l];
@@ -2452,8 +2418,6 @@ pub fn analyze(c: &Contract) -> Report {
         if f.mutability == crate::function::Mutability::Payable {
             any_payable = true;
         }
-        // A function with no successful exit (simulation helpers such as Safe's
-        // `simulateAndRevert`) leaves nothing behind: what it calls cannot change state.
         let always_reverts = !l.nodes.iter().any(|nd| {
             matches!(
                 nd.term,
@@ -2461,9 +2425,6 @@ pub fn analyze(c: &Contract) -> Report {
             )
         });
 
-        // Reentrancy guard: a constant slot that is tested before the call, set to a constant
-        // before it and set to a constant again after it (`require(lock == 1); lock = 2; …;
-        // lock = 1`, OpenZeppelin/Uniswap/Seaport style, storage or transient).
         let const_sloads = |e: ExprId| -> Vec<ExprId> {
             let mut out = Vec::new();
             let mut seen = HashSet::new();
@@ -2488,9 +2449,6 @@ pub fn analyze(c: &Contract) -> Report {
             for (j, e) in events.iter().enumerate() {
                 if let Some(Stmt::SStore { key, val, .. }) = &e.stmt {
                     if expr::is_const(*key) {
-                        // Entering may store a caller-dependent marker (`lockedBy = msg.sender`,
-                        // `guard = accepting ? A : B`); leaving restores a constant, either the
-                        // whole slot or a packed field of it (`slot & ~mask` clears the field).
                         let restores_const = expr::is_const(*val)
                             || emit::packed_write(*key, *val)
                                 .is_some_and(|(_, _, _, v)| expr::is_const(v));
@@ -2524,11 +2482,8 @@ pub fn analyze(c: &Contract) -> Report {
                 }
             }
         }
-        // Walk events for call-related rules.
         for (i, ev) in events.iter().enumerate() {
             let Some(stmt) = &ev.stmt else { continue };
-            // Inlined helper statements carry the caller's actual arguments (see `events_of_in`),
-            // so they print with the caller's names.
             let names = &names;
             match stmt {
                 Stmt::Call {
@@ -2553,7 +2508,6 @@ pub fn analyze(c: &Contract) -> Report {
                         line.trim_end_matches(';')
                     ));
                     let in_len_c = expr::as_const(*in_len).and_then(|l| l.as_usize());
-                    // The selector of the payload, from the decoded words or from the first memory word.
                     let selector: Option<u32> = input
                         .as_ref()
                         .and_then(|w| w.first().copied())
@@ -2575,7 +2529,6 @@ pub fn analyze(c: &Contract) -> Report {
                             emit::fmt_expr(*in_len, names)
                         );
                     }
-                    // Payload words for argument inspection: decoded ones, else the raw head words.
                     let words_view: Option<&Vec<ExprId>> =
                         input.as_ref().or(if input_head.is_empty() {
                             None
@@ -2592,10 +2545,8 @@ pub fn analyze(c: &Contract) -> Report {
                         || matches!(expr::node(*gas), Node::Op(op::MUL, ref v) if expr::as_const(v[1]) == Some(U256::from_u64(2300)) || expr::as_const(v[0]) == Some(U256::from_u64(2300)));
                     let user_target = from_calldata(*addr) || from_caller(*addr);
                     let storage_target = from_storage(*addr);
-                    // Known safe precompiles
                     let precompile = expr::as_const(*addr).is_some_and(|a| a <= U256::from_u64(10));
 
-                    // Delegatecall
                     if *kind == op::DELEGATECALL || *kind == op::CALLCODE {
                         if f.kind == FnKind::Fallback {
                             fallback_delegatecall = true;
@@ -2603,8 +2554,6 @@ pub fn analyze(c: &Contract) -> Report {
                         if storage_target {
                             delegatecall_targets_storage = true;
                         }
-                        // A diamond's fallback reads the facet from storage under the call's
-                        // selector: the caller picks which stored address runs, not the address.
                         let router = storage_target
                             && ctx.c.diamond_lookup.is_some()
                             && f.kind == FnKind::Fallback;
@@ -2627,7 +2576,6 @@ pub fn analyze(c: &Contract) -> Report {
                         }
                     }
 
-                    // Reentrancy: state write reachable after a non-static external call.
                     if *kind == op::CALL || *kind == op::CALLCODE {
                         let later_write = events[i + 1..].iter().any(|e2| {
                             let hit = matches!(&e2.stmt, Some(Stmt::SStore { .. }))
@@ -2664,7 +2612,6 @@ pub fn analyze(c: &Contract) -> Report {
                                 format!("`{}` performs an external call to `{}` and writes storage afterwards. A malicious callee can re-enter before the state update is applied (checks-effects-interactions violated).{}", f.name, target, extra),
                                 vec![line.clone()], "Apply the checks-effects-interactions pattern (update state before calling out) or use a reentrancy guard.");
                         }
-                        // Unchecked return value
                         let used = events.iter().any(|e2| {
                             e2.stmt.as_ref().is_some_and(|s2| match s2 {
                                 Stmt::Drop(_) => false,
@@ -2707,8 +2654,6 @@ pub fn analyze(c: &Contract) -> Report {
                                 format!("`{}` ignores the success flag of a low-level call to `{}`. If the call fails (reverting callee, out of gas, non-contract address) execution continues as if it succeeded{}.", f.name, target, if value_nonzero { ", and the ether is kept by this contract while state may assume it was sent" } else { "" }),
                                 vec![line.clone()], "Check the returned boolean (`require(success)`) or use a high-level call that reverts on failure.");
                         }
-                        // ERC20 transfer/transferFrom/approve whose returned bool is never read: a
-                        // token that returns false instead of reverting is treated as a success.
                         if input.is_some() {
                             if let Some(sel) = selector {
                                 if matches!(sel, SEL_TRANSFER | SEL_TRANSFER_FROM | SEL_APPROVE) {
@@ -2754,17 +2699,10 @@ pub fn analyze(c: &Contract) -> Report {
                                         .values()
                                         .flatten()
                                         .any(|(_, v)| ret_read(*v));
-                                    // Return data read through a copy (`(bool ok, bytes memory
-                                    // data) = token.call(...)` then `data.length == 0 ||
-                                    // abi.decode(data, (bool))`): the copy or the length test
-                                    // sits between this call and the next.
                                     let window_end = events[i + 1..]
                                         .iter()
                                         .position(|e2| matches!(e2.stmt, Some(Stmt::Call { .. })))
                                         .map_or(events.len(), |k| i + 1 + k);
-                                    // Only a copy made before the success test counts (the copy on
-                                    // the failing side of `if (success) … else { bubble revert }`
-                                    // is not a check), as does a test that looks at the size.
                                     let mut copied = false;
                                     for e2 in &events[i + 1..window_end] {
                                         if matches!(
@@ -2805,7 +2743,6 @@ pub fn analyze(c: &Contract) -> Report {
                                         let sig = sigs::function(sel);
                                         let name =
                                             sig.as_deref().map(sigs::name_of).unwrap_or("transfer");
-                                        // What the function gives in return for the unchecked pull.
                                         let payout =
                                             events[i + 1..].iter().find_map(|e2| match &e2.stmt {
                                                 Some(
@@ -2872,11 +2809,6 @@ pub fn analyze(c: &Contract) -> Report {
                                 }
                             }
                         }
-                        // Arbitrary call
-                        // The payload counts as caller-controlled when its selector word comes from
-                        // calldata, or when an undecoded payload starts with a CALLDATACOPY (the whole
-                        // call data is the caller's). A fixed selector with calldata arguments
-                        // (`token.transferFrom(from, to, amount)`) is an ordinary call.
                         let same_addr = |a: ExprId, b: ExprId| {
                             strip_versions(a, &mut HashMap::new())
                                 == strip_versions(b, &mut HashMap::new())
@@ -2895,11 +2827,6 @@ pub fn analyze(c: &Contract) -> Report {
                                 format!("`{}` calls `{}` with calldata-derived payload and no access control. If this contract holds token approvals or ether, anyone can drain them through it (e.g. calling `transferFrom` on an approved token).", f.name, target),
                                 vec![line.clone()], "Restrict callable targets/selectors, or make sure the contract never holds funds or approvals.");
                         }
-                        // Dynamic dispatch: neither the target nor the selector is fixed or taken
-                        // from storage (cross-chain executors, relayers, generic forwarders).
-                        // A value returned by an internal helper is "fixed" only when the helper's
-                        // arguments are: a bytes-to-address decoder fed from a calldata copy is as
-                        // caller-controlled as the calldata itself.
                         let int_ret_fixed = |e: ExprId| -> bool {
                             let seqs: RefCell<Vec<u32>> = RefCell::new(Vec::new());
                             mentions(e, &|n| {
@@ -2938,9 +2865,6 @@ pub fn analyze(c: &Contract) -> Report {
                             && !precompile
                             && f.kind == FnKind::External
                         {
-                            // A target the caller demonstrably feeds (calldata, or a helper decoding
-                            // calldata) is High; one of unknown provenance (memory the analysis could
-                            // not resolve) is Medium.
                             let caller_fed = from_calldata(*addr)
                                 || (mentions(*addr, &|n| matches!(n, Node::IntRet(..)))
                                     && !int_ret_fixed(*addr));
@@ -2953,17 +2877,13 @@ pub fn analyze(c: &Contract) -> Report {
                                 format!("`{}` calls `{}` with a payload whose selector is computed rather than fixed, and the function has no access control. If the caller can influence either (through calldata, a forged proof, or a message the contract trusts), this is an arbitrary call made by this contract.", f.name, target),
                                 vec![line.clone()], "Whitelist the targets and the selectors that can be dispatched, and authenticate the source of the request.");
                         }
-                        // transferFrom(from, …) moving someone else's tokens on the caller's say-so.
                         if let (Some(words), Some(SEL_TRANSFER_FROM)) = (words_view, selector) {
                             if !caller_checked && f.kind == FnKind::External && !always_reverts {
                                 let from = emit::shifted_word_len(words, 0, in_len_c);
                                 let from_user = from_calldata(from)
                                     && !from_caller(from)
                                     && !mentions(from, &|n| matches!(n, Node::Env(op::ADDRESS, _)));
-                                // An allowance keyed by both `from` and msg.sender, or a signature
-                                // check, is what makes delegated transfers legitimate (Permit2 style).
                                 let allowance = events.iter().flat_map(event_exprs).any(|e| mentions(e, &|n| matches!(n, Node::SLoad(k, _, _) if from_caller(*k) && contains_expr(*k, from))));
-                                // ecrecover, or an EIP-1271 `isValidSignature` call.
                                 let signed = events.iter().any(|e| match &e.stmt {
                                     Some(Stmt::Call {
                                         addr,
@@ -2995,7 +2915,6 @@ pub fn analyze(c: &Contract) -> Report {
                                 }
                             }
                         }
-                        // Decisions based on what a caller-chosen contract answers.
                         if user_target
                             && !caller_checked
                             && !precompile
@@ -3016,8 +2935,6 @@ pub fn analyze(c: &Contract) -> Report {
                                 }
                                 _ => false,
                             });
-                            // The address was looked up in storage before the call
-                            // (`require(isBound[token])`): a registry, not an arbitrary contract.
                             let registry_checked = events[..i].iter().any(|e| {
                                 let conds: Vec<ExprId> = match (&e.stmt, &e.term) {
                                     (Some(Stmt::Require { cond, .. }), _) => vec![*cond],
@@ -3028,8 +2945,6 @@ pub fn analyze(c: &Contract) -> Report {
                                     mentions(c, &|n| matches!(n, Node::SLoad(k, _, _) if contains_expr(*k, *addr)))
                                 })
                             });
-                            // Checking a token's transfer/approve result is the correct use of
-                            // its answer, not a decision an attacker-chosen callee can forge.
                             let erc20_result_only = matches!(
                                 selector,
                                 Some(SEL_TRANSFER | SEL_TRANSFER_FROM | SEL_APPROVE)
@@ -3043,7 +2958,6 @@ pub fn analyze(c: &Contract) -> Report {
                                     vec![line.clone()], "Only trust return data from addresses taken from storage or a registry; measure effects (balance deltas) instead of believing the callee.");
                             }
                         }
-                        // Chainlink answers used without validity/staleness checks.
                         if let Some(sel) = selector {
                             if sel == SEL_LATEST_ROUND_DATA || sel == SEL_LATEST_ANSWER {
                                 let answer_idx = if sel == SEL_LATEST_ROUND_DATA { 1 } else { 0 };
@@ -3072,7 +2986,6 @@ pub fn analyze(c: &Contract) -> Report {
                                 }
                             }
                         }
-                        // Token amount credited as sent, without measuring what arrived.
                         if let (Some(words), Some(SEL_TRANSFER_FROM)) = (words_view, selector) {
                             let to = emit::shifted_word_len(words, 1, in_len_c);
                             if mentions(to, &|n| matches!(n, Node::Env(op::ADDRESS, _))) {
@@ -3086,8 +2999,6 @@ pub fn analyze(c: &Contract) -> Report {
                                 }
                             }
                         }
-                        // Reverse-quoted amount: the caller fixes what it receives while what it
-                        // gives is computed with a division and only required to be nonzero.
                         if let (Some(words), Some(sel)) = (words_view, selector) {
                             if let Some((given, received, how)) =
                                 reverse_quote(&ctx, l, &events, words, sel, in_len_c)
@@ -3097,7 +3008,6 @@ pub fn analyze(c: &Contract) -> Report {
                                     vec![line.clone()], "Round the computed input up and the output down, and require a minimum input relative to the output (or a minimum reserve) instead of a nonzero check.");
                             }
                         }
-                        // Ether to caller without auth or balance accounting
                         if let (Some(v), true, true, false, FnKind::External) = (
                             *value,
                             value_nonzero,
@@ -3105,9 +3015,6 @@ pub fn analyze(c: &Contract) -> Report {
                             caller_checked,
                             f.kind,
                         ) {
-                            // Per-caller accounting before the transfer: a store to a caller-keyed
-                            // slot, or a check against a caller-keyed balance (`balanceOf[msg.sender] >= wad`).
-                            // Variables in an inlined helper's statement belong to that helper's graph.
                             let graph_of = |ev2: &Event| -> &Lifted {
                                 ev2.callee
                                     .and_then(|pc| ctx.internals.get(&pc))
@@ -3139,7 +3046,6 @@ pub fn analyze(c: &Contract) -> Report {
                                 (_, Some(Term::Branch { cond, .. })) => {
                                     caller_slot(*cond, graph_of(e))
                                 }
-                                // A swap: tokens pulled from the caller pay for the ether.
                                 (
                                     Some(Stmt::Call {
                                         input: Some(w),
@@ -3164,8 +3070,6 @@ pub fn analyze(c: &Contract) -> Report {
                                     vec![line.clone()], "Verify the amount is bounded by what the caller is owed.");
                             }
                         }
-                        // Pre-0.8: a payout amount computed with `-` or `*` from a parameter that
-                        // no earlier comparison bounds wraps silently (accounting error).
                         if let (Some(v), true) = (*value, value_nonzero) {
                             let wrapping = c.compiler.kind == compiler::Kind::Solc
                                 && c.compiler.is_below(compiler::Version::new(0, 8, 0));
@@ -3207,9 +3111,6 @@ pub fn analyze(c: &Contract) -> Report {
                             }
                         }
                         if ev.in_loop && !precompile {
-                            // The loop pays every entry of a storage array and reverts unless each
-                            // call succeeds, and some function without access control adds
-                            // entries: one entry that rejects the call blocks everyone's payout.
                             let required = events.iter().any(|e2| match (&e2.stmt, &e2.term) {
                                 (Some(Stmt::Require { cond, .. }), _)
                                 | (_, Some(Term::Branch { cond, .. })) => mentions(
@@ -3238,7 +3139,6 @@ pub fn analyze(c: &Contract) -> Report {
                                     format!("`{}` performs an external call to `{}` inside a loop; one failing or gas-hungry callee can block the whole iteration (denial of service).{}", f.name, target, note), vec![line.clone()], "Prefer pull-payments or bound the iteration.");
                             }
                         }
-                        // ecrecover
                         if expr::as_const(*addr) == Some(U256::ONE) {
                             let zero_checked = l.nodes.iter().any(|nd| matches!(&nd.term, Term::Branch { cond, .. } if mentions(*cond, &|n| matches!(n, Node::ReturnData(s, _) if *s == *seq)) || mentions(*cond, &|n| matches!(n, Node::MLoad(..)))));
                             if !zero_checked {
@@ -3248,7 +3148,6 @@ pub fn analyze(c: &Contract) -> Report {
                             if let Some(words) = input {
                                 let all: Vec<ExprId> =
                                     events.iter().flat_map(event_exprs).collect();
-                                // Domain: the signed digest should bind this chain and this contract.
                                 let digest = words[0];
                                 let domain_bound =
                                     mentions(digest, &|n| {
@@ -3263,14 +3162,12 @@ pub fn analyze(c: &Contract) -> Report {
                                         format!("`{}` verifies a signature over `{}`, which includes neither `block.chainid` nor `address(this)` (no EIP-712 domain). The same signature is valid on every chain and every deployment.", f.name, emit::fmt_expr(digest, names)),
                                         vec![line.clone()], "Sign an EIP-712 digest that includes the chain id and the verifying contract.");
                                 }
-                                // Nonce: some storage keyed by the signer (or by the digest) must change.
                                 let signer_keyed_write = events.iter().any(|e2| matches!(&e2.stmt, Some(Stmt::SStore { key, .. }) if mentions_returndata(*key, *seq) || contains_expr(*key, digest) || mentions(*key, &|n| matches!(n, Node::Keccak(..) | Node::KeccakMem(..)))));
                                 if !signer_keyed_write && !always_reverts {
                                     push(&mut findings, "signature-replay-nonce", "No nonce or consumed-digest bookkeeping for a verified signature", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                         format!("`{}` recovers a signer but writes no storage keyed by the signer or by the digest, so the same signature can be submitted again.", f.name),
                                         vec![line.clone()], "Store and increment a per-signer nonce, or mark the digest as used.");
                                 }
-                                // Malleability: s must be in the lower half of the curve order.
                                 if words.len() >= 4 {
                                     let half = U256::from_hex_str(SECP_HALF_ORDER);
                                     let s_checked = all.iter().any(|e| {
@@ -3313,7 +3210,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // Terminators: selfdestruct (in the function or an inlined helper), unresolved
         for (si, ev) in events.iter().enumerate() {
             let Some(Term::SelfDestruct(a)) = &ev.term else {
                 continue;
@@ -3321,13 +3217,11 @@ pub fn analyze(c: &Contract) -> Report {
             let a = *a;
             let to_caller = from_caller(a) || from_calldata(a);
             let time_guard = guard_conds(&events).into_iter().find(|c| is_time_cond(*c));
-            // Ether leaves by calls on the way to the destruct: what it forwards is what is left.
             let paid_before = events[..si].iter().any(|e2| {
                 matches!(&e2.stmt, Some(Stmt::Call { value: Some(v), .. })
                     if expr::as_const(*v) != Some(U256::ZERO))
                     && ev_reaches(&ctx, l, e2, ev)
             });
-            // A condition on storage (not on the caller or the clock) stands in front of it.
             let state_gate = events[..si]
                 .iter()
                 .filter(|e2| ev_reaches(&ctx, l, e2, ev))
@@ -3411,7 +3305,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // tx.origin authorization
         for nd in &l.nodes {
             if let Term::Branch { cond, .. } = &nd.term {
                 if mentions(*cond, &|n| matches!(n, Node::Env(op::ORIGIN, _)))
@@ -3426,9 +3319,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // Weak randomness: a hash (or blockhash) of block attributes that is reduced to a range
-        // or decides a branch. A plain hash that is only stored or emitted is reported at low
-        // confidence (it may be an identifier rather than a random draw).
         {
             let blocky = |n: &Node| {
                 matches!(n, Node::Env(o, _) if matches!(*o, op::TIMESTAMP | op::NUMBER | op::PREVRANDAO | op::COINBASE | op::GASLIMIT))
@@ -3516,7 +3406,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // msg.value read inside a loop: every iteration sees the same payment.
         if f.mutability == crate::function::Mutability::Payable {
             let cv = |e: ExprId| mentions(e, &|n| matches!(n, Node::Env(op::CALLVALUE, _)));
             if let Some(ev) = events
@@ -3543,7 +3432,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // Division before multiplication loses precision: (a / b) * c.
         {
             let mut shown: Option<(ExprId, usize)> = None;
             for ev in &events {
@@ -3581,8 +3469,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // Spot balances as a price: a transferred amount derived from this contract's own
-        // balance (ether or a token balanceOf(this)) through a division.
         if f.kind == FnKind::External {
             let spot = |e: ExprId| -> bool {
                 mentions(e, &|n| matches!(n, Node::Env(op::SELFBALANCE, _)) || matches!(n, Node::Op(op::BALANCE, ref v) if matches!(expr::node(v[0]), Node::Env(op::ADDRESS, _))))
@@ -3629,7 +3515,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // Payouts to the caller: ether sent to msg.sender, or tokens transferred to it.
         if f.kind == FnKind::External && !caller_checked {
             let payouts: Vec<(ExprId, String, usize)> = events
                 .iter()
@@ -3659,8 +3544,6 @@ pub fn analyze(c: &Contract) -> Report {
                 })
                 .collect();
             let guards = guard_conds(&events);
-            // A computed price or share (balances or storage, and the caller's input, with a
-            // division) paid out with no caller-supplied bound.
             for (amount, line, pc) in &payouts {
                 if expr::is_const(*amount) || from_calldata(*amount) && !from_storage(*amount) {
                     continue;
@@ -3679,8 +3562,6 @@ pub fn analyze(c: &Contract) -> Report {
                 {
                     continue;
                 }
-                // Results the amount is built from: a guard on any of them against a calldata
-                // word is a bound the caller chose.
                 let mut parts: HashSet<ExprId> = HashSet::new();
                 let mut seen = HashSet::new();
                 let mut stack = vec![*amount];
@@ -3703,8 +3584,6 @@ pub fn analyze(c: &Contract) -> Report {
                         vec![line.clone()], "Take a minimum acceptable output (and a deadline) as parameters and require them.");
                 }
             }
-            // A required payment to a fixed address next to the caller's payout: that address
-            // can make the function unusable by rejecting ether.
             if !payouts.is_empty() {
                 for ev in &events {
                     let Some(
@@ -3744,8 +3623,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // Unchecked arithmetic: pre-0.8 compilers wrap silently; on 0.8+ an operation without
-        // the compiler's overflow guard sits in an `unchecked { }` block.
         let solc = c.compiler.kind == compiler::Kind::Solc;
         let pre08 = solc && !c.compiler.checked_arithmetic;
         let post08 = solc && c.compiler.checked_arithmetic;
@@ -3765,11 +3642,6 @@ pub fn analyze(c: &Contract) -> Report {
             let mut memo = HashMap::new();
             for (body, body_fn) in &bodies {
                 let body_names = names_for(body_fn);
-                // Conditions visible from this body: its own plus those of the helpers it calls,
-                // with the helpers' arguments replaced by the actual values (SafeMath-style checks
-                // live in the callee and mention the caller's operands only after substitution).
-                // Storage/memory versions are stripped so that a check made before an earlier
-                // store still matches the operands of a later one.
                 let conds: Vec<ExprId> = crate::function::exprs_with_callees(body, &resolve, 2)
                     .into_iter()
                     .filter(|e| expr::is_boolean(*e))
@@ -3789,16 +3661,11 @@ pub fn analyze(c: &Contract) -> Report {
                                         && !expr::is_const(v[0])
                                         && !expr::is_const(v[1])
                                     {
-                                        // Is there a comparison involving this op or its operands (SafeMath-style check)?
                                         let (xn, v0, v1) = (
                                             strip_versions(x, &mut memo),
                                             strip_versions(v[0], &mut memo),
                                             strip_versions(v[1], &mut memo),
                                         );
-                                        // An overflow check relates the result to one of its operands
-                                        // (`c >= a`, `c / a == b`) or compares the operands (`a >= b`,
-                                        // `a > max / b`). A comparison that merely consumes the result
-                                        // (`balance >= cnt * value`) does not check it (BeautyChain).
                                         let outside = |cnd: ExprId, target: ExprId| {
                                             mentions_outside(cnd, target, xn)
                                         };
@@ -3811,7 +3678,6 @@ pub fn analyze(c: &Contract) -> Report {
                                         }
                                     }
                                 }
-                                // Addresses inside loads and hashes are pointer arithmetic, not values.
                                 if !matches!(
                                     expr::node(x),
                                     Node::MLoad(..)
@@ -3837,7 +3703,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // Loops bounded by storage
         {
             let loops = loop_nodes(l);
             for nd in &l.nodes {
@@ -3871,7 +3736,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // Privileged slot writable without access control.
         if f.kind == FnKind::External && !caller_checked {
             for nd in &l.nodes {
                 for s in &nd.stmts {
@@ -3880,8 +3744,6 @@ pub fn analyze(c: &Contract) -> Report {
                             && expr::is_const(*key)
                             && (from_calldata(*val) || from_caller(*val))
                         {
-                            // `require(owner == 0)` / `require(!initialized)` before the write: an
-                            // initializer, dangerous only if it is not called in the deployment tx.
                             let k = *key;
                             let init_guard = events.iter().any(|e| match (&e.term, &e.stmt) {
                                 (Some(Term::Branch { cond, .. }), _) | (_, Some(Stmt::Require { cond, .. })) => mentions(*cond, &|n| matches!(n, Node::SLoad(kk, _, _) if *kk == k)) || mentions(*cond, &|n| matches!(n, Node::SLoad(kk, _, _) if expr::is_const(*kk) && *kk != k)) && matches!(expr::node(*cond), Node::Op(op::ISZERO, _) | Node::Op(op::EQ, _)),
@@ -3902,7 +3764,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // msg.value reuse in delegatecall loops (multicall)
         if f.mutability == crate::function::Mutability::Payable {
             let dc_in_loop = events.iter().any(|e| {
                 e.in_loop
@@ -3920,7 +3781,6 @@ pub fn analyze(c: &Contract) -> Report {
             }
         }
 
-        // EIP-1967 slots
         for nd in &l.nodes {
             for e in lift::node_exprs(nd) {
                 if mentions(
@@ -3933,25 +3793,19 @@ pub fn analyze(c: &Contract) -> Report {
         }
     }
 
-    // ---- authorisation that fails by returning instead of reverting ----
     silent_guard_findings(&ctx, &mut findings);
 
-    // ---- cross-function passes: inferred access policy, attack chains ----
     policy_findings(&facts, &mut findings);
     chain_findings(&facts, &auth, &mut findings);
     accounting_findings(&facts, &mut findings);
     trust_findings(c, &facts, &mut findings);
 
-    // ---- widths, signedness and kinds of values ----
     type_rules::findings(c, &c.types, names_for, &mut findings);
 
-    // ---- confirm reachable findings by execution ----
     crate::confirm::confirm(c, &mut findings);
 
-    // ---- invariant violations found by execution ----
     crate::invariant::findings(c, &c.types, &mut findings);
 
-    // ---- contract-level findings ----
     if std::env::var("EVMDEC_DEBUG_LOCKS").is_ok() {
         for (slot, fs) in &lock_slots {
             eprintln!(
@@ -3962,8 +3816,6 @@ pub fn analyze(c: &Contract) -> Report {
             );
         }
     }
-    // A correct compile shares one slot per lock key (one or two keys in practice); the buggy
-    // versions gave each function its own slot (default-argument variants of a function share).
     if ctx.vyper && lock_slots.len() >= 3 {
         let mut fns: Vec<String> = lock_slots
             .values()
@@ -4163,7 +4015,6 @@ pub fn analyze(c: &Contract) -> Report {
     if c.stats.unresolved_jumps > 0 {
         push(&mut findings, "coverage", "Some code could not be reached by the analysis", Severity::Info, Confidence::High, None, None, format!("{} jump(s) have unresolved targets and {} of {} code blocks were covered. Findings may be incomplete.", c.stats.unresolved_jumps, c.stats.covered_blocks, c.stats.code_blocks), vec![], "Informational.");
     }
-    // Unknown selectors
     let unknown: Vec<String> = c
         .functions
         .iter()
@@ -4197,19 +4048,15 @@ pub fn analyze(c: &Contract) -> Report {
         );
     }
 
-    // Deduplicate identical findings (same id, function, pc).
     let mut seen = HashSet::new();
     findings.retain(|f| seen.insert((f.id.clone(), f.function.clone(), f.pc, f.title.clone())));
     let mut findings = merge_findings(findings);
-    // A call into a deployment-fixed contract is not worth a line next to a real reentrancy
-    // finding in the same function.
     let reentrant: HashSet<Option<String>> = findings
         .iter()
         .filter(|f| f.id == "reentrancy")
         .map(|f| f.function.clone())
         .collect();
     findings.retain(|f| f.id != "reentrancy-fixed-callee" || !reentrant.contains(&f.function));
-    // Lock-protected call-then-write paths are one fact about the contract, not one per function.
     let locked: Vec<Finding> = findings
         .iter()
         .filter(|f| f.id == "reentrancy" && f.severity == Severity::Info)
@@ -4509,8 +4356,6 @@ fn only_nonzero_bound(ctx: &Ctx, l: &Lifted, events: &[Event], amt: ExprId) -> O
         if from_calldata(c) {
             continue;
         }
-        // Only a comparison with `amt` as a direct operand says anything about its range;
-        // `amt + x >= x` is an overflow check, not a bound.
         let lower = match expr::node(c) {
             Node::Op(op::GT, v) if v[0] == amt => pol,
             Node::Op(op::LT, v) if v[1] == amt => pol,
@@ -4547,7 +4392,6 @@ fn reverse_quote(
     let names = Names::default();
     match sel {
         SEL_TRANSFER_FROM => {
-            // Parameter words: 0 = from, 1 = to, 2 = amount.
             let to = emit::shifted_word_len(words, 1, in_len);
             let amt = emit::shifted_word_len(words, 2, in_len);
             if std::env::var("EVMDEC_DEBUG_RQ").is_ok() {
@@ -4585,13 +4429,10 @@ fn reverse_quote(
             ))
         }
         SEL_TRANSFER => {
-            // Parameter words: 0 = to, 1 = amount.
             let amt_out = emit::shifted_word_len(words, 1, in_len);
             if !direct(amt_out) {
                 return None;
             }
-            // The debit: `balance - computed`, or the result of a helper (`bsub`) that was
-            // handed the computed amount.
             let computed_input = |x: ExprId| {
                 computed_by_division(ctx, events, x)
                     && only_nonzero_bound(ctx, l, events, x) == Some(true)
@@ -4726,8 +4567,10 @@ fn silent_guard_findings(ctx: &Ctx, findings: &mut Vec<Finding>) {
     }
 }
 
-// Same shape as `push`, for findings anchored on a function's facts.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a finding is built from its fields in one call at every rule site"
+)]
 fn push_fact(
     findings: &mut Vec<Finding>,
     id: &str,
@@ -4770,19 +4613,11 @@ fn join_names(names: &[&str], max: usize) -> String {
 /// synchronised after state was moved prices that move in at once.
 fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let slot_const = |e: ExprId| expr::as_const(e);
-    // Slots that hold a pair: called with a pair selector somewhere, or returned by a getter
-    // whose known name says so.
-    // Ledgers: address-keyed numeric mappings moved between accounts.
     let ledgers: HashSet<U256> = crate::invariant::balance_mappings(&c.types)
         .into_iter()
         .map(|l| l.root)
         .filter(|r| crate::invariant::is_ledger(c, *r))
         .collect();
-    // Slots that hold the token's market counterparty, by how the token treats the address
-    // rather than by which DEX it is: its transfer guards single the address out, it came from
-    // another contract's return value, its ledger balance is read as a quantity, or the token
-    // calls it with a pool interface selector. Any of these is the shape a pool-aware token has
-    // whatever the pool's design.
     let mut pool_slots: HashSet<U256> = HashSet::new();
     for x in facts {
         for sc in &x.stored_callees {
@@ -4805,8 +4640,6 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
             }
         }
     }
-    // Slots a zero-argument getter named for a pair or pool returns: weaker evidence, from the
-    // dictionary name rather than from use.
     let mut named_slots: HashSet<U256> = HashSet::new();
     for f in &c.functions {
         let getter_name = f
@@ -4834,7 +4667,6 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
         }
     }
 
-    // Rule: a gate slot that is also a callee on a public path.
     let mut open_gates: HashMap<usize, Vec<String>> = HashMap::new();
     let mut linked_cache: HashMap<String, LinkedSummary> = HashMap::new();
     for x in facts
@@ -4881,11 +4713,6 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
         }
     }
 
-    // Rule: a balance lowered on an account the caller neither owns nor has an allowance for.
-    // Only ledgers count (address-keyed numeric mappings that are moved between accounts), only
-    // accounts the bytecode names (a stored address or a calldata word), and not where the
-    // function authorises per account, by signature, or debits the very account its gate
-    // compares the caller to.
     for x in facts {
         if x.account_authorised || x.signature_authorised {
             continue;
@@ -4959,7 +4786,6 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
         }
     }
 
-    // Rule: a pair synchronised after this function moved state.
     for x in facts {
         for sync in &x.syncs {
             if !sync.after_mutation {
@@ -5033,7 +4859,6 @@ fn linked_forwards(
         );
     }
     let summary = &cache[&address];
-    // `selectors_called` entries read `0xselector signature` when the signature is known.
     let calls_back = gated.selector.as_deref().is_some_and(|sel| {
         summary.selectors_called.iter().any(|entry| {
             entry
@@ -5043,7 +4868,6 @@ fn linked_forwards(
         })
     });
     let mut forwarders: Vec<&String> = summary.forwarders.iter().collect();
-    // The function this contract calls comes first, when it is among them.
     if let Some(sel) = called {
         let tag = format!("{:#010x}", sel);
         forwarders.sort_by_key(|name| !name.contains(&tag));
@@ -5107,14 +4931,10 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
         return;
     }
     let follower_names: Vec<&str> = followers.iter().map(|g| g.name.as_str()).collect();
-    // Slots written only behind the policy check. An initializer's writes do not count: it sets
-    // up state that ordinary functions then maintain.
     let mut gated_slots: HashSet<ExprId> = HashSet::new();
     for g in followers.iter().filter(|g| !g.init_guarded) {
         gated_slots.extend(g.const_writes.iter().map(|(s, _, _)| *s));
     }
-    // What the gated functions do beyond writing slots: only an action some gated function also
-    // takes is privileged by this contract's own standard.
     let gated_pays_storage = followers
         .iter()
         .any(|g| g.ether_out.iter().any(|(a, _, _)| from_storage(*a)));
@@ -5126,7 +4946,6 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
         .filter(|x| x.external && x.state_changing && !x.caller_checked)
     {
         for (s, _, _) in &x.const_writes {
-            // Written by two unprotected functions: an ordinary public slot, not a gated one.
             if facts
                 .iter()
                 .filter(|y| !y.caller_checked && !std::ptr::eq(*y, x))
@@ -5144,10 +4963,6 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 *sev = to;
             }
         };
-        // Ether to an address the caller picks is a user-facing payout (a withdrawal, a swap):
-        // `unprotected-ether-withdrawal` judges those. Ether to a constant address is a call
-        // into a known contract (WETH.deposit). Ether to an address held in storage is a
-        // treasury/owner payout, the kind the gated functions make.
         for (addr, _, line) in &x.ether_out {
             if from_caller(*addr)
                 || from_calldata(*addr)
@@ -5178,8 +4993,6 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
             );
             evidence.push(line.clone());
         }
-        // A delegatecall to a constant address is a linked library; to a calldata address it is
-        // `arbitrary-delegatecall`. One to a stored address is an upgrade path.
         for (t, line) in &x.delegatecalls {
             if !from_storage(*t) || from_calldata(*t) || from_caller(*t) || !gated_delegates {
                 continue;
@@ -5190,7 +5003,6 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
         }
         for (slot, _, line) in &x.const_writes {
             if policy.iter().any(|(p, _)| p == slot) {
-                // The owner slot itself: `unprotected-owner-write` covers it.
                 continue;
             }
             if gated_slots.contains(slot) {
@@ -5224,8 +5036,6 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
 fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<Finding>) {
     let mut reported: HashSet<(String, String)> = HashSet::new();
     for x in facts.iter().filter(|x| x.external && !x.caller_checked) {
-        // A write behind a not-yet-set check is open only until the contract is initialised:
-        // a real chain for an implementation left uninitialised, nothing otherwise.
         let (chain_sev, init_note) = if x.init_guarded {
             (Severity::Medium, " Step 1 sits behind a not-yet-initialised check, so the chain is open only while the contract (or a bare implementation) is uninitialised.")
         } else {
@@ -5235,7 +5045,6 @@ fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<
             if *source == WriteSource::Other {
                 continue;
             }
-            // (1) Take over a role, then use what the role can do.
             if auth.contains(slot) {
                 for g in facts
                     .iter()
@@ -5267,9 +5076,6 @@ fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<
                         "Protect the role write (step 1); the chain then collapses to an ordinary privileged function.");
                 }
             }
-            // (2) Set a payout target or amount, then trigger the payout. Storing msg.sender
-            // (a depositor, the current king) is a pull-payment design, so only a value the
-            // caller passes in counts.
             if *source != WriteSource::Calldata {
                 continue;
             }
@@ -5535,7 +5341,6 @@ fn merge_findings(findings: Vec<Finding>) -> Vec<Finding> {
         Confidence::Medium => 1,
         Confidence::Low => 0,
     };
-    // Same rule and function.
     let mut by_fn: Vec<Finding> = Vec::new();
     for f in findings {
         let same = by_fn.iter_mut().find(|p| {
@@ -5571,7 +5376,6 @@ fn merge_findings(findings: Vec<Finding>) -> Vec<Finding> {
             ));
         }
     }
-    // Same rule, same code site (pc) and evidence, several functions: a shared helper.
     let mut out: Vec<Finding> = Vec::new();
     let mut extra: Vec<Vec<String>> = Vec::new();
     for f in by_fn {
@@ -5658,7 +5462,6 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         if let Some(func) = &f.function {
             out.push_str(&format!("- Function: `{}`", func));
             if let Some(pc) = f.pc {
-                // In a composite the pc is shown as an offset into the part's own code.
                 let local = c
                     .functions
                     .iter()
@@ -5733,7 +5536,6 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         out.push('\n');
     }
     if !c.storage.is_empty() {
-        // In a composite, which parts touch each slot: shared state is where facets meet.
         let composite = !c.parts.is_empty();
         let parts_of = |slot: &str| -> String {
             c.parts

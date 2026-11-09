@@ -51,7 +51,6 @@ impl Ty {
             (Ty::Unknown, x) | (x, Ty::Unknown) => x,
             (Ty::Conflict, _) | (_, Ty::Conflict) => Ty::Conflict,
             (Ty::Bool, Ty::Bool) => Ty::Bool,
-            // A flag stored in a byte.
             (Ty::Bool, Ty::Uint(n)) | (Ty::Uint(n), Ty::Bool) => {
                 if n <= 8 {
                     Ty::Bool
@@ -392,7 +391,6 @@ impl TypeEnv {
                 self.classes[i].weak,
                 self.classes[i].flags,
             );
-            // Cloned: the loop below mutates other classes.
             let sources = self.classes[i].sources.clone();
             for j in sources {
                 let c = &mut self.classes[j];
@@ -469,8 +467,6 @@ impl TypeEnv {
                 self.def(Loc::Var { scope: pc, id }, val, pc);
             }
         }
-        // The parameters of this unit, so that callers' values and uses inside the body meet in
-        // one class even when the body never reads some parameter.
         if l.ret_slot.is_some() {
             for slot in 0..ssa::arity(l) {
                 self.intern(Loc::Arg {
@@ -482,7 +478,6 @@ impl TypeEnv {
         for site in ssa::call_sites(l, &arity) {
             let k = arity(site.callee).unwrap_or(0);
             for (idx, val) in site.args {
-                // Parameter `idx` in declaration order is `Arg(k - 1 - idx)` of the callee.
                 if (idx as usize) < k {
                     let slot = (k - 1 - idx as usize) as u32;
                     self.def(
@@ -512,7 +507,6 @@ impl TypeEnv {
                 );
             }
         }
-        // Values assigned on edges (phi copies) are used nowhere else: walk them too.
         for assigns in l.edge_assigns.values() {
             for (_, val) in assigns {
                 self.uses(*val, pc, None);
@@ -628,7 +622,6 @@ impl TypeEnv {
                 Node::Op(o, v) => self.op_use(*o, v, parent, scope),
                 _ => {}
             }
-            // Hash preimages are packed words: shifts and masks in them are encoding.
             let o = match &n {
                 Node::Op(o, _) => Some(*o),
                 Node::Keccak(..) => Some(op::OR),
@@ -680,16 +673,12 @@ impl TypeEnv {
                 }
             }
             op::SLT | op::SGT => {
-                // `x <= 2^(n-1) - 1`, `x >= -2^(n-1)`: the range of an `intN`. Any other signed
-                // comparison (`x < 0`) treats the value as signed here, which also happens to
-                // unsigned values cast for a check, so it does not flow back.
                 for (x, c) in [(v[0], v[1]), (v[1], v[0])] {
                     let loc = self.location(x, scope);
                     let bound = konst(c);
                     match bound.and_then(signed_bound) {
                         Some(n) => self.hint(loc, Ty::Int(n)),
                         None => {
-                            // Cloned: the location is used for two records.
                             self.weak(loc.clone(), Ty::Int(256));
                             if bound.is_none_or(|c| !c.is_zero()) {
                                 self.flag(loc, |f| f.signed_cmp = true);
@@ -707,7 +696,6 @@ impl TypeEnv {
                     }
                 }
             }
-            // `iszero(sub(a, b))` is `a == b`; so is a bare `sub`/`xor` as a branch condition.
             op::SUB | op::XOR if parent == Some(op::ISZERO) => {
                 for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                     if is_account(b) {
@@ -715,9 +703,7 @@ impl TypeEnv {
                     }
                 }
             }
-            // `cond * a + b` is a branchless select, not arithmetic on `a` and `b`.
             op::MUL if v.iter().any(|x| expr::is_boolean(*x)) => {}
-            // `x * 2^(8k)` and `x / 2^(8k)` are byte shifts: packing, like `SHL`/`SHR`.
             op::MUL | op::DIV if v.iter().any(|x| is_byte_shift(*x)) => {}
             op::ADD if v.iter().any(|x| is_masked_select(*x)) => {}
             op::ADD | op::SUB | op::MUL | op::DIV | op::MOD | op::EXP | op::ADDMOD | op::MULMOD => {
@@ -900,7 +886,6 @@ impl TypeEnv {
         }
         if let Some(loc) = self.location(e, scope) {
             let own = self.resolved_of(&loc);
-            // A field read carries its width in the mask.
             return match loc {
                 Loc::Field { bits, .. } if matches!(expr::node(e), Node::Op(op::AND, _)) => {
                     own.join(Ty::of_mask(bits))
@@ -943,7 +928,6 @@ impl TypeEnv {
             if m.is_low_mask() {
                 let inner = self.type_of_at(x, scope, depth + 1);
                 let masked = Ty::of_mask(m.bits());
-                // `uint32(x)` of an address is a uint32.
                 return match (inner, masked) {
                     (Ty::Address, Ty::Uint(n)) if n < 160 => Ty::Uint(n),
                     (Ty::Bool, Ty::Uint(_)) => Ty::Bool,
@@ -1130,7 +1114,6 @@ fn persistent(root: U256, steps: &[ShapeStep]) -> Shape {
 fn resolve(c: &Class, evidence: Evidence) -> Ty {
     let f = c.flags;
     let mut t = match c.from_defs.join(c.hints) {
-        // `require(x < 2^n); uint<n>(x)`: a checked cast of a wider value.
         Ty::Uint(n) if f.checked(n) => Ty::Unknown,
         Ty::Address if f.checked(160) => Ty::Unknown,
         t => t,
@@ -1138,15 +1121,11 @@ fn resolve(c: &Class, evidence: Evidence) -> Ty {
     if t == Ty::Unknown && evidence == Evidence::Final {
         t = c.weak;
     }
-    // `x != 0` on a value that is never a number and gets no other value is a flag; a storage
-    // slot holding 1 and tested for zero is as often a `uint256` used as one.
     if t == Ty::Unknown && f.tested && !f.arith && !f.other && !c.storage {
         t = Ty::Bool;
     }
     match t {
-        // A byte that only ever holds 0 and 1 is a flag.
         Ty::Uint(n) if n <= 8 && f.one && !f.other && !f.arith => Ty::Bool,
-        // A 160-bit number that is never an account.
         Ty::Address if f.arith && !f.account => Ty::Uint(160),
         Ty::Bool if f.arith => Ty::Unknown,
         t => t,

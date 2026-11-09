@@ -276,7 +276,6 @@ fn main() -> Result<()> {
                 Some(load_input(&input)?)
             };
             if lookup {
-                // First pass to learn the selectors, then resolve the unknown ones online.
                 let probe = code
                     .as_ref()
                     .map(|c| evmdec::decompile::decompile(c, &opts));
@@ -309,9 +308,6 @@ fn main() -> Result<()> {
                 )?,
                 Some(code) => {
                     let opts2 = opts.clone();
-                    // Defense in depth only: the decompiler is written to never panic (the
-                    // corpus and oracle runs check that), so this guard is never relied upon.
-                    // When it does fire, the user still gets a disassembly instead of nothing.
                     match std::panic::catch_unwind(move || {
                         evmdec::decompile::decompile(&code, &opts2)
                     }) {

@@ -844,7 +844,6 @@ impl<'a> Machine<'a> {
                     out_off,
                     out_len,
                 });
-                // The identity precompile echoes its input; every other call is opaque.
                 let (success, data) = if addr == U256::from_u64(4) {
                     (true, input)
                 } else {
@@ -857,7 +856,6 @@ impl<'a> Machine<'a> {
                 if ol > 0 {
                     let mut buf = data.clone();
                     buf.truncate(ol);
-                    // Memory is expanded for the whole out region even if returndata is shorter.
                     self.expand(out_off.as_usize().ok_or("out offset too large")?, ol)?;
                     self.mwrite(out_off, &buf)?;
                 }

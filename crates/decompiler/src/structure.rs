@@ -26,7 +26,6 @@ fn dominators(
     rpo: &[usize],
     rpo_index: &[usize],
 ) -> Vec<Option<usize>> {
-    // Cooper-Harvey-Kennedy.
     let mut idom: Vec<Option<usize>> = vec![None; n];
     idom[entry] = Some(entry);
     let intersect = |mut a: usize, mut b: usize, idom: &Vec<Option<usize>>| -> usize {
@@ -80,7 +79,6 @@ impl Graph {
                 }
             }
         }
-        // Reachability and RPO.
         let mut reachable = vec![false; n];
         let mut order = Vec::new();
         let mut state = vec![0u8; n];
@@ -117,9 +115,6 @@ impl Graph {
             }
         }
         let idom = dominators(n, l.entry, &succs, &preds, &rpo, &rpo_index);
-        // Post-dominators: reverse graph with a virtual exit (index n). Edges into "noreturn"
-        // leaves (reverts, invalid jumps) are ignored so that `require`-style checks do not
-        // break the post-dominance of the normal path.
         let noreturn: Vec<bool> = (0..n).map(|x| is_noreturn_leaf(l, x)).collect();
         let mut rsuccs: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
         let mut rpreds: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
@@ -137,8 +132,6 @@ impl Graph {
                 rpreds[x].push(s);
             }
         }
-        // Nodes in infinite loops never reach the exit; connect loop headers of such regions too:
-        // every reachable node without a path to exit gets an edge to the virtual exit.
         {
             let mut to_exit = vec![false; n + 1];
             let mut q = VecDeque::new();
@@ -159,7 +152,6 @@ impl Graph {
                 }
             }
         }
-        // RPO on the reverse graph from the virtual exit.
         let mut rorder = Vec::new();
         let mut rstate = vec![0u8; n + 1];
         let mut rstack: Vec<(usize, usize)> = vec![(n, 0)];
@@ -243,7 +235,6 @@ fn find_loops(g: &Graph) -> HashMap<usize, Loop> {
         }
         for &s in &g.succs[x] {
             if g.dominates(s, x) {
-                // Back edge x -> s. Natural loop body: nodes reaching x without passing s.
                 let entry = loops.entry(s).or_insert(Loop {
                     body: HashSet::new(),
                     exits: Vec::new(),
@@ -482,8 +473,6 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
             let Some((what, gen)) = overwrites(st, names) else {
                 continue;
             };
-            // Expressions evaluated after the statement: its own operands are evaluated before
-            // it, so they are excluded, as is everything on the path up to it.
             let mut after: Vec<ExprId> = Vec::new();
             for later in &nd.stmts[i + 1..] {
                 after.extend(lift::stmt_exprs(later));
@@ -517,10 +506,6 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
             found.push((nd.id, i, what, gen, stale));
         }
     }
-    // A load is saved at the first statement that overwrites it: of the candidates holding it,
-    // the one with the smallest generation (later overwrites see an already-saved value).
-    // Generations grow along a path, so overwrites sharing the minimal generation lie on
-    // different paths and each saves the value on its own.
     let mut first_gen: HashMap<ExprId, u32> = HashMap::new();
     for (_, _, _, gen, stale) in &found {
         for e in stale {
@@ -551,10 +536,6 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
     }
     plan
 }
-
-// ------------------------------------------------------------------------------------------
-// Peeled loops
-// ------------------------------------------------------------------------------------------
 
 /// A recognised peeled iteration: the phi copies `(loop variable, value)` that start the loop
 /// from the peeled state, and the `(copy node, loop node)` pairs.
@@ -610,7 +591,6 @@ fn reroll_peeled_loops(l: &Lifted) -> Lifted {
     headers.sort_by_key(|h| g.rpo_index[*h]);
     for h in headers {
         let lp = &loops[&h];
-        // A copy of some loop node outside the loop, entered from outside the copy too.
         let mut found: Option<(usize, usize, Peel)> = None;
         'search: for hp in 0..l.nodes.len() {
             if !g.reachable[hp] || consumed.contains(&hp) || lp.body.contains(&hp) {
@@ -663,7 +643,6 @@ fn reroll_peeled_loops(l: &Lifted) -> Lifted {
     if !changed {
         return l.clone();
     }
-    // Predecessor lists follow the rewired successors.
     for nd in out.nodes.iter_mut() {
         nd.preds.clear();
     }
@@ -684,8 +663,6 @@ fn reroll_peeled_loops(l: &Lifted) -> Lifted {
 /// specialised to the state before it? On success, the phi copies that start the loop from that
 /// state (`(loop variable, value)`) and the pairs `(copy node, loop node)`.
 fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
-    // Pair the copy's nodes with the loop's by walking both in step, until they converge on
-    // shared nodes (the loop itself, or a shared exit).
     let debug = std::env::var("EVMDEC_DEBUG_PEEL").is_ok();
     let fail = |why: &str| {
         if debug {
@@ -720,8 +697,6 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
             return None;
         }
     }
-    // The loop's variables as the copy knows them, from the paired nodes' entry stacks: the
-    // positions holding a variable define the substitution, the others must agree under it.
     let mut sub: HashMap<ExprId, ExprId> = HashMap::new();
     let mut derived: Vec<(usize, usize, ExprId, ExprId)> = Vec::new();
     for (p, q) in &pairs {
@@ -761,8 +736,6 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
         }
     }
     let subst = |e: ExprId| with_init(e, &sub);
-    // The copy's statements are the loop's under the substitution; a guard the initial values
-    // satisfy outright (`0 + x >= 0`) has no counterpart in the copy.
     let same_stmts = |p: usize, q: usize| {
         let mut rest = l.nodes[p].stmts.iter();
         let mut next = rest.next();
@@ -796,10 +769,6 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
             .map(|v| v.iter().copied().collect())
             .unwrap_or_default()
     };
-    // Phi copies on corresponding edges. Into a shared node (the loop itself, a common exit) the
-    // copy assigns the loop's variables their values; the loop's own edge may leave a variable
-    // unchanged, which under the substitution is that variable's initial value. Into paired
-    // copy nodes both sides assign their own variables, related by the substitution.
     let same_edges = |p: usize, q: usize| {
         l.nodes[p]
             .succs
@@ -842,7 +811,6 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
             return None;
         }
     }
-    // The phi copies that start the loop from the peeled state: the entry node's variables.
     let init: Vec<(ExprId, ExprId)> = l.nodes[q0]
         .entry_stack
         .iter()
@@ -874,10 +842,6 @@ fn remap_term_nodes(t: &Term, m: &HashMap<usize, usize>) -> Term {
     }
 }
 
-// ------------------------------------------------------------------------------------------
-// Dead stores
-// ------------------------------------------------------------------------------------------
-
 /// Memory stores (at any offset) after which nothing on any path to the end of the function
 /// reads memory: the returndata copies of a `(bool ok,) = x.call(...)` whose bytes are dropped,
 /// for instance. Keyed by `(node, statement index)`.
@@ -891,7 +855,6 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
         })
     };
     let reads_memory = |s: &Stmt| match s {
-        // The offset of a store is pointer arithmetic (the free-memory pointer), not a data read.
         Stmt::MStore { val, .. } => mentions_memory(*val),
         Stmt::Copy { kind, .. } => *kind == op::MCOPY,
         Stmt::SStore { .. } | Stmt::Assign { .. } | Stmt::Drop(_) | Stmt::Require { .. } => {
@@ -904,7 +867,6 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
         Stmt::Call { .. } | Stmt::Create { .. } | Stmt::Internal { .. } => true,
     };
     let term_reads_memory = |t: &Term| match t {
-        // Known payload words: only they matter, not the pointer they were encoded at.
         Term::Return { data, .. } | Term::Revert { data, .. } => match data {
             None => true,
             Some(d) => d.iter().any(|e| mentions_memory(*e)),
@@ -912,7 +874,6 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
         Term::ReturnDyn { .. } | Term::Unresolved(_) | Term::Switch { .. } => true,
         _ => lift::term_exprs(t).iter().any(|e| mentions_memory(*e)),
     };
-    // Nodes from which some memory read is reachable (the node's own statements included).
     let mut reads_ahead: Vec<bool> = vec![false; l.nodes.len()];
     for nd in &l.nodes {
         let own = nd.stmts.iter().any(&reads_memory)
@@ -959,7 +920,6 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
         {
             continue;
         }
-        // Walk backwards: stores before the last memory read of the node stay.
         for (i, s) in nd.stmts.iter().enumerate().rev() {
             if reads_memory(s) {
                 break;
@@ -971,10 +931,6 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
     }
     dead
 }
-
-// ------------------------------------------------------------------------------------------
-// Shared sub-expressions
-// ------------------------------------------------------------------------------------------
 
 /// Where an expression occurs inside a node, in evaluation order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -1234,7 +1190,6 @@ fn available_at(
     let reads = vars_in(e);
     let seqs = result_seqs(e);
     let loaded = newest_gen(e);
-    // Nodes strictly between `d` and the frontier: reachable from `d`, reaching a frontier node.
     let mut from_d = HashSet::new();
     let mut stack: Vec<usize> = l.nodes[d].succs.clone();
     while let Some(x) = stack.pop() {
@@ -1347,8 +1302,6 @@ fn reaches_within(l: &Lifted, a: usize, b: usize, within: &HashSet<usize>) -> bo
 fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
     let g = Graph::new(l);
     let debug = std::env::var("EVMDEC_DEBUG_BIND").is_ok();
-    // Every bindable sub-expression with the positions that evaluate it, and the order in
-    // which the sub-expressions were first met.
     let mut uses: HashMap<ExprId, Vec<(usize, Pos)>> = HashMap::new();
     let mut count: HashMap<ExprId, usize> = HashMap::new();
     let mut first_seen: HashMap<ExprId, usize> = HashMap::new();
@@ -1387,8 +1340,6 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
             }
         }
     }
-    // Variables assigned in each node: on its outgoing edges (phi copies), and by its explicit
-    // assignments with their statement index.
     let mut edge_assigned: Vec<HashSet<ExprId>> = vec![HashSet::new(); l.nodes.len()];
     for ((from, _), assigns) in &l.edge_assigns {
         edge_assigned[*from].extend(assigns.iter().map(|(v, _)| *v));
@@ -1415,8 +1366,6 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
         let (f, pos) = if at[1..].iter().all(|u| dominated_by(f, pos, u)) {
             (f, pos)
         } else {
-            // The first use does not reach every other use: bind at the end of the nearest
-            // common dominator when the value is the same there.
             let nodes: Vec<usize> = at.iter().map(|(n, _)| *n).collect();
             let d = common_dominator(&g, &nodes);
             let frontier: Vec<(usize, Pos)> = at
@@ -1437,11 +1386,6 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
             }
             (d, Pos::Term)
         };
-        // A variable the expression reads must not change between the binding and a use. An
-        // assignment in node `x` after the binding clobbers when a use follows it: later in `x`,
-        // or in another node reachable from `x` (the binding node itself excepted: a path back
-        // to it recomputes the binding before its uses run; phi copies on an edge are
-        // simultaneous with the uses on that edge).
         let reads = vars_in(e);
         if !reads.is_empty() {
             let mut seen = HashSet::new();
@@ -1509,10 +1453,7 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
             }
         }
     }
-    // Original statement index -> number of bindings inserted before it, per node.
     let mut inserted: Vec<Vec<usize>> = vec![Vec::new(); l.nodes.len()];
-    // Expressions already bound, in binding order: an expression bound later is rewritten with
-    // each earlier binding in turn, the way the statements were.
     let mut bound: Vec<(Node, ExprId)> = Vec::new();
     for (f, pos, e) in plan {
         let mut e = e;
@@ -1659,8 +1600,6 @@ impl<'a> Printer<'a> {
                             if expr::as_const(*len) == Some(U256::ZERO) {
                                 None
                             } else if let Some((words, l)) = payload_from_stores(&stores, *off) {
-                                // A revert tail shared by several sites: the lifter saw merged
-                                // memory, but the stores on this path spell the payload out.
                                 let p = emit::fmt_payload(
                                     &words,
                                     Some(U256::from_u64(l)),
@@ -1726,7 +1665,6 @@ impl<'a> Printer<'a> {
             return false;
         }
         let is_result = |e: ExprId| matches!(expr::node(e), Node::CallResult(s) if s == *seq);
-        // require(success): the revert side has no reason.
         let (ok, revert) = if is_result(*cond) {
             (*t, *f)
         } else if matches!(expr::node(*cond), Node::Op(op::ISZERO, ref v) if is_result(v[0])) {
@@ -1785,8 +1723,6 @@ impl<'a> Printer<'a> {
             _ => 0,
         };
         if delta == 1 {
-            // The element store at the old length, `sstore(keccak(slot) + old_len, value)`: the
-            // next statement, which sits in the continuation node when the call ends this one.
             let next = if index + 1 < self.l.nodes[node].stmts.len() {
                 Some((node, index + 1))
             } else {
@@ -1867,8 +1803,6 @@ impl<'a> Printer<'a> {
                 self.line(depth, &txt);
                 continue;
             }
-            // A slot about to be overwritten while an older read of it is still needed: keep
-            // the old value in a temporary and print those reads under it from here on.
             if let Some(stale) = self.stale_plan.get(&(n, i)) {
                 let (loads, tmp) = (stale.clone(), stale[0].1.clone());
                 let (what, _) =
@@ -1885,15 +1819,12 @@ impl<'a> Printer<'a> {
                     self.names.stale.borrow_mut().insert(e, t);
                 }
             }
-            // A call whose every result prints under an alias (storage-string loader) is implied.
             if let Stmt::Internal { results, .. } = s {
                 if !results.is_empty() && results.iter().all(|r| self.names.aliases.contains_key(r))
                 {
                     continue;
                 }
             }
-            // The compiler's array-resize helper: `a.length = n`, `a.push(x)` (with the element
-            // store that follows), `a.pop()`.
             if let Stmt::Internal { callee, args, .. } = s {
                 if self.names.array_resizers.contains(callee) && args.len() == 2 {
                     if let Some(txt) = self.array_resize(n, i, args[0], args[1]) {
@@ -1914,7 +1845,6 @@ impl<'a> Printer<'a> {
             }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
-            // From here on the stored value reads as the slot (until the slot is stored again).
             if let Stmt::SStore {
                 key,
                 val,
@@ -1993,13 +1923,11 @@ impl<'a> Printer<'a> {
         if Some(n) == stop {
             return;
         }
-        // Loop control.
         for i in (0..self.loop_stack.len()).rev() {
             let (header, exit, body_depth) = self.loop_stack[i];
             let innermost = i == self.loop_stack.len() - 1;
             if n == header {
                 if innermost {
-                    // A `continue` directly at the body level is always the last statement of the body.
                     if depth != body_depth {
                         self.line(depth, "continue;");
                     }
@@ -2062,7 +1990,6 @@ impl<'a> Printer<'a> {
     }
 
     fn emit_node(&mut self, n: usize, stop: Option<usize>, depth: usize) {
-        // Loop header?
         if let Some(lp) = self.loops.get(&n) {
             if !self.emitted.contains(&n) && !self.loop_stack.iter().any(|(h, _, _)| *h == n) {
                 let body: HashSet<usize> = lp.body.clone();
@@ -2117,7 +2044,6 @@ impl<'a> Printer<'a> {
                 &format!("L{:x}:", self.node_pc(header)),
             );
         }
-        // Prefer the post-dominator of the header as the loop's continuation if it is an exit.
         let exit = match exits.len() {
             0 => None,
             1 => Some(exits[0]),
@@ -2130,12 +2056,8 @@ impl<'a> Printer<'a> {
             }
         };
         let nd = &self.l.nodes[header];
-        // `while (cond)` form: header has no statements and branches between the body and a
-        // node outside it (that node is the loop's continuation, whatever other exits -
-        // reverts inside the body - the loop has).
         let mut while_cond: Option<(String, usize)> = None;
         let mut exit = exit;
-        // The condition may sit in an empty node the (empty) header jumps to.
         let mut cond_node = header;
         if nd.stmts.is_empty() {
             if let Term::Jump(j) = &nd.term {
@@ -2229,8 +2151,6 @@ impl<'a> Printer<'a> {
         }
         self.loop_stack.pop();
         if let Some(e) = exit {
-            // Edge assignments on the exit edge(s) are emitted inside the loop before `break`;
-            // for the `while (cond)` form the header->exit edge assignments go here.
             if let Some(a) = self.l.edge_assigns.get(&(header, e)) {
                 if while_cond_exit_from_header(&self.l.nodes[header].term, e) {
                     let a = a.clone();
@@ -2264,7 +2184,6 @@ impl<'a> Printer<'a> {
         stop: Option<usize>,
         depth: usize,
     ) {
-        // A condition already decided on this path: only one side can execute.
         if let Some(v) = self.known(cond) {
             match (v, t) {
                 (true, Some(t)) => {
@@ -2278,13 +2197,11 @@ impl<'a> Printer<'a> {
                 _ => {}
             }
         }
-        // require(): one side is a plain revert.
         let t_rev = t.map_or(Some(None), |t| self.revert_reason(t));
         let f_rev = self.revert_reason(f);
         let join = self.g.ipdom[n];
         if let Some(reason) = f_rev.clone() {
             if let (Some(t), None) = (t, &t_rev) {
-                // if (!cond) revert  =>  require(cond)
                 self.line(
                     depth,
                     &format!(
@@ -2324,18 +2241,14 @@ impl<'a> Printer<'a> {
             self.transfer(n, f, stop, depth);
             return;
         };
-        // `if (c) { return true; } else { return false; }` of a bool function: `return c;`.
         if let Some(txt) = self.try_bool_return(cond, t, f) {
             self.line(depth, &txt);
             return;
         }
-        // Both sides do the same thing (the compiler split on returndatasize to copy return
-        // data nobody reads): print one of them, without the condition.
         if self.same_side(t, f) {
             self.transfer(n, t, stop, depth);
             return;
         }
-        // Conditional assignment: `if (c) { v = X } else { v = Y }` with nothing else happening.
         if let Some(j) = join {
             if let Some(txt) = self.try_ternary(n, cond, t, f, j) {
                 self.line(depth, &txt);
@@ -2343,12 +2256,10 @@ impl<'a> Printer<'a> {
                 return;
             }
         }
-        // Choose the join: immediate post-dominator (if it is beyond both sides), else `stop`.
         let join = match join {
             Some(j) if j != n => Some(j),
             _ => stop,
         };
-        // If one side is terminal (never reaches the join) and small, print it as an early exit.
         let t_terminal = self.region_is_terminal(t, join);
         let f_terminal = self.region_is_terminal(f, join);
         let (first_cond, first, second, first_terminal) = if t_terminal && !f_terminal {
@@ -2356,7 +2267,6 @@ impl<'a> Printer<'a> {
         } else if f_terminal && !t_terminal {
             (expr::op1(op::ISZERO, cond), f, t, true)
         } else {
-            // Prefer the "else-less" shape when the false side is the join itself.
             if Some(f) == join {
                 (cond, t, f, false)
             } else if Some(t) == join {
@@ -2380,7 +2290,6 @@ impl<'a> Printer<'a> {
             self.transfer(n, second, stop, depth);
             self.facts.pop();
         } else if Some(second) == join {
-            // The direct edge may carry phi copies: they belong in an else branch.
             if self.l.edge_assigns.contains_key(&(n, second)) {
                 self.line(depth, "} else {");
                 self.edge_assigns(n, second, depth + 1);
@@ -2451,7 +2360,6 @@ impl<'a> Printer<'a> {
         let (na, nb) = (&self.l.nodes[a], &self.l.nodes[b]);
         let same_term = match (&na.term, &nb.term) {
             (Term::Jump(x), Term::Jump(y)) => x == y || self.same_side_depth(*x, *y, depth - 1),
-            // The same test with the same outcomes (copies of a revert node included).
             (
                 Term::Branch {
                     cond: c1,
@@ -2536,8 +2444,6 @@ impl<'a> Printer<'a> {
             }
             match &p.l.nodes[n].term {
                 Term::InternalReturn(v) if v.len() == 1 => as_flag(v[0]),
-                // An empty node jumping on to a return: the constant is handed over as a phi
-                // copy on the edge, or the return node holds it itself.
                 Term::Jump(x) => {
                     let handed = match &p.l.nodes[*x].term {
                         Term::InternalReturn(v) if v.len() == 1 => {
@@ -2622,9 +2528,6 @@ impl<'a> Printer<'a> {
             self.emitted.insert(f);
         }
         let ncond = expr::op1(op::ISZERO, cond);
-        // `v = c ? x : y` with one side equal to the condition (or its negation) is a
-        // short-circuit:  c ? x : c  = c && x      c ? c : y  = c || y
-        //                 c ? !c : y = !c && y     c ? x : !c = !c || x
         let (var_s, c_s, nc_s) = (
             emit::fmt_expr(var, self.names),
             emit::fmt_expr(cond, self.names),
@@ -2673,7 +2576,6 @@ impl<'a> Printer<'a> {
             if size > 64 {
                 return false;
             }
-            // Loop control edges count as terminal.
             if self
                 .loop_stack
                 .iter()
@@ -2741,7 +2643,6 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     };
     names.stale.borrow_mut().clear();
     p.go(l.entry, None, base_depth);
-    // Emit any reachable nodes that were targeted by gotos but never emitted (irreducible parts).
     let mut pending: Vec<usize> = p
         .labels
         .iter()
@@ -2764,8 +2665,6 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             .filter(|n| !p.emitted.contains(n))
             .collect();
     }
-    // Labels are known only after printing: insert them where referenced nodes were emitted.
-    // The printer emits labels eagerly when known; a second pass handles labels discovered later.
     let text = if p.labels.iter().any(|n| p.emitted.contains(n)) {
         let g2 = Graph::new(l);
         let loops2 = find_loops(&g2);
@@ -2909,8 +2808,6 @@ fn payload_from_stores(stores: &[(ExprId, ExprId)], ptr: ExprId) -> Option<(Vec<
     if !any || image.len() < 4 {
         return None;
     }
-    // An `Error(string)` image is 4 + 32 + 32 + ceil32(len) bytes; trim the padding of the last
-    // store to that.
     let mut len = image.len() as u64;
     if image[..4] == [0x08, 0xc3, 0x79, 0xa0] && image.len() >= 68 {
         let n = U256::from_be_bytes(&image[36..68]);
@@ -2923,7 +2820,6 @@ fn payload_from_stores(stores: &[(ExprId, ExprId)], ptr: ExprId) -> Option<(Vec<
     while i < image.len() {
         let mut w = [0u8; 32];
         let k = (image.len() - i).min(32);
-        // A partial last word is right-aligned, as the lifter's region reads are.
         w[32 - k..].copy_from_slice(&image[i..i + k]);
         words.push(expr::konst(U256::from_be_bytes(&w)));
         i += 32;

@@ -145,7 +145,6 @@ fn slot_path_at(key: ExprId, layout: MappingLayout, depth: u32) -> Option<SlotPa
         }
         Node::Op(op::ADD, v) => {
             for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
-                // `keccak256(slot) + i`: element `i` of the array at `slot`.
                 if let Node::Keccak(w, 0) = expr::node(a) {
                     if w.len() == 1 {
                         let mut p = slot_path_at(w[0], layout, depth + 1)?;
@@ -153,7 +152,6 @@ fn slot_path_at(key: ExprId, layout: MappingLayout, depth: u32) -> Option<SlotPa
                         return Some(p);
                     }
                 }
-                // The hash precomputed by the compiler, plus a constant, plus the index.
                 if let Some(Some((root, k))) = expr::as_const(a).and_then(precomputed_element) {
                     let idx = if k == 0 {
                         b
@@ -166,7 +164,6 @@ fn slot_path_at(key: ExprId, layout: MappingLayout, depth: u32) -> Option<SlotPa
                     });
                 }
             }
-            // `path + c`: struct member `c` of the element.
             for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                 if let Some(c) = expr::as_const(b) {
                     if c.fits_u64() && c.low_u64() < 1 << 16 {
@@ -176,7 +173,6 @@ fn slot_path_at(key: ExprId, layout: MappingLayout, depth: u32) -> Option<SlotPa
                     }
                 }
             }
-            // `path + i`: an array (of structs) under a mapping entry, or a fixed-size array.
             for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                 if let Some(mut p) = slot_path_at(a, layout, depth + 1) {
                     p.steps.push(Step::Index(b));
@@ -275,7 +271,6 @@ pub fn field_write(key: ExprId, val: ExprId) -> Option<FieldWrite> {
     let Node::Op(op::OR, v) = expr::node(val) else {
         return None;
     };
-    // `old & ~(mask << s)`: the number of cleared bits is the field width.
     let cleared_bits = |e: ExprId| -> Option<u32> {
         let Node::Op(op::AND, w) = expr::node(e) else {
             return None;
@@ -372,8 +367,6 @@ pub fn call_sites(l: &Lifted, arity: impl Fn(usize) -> Option<usize>) -> Vec<Cal
                 continue;
             };
             let Some(k) = arity(*callee) else { continue };
-            // Arguments are deepest first, which is declaration order: the first parameter is
-            // pushed first.
             let bound = args
                 .iter()
                 .enumerate()
@@ -459,7 +452,6 @@ mod tests {
         let p = slot_path(e, MappingLayout::Vyper).expect("path");
         assert_eq!(p.root, U256::from_u64(3));
         assert_eq!(p.steps, vec![Step::Key(key)]);
-        // Solidity output with the same word order: the small constant is still the slot.
         let p = slot_path(e, MappingLayout::Solidity).expect("path");
         assert_eq!(p.root, U256::from_u64(3));
     }
@@ -480,7 +472,6 @@ mod tests {
         .expect("path");
         assert_eq!(p.root, U256::from_u64(2));
         assert_eq!(p.steps, vec![Step::Index(k(3))]);
-        // A constant just below the hash is not an element of the array.
         assert_eq!(
             slot_path(
                 expr::konst(h.wrapping_sub(U256::from_u64(3))),

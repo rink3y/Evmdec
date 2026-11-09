@@ -28,7 +28,6 @@ fn every_contract_decompiles_with_full_jump_resolution() {
             c.stats.external_functions + c.stats.internal_functions > 0 || code.len() < 100,
             "{name}: no functions"
         );
-        // The Uniswap V3 factory embeds the pool's creation code as data; its "jumps" are not code.
         if name != "univ3_factory" {
             assert_eq!(c.stats.unresolved_jumps, 0, "{name}: unresolved jumps");
             assert!(
@@ -44,7 +43,6 @@ fn every_contract_decompiles_with_full_jump_resolution() {
 
 #[test]
 fn selectors_match_verified_abis() {
-    // Compare against the Sourcify ABIs shipped next to the bytecode.
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/mainnet");
     let mut total = 0;
     let mut found = 0;
@@ -140,7 +138,6 @@ fn oracle_finds_no_mismatch_on_weth_and_permit2() {
 
 #[test]
 fn interpreter_matches_known_semantics() {
-    // 0x60 0x01 0x60 0x02 0x01 (PUSH1 1 PUSH1 2 ADD) then STOP
     let code = [0x60, 0x01, 0x60, 0x02, 0x01, 0x00];
     let mut rng = evmdec::interp::Rng::new(1);
     let host = evmdec::interp::Host::random(&mut rng);
@@ -152,7 +149,6 @@ fn interpreter_matches_known_semantics() {
 
 #[test]
 fn creation_code_is_split_and_minimal_proxy_detected() {
-    // EIP-1167 clone pointing at 0xbebebe...
     let hex = "363d3d373d3d3d363d73bebebebebebebebebebebebebebebebebebebebe5af43d82803e903d91602b57fd5bf3";
     let code = evmdec::hex::decode(hex).unwrap();
     assert_eq!(
@@ -161,7 +157,6 @@ fn creation_code_is_split_and_minimal_proxy_detected() {
     );
     let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
     assert!(c.source.contains("delegatecall"));
-    // A creation wrapper around it: PUSH1 len PUSH1 off PUSH1 0 CODECOPY PUSH1 len PUSH1 0 RETURN
     let rt = code.clone();
     let mut creation = vec![
         0x60,
@@ -216,7 +211,6 @@ fn short_circuit_and_is_not_inverted() {
         }
         out
     }
-    // require(arg0 > 0 && arg0 <= 100)
     let code = asm("PUSH1 0x80 PUSH1 0x40 MSTORE PUSH1 0x00 CALLDATALOAD PUSH1 0xe0 SHR PUSH4 0xaaaaaaaa EQ PUSH2 @f JUMPI PUSH1 0x00 DUP1 REVERT :f JUMPDEST PUSH1 0x04 CALLDATALOAD PUSH1 0x00 DUP2 GT DUP1 ISZERO PUSH2 @end JUMPI POP PUSH1 0x65 DUP2 LT :end JUMPDEST SWAP1 POP PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST STOP");
     let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
     assert!(
@@ -240,7 +234,6 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
     let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
     let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
     let src = &c.source;
-    // Revert reasons decoded through the shared tail, including 31- and 34-byte strings.
     for s in [
         "\"No stake in game\"",
         "\"Input ETC must be larger then 0\"",
@@ -253,7 +246,6 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
         !src.contains("0x8c379a0"),
         "raw Error(string) selector left in the output"
     );
-    // Checked arithmetic helpers are inlined and their panics are not printed on solc 0.8.
     assert!(
         !src.contains("Panic(arithmetic overflow)"),
         "compiler panic printed"
@@ -262,19 +254,14 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
         src.contains("stor_7 - stor_8[msg.sender]"),
         "checked_sub not inlined"
     );
-    // The balanceOf helper returns the call's return data, not a raw memory read.
     assert!(
         src.contains("return (returndata_1[0]);"),
         "return data not resolved"
     );
-    // ABI size checks print unsigned; address validators are not printed.
     assert!(src.contains("require(msg.data.length >= 36);"));
     assert!(!src.contains("int256(msg.data.length"));
     assert!(!src.contains("address(arg0))"), "ABI validator printed");
-    // Unknown events are named by their topic.
     assert!(src.contains("emit Event_22e25c6d("));
-    // The loop is a `while (i < steps)` whose parallel copies are ordered so that no copy reads a
-    // variable already overwritten above it.
     let helper = src
         .split("function func_0x1331(")
         .nth(1)
@@ -301,7 +288,6 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    // Two shared sub-expressions bound once each, then the four loop-carried updates.
     assert_eq!(lines.len(), 6, "loop body: {body}");
     let words = |s: &str| {
         s.split(|c: char| !c.is_alphanumeric())
@@ -313,7 +299,6 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
         .iter()
         .map(|l| l.split_once(" = ").expect("an assignment"))
         .collect();
-    // A loop-carried copy reads its variable before assigning it; the rest are bindings.
     let is_copy = |i: usize| {
         let var = parsed[i].0;
         parsed[..=i]
@@ -333,7 +318,6 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
         }
         assigned.push(var);
     }
-    // No string piece in the inventory.
     assert!(
         !c.strings
             .iter()
@@ -354,7 +338,6 @@ fn old_multiowned_wallet_reads_as_source() {
     let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
     let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
     let src = &c.source;
-    // Dictionary: the wallet's selectors and events are known.
     for s in [
         "function confirm(bytes32 arg0)",
         "function revoke(bytes32 arg0)",
@@ -369,8 +352,6 @@ fn old_multiowned_wallet_reads_as_source() {
         !src.contains("unknown signature"),
         "every selector of the wallet is in the dictionary"
     );
-    // Storage: `uint[256] m_owners` at slot 2, `bytes32[] m_pendingIndex` at slot 0x104 with
-    // its elements at keccak256(0x104) + i; no variable named after the hash.
     assert!(
         src.contains("uint256[] stor_2; // slot 0x2, fixed-size array"),
         "{src}"
@@ -391,15 +372,11 @@ fn old_multiowned_wallet_reads_as_source() {
         !src.contains("stor_0x4c0be602"),
         "precomputed hash printed as a variable"
     );
-    // A slot read before it is incremented keeps its old value under a temporary; the bare slot
-    // of a dynamic array is its length.
     assert!(
         src.contains("uint256 prev_stor_260_length = stor_260.length;"),
         "{src}"
     );
     assert!(src.contains("stor_260.length = prev_stor_260_length + 1;"));
-    // The type solver: `execute` returns the operation hash it computes, `hasConfirmed` a flag,
-    // and the pending-operation mappings are keyed by hash.
     assert!(
         src.contains("function execute(address arg0, uint256 arg1, bytes arg2) external payable returns (bytes32)"),
         "{src}"
@@ -413,10 +390,8 @@ fn old_multiowned_wallet_reads_as_source() {
         !src.contains("require(stor_260.length < stor_260.length)"),
         "stale read printed as the slot"
     );
-    // The scratch loads of the precomputed hash and no-op stores are not printed.
     assert!(!src.contains("code[4056"), "dead CODECOPY printed");
     assert!(!src.contains("mem[0x0] = mem[0x0]"), "no-op store printed");
-    // Continuations of modified functions are not printed as separate helpers.
     for h in [
         "func_0x7be",
         "func_0x965",
@@ -429,7 +404,6 @@ fn old_multiowned_wallet_reads_as_source() {
             "{h} printed twice"
         );
     }
-    // Every temporary is declared before it is used, in the function that uses it.
     for body in src.split("\n    function ").skip(1) {
         let mut declared: Vec<String> = Vec::new();
         for line in body.lines() {
@@ -456,8 +430,6 @@ fn old_multiowned_wallet_reads_as_source() {
             }
         }
     }
-    // Report: one real reentrancy per path (confirm's delete-after-call), behind the owner
-    // gate, and the silent modifier failure.
     let r = evmdec::analyze::analyze(&c);
     let re: Vec<_> = r.findings.iter().filter(|f| f.id == "reentrancy").collect();
     assert_eq!(
@@ -494,10 +466,8 @@ fn balancer_bpool_reads_as_source() {
         !src.contains("unknown signature"),
         "BPool selectors are in the dictionary"
     );
-    // The lock release prints as the bool field, not as a whole-slot mask.
     assert!(src.contains("stor_5_1 = false;"), "{src}");
     assert!(!src.contains("& 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00ff"));
-    // `_logs_`: emit of the ABI-encoded calldata, with `msg.sig` as a topic.
     assert!(
         src.contains("log2(msg.sig, msg.sender, abi.encode(msg.data));"),
         "{src}"
@@ -506,17 +476,14 @@ fn balancer_bpool_reads_as_source() {
         !src.contains("mem[mem[0x40] + 32] = msg.data.length;"),
         "encoding stores printed"
     );
-    // `_tokens[_tokens.length - 1]` through the folded hash constant.
     assert!(src.contains("stor_9[stor_9.length - 1]"), "{src}");
     assert!(!src.contains("0x6e1540171b6c0c960b71a7020d9f60077f6af931a8bbf590da0223dacf75c7ae"));
     let r = evmdec::analyze::analyze(&c);
-    // The lock is recognised: every reentrancy entry is informational.
     assert!(r
         .findings
         .iter()
         .filter(|f| f.id == "reentrancy")
         .all(|f| f.severity == evmdec::analyze::Severity::Info));
-    // The reverse-quote rounding on both single-sided paths.
     let rq: Vec<String> = r
         .findings
         .iter()
@@ -554,16 +521,12 @@ fn tribe_reads_as_source_and_is_rated_by_its_logic() {
         "stor_4.push(address(v1));",
         "stor_3[address(v1)] = true;",
         "if (stor_4.length < stor_7) {",
-        // `find`: one loop, no peeled first iteration, parameters not turned into phis.
         "while (v1 < stor[arg0]) {",
     ] {
         assert!(src.contains(s), "missing {s}\n{src}");
     }
-    // One body per function: `BuyIn` and `Refund` each self-destruct once.
     assert_eq!(src.matches("selfdestruct(msg.sender);").count(), 2, "{src}");
     let r = evmdec::analyze::analyze(&c);
-    // The destructs come after the payout: no Critical. The real risk is the payout loop over an
-    // array anyone can extend.
     assert!(
         r.findings
             .iter()
@@ -601,7 +564,6 @@ fn lobby_calls_into_its_own_deployment() {
     let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
     let src = &c.source;
     assert!(src.contains("deployed_2 = create("), "{src}");
-    // The mapping entry is an address: no preserving mask.
     assert!(src.contains("stor_0[stor_1] = deployed_2;"), "{src}");
     assert!(c.strings.is_empty(), "{:?}", c.strings);
     let r = evmdec::analyze::analyze(&c);
@@ -614,8 +576,6 @@ fn lobby_calls_into_its_own_deployment() {
 
 #[test]
 fn types_follow_values_through_helpers_and_range_checks() {
-    // Vyper validates decoded values by range checks; solc helpers decode and mask them. With the
-    // dictionary disabled every type below comes from the solver.
     let opts = evmdec::decompile::Options {
         no_sigs: true,
         ..evmdec::decompile::Options::default()
@@ -637,7 +597,6 @@ fn types_follow_values_through_helpers_and_range_checks() {
     assert!(curve.contains("function func_6b441a40(address arg0) external"));
     assert!(curve.contains("function func_8da5cb5b() external view returns (address)"));
     let compound = evmdec::decompile::decompile(&by_name("compound_ceth"), &opts).source;
-    // The 4-byte tail of a call payload is a bare `& 0xffffffff`, not a uint32 parameter.
     assert!(
         compound
             .contains("function func_a9059cbb(address arg0, uint256 arg1) external returns (bool)"),

@@ -258,10 +258,6 @@ pub struct Lifted {
     pub node_map: HashMap<usize, usize>,
 }
 
-// ------------------------------------------------------------------------------------------
-// Memory model
-// ------------------------------------------------------------------------------------------
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MVal {
     Word(ExprId),
@@ -308,9 +304,6 @@ fn norm_offset(e: ExprId) -> (Option<ExprId>, u64) {
     let (b, d) = expr::split_offset(e);
     if d.fits_u64() && d.low_u64() < BIG {
         (b, d.low_u64())
-    } else if b.is_none() {
-        // A huge constant offset: keep as a symbolic base.
-        (Some(e), 0)
     } else {
         (Some(e), 0)
     }
@@ -338,9 +331,6 @@ fn may_alias(
 ) -> bool {
     let w_wild = wb.is_some_and(wild_base);
     let r_wild = rb.is_some_and(wild_base);
-    // `p + v + k` with `v` unknown but unsigned lies at or above `p + k`: a region write that
-    // starts past the end of a read on the same `p` cannot touch it.
-    // Returns the constant part `k` of the sum when `wild` has the shape `fixed + k + <unknowns>`.
     let above = |wild: ExprId, fixed: ExprId| -> Option<u64> {
         let mut terms = Vec::new();
         let mut stack = vec![wild];
@@ -452,13 +442,11 @@ impl Mem {
     ) {
         let (base, d) = norm_offset(off);
         if let Some(l) = len {
-            // Remove writes fully covered by this one (same base).
             self.writes.retain(|w| {
                 !(w.base == base && w.len.is_some_and(|wl| w.off >= d && w.off + wl <= d + l))
             });
         }
         if self.writes.len() > 256 {
-            // Forgotten writes: anything may have changed since this point.
             self.writes.drain(..64);
             self.fresh = false;
             self.clobber_gen = self.gen + 1;
@@ -502,8 +490,7 @@ impl Mem {
     /// Read `n` bytes (n <= 32) at `off` as a word (right-aligned), if known.
     fn load_bytes(&self, off: ExprId, n: u64, version: u32) -> Option<ExprId> {
         let (base, d) = norm_offset(off);
-        // Collect per-byte sources.
-        let mut pieces: Vec<Option<(ExprId, u64)>> = vec![None; n as usize]; // (word expr, byte index within word)
+        let mut pieces: Vec<Option<(ExprId, u64)>> = vec![None; n as usize];
         let mut copy_hit: Option<(u8, ExprId, Option<ExprId>, u64, u32)> = None;
         let mut covered = 0usize;
         for w in self.writes.iter().rev() {
@@ -511,15 +498,12 @@ impl Mem {
                 break;
             }
             if w.base != base {
-                // Different bases are assumed not to alias (free-memory-pointer regions versus
-                // constants), unless one of them is an unknown pointer.
                 if may_alias(w.base, w.off, w.len, base, d, n) {
                     return None;
                 }
                 continue;
             }
             let Some(wl) = w.len else {
-                // Unknown-length write on the same base: anything at or past its start may be clobbered.
                 if d + n > w.off {
                     return None;
                 }
@@ -548,7 +532,6 @@ impl Mem {
                     }
                 }
                 MVal::Copy(k, src, addr) => {
-                    // Whole read inside one copy and nothing newer overlapping: a copied word.
                     if lo == d && hi == d + n && covered == 0 {
                         copy_hit = Some((*k, *src, *addr, d - w.off, w.gen));
                         covered = n as usize;
@@ -584,9 +567,6 @@ impl Mem {
                 op2(op::SHR, konst_u64(8 * (32 - n)), word)
             });
         }
-        // Bytes nothing wrote: zero in a fresh frame at an address whose writes we would have
-        // seen (a constant, or free-memory-pointer arithmetic); otherwise they come from the
-        // unknown word at `off`, masked to those byte positions, if at least one byte is known.
         let mut unknown_mask = U256::ZERO;
         if covered < n as usize {
             let zero_ok = self.fresh && !base.is_some_and(wild_base);
@@ -602,7 +582,6 @@ impl Mem {
                 }
             }
         }
-        // Fast path: a single word write exactly aligned.
         if n == 32 {
             if let Some((v, 0)) = pieces[0] {
                 if pieces
@@ -614,17 +593,14 @@ impl Mem {
                 }
             }
         }
-        // Compose byte by byte: result byte j (0 = most significant of the n-byte value) comes from
-        // byte `bi` of word `v` : (v >> (8*(31-bi))) & 0xff, placed at shift 8*(n-1-j).
         let mut acc: Option<ExprId> = None;
         let mut j = 0usize;
         while j < n as usize {
             match pieces[j] {
                 None => {
-                    j += 1; // zero byte (fresh memory)
+                    j += 1;
                 }
                 Some((v, bi)) => {
-                    // Extend the run of consecutive bytes from the same word.
                     let mut run = 1usize;
                     while j + run < n as usize {
                         match pieces[j + run] {
@@ -632,7 +608,6 @@ impl Mem {
                             _ => break,
                         }
                     }
-                    // Extract bytes [bi, bi+run) of v as a right-aligned value.
                     let shr = 8 * (32 - (bi + run as u64));
                     let mut piece = if shr > 0 {
                         op2(op::SHR, konst_u64(shr), v)
@@ -722,9 +697,6 @@ impl Mem {
     fn intersect(&mut self, other: &Mem) -> bool {
         let fresh_before = self.fresh;
         let gen_before = self.gen;
-        // Same write = same base/offset/length/value (generation and origin may differ). Bytes
-        // written differently (or only) on one side keep an `Unknown` write so that they are not
-        // read as fresh zeros or as the other side's value.
         let same = |a: &MemWrite, b: &MemWrite| {
             a.base == b.base && a.off == b.off && a.len == b.len && a.val == b.val
         };
@@ -761,17 +733,12 @@ impl Mem {
         self.writes = merged;
         self.fresh &= other.fresh;
         if other.gen != self.gen || other.clobber_gen != self.clobber_gen {
-            // Different histories: unknown reads must not be conflated across predecessors.
             self.gen = self.gen.max(other.gen) + 1;
             self.clobber_gen = self.gen;
         }
         changed_writes || fresh_before != self.fresh || gen_before != self.gen
     }
 }
-
-// ------------------------------------------------------------------------------------------
-// Lifting
-// ------------------------------------------------------------------------------------------
 
 /// Symbolic execution state at a program point: stack, memory and storage knowledge.
 ///
@@ -947,13 +914,11 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
         }
         match &nd.term {
             Term::Revert { off, len, data } if seen.len() <= 4 => {
-                // A helper whose only job is to revert (solc panic/error helpers).
                 sum.reverts = Some((*off, *len, data.clone()));
                 return Some(sum);
             }
             Term::InternalReturn(vals) => {
                 sum.returns = vals.clone();
-                // Expressions must not depend on the callee's own memory versions in complex ways.
                 let simple = |e: &ExprId| {
                     expr::size(*e) <= 64
                         && !expr::contains(*e, &|x| {
@@ -979,15 +944,11 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
             }
             Term::Jump(t) => n = *t,
             Term::Branch { cond, t, f } => {
-                // Both sides the same node (a loop summarised away): no branch at all.
                 if *t == Some(*f) {
                     n = *f;
                     continue;
                 }
-                // A diamond of store-only arms joining again (padding of a copied region):
-                // the arms' writes become "maybe" writes and the walk continues at the join.
                 if let Some(t) = t {
-                    // Where does a store-only arm lead: a join node, or a return of these values?
                     #[derive(PartialEq)]
                     enum ArmEnd {
                         Join(usize),
@@ -1055,10 +1016,6 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                         }
                     }
                 }
-                // Follow the non-reverting side if the other only reverts, and remember the
-                // condition that side needs as a guard.
-                // The reverting side may reach its revert through a chain of store-only nodes
-                // (a shared `revert(ptr, sub(end, ptr))` tail).
                 let follow = |mut x: usize| -> Option<usize> {
                     let mut hops = 0;
                     loop {
@@ -1242,11 +1199,8 @@ impl<'a> Lifter<'a> {
                 .expect("a scheduled node has an entry state");
             let (mut lnode, exit) = self.run_node(unit, nid, &entry.state, &hidden);
             max_args = max_args.max(exit.args_used);
-            // A recognised word-copy loop entered from here becomes one memory copy and the edge
-            // goes straight to the loop's exit.
             let loops = self.copy_loops.borrow();
             let mut redirect: Vec<(usize, usize)> = Vec::new();
-            // The state handed to a redirected successor (the loop's exit) differs from `exit`.
             let mut succ_state: HashMap<usize, State> = HashMap::new();
             for s in lnode.succs.clone() {
                 if let Some(cl) = loops.get(&(unit.entry_block, s)) {
@@ -1291,7 +1245,6 @@ impl<'a> Lifter<'a> {
                         true
                     }
                     Some(e) if single_pred => {
-                        // One predecessor: no phi, just take the latest state.
                         let new_state = State {
                             stack: exit.stack.clone(),
                             args_used: exit.args_used.max(e.state.args_used),
@@ -1320,7 +1273,6 @@ impl<'a> Lifter<'a> {
             }
         }
 
-        // Finalise: edge assignments and node list.
         let hidden_set = hidden.all();
         let mut nodes: Vec<LNode> = Vec::new();
         let mut map: HashMap<usize, usize> = HashMap::new();
@@ -1332,8 +1284,6 @@ impl<'a> Lifter<'a> {
                     .as_ref()
                     .map(|e| e.state.stack.clone())
                     .unwrap_or_default();
-                // Drop encoding-only memory writes and free-memory-pointer bookkeeping (display
-                // only; the oracle keeps every statement).
                 if !self.oracle && std::env::var("EVMDEC_SHOW_HIDDEN").is_err() {
                     let mut idx = 0usize;
                     ln.stmts.retain(|s| {
@@ -1351,7 +1301,6 @@ impl<'a> Lifter<'a> {
                 nodes.push(ln);
             }
         }
-        // Remap ids.
         for nd in nodes.iter_mut() {
             nd.id = map[&nd.id];
             nd.succs = nd
@@ -1380,7 +1329,6 @@ impl<'a> Lifter<'a> {
                     if !*is_phi {
                         continue;
                     }
-                    // Align from the top: entry position k (from bottom) corresponds to exit position
                     let from_top = el - 1 - k;
                     let var = entry.state.stack[k];
                     let val = if from_top < xl {
@@ -1397,8 +1345,6 @@ impl<'a> Lifter<'a> {
                 }
             }
         }
-        // Dead phi elimination: copies to variables that nothing reads are dropped (iterate, since
-        // a phi may only feed another dead phi).
         loop {
             let mut used: HashSet<ExprId> = HashSet::new();
             let collect = |e: ExprId, used: &mut HashSet<ExprId>| {
@@ -1426,7 +1372,6 @@ impl<'a> Lifter<'a> {
             }
             let before: usize = edge_assigns.values().map(|v| v.len()).sum();
             for v in edge_assigns.values_mut() {
-                // Copies of an undefined value carry no information.
                 v.retain(|(var, val)| {
                     used.contains(var) && !matches!(expr::node(*val), Node::Unknown(_))
                 });
@@ -1437,7 +1382,6 @@ impl<'a> Lifter<'a> {
                 break;
             }
         }
-        // preds
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
         for nd in &nodes {
             for s in &nd.succs {
@@ -1497,9 +1441,6 @@ impl<'a> Lifter<'a> {
         match &cl.shape {
             CopyShape::Index { slot, rotated } => {
                 let i0 = at(entering, *slot)?;
-                // Run the loop nodes once with a placeholder counter (so that a constant start
-                // does not fold the condition away) to learn the copied addresses and the bound
-                // in the current state's terms; then put the real start value back.
                 let marker = expr::intern(Node::Unknown(expr::next_seq()));
                 let mut probe = entering.clone();
                 probe.stack[top - 1 - *slot] = marker;
@@ -1577,8 +1518,6 @@ impl<'a> Lifter<'a> {
                     len: count,
                     addr: None,
                 };
-                // Leave the loop: the counter at its final value, then one pass over the loop
-                // nodes gives the exit stack layout (and leaves the already-copied memory alone).
                 let last = op2(op::SUB, op2(op::ADD, i0, count), konst_u64(32));
                 let final_i = if *rotated {
                     last
@@ -1631,8 +1570,6 @@ impl<'a> Lifter<'a> {
         let mut stmts: Vec<Stmt> = Vec::new();
         let mut term: Option<Term> = None;
         let mut underflow = false;
-        let root = self.root && unit.entry_block == 0 && false; // underflow tolerance: Args are fine
-        let _ = root;
         let seq_base = (nid as u32) << 10;
         let mut seq_ctr = 0u32;
         let next_version = |st: &mut State| {
@@ -1694,7 +1631,6 @@ impl<'a> Lifter<'a> {
                 op::PC => st.stack.push(konst_u64(ins.pc as u64)),
                 op::MSIZE | op::GAS => st.stack.push(expr::env_seq(o)),
                 op::RETURNDATASIZE => {
-                    // Zero in a fresh frame until the first call.
                     st.stack.push(if st.called {
                         expr::env(o)
                     } else {
@@ -1718,8 +1654,6 @@ impl<'a> Lifter<'a> {
                 | op::BLOBBASEFEE => {
                     st.stack.push(expr::env(o));
                 }
-                // The balance changes whenever value moves, which the storage generation
-                // already tracks (external calls, creations, side-effecting helpers).
                 op::SELFBALANCE => {
                     st.stack
                         .push(expr::intern(Node::Env(op::SELFBALANCE, st.sgen)));
@@ -1792,7 +1726,6 @@ impl<'a> Lifter<'a> {
                                 st.mem.version_for(off, l as u64),
                             )),
                         },
-                        // Symbolic length: anything from `off` on may be covered.
                         _ => expr::intern(Node::KeccakMem(
                             off,
                             len,
@@ -1870,7 +1803,6 @@ impl<'a> Lifter<'a> {
                     let key = pop!();
                     let val = pop!();
                     let transient = o == op::TSTORE;
-                    // A write to an unknown key may alias any cached key: keep only exact matches.
                     st.storage.retain(|(k, _, t)| *t != transient || *k != key);
                     if expr::is_const(key) {
                         st.storage
@@ -1894,7 +1826,6 @@ impl<'a> Lifter<'a> {
                         term = Some(Term::Unresolved(_target));
                         break;
                     }
-                    // Resolved by the unit: call, return, jump or switch.
                     if let Some(call) = &un.call {
                         term = Some(self.internal_call(
                             unit,
@@ -1906,8 +1837,6 @@ impl<'a> Lifter<'a> {
                             &mut underflow,
                         ));
                     } else if let Some(via) = un.returns_via {
-                        // Values equal to the return address itself (solc < 0.5 leaves it for the
-                        // caller to pop) are not results.
                         let ret_arg = match via {
                             AVal::Slot(k) => Some(expr::arg(k as u32)),
                             _ => None,
@@ -1983,7 +1912,6 @@ impl<'a> Lifter<'a> {
                         .and_then(|v| v.as_usize())
                         .map(|v| v as u64);
                     if o == op::MCOPY {
-                        // Copy known words when possible.
                         if let Some(l) = l {
                             if let Some((words, tail)) = st.mem.read_region(src, l, st.version) {
                                 let mut i = 0u64;
@@ -2012,7 +1940,6 @@ impl<'a> Lifter<'a> {
                             st.mem.store(dest, None, MVal::Copy(o, src, None));
                         }
                     } else if o == op::CODECOPY {
-                        // Constant code regions become known words.
                         match (expr::as_const(src).and_then(|v| v.as_usize()), l) {
                             (Some(s), Some(l)) if l <= 4096 => {
                                 let mut i = 0u64;
@@ -2030,7 +1957,6 @@ impl<'a> Lifter<'a> {
                                             MVal::Word(konst(U256::from_be_bytes(&buf))),
                                         );
                                     } else {
-                                        // Partial tail word: store as bytes.
                                         for (j, byte) in buf.iter().enumerate().take(n) {
                                             st.mem.store(
                                                 expr::add_const(dest, U256::from(i + j as u64)),
@@ -2118,8 +2044,6 @@ impl<'a> Lifter<'a> {
                         hidden.add(nid, st.mem.consumers(in_off, l.low_u64()));
                     }
                     let result = expr::intern(Node::CallResult(seq));
-                    // The first payload words, read before the output region (which usually
-                    // overlaps the input buffer) is written.
                     if let Ok(want) = std::env::var("EVMDEC_DEBUG_HEAD") {
                         if want == "all" || want == ins.pc.to_string() {
                             eprintln!(
@@ -2161,9 +2085,6 @@ impl<'a> Lifter<'a> {
                             })
                             .collect()
                     };
-                    // Output region: known to be return data of this call. The identity
-                    // precompile (address 4, Vyper's memory copy) returns its input, so the
-                    // output region holds the input words when both lengths are constant.
                     let ol = expr::as_const(out_len)
                         .and_then(|v| v.as_usize())
                         .map(|v| v as u64);
@@ -2178,7 +2099,6 @@ impl<'a> Lifter<'a> {
                         st.mem.store(out_off, ol, MVal::CallOut(seq));
                     }
                     next_version(&mut st);
-                    // Storage may change during an external call (reentrancy / callee effects).
                     let gen = (o != op::STATICCALL).then_some(st.sgen);
                     if o != op::STATICCALL {
                         st.storage.clear();
@@ -2267,7 +2187,6 @@ impl<'a> Lifter<'a> {
                     break;
                 }
                 _ => {
-                    // Unknown opcode: the EVM halts with an exception.
                     term = Some(Term::Invalid);
                     break;
                 }
@@ -2295,7 +2214,10 @@ impl<'a> Lifter<'a> {
         (ln, st)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the lifter state, call site and summaries are all needed to bind one call"
+    )]
     fn internal_call(
         &self,
         _unit: &Unit,
@@ -2306,9 +2228,7 @@ impl<'a> Lifter<'a> {
         seq: u32,
         underflow: &mut bool,
     ) -> Term {
-        // Stack now (target already popped): position 0 is the top.
         let consumed = call.consumed as usize;
-        // Materialise enough entries.
         if consumed > 0 {
             st.peek(consumed, false, underflow);
         }
@@ -2329,7 +2249,6 @@ impl<'a> Lifter<'a> {
             }
             args.push(at(i));
         }
-        // Simple callee: substitute its effects directly.
         let summary = self.summaries.get(&call.callee);
         let subst = |e: ExprId| -> ExprId {
             let mut memo = HashMap::new();
@@ -2347,7 +2266,6 @@ impl<'a> Lifter<'a> {
         };
         if let Some(sum) = summary {
             if let Some((off, len, data)) = &sum.reverts {
-                // The helper always reverts: this call site is a revert.
                 for (o, v) in &sum.mstores {
                     st.mem.store(subst(*o), Some(32), MVal::Word(subst(*v)));
                 }
@@ -2364,12 +2282,7 @@ impl<'a> Lifter<'a> {
             .iter()
             .filter(|v| !matches!(v, AVal::Slot(_) | AVal::Const(_) | AVal::Pc(_)))
             .count();
-        // The callee's summarised return values, one per pushed entry (preferred: a helper that
-        // returns one of its arguments leaves a `Slot` push, which still counts as a return), or
-        // one per unknown push.
         let by_position = summary.is_some_and(|s| s.returns.len() == call.pushed.len());
-        // A helper that returns `mload(p)` for a pointer argument reads the caller's memory:
-        // resolve such loads here (the pointer may hold a call's return data).
         let resolve = |e: ExprId| -> ExprId {
             let mut memo = HashMap::new();
             expr::substitute(
@@ -2384,8 +2297,6 @@ impl<'a> Lifter<'a> {
                 &mut memo,
             )
         };
-        // (Only for a callee that writes no memory itself: its reads then see the caller's memory
-        // as it is at the call.)
         let reads_caller = summary.is_some_and(|s| {
             s.mstores.is_empty() && s.copies.is_empty() && s.maybe_mstores.is_empty()
         });
@@ -2427,14 +2338,10 @@ impl<'a> Lifter<'a> {
         }
         st.stack.extend(pushed_vals);
         let inlined = direct_returns.is_some();
-        // An inlined helper without storage/log/call effects is transparent: its memory writes
-        // and checks become statements of the caller and no call remains. Helpers with side
-        // effects, or whose results could not be substituted, stay as calls.
         let transparent = inlined && summary.is_some_and(|s| !s.side_effects);
         let gen_before = st.sgen;
         match summary {
             Some(sum) => {
-                // Replay the callee's memory writes; storage is untouched unless it has side effects.
                 for (off, val) in &sum.mstores {
                     let (o, v) = (subst(*off), subst(*val));
                     if transparent {
@@ -2475,7 +2382,6 @@ impl<'a> Lifter<'a> {
                 }
             }
             None => {
-                // The callee may have written memory and storage, and may have made calls.
                 st.mem.clobber();
                 st.storage.clear();
                 st.sgen += 1;
@@ -2483,7 +2389,6 @@ impl<'a> Lifter<'a> {
             }
         }
         if transparent {
-            // The helper's own checks (SafeMath asserts, bounds checks) survive as guards.
             for (cond, data, invalid) in summary.map(|s| s.guards.as_slice()).unwrap_or(&[]) {
                 let cond = subst(*cond);
                 if expr::as_const(cond).is_some_and(|c| !c.is_zero()) {
@@ -2576,14 +2481,8 @@ fn merge_into(
     let mut changed = false;
     let el = e.state.stack.len();
     let xl = exit.stack.len();
-    // Align from the top. If the exit stack is deeper, the entry's slots below its known stack
-    // are the frame's entry slots it has not touched yet: materialise them as the `Arg`s they
-    // are (in consumption order, the slot just below the known stack first). The loop below then
-    // turns each into a phi only where the exit holds something else.
     if xl > el {
         let extra = xl - el;
-        // Only when the exit holds exactly those entry slots there (the other path merely
-        // touched deeper parameters); an unbalanced join keeps the old treatment: phis.
         let as_args: Vec<ExprId> = (0..extra)
             .map(|i| {
                 let from_top = xl - 1 - i;
@@ -3146,7 +3045,6 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
         Node::Op(op::OR, v) | Node::Op(op::XOR, v) | Node::Op(op::ADD, v) => {
             let a = jump_target_bits(v[0])?;
             let b = jump_target_bits(v[1])?;
-            // ADD may carry; be conservative by allowing all bits up to the sum's width.
             if matches!(expr::node(e), Node::Op(op::ADD, _)) {
                 let bits = a.bits().max(b.bits()) + 1;
                 Some(expr::mask_bits(bits))
@@ -3223,8 +3121,6 @@ pub fn unknown_leaves(e: ExprId) -> Vec<ExprId> {
 pub fn jump_candidates(e: ExprId, jumpdests: &HashSet<usize>, code_len: usize) -> Vec<usize> {
     let mut out: HashSet<usize> = HashSet::new();
     let leaves = unknown_leaves(e);
-    // A bare stack input (`Arg`) is a return address or a caller-provided pointer, never a
-    // dispatcher index: only calldata/memory/environment-derived inputs are enumerated.
     if leaves.len() == 1
         && !matches!(
             expr::node(leaves[0]),

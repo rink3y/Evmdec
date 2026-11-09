@@ -247,9 +247,6 @@ impl<'a> Eval<'a> {
                 let o = self.eval(off, memo);
                 match self.calls.get(call_index(seq)) {
                     Some((_, data)) => {
-                        // The lifter models the out region as return data: bytes beyond the actual
-                        // return data are *not* written by the EVM (old memory stays), so this is only
-                        // exact when the data covers the read.
                         if o.as_usize().is_none_or(|o| o + 32 > data.len()) {
                             self.inconclusive = Some("returndata shorter than out region".into());
                         }
@@ -452,7 +449,6 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
         stats.blocks += 1;
         let n_ins = b.last - b.first + 1;
         stats.instructions_total += n_ins;
-        // Lift the block alone with an unknown entry stack.
         let unit = Unit {
             entry_block: b.id,
             nodes: vec![UNode {
@@ -483,9 +479,6 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
             attempts += 1;
             let host = Host::random(&mut rng);
             let depth = need + rng.below(4) as usize;
-            // Input phases: mixed random values first; after repeated infeasible states (huge
-            // memory offsets) small word-aligned values; then widely spread values so that
-            // differently-based memory accesses cannot alias.
             let phase = if attempts <= opts.runs * 2 {
                 0
             } else if attempts <= opts.runs * 5 {
@@ -500,7 +493,6 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                     _ => U256::from_u64(0x2000 * (i as u64 + 1) + 32 * rng.below(8)),
                 })
                 .collect();
-            // Initial memory: mostly plausible word-aligned pointers/small numbers, some random words.
             let mem_words = (rng.below(8) as usize + 1) * 4;
             let mut mem0: Vec<u8> = Vec::with_capacity(mem_words * 32);
             for w in 0..mem_words {
@@ -513,7 +505,6 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                 };
                 mem0.extend_from_slice(&word.to_be_bytes());
             }
-            // Reference run.
             let mut m = Machine::new(code, &host);
             m.stack = stack0.clone();
             m.memory = mem0.clone();
@@ -522,8 +513,6 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
             let returndata0 = m.returndata.clone();
             let outcome = m.run_block(b.start, b.end);
             if let Outcome::Exception(reason) = &outcome {
-                // The block cannot execute from this state (e.g. a random stack value used as a huge
-                // memory offset): draw another state. Counted only if no state ever works.
                 if attempts >= max_attempts && completed == 0 {
                     stats.inconclusive += 1;
                     block_inconclusive = true;
@@ -536,9 +525,6 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
             }
             completed += 1;
             stats.runs += 1;
-            // Lifted run.
-            // GAS / MSIZE nodes carry increasing sequence numbers in program order; map their
-            // rank to the interpreter's observation order.
             let (gas_rank, msize_rank) = {
                 let mut gas: Vec<u32> = Vec::new();
                 let mut msz: Vec<u32> = Vec::new();
@@ -596,7 +582,6 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
             let mut creates = Vec::new();
             let mut diverged: Option<String> = None;
             let mut acc = Accesses::default();
-            // Statements in order. The lifter advances the memory generation on every write.
             for s in &ln.stmts {
                 match s {
                     Stmt::MStore { off, val, width } => {
@@ -700,7 +685,6 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                             write_mem(&mut mem, oo, &buf);
                         }
                         ev.returndata = data;
-                        // One generation per call statement.
                         ev.mem_snapshots.push(mem.clone());
                         if *kind != op::STATICCALL {
                             ev.stor_snapshots.push(storage.clone());
@@ -778,13 +762,11 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                     | Stmt::Require { .. } => {}
                 }
             }
-            // Terminator.
             let exit_stack: Vec<U256> = ln
                 .exit_stack
                 .iter()
                 .map(|e| ev.eval(*e, &mut memo))
                 .collect();
-            // Memory reads inside expressions (for the aliasing check).
             {
                 let mut seen = std::collections::HashSet::new();
                 let mut stack: Vec<ExprId> = crate::lift::node_exprs(ln);
@@ -856,8 +838,6 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                 continue;
             }
             if acc.aliased() {
-                // The random state made two differently-based memory accesses overlap: the lifter's
-                // documented no-alias assumption does not apply, so the run proves nothing.
                 stats.inconclusive += 1;
                 block_inconclusive = true;
                 *stats
@@ -866,26 +846,21 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                     .or_default() += 1;
                 continue;
             }
-            // Compare.
             let mut ref_mem = m.memory.clone();
             let n = ref_mem.len().max(mem.len());
             ref_mem.resize(n, 0);
             let mut our_mem = mem.clone();
             our_mem.resize(n, 0);
-            // Compare outcomes modulo the EVM's "exception" cases we don't model identically.
             let outcome_eq = match (&outcome, &lifted_outcome) {
                 (Outcome::Fallthrough, Outcome::Fallthrough) => true,
                 (a, b) => a == b,
             };
-            // Exit stack: the reference stack may contain the untouched part below.
             let ref_stack = &m.stack;
             let stack_eq = if matches!(
                 outcome,
                 Outcome::Jump(_) | Outcome::JumpI(..) | Outcome::Fallthrough
             ) {
                 let k = exit_stack.len();
-                // Our explicit exit stack covers the top `k` entries; below them the reference must
-                // hold the untouched entry stack.
                 let untouched = stack0.len().saturating_sub(lifted.n_args);
                 ref_stack.len() == untouched + k
                     && ref_stack[untouched..] == exit_stack[..]
@@ -957,7 +932,6 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                 }
             }
         }
-        // A block is verified when at least one conclusive run agreed and none disagreed.
         if !block_ok {
             stats.blocks_mismatched += 1;
         } else if block_agree > 0 {

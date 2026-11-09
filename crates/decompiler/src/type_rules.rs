@@ -184,7 +184,6 @@ impl Downcast<'_> {
                         )
                     });
                 }
-                // No signature: the word is wide when the code also uses it unmasked.
                 info?
                     .arith
                     .then(|| (Confidence::Medium, format!("the parameter `{}`", name)))
@@ -395,8 +394,6 @@ fn describe<'a>(c: &'a Contract, loc: &Loc) -> Option<Place<'a>> {
 /// another: one of the two comparisons is wrong for every value with the top bit set.
 fn sign_confusion(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     for loc in env.locations() {
-        // Helper arguments are left out: solc's ABI decoders compare calldata offsets with
-        // `slt` and `lt` by design.
         if !matches!(loc, Loc::Param { .. } | Loc::Slot(_) | Loc::Field { .. }) {
             continue;
         }
@@ -404,8 +401,6 @@ fn sign_confusion(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
         if !(info.signed_cmp && info.unsigned_cmp) || info.ty == Ty::Bool {
             continue;
         }
-        // A declared narrow signed integer (validated against its signed bounds) is bounds-checked
-        // unsigned when it indexes an array: that is the compiler's doing, not confusion.
         if matches!(info.ty, Ty::Int(n) if n < 256) {
             continue;
         }
@@ -437,8 +432,6 @@ fn arithmetic_accounts(
     out: &mut Vec<Finding>,
 ) {
     for loc in env.locations() {
-        // Helper results are left out: a result position that is not aligned with the caller's
-        // view would blame the wrong value.
         if matches!(loc, Loc::Ret { .. } | Loc::Key(_)) {
             continue;
         }
@@ -484,8 +477,6 @@ fn arithmetic_accounts(
 /// from or multiplied (commitment arithmetic, hand-rolled identifiers).
 fn hashes_as_numbers(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     for loc in env.locations() {
-        // Stack values and helper arguments are left out: `keccak256(slot) + i` is how the
-        // compiler addresses array elements, and resize helpers take that pointer as a parameter.
         if !matches!(loc, Loc::Param { .. } | Loc::Slot(_) | Loc::Field { .. }) {
             continue;
         }

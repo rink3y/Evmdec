@@ -57,7 +57,6 @@ def main():
                 if f["id"] not in NOISE:
                     print(f"      [{f['severity']}] {f['id']} {f.get('function','')}")
     print(f"\nrecall: {hits}/{total} = {100*hits/max(1,total):.1f}%   (not counted, outside pattern rules: {', '.join(undetectable) or 'none'})")
-    # False-positive load on the audited corpus: high/critical findings per contract.
     good = sorted(f for f in os.listdir(os.path.join(ROOT, "testdata", "mainnet")) if f.endswith(".hex"))
     print(f"\n{'audited contract':<22}{'score':>5}  high/critical findings")
     hc_total = 0

@@ -7,7 +7,6 @@ Writes DIR/<address>.hex for every distinct `to` address with code.
 import argparse, json, os, sys, random
 
 def rpc(url, method, params):
-    # curl honours the system proxy/CA configuration everywhere; urllib does not always.
     import subprocess
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
     out = subprocess.run(["curl", "-sS", "--max-time", "40", "-X", "POST", "-H", "content-type: application/json", "--data", body, url], capture_output=True, text=True)

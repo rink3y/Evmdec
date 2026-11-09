@@ -29,7 +29,6 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@500;600;700&family=Source+Code+Pro:wght@400;600&display=swap">
 <style>
-/* Drawing set: an ink band holds the title block; the sheet below is the drawing; findings are keyed callouts. */
 :root{--danger:#b3261e;
  --bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--sel:#dbe8ff;--lit:#fff1c2;
  --band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;
@@ -58,7 +57,6 @@ header :focus-visible,.tb :focus-visible{outline-color:var(--band-rubric);outlin
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .lbl{display:block;font:500 12px/1.3 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--band-muted)}
 
-/* ink band: header strip and title block */
 header{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:stretch;background:var(--band);color:var(--band-fg);border-bottom:1px solid var(--band-line)}
 .brand{display:flex;align-items:center;padding:0 18px;border-right:1px solid var(--band-line);font:700 20px/1 var(--cond);letter-spacing:.02em;text-transform:lowercase;color:inherit;text-decoration:none}.brand:hover{color:var(--band-rubric)}
 .query{display:flex;min-width:0;align-items:stretch}
@@ -83,7 +81,6 @@ header{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-ite
 .tb .risk b{color:var(--band-rubric);font:600 18px/1.2 var(--cond);letter-spacing:.02em}
 .tb .risk b.calm{color:var(--band-fg);font:500 14px/1.45 var(--sans)}
 
-/* the empty sheet */
 #landing{display:grid;place-content:start center;padding:48px 24px 64px;overflow:auto}
 .sheet{width:min(100%,760px);border:1px solid var(--line);padding:36px 40px 32px;position:relative}
 .sheet::before{content:"";position:absolute;inset:6px;border:1px solid var(--hair);pointer-events:none}
@@ -101,7 +98,6 @@ header{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-ite
 .sup-foot code{font:12px/1 var(--mono);text-transform:none;letter-spacing:0}.sup-foot code.a,.sup-foot .hint{color:var(--muted)}.sup-foot .hint{font-size:11px}
 .sup-foot:hover{border-color:var(--fg)}.sup-foot.done{color:#2e7d32;border-color:#2e7d32}.sup-foot.done .hint{visibility:hidden}
 
-/* three columns */
 main{display:grid;grid-template-columns:280px minmax(0,1fr) 380px;min-height:0;min-width:0}
 main>*{min-width:0;min-height:0;overflow:auto}
 .index{border-right:1px solid var(--line);background:var(--well)}
@@ -119,7 +115,6 @@ main>*{min-width:0;min-height:0;overflow:auto}
 #fns li:first-child button .name{font:500 13px/1.5 var(--sans)}
 #fns li button[aria-current="true"]{background:var(--lit)}#fns li button[aria-current="true"] .name{font-weight:600}
 
-/* drawing */
 .tabs{display:flex;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:2;overflow-x:auto}
 .tabs [role=tab]{flex:none;border:0;background:transparent;padding:10px 16px;border-right:1px solid var(--hair);color:var(--muted);white-space:nowrap;font:600 13px/1.2 var(--cond);letter-spacing:.1em;text-transform:uppercase}
 .tabs [role=tab]:hover{color:var(--fg)}
@@ -152,7 +147,6 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .err{margin:16px;padding:12px 14px;border:1px solid var(--rubric);color:var(--fg)}
 .err b{color:var(--rubric)}
 
-/* details */
 .findings{list-style:none;margin:0;padding:0}
 .finding{border-bottom:1px solid var(--hair)}
 .finding>button{display:grid;grid-template-columns:30px auto minmax(0,1fr);grid-template-areas:"n s t" "n s m";gap:2px 8px;width:100%;text-align:left;border:0;background:transparent;padding:9px 12px;align-items:baseline}
@@ -174,7 +168,6 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .report table{border-collapse:collapse;font-size:13px;width:100%}
 .report th,.report td{border:1px solid var(--hair);padding:4px 8px;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}
 .report th{color:var(--muted);font:600 12px/1.4 var(--cond);letter-spacing:.08em;text-transform:uppercase}
-/* trusted-contracts band: one line, scrolls sideways in a focusable region when it does not fit */
 .deps{border-bottom:1px solid var(--line);background:var(--well)}
 .deps-scroll{overflow-x:auto;white-space:nowrap;scrollbar-width:thin;padding:6px 16px}
 .deps-inner{display:flex;align-items:center;gap:8px;width:max-content;max-width:100%;margin:0 auto}
@@ -187,7 +180,6 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .dep.loop{border-color:var(--danger)}
 .dep.back{border-style:dashed}
 .dep.cur{background:var(--fg);color:var(--bg);border-color:var(--fg);cursor:default}.dep.cur code,.dep.cur .tag{color:var(--bg)}
-/* trust graph: a list with the edge written above each node */
 .graph{padding:16px;max-width:720px}.graph ol,.graph ul{list-style:none;margin:0;padding:0}
 .graph .node{border:1px solid var(--line);border-radius:6px;padding:8px 12px;background:var(--bg);display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:start}
 .graph .node.me{background:var(--band);color:var(--band-fg);border-color:var(--band)}.graph .node.me code{color:#a9bbd3}
@@ -227,7 +219,6 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
  .index{border-bottom:1px solid var(--line)}.index #fns{max-height:40vh;overflow:auto}
  .details{border-top:1px solid var(--line)}
  #landing{padding:24px 16px 40px}.sheet{padding:24px 20px}.sheet h1{font-size:28px}
- /* data tables stack one row per card on narrow screens instead of scrolling sideways (WCAG 1.4.10); roles keep the table semantics */
  .report .tscroll{overflow:visible;border:0}
  .report .stack thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
  .report .stack,.report .stack tbody{display:block;width:100%}
@@ -319,7 +310,6 @@ const SEV={critical:0,high:1,medium:2,low:3,info:4},SEVL={critical:'Critical',hi
 const root=document.documentElement,status=$('#status');
 function say(t){status.textContent='';setTimeout(()=>{status.textContent=t},30)}
 
-/* theme: system by default, manual override remembered per browser */
 const themeBtn=$('#theme');
 function isDark(){const a=root.getAttribute('data-theme');return a?a==='dark':matchMedia('(prefers-color-scheme: dark)').matches}
 function paintTheme(){const d=isDark();themeBtn.setAttribute('aria-pressed',d?'true':'false');themeBtn.querySelector('span').textContent=d?'Dark theme':'Light theme'}
@@ -328,20 +318,15 @@ themeBtn.addEventListener('click',()=>{const d=!isDark();root.setAttribute('data
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change',paintTheme);
 paintTheme();
 
-/* chains */
 fetch('/api/chains').then(r=>r.json()).then(cs=>{const sel=$('#chain');const want=sel.value;sel.innerHTML='';cs.forEach(c=>{const o=document.createElement('option');o.value=c.name;o.textContent=c.name+' ('+c.id+')';sel.appendChild(o)});if([...sel.options].some(o=>o.value===want))sel.value=want;fromUrl()}).catch(()=>fromUrl());
 
-/* tabs */
 const tabs=[...document.querySelectorAll('#tabs [role=tab]')];
 function selectTab(tab){tabs.forEach(t=>{const on=t===tab;t.setAttribute('aria-selected',on?'true':'false');t.tabIndex=on?0:-1;document.getElementById(t.getAttribute('aria-controls')).hidden=!on});$('#scale').hidden=!(DATA&&tab.id==='tab-code')}
 tabs.forEach(t=>{t.addEventListener('click',()=>selectTab(t));t.addEventListener('keydown',e=>{const vis=tabs.filter(x=>!x.hidden);const i=vis.indexOf(t);let j=null;if(e.key==='ArrowRight')j=(i+1)%vis.length;if(e.key==='ArrowLeft')j=(i-1+vis.length)%vis.length;if(e.key==='Home')j=0;if(e.key==='End')j=vis.length-1;if(j!==null){e.preventDefault();vis[j].focus();selectTab(vis[j])}})});
 
-/* query */
 document.querySelectorAll('[data-try]').forEach(b=>b.addEventListener('click',()=>{$('#q').value=b.dataset.try;const sel=$('#chain');if([...sel.options].some(o=>o.value===b.dataset.chain))sel.value=b.dataset.chain;go()}));
 $('#form').addEventListener('submit',e=>{e.preventDefault();go()});
 $('#filter').addEventListener('input',renderFns);
-/* Copy what the drawing shows: the whole contract on F-00, otherwise the chosen function with
-   its helpers (the same lines the code pane displays). */
 function shownText(){if(!DATA)return '';if(CUR==null)return DATA.contract.source;return SHOWN.map(([a,b])=>SRC_LINES.slice(a,b+1).join('\n')).join('\n\n')+'\n'}
 async function copyShown(){const text=shownText();if(!text)return;const btn=$('#copy');let ok=false;
  try{await navigator.clipboard.writeText(text);ok=true}catch(e){const ta=document.createElement('textarea');ta.value=text;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{ok=document.execCommand('copy')}catch(e2){}ta.remove()}
@@ -372,11 +357,6 @@ async function go(){const q=$('#q').value.trim();if(!q)return;const btn=$('#go')
 
 function riskWord(s){return s>=80?'Critical':s>=40?'High':s>=20?'Medium':s>=8?'Low':'Minimal'}
 function summaryText(sum){return ['critical','high','medium','low','info'].filter(k=>sum[k]).map(k=>sum[k]+' '+SEVL[k].toLowerCase()).join(', ')||'no findings'}
-/* linked and part contracts: the band under the title block, the Graph tab, and navigation
-   into a linked contract's own view with a way back */
-/* One flat list of chips built once from the loaded contract: this contract, the parts that
-   run in its storage (shell, implementation, facets), and the contracts it trusts. Every chip
-   opens its contract the same way, from any view, and the band never changes. */
 let ROOT=null,ENTRIES=[],CURRENT=0;
 function partOf(f){return f.part||0}
 function findingPart(f,full){const fn=f.function||'';const m=/ @ (0x[0-9a-fA-F]{40})/.exec(fn);if(!m)return fn?0:-1;const i=(full.contract.parts||[]).findIndex(p=>p.address.toLowerCase()===m[1].toLowerCase());return i<0?0:i}
@@ -420,7 +400,6 @@ function titleBlock(){const c=DATA.contract,s=c.stats,rep=DATA.report;const meta
  const r=$('#tb-risk');r.textContent=rep.risk_score+'/100 · '+riskWord(rep.risk_score);r.classList.toggle('calm',rep.risk_score<8);
 }
 
-/* findings and callouts: evidence lines are matched to source lines */
 function prepareFindings(){const f=(DATA.report.findings||[]).slice();f.sort((a,b)=>(SEV[a.severity]-SEV[b.severity])||((a.function?0:1)-(b.function?0:1)));FINDINGS=f;
  SRC_LINES=DATA.contract.source.split('\n');CALLOUTS=new Map();const trimmed=SRC_LINES.map(l=>l.trim());
  const mark=(k,n)=>{if(k<0)return false;if(!CALLOUTS.has(k))CALLOUTS.set(k,[]);const arr=CALLOUTS.get(k);if(!arr.includes(n))arr.push(n);return true};
@@ -458,17 +437,12 @@ function findingItem(n,f,open){const fn=f.function?f.function.split(' [')[0]:'co
 function renderFindings(){$('#findings').innerHTML=FINDINGS.length?FINDINGS.map((f,i)=>findingItem(i+1,f,i===0)).join(''):'<li class="finding"><div class="fbody" style="padding:12px">No findings. The analyzer is heuristic: absence of findings is not proof of safety.</div></li>';
  document.querySelectorAll('.finding>button').forEach(b=>b.addEventListener('click',()=>{const on=b.getAttribute('aria-expanded')!=='true';b.setAttribute('aria-expanded',on?'true':'false');document.getElementById(b.getAttribute('aria-controls')).hidden=!on}))}
 
-/* a chosen callout or line stays lit until another is chosen */
 function light(id,block){document.querySelectorAll('.lit').forEach(x=>x.classList.remove('lit'));const el=document.getElementById(id);if(!el)return;el.classList.add('lit');
  if(/^F\d+$/.test(id)){const n=+id.slice(1);document.querySelectorAll('.co[href="#'+id+'"]').forEach(a=>a.closest('li').classList.add('lit'));const b=el.querySelector('button');if(b&&b.getAttribute('aria-expanded')!=='true')b.click();b&&b.focus({preventScroll:true});say('Finding '+n+': '+FINDINGS[n-1].title)}
  if(/^L\d+$/.test(id)){const co=el.querySelector('.co');if(co)co.focus({preventScroll:true});say('Line '+id.slice(1))}
 
- /* The tab bar (and the scale strip under it) are sticky inside the drawing's scroll box: keep the
-    target clear of them, or a "start" scroll hides the very line that was asked for. */
  if(/^L\d+$/.test(id)){let h=8;const box=el.closest('main>*');if(box){box.querySelectorAll('.tabs,#scale').forEach(x=>{if(!x.hidden&&getComputedStyle(x).position==='sticky')h+=x.offsetHeight})}el.style.scrollMarginTop=h+'px'}
  el.scrollIntoView({block:block||'center'})}
-/* A helper call jumps to the helper's definition inside the current view (whole contract or the
-   chosen function with its helpers); it never widens the view. The definition row gets a way back. */
 function gotoHelper(a){const name=a.dataset.fn;const target=document.querySelector('#panel-code li.ln[data-fn="'+name+'"]');
  if(!target){say(name+' is not part of this view');return}
  const from=a.closest('li.ln');document.querySelectorAll('#panel-code .back').forEach(b=>b.remove());
@@ -486,20 +460,15 @@ function storagePanel(c){const comp=!!(c.parts&&c.parts.length);const pcol=s=>co
  return '<div class="report">'+partsTable(c)+'<h2>Storage layout</h2>'+table+'<h2>Events</h2>'+list(c.events,'No events emitted.')+'<h2>Custom errors</h2>'+list(c.errors,'None.')+'<h2>Strings</h2>'+(c.strings.length?'<ul>'+c.strings.map(e=>'<li>'+esc(e)+'</li>').join('')+'</ul>':'<p>None.</p>')+'<h2>Selectors called on other contracts</h2>'+list(c.selectors_called,'None.')+'</div>'}
 function reportPanel(rep,c){const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
  return '<div class="report"><h2>Summary</h2><p>Risk score <b class="'+(rep.risk_score>=8?'sev-high':'')+'">'+rep.risk_score+'/100</b> ('+riskWord(rep.risk_score).toLowerCase()+'). '+summaryText(rep.summary)+((typeof rep.contract_kind==='string'&&rep.contract_kind.trim()&&rep.contract_kind.trim()!=='unclassified')?'. Kind: '+esc(rep.contract_kind.trim()):'')+'. Findings are leads with a confidence level; coverage and unresolved jumps are in the title block.</p><h2>Privileged functions</h2>'+list(rep.privileged_functions)+'<h2>State-changing functions callable by anyone</h2>'+list(rep.unauthenticated_state_changers)+'<h2>External calls</h2>'+list(rep.external_calls)+'<h2>All findings</h2><ol class="findings">'+FINDINGS.map((f,i)=>findingItem(i+1,f,true).replace(' id="F'+(i+1)+'"',' id="R'+(i+1)+'"').replace('id="FB'+(i+1)+'"','id="RB'+(i+1)+'"').replace('aria-controls="FB'+(i+1)+'"','aria-controls="RB'+(i+1)+'"')).join('')+'</ol></div>'}
-/* parts of a composite (proxy + implementation, diamond + facets): the routing table */
 function partsTable(c){const parts=c.parts||[];if(!parts.length)return '';const comp=c.composite||{};
  const role=p=>p.role==='shell'?'shell (routes calls)':p.role==='implementation'?'implementation':'facet';
  const sels=p=>p.role==='shell'?'router':(p.selectors.length?p.selectors.length+' selectors':'all unrouted');
  const rows=parts.map(p=>'<tr role="row"><td role="cell" data-label="Part"><code>'+esc(partLabel(c,p))+'</code></td><td role="cell" data-label="Role">'+esc(role(p))+'</td><td role="cell" data-label="Address"><code class="hash">'+esc(p.address)+'</code></td><td role="cell" data-label="Selectors">'+esc(sels(p))+'</td><td role="cell" data-label="Compiler">'+esc(p.compiler||'')+'</td><td role="cell" data-label="Code">'+(p.stats?p.stats.code_bytes.toLocaleString()+' bytes':'')+'</td></tr>').join('');
  const coll=(comp.collisions||[]).map(x=>'<li>slot <code>'+esc(x.slot)+'</code>: '+esc(x.first[1])+' in '+esc(shortAddr(parts[x.first[0]]))+', '+esc(x.second[1])+' in '+esc(shortAddr(parts[x.second[0]]))+'</li>').join('');
  return '<h2>'+esc(comp.kind||'Composite')+'</h2><p>Every part runs in this contract\'s storage through delegatecall; the code and the report cover them as one contract.</p>'+scrollTable('Parts','<table class="stack" role="table"><thead role="rowgroup"><tr role="row"><th role="columnheader" scope="col">Part</th><th role="columnheader" scope="col">Role</th><th role="columnheader" scope="col">Address</th><th role="columnheader" scope="col">Selectors</th><th role="columnheader" scope="col">Compiler</th><th role="columnheader" scope="col">Code</th></tr></thead><tbody role="rowgroup">'+rows+'</tbody></table>')+(coll?'<h2>Storage collisions</h2><ul>'+coll+'</ul>':'')}
-/* wide tables scroll sideways inside a labelled region the keyboard can focus (WCAG 1.4.10 allows two-way scrolling for data tables; 2.1.1 needs the scroller reachable) */
 function scrollTable(label,inner){return '<div class="tscroll" role="region" aria-label="'+esc(label)+'" tabindex="0">'+inner+'</div>'}
-/* a Solidity type wraps only between mapping levels: `mapping(address =>` then `mapping(address => uint256))` */
 function fmtType(t){return esc(t).split(' =&gt; ').join(' =&gt;<wbr> ')}
-/* a 32-byte hash is shown short with the full value kept for assistive tech and copying */
 function hashCell(t){if(t.length<=24)return '<code>'+esc(t).split('_').join('_<wbr>')+'</code>';const m=t.match(/^(.*?)(0x[0-9a-fA-F]{40,})(.*)$/);if(!m)return '<code class="hash">'+esc(t)+'</code>';const short=m[2].slice(0,6)+'…'+m[2].slice(-4);return '<code><span aria-hidden="true">'+esc(m[1]+short+m[3])+'</span><span class="sr">'+esc(t)+'</span></code>'}
-/* short label of a part: the parts table above the layout shows which address each one is */
 function partLabel(c,p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.role==='implementation')return 'impl';const i=(c.parts||[]).indexOf(p);return 'facet '+(i<0?'?':i)}
 function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.role==='implementation')return 'impl';const a=p.address||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
 function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(p=>'<span class="pt">'+esc(partLabel(c,p))+'</span>').join('<br>')}

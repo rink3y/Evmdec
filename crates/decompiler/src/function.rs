@@ -63,7 +63,6 @@ pub struct Dispatch {
 }
 
 fn branch_polarity(cond: ExprId) -> Option<(u32, bool)> {
-    // Returns (selector, body_is_true_branch)
     if let Some(sel) = emit::selector_compare(cond) {
         return Some((sel, true));
     }
@@ -113,7 +112,6 @@ pub fn discover(main: &Lifted) -> Dispatch {
     let mut functions: Vec<Discovered> = Vec::new();
     let mut entries: HashSet<usize> = HashSet::new();
     let mut sel_nodes: Vec<usize> = Vec::new();
-    // Pass 1: selector branches anywhere reachable.
     let reach = lift::reachable(main);
     for &nid in &reach {
         if let Term::Branch { cond, t, f } = &main.nodes[nid].term {
@@ -132,8 +130,6 @@ pub fn discover(main: &Lifted) -> Dispatch {
             }
         }
     }
-    // No selector dispatcher at all (hand-written contract, minimal proxy, pure fallback): the
-    // whole entry region is the fallback.
     if sel_nodes.is_empty() {
         return Dispatch {
             functions: vec![],
@@ -142,8 +138,6 @@ pub fn discover(main: &Lifted) -> Dispatch {
             dispatcher: HashSet::new(),
         };
     }
-    // Dispatcher = nodes reachable from entry without entering a body, from which a selector
-    // branch is reachable without entering a body.
     let mut fwd: HashSet<usize> = HashSet::new();
     let mut q = VecDeque::new();
     q.push_back(main.entry);
@@ -155,7 +149,6 @@ pub fn discover(main: &Lifted) -> Dispatch {
             q.push_back(*s);
         }
     }
-    // Backward from selector nodes within fwd.
     let mut preds: HashMap<usize, Vec<usize>> = HashMap::new();
     for &x in &fwd {
         for s in &main.nodes[x].succs {
@@ -183,10 +176,9 @@ pub fn discover(main: &Lifted) -> Dispatch {
     if dispatcher.is_empty() {
         dispatcher.insert(main.entry);
     }
-    // Exits of the dispatcher that are not bodies: fallback / receive candidates.
     let mut fallback = None;
     let mut receive = None;
-    let mut exits: Vec<(usize, usize)> = Vec::new(); // (from, to)
+    let mut exits: Vec<(usize, usize)> = Vec::new();
     for &d in &dispatcher {
         for s in &main.nodes[d].succs {
             if !dispatcher.contains(s) && !entries.contains(s) {
@@ -198,14 +190,12 @@ pub fn discover(main: &Lifted) -> Dispatch {
     exits.dedup();
     for (from, to) in exits {
         let node = &main.nodes[to];
-        // A bare revert is "no fallback".
         if is_plain_revert(main, to) {
             continue;
         }
         let from_term = &main.nodes[from].term;
         let is_receive = match from_term {
             Term::Branch { cond, t, .. } => {
-                // receive: calldatasize == 0 branch taken
                 let cz = matches!(expr::node(*cond), Node::Op(op::ISZERO, ref v) if matches!(expr::node(v[0]), Node::Env(op::CALLDATASIZE, _)));
                 cz && *t == Some(to)
             }
@@ -443,7 +433,6 @@ pub fn exprs_with_callees_tagged<'a>(
             if let Stmt::Internal { callee, args, .. } = s {
                 if let Some(cl) = resolve(*callee) {
                     let k = cl.ret_slot.map(|k| k as usize).unwrap_or(usize::MAX);
-                    // Arg(i) (i < k) is the (k-1-i)-th argument in natural order.
                     let mut map: HashMap<u32, ExprId> = HashMap::new();
                     for (j, a) in args.iter().enumerate() {
                         if k != usize::MAX && j < k {
@@ -537,7 +526,6 @@ pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
                     if let Some(i) = calldata_word_index(*off) {
                         max_idx = Some(max_idx.map_or(i, |m| m.max(i)));
                     } else {
-                        // calldataload(4 + arg_i + k): arg_i is a dynamic offset
                         let (base, _) = expr::split_offset(*off);
                         if let Some(b) = base {
                             if let Node::CallDataLoad(o2) = expr::node(b) {
@@ -562,7 +550,6 @@ pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
                                 } else if bits % 8 == 0 {
                                     Some(format!("uint{}", bits))
                                 } else {
-                                    // `x & (2^255 - 1)` strips a flag bit from a uint256.
                                     None
                                 };
                                 if let Some(ty) = ty {
@@ -598,7 +585,6 @@ pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
                 | Node::Op(op::GT, v)
                 | Node::Op(op::SLT, v)
                 | Node::Op(op::SGT, v) => {
-                    // calldatasize - 4 < 32n  or  calldatasize < 4 + 32n (head size check)
                     for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                         if let Some(c) = expr::as_const(b) {
                             if c.fits_u64() {
@@ -606,7 +592,6 @@ pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
                                 if base.is_some_and(|x| {
                                     matches!(expr::node(x), Node::Env(op::CALLDATASIZE, _))
                                 }) {
-                                    // a = calldatasize - 4 (delta = -4) or calldatasize
                                     let k = c.low_u64() as i128
                                         - if delta.is_negative() { 0 } else { 4 };
                                     if k >= 0 && k % 32 == 0 && k / 32 <= 64 {
@@ -626,8 +611,6 @@ pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
     for r in roots {
         visit(r.expr);
     }
-    // `iszero(iszero(x))` is both the bool cleanup and `x != 0`: a word is a bool only when it
-    // is never used raw anywhere else (arithmetic, comparison, call argument, hash input).
     {
         let bool_words: Vec<u32> = types
             .iter()
@@ -664,9 +647,6 @@ pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
             }
         }
     }
-    // The ABI head-size check (solc >= 0.5) gives the exact head word count; otherwise fall back
-    // to the highest calldata word read. Reads beyond a present check are not parameters (e.g.
-    // `LogNote`-style modifiers logging raw calldata words).
     let count = match (max_idx, head_words) {
         (_, Some(h)) => h,
         (Some(m), None) => m + 1,
@@ -694,7 +674,6 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
     for nd in &l.nodes {
         if let Term::Return { len, data, .. } = &nd.term {
             let tys: Vec<String> = match (data, expr::as_const(*len)) {
-                // `(32, n, <n bytes>)`: one dynamic value encoded in place.
                 (Some(words), Some(l))
                     if words.len() >= 2
                         && expr::as_const(words[0]) == Some(U256::from_u64(32))
@@ -702,7 +681,6 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
                             n.fits_u64() && l == U256::from_u64(64 + n.low_u64().div_ceil(32) * 32)
                         }) =>
                 {
-                    // Printable constant text is a `string`; anything else stays `bytes`.
                     let text = emit::decode_plain_string(&words[1..]).is_some_and(|t| {
                         !t.is_empty() && t.chars().all(|c| !c.is_control() && c != '\u{fffd}')
                     });
@@ -734,7 +712,6 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
             }
         }
     }
-    // A position that only ever returns the constants 0 and 1, with 1 seen, is a bool.
     if !best.is_empty() {
         let rets: Vec<&Vec<ExprId>> = l
             .nodes
@@ -787,7 +764,6 @@ pub fn infer_internal_returns(l: &Lifted, n_rets: usize) -> Vec<String> {
         return tys;
     }
     for (i, ty) in tys.iter_mut().enumerate() {
-        // Values are deepest first: the j-th result is the j-th from the top.
         let j = n_rets - 1 - i;
         let consts: Vec<Option<U256>> = rets.iter().map(|w| expr::as_const(w[j])).collect();
         let all_flags = consts

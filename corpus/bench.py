@@ -9,7 +9,6 @@ event recall. The signature dictionary is disabled by default so that *inference
 """
 import argparse, json, os, subprocess, sys
 
-# --- keccak256 (so the script has no dependencies) ---
 RC = [0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000, 0x000000000000808b, 0x0000000080000001,
       0x8000000080008081, 0x8000000000008009, 0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
       0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003, 0x8000000000008002, 0x8000000000000080,
@@ -65,7 +64,6 @@ def main():
     ap.add_argument('-v', action='store_true')
     a = ap.parse_args()
     tot = dict(abi=0, found=0, match=0, mut_ok=0, mut_n=0, par_ok=0, par_n=0, ret_ok=0, ret_n=0, ev=0, ev_found=0, time=0.0, blocks=0, covered=0, unresolved=0)
-    # Type accuracy: ABI head words whose inferred Solidity type equals the declared one.
     ty = dict(par_words=0, par_exact=0, ret_words=0, ret_exact=0)
     wrong = []
     rows = []
@@ -96,9 +94,7 @@ def main():
             m = mut(it); ours = fx['mutability']
             ok = (m in ('view', 'pure') and ours in ('view', 'pure')) or (m == 'payable' and ours == 'payable') or (m == 'nonpayable' and ours in ('non_payable', 'nonpayable'))
             mut_ok += ok
-            # parameter count: ABI head words (dynamic = 1 word each)
             n_in = len(it.get('inputs', []))
-            # tuples occupy several words when static; count ABI head words
             def is_dynamic(t):
                 ty = t['type']
                 if ty in ('string', 'bytes') or ty.endswith('[]'): return True
@@ -123,7 +119,6 @@ def main():
             hw = sum(head_words(x) for x in it.get('inputs', []))
             par_ok += (len(fx['params']) == hw)
             def word_types(t):
-                # Declared type of every head word of `t`; dynamic values are one word.
                 if is_dynamic(t): return ['dynamic']
                 tt = t['type']
                 if tt.startswith('tuple') and not tt.endswith(']'):
@@ -162,7 +157,6 @@ def main():
             if '// topic0 0x' in e: got_ev.add(e.split('// topic0 0x')[1].strip())
             elif e.startswith('0x') and ' ' in e: got_ev.add(e.split()[0][2:])
             else:
-                # Declarations carry `indexed` markers; the topic hash uses the bare signature.
                 bare = e.replace(' indexed', '').replace(', ', ',')
                 got_ev.add(keccak256(bare.encode()).hex())
         ev_found = len(abi_ev & got_ev)

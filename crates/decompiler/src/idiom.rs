@@ -90,8 +90,6 @@ struct DynReturn {
 /// ```
 fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
     let sn = &l.nodes[s];
-    // The two head stores are the last memory writes (a summarised copy may follow them);
-    // explicit assignments may follow.
     let mut k = sn.stmts.len();
     while k > 0 && matches!(sn.stmts[k - 1], Stmt::Assign { .. }) {
         k -= 1;
@@ -137,7 +135,6 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
     let region_start: Vec<usize>;
     let dropped;
     if copy_form {
-        // mem[a + 64 : …] = mem[p + 32 : …]
         let Stmt::Copy { dest, src, .. } = &sn.stmts[k - 1] else {
             return None;
         };
@@ -150,7 +147,6 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
         dropped = 3;
     } else {
         let Term::Jump(h) = sn.term else { return None };
-        // Loop counter initialised to zero, on the edge into the header or by a trailing assignment.
         let from_edge = l.edge_assigns.get(&(s, h)).and_then(|ea| {
             ea.iter()
                 .find(|(_, val)| expr::as_const(*val) == Some(U256::ZERO))
@@ -235,7 +231,6 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
         region_start = vec![e];
         dropped = 2;
     }
-    // Exit region: padding stores only, ending in `return mem[a : …]`.
     let mut work = region_start;
     let mut seen = HashSet::new();
     let mut found = false;
@@ -261,7 +256,6 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
                 if to != ta || co != ca {
                     return None;
                 }
-                // A payload the lifter already decoded (a literal string) is better than `return p`.
                 if data.as_ref().is_some_and(|d| !d.is_empty()) {
                     return None;
                 }
@@ -274,7 +268,6 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
     if !found {
         return None;
     }
-    // Nothing else may flow into the folded region.
     for &d in &dead {
         if l.nodes[d]
             .preds
@@ -352,9 +345,7 @@ pub fn fold(l: &mut Lifted) -> usize {
         }
         let tail: Vec<Stmt> = l.nodes[s].stmts.drain(k..).collect();
         l.nodes[s].stmts.truncate(k - m.dropped);
-        // Trailing assignments other than the loop counter keep their place.
         l.nodes[s].stmts.extend(tail.into_iter().filter(|st| !matches!(st, Stmt::Assign { value, .. } if expr::as_const(*value) == Some(U256::ZERO))));
-        // The payload stores may sit in the straight-line predecessors of the return node.
         let mut chain: Vec<Stmt> = Vec::new();
         let mut cur = s;
         let mut hops = 0;
@@ -550,7 +541,6 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
         if !xn.stmts.is_empty() && !(*t == x || *f == x) {
             continue;
         }
-        // The body: a successor holding exactly one store, looping back to x (or x itself).
         let is_body = |b: usize| {
             l.nodes[b].stmts.len() == 1
                 && (b == x || matches!(l.nodes[b].term, Term::Jump(y) if y == x))
@@ -584,7 +574,6 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
                 expr::node(*cond)
             );
         }
-        // Countdown: mem[d] = mem[s]; n -= 32; d += 32; s += 32; while n >= 32 (phi on x).
         if b != x {
             if let (Node::Var(_), Node::Var(_), Some(assigns)) =
                 (expr::node(*bo), expr::node(bs), l.edge_assigns.get(&(b, x)))
@@ -629,7 +618,6 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
                 }
             }
         }
-        // Index forms: a Var shared by the store address and the load address, stepped by 32.
         let (tbo, _) = addends(*bo);
         let (tbs, _) = addends(bs);
         let shared: Vec<ExprId> = tbo
@@ -647,7 +635,6 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
             }
             continue;
         };
-        // Where is the phi, and where is the step?
         let (phi_node, rotated) = if b == x {
             (b, true)
         } else if l.edge_assigns.get(&(b, x)).is_some_and(|a| step32(a, iv))
@@ -671,8 +658,6 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
         if b == x && !l.edge_assigns.get(&(b, b)).is_some_and(|a| step32(a, iv)) {
             continue;
         }
-        // The condition compares the counter (while) or counter + 32 (rotated) with a bound and
-        // continues into the body.
         let counter_term = |c: ExprId| -> bool {
             let (ta, ca) = addends(c);
             ta == vec![iv] && ca == if rotated { u(32) } else { U256::ZERO }

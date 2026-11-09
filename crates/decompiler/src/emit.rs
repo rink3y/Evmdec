@@ -33,7 +33,6 @@ pub fn hashed_slot(c: U256) -> Option<(U256, i64)> {
                 } else {
                     h.wrapping_sub(U256::from_u64((-k) as u64))
                 };
-                // The exact hash wins over a neighbour's offset.
                 t.entry(key).or_insert((s, k));
             }
         }
@@ -230,7 +229,6 @@ pub fn fmt_const(c: U256) -> String {
     if c < U256::from_u64(1_000_000) {
         return c.to_decimal();
     }
-    // n * 10^k with small n
     let dec = c.to_decimal();
     let trimmed = dec.trim_end_matches('0');
     let zeros = dec.len() - trimmed.len();
@@ -580,7 +578,6 @@ fn size_compare(o: u8, a: ExprId, b: ExprId, n: &Names) -> Option<String> {
     if name != "msg.data.length" && name != "returndatasize()" {
         return None;
     }
-    // a = base + c (c may be a wrapped negative constant): base <op> k - c
     let bound = k.wrapping_sub(c);
     if bound.bits() > 64 {
         return None;
@@ -655,7 +652,6 @@ pub fn packed_read(e: ExprId) -> Option<(U256, u32, u32)> {
                 None
             }
         }
-        // signextend(n, slot >> 8k): a signed field of 8(n+1) bits.
         Node::Op(op::SIGNEXTEND, v) => {
             let nb = expr::as_const(v[0])?;
             if !nb.fits_u64() || nb.low_u64() >= 31 {
@@ -685,7 +681,6 @@ pub fn packed_read(e: ExprId) -> Option<(U256, u32, u32)> {
 /// `(slot, byte offset, bits, value)`.
 pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)> {
     let k = expr::as_const(key)?;
-    // `slot = slot & ~mask`: the field under the mask is set to zero.
     if let Node::Op(op::AND, w) = expr::node(val) {
         if let (Node::SLoad(kk, false, _), Some(keep)) = (expr::node(w[0]), expr::as_const(w[1])) {
             if expr::as_const(kk) == Some(k) {
@@ -722,7 +717,6 @@ pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)
             continue;
         }
         let bits = shifted.bits();
-        // Undo the placement: value << s, value * 2^s, or a constant.
         let mut value = if s == 0 {
             b
         } else {
@@ -757,7 +751,6 @@ pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)
 pub fn element_write(key: ExprId, val: ExprId, n: &Names) -> Option<(U256, ExprId)> {
     let root = element_root(key)?;
     let width_bits = element_width(n.elem_types.get(&root)?)?;
-    // The mask kept on the slot's own load, if `e` is `slot & mask`.
     let kept_mask = |e: ExprId| -> Option<U256> {
         let Node::Op(op::AND, w) = expr::node(e) else {
             return None;
@@ -888,9 +881,7 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
             format!("{}[0]", base_name(words[0], n, space))
         }
         Node::Op(op::ADD, v) => {
-            // array element: keccak(slot) + i, or (base) + i for struct fields in mappings
             let (base, idx) = (v[0], v[1]);
-            // A precomputed `keccak256(slot)` on either side: element `idx` of that array.
             for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                 if let Some((s, k)) = expr::as_const(a).and_then(hashed_slot) {
                     return format!(
@@ -900,7 +891,6 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
                     );
                 }
             }
-            // `index + small constant`: a fixed-size array laid out from a known base slot.
             for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                 if let (Some(c), true) = (expr::as_const(a), is_plain_index(b)) {
                     if let Some((root, off)) = fixed_array_base(c, &n.array_bases) {
@@ -965,7 +955,6 @@ fn copy_source(kind: u8) -> &'static str {
 }
 
 fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
-    // `uint8(stor_3[x])`, `address(stor_4[i])`: a typed element needs no cast.
     if let Some(load) = element_typed_load(e, n) {
         return (fmt_expr(load, n), P_PRIMARY);
     }
@@ -1049,12 +1038,10 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
     match (o, v.len()) {
         (op::ISZERO, 1) => {
             let a = v[0];
-            // Negated comparisons
             if let Node::Op(io, iv) = expr::node(a) {
                 match io {
                     op::EQ => {
                         if let Some((b, truth)) = bool_against_const(iv[0], iv[1], n) {
-                            // `!(b == 1)` is `!b`; `!(b == 0)` is `b`.
                             return if truth {
                                 (format!("!{}", fmt_prec(b, P_UNARY, n)), P_UNARY)
                             } else {
@@ -1122,7 +1109,6 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                 if !is_bool(iv[0], n) {
                     return (format!("{} != 0", fmt_prec(iv[0], P_EQ + 1, n)), P_EQ);
                 }
-                // `!!b` of a boolean is `b`.
                 return (fmt_prec(iv[0], P_PRIMARY, n), P_PRIMARY);
             }
             if is_bool(a, n) {
@@ -1410,10 +1396,6 @@ fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
     fmt_prec(rhs, prec, n)
 }
 
-// ------------------------------------------------------------------------------------------
-// Statements
-// ------------------------------------------------------------------------------------------
-
 /// Decode a revert/return payload into a readable form.
 /// The 4-byte selector at the start of a payload word, if the word is `sel << 224 | rest` where
 /// `rest` is anything with its top 32 bits clear (constant, or an OR with such a constant), or a
@@ -1454,7 +1436,6 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, kind: Payload
     if words.is_empty() {
         return String::new();
     }
-    // Error(string) / Panic / custom error: first word's top 4 bytes
     let lenu = len.and_then(|l| l.as_usize());
     if let Some(sel) = leading_selector(words[0], lenu) {
         let top4_only = lenu.map_or(
@@ -1487,7 +1468,6 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, kind: Payload
             return format!("CustomError_{:08x}({})", sel, args.join(", "));
         }
     }
-    // A single dynamic value `(32, len, data…)` returned in place: show the text when it is one.
     if kind == PayloadKind::Return
         && words.len() >= 3
         && expr::as_const(words[0]) == Some(U256::from_u64(32))
@@ -1538,7 +1518,6 @@ pub fn shifted_word_len(words: &[ExprId], i: usize, len: Option<usize>) -> ExprI
     };
     let hi = align(i);
     let lo = align(i + 1);
-    // (hi << 32) | (lo >> 224)
     expr::op2(
         op::OR,
         expr::op2(op::SHL, expr::konst_u64(32), hi),
@@ -1564,7 +1543,6 @@ fn panic_name(code: u64) -> String {
 
 /// Decode `Error(string)` payload words (selector-shifted) into the string.
 pub fn decode_string_payload(words: &[ExprId], payload_len: Option<usize>) -> Option<String> {
-    // ABI words after the selector: [offset (0x20), length, data...]
     let offset = expr::as_const(shifted_word_len(words, 0, payload_len))?;
     if offset != U256::from_u64(0x20) {
         return None;
@@ -1638,7 +1616,6 @@ pub fn fmt_call_input(
     in_len: Option<U256>,
     n: &Names,
 ) -> (Option<String>, Vec<String>) {
-    // Returns (function name if known, args)
     if words.is_empty() {
         return (None, vec![]);
     }
@@ -1797,7 +1774,6 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     }
                 }
             };
-            // Known target function: show as a typed call.
             match fname {
                 Some(f) if *kind == op::CALL || *kind == op::STATICCALL => {
                     format!(
@@ -1920,7 +1896,6 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             }
             match data {
                 Some(words) if !words.is_empty() => {
-                    // Selector payloads (Error(string), Panic(code), custom errors) are 4 + 32n bytes.
                     let len = leading_selector(words[0], None)
                         .map(|_| U256::from_u64(4 + 32 * (words.len() as u64 - 1)));
                     let p = fmt_payload(words, len, n, PayloadKind::Revert);
@@ -2033,7 +2008,6 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
             if vals.is_empty() {
                 "return;".into()
             } else {
-                // Values are deepest first; `bool_returns` is in declaration order.
                 let k = vals.len();
                 format!(
                     "return ({});",
@@ -2068,7 +2042,6 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     let mut out = String::new();
     let reach = crate::lift::reachable(l);
     let mut order: Vec<usize> = Vec::new();
-    // Reverse post-order from entry.
     let mut seen = HashSet::new();
     fn dfs(l: &Lifted, x: usize, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
         if !seen.insert(x) {
@@ -2081,8 +2054,6 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     }
     dfs(l, l.entry, &mut seen, &mut order);
     order.reverse();
-    // A node needs a label unless its only predecessor is the node printed just before it and
-    // that predecessor falls through with a plain jump.
     let mut needs_label: HashSet<usize> = HashSet::new();
     for (idx, &nid) in order.iter().enumerate() {
         let nd = &l.nodes[nid];

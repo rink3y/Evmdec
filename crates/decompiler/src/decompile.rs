@@ -453,7 +453,6 @@ pub fn compose(
         .iter()
         .filter_map(|f| f.selector.clone())
         .collect();
-    // Which part first declared each slot, for naming both sides of a collision.
     let mut declared: HashMap<String, usize> =
         shell.storage.iter().map(|v| (v.slot.clone(), 0)).collect();
     let mut shadowed = Vec::new();
@@ -543,7 +542,6 @@ pub fn compose(
                 shell.call_targets.push(v);
             }
         }
-        // The part's code calls through slots of the shell's storage.
         for v in part.call_target_slots {
             if !shell.call_target_slots.contains(&v) {
                 shell.call_target_slots.push(v);
@@ -646,7 +644,6 @@ pub struct ProxyRef {
 /// the whole thing lands in `Contract::source`.
 pub fn decompile(code: &[u8], opts: &Options) -> Contract {
     let t0 = std::time::Instant::now();
-    // No code (an account without a contract) decompiles as a contract that only stops.
     let code: &[u8] = if code.is_empty() { &[op::STOP] } else { code };
     let info = metadata::analyze(code);
     let mut c = decompile_runtime(&info.runtime, &info, opts);
@@ -695,8 +692,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         .map(|m| m.offset)
         .unwrap_or(code.len());
     let mut rec = cfg::recover(&prog, code_end);
-    // Embedded creation code (CODECOPY'd into memory and fed to CREATE/CREATE2) is data for the
-    // purposes of this contract: it is excluded from coverage and decompiled separately on request.
     let embedded_ranges = embedded_regions(&prog, &rec);
     let in_embedded = |pc: usize| {
         embedded_ranges
@@ -712,7 +707,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                 .map(|b| b.id)
                 .collect();
             rec.orphans.retain(|b, _| keep.contains(b));
-            // Unresolved jumps are those of the surviving units only.
             let mut un: Vec<usize> = std::iter::once(&rec.main)
                 .chain(rec.functions.values())
                 .chain(rec.orphans.values())
@@ -730,8 +724,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     };
     prune_embedded(&mut rec);
-    // Computed jumps (hand-written dispatchers): derive candidate targets from the target
-    // expression's shape and recover again with them.
     if !rec.unresolved_jumps.is_empty() {
         let oracle = Lifter {
             prog: &prog,
@@ -788,9 +780,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     }
     if info.metadata.is_none() {
-        // Without a metadata trailer the end of the code is unknown: a trailing region that is
-        // reached by nothing and whose JUMPDESTs are referenced by no PUSH in reached code is data
-        // (Vyper constants, embedded payloads), not code.
         let reached: BTreeSet<usize> = std::iter::once(&rec.main)
             .chain(rec.functions.values())
             .flat_map(|u| u.nodes.iter().map(|n| n.block))
@@ -825,8 +814,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     };
     let mut tt = std::time::Instant::now();
     tick("recover", &mut tt);
-    // Internal function units first: simple ones (ABI decoders/encoders, getters) are summarised
-    // and seen through at their call sites.
     let mut int_lifter = Lifter {
         prog: &prog,
         root: false,
@@ -836,7 +823,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     };
     let mut internals: BTreeMap<usize, Lifted> = BTreeMap::new();
     let mut by_block: Vec<(usize, Lifted)> = Vec::new();
-    // Callees before callers where possible: iterate until the summary set stabilises.
     for _round in 0..8 {
         by_block.clear();
         for (b, unit) in &rec.functions {
@@ -877,7 +863,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         internals.insert(prog.blocks[b].start, l);
     }
     tick("lift internals", &mut tt);
-    // Helpers that load a storage string: their result prints as the storage variable.
     let loaders: HashMap<usize, U256> = internals
         .iter()
         .filter_map(|(pc, l)| crate::idiom::storage_string_loader(l).map(|k| (*pc, k)))
@@ -911,7 +896,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     let reprocess =
         main.reprocess_count + internals.values().map(|l| l.reprocess_count).sum::<usize>();
 
-    // Effects of internal functions (transitive).
     let mut int_effects: HashMap<usize, function::Effects> = HashMap::new();
     for (pc, l) in &internals {
         int_effects.insert(*pc, function::effects(l));
@@ -942,8 +926,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         acc
     };
 
-    // Leak the internal graphs for the lifetime of this analysis so the resolver can hand out
-    // `&'static` references (the decompiler is a one-shot process per contract).
     let internals_static: &'static HashMap<usize, Lifted> = Box::leak(Box::new(
         internals
             .iter()
@@ -1048,9 +1030,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     };
 
-    // Each external function is lifted again on its own from the state the dispatcher hands it,
-    // so that code shared between functions (ABI-encoding tails, reverts) is specialised per
-    // function instead of merged across all of them.
     let unit_node_of = |lifted_node: usize| -> Option<usize> {
         main.node_map
             .iter()
@@ -1099,7 +1078,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         ));
     }
     if dispatch.functions.is_empty() && dispatch.fallback.is_none() && dispatch.receive.is_none() {
-        // No dispatcher at all: the whole runtime is one entry (e.g. a hand-written contract).
         functions.push(make(
             FnKind::Fallback,
             None,
@@ -1151,8 +1129,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         ));
     }
 
-    // Internal helpers that no printed statement calls any more (every call site was inlined or
-    // aliased) are kept for the JSON but not printed.
     {
         let mut referenced: HashSet<usize> = HashSet::new();
         for f in &functions {
@@ -1171,10 +1147,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                 }
             }
         }
-        // A "helper" whose entry block every caller also holds as a plain node of its own is
-        // the continuation of those callers (old solc reaches the rest of a modified function
-        // both by falling through and by a jump with a return address): its body is already
-        // printed inline, so the duplicate definition is not.
         let mut continuation: HashSet<usize> = HashSet::new();
         for f in &functions {
             if f.kind != FnKind::Internal || !referenced.contains(&f.pc) {
@@ -1203,8 +1175,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     }
 
-    // Types: follow values through phis, helpers and storage to fill in what the direct
-    // heuristics leave at `uint256`.
     let env = {
         let units: Vec<(usize, &Lifted)> = functions
             .iter()
@@ -1215,7 +1185,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     refine_types(&mut functions, &env);
     tick("types", &mut tt);
 
-    // Inventories.
     let string_slots: HashSet<U256> = loaders.values().copied().collect();
     let solc08 = profile.kind == compiler::Kind::Solc && profile.checked_arithmetic;
     let Inventories {
@@ -1234,7 +1203,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     }
     strings.sort();
     strings.dedup();
-    // Pieces of a longer string (32-byte halves of a revert reason) are not strings of their own.
     strings.retain(|s| {
         s.len() >= 5 && s.chars().filter(|c| c.is_ascii_alphabetic()).count() * 2 >= s.len()
     });
@@ -1246,7 +1214,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     });
 
     tick("discover+inventories", &mut tt);
-    // Render code for each function.
     let pure_callees: HashSet<usize> = functions
         .iter()
         .filter(|f| {
@@ -1357,7 +1324,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     }
 
-    // Delegatecall targets (proxy resolution).
     let mut dc_slots: Vec<String> = Vec::new();
     let mut dc_targets: Vec<String> = Vec::new();
     let mut call_targets: Vec<String> = Vec::new();
@@ -1399,9 +1365,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                                 dc_targets.push(h);
                             }
                         }
-                        // A literal address called with CALL/STATICCALL/CALLCODE: a hard-coded
-                        // dependency. Precompiles (0x01 through 0x11 as of Prague) and the zero
-                        // address are not contracts to link.
                         Node::Const(c)
                             if matches!(*kind, op::CALL | op::STATICCALL | op::CALLCODE) =>
                         {
@@ -1458,7 +1421,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
 /// Code regions copied to memory and fed to CREATE/CREATE2 (embedded contracts).
 fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
-    // Heuristic: constant CODECOPY of a large region that starts at a block boundary past the dispatcher.
     for u in std::iter::once(&rec.main).chain(rec.functions.values()) {
         for n in &u.nodes {
             let b = &prog.blocks[n.block];
@@ -1567,7 +1529,6 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
                     if !visited.insert(x) || visited.len() > 20_000 {
                         continue;
                     }
-                    // The 4-byte tail of a payload is a bare mask of its last value.
                     if x == root.expr && root.payload {
                         stack.extend(expr::children(x));
                         continue;
@@ -1648,7 +1609,6 @@ fn is_array_resizer(l: &Lifted) -> bool {
                 {
                     clears = true;
                 }
-                // Larger shrinks zero the dropped elements in a loop the compiler outlines.
                 Stmt::Internal { .. } => clears = true,
                 Stmt::Call { .. } | Stmt::Log { .. } | Stmt::Create { .. } => return false,
                 _ => {}
@@ -1667,7 +1627,6 @@ fn name_storage_from_getters(functions: &[Function], storage: &mut [StorageVar])
         let (FnKind::External, Some(sig), Some(l)) = (f.kind, &f.signature, &f.lifted) else {
             continue;
         };
-        // `getSwapFee()` names the variable `swapFee`.
         let raw = sigs::name_of(sig);
         let name = match raw.strip_prefix("get") {
             Some(rest) if rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
@@ -1715,7 +1674,6 @@ fn name_storage_from_getters(functions: &[Function], storage: &mut [StorageVar])
         let [word] = returned.as_slice() else {
             continue;
         };
-        // Strip a bool test (`x != 0`) and a type mask.
         let mut word = *word;
         if let Node::Op(op::ISZERO, v) = expr::node(word) {
             if let Node::Op(op::ISZERO, w) = expr::node(v[0]) {
@@ -1732,7 +1690,6 @@ fn name_storage_from_getters(functions: &[Function], storage: &mut [StorageVar])
             (Some((k, _, _)), _) => Some(k),
             (None, Node::SLoad(key, false, _)) => match expr::node(key) {
                 Node::Const(k) => emit::hashed_slot(k).map(|(s, _)| s).or(Some(k)),
-                // A mapping entry or array element: the root slot of the key.
                 _ => emit::element_root(key),
             },
             _ => None,
@@ -1759,7 +1716,6 @@ fn name_storage_from_getters(functions: &[Function], storage: &mut [StorageVar])
                 fld.name = name.clone();
             }
             None => {
-                // A getter of the bare slot of an array returns its length, not the array.
                 let bare =
                     matches!(expr::node(word), Node::SLoad(key, false, _) if expr::is_const(key));
                 if !var.name.starts_with("stor_")
@@ -1796,8 +1752,6 @@ pub fn make_names(
     }
     n.bool_returns = f.returns.iter().map(|t| t == "bool").collect();
     n.bools.extend(f.bool_vars.iter().map(|v| expr::var(*v)));
-    // Call results are numbered by the order of their calls in the function, the same for every
-    // reader of these names (the printer and the analyzer's evidence lines).
     if let Some(l) = &f.lifted {
         let mut seqs: Vec<u32> = l
             .nodes
@@ -1818,7 +1772,6 @@ pub fn make_names(
         }
     }
     if let Some(l) = &f.lifted {
-        // Internal units: Arg(i) below the return slot k are the parameters, last pushed on top.
         let k = l.ret_slot.map(|k| k as usize).unwrap_or(l.n_args);
         for i in 0..l.n_args.max(k + 1) {
             let name = if i < k {
@@ -1916,7 +1869,6 @@ fn refine_params(pc: usize, params: &mut [Param], env: &TypeEnv) {
                 p.ty = t;
             }
         } else if p.ty == "bool" && env.param_is_numeric(pc, p.index) {
-            // `x != 0` on a word that helpers further down do arithmetic on.
             p.ty = env
                 .param_type(pc, p.index)
                 .unwrap_or_else(|| "uint256".to_string());
@@ -2090,7 +2042,6 @@ fn inventories(
         layout,
         ..Default::default()
     };
-    // Packed fields: slot -> (offset, bits) -> constant values written (for bool typing).
     let mut fields: PackedFields = BTreeMap::new();
     let bases = fixed_array_bases(functions);
     for f in functions {
@@ -2119,8 +2070,6 @@ fn inventories(
                             match sigs::event(&t0.to_be_bytes()) {
                                 Some(sig) => events.insert(with_indexed(&sig, topics.len() - 1)),
                                 None => {
-                                    // Unknown signature: named by the hash's first four bytes, with
-                                    // one indexed parameter per extra topic and one per data word.
                                     let mut tys: Vec<String> =
                                         vec!["uint256 indexed".to_string(); topics.len() - 1];
                                     match data {
@@ -2186,7 +2135,6 @@ fn inventories(
                     }
                 }
             }
-            // Init code of a deployed contract is bytes, not this contract's string constants.
             let init_words: HashSet<ExprId> = nd
                 .stmts
                 .iter()
@@ -2224,7 +2172,6 @@ fn inventories(
             let ty = if string_slots.contains(&slot) {
                 "string".to_string()
             } else {
-                // Prefer the most specific.
                 let mut v: Vec<String> = tys.into_iter().collect();
                 v.sort_by_key(|t| {
                     if t.starts_with("mapping") {
@@ -2241,7 +2188,6 @@ fn inventories(
                     .into_iter()
                     .next()
                     .unwrap_or_else(|| "uint256".to_string());
-                // The element type the accesses show (`bool` flags, `address` entries).
                 match elem_types.get(&slot) {
                     Some(t) if picked.ends_with("[]") => format!("{}[]", t),
                     Some(t) if picked.starts_with("mapping(") => {
@@ -2259,9 +2205,7 @@ fn inventories(
                 None if slot.bits() <= 32 => format!("stor_{}", slot.to_decimal()),
                 None => format!("stor_{}", slot.to_hex()),
             };
-            // A slot is packed when a field starts past byte 0 or several fields share it.
             let mut fs: Vec<StorageField> = Vec::new();
-            // (a string slot is read with `& 1` and `>> 8`, which is its length encoding, not packing)
             if let (Some(acc), false) = (fields.get(&slot), string_slots.contains(&slot)) {
                 let keys: Vec<(u32, u32)> = acc
                     .keys()
@@ -2270,7 +2214,6 @@ fn inventories(
                     .collect();
                 let packed = keys.iter().any(|(off, _)| *off > 0) || keys.len() > 1;
                 if packed {
-                    // Drop a field that is the union of others (`slot >> 8` read as one word over two fields).
                     let mut sorted = keys.clone();
                     sorted.sort();
                     for (off, bits) in sorted {
@@ -2349,7 +2292,6 @@ fn with_indexed(sig: &str, n: usize) -> String {
     if inner.is_empty() || n == 0 {
         return sig.to_string();
     }
-    // Split on top-level commas (tuple types contain nested commas).
     let mut parts = Vec::new();
     let mut depth = 0;
     let mut start = 0;
@@ -2411,7 +2353,6 @@ fn note_slot(
 /// `owners[n + 1]`) fold onto the lowest one of their cluster.
 fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
     let mut seen: BTreeSet<U256> = BTreeSet::new();
-    // (key, index expressions bounded by `index < N` in the same function)
     let mut keys: Vec<(ExprId, usize)> = Vec::new();
     let mut bounded: Vec<HashSet<ExprId>> = Vec::new();
     for (fi, f) in functions.iter().enumerate() {
@@ -2465,8 +2406,6 @@ fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
         bounded.resize(fi + 1, HashSet::new());
         bounded[fi] = bounds;
     }
-    // Only an index the function bounds (`require(i < 256)`) marks a fixed-size array; a bare
-    // `p + 1` is as often a pointer into a dynamic array's data.
     for (k, fi) in keys {
         if let Node::Op(op::ADD, v) = expr::node(k) {
             for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
@@ -2480,7 +2419,6 @@ fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
             }
         }
     }
-    // Cluster: a constant within 16 of a lower one is an offset into that array.
     let mut bases: BTreeSet<U256> = BTreeSet::new();
     for c in seen {
         match bases.range(..=c).next_back() {
@@ -2526,13 +2464,11 @@ fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>,
             (root, Some("uint256[]".into()))
         }
         Node::Op(op::ADD, v) => {
-            // `keccak256(slot) + i` with the hash precomputed by the compiler.
             for (a, _) in [(v[0], v[1]), (v[1], v[0])] {
                 if let Some((s, _)) = expr::as_const(a).and_then(emit::hashed_slot) {
                     return (Some(s), Some("uint256[]".into()));
                 }
             }
-            // `index + c` into a fixed-size array at a known base.
             for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                 if let Some(c) = expr::as_const(a) {
                     if emit::is_plain_index(b) {
@@ -2562,7 +2498,6 @@ fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
         if !seen.insert(x) || seen.len() > 50_000 {
             continue;
         }
-        // The 4-byte tail of a payload is a bare mask of its last value, not a field read.
         if x == root.expr && root.payload {
             stack.extend(expr::children(x));
             continue;
@@ -2571,7 +2506,6 @@ fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
             if off > 0 || bits < 256 {
                 let entry = fields.entry(k).or_default().entry((off, bits)).or_default();
                 if matches!(expr::node(x), Node::Op(op::SIGNEXTEND, _)) {
-                    // Marker for a signed field (never a written constant otherwise).
                     entry.push(Some(U256::MAX));
                 }
             }
@@ -2639,18 +2573,14 @@ fn collect_sloads(
 fn scan_strings(code: &[u8], code_end: usize, skip: &[(usize, usize)]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let end = code_end.min(code.len());
-    // A string longer than 32 bytes is pushed in 32-byte pieces a few instructions apart: a
-    // full printable PUSH32 is held back and joined with the piece that follows it.
     let mut pending: Option<(String, usize)> = None;
     let insns = crate::disasm::disassemble(&code[..end]);
     for (idx, insn) in insns.iter().enumerate() {
-        // Embedded creation code (and its metadata) is data here, not this contract's strings.
         if skip.iter().any(|(o, l)| insn.pc >= *o && insn.pc < *o + *l) {
             continue;
         }
         let Some(imm) = insn.imm else { continue };
         let mut size = insn.opcode as usize - 0x5f;
-        // `PUSHn x; PUSH1 k; SHL`: the optimizer's form of a left-aligned short piece.
         let mut imm = imm;
         if let (Some(a), Some(b)) = (insns.get(idx + 1), insns.get(idx + 2)) {
             if a.opcode == 0x60 && b.opcode == crate::opcode::SHL {
@@ -2706,8 +2636,6 @@ fn scan_strings(code: &[u8], code_end: usize, skip: &[(usize, usize)]) -> Vec<St
         s.len() >= 6 && letters * 2 >= s.len()
     });
     let mut out: Vec<String> = out.iter().map(|s| s.trim().to_string()).collect();
-    // One entry per string: no duplicates, and no 32-byte piece of a longer string that was
-    // also joined.
     out.sort();
     out.dedup();
     let snap = out.clone();
@@ -2722,7 +2650,6 @@ fn scan_strings(code: &[u8], code_end: usize, skip: &[(usize, usize)]) -> Vec<St
 fn collect_strings(e: ExprId, out: &mut BTreeSet<String>) {
     if let Some(c) = expr::as_const(e) {
         let b = c.to_be_bytes();
-        // Left-aligned ASCII (string constants are stored left-aligned).
         let end = b.iter().position(|x| *x == 0).unwrap_or(32);
         if end >= 4
             && b[..end].iter().all(|x| (0x20..0x7f).contains(x))
@@ -2936,7 +2863,6 @@ pub fn fmt_function_header(f: &Function) -> String {
         FnKind::Receive => s.push_str("    receive() external payable {\n"),
         FnKind::Constructor => s.push_str("    constructor() {\n"),
         FnKind::Internal => {
-            // `refine_types` fills the parameters of every lifted internal unit.
             let params: Vec<String> = (0..f.n_args)
                 .map(|i| {
                     let ty = f.params.get(i).map_or("uint256", |p| p.ty.as_str());

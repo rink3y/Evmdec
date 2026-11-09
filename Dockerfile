@@ -4,7 +4,7 @@ COPY . .
 RUN cargo build --release -p evmdec-cli -p evmdec-server
 
 FROM python:3.12-slim AS sigs
-ARG SIGS=0
+ARG SIGS=1
 WORKDIR /sigs
 COPY corpus/build_sigs.py .
 RUN if [ "$SIGS" = "1" ]; then pip install --no-cache-dir pyarrow numpy \

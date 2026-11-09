@@ -210,8 +210,9 @@ Chains: mainnet, sepolia, arbitrum, optimism, base, polygon, bsc, avalanche, gno
 linea, scroll, blast, zksync, classic. Public endpoints are tried in order; an endpoint that
 returns empty code or zero storage falls through to the next.
 
-Docker: `docker build -t evmdec . && docker run -p 8080:8080 evmdec`. Build with
-`--build-arg SIGS=1` to include the full signature index.
+Docker: `docker build -t evmdec . && docker run -p 8080:8080 evmdec`. The image builds the full
+signature index in its own stage; `--build-arg SIGS=0` skips it and leaves only the built-in
+dictionary.
 
 ### Full signature index
 
@@ -225,7 +226,9 @@ sudo install -D sigs.idx /var/lib/evmdec/sigs.idx
 ```
 
 The index is a sorted table searched in place with positional reads, so nothing is loaded at
-start-up and a lookup costs microseconds. `evmdec sigs` shows which index is in use.
+start-up and a lookup costs microseconds. `evmdec sigs` shows which index is in use, and the
+server prints the same at start-up. Without an index most functions of an unverified contract
+print as `func_<selector>`.
 
 ### Web app and API
 
@@ -240,6 +243,7 @@ POST /api/decompile      {"address": "0x...", "chain": "mainnet"}  or  {"bytecod
                          optional: "no_follow_proxy": true, "lookup": true
 GET  /api/address/{chain}/{address}
 GET  /api/chains
+GET  /api/status         {"signature_index": 10780428}, or 0 when no index is installed
 GET  /healthz
 ```
 

@@ -339,6 +339,13 @@ async fn chains() -> Json<Value> {
         .collect::<Vec<_>>()))
 }
 
+/// What this server can name: the size of the local signature index, or zero when none is
+/// installed and only the built-in dictionary is in use.
+async fn status() -> Json<Value> {
+    let signatures = evmdec::sigdb::global().map_or(0, evmdec::sigdb::SigDb::len);
+    Json(json!({"signature_index": signatures}))
+}
+
 #[tokio::main]
 async fn main() {
     let port: u16 = std::env::var("PORT")
@@ -353,11 +360,19 @@ async fn main() {
         .route("/favicon.ico", get(favicon))
         .route("/robots.txt", get(robots))
         .route("/api/chains", get(chains))
+        .route("/api/status", get(status))
         .route("/api/decompile", post(api_decompile))
         .route("/api/address/{chain}/{address}", get(api_address))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(AppState::default());
     let addr = format!("0.0.0.0:{}", port);
+    match evmdec::sigdb::global() {
+        Some(db) => eprintln!("signature index: {} signatures", db.len()),
+        None => eprintln!(
+            "signature index: none, only the built-in dictionary names functions \
+             (build one with corpus/build_sigs.py or set EVMDEC_SIGS)"
+        ),
+    }
     eprintln!("evmdec-server listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");

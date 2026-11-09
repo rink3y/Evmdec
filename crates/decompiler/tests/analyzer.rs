@@ -926,3 +926,81 @@ fn a_limit_that_does_not_cap_the_payout_is_not_compared() {
         ids(&r)
     );
 }
+
+/// The high 128 bits of `x`, read in place with a high mask and no shift.
+fn high128_in_place(x: &str) -> String {
+    format!("{x} PUSH32 0xffffffffffffffffffffffffffffffff00000000000000000000000000000000 AND")
+}
+
+#[test]
+fn a_field_read_with_a_high_mask_is_a_liability() {
+    // exit() subtracts the slot's high half through a mask, not a shift. Unrecognised, that
+    // read would drop out and the two limits would look the same.
+    let m1 = mread(1);
+    let draw = bounded_payout(&format!("{} {} SUB", low128(&m1), mread(0)), "bad_a");
+    let exit = bounded_payout(
+        &format!(
+            "{} {} ADD {} SUB",
+            high128_in_place(&m1),
+            low128(&m1),
+            mread(0)
+        ),
+        "bad_b",
+    );
+    let code = dispatcher3(&draw, &exit, "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f =
+        finding(&r, "inconsistent-liability-accounting").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(
+        f.function.as_deref(),
+        Some("func_aaaaaaaa [0xaaaaaaaa]"),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn a_liability_added_back_once_and_subtracted_twice_still_counts() {
+    // exit(): deposits - borrowed - matured - matured + matured. Net, matured is subtracted
+    // once; cancelling by set membership would lose it and make the limits look equal.
+    let draw = bounded_payout(&format!("{} {} SUB", mread(1), mread(0)), "bad_a");
+    let exit = bounded_payout(
+        &format!(
+            "{m2} {m2} ADD {m1} ADD {m0} SUB {m2} ADD",
+            m0 = mread(0),
+            m1 = mread(1),
+            m2 = mread(2)
+        ),
+        "bad_b",
+    );
+    let code = dispatcher3(&draw, &exit, "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f =
+        finding(&r, "inconsistent-liability-accounting").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(
+        f.function.as_deref(),
+        Some("func_aaaaaaaa [0xaaaaaaaa]"),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn a_view_reporting_the_full_limit_is_a_reference() {
+    // available() (0xbbbbbbbb) only returns deposits - (borrowed + matured); it moves nothing.
+    // draw() pays against deposits - borrowed.
+    let draw = bounded_payout(&format!("{} {} SUB", mread(1), mread(0)), "bad_a");
+    let view = format!(
+        "{} {} ADD {} SUB PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN",
+        mread(2),
+        mread(1),
+        mread(0)
+    );
+    let code = dispatcher3(&draw, &view, "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f =
+        finding(&r, "inconsistent-liability-accounting").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(
+        f.function.as_deref(),
+        Some("func_aaaaaaaa [0xaaaaaaaa]"),
+        "{f:?}"
+    );
+}

@@ -334,6 +334,10 @@ struct FnFacts {
     signature_authorised: bool,
     /// Payout limits of the shape `deposits - liabilities` that gate value leaving this function.
     avail_bounds: Vec<AvailBound>,
+    /// Every limit of that shape the function states, whether or not it caps a payout: in any
+    /// comparison, or as a returned value (a view reporting what is available). Used only as the
+    /// reference another function's payout limit is held against.
+    ref_bounds: Vec<AvailBound>,
     /// The function lets value leave: an ether call, a token transfer, or a ledger debit.
     moves_value: bool,
 }
@@ -499,6 +503,7 @@ fn collect_facts(
         account_authorised: false,
         signature_authorised: false,
         avail_bounds: Vec::new(),
+        ref_bounds: Vec::new(),
         moves_value: false,
     };
     for cond in guard_conds(events) {
@@ -743,6 +748,22 @@ fn collect_facts(
                 .collect::<Vec<_>>()
         );
     }
+    if std::env::var("EVMDEC_DEBUG_UNPLACED").is_ok() {
+        debug_unplaced(&facts.name, events, layout, names);
+    }
+    facts.ref_bounds = candidates.iter().map(|(b, _)| b.clone()).collect();
+    for ev in events {
+        if let Some(Term::Return {
+            data: Some(words), ..
+        }) = &ev.term
+        {
+            for w in words {
+                if let Some(b) = linear_bound(*w, layout, names) {
+                    facts.ref_bounds.push(b);
+                }
+            }
+        }
+    }
     // A limit counts only when what it is compared with is the amount that leaves.
     facts.avail_bounds = candidates
         .into_iter()
@@ -913,21 +934,26 @@ fn ledger_entry(key: ExprId, layout: emit::MappingLayout) -> Option<(U256, ExprI
 fn pooled_field(e: ExprId, layout: emit::MappingLayout) -> Option<Field> {
     let mut x = e;
     let mut width = 256u32;
+    let mut lo = 0u32;
     if let Node::Op(op::AND, v) = expr::node(x) {
+        // A contiguous mask: `0x..ff` keeps the low bits, `0xff..00` a field higher up that is
+        // read in place without a shift.
         let masked = [(v[0], v[1]), (v[1], v[0])].into_iter().find_map(|(m, o)| {
-            expr::as_const(m)
-                .filter(|c| c.is_low_mask())
-                .map(|c| (c.bits(), o))
+            let c = expr::as_const(m)?;
+            let tz = c.trailing_zeros();
+            (tz < 256 && (c >> tz).is_low_mask()).then(|| (tz, c.count_ones(), o))
         });
-        let (w, o) = masked?;
+        let (t, w, o) = masked?;
+        lo = t;
         width = w;
         x = o;
     }
-    let mut lo = 0u32;
-    if let Node::Op(op::SHR, v) = expr::node(x) {
-        let s = expr::as_const(v[0]).filter(|s| s.fits_u64() && s.low_u64() < 256)?;
-        lo = s.low_u64() as u32;
-        x = v[1];
+    if lo == 0 {
+        if let Node::Op(op::SHR, v) = expr::node(x) {
+            let s = expr::as_const(v[0]).filter(|s| s.fits_u64() && s.low_u64() < 256)?;
+            lo = s.low_u64() as u32;
+            x = v[1];
+        }
     }
     let Node::SLoad(k, false, _) = expr::node(x) else {
         return None;
@@ -947,15 +973,17 @@ fn pooled_field(e: ExprId, layout: emit::MappingLayout) -> Option<Field> {
     })
 }
 
-/// Split the linear combination `e` into the pooled fields it adds and the ones it subtracts.
-/// Only sums, differences and width casts are followed: a field inside a product, a quotient or
-/// a comparison is a factor, not a balance term, and is left out.
+/// Accumulate the linear combination `e` into signed coefficients per pooled field, so
+/// `a + a - a` keeps one `a` and `a - a` cancels. Only sums, differences and width casts are
+/// followed: a field inside a product, a quotient or a comparison is a factor, not a balance
+/// term, and is left out.
 fn linear_fields(
     e: ExprId,
-    neg: bool,
+    sign: i32,
     layout: emit::MappingLayout,
     names: &Names,
-    bound: &mut AvailBound,
+    coef: &mut BTreeMap<Field, i32>,
+    labels: &mut HashMap<Field, String>,
     budget: &mut u32,
 ) {
     if *budget == 0 {
@@ -963,37 +991,133 @@ fn linear_fields(
     }
     *budget -= 1;
     if let Some(f) = pooled_field(e, layout) {
-        bound
-            .names
+        labels
             .entry(f.clone())
             .or_insert_with(|| emit::fmt_expr(e, names));
-        if neg {
-            bound.subbed.insert(f);
-        } else {
-            bound.added.insert(f);
-        }
+        *coef.entry(f).or_insert(0) += sign;
         return;
     }
     match expr::node(e) {
         Node::Op(op::ADD, v) => {
             for x in v {
-                linear_fields(x, neg, layout, names, bound, budget);
+                linear_fields(x, sign, layout, names, coef, labels, budget);
             }
         }
         Node::Op(op::SUB, v) if v.len() == 2 => {
-            linear_fields(v[0], neg, layout, names, bound, budget);
-            linear_fields(v[1], !neg, layout, names, bound, budget);
+            linear_fields(v[0], sign, layout, names, coef, labels, budget);
+            linear_fields(v[1], -sign, layout, names, coef, labels, budget);
         }
         Node::Op(op::AND, v) if v.len() == 2 => {
             for (m, o) in [(v[0], v[1]), (v[1], v[0])] {
                 if expr::as_const(m).is_some_and(|c| c.is_low_mask()) {
-                    linear_fields(o, neg, layout, names, bound, budget);
+                    linear_fields(o, sign, layout, names, coef, labels, budget);
                     break;
                 }
             }
         }
         _ => {}
     }
+}
+
+/// Debug aid: the additive leaves of `e` that are memory reads or internal-call results, which
+/// `linear_fields` cannot place, with the sign they carry.
+fn unplaced_terms(e: ExprId, sign: i32, names: &Names, out: &mut Vec<String>, budget: &mut u32) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
+    match expr::node(e) {
+        Node::Op(op::ADD, v) => {
+            for x in v {
+                unplaced_terms(x, sign, names, out, budget);
+            }
+        }
+        Node::Op(op::SUB, v) if v.len() == 2 => {
+            unplaced_terms(v[0], sign, names, out, budget);
+            unplaced_terms(v[1], -sign, names, out, budget);
+        }
+        Node::Op(op::AND, v) if v.len() == 2 => {
+            for x in v {
+                if !expr::is_const(x) {
+                    unplaced_terms(x, sign, names, out, budget);
+                }
+            }
+        }
+        Node::MLoad(..) | Node::IntRet(..) | Node::Var(_) => {
+            out.push(format!(
+                "{}{}",
+                if sign > 0 { "+" } else { "-" },
+                emit::fmt_expr(e, names)
+            ));
+        }
+        _ => {}
+    }
+}
+
+/// Debug aid (`EVMDEC_DEBUG_UNPLACED`): every difference in the function that subtracts pooled
+/// fields but also holds memory reads or internal-call results the accounting rule cannot place.
+fn debug_unplaced(name: &str, events: &[Event], layout: emit::MappingLayout, names: &Names) {
+    let mut seen = HashSet::new();
+    for ev in events {
+        for e in ev
+            .stmt
+            .iter()
+            .flat_map(lift::stmt_exprs)
+            .chain(ev.term.iter().flat_map(lift::term_exprs))
+        {
+            let mut stack = vec![e];
+            while let Some(x) = stack.pop() {
+                if !seen.insert(x) || seen.len() > 50_000 {
+                    continue;
+                }
+                if let Node::Op(op::SUB, _) = expr::node(x) {
+                    let mut coef = BTreeMap::new();
+                    let mut labels = HashMap::new();
+                    let mut budget = 256;
+                    linear_fields(x, 1, layout, names, &mut coef, &mut labels, &mut budget);
+                    let mut un = Vec::new();
+                    let mut b2 = 256;
+                    unplaced_terms(x, 1, names, &mut un, &mut b2);
+                    if coef.values().any(|c| *c < 0) && !un.is_empty() {
+                        let fields: Vec<String> = coef
+                            .iter()
+                            .filter(|(_, c)| **c != 0)
+                            .map(|(f, c)| {
+                                format!("{}{}", if *c > 0 { "+" } else { "-" }, labels[f])
+                            })
+                            .collect();
+                        eprintln!("[unplaced] {} fields={:?} unplaced={:?}", name, fields, un);
+                    }
+                }
+                stack.extend(expr::children(x));
+            }
+        }
+    }
+}
+
+/// `e` as a limit, `credits - liabilities`: at least one pooled field with a positive net
+/// coefficient and at least one with a negative one.
+fn linear_bound(e: ExprId, layout: emit::MappingLayout, names: &Names) -> Option<AvailBound> {
+    let mut coef = BTreeMap::new();
+    let mut labels = HashMap::new();
+    let mut budget = 256;
+    linear_fields(e, 1, layout, names, &mut coef, &mut labels, &mut budget);
+    let added: BTreeSet<Field> = coef
+        .iter()
+        .filter(|(_, c)| **c > 0)
+        .map(|(f, _)| f.clone())
+        .collect();
+    let subbed: BTreeSet<Field> = coef
+        .iter()
+        .filter(|(_, c)| **c < 0)
+        .map(|(f, _)| f.clone())
+        .collect();
+    (!added.is_empty() && !subbed.is_empty()).then(|| AvailBound {
+        added,
+        subbed,
+        names: labels,
+        line: emit::fmt_expr(e, names),
+    })
 }
 
 /// Does a limit compared with `other` cap one of `outflows`? It does when `other` is the amount
@@ -1044,25 +1168,12 @@ fn limits_in(
                 if expr::is_const(other) {
                     continue;
                 }
-                let mut b = AvailBound {
-                    added: BTreeSet::new(),
-                    subbed: BTreeSet::new(),
-                    names: HashMap::new(),
-                    line: emit::fmt_expr(side, names),
+                let Some(b) = linear_bound(side, layout, names) else {
+                    continue;
                 };
-                let mut budget = 256;
-                linear_fields(side, false, layout, names, &mut b, &mut budget);
-                // `a + b - a` is `b`: a field on both sides cancels.
-                let both: Vec<Field> = b.added.intersection(&b.subbed).cloned().collect();
-                for f in &both {
-                    b.added.remove(f);
-                    b.subbed.remove(f);
-                }
-                if !b.added.is_empty()
-                    && !b.subbed.is_empty()
-                    && !out
-                        .iter()
-                        .any(|(o, w)| *w == other && o.added == b.added && o.subbed == b.subbed)
+                if !out
+                    .iter()
+                    .any(|(o, w)| *w == other && o.added == b.added && o.subbed == b.subbed)
                 {
                     out.push((b, other));
                 }
@@ -5233,10 +5344,10 @@ fn accounting_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 continue;
             }
             let stronger = facts.iter().enumerate().find_map(|(j, g)| {
-                if i == j || !g.moves_value {
+                if i == j {
                     return None;
                 }
-                g.avail_bounds.iter().find_map(|gb| {
+                g.ref_bounds.iter().find_map(|gb| {
                     (fb.subbed.is_subset(&gb.subbed)
                         && fb.subbed != gb.subbed
                         && !fb.added.is_disjoint(&gb.added))

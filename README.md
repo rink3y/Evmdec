@@ -100,7 +100,7 @@ substituted. No rule names a contract, a protocol, a token or an address.
 | value | reverse-quoted amounts, payouts without a slippage bound, spot balances as a price, fee-on-transfer assumptions, division before multiplication, `msg.value` reused in loops and multicalls, unbounded payout parameters, wrapping arithmetic on pre-0.8 compilers and inside `unchecked` blocks |
 | authority | owner and initializer writes without access control, silent authorisation failures, `tx.origin`, `selfdestruct` by reachability, unprotected upgrades, ether withdrawable by anyone, access control by intent (`inconsistent-access-control`), attack chains (a write anyone can make paired with the function that trusts it) |
 | trust | a gate that trusts a contract the token itself calls on a public path (`trusted-callee-loop`), a balance lowered on an account the caller neither owns nor has an allowance for (`third-party-balance-debit`, critical when the account is a market counterparty recognised by behaviour: singled out by transfer guards, returned by a factory, read as a ledger, or called with a pool interface), a pair `sync()` reachable after balances changed (`pair-sync-after-state-change`) |
-| accounting | two functions that each cap the amount they pay out by `credits - liabilities` over the same pooled storage, where one subtracts a proper subset of the liability fields the other subtracts (`inconsistent-liability-accounting`): the path subtracting fewer can release more than the shared balance backs. A field is a slot path plus a bit range, so packed halves stay apart, and a limit counts only when it is compared with the amount that leaves |
+| accounting | two functions that each cap the amount they pay out by `credits - liabilities` over the same pooled storage, where one subtracts a proper subset of the liability fields the other subtracts (`inconsistent-liability-accounting`): the path subtracting fewer can release more than the shared balance backs. A field is a slot path plus a bit range, so packed halves stay apart; terms carry signed coefficients; the flagged limit must be compared with the amount that leaves, and the reference may be any limit the contract states, a view's returned value included |
 | types | wide values cut to `uintN` without a check, signed and unsigned comparison of one value, addresses built by arithmetic, hashes used as numbers, narrow counters |
 | signatures and randomness | `ecrecover` zero address and malleability, signatures without a domain or a nonce, block attributes as randomness, Chainlink answers without staleness or positivity checks |
 | compiler | known solc and Vyper bugs for the detected version, with triggers the bytecode cannot show marked informational; the Vyper 0.2.15 to 0.3.0 lock bug |
@@ -289,9 +289,12 @@ root turns on `#![warn(missing_docs)]`, and clippy is kept at zero warnings.
   stays unconfirmed, not refuted.
 - `pair-sync-after-state-change` looks for the Uniswap V2 `sync()` call; V3 and later pools
   have no equivalent, and the third-party debit rule covers them.
-- `inconsistent-liability-accounting` reads limits built from storage reads. A limit computed
-  from a copy of the record in memory, or from values a helper returns, is not seen, which is why
-  the Fence pool is listed as missed. Two limits that differ on purpose, because they cap
+- `inconsistent-liability-accounting` compares limits built from storage reads. Memory is
+  resolved where the analyzer can replay it safely; a copy of the record that a helper updates
+  and returns is not mapped back to storage, because its values no longer equal the stored
+  fields. In the Fence pool those copies measure how far a time-based update moved each field,
+  and the defect is that reclassification over time, which a comparison of limits does not
+  model; the pool is listed as missed. Two limits that differ on purpose, because they cap
   different things, can read as an omission.
 - Findings are heuristic and should be read as leads with a confidence level.
 

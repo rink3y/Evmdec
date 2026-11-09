@@ -820,11 +820,27 @@ fn mread(slot: u8) -> String {
 
 /// A payout limited by `avail >= calldata[0x24]`, then `calldata[0x24]` wei sent to the caller.
 fn bounded_payout(avail: &str, bad: &str) -> String {
+    limited_payout(avail, "0x24", bad)
+}
+
+/// `avail >= calldata[cmp]`, then `calldata[0x24]` wei sent to the caller: the limit caps the
+/// payout only when `cmp` is `0x24`.
+fn limited_payout(avail: &str, cmp: &str, bad: &str) -> String {
     format!(
-        "{avail} PUSH1 0x24 CALLDATALOAD GT PUSH2 @{bad} JUMPI \
+        "{avail} PUSH1 {cmp} CALLDATALOAD GT PUSH2 @{bad} JUMPI \
          PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 PUSH1 0x24 CALLDATALOAD CALLER GAS CALL POP STOP \
          :{bad} JUMPDEST PUSH1 0x00 DUP1 REVERT"
     )
+}
+
+/// The low 128 bits of `x`.
+fn low128(x: &str) -> String {
+    format!("{x} PUSH16 0xffffffffffffffffffffffffffffffff AND")
+}
+
+/// The high 128 bits of `x`.
+fn high128(x: &str) -> String {
+    format!("{x} PUSH1 0x80 SHR")
 }
 
 #[test]
@@ -864,6 +880,45 @@ fn payout_omitting_a_liability_another_path_subtracts_is_flagged() {
 
     // A single payout path has nothing to disagree with.
     let code = dispatcher3(&draw, "STOP", "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    assert!(
+        finding(&r, "inconsistent-liability-accounting").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+}
+
+#[test]
+fn packed_halves_are_separate_liabilities() {
+    // One slot holds two liabilities in its halves. draw() subtracts the low half only;
+    // exit() subtracts both. Reading the slot as one field would make the two limits equal.
+    let m1 = mread(1);
+    let draw = bounded_payout(&format!("{} {} SUB", low128(&m1), mread(0)), "bad_a");
+    let exit = bounded_payout(
+        &format!("{} {} ADD {} SUB", high128(&m1), low128(&m1), mread(0)),
+        "bad_b",
+    );
+    let code = dispatcher3(&draw, &exit, "STOP");
+    let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+    let f =
+        finding(&r, "inconsistent-liability-accounting").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(
+        f.function.as_deref(),
+        Some("func_aaaaaaaa [0xaaaaaaaa]"),
+        "{f:?}"
+    );
+}
+
+#[test]
+fn a_limit_that_does_not_cap_the_payout_is_not_compared() {
+    // draw() compares its smaller limit with calldata[0x44] but pays calldata[0x24]: the
+    // limit does not bound what leaves, so there is nothing to hold against exit().
+    let draw = limited_payout(&format!("{} {} SUB", mread(1), mread(0)), "0x44", "bad_a");
+    let exit = bounded_payout(
+        &format!("{} {} ADD {} SUB", mread(2), mread(1), mread(0)),
+        "bad_b",
+    );
+    let code = dispatcher3(&draw, &exit, "STOP");
     let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
     assert!(
         finding(&r, "inconsistent-liability-accounting").is_none(),

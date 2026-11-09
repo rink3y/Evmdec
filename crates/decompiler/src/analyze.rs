@@ -366,19 +366,30 @@ struct Debit {
     line: String,
 }
 
-/// A payout limit of the form `deposits - liabilities`: the storage fields a function adds up
-/// as credit and the fields it subtracts as owed, before it lets value leave. Two functions that
-/// limit transfers over the same storage must subtract the same owed fields; one that subtracts a
-/// proper subset lets more leave than the balance supports.
+/// One field of pooled storage: the slot shape of a mapping entry or array element and the bit
+/// range a read extracts from it, so the two halves of a packed slot are different fields.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct Field {
+    /// Slot shape (root and step kinds), independent of the concrete key.
+    shape: ssa::Shape,
+    /// Lowest bit of the field within the slot.
+    lo: u32,
+    /// Width in bits.
+    width: u32,
+}
+
+/// A payout limit of the form `credits - liabilities`: one side of an ordering comparison that
+/// adds some pooled fields and subtracts others. Two functions that limit value over the same
+/// pooled record must subtract the same liability fields.
 #[derive(Clone, Debug)]
 struct AvailBound {
-    /// Storage fields summed as available credit.
-    added: BTreeSet<ssa::Shape>,
-    /// Storage fields subtracted as owed.
-    subbed: BTreeSet<ssa::Shape>,
+    /// Fields summed as available credit.
+    added: BTreeSet<Field>,
+    /// Fields subtracted as owed.
+    subbed: BTreeSet<Field>,
     /// A readable name for each field, for the finding's evidence.
-    names: HashMap<ssa::Shape, String>,
-    /// The printed guard the limit came from.
+    names: HashMap<Field, String>,
+    /// The printed limit expression.
     line: String,
 }
 
@@ -674,21 +685,85 @@ fn collect_facts(
     }
     facts.moves_value = !facts.ether_out.is_empty()
         || !facts.debits.is_empty()
-        || call_selector
-            .values()
-            .any(|s| *s == SEL_TRANSFER || *s == SEL_TRANSFER_FROM);
-    for cond in guard_conds(events) {
-        let mut added = BTreeSet::new();
-        let mut subbed = BTreeSet::new();
-        let mut name_map = HashMap::new();
-        signed_storage_terms(cond, layout, names, &mut added, &mut subbed, &mut name_map);
-        if !added.is_empty() && !subbed.is_empty() {
-            facts.avail_bounds.push(AvailBound {
-                added,
-                subbed,
-                names: name_map,
-                line: emit::fmt_cond(cond, names),
-            });
+        || call_selector.values().any(|s| *s == SEL_TRANSFER);
+    // Amounts that leave: ether call values, `transfer` amounts, ledger debits.
+    let mut outflows: Vec<ExprId> = facts.ether_out.iter().map(|(_, v, _)| *v).collect();
+    let mut candidates: Vec<(AvailBound, ExprId)> = Vec::new();
+    let mut seen = HashSet::new();
+    for ev in events {
+        match &ev.stmt {
+            Some(Stmt::Call {
+                input,
+                input_head,
+                in_len,
+                ..
+            }) => {
+                let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
+                let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
+                let selector = words
+                    .first()
+                    .and_then(|w0| emit::leading_selector(*w0, len));
+                if selector == Some(SEL_TRANSFER) && words.len() >= 2 {
+                    outflows.push(emit::shifted_word_len(words, 1, len));
+                }
+            }
+            Some(Stmt::SStore {
+                key,
+                val,
+                transient: false,
+                ..
+            }) => {
+                if let Some(amount) = subtracts_from(*val, *key) {
+                    outflows.push(amount);
+                }
+            }
+            _ => {}
+        }
+        for e in ev
+            .stmt
+            .iter()
+            .flat_map(lift::stmt_exprs)
+            .chain(ev.term.iter().flat_map(lift::term_exprs))
+        {
+            limits_in(e, layout, names, &mut seen, &mut candidates);
+        }
+    }
+    if std::env::var("EVMDEC_DEBUG_LIMITS").is_ok() && !candidates.is_empty() {
+        eprintln!(
+            "[outflow] {} moves={} outflows={:?} others={:?}",
+            facts.name,
+            facts.moves_value,
+            outflows
+                .iter()
+                .map(|a| emit::fmt_expr(*a, names))
+                .collect::<Vec<_>>(),
+            candidates
+                .iter()
+                .map(|(_, o)| emit::fmt_expr(*o, names))
+                .collect::<Vec<_>>()
+        );
+    }
+    // A limit counts only when what it is compared with is the amount that leaves.
+    facts.avail_bounds = candidates
+        .into_iter()
+        .filter(|(_, other)| limits_outflow(*other, &outflows))
+        .map(|(b, _)| b)
+        .collect();
+    if std::env::var("EVMDEC_DEBUG_LIMITS").is_ok() {
+        for b in &facts.avail_bounds {
+            let show = |set: &BTreeSet<Field>| {
+                set.iter()
+                    .map(|f| b.names.get(f).cloned().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            };
+            eprintln!(
+                "[limit] {} moves={} : ({}) - ({})",
+                facts.name,
+                facts.moves_value,
+                show(&b.added),
+                show(&b.subbed)
+            );
         }
     }
     if std::env::var("EVMDEC_DEBUG_FACTS").is_ok() {
@@ -832,56 +907,168 @@ fn ledger_entry(key: ExprId, layout: emit::MappingLayout) -> Option<(U256, ExprI
     }
 }
 
-/// Walk `e` and record the storage fields it adds and the ones it subtracts, as canonical
-/// shapes. Only `SUB` flips a term's sign; masks, shifts and comparisons are transparent, so a
-/// packed field read through a mask keeps the sign of the term it sits in. Reads whose key does
-/// not decompose to a slot path are ignored. The names map gets a readable label per field.
-fn signed_storage_terms(
+/// The pooled field `e` reads: `SLOAD(k)`, optionally shifted right by a constant and masked
+/// with a low mask, where `k` is a mapping entry or array element. A global scalar slot is not
+/// pooled state and gives `None`.
+fn pooled_field(e: ExprId, layout: emit::MappingLayout) -> Option<Field> {
+    let mut x = e;
+    let mut width = 256u32;
+    if let Node::Op(op::AND, v) = expr::node(x) {
+        let masked = [(v[0], v[1]), (v[1], v[0])].into_iter().find_map(|(m, o)| {
+            expr::as_const(m)
+                .filter(|c| c.is_low_mask())
+                .map(|c| (c.bits(), o))
+        });
+        let (w, o) = masked?;
+        width = w;
+        x = o;
+    }
+    let mut lo = 0u32;
+    if let Node::Op(op::SHR, v) = expr::node(x) {
+        let s = expr::as_const(v[0]).filter(|s| s.fits_u64() && s.low_u64() < 256)?;
+        lo = s.low_u64() as u32;
+        x = v[1];
+    }
+    let Node::SLoad(k, false, _) = expr::node(x) else {
+        return None;
+    };
+    let p = ssa::slot_path(k, layout)?;
+    if !p
+        .steps
+        .iter()
+        .any(|st| matches!(st, ssa::Step::Key(_) | ssa::Step::Index(_)))
+    {
+        return None;
+    }
+    Some(Field {
+        shape: p.shape(SlotSpace::Persistent),
+        lo,
+        width: width.min(256 - lo),
+    })
+}
+
+/// Split the linear combination `e` into the pooled fields it adds and the ones it subtracts.
+/// Only sums, differences and width casts are followed: a field inside a product, a quotient or
+/// a comparison is a factor, not a balance term, and is left out.
+fn linear_fields(
+    e: ExprId,
+    neg: bool,
+    layout: emit::MappingLayout,
+    names: &Names,
+    bound: &mut AvailBound,
+    budget: &mut u32,
+) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
+    if let Some(f) = pooled_field(e, layout) {
+        bound
+            .names
+            .entry(f.clone())
+            .or_insert_with(|| emit::fmt_expr(e, names));
+        if neg {
+            bound.subbed.insert(f);
+        } else {
+            bound.added.insert(f);
+        }
+        return;
+    }
+    match expr::node(e) {
+        Node::Op(op::ADD, v) => {
+            for x in v {
+                linear_fields(x, neg, layout, names, bound, budget);
+            }
+        }
+        Node::Op(op::SUB, v) if v.len() == 2 => {
+            linear_fields(v[0], neg, layout, names, bound, budget);
+            linear_fields(v[1], !neg, layout, names, bound, budget);
+        }
+        Node::Op(op::AND, v) if v.len() == 2 => {
+            for (m, o) in [(v[0], v[1]), (v[1], v[0])] {
+                if expr::as_const(m).is_some_and(|c| c.is_low_mask()) {
+                    linear_fields(o, neg, layout, names, bound, budget);
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Does a limit compared with `other` cap one of `outflows`? It does when `other` is the amount
+/// that leaves, sits inside it, contains it, or reads the same calldata word.
+fn limits_outflow(other: ExprId, outflows: &[ExprId]) -> bool {
+    let calldata = |e: ExprId| {
+        let mut words = HashSet::new();
+        let mut stack = vec![e];
+        let mut seen = HashSet::new();
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) || seen.len() > 5_000 {
+                continue;
+            }
+            if let Node::CallDataLoad(off) = expr::node(x) {
+                words.insert(off);
+            }
+            stack.extend(expr::children(x));
+        }
+        words
+    };
+    let mine = calldata(other);
+    outflows.iter().any(|a| {
+        *a == other
+            || contains_expr(*a, other)
+            || contains_expr(other, *a)
+            || !mine.is_disjoint(&calldata(*a))
+    })
+}
+
+/// Every payout limit in `e`: each side of an ordering comparison (`<`, `>`, signed or not)
+/// that adds at least one pooled field and subtracts at least one. Each side is read on its
+/// own, so the amount being limited never mixes into the limit's fields.
+fn limits_in(
     e: ExprId,
     layout: emit::MappingLayout,
     names: &Names,
-    added: &mut BTreeSet<ssa::Shape>,
-    subbed: &mut BTreeSet<ssa::Shape>,
-    name_map: &mut HashMap<ssa::Shape, String>,
+    seen: &mut HashSet<ExprId>,
+    out: &mut Vec<(AvailBound, ExprId)>,
 ) {
-    let mut seen: HashSet<(ExprId, bool)> = HashSet::new();
-    let mut stack = vec![(e, false)];
-    while let Some((x, neg)) = stack.pop() {
-        if !seen.insert((x, neg)) || seen.len() > 50_000 {
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 50_000 {
             continue;
         }
-        match expr::node(x) {
-            Node::SLoad(k, false, _) => {
-                if let Some(p) = ssa::slot_path(k, layout) {
-                    // Only pooled state (a mapping entry or array element) is a shared balance;
-                    // a global scalar slot (an interpolation parameter, a config value) is not.
-                    let pooled = p
-                        .steps
-                        .iter()
-                        .any(|st| matches!(st, ssa::Step::Key(_) | ssa::Step::Index(_)));
-                    if pooled {
-                        let sh = p.shape(SlotSpace::Persistent);
-                        if neg {
-                            subbed.insert(sh.clone());
-                        } else {
-                            added.insert(sh.clone());
-                        }
-                        name_map
-                            .entry(sh)
-                            .or_insert_with(|| emit::fmt_expr(x, names));
-                    }
+        if let Node::Op(op::LT | op::GT | op::SLT | op::SGT, v) = expr::node(x) {
+            for (side, other) in [(v[0], v[1]), (v[1], v[0])] {
+                // Against a constant it is a range or overflow check, not a payout limit.
+                if expr::is_const(other) {
+                    continue;
                 }
-            }
-            Node::Op(op::SUB, v) if v.len() == 2 => {
-                stack.push((v[0], neg));
-                stack.push((v[1], !neg));
-            }
-            _ => {
-                for c in expr::children(x) {
-                    stack.push((c, neg));
+                let mut b = AvailBound {
+                    added: BTreeSet::new(),
+                    subbed: BTreeSet::new(),
+                    names: HashMap::new(),
+                    line: emit::fmt_expr(side, names),
+                };
+                let mut budget = 256;
+                linear_fields(side, false, layout, names, &mut b, &mut budget);
+                // `a + b - a` is `b`: a field on both sides cancels.
+                let both: Vec<Field> = b.added.intersection(&b.subbed).cloned().collect();
+                for f in &both {
+                    b.added.remove(f);
+                    b.subbed.remove(f);
+                }
+                if !b.added.is_empty()
+                    && !b.subbed.is_empty()
+                    && !out
+                        .iter()
+                        .any(|(o, w)| *w == other && o.added == b.added && o.subbed == b.subbed)
+                {
+                    out.push((b, other));
                 }
             }
         }
+        stack.extend(expr::children(x));
     }
 }
 

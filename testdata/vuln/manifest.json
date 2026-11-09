@@ -257,6 +257,16 @@
     "reverse-quote-rounding"
    ],
    "min_severity": "medium"
+  },
+  "fence_usdc_pool": {
+   "address": "0xe25cb545bdd47a8ec2d08001cb5661b00d47621a",
+   "chain": "avalanche",
+   "year": 2026,
+   "bug": "Tranche pool: the borrower draw limit subtracts outstanding principal but not principal that matured unpaid, while the lender withdrawal limit subtracts both; the withdrawal limit is computed from an in-memory copy of the record updated to the current time, which storage-level rules do not read",
+   "expected": [
+    "inconsistent-liability-accounting"
+   ],
+   "min_severity": "high"
   }
  }
 }

@@ -195,6 +195,8 @@ struct Flags {
     /// Used as an arithmetic operand: not a `bool`, and a 160-bit value that is a number rather
     /// than an account.
     arith: bool,
+    /// Multiplied, divided or taken modulo: a number, which no account ever is.
+    scaled: bool,
     /// Used as an account: call target, compared with `msg.sender`, balance queried.
     account: bool,
     /// `x != 0` was tested on it.
@@ -232,6 +234,7 @@ impl Flags {
     /// Merge the use evidence of a class into one of its sources.
     fn absorb(&mut self, other: Flags) {
         self.arith |= other.arith;
+        self.scaled |= other.scaled;
         self.account |= other.account;
         self.tested |= other.tested;
         self.cast |= other.cast;
@@ -394,6 +397,10 @@ pub fn solve(
     }
     env.propagate();
     env.run();
+    if env.keys_are_words() {
+        env.propagate();
+        env.run();
+    }
     if env.debug {
         env.debug_dump();
     }
@@ -407,8 +414,13 @@ impl TypeEnv {
             return *i;
         }
         let i = self.classes.len();
+        let hints = match &loc {
+            Loc::Field { bits: 160, .. } => Ty::Address,
+            _ => Ty::Unknown,
+        };
         self.classes.push(Class {
             storage: loc.is_storage(),
+            hints,
             ..Class::default()
         });
         self.ids.insert(loc, i);
@@ -444,7 +456,14 @@ impl TypeEnv {
                 eprintln!("[types] arith on {:?} by {}", l, op::name(by));
             }
         }
-        self.flag(loc, |f| f.arith = true);
+        let scaled = matches!(
+            by,
+            op::MUL | op::DIV | op::SDIV | op::MOD | op::SMOD | op::EXP | op::MULMOD
+        );
+        self.flag(loc, |f| {
+            f.arith = true;
+            f.scaled |= scaled;
+        });
     }
 
     /// Record that `val` (read in `scope`) flows into `loc`.
@@ -521,7 +540,7 @@ impl TypeEnv {
         match expr::node(e) {
             Node::Var(id) => Some(Loc::Var { scope, id }),
             Node::Arg(slot) => Some(Loc::Arg { unit: scope, slot }),
-            Node::CallDataLoad(off) => {
+            Node::CallDataLoad(off) | Node::CopiedWord(op::CALLDATACOPY, off, _) => {
                 calldata_word_index(off).map(|word| Loc::Param { scope, word })
             }
             Node::SLoad(key, transient, _) => {
@@ -602,6 +621,7 @@ impl TypeEnv {
             for s in &nd.stmts {
                 self.index_stmt(s, pc);
             }
+            self.index_layouts(&nd.stmts, pc);
             if let Term::SelfDestruct(a) = &nd.term {
                 self.account(*a, pc);
             }
@@ -642,17 +662,20 @@ impl TypeEnv {
                 let space = ssa::space_of(*transient);
                 let shape = path.shape(space);
                 self.note_keys(&path, space, pc);
-                match ssa::field_write(*key, *val).filter(|_| !self.vyper) {
-                    Some(w) => self.def(
-                        Loc::Field {
-                            shape,
-                            bit_offset: w.bit_offset,
-                            bits: w.bits,
-                        },
-                        w.value,
-                        pc,
-                    ),
-                    None => self.def(Loc::Slot(shape), *val, pc),
+                let fields = match self.vyper {
+                    true => Vec::new(),
+                    false => ssa::field_writes(*key, *val),
+                };
+                if fields.is_empty() {
+                    self.def(Loc::Slot(shape.clone()), *val, pc);
+                }
+                for w in fields {
+                    let field = Loc::Field {
+                        shape: shape.clone(),
+                        bit_offset: w.bit_offset,
+                        bits: w.bits,
+                    };
+                    self.def(field, w.value, pc);
                 }
             }
             Stmt::Call {
@@ -681,6 +704,55 @@ impl TypeEnv {
                 ..
             } => self.account(*a, pc),
             _ => {}
+        }
+    }
+
+    /// Two byte layouts built in memory say what their words are. A 65-byte string of two
+    /// words and one byte is a signature: its words are `r` and `s`. The two words after the
+    /// two-byte prefix `0x1901` are the domain separator and the struct hash of a typed-data
+    /// digest. All four are opaque 32-byte words.
+    fn index_layouts(&mut self, stmts: &[Stmt], scope: usize) {
+        let words: Vec<(Option<ExprId>, U256, ExprId)> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::MStore {
+                    off,
+                    val,
+                    width: 32,
+                } => {
+                    let (base, at) = expr::split_offset(*off);
+                    Some((base, at, *val))
+                }
+                _ => None,
+            })
+            .collect();
+        let at = |base: Option<ExprId>, addr: U256| {
+            words
+                .iter()
+                .find(|(b, a, _)| *b == base && *a == addr)
+                .map(|(_, _, v)| *v)
+        };
+        let step = |a: U256, by: u64| a.wrapping_add(U256::from_u64(by));
+        let top_byte = |e: ExprId| match expr::node(e) {
+            Node::Op(op::SHL, v) => expr::as_const(v[0]) == Some(U256::from_u64(248)),
+            Node::Const(c) => !c.is_zero() && c.trailing_zeros() >= 248,
+            _ => false,
+        };
+        let prefix = U256::from_u64(0x1901) << 240;
+        for (base, addr, val) in &words {
+            let found = match expr::as_const(*val) {
+                Some(c) if c == U256::from_u64(65) => {
+                    let v = at(*base, step(*addr, 96));
+                    v.filter(|v| top_byte(*v))
+                        .and(at(*base, step(*addr, 32)).zip(at(*base, step(*addr, 64))))
+                }
+                Some(c) if c == prefix => at(*base, step(*addr, 2)).zip(at(*base, step(*addr, 34))),
+                _ => None,
+            };
+            if let Some((first, second)) = found {
+                self.word32(first, scope);
+                self.word32(second, scope);
+            }
         }
     }
 
@@ -924,6 +996,26 @@ impl TypeEnv {
         }
     }
 
+    /// A mapping has one key type. Where some key of a mapping is a hash, every value used as
+    /// a key of that mapping is an opaque 32-byte word. Returns whether any class learned so.
+    fn keys_are_words(&mut self) -> bool {
+        let keys: Vec<usize> = self
+            .ids
+            .iter()
+            .filter(|(loc, _)| matches!(loc, Loc::Key(_)))
+            .map(|(_, i)| *i)
+            .collect();
+        let mut learned = false;
+        for i in keys {
+            let c = &mut self.classes[i];
+            if c.resolved == Ty::Bytes(32) && !c.flags.word32 {
+                c.flags.word32 = true;
+                learned = true;
+            }
+        }
+        learned
+    }
+
     /// Iterate the def types to a fixpoint and resolve every class.
     fn run(&mut self) {
         for _round in 0..MAX_ROUNDS {
@@ -1021,7 +1113,10 @@ impl TypeEnv {
             let own = self.resolved_of(&loc);
             return match loc {
                 Loc::Field { bits, .. } if matches!(expr::node(e), Node::Op(op::AND, _)) => {
-                    own.join(Ty::of_mask(bits))
+                    match own {
+                        Ty::Uint(160) => own,
+                        _ => own.join(Ty::of_mask(bits)),
+                    }
                 }
                 _ => own,
             };
@@ -1271,6 +1366,7 @@ fn resolve(c: &Class, evidence: Evidence) -> Ty {
     }
     match t {
         Ty::Uint(n) if n <= 8 && f.one && !f.other && !f.arith => Ty::Bool,
+        Ty::Address if f.scaled && f.account => Ty::Unknown,
         Ty::Address if f.arith && !f.account => Ty::Uint(160),
         Ty::Bool if f.arith => Ty::Unknown,
         t => t,

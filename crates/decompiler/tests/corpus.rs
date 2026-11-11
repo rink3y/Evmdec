@@ -856,7 +856,7 @@ fn struct_elements_are_declared_and_read_by_member() {
     let types: Vec<&str> = role.members.iter().map(|m| m.ty.as_str()).collect();
     assert_eq!(
         types,
-        ["address[]", "mapping(address => uint256)", "uint256"]
+        ["address[]", "mapping(address => uint256)", "bytes32"]
     );
     assert!(
         role.members[0].name != "roleMemberCount",
@@ -886,4 +886,51 @@ fn vyper_fixed_addresses_read_as_locals() {
         "an aligned fixed address is a local"
     );
     assert!(src.contains("mem[0x2a4] = "), "an unaligned address is not");
+}
+
+/// Types that take evidence from more than one place: a mapping keyed by a hash somewhere types
+/// every key of it, a 160-bit field used in arithmetic is an amount and so is what is stored
+/// into it, the words of a packed signature and of a typed-data digest are 32-byte words, and
+/// a multiplied value is not an account whatever it later flows into.
+#[test]
+fn types_join_evidence_across_keys_fields_and_layouts() {
+    let source = |name: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/mainnet")
+            .join(name);
+        let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        let opts = evmdec::decompile::Options {
+            no_sigs: true,
+            ..Default::default()
+        };
+        evmdec::decompile::decompile(&code, &opts).source
+    };
+    for (file, header) in [
+        (
+            "ens_registry.hex",
+            "function func_5b0fc9c3(bytes32 key, address arg1) external {",
+        ),
+        (
+            "permit2.hex",
+            "function func_87517c45(address account, address account2, uint160 arg2, uint48 arg3)",
+        ),
+        (
+            "permit2.hex",
+            "function func_927da105(address account, address account2, address account3) external view returns (uint160, uint48, uint48)",
+        ),
+        (
+            "usdc_impl.hex",
+            "uint8 arg4, bytes32 arg5, bytes32 arg6) external {",
+        ),
+        (
+            "univ2_pair.hex",
+            "function func_3644e515() external view returns (bytes32) {",
+        ),
+        (
+            "oneinch_v5.hex",
+            "function func_62e238bb(bytes arg0, bytes arg1, bytes arg2, uint256 arg3, uint256 arg4, uint256 arg5)",
+        ),
+    ] {
+        assert!(source(file).contains(header), "{file}: missing `{header}`");
+    }
 }

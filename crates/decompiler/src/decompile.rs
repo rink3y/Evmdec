@@ -2099,12 +2099,15 @@ fn refine_returns(
         return;
     }
     for (i, ty) in returns.iter_mut().enumerate() {
-        if ty != "uint256" {
-            continue;
-        }
         let t = rets
             .iter()
             .fold(types::Ty::Unknown, |t, w| t.join(env.type_of(w[i], pc)));
+        if ty == "address" && t == types::Ty::Uint(160) {
+            *ty = "uint160".into();
+        }
+        if ty != "uint256" {
+            continue;
+        }
         if debug {
             eprintln!(
                 "[types] return {} of {} (pc {:#x}): {:?} from {:?}",

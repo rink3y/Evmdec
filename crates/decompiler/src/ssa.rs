@@ -287,6 +287,72 @@ fn shifted_then_masked(e: ExprId) -> Option<FieldWrite> {
     })
 }
 
+/// Every field a store of `val` to `key` writes: one for the plain read-modify-write, several
+/// when the compiler merges the values of neighbouring fields into one store
+/// (`old & keep | a | b << s`). Each merged value must sit inside bits `keep` clears.
+pub fn field_writes(key: ExprId, val: ExprId) -> Vec<FieldWrite> {
+    if let Some(w) = field_write(key, val) {
+        return vec![w];
+    }
+    let mut leaves = Vec::new();
+    let mut pending = vec![val];
+    while let Some(e) = pending.pop() {
+        match expr::node(e) {
+            Node::Op(op::OR, v) if leaves.len() + pending.len() < 16 => pending.extend(v),
+            _ => leaves.push(e),
+        }
+    }
+    let kept = |e: ExprId| match expr::node(e) {
+        Node::Op(op::AND, w) => [(w[0], w[1]), (w[1], w[0])].into_iter().find_map(|(a, b)| {
+            matches!(expr::node(a), Node::SLoad(k, false, _) if k == key)
+                .then(|| expr::as_const(b))
+                .flatten()
+        }),
+        _ => None,
+    };
+    let Some(keep) = leaves.iter().find_map(|e| kept(*e)) else {
+        return Vec::new();
+    };
+    let cleared = !keep;
+    let run_at = |shift: u32| (!(cleared >> shift)).trailing_zeros();
+    let low_masked = |e: ExprId| match expr::node(e) {
+        Node::Op(op::AND, w) => [(w[0], w[1]), (w[1], w[0])].into_iter().find_map(|(m, x)| {
+            expr::as_const(m)
+                .filter(|m| m.is_low_mask())
+                .map(|m| (m.bits(), x))
+        }),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for leaf in leaves.into_iter().filter(|e| kept(*e).is_none()) {
+        let found = shifted_then_masked(leaf).or_else(|| match expr::node(leaf) {
+            Node::Op(op::SHL, v) => {
+                let shift = expr::as_const(v[0]).filter(|s| s.fits_u64())?.low_u64();
+                let shift = u32::try_from(shift).ok().filter(|s| *s < 256)?;
+                let (bits, value) = low_masked(v[1]).unwrap_or((run_at(shift), v[1]));
+                Some(FieldWrite {
+                    bit_offset: shift,
+                    bits,
+                    value,
+                })
+            }
+            _ => {
+                let (bits, value) = low_masked(leaf).unwrap_or((run_at(0), leaf));
+                Some(FieldWrite {
+                    bit_offset: 0,
+                    bits,
+                    value,
+                })
+            }
+        });
+        match found {
+            Some(w) if w.bits > 0 && w.bits < 256 && run_at(w.bit_offset) >= w.bits => out.push(w),
+            _ => return Vec::new(),
+        }
+    }
+    out
+}
+
 /// A write of part of a slot's word: the compiler's read-modify-write
 /// `(old & ~(mask << s)) | ((value & mask) << s)`, where `old` reads `key`. With nothing merged
 /// in, `old & ~(mask << s)` writes zero to the field.

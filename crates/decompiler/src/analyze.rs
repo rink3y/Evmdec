@@ -2312,7 +2312,7 @@ pub fn analyze(c: &Contract) -> Report {
     let ctx = ctx;
     let mut findings: Vec<Finding> = Vec::new();
     let mut report = Report::default();
-    let callees = decompile::Callees::of(&c.functions);
+    let callees = decompile::Callees::of(&c.functions, c.compiler.kind);
     let names_for = |f: &Function| -> Names {
         decompile::make_names(
             f,
@@ -4506,7 +4506,7 @@ fn silent_guard_findings(ctx: &Ctx, findings: &mut Vec<Finding>) {
             &ctx.c.storage,
             ctx.c.compiler.layout,
             &ctx.c.string_loaders,
-            &decompile::Callees::of(&ctx.c.functions),
+            &decompile::Callees::of(&ctx.c.functions, ctx.c.compiler.kind),
         );
         for nd in &l.nodes {
             let Term::Branch {

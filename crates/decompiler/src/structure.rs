@@ -387,6 +387,51 @@ fn encoded_bytes_logs(stmts: &[Stmt]) -> Vec<FoldedLog> {
     out
 }
 
+/// A copy of calldata into memory that the next statement sends on as a call's whole payload:
+/// the call prints with `msg.data` (or the slice copied) and the copy is not printed. Returns
+/// the indices of the copies and records each payload's text in `names`.
+fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) -> Vec<usize> {
+    let live: Vec<usize> = (0..stmts.len()).filter(|i| !hidden.contains(i)).collect();
+    let mut folded = Vec::new();
+    for pair in live.windows(2) {
+        let (
+            Stmt::Copy {
+                kind: op::CALLDATACOPY,
+                dest,
+                src,
+                len,
+                ..
+            },
+            Stmt::Call {
+                in_off,
+                in_len,
+                input: None,
+                ..
+            },
+        ) = (&stmts[pair[0]], &stmts[pair[1]])
+        else {
+            continue;
+        };
+        if dest != in_off || len != in_len {
+            continue;
+        }
+        let whole = expr::as_const(*src) == Some(U256::ZERO)
+            && matches!(expr::node(*len), Node::Env(op::CALLDATASIZE, _));
+        let text = if whole {
+            "msg.data".to_string()
+        } else {
+            format!(
+                "msg.data[{}:+{}]",
+                emit::fmt_expr(*src, names),
+                emit::fmt_expr(*len, names)
+            )
+        };
+        names.payload_overrides.borrow_mut().insert(*in_off, text);
+        folded.push(pair[0]);
+    }
+    folded
+}
+
 /// What a statement overwrites, for the stale-load planner: a persistent storage slot, or the
 /// contract's own balance (every statement that advances the storage generation may move ether).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1794,8 +1839,37 @@ impl<'a> Printer<'a> {
         for f in &folded {
             dead.extend(f.hidden.iter().copied());
         }
+        dead.extend(emit::free_pointer_updates(
+            &self.l.nodes[n].stmts,
+            self.names,
+        ));
+        self.names.payload_overrides.borrow_mut().clear();
+        dead.extend(forwarded_calldata(
+            &self.l.nodes[n].stmts,
+            &dead,
+            self.names,
+        ));
+        let hidden: HashSet<usize> = dead
+            .iter()
+            .copied()
+            .chain(
+                self.skipped
+                    .borrow()
+                    .iter()
+                    .filter(|(node, _)| *node == n)
+                    .map(|(_, i)| *i),
+            )
+            .collect();
+        let literals = emit::block_literals(&self.l.nodes[n].stmts, &hidden, self.names);
+        for lit in &literals {
+            dead.extend(lit.rest.iter().copied());
+        }
         for (i, s) in self.l.nodes[n].stmts.iter().enumerate() {
             if dead.contains(&i) || self.skipped.borrow().contains(&(n, i)) {
+                continue;
+            }
+            if let Some(lit) = literals.iter().find(|lit| lit.first == i) {
+                self.line(depth, &lit.text);
                 continue;
             }
             if let (Some(f), Stmt::Log { topics, .. }) = (folded.iter().find(|f| f.index == i), s) {

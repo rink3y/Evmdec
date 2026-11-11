@@ -310,7 +310,8 @@ pub struct TypeEnv {
     layout: MappingLayout,
     /// Vyper validates decoded values by range checks (`x < 2^160`, `x >> 1 == 0`); solc masks
     /// them, so a range check in solc output is a cast or a user `require`. Vyper never masks a
-    /// value to its declared width, so a mask or shift there is the program unpacking a word.
+    /// value to its declared width and never packs storage, so a mask or shift there is the
+    /// program unpacking a word, not a narrower variable.
     vyper: bool,
     debug: bool,
     ids: HashMap<Loc, usize>,
@@ -509,7 +510,7 @@ impl TypeEnv {
     /// slot, a calldata word, a storage slot or packed field, or a helper result.
     #[must_use]
     pub fn location(&self, e: ExprId, scope: usize) -> Option<Loc> {
-        if let Some(field) = ssa::field_read(e) {
+        if let Some(field) = ssa::field_read(e).filter(|_| !self.vyper) {
             let path = ssa::slot_path(field.key, self.layout)?;
             return Some(Loc::Field {
                 shape: path.shape(SlotSpace::Persistent),
@@ -641,7 +642,7 @@ impl TypeEnv {
                 let space = ssa::space_of(*transient);
                 let shape = path.shape(space);
                 self.note_keys(&path, space, pc);
-                match ssa::field_write(*key, *val) {
+                match ssa::field_write(*key, *val).filter(|_| !self.vyper) {
                     Some(w) => self.def(
                         Loc::Field {
                             shape,
@@ -839,8 +840,12 @@ impl TypeEnv {
 
     /// `x & mask`: a low mask is a cleanup to a width, unless it carves a piece of a value for a
     /// packed payload word (`x & 0xffffffff << 224 | y >> 32`), which says nothing; a high
-    /// mask keeps the top bytes of a `bytesN`.
+    /// mask keeps the top bytes of a `bytesN`. In Vyper a mask is the program's own arithmetic
+    /// and says nothing about the declared type.
     fn mask_use(&mut self, v: &[ExprId], parent: Option<u8>, scope: usize) {
+        if self.vyper {
+            return;
+        }
         let packing = matches!(parent, Some(op::OR) | Some(op::SHL) | Some(op::MUL));
         for (x, m) in [(v[0], v[1]), (v[1], v[0])] {
             let Some(m) = expr::as_const(m) else { continue };

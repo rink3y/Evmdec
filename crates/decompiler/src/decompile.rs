@@ -1236,7 +1236,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         })
         .map(|f| f.pc)
         .collect();
-    let callees = Callees::of(&functions);
+    let callees = Callees::of(&functions, profile.kind);
     let array_resizers: HashSet<usize> = functions
         .iter()
         .filter(|f| f.kind == FnKind::Internal && f.lifted.as_ref().is_some_and(is_array_resizer))
@@ -1749,24 +1749,28 @@ fn name_storage_from_getters(
     }
 }
 
-/// What printing a call to an internal function needs: its name and its return types, by
-/// entry pc.
+/// What printing a function needs to know about the code around it: the names and return
+/// types of the internal functions it may call, by entry pc, and the compiler's memory model.
 #[derive(Clone, Debug, Default)]
 pub struct Callees {
     /// Return types in declaration order.
     pub returns: HashMap<usize, Vec<String>>,
     /// Printed name.
     pub names: HashMap<usize, String>,
+    /// The code is solc's and keeps its free memory pointer at `0x40`, so a load of that slot
+    /// is the address of a memory block.
+    pub free_pointer: bool,
 }
 
 impl Callees {
     /// The internal functions of `functions`.
     #[must_use]
-    pub fn of(functions: &[Function]) -> Callees {
+    pub fn of(functions: &[Function], compiler: compiler::Kind) -> Callees {
         let internal = || functions.iter().filter(|f| f.kind == FnKind::Internal);
         Callees {
             returns: internal().map(|f| (f.pc, f.returns.clone())).collect(),
             names: internal().map(|f| (f.pc, f.name.clone())).collect(),
+            free_pointer: compiler == compiler::Kind::Solc,
         }
     }
 }
@@ -1784,6 +1788,11 @@ pub fn make_names(
     let mut n = Names {
         layout,
         callee_names: callees.names.clone(),
+        blocks: f
+            .lifted
+            .as_ref()
+            .filter(|_| callees.free_pointer)
+            .map(emit::number_blocks),
         ..Default::default()
     };
     if f.kind != FnKind::Internal {
@@ -1939,14 +1948,17 @@ fn refine_returns(
             _ => None,
         })
         .collect();
+    if env.vyper() {
+        for ty in returns.iter_mut() {
+            if ty.starts_with("uint") && ty != "uint256" {
+                *ty = "uint256".into();
+            }
+        }
+    }
     if rets.is_empty() || rets.iter().any(|w| w.len() != returns.len()) {
         return;
     }
     for (i, ty) in returns.iter_mut().enumerate() {
-        let narrow_uint = ty.starts_with("uint") && ty != "uint256";
-        if env.vyper() && narrow_uint {
-            *ty = "uint256".into();
-        }
         if ty != "uint256" {
             continue;
         }
@@ -2749,6 +2761,12 @@ pub fn render(c: &Contract, name: &str) -> String {
         c.stats.internal_functions,
         if inlined > 0 { format!(" ({} inlined at every call site and not shown)", inlined) } else { String::new() }
     ));
+    if c.functions.iter().any(|f| f.code.contains("ptr")) {
+        out.push_str(
+            "// Memory: ptrN is a block allocated at the free memory pointer; \
+             ptrN = memory(a, b) writes its words; bytes(p) is the byte string at p.\n",
+        );
+    }
     out.push_str(&format!("\ncontract {} {{\n", name));
     if !c.storage.is_empty() {
         out.push_str("    // ---- storage layout ----\n");

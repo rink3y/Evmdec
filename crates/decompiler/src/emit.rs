@@ -2,12 +2,12 @@
 
 use crate::expr::{self, ExprId, Node};
 use crate::keccak;
-use crate::lift::{Lifted, Stmt, Term};
+use crate::lift::{Lifted, Stmt, Term, FREE_POINTER};
 use crate::opcode as op;
 use crate::sigs;
 use crate::u256::U256;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// How many small slots the hashed-slot table covers.
@@ -135,6 +135,13 @@ pub struct Names {
     pub args: HashMap<u32, String>,
     /// entry pc of an internal function -> its name
     pub callee_names: HashMap<usize, String>,
+    /// Call payloads the structurer has a better text for than the memory range: the offset of
+    /// the payload -> what it holds (`msg.data` after a copy of the whole calldata).
+    pub payload_overrides: RefCell<HashMap<ExprId, String>>,
+    /// Memory blocks at solc's free pointer, numbered in code order: each value the pointer
+    /// takes starts a block, keyed by the symbolic part of its address with the constant part
+    /// and the block's number (`ptr1`, `ptr2`, …). `None` when the code keeps no free pointer.
+    pub blocks: Option<Blocks>,
     /// storage slot (constant) -> name
     pub storage: HashMap<U256, String>,
     /// First slots of fixed-size storage arrays (`uint[256] owners` occupies `base..base+256`).
@@ -515,7 +522,8 @@ fn is_abi_validator(cond: ExprId) -> bool {
 }
 
 /// A `require` the printer leaves out: an ABI decoder validator (the parameter type says it),
-/// or, on solc >= 0.8, the compiler's own overflow / division-by-zero panic.
+/// or, on solc >= 0.8, a panic the compiler adds on its own: arithmetic overflow, division by
+/// zero, or a memory allocation past the allocator's limit.
 pub fn is_hidden_require(cond: ExprId, data: Option<&[ExprId]>, n: &Names) -> bool {
     if is_abi_validator(cond) {
         return true;
@@ -532,7 +540,8 @@ pub fn is_hidden_require(cond: ExprId, data: Option<&[ExprId]>, n: &Names) -> bo
     let len = 4 + 32 * (words.len() - 1);
     matches!(
         expr::as_const(shifted_word_len(words, 0, Some(len))),
-        Some(c) if c == U256::from_u64(PANIC_OVERFLOW) || c == U256::from_u64(PANIC_DIV_BY_ZERO)
+        Some(c) if [PANIC_OVERFLOW, PANIC_DIV_BY_ZERO, PANIC_ALLOCATION].contains(&c.low_u64())
+            && c.fits_u64()
     )
 }
 
@@ -544,6 +553,8 @@ pub const SEL_ERROR: u32 = 0x08c379a0;
 const PANIC_OVERFLOW: u64 = 0x11;
 /// `Panic` code for division by zero.
 const PANIC_DIV_BY_ZERO: u64 = 0x12;
+/// `Panic` code for a memory allocation that is too large or overflows the free pointer.
+const PANIC_ALLOCATION: u64 = 0x41;
 
 /// Is `e` boolean-valued: by its shape, as a helper's `bool` result, or as a `bool` field?
 pub fn is_bool(e: ExprId, n: &Names) -> bool {
@@ -602,9 +613,209 @@ fn is_signed_op(o: u8) -> bool {
 }
 
 /// Memory offsets print in hex (0x40 is the free memory pointer, 0x00..0x3f scratch).
+/// The starts of the memory blocks of one function: the symbolic part of each start (`None`
+/// for a constant address) -> `(constant part, block number)`.
+pub type Blocks = HashMap<Option<ExprId>, Vec<(U256, u32)>>;
+
+fn is_free_pointer(off: ExprId) -> bool {
+    expr::as_const(off) == Some(U256::from_u64(FREE_POINTER))
+}
+
+/// The memory blocks of `l`: every value its free pointer has, in code order. solc allocates by
+/// reading the pointer and moving it past the new block, so the pointer's value on entry and
+/// each value stored to it afterwards is where a block starts.
+#[must_use]
+pub fn number_blocks(l: &Lifted) -> Blocks {
+    let mut starts: Vec<ExprId> = l.entry_free_pointer().into_iter().collect();
+    let mut seen: HashSet<ExprId> = HashSet::new();
+    let mut note_loads = |roots: Vec<ExprId>, starts: &mut Vec<ExprId>| {
+        let mut found: Vec<(u32, ExprId)> = Vec::new();
+        let mut stack = roots;
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            if let Node::MLoad(off, version) = expr::node(x) {
+                if is_free_pointer(off) {
+                    found.push((version, x));
+                }
+            }
+            stack.extend(expr::children(x));
+        }
+        found.sort_unstable();
+        starts.extend(found.into_iter().map(|(_, x)| x));
+    };
+    for nd in &l.nodes {
+        for st in &nd.stmts {
+            note_loads(crate::lift::stmt_exprs(st), &mut starts);
+            if let Stmt::MStore {
+                off,
+                val,
+                width: 32,
+            } = st
+            {
+                if is_free_pointer(*off) {
+                    starts.push(*val);
+                }
+            }
+        }
+        note_loads(crate::lift::term_exprs(&nd.term), &mut starts);
+    }
+    note_loads(
+        l.edge_assigns
+            .values()
+            .flatten()
+            .map(|(_, val)| *val)
+            .collect(),
+        &mut starts,
+    );
+    let mut blocks = Blocks::new();
+    let mut number = 0;
+    for start in starts {
+        let (base, offset) = expr::split_offset(start);
+        if base.is_none() && offset < U256::from_u64(0x80) {
+            continue;
+        }
+        let at = blocks.entry(base).or_default();
+        if !at.iter().any(|(o, _)| *o == offset) {
+            number += 1;
+            at.push((offset, number));
+        }
+    }
+    blocks
+}
+
+/// The block an address falls in and its offset from the block's start: the block with the
+/// same symbolic base whose start is the nearest at or below the address.
+fn block_ref(e: ExprId, n: &Names) -> Option<(u32, U256)> {
+    let blocks = n.blocks.as_ref()?;
+    let (base, offset) = expr::split_offset(e);
+    blocks
+        .get(&base)?
+        .iter()
+        .filter(|(start, _)| *start <= offset)
+        .max_by_key(|(start, _)| *start)
+        .map(|(start, number)| (*number, offset.wrapping_sub(*start)))
+}
+
+fn fmt_block_ref(number: u32, offset: U256) -> String {
+    if offset.is_zero() {
+        format!("ptr{number}")
+    } else {
+        format!("ptr{number} + {}", offset.to_decimal())
+    }
+}
+
+/// A value written into memory: a constant that is exactly where a block starts is that
+/// block's address, so the word points at it.
+fn fmt_stored_word(val: ExprId, n: &Names) -> String {
+    match (expr::as_const(val), block_ref(val, n)) {
+        (Some(_), Some((number, offset))) if offset.is_zero() => format!("ptr{number}"),
+        _ => fmt_expr(val, n),
+    }
+}
+
+/// Indices of the statements that move the free memory pointer: bookkeeping the named blocks
+/// already show.
+#[must_use]
+pub fn free_pointer_updates(stmts: &[Stmt], n: &Names) -> HashSet<usize> {
+    if n.blocks.is_none() {
+        return HashSet::new();
+    }
+    stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, Stmt::MStore { off, .. } if is_free_pointer(*off)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Stores that fill a memory block word by word, as one line.
+#[derive(Clone, Debug)]
+pub struct BlockLiteral {
+    /// Index of the first statement the line stands for.
+    pub first: usize,
+    /// Indices of the other statements it stands for.
+    pub rest: Vec<usize>,
+    /// `ptrN = memory(a, b, c);`
+    pub text: String,
+}
+
+/// The blocks `stmts` fill (skipping the indices in `hidden`). Within a run of consecutive
+/// word stores into blocks, whose values read no memory, the stores to one block may be
+/// gathered: blocks do not overlap, so their order among the others does not matter. A block
+/// becomes one line when the run stores its words `0..n` each exactly once; two words are the
+/// least worth a line.
+#[must_use]
+pub fn block_literals(stmts: &[Stmt], hidden: &HashSet<usize>, n: &Names) -> Vec<BlockLiteral> {
+    let word_of = |s: &Stmt| -> Option<(u32, u64, ExprId)> {
+        let Stmt::MStore {
+            off,
+            val,
+            width: 32,
+        } = s
+        else {
+            return None;
+        };
+        let (number, offset) = block_ref(*off, n)?;
+        let aligned =
+            offset.fits_u64() && offset.low_u64().is_multiple_of(32) && offset.low_u64() < 32 * 64;
+        let reads_memory = expr::contains(*val, &|x| matches!(x, Node::MLoad(..)));
+        (aligned && !reads_memory).then(|| (number, offset.low_u64() / 32, *val))
+    };
+    let live: Vec<usize> = (0..stmts.len()).filter(|i| !hidden.contains(i)).collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < live.len() {
+        let mut end = at;
+        while end < live.len() && word_of(&stmts[live[end]]).is_some() {
+            end += 1;
+        }
+        let mut by_block: BTreeMap<u32, Vec<(usize, u64, ExprId)>> = BTreeMap::new();
+        for i in &live[at..end] {
+            let (number, index, val) = word_of(&stmts[*i]).expect("the run holds word stores");
+            by_block.entry(number).or_default().push((*i, index, val));
+        }
+        for (number, words) in by_block {
+            let mut sorted = words.clone();
+            sorted.sort_by_key(|(_, index, _)| *index);
+            let dense = sorted
+                .iter()
+                .map(|(_, index, _)| *index)
+                .eq(0..sorted.len() as u64);
+            if sorted.len() < 2 || !dense {
+                continue;
+            }
+            let raw: Vec<ExprId> = sorted.iter().map(|(_, _, v)| *v).collect();
+            let text = decode_plain_string(&raw)
+                .filter(|_| {
+                    expr::as_const(raw[0])
+                        .and_then(|l| l.as_usize())
+                        .is_some_and(|l| l.div_ceil(32) == raw.len() - 1)
+                })
+                .map(|t| format!("\"{t}\""));
+            let values: Vec<String> = match text {
+                Some(t) => vec![t],
+                None => raw.iter().map(|v| fmt_stored_word(*v, n)).collect(),
+            };
+            let mut indices: Vec<usize> = words.iter().map(|(i, _, _)| *i).collect();
+            indices.sort_unstable();
+            out.push(BlockLiteral {
+                first: indices[0],
+                rest: indices[1..].to_vec(),
+                text: format!("ptr{number} = memory({});", values.join(", ")),
+            });
+        }
+        at = end.max(at + 1);
+    }
+    out
+}
+
+/// Memory offsets print in hex when constant (`0x00..0x3f` is scratch space).
 pub fn fmt_mem_off(off: ExprId, n: &Names) -> String {
-    match expr::as_const(off) {
-        Some(c) if c.bits() <= 64 => c.to_hex(),
+    match (expr::as_const(off), block_ref(off, n)) {
+        (Some(_), Some((number, offset))) => fmt_block_ref(number, offset),
+        (Some(c), None) if c.bits() <= 64 => c.to_hex(),
         _ => fmt_expr(off, n),
     }
 }
@@ -968,6 +1179,12 @@ fn copy_source(kind: u8) -> &'static str {
 fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
     if let Some(load) = element_typed_load(e, n) {
         return (fmt_expr(load, n), P_PRIMARY);
+    }
+    if !expr::is_const(e) {
+        if let Some((number, offset)) = block_ref(e, n) {
+            let precedence = if offset.is_zero() { P_PRIMARY } else { P_ADD };
+            return (fmt_block_ref(number, offset), precedence);
+        }
     }
     if !n.fields.is_empty() {
         if let Some((k, off, bits)) = packed_read(e) {
@@ -1653,6 +1870,53 @@ pub fn fmt_call_input(
     (None, words.iter().map(|w| fmt_expr(*w, n)).collect())
 }
 
+/// The name of the precompiled contract at a constant address.
+fn precompile_name(addr: U256) -> Option<&'static str> {
+    if !addr.fits_u64() {
+        return None;
+    }
+    Some(match addr.low_u64() {
+        1 => "ecrecover",
+        2 => "sha256",
+        3 => "ripemd160",
+        4 => "identity",
+        5 => "modexp",
+        6 => "bn256Add",
+        7 => "bn256ScalarMul",
+        8 => "bn256Pairing",
+        9 => "blake2f",
+        10 => "pointEvaluation",
+        _ => return None,
+    })
+}
+
+/// The pointer `p` when the range `off .. off + len` is the contents of the byte string at
+/// `p`: its length word at `p`, its bytes from `p + 32`.
+#[must_use]
+pub fn bytes_value(off: ExprId, len: ExprId) -> Option<ExprId> {
+    let Node::MLoad(pointer, _) = expr::node(len) else {
+        return None;
+    };
+    (expr::add_const(pointer, U256::from_u64(32)) == off).then_some(pointer)
+}
+
+/// The function and the leading arguments of a payload whose first words are known but whose
+/// tail is not (dynamic data the lifter did not follow): the selector's name and the head
+/// words after it.
+fn fmt_call_head(head: &[ExprId], n: &Names) -> (Option<String>, Vec<String>) {
+    let Some(sel) = head.first().and_then(|w| leading_selector(*w, None)) else {
+        return (None, vec![]);
+    };
+    let name = match sigs::function(sel) {
+        Some(sig) => sigs::name_of(&sig).to_string(),
+        None => format!("func_{sel:08x}"),
+    };
+    let args = (0..head.len().saturating_sub(1))
+        .map(|i| fmt_expr(shifted_word_len(head, i, None), n))
+        .collect();
+    (Some(name), args)
+}
+
 /// Render one statement as a line of pseudo-Solidity, without indentation.
 pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
     match s {
@@ -1661,7 +1925,11 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             if *width == 1 {
                 format!("mem8[{}] = {};", fmt_mem_off(*off, n), fmt_expr(*val, n))
             } else {
-                format!("mem[{}] = {};", fmt_mem_off(*off, n), fmt_expr(*val, n))
+                format!(
+                    "mem[{}] = {};",
+                    fmt_mem_off(*off, n),
+                    fmt_stored_word(*val, n)
+                )
             }
         }
         Stmt::SStore {
@@ -1733,10 +2001,14 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             in_len,
             out_len: _,
             input,
+            input_head,
             result,
             ..
         } => {
-            let target = fmt_prec(*addr, P_PRIMARY, n);
+            let target = match expr::as_const(*addr).and_then(precompile_name) {
+                Some(name) => name.to_string(),
+                None => fmt_prec(*addr, P_PRIMARY, n),
+            };
             let mut opts = Vec::new();
             if let Some(v) = value {
                 if expr::as_const(*v) != Some(U256::ZERO) {
@@ -1760,10 +2032,15 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 op::STATICCALL => "staticcall",
                 _ => "call",
             };
-            let (fname, args) = match input {
+            let partial = input.is_none() && !n.payload_overrides.borrow().contains_key(in_off);
+            let (fname, mut args) = match input {
                 Some(words) => fmt_call_input(words, expr::as_const(*in_len), n),
+                None if partial => fmt_call_head(input_head, n),
                 None => (None, vec![]),
             };
+            if partial && fname.is_some() {
+                args.push("...".to_string());
+            }
             let payload = match (&fname, input) {
                 (Some(f), _) => format!(
                     "abi.encodeWithSelector({}.selector, {})",
@@ -1776,6 +2053,10 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 (None, None) => {
                     if expr::as_const(*in_len) == Some(U256::ZERO) {
                         "\"\"".into()
+                    } else if let Some(text) = n.payload_overrides.borrow().get(in_off) {
+                        text.clone()
+                    } else if let Some(pointer) = bytes_value(*in_off, *in_len) {
+                        format!("bytes({})", fmt_mem_off(pointer, n))
                     } else {
                         format!(
                             "mem[{}:{}]",
@@ -1911,7 +2192,9 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                         .map(|_| U256::from_u64(4 + 32 * (words.len() as u64 - 1)));
                     let p = fmt_payload(words, len, n, PayloadKind::Revert);
                     if n.hide_checked
-                        && (p == "Panic(arithmetic overflow)" || p == "Panic(division by zero)")
+                        && (p == "Panic(arithmetic overflow)"
+                            || p == "Panic(division by zero)"
+                            || p == "Panic(memory allocation too large)")
                     {
                         return String::new();
                     }
@@ -2087,7 +2370,8 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
             out.push_str(&format!("{}L{:x}:\n", indent, nd.pc));
         }
         n.end_block();
-        let dead = dead_memory_stores(&nd.stmts);
+        let mut dead = dead_memory_stores(&nd.stmts);
+        dead.extend(free_pointer_updates(&nd.stmts, n));
         for (i, s) in nd.stmts.iter().enumerate() {
             if dead.contains(&i) {
                 continue;

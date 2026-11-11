@@ -60,6 +60,13 @@ Every stage is in `crates/decompiler`:
   `require` lines, checked arithmetic printed plain, `payable(to).transfer(v)`, `members.push(x)`,
   locals for values the source held in locals, the previous value of a slot read before it is
   overwritten, loops folded back together after control-flow recovery peeled an iteration.
+- Memory. Each allocation at solc's free memory pointer is a named block (`ptr1`, `ptr2`), so
+  two structs never read as one address; a run of stores that fills a block prints as one line
+  (`ptr1 = memory(arg0, arg1, ptr2)`), a string built in memory as its text, and the
+  allocator's own bookkeeping and overflow panics are left out. A call's payload prints as
+  what it is: `abi.encodeWithSelector(...)` when its words are known, `msg.data` when a proxy
+  forwards its calldata, `bytes(p)` for the byte string at a pointer, and the selector with
+  the leading arguments when only the head is known. Precompiles are called by name.
 - Names. A built-in dictionary of about 1,300 selectors, topics and errors; an optional local
   index of the whole public signature database; online lookup with `--lookup`. Where no
   signature gives a name, the code does: a variable is named by its getter, by the setter that
@@ -143,7 +150,7 @@ TriCrypto-NG, the CREATE2 deployer, UNI), and one on 26 exploited contracts.
 | parameter count | 513 / 515 |
 | return count | 514 / 515 |
 | parameter types, exact Solidity type | 885 / 955 |
-| return types | 359 / 380 |
+| return types | 361 / 380 |
 | events | 119 / 121 |
 | code blocks covered by some function | 10,810 / 10,810 |
 | unresolved jumps | 0 |
@@ -299,8 +306,8 @@ root turns on `#![warn(missing_docs)]`, and clippy is kept at zero warnings.
 - Internal functions the code does not characterise keep the name `func_<pc>`, and parameters
   nothing narrows are `uint256`. Names inferred from roles describe what the code does, not
   what the author called it.
-- Dynamic ABI encodings the printer does not recognise appear as the memory operations the
-  compiler emitted rather than as `abi.encode`.
+- A payload assembled with dynamic data the lifter does not follow prints its selector and
+  leading arguments, then `...`; one with no known head prints as a memory range.
 - Vyper internal calls pass arguments through fixed memory, so some values in Vyper output
   print as `mem[0x...]` reads where the analyzer, which replays the callee, sees the value.
 - The confirmation pass starts from a fresh state. A finding whose path needs prior storage

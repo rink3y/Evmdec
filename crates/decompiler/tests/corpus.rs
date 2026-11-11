@@ -631,7 +631,7 @@ fn types_use_validators_precompiles_and_literals() {
     for header in [
         "function func_a9059cbb(address arg0, uint256 arg1) external returns (bool)",
         "function func_cab4d3db() external view returns (address)",
-        "function func_59189017(uint256 arg0) external pure returns (uint256)",
+        "function func_59189017(uint256 arg0) external view returns (uint256)",
         "function func_ddca3f43() external view returns (uint256)",
     ] {
         assert!(tricrypto.contains(header), "missing `{header}`");
@@ -751,4 +751,55 @@ fn a_shared_helper_site_is_one_finding_under_any_parameter_names() {
     assert!(shared[0]
         .description
         .contains("The same code is reached from"));
+}
+
+/// Every allocation moves the free memory pointer, including one made inside a helper the
+/// lifter inlines: three structs decoded from calldata are three blocks, the outer one holding
+/// pointers to the other two. Before the pointer updates were kept in the helper's summary, all
+/// three were written to the same address.
+#[test]
+fn allocations_in_inlined_helpers_are_separate_blocks() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vuln/fence_usdc_pool.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+    let src = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
+    for line in [
+        "ptr1 = memory(arg0, arg1, ptr2, arg4, arg5, arg6, arg7, arg8, ptr3);",
+        "ptr2 = memory(arg2, arg3);",
+        "ptr3 = memory(arg9, arg10, arg11, arg12);",
+    ] {
+        assert!(src.contains(line), "missing `{line}`");
+    }
+    assert!(
+        !src.contains("mem[mem[0x40]"),
+        "the free pointer is never printed as an address of its own"
+    );
+    assert!(src.contains("// Memory: ptrN is a block"), "legend");
+}
+
+/// Payloads that are not a fixed list of words still read as what they are: the calldata a
+/// proxy forwards, and a string literal built in memory.
+#[test]
+fn payloads_and_literals_read_as_values() {
+    let source = |name: &str| -> String {
+        let code = corpus()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, code)| code)
+            .expect("fixture present");
+        evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source
+    };
+    let proxy = source("usdc_proxy");
+    assert!(proxy.contains(".delegatecall(msg.data);"), "{proxy}");
+    assert!(!proxy.contains("mem[0:msg.data.length]"), "{proxy}");
+    let permit2 = source("permit2");
+    assert!(
+        permit2.contains("= memory(\"PermitWitnessTransferFrom(TokenPermissions permitted,"),
+        "string literal block"
+    );
+    let uni = source("uni_token");
+    assert!(
+        uni.contains("= ecrecover.staticcall(abi.encode("),
+        "precompile by name"
+    );
 }

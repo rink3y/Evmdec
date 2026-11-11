@@ -299,6 +299,9 @@ struct Mem {
 
 const BIG: u64 = 1 << 40;
 
+/// The memory slot solc keeps its free memory pointer in.
+pub const FREE_POINTER: u64 = 0x40;
+
 /// Normalise an offset into `(base, delta)` with a small delta.
 fn norm_offset(e: ExprId) -> (Option<ExprId>, u64) {
     let (b, d) = expr::split_offset(e);
@@ -1288,10 +1291,7 @@ impl<'a> Lifter<'a> {
                     let mut idx = 0usize;
                     ln.stmts.retain(|s| {
                         let keep = match s {
-                            Stmt::MStore { off, .. } => {
-                                !(hidden_set.contains(&(i, idx))
-                                    || expr::as_const(*off) == Some(U256::from_u64(0x40)))
-                            }
+                            Stmt::MStore { .. } => !hidden_set.contains(&(i, idx)),
                             _ => true,
                         };
                         idx += 1;
@@ -2250,16 +2250,16 @@ impl<'a> Lifter<'a> {
             args.push(at(i));
         }
         let summary = self.summaries.get(&call.callee);
+        let free_pointer = konst(U256::from_u64(FREE_POINTER));
+        let free_now = st.mem.load_word(free_pointer, st.version);
         let subst = |e: ExprId| -> ExprId {
             let mut memo = HashMap::new();
             expr::substitute(
                 e,
-                &|n| {
-                    if let Node::Arg(i) = n {
-                        Some(at(*i as usize))
-                    } else {
-                        None
-                    }
+                &|n| match n {
+                    Node::Arg(i) => Some(at(*i as usize)),
+                    Node::MLoad(a, _) if *a == free_pointer => Some(free_now),
+                    _ => None,
                 },
                 &mut memo,
             )
@@ -2692,6 +2692,25 @@ fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
     }
     st.mem.tick();
     st.version = st.mem.gen;
+}
+
+impl Lifted {
+    /// The value of the free memory pointer when the unit is entered: a constant when the
+    /// dispatcher has just set it, otherwise the load of its slot.
+    #[must_use]
+    pub fn entry_free_pointer(&self) -> Option<ExprId> {
+        let unit_entry = self
+            .node_map
+            .iter()
+            .find(|(_, lifted)| **lifted == self.entry)
+            .map(|(unit, _)| *unit)?;
+        let state = self.entry_states.get(unit_entry)?.as_ref()?;
+        Some(
+            state
+                .mem
+                .load_word(konst(U256::from_u64(FREE_POINTER)), state.version),
+        )
+    }
 }
 
 /// Every path from `start` ends in a revert or an invalid opcode.

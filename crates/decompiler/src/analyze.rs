@@ -340,6 +340,8 @@ struct FnFacts {
     ref_bounds: Vec<AvailBound>,
     /// The function lets value leave: an ether call, a token transfer, or a ledger debit.
     moves_value: bool,
+    /// Calls and approvals that reach a contract fetched with this one.
+    linked_calls: Vec<LinkedCall>,
     /// Writes to entries of single-level mappings, in event order.
     ledger_writes: Vec<LedgerWrite>,
     /// Writes to constant slots, as changes of the slot's own value.
@@ -376,6 +378,48 @@ struct Debit {
     account_text: String,
     /// Printed statement.
     line: String,
+}
+
+/// A call this function makes to a contract fetched with this one, or an approval naming one.
+#[derive(Clone, Debug)]
+struct LinkedCall {
+    /// Address of the linked contract, lower case.
+    address: String,
+    /// Selector of the payload, when it is known.
+    selector: Option<u32>,
+    /// The call carries ether.
+    sends_value: bool,
+    /// The linked contract is the spender of an `approve` sent to a token, not the callee.
+    approval: bool,
+    /// Printed statement.
+    line: String,
+}
+
+/// The address `e` names when it is a contract fetched with `c`: a constant, or the address
+/// read from a constant slot whose content was fetched.
+fn linked_address(c: &Contract, e: ExprId) -> Option<String> {
+    let e = unmask(e);
+    let address = match expr::as_const(e) {
+        Some(a) => a.to_hex_padded(20),
+        None => {
+            let slot = expr::as_const(ssa::stored_address_slot(e)?)?.to_hex_padded(32);
+            let held = c
+                .stored_targets
+                .iter()
+                .find(|(s, _)| s.eq_ignore_ascii_case(&slot))?;
+            held.1.clone()
+        }
+    };
+    linked_contract(c, &address).map(|_| address.to_ascii_lowercase())
+}
+
+/// The contract fetched with `c` that lives at `address`.
+fn linked_contract<'a>(c: &'a Contract, address: &str) -> Option<&'a Contract> {
+    c.linked.iter().find(|lc| {
+        lc.address
+            .as_deref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(address))
+    })
 }
 
 /// How a write changes the value its slot held.
@@ -723,6 +767,7 @@ fn collect_facts(
         avail_bounds: Vec::new(),
         ref_bounds: Vec::new(),
         moves_value: false,
+        linked_calls: Vec::new(),
         ledger_writes: Vec::new(),
         total_changes: Vec::new(),
         stale_moves: Vec::new(),
@@ -773,6 +818,7 @@ fn collect_facts(
     let layout = ctx.c.compiler.layout;
     let mut mutations: Vec<&Event> = Vec::new();
     let mut call_selector: HashMap<u32, u32> = HashMap::new();
+    let mut linked_sites: Vec<(String, Option<u32>, bool, bool, Stmt)> = Vec::new();
     for ev in events {
         match &ev.stmt {
             Some(
@@ -846,6 +892,21 @@ fn collect_facts(
                     call_selector.insert(*seq, sel);
                 }
                 let is_static = *kind == op::STATICCALL;
+                if !ctx.c.linked.is_empty() {
+                    let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
+                    let sends_value = value.is_some_and(|v| expr::as_const(v) != Some(U256::ZERO));
+                    let spender = (selector == Some(SEL_APPROVE) && words.len() >= 2).then(|| {
+                        let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
+                        emit::shifted_word_len(words, 0, len)
+                    });
+                    let callee = linked_address(ctx.c, *addr).map(|a| (a, false));
+                    let approved = spender
+                        .and_then(|sp| linked_address(ctx.c, sp))
+                        .map(|a| (a, true));
+                    for (address, approval) in callee.into_iter().chain(approved) {
+                        linked_sites.push((address, selector, sends_value, approval, st.clone()));
+                    }
+                }
                 if let Some(slot) = ssa::stored_address_slot(*addr) {
                     let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
                     facts.stored_callees.push(StoredCall {
@@ -909,6 +970,21 @@ fn collect_facts(
                 }
             }
         }
+    }
+    if !linked_sites.is_empty() {
+        let own = names.clone();
+        facts.linked_calls = linked_sites
+            .into_iter()
+            .map(
+                |(address, selector, sends_value, approval, st)| LinkedCall {
+                    address,
+                    selector,
+                    sends_value,
+                    approval,
+                    line: emit::fmt_stmt(&st, &own),
+                },
+            )
+            .collect();
     }
     facts.moves_value = !facts.ether_out.is_empty()
         || !facts.debits.is_empty()
@@ -4027,6 +4103,7 @@ pub fn analyze(c: &Contract) -> Report {
     let slot_names = c.functions.first().map(names_for).unwrap_or_default();
     let slot_name = |slot: ExprId| emit::fmt_slot(slot, &slot_names, SlotSpace::Persistent);
     conservation_findings(&facts, &slot_name, &mut findings);
+    link_findings(c, &facts, &mut findings);
     trust_findings(c, &facts, &mut findings);
 
     type_rules::findings(c, &c.types, names_for, &mut findings);
@@ -5409,6 +5486,172 @@ fn accounting_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
             );
             flagged.insert(i);
             break;
+        }
+    }
+}
+
+/// Hold every call, value transfer and approval that reaches a contract fetched with this one
+/// against that contract's own code and report: a selector it does not answer, value sent to
+/// code that rejects it, a called function its own report rates high, and an approval given to
+/// a spender that moves tokens from accounts its caller picks.
+fn link_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) {
+    if c.linked.is_empty() {
+        return;
+    }
+    let mut reports: HashMap<String, Report> = HashMap::new();
+    let mut told: HashSet<(usize, String, &str)> = HashSet::new();
+    for f in facts.iter().filter(|f| f.external) {
+        for call in &f.linked_calls {
+            let Some(lc) = linked_contract(c, &call.address) else {
+                continue;
+            };
+            let externals = || lc.functions.iter().filter(|g| g.kind == FnKind::External);
+            if externals().next().is_none() {
+                continue;
+            }
+            let report = reports
+                .entry(call.address.clone())
+                .or_insert_with(|| analyze(lc));
+            let catch_all = |payable: bool| {
+                lc.functions.iter().any(|g| {
+                    matches!(g.kind, FnKind::Fallback | FnKind::Receive)
+                        && g.lifted
+                            .as_ref()
+                            .is_some_and(|l| !lift::always_reverts(l, l.entry))
+                        && (!payable || g.mutability == crate::function::Mutability::Payable)
+                })
+            };
+            let mut tell = |id: &'static str,
+                            title: &str,
+                            sev: Severity,
+                            desc: String,
+                            evidence: Vec<String>,
+                            rec: &str,
+                            findings: &mut Vec<Finding>| {
+                if told.insert((f.pc, call.address.clone(), id)) {
+                    push_fact(
+                        findings,
+                        id,
+                        title,
+                        sev,
+                        Confidence::Medium,
+                        f,
+                        desc,
+                        evidence,
+                        rec,
+                    );
+                }
+            };
+            if call.approval {
+                let open = report
+                    .findings
+                    .iter()
+                    .find(|x| x.id == "arbitrary-transferfrom" && x.severity <= Severity::High);
+                if let Some(open) = open {
+                    tell(
+                        "approval-to-open-spender",
+                        "Tokens are approved to a contract that moves them for any caller",
+                        Severity::High,
+                        format!(
+                            "`{}` approves the contract at {} to spend tokens this contract holds. That contract's own report finds that `{}` moves tokens from an account its caller chooses, and this contract is such an account once the approval stands.",
+                            f.name,
+                            call.address,
+                            open.function.as_deref().unwrap_or("a function"),
+                        ),
+                        vec![call.line.clone()],
+                        "Approve only the amount a single operation needs, to a spender that moves tokens only from its own caller.",
+                        findings,
+                    );
+                }
+                continue;
+            }
+            let target = call.selector.and_then(|sel| {
+                let hex = format!("{sel:#010x}");
+                externals()
+                    .find(|g| {
+                        g.selector
+                            .as_deref()
+                            .is_some_and(|s| s.eq_ignore_ascii_case(&hex))
+                    })
+                    .map(|g| (hex, g))
+            });
+            match (call.selector, &target) {
+                (Some(sel), None) if !catch_all(false) => tell(
+                    "linked-call-unanswered",
+                    "A call names a function the called contract does not have",
+                    Severity::Medium,
+                    format!(
+                        "`{}` calls selector {sel:#010x} on the contract at {}. That contract's code has no function with this selector and nothing that runs for an unknown one, so the call fails every time.",
+                        f.name, call.address
+                    ),
+                    vec![call.line.clone()],
+                    "Call a function the target implements, or point the call at the contract that does.",
+                    findings,
+                ),
+                (None, _) if call.sends_value && !catch_all(true) => tell(
+                    "value-to-non-payable",
+                    "Ether is sent to a contract that does not accept it",
+                    Severity::Medium,
+                    format!(
+                        "`{}` sends ether with no function selected to the contract at {}, whose code has no payable receive or fallback. The transfer fails every time.",
+                        f.name, call.address
+                    ),
+                    vec![call.line.clone()],
+                    "Send value through a payable function of the target, or to an address that accepts plain transfers.",
+                    findings,
+                ),
+                _ => {}
+            }
+            let Some((hex, g)) = target else { continue };
+            if call.sends_value && g.mutability != crate::function::Mutability::Payable {
+                tell(
+                    "value-to-non-payable",
+                    "Ether is sent to a contract that does not accept it",
+                    Severity::Medium,
+                    format!(
+                        "`{}` sends ether with its call to `{}` on the contract at {}, and that function reverts when it receives any. The call fails whenever the amount is not zero.",
+                        f.name, g.name, call.address
+                    ),
+                    vec![call.line.clone()],
+                    "Send value only to a payable function.",
+                    findings,
+                );
+            }
+            let tag = format!("[{hex}]");
+            let rated: Vec<&Finding> = report
+                .findings
+                .iter()
+                .filter(|x| {
+                    x.severity <= Severity::High
+                        && x.function
+                            .as_deref()
+                            .is_some_and(|name| name.contains(&tag))
+                })
+                .collect();
+            let Some(worst) = rated.iter().map(|x| x.severity).min() else {
+                continue;
+            };
+            let titles: Vec<String> = rated
+                .iter()
+                .take(3)
+                .map(|x| format!("{} ({})", x.title, x.id))
+                .collect();
+            tell(
+                "linked-callee-defect",
+                "A called function has a serious finding in its own contract's report",
+                if worst == Severity::Critical { Severity::High } else { Severity::Medium },
+                format!(
+                    "`{}` calls `{}` on the contract at {}. That contract's own report rates this function {}: {}. What this contract takes from the call is only as sound as that function.",
+                    f.name,
+                    g.name,
+                    call.address,
+                    if worst == Severity::Critical { "critical" } else { "high" },
+                    titles.join("; "),
+                ),
+                vec![call.line.clone()],
+                "Review the linked contract's finding before relying on this call, and check what this contract does when the call misbehaves.",
+                findings,
+            );
         }
     }
 }

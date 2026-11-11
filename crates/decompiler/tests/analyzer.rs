@@ -1089,3 +1089,99 @@ fn an_entry_raised_without_the_total_that_moves_with_it_is_reported() {
         "a step of one is a counter, not an amount"
     );
 }
+
+const LINKED: &str = "0x00000000000000000000000000000000000000b1";
+
+/// A call with the four-byte payload `selector` and `value` wei to the fixed address `to`.
+fn call_fixed(to: &str, selector: &str, value: &str) -> String {
+    format!(
+        "PUSH4 {selector} PUSH1 0xe0 SHL PUSH1 0x80 MSTORE PUSH1 0x00 PUSH1 0x00 PUSH1 0x04 \
+         PUSH1 0x80 {value} PUSH20 {to} GAS CALL POP"
+    )
+}
+
+/// Findings of the linked-contract rules on `root` analysed with `linked` fetched at `LINKED`.
+fn link_ids(root: &[u8], linked: &[u8]) -> Vec<String> {
+    let mut c = decompile::decompile(root, &Options::default());
+    let mut lc = decompile::decompile(linked, &Options::default());
+    lc.address = Some(LINKED.into());
+    c.linked = vec![lc];
+    let ours = [
+        "linked-call-unanswered",
+        "value-to-non-payable",
+        "linked-callee-defect",
+        "approval-to-open-spender",
+    ];
+    analyze::analyze(&c)
+        .findings
+        .iter()
+        .filter(|f| ours.contains(&f.id.as_str()))
+        .map(|f| format!("{} {:?}", f.id, f.severity))
+        .collect()
+}
+
+#[test]
+fn a_call_is_held_against_the_code_of_the_contract_it_reaches() {
+    let plain = dispatcher("STOP");
+    let rejects_value =
+        dispatcher("CALLVALUE ISZERO PUSH2 @np JUMPI PUSH1 0x00 DUP1 REVERT :np JUMPDEST STOP");
+    let no_value = "PUSH1 0x00";
+    let one_wei = "PUSH1 0x01";
+    let root = |body: String| dispatcher(&format!("{body} STOP"));
+
+    let known = root(call_fixed(LINKED, "0xaaaaaaaa", no_value));
+    assert!(link_ids(&known, &plain).is_empty());
+    assert!(
+        link_ids(&known, &[]).is_empty(),
+        "nothing is said about a contract whose code is not there"
+    );
+
+    let unknown = root(call_fixed(LINKED, "0x12345678", no_value));
+    assert_eq!(
+        link_ids(&unknown, &plain),
+        ["linked-call-unanswered Medium"]
+    );
+
+    let paid = root(call_fixed(LINKED, "0xaaaaaaaa", one_wei));
+    assert!(link_ids(&paid, &plain).is_empty());
+    assert_eq!(
+        link_ids(&paid, &rejects_value),
+        ["value-to-non-payable Medium"]
+    );
+
+    let bare = root(format!(
+        "PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 {one_wei} PUSH20 {LINKED} GAS CALL POP"
+    ));
+    assert_eq!(link_ids(&bare, &plain), ["value-to-non-payable Medium"]);
+}
+
+#[test]
+fn a_called_function_brings_its_own_serious_findings() {
+    let root = dispatcher(&format!(
+        "{} STOP",
+        call_fixed(LINKED, "0xaaaaaaaa", "PUSH1 0x00")
+    ));
+    let destroys = dispatcher("CALLER SELFDESTRUCT");
+    assert_eq!(link_ids(&root, &destroys), ["linked-callee-defect High"]);
+    assert!(link_ids(&root, &dispatcher("STOP")).is_empty());
+}
+
+#[test]
+fn an_approval_is_held_against_what_the_spender_lets_callers_do() {
+    let approve = format!(
+        "PUSH4 0x095ea7b3 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE PUSH20 {LINKED} PUSH1 0x84 MSTORE \
+         PUSH1 0x01 PUSH1 0xa4 MSTORE PUSH1 0x00 PUSH1 0x00 PUSH1 0x44 PUSH1 0x80 PUSH1 0x00 \
+         PUSH1 0x04 CALLDATALOAD GAS CALL POP STOP"
+    );
+    let root = dispatcher(&approve);
+    let pulls_from_anyone = dispatcher(
+        "PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0x84 \
+         MSTORE CALLER PUSH1 0xa4 MSTORE PUSH1 0x24 CALLDATALOAD PUSH1 0xc4 MSTORE PUSH1 0x00 \
+         PUSH1 0x00 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 PUSH1 0x44 CALLDATALOAD GAS CALL POP STOP",
+    );
+    assert_eq!(
+        link_ids(&root, &pulls_from_anyone),
+        ["approval-to-open-spender High"]
+    );
+    assert!(link_ids(&root, &dispatcher("STOP")).is_empty());
+}

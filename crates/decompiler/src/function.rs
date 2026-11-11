@@ -398,7 +398,7 @@ pub struct Param {
     pub index: u32,
     /// Inferred Solidity type (`uint256` when nothing narrows it).
     pub ty: String,
-    /// Placeholder name, `arg<index>`.
+    /// Printed name: the one the code implies, else `arg<index>`.
     pub name: String,
 }
 

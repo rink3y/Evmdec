@@ -339,10 +339,10 @@ fn old_multiowned_wallet_reads_as_source() {
     let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
     let src = &c.source;
     for s in [
-        "function confirm(bytes32 arg0)",
-        "function revoke(bytes32 arg0)",
-        "function changeOwner(address arg0, address arg1)",
-        "function kill(address arg0)",
+        "function confirm(bytes32 key)",
+        "function revoke(bytes32 key)",
+        "function changeOwner(address account, address account2)",
+        "function kill(address recipient)",
         "event ConfirmationNeeded(",
         "event MultiTransact(",
     ] {
@@ -357,7 +357,7 @@ fn old_multiowned_wallet_reads_as_source() {
         "{src}"
     );
     assert!(
-        src.contains("stor_2[isOwner[address(arg0)]]"),
+        src.contains("stor_2[isOwner[address(account)]]"),
         "owners[ownerIndex]"
     );
     assert!(
@@ -378,11 +378,11 @@ fn old_multiowned_wallet_reads_as_source() {
     );
     assert!(src.contains("stor_260.length = prev_stor_260_length + 1;"));
     assert!(
-        src.contains("function execute(address arg0, uint256 arg1, bytes arg2) external payable returns (bytes32)"),
+        src.contains("function execute(address target, uint256 amount, bytes arg2) external payable returns (bytes32)"),
         "{src}"
     );
     assert!(src.contains(
-        "function hasConfirmed(bytes32 arg0, address arg1) external payable returns (bool)"
+        "function hasConfirmed(bytes32 arg0, address account) external payable returns (bool)"
     ));
     assert!(src.contains("mapping(bytes32 => uint256) stor_259;"));
     assert!(src.contains("require(prev_stor_260_length < stor_260.length);"));
@@ -455,7 +455,7 @@ fn balancer_bpool_reads_as_source() {
     let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
     let src = &c.source;
     for s in [
-        "function joinswapPoolAmountOut(address arg0, uint256 arg1, uint256 arg2)",
+        "function joinswapPoolAmountOut(address target, uint256 amount, uint256 arg2)",
         "function swapExactAmountIn(",
         "function calcSingleInGivenPoolOut(",
         "event LOG_SWAP(",
@@ -598,13 +598,13 @@ fn types_follow_values_through_helpers_and_range_checks() {
     assert!(curve.contains("function func_8da5cb5b() external view returns (address)"));
     let compound = evmdec::decompile::decompile(&by_name("compound_ceth"), &opts).source;
     assert!(
-        compound
-            .contains("function func_a9059cbb(address arg0, uint256 arg1) external returns (bool)"),
+        compound.contains(
+            "function func_a9059cbb(address account, uint256 arg1) external returns (bool)"
+        ),
         "{compound}"
     );
-    assert!(
-        compound.contains("function func_0xe3c(address arg0, address arg1, uint256 arg2) internal")
-    );
+    assert!(compound
+        .contains("function func_0xe3c(address account, address account2, uint256 arg2) internal"));
     let ens = evmdec::decompile::decompile(&by_name("ens_registry"), &opts).source;
     assert!(ens.contains("mapping(bytes32 => "), "{ens}");
     assert!(ens.contains("external returns (bytes32)"), "{ens}");
@@ -638,7 +638,7 @@ fn types_use_validators_precompiles_and_literals() {
     }
     let uni = source("uni_token");
     assert!(
-        uni.contains("uint256 arg3, uint8 arg4, bytes32 arg5, bytes32 arg6) external"),
+        uni.contains("uint256 deadline, uint8 v, bytes32 r, bytes32 s) external"),
         "ecrecover arguments"
     );
     let multicall = source("multicall3");
@@ -648,7 +648,7 @@ fn types_use_validators_precompiles_and_literals() {
     );
     let vat = source("maker_vat");
     assert!(
-        vat.contains("function func_1a0b287e(uint256 arg0, bytes32 arg1, uint256 arg2) external"),
+        vat.contains("function func_1a0b287e(uint256 key, bytes32 arg1, uint256 value) external"),
         "text literal comparison"
     );
 }
@@ -675,4 +675,80 @@ fn declared_types_flow_into_storage() {
         "a static tuple takes several words and ends the count"
     );
     assert_eq!(declared_words(&params(&["uint256[3]", "address"])), vec![]);
+}
+
+/// Names the code implies where no signature supplies one: storage by role, helpers by what
+/// they do, parameters by how they are used.
+#[test]
+fn defaults_give_way_to_names_the_code_implies() {
+    let source = |name: &str| -> String {
+        let code = corpus()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, code)| code)
+            .expect("fixture present");
+        evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source
+    };
+    let usdt = source("usdt");
+    for line in [
+        "address owner; // slot 0x0 bytes 0..20",
+        "uint256 totalSupply; // slot 0x1",
+        "mapping(address => uint256) balances; // slot 0x2",
+        "mapping(address => mapping(address => uint256)) allowances; // slot 0x5",
+        "function _transfer(address from, address to, uint256 amount) internal",
+        "function _pause() internal",
+    ] {
+        assert!(usdt.contains(line), "usdt: missing `{line}`");
+    }
+    let pair = source("univ2_pair");
+    assert!(
+        pair.contains("uint256 reentrancyLock; // slot 0xc"),
+        "lock by its toggling"
+    );
+    let weth = source("weth9");
+    for line in [
+        "function transferFrom(address from, address to, uint256 amount) external",
+        "function balanceOf(address account) external view",
+        "function _withdrawal(uint256 amount) internal",
+    ] {
+        assert!(weth.contains(line), "weth9: missing `{line}`");
+    }
+    let uni = source("uni_token");
+    assert!(
+        uni.contains("uint256 deadline, uint8 v, bytes32 r, bytes32 s) external"),
+        "signature parts and deadline are named"
+    );
+}
+
+/// A statement in a helper shared by two external functions is one finding, whatever each
+/// caller names the argument it passes: the Safe's two module entry points reach the same
+/// call and the same delegatecall.
+#[test]
+fn a_shared_helper_site_is_one_finding_under_any_parameter_names() {
+    let code = corpus()
+        .into_iter()
+        .find(|(n, _)| n == "safe_l2_130")
+        .map(|(_, code)| code)
+        .expect("fixture present");
+    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    let report = evmdec::analyze::analyze(&c);
+    let shared: Vec<&evmdec::analyze::Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.id == "arbitrary-delegatecall")
+        .filter(|f| f.function.as_deref().is_some_and(|n| n.contains("(+1)")))
+        .collect();
+    assert_eq!(
+        shared.len(),
+        1,
+        "{:?}",
+        report
+            .findings
+            .iter()
+            .map(|f| (&f.id, &f.function))
+            .collect::<Vec<_>>()
+    );
+    assert!(shared[0]
+        .description
+        .contains("The same code is reached from"));
 }

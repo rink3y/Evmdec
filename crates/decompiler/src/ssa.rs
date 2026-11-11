@@ -265,6 +265,28 @@ pub fn field_read(e: ExprId) -> Option<FieldRef> {
     }
 }
 
+/// `(value << s) & (mask << s)`: the new field value masked after it is moved into place.
+fn shifted_then_masked(e: ExprId) -> Option<FieldWrite> {
+    let Node::Op(op::AND, w) = expr::node(e) else {
+        return None;
+    };
+    [(w[0], w[1]), (w[1], w[0])].into_iter().find_map(|(m, x)| {
+        let m = expr::as_const(m)?;
+        let shift = m.trailing_zeros();
+        let Node::Op(op::SHL, v) = expr::node(x) else {
+            return None;
+        };
+        let moved = expr::as_const(v[0]).filter(|s| s.fits_u64())?.low_u64();
+        (shift > 0 && shift < 256 && moved == u64::from(shift) && (m >> shift).is_low_mask()).then(
+            || FieldWrite {
+                bit_offset: shift,
+                bits: m.count_ones(),
+                value: v[1],
+            },
+        )
+    })
+}
+
 /// A write of part of a slot's word: the compiler's read-modify-write
 /// `(old & ~(mask << s)) | ((value & mask) << s)`, where `old` reads `key`.
 pub fn field_write(key: ExprId, val: ExprId) -> Option<FieldWrite> {
@@ -288,6 +310,9 @@ pub fn field_write(key: ExprId, val: ExprId) -> Option<FieldWrite> {
         let Some(cleared) = cleared_bits(old) else {
             continue;
         };
+        if let Some(w) = shifted_then_masked(new) {
+            return Some(w);
+        }
         let (shift, inner) = match expr::node(new) {
             Node::Op(op::SHL, w) if expr::as_const(w[0]).is_some_and(|s| s.fits_u64()) => {
                 (expr::as_const(w[0]).map_or(0, |s| s.low_u64() as u32), w[1])

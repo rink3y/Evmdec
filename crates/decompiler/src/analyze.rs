@@ -2312,19 +2312,14 @@ pub fn analyze(c: &Contract) -> Report {
     let ctx = ctx;
     let mut findings: Vec<Finding> = Vec::new();
     let mut report = Report::default();
-    let callee_returns: HashMap<usize, Vec<String>> = c
-        .functions
-        .iter()
-        .filter(|f| f.kind == FnKind::Internal)
-        .map(|f| (f.pc, f.returns.clone()))
-        .collect();
+    let callees = decompile::Callees::of(&c.functions);
     let names_for = |f: &Function| -> Names {
         decompile::make_names(
             f,
             &c.storage,
             c.compiler.layout,
             &c.string_loaders,
-            &callee_returns,
+            &callees,
         )
     };
 
@@ -3292,7 +3287,7 @@ pub fn analyze(c: &Contract) -> Report {
                 " with no access control found".to_string()
             };
             let where_ = match ev.callee {
-                Some(pc) => format!(" (in the helper `func_{:#x}`)", pc),
+                Some(pc) => format!(" (in the helper `{}`)", names.callee_name(pc)),
                 None => String::new(),
             };
             push(&mut findings, "selfdestruct", title, sev, conf, Some(f), Some(ev.pc),
@@ -4050,7 +4045,21 @@ pub fn analyze(c: &Contract) -> Report {
 
     let mut seen = HashSet::new();
     findings.retain(|f| seen.insert((f.id.clone(), f.function.clone(), f.pc, f.title.clone())));
-    let mut findings = merge_findings(findings);
+    let positions: HashMap<String, Vec<(String, String)>> = c
+        .functions
+        .iter()
+        .filter(|f| f.kind == FnKind::External)
+        .map(|f| {
+            let renamed = f
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), format!("arg{}", p.index)))
+                .filter(|(name, position)| name != position)
+                .collect();
+            (display_name(f), renamed)
+        })
+        .collect();
+    let mut findings = merge_findings(findings, &positions);
     let reentrant: HashSet<Option<String>> = findings
         .iter()
         .filter(|f| f.id == "reentrancy")
@@ -4497,7 +4506,7 @@ fn silent_guard_findings(ctx: &Ctx, findings: &mut Vec<Finding>) {
             &ctx.c.storage,
             ctx.c.compiler.layout,
             &ctx.c.string_loaders,
-            &HashMap::new(),
+            &decompile::Callees::of(&ctx.c.functions),
         );
         for nd in &l.nodes {
             let Term::Branch {
@@ -5310,10 +5319,54 @@ fn strip_versions(e: ExprId, memo: &mut HashMap<ExprId, ExprId>) -> ExprId {
     )
 }
 
+/// The evidence of `f` with its function's parameter names put back to their positions
+/// (`arg0`, `arg1`): a helper's statement is printed with each caller's arguments substituted,
+/// and two callers may name the same position differently. A word followed by a colon is a
+/// call option (`value:`), not a parameter.
+fn positional_evidence(
+    f: &Finding,
+    params: &HashMap<String, Vec<(String, String)>>,
+) -> Vec<String> {
+    let Some(renames) = f.function.as_ref().and_then(|name| params.get(name)) else {
+        return f.evidence.clone();
+    };
+    f.evidence
+        .iter()
+        .map(|line| {
+            let mut out = String::with_capacity(line.len());
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if !(c.is_ascii_alphabetic() || c == '_') {
+                    out.push(c);
+                    continue;
+                }
+                let mut word = String::from(c);
+                while let Some(n) = chars
+                    .peek()
+                    .filter(|n| n.is_ascii_alphanumeric() || **n == '_')
+                {
+                    word.push(*n);
+                    chars.next();
+                }
+                let option = chars.peek() == Some(&':');
+                let member = out.ends_with('.');
+                match renames.iter().find(|(name, _)| *name == word) {
+                    Some((_, position)) if !option && !member => out.push_str(position),
+                    _ => out.push_str(&word),
+                }
+            }
+            out
+        })
+        .collect()
+}
+
 /// Fold findings that describe one defect several times: the same rule firing at several sites
 /// of one function (a loop body with many calls), and the same site reached from several
 /// external functions through a shared helper. The report then has one entry per defect.
-fn merge_findings(findings: Vec<Finding>) -> Vec<Finding> {
+fn merge_findings(
+    findings: Vec<Finding>,
+    params: &HashMap<String, Vec<(String, String)>>,
+) -> Vec<Finding> {
     let conf_rank = |c: Confidence| match c {
         Confidence::High => 2,
         Confidence::Medium => 1,
@@ -5362,7 +5415,7 @@ fn merge_findings(findings: Vec<Finding>) -> Vec<Finding> {
                 p.id == f.id
                     && p.title == f.title
                     && p.pc == f.pc
-                    && p.evidence == f.evidence
+                    && positional_evidence(p, params) == positional_evidence(&f, params)
                     && p.function.is_some()
                     && f.function.is_some()
             })

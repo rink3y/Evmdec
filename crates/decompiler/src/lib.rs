@@ -10,6 +10,7 @@ pub mod hex;
 pub mod idiom;
 pub mod keccak;
 pub mod metadata;
+pub mod naming;
 pub mod opcode;
 pub mod u256;
 

@@ -394,7 +394,11 @@ fn a_value_compared_signed_and_unsigned_is_reported() {
     );
     let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
     let f = finding(&r, "signed-unsigned-confusion").unwrap_or_else(|| panic!("{:?}", ids(&r)));
-    assert!(f.description.contains("arg"), "{}", f.description);
+    assert!(
+        f.description.contains("Parameter `arg0`"),
+        "the finding names the parameter as the code prints it: {}",
+        f.description
+    );
 }
 
 #[test]
@@ -926,4 +930,59 @@ fn a_view_reporting_the_full_limit_is_a_reference() {
         Some("func_aaaaaaaa [0xaaaaaaaa]"),
         "{f:?}"
     );
+}
+
+fn source_of(code: &[u8]) -> String {
+    decompile::decompile(code, &Options::default()).source
+}
+
+#[test]
+fn names_come_from_roles_the_code_shows() {
+    const OWNER_ONLY: &str =
+        "PUSH1 0x07 SLOAD CALLER EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST";
+    // Two functions compare the caller with slot 7; a third moves an amount between two
+    // entries of the mapping at slot 3.
+    let gated_a = OWNER_ONLY.replace("@ok", "@oka").replace(":ok", ":oka");
+    let gated_b = OWNER_ONLY.replace("@ok", "@okb").replace(":ok", ":okb");
+    let entry = |word: &str| {
+        format!("PUSH1 {word} CALLDATALOAD PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256")
+    };
+    let moved = format!(
+        "{from} DUP1 SLOAD PUSH1 0x44 CALLDATALOAD SWAP1 SUB SWAP1 SSTORE \
+         {to} DUP1 SLOAD PUSH1 0x44 CALLDATALOAD ADD SWAP1 SSTORE STOP",
+        from = entry("0x04"),
+        to = entry("0x24"),
+    );
+    let code = dispatcher3(
+        &format!("{gated_a} PUSH1 0x01 PUSH1 0x09 SSTORE STOP"),
+        &format!("{gated_b} PUSH1 0x02 PUSH1 0x0a SSTORE STOP"),
+        &moved,
+    );
+    let src = source_of(&code);
+    assert!(
+        src.contains(" owner; // slot 0x7"),
+        "caller guard names the slot: {src}"
+    );
+    assert!(
+        src.contains(" balances; // slot 0x3"),
+        "two-sided mapping is a ledger: {src}"
+    );
+    let header = src
+        .lines()
+        .find(|l| l.contains("function func_cccccccc("))
+        .unwrap_or_else(|| panic!("{src}"));
+    assert_eq!(
+        header.trim(),
+        "function func_cccccccc(address from, address to, uint256 amount) external payable {"
+    );
+}
+
+#[test]
+fn a_one_sided_entry_is_not_a_transfer_party() {
+    // records[key] += amount, with nothing lowered anywhere: the key is not a recipient.
+    let credit = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD PUSH1 0x24 CALLDATALOAD ADD SWAP1 SSTORE STOP";
+    let src = source_of(&dispatcher(credit));
+    assert!(!src.contains(" to,") && !src.contains(" from,"), "{src}");
+    assert!(src.contains("uint256 amount) external"), "{src}");
+    assert!(!src.contains(" balances;"), "{src}");
 }

@@ -7,6 +7,7 @@ use crate::expr::{self, ExprId, Node};
 use crate::function::{self, FnKind, Mutability, Param};
 use crate::lift::{self, Lifted, Lifter, Stmt, Term};
 use crate::metadata::{self, BytecodeInfo, CodeKind};
+use crate::naming;
 use crate::opcode as op;
 use crate::sigs;
 use crate::ssa::{self, ShapeStep, Step};
@@ -1205,7 +1206,10 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         selectors: selectors_called,
     } = inventories(&functions, layout, &string_slots);
     refine_storage_types(&mut storage, &env);
-    name_storage_from_getters(&functions, &mut storage);
+    name_storage_from_getters(&functions, &mut storage, layout);
+    naming::name_storage(&functions, &mut storage, layout, !opts.no_sigs);
+    naming::name_helpers(&mut functions, &storage, layout, !opts.no_sigs);
+    naming::name_params(&mut functions, &storage, layout);
     for st in scan_strings(code, code_end, &embedded_ranges) {
         if !strings.iter().any(|x| x.contains(&st)) {
             strings.push(st);
@@ -1232,18 +1236,14 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         })
         .map(|f| f.pc)
         .collect();
-    let callee_returns: HashMap<usize, Vec<String>> = functions
-        .iter()
-        .filter(|f| f.kind == FnKind::Internal)
-        .map(|f| (f.pc, f.returns.clone()))
-        .collect();
+    let callees = Callees::of(&functions);
     let array_resizers: HashSet<usize> = functions
         .iter()
         .filter(|f| f.kind == FnKind::Internal && f.lifted.as_ref().is_some_and(is_array_resizer))
         .map(|f| f.pc)
         .collect();
     for f in functions.iter_mut() {
-        let mut names = make_names(f, &storage, layout, &loaders, &callee_returns);
+        let mut names = make_names(f, &storage, layout, &loaders, &callees);
         names.hide_checked = solc08;
         names.pure_callees = pure_callees.clone();
         names.array_resizers = array_resizers.clone();
@@ -1631,7 +1631,11 @@ fn is_array_resizer(l: &Lifted) -> bool {
 /// A public getter whose signature is known names the variable it returns: a function that only
 /// reads one slot (or one packed field, or one mapping entry keyed by its parameter) and returns
 /// it gives that slot its name.
-fn name_storage_from_getters(functions: &[Function], storage: &mut [StorageVar]) {
+fn name_storage_from_getters(
+    functions: &[Function],
+    storage: &mut [StorageVar],
+    layout: MappingLayout,
+) {
     let mut taken: HashSet<String> = storage.iter().map(|s| s.name.clone()).collect();
     for f in functions {
         let (FnKind::External, Some(sig), Some(l)) = (f.kind, &f.signature, &f.lifted) else {
@@ -1700,7 +1704,11 @@ fn name_storage_from_getters(functions: &[Function], storage: &mut [StorageVar])
             (Some((k, _, _)), _) => Some(k),
             (None, Node::SLoad(key, false, _)) => match expr::node(key) {
                 Node::Const(k) => emit::hashed_slot(k).map(|(s, _)| s).or(Some(k)),
-                _ => emit::element_root(key),
+                _ => emit::element_root(key).or_else(|| {
+                    ssa::slot_path(key, layout)
+                        .filter(|p| p.steps.iter().all(|s| matches!(s, ssa::Step::Key(_))))
+                        .map(|p| p.root)
+                }),
             },
             _ => None,
         };
@@ -1741,18 +1749,41 @@ fn name_storage_from_getters(functions: &[Function], storage: &mut [StorageVar])
     }
 }
 
+/// What printing a call to an internal function needs: its name and its return types, by
+/// entry pc.
+#[derive(Clone, Debug, Default)]
+pub struct Callees {
+    /// Return types in declaration order.
+    pub returns: HashMap<usize, Vec<String>>,
+    /// Printed name.
+    pub names: HashMap<usize, String>,
+}
+
+impl Callees {
+    /// The internal functions of `functions`.
+    #[must_use]
+    pub fn of(functions: &[Function]) -> Callees {
+        let internal = || functions.iter().filter(|f| f.kind == FnKind::Internal);
+        Callees {
+            returns: internal().map(|f| (f.pc, f.returns.clone())).collect(),
+            names: internal().map(|f| (f.pc, f.name.clone())).collect(),
+        }
+    }
+}
+
 /// Naming context for printing `f`: parameters, internal-unit arguments, storage variables and
-/// packed fields, aliases for the results of storage-string loaders, and the helper results
-/// known to be booleans (`callee_returns` maps a helper's entry pc to its return types).
+/// packed fields, aliases for the results of storage-string loaders, the names of the helpers
+/// it calls and which of their results are booleans.
 pub fn make_names(
     f: &Function,
     storage: &[StorageVar],
     layout: MappingLayout,
     loaders: &HashMap<usize, U256>,
-    callee_returns: &HashMap<usize, Vec<String>>,
+    callees: &Callees,
 ) -> Names {
     let mut n = Names {
         layout,
+        callee_names: callees.names.clone(),
         ..Default::default()
     };
     if f.kind != FnKind::Internal {
@@ -1785,7 +1816,11 @@ pub fn make_names(
         let k = l.ret_slot.map(|k| k as usize).unwrap_or(l.n_args);
         for i in 0..l.n_args.max(k + 1) {
             let name = if i < k {
-                format!("arg{}", k - 1 - i)
+                let index = k - 1 - i;
+                match f.params.get(index).filter(|_| f.kind == FnKind::Internal) {
+                    Some(p) => p.name.clone(),
+                    None => format!("arg{index}"),
+                }
             } else if i == k && l.ret_slot.is_some() {
                 "__return_pc".to_string()
             } else {
@@ -1833,7 +1868,7 @@ pub fn make_names(
                             .unwrap_or_else(|| format!("stor_{}", k.to_decimal()));
                         n.aliases.insert(*r, name);
                     }
-                    if let Some(tys) = callee_returns.get(callee) {
+                    if let Some(tys) = callees.returns.get(callee) {
                         for (r, ty) in results.iter().zip(tys) {
                             if ty == "bool" {
                                 n.bools.insert(*r);
@@ -2878,9 +2913,9 @@ pub fn fmt_function_header(f: &Function) -> String {
         FnKind::Constructor => s.push_str("    constructor() {\n"),
         FnKind::Internal => {
             let params: Vec<String> = (0..f.n_args)
-                .map(|i| {
-                    let ty = f.params.get(i).map_or("uint256", |p| p.ty.as_str());
-                    format!("{} arg{}", ty, i)
+                .map(|i| match f.params.get(i) {
+                    Some(p) => format!("{} {}", p.ty, p.name),
+                    None => format!("uint256 arg{i}"),
                 })
                 .collect();
             let m = match f.mutability {

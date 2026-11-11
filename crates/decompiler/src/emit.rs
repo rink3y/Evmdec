@@ -133,6 +133,8 @@ pub struct Names {
     pub fields: HashMap<(U256, u32, u32), String>,
     /// internal-unit argument index -> name
     pub args: HashMap<u32, String>,
+    /// entry pc of an internal function -> its name
+    pub callee_names: HashMap<usize, String>,
     /// storage slot (constant) -> name
     pub storage: HashMap<U256, String>,
     /// First slots of fixed-size storage arrays (`uint[256] owners` occupies `base..base+256`).
@@ -182,6 +184,15 @@ pub struct Names {
 const TEMP_THRESHOLD: usize = 160;
 
 impl Names {
+    /// The printed name of the internal function at `pc`.
+    #[must_use]
+    pub fn callee_name(&self, pc: usize) -> String {
+        self.callee_names
+            .get(&pc)
+            .cloned()
+            .unwrap_or_else(|| format!("func_{pc:#x}"))
+    }
+
     /// Temporaries created while rendering the last statement(s); the caller prints them first.
     pub fn take_temps(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.temps.borrow_mut())
@@ -1866,7 +1877,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             ..
         } => {
             let a: Vec<String> = args.iter().map(|x| fmt_expr(*x, n)).collect();
-            let call = format!("func_{:#x}({})", callee, a.join(", "));
+            let call = format!("{}({})", n.callee_name(*callee), a.join(", "));
             match results.len() {
                 0 => format!("{};", call),
                 1 => format!("{} = {};", fmt_expr(results[0], n), call),

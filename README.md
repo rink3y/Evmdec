@@ -37,7 +37,7 @@ Every stage is in `crates/decompiler`:
 | `cfg` | jump resolution by compositional summaries; dispatcher, internal functions, argument and return counts |
 | `expr`, `lift`, `ssa`, `idiom` | hash-consed expression IR, symbolic execution of blocks, def-use index, compiler idioms |
 | `types`, `type_rules` | type recovery as constraint solving over parameters, storage, helpers and merges |
-| `structure`, `emit`, `function`, `sigs`, `sigdb` | loops, conditionals and short-circuits; printing; signature dictionary and local index |
+| `structure`, `emit`, `function`, `sigs`, `sigdb`, `naming` | loops, conditionals and short-circuits; printing; signature dictionary and local index; names inferred from roles |
 | `compiler` | compiler version and feature fingerprints when the metadata is missing |
 | `analyze`, `confirm`, `invariant`, `exec` | security rules, concrete confirmation of reachable findings, invariant search, whole-frame executor |
 | `interp`, `verify` | reference EVM interpreter and the block oracle |
@@ -61,7 +61,16 @@ Every stage is in `crates/decompiler`:
   locals for values the source held in locals, the previous value of a slot read before it is
   overwritten, loops folded back together after control-flow recovery peeled an iteration.
 - Names. A built-in dictionary of about 1,300 selectors, topics and errors; an optional local
-  index of the whole public signature database; online lookup with `--lookup`.
+  index of the whole public signature database; online lookup with `--lookup`. Where no
+  signature gives a name, the code does: a variable is named by its getter, by the setter that
+  writes it (`setFee` writes `fee`), by the event announcing its change, or by its role (the
+  `owner` the guards compare the caller with, the `reentrancyLock` toggled around calls, the
+  `balances` a transfer debits and credits with their `allowances` and `totalSupply`). An
+  internal function is named by what it does (`_transfer` emits `Transfer`, `_callBalanceOf`
+  makes one call, `_onlyOwner` checks the caller). A parameter is named by its use: `from`,
+  `to` and `amount` on a ledger, `deadline`, the `v`, `r`, `s` given to `ecrecover`, a call
+  `target`, a `recipient`, `newFee` for the value stored into `fee`. A name is given only
+  where `stor_3`, `func_0x1fbb` or `arg0` would stand, and only when the type fits the role.
 
 ## Composites and linked contracts
 
@@ -287,7 +296,9 @@ root turns on `#![warn(missing_docs)]`, and clippy is kept at zero warnings.
 - Memory accesses through different symbolic bases are assumed not to alias. This holds for
   compiler output; a hand-written contract that relies on aliasing decompiles imprecisely, and
   the oracle reports such states as inconclusive rather than hiding them.
-- Internal functions are named `func_<pc>`, and parameters nothing narrows are `uint256`.
+- Internal functions the code does not characterise keep the name `func_<pc>`, and parameters
+  nothing narrows are `uint256`. Names inferred from roles describe what the code does, not
+  what the author called it.
 - Dynamic ABI encodings the printer does not recognise appear as the memory operations the
   compiler emitted rather than as `abi.encode`.
 - Vyper internal calls pass arguments through fixed memory, so some values in Vyper output

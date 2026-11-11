@@ -144,6 +144,13 @@ pub struct Names {
     pub blocks: Option<Blocks>,
     /// storage slot (constant) -> name
     pub storage: HashMap<U256, String>,
+    /// Struct members of mapping and array elements: (root slot, slot offset in the element)
+    /// -> member name.
+    pub members: HashMap<(U256, u64), String>,
+    /// Packed fields of struct members: (root slot, slot offset, byte offset, bits) -> name.
+    pub member_fields: HashMap<(U256, u64, u32, u32), String>,
+    /// Roots whose elements are structs -> number of keys and indices that select an element.
+    pub struct_depth: HashMap<U256, usize>,
     /// First slots of fixed-size storage arrays (`uint[256] owners` occupies `base..base+256`).
     pub array_bases: BTreeSet<U256>,
     /// Loads that read a slot's value from before a store printed earlier on the path: printed
@@ -1064,9 +1071,58 @@ fn base_name(e: ExprId, n: &Names, space: SlotSpace) -> String {
     }
 }
 
+/// The struct member a storage key selects: the root, the member's slot offset in the element
+/// and its name. A key that selects a whole element of a struct root is the member at offset 0.
+fn struct_member(e: ExprId, n: &Names) -> Option<(U256, u64, &String)> {
+    if n.struct_depth.is_empty() {
+        return None;
+    }
+    let path = crate::ssa::slot_path(e, n.layout)?;
+    let depth = *n.struct_depth.get(&path.root)?;
+    let selects = |steps: &[crate::ssa::Step]| {
+        steps.len() == depth
+            && steps
+                .iter()
+                .all(|s| !matches!(s, crate::ssa::Step::Offset(_)))
+    };
+    let offset = match path.steps.split_last() {
+        Some((crate::ssa::Step::Offset(o), element)) if selects(element) => *o,
+        _ if selects(&path.steps) => 0,
+        _ => return None,
+    };
+    let name = n.members.get(&(path.root, offset))?;
+    Some((path.root, offset, name))
+}
+
+/// `element.field` for a read of a packed field of a struct member.
+fn member_field_read(e: ExprId, n: &Names) -> Option<String> {
+    if n.member_fields.is_empty() {
+        return None;
+    }
+    let field = crate::ssa::field_read(e)?;
+    member_field(field.key, field.bit_offset, field.bits, n)
+}
+
+/// `element.field` for the packed field at `bit_offset` of the struct member `key` selects.
+fn member_field(key: ExprId, bit_offset: u32, bits: u32, n: &Names) -> Option<String> {
+    let (root, offset, member) = struct_member(key, n)?;
+    let name = n.member_fields.get(&(root, offset, bit_offset / 8, bits))?;
+    let whole = fmt_slot(key, n, SlotSpace::Persistent);
+    Some(format!("{}{}", whole.strip_suffix(member.as_str())?, name))
+}
+
 /// Render a storage key: a named variable or `stor_N` for a constant, `name[key]` for mapping and
-/// array elements, `name.fieldN` for struct fields.
+/// array elements, `name[key].member` for the members of a struct element.
 pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
+    let text = fmt_slot_path(e, n, space);
+    match struct_member(e, n) {
+        Some((_, 0, name)) if space == SlotSpace::Persistent => format!("{text}.{name}"),
+        _ => text,
+    }
+}
+
+/// `fmt_slot` without the member a bare struct element stands for.
+fn fmt_slot_path(e: ExprId, n: &Names, space: SlotSpace) -> String {
     let prefix = match space {
         SlotSpace::Persistent => "stor",
         SlotSpace::Transient => "tstor",
@@ -1130,7 +1186,11 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
                     format!("{}[{}]", base_name(words[0], n, space), fmt_expr(idx, n))
                 }
                 Node::Keccak(words, 0) if words.len() == 2 => {
-                    format!("{}.field{}", fmt_slot(base, n, space), fmt_expr(idx, n))
+                    let member = match struct_member(e, n) {
+                        Some((_, _, name)) => name.clone(),
+                        None => format!("field{}", fmt_expr(idx, n)),
+                    };
+                    format!("{}.{}", fmt_slot_path(base, n, space), member)
                 }
                 _ => format!("{}[{}]", prefix, fmt_expr(e, n)),
             }
@@ -1177,6 +1237,9 @@ fn copy_source(kind: u8) -> &'static str {
 }
 
 fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
+    if let Some(text) = member_field_read(e, n) {
+        return (text, P_PRIMARY);
+    }
     if let Some(load) = element_typed_load(e, n) {
         return (fmt_expr(load, n), P_PRIMARY);
     }
@@ -1953,6 +2016,13 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                             _ => fmt_expr(value, n),
                         };
                         return format!("{} = {};", name, shown);
+                    }
+                }
+            }
+            if !*transient && !n.member_fields.is_empty() {
+                if let Some(w) = crate::ssa::field_write(*key, *val) {
+                    if let Some(field) = member_field(*key, w.bit_offset, w.bits, n) {
+                        return format!("{} = {};", field, fmt_expr(w.value, n));
                     }
                 }
             }

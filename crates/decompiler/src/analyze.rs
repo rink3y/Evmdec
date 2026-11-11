@@ -5608,6 +5608,36 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
                     s.writes,
                     tail(&s.slot)
                 ));
+                let owner = s.struct_name();
+                for m in &s.members {
+                    let cells: Vec<(String, &str, &str)> = match m.fields.is_empty() {
+                        true => vec![(String::new(), m.name.as_str(), m.ty.as_str())],
+                        false => m
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                let bytes = format!(
+                                    " bytes {}..{}",
+                                    f.offset,
+                                    f.offset + f.bits.div_ceil(8)
+                                );
+                                (bytes, f.name.as_str(), f.ty.as_str())
+                            })
+                            .collect(),
+                    };
+                    for (bytes, name, ty) in cells {
+                        out.push_str(&format!(
+                            "| {} +{}{} | {}.{} | {} | | |{}\n",
+                            s.slot,
+                            m.offset,
+                            bytes,
+                            owner,
+                            name,
+                            ty.replace('|', "\\|"),
+                            tail(&s.slot)
+                        ));
+                    }
+                }
             } else {
                 for fld in &s.fields {
                     out.push_str(&format!(

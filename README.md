@@ -55,7 +55,12 @@ Every stage is in `crates/decompiler`:
   from the topic count; custom errors; `require(cond, "reason")` and `Panic(...)`.
 - Storage. Mappings, dynamic and fixed arrays, packed fields (`uint112 reserve0; uint112
   reserve1; uint32 blockTimestampLast;`), strings, precomputed array slots, EIP-1967,
-  ZeppelinOS, diamond and ERC-7201 namespaced slots by name.
+  ZeppelinOS, diamond and ERC-7201 namespaced slots by name. A mapping or array whose
+  elements span several slots is declared with its struct (`struct Struct_264 { address
+  field0; uint256 field1; bytes field2; }`) and read by member (`stor_264[key].field1`):
+  members packed into one slot, byte strings, and arrays and mappings held inside the
+  element each get their own type, and a member takes its name from the getter that returns
+  it.
 - Readable code. Helpers (SafeMath, ABI coders, getters) inlined with their checks kept as
   `require` lines, checked arithmetic printed plain, `payable(to).transfer(v)`, `members.push(x)`,
   locals for values the source held in locals, the previous value of a slot read before it is

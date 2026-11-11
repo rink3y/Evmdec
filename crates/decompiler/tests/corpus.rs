@@ -384,7 +384,7 @@ fn old_multiowned_wallet_reads_as_source() {
     assert!(src.contains(
         "function hasConfirmed(bytes32 arg0, address account) external payable returns (bool)"
     ));
-    assert!(src.contains("mapping(bytes32 => uint256) stor_259;"));
+    assert!(src.contains("mapping(bytes32 => Struct_259) stor_259;"));
     assert!(src.contains("require(prev_stor_260_length < stor_260.length);"));
     assert!(
         !src.contains("require(stor_260.length < stor_260.length)"),
@@ -801,5 +801,65 @@ fn payloads_and_literals_read_as_values() {
     assert!(
         uni.contains("= ecrecover.staticcall(abi.encode("),
         "precompile by name"
+    );
+}
+
+/// Elements with members at several slot offsets are declared as structs and read by member:
+/// plain members, members packed into one slot, a byte string, and an array and a mapping held
+/// inside the element.
+#[test]
+fn struct_elements_are_declared_and_read_by_member() {
+    let source = |path: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+        let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default())
+    };
+    let wallet = source("../../testdata/regress/parity_wallet_v1.hex");
+    for line in [
+        "struct Struct_264 {",
+        "address field0; // slot +0",
+        "bytes field2; // slot +2",
+        "mapping(bytes32 => Struct_264) stor_264;",
+        "stor_264[key].field0.call{value: stor_264[key].field1}",
+    ] {
+        assert!(wallet.source.contains(line), "wallet: missing `{line}`");
+    }
+    let pending = wallet
+        .storage
+        .iter()
+        .find(|v| v.name == "stor_259")
+        .expect("the pending-operation mapping");
+    assert_eq!(pending.ty, "mapping(bytes32 => Struct_259)");
+    assert_eq!(pending.members.len(), 3);
+    assert!(pending.members.iter().all(|m| m.ty == "uint256"));
+
+    let registry = source("../../testdata/mainnet/ens_registry.hex").source;
+    for line in [
+        "address field1_0; // slot +1 bytes 0..20",
+        "uint64 field1_20; // slot +1 bytes 20..28",
+        "mapping(bytes32 => Struct_0) stor_0;",
+        "stor_0[key].field1_0",
+    ] {
+        assert!(registry.contains(line), "registry: missing `{line}`");
+    }
+
+    let vat = source("../../testdata/mainnet/maker_vat.hex").source;
+    assert!(vat.contains("require(stor_2[key].field1 == 0, \"Vat/ilk-already-init\");"));
+    assert!(vat.contains("stor_3[key][address(account)].field0"));
+
+    let roles = source("../../testdata/vuln/miso_batch_impl.hex");
+    let role = roles
+        .storage
+        .iter()
+        .find(|v| v.slot == "0x0")
+        .expect("the role registry");
+    let types: Vec<&str> = role.members.iter().map(|m| m.ty.as_str()).collect();
+    assert_eq!(
+        types,
+        ["address[]", "mapping(address => uint256)", "uint256"]
+    );
+    assert!(
+        role.members[0].name != "roleMemberCount",
+        "a count getter reads the head of the array, it does not name the array"
     );
 }

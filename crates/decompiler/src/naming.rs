@@ -402,11 +402,15 @@ impl<'a> Namer<'a> {
         Namer { storage, taken }
     }
 
-    /// Whether `t` exists and still has its default name.
+    /// Whether `t` exists and still has its default name. A mapping or array of structs is not
+    /// named here: a store that looks like a write of the variable is a write of one member.
     fn unnamed(&self, t: Target) -> bool {
         match canonical(self.storage, t) {
             Target::Var(slot) => self.storage.iter().any(|v| {
-                slot_of(v) == Some(slot) && v.fields.is_empty() && v.name.starts_with("stor_")
+                slot_of(v) == Some(slot)
+                    && v.fields.is_empty()
+                    && v.members.is_empty()
+                    && v.name.starts_with("stor_")
             }),
             Target::Field(slot, offset, bits) => self.storage.iter().any(|v| {
                 slot_of(v) == Some(slot)

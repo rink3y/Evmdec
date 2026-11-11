@@ -288,8 +288,26 @@ fn shifted_then_masked(e: ExprId) -> Option<FieldWrite> {
 }
 
 /// A write of part of a slot's word: the compiler's read-modify-write
-/// `(old & ~(mask << s)) | ((value & mask) << s)`, where `old` reads `key`.
+/// `(old & ~(mask << s)) | ((value & mask) << s)`, where `old` reads `key`. With nothing merged
+/// in, `old & ~(mask << s)` writes zero to the field.
 pub fn field_write(key: ExprId, val: ExprId) -> Option<FieldWrite> {
+    if let Node::Op(op::AND, w) = expr::node(val) {
+        for (a, b) in [(w[0], w[1]), (w[1], w[0])] {
+            let (Node::SLoad(k, false, _), Some(keep)) = (expr::node(a), expr::as_const(b)) else {
+                continue;
+            };
+            let field = !keep;
+            let shift = field.trailing_zeros();
+            if k == key && !field.is_zero() && (field >> shift).is_low_mask() {
+                return Some(FieldWrite {
+                    bit_offset: shift,
+                    bits: (field >> shift).bits(),
+                    value: expr::konst(U256::ZERO),
+                });
+            }
+        }
+        return None;
+    }
     let Node::Op(op::OR, v) = expr::node(val) else {
         return None;
     };

@@ -2,7 +2,7 @@
 
 use crate::cfg::{self, Program, Recovered};
 use crate::compiler;
-use crate::emit::{self, MappingLayout, Names};
+use crate::emit::{self, MappingLayout, Names, SlotSpace};
 use crate::expr::{self, ExprId, Node};
 use crate::function::{self, FnKind, Mutability, Param};
 use crate::lift::{self, Lifted, Lifter, Stmt, Term};
@@ -10,7 +10,7 @@ use crate::metadata::{self, BytecodeInfo, CodeKind};
 use crate::naming;
 use crate::opcode as op;
 use crate::sigs;
-use crate::ssa::{self, ShapeStep, Step};
+use crate::ssa::{self, Shape, ShapeStep, Step};
 use crate::types::{self, TypeEnv};
 use crate::u256::U256;
 use serde::Serialize;
@@ -108,6 +108,68 @@ pub struct StorageVar {
     /// Fields of a packed slot (several variables share the 32 bytes).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<StorageField>,
+    /// Members of the struct each element holds, when the elements span several slots.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<StructMember>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+/// One member of the struct a mapping or array element holds.
+pub struct StructMember {
+    /// Slot offset within the element.
+    pub offset: u64,
+    /// Printed name: `field<offset>` until something names it.
+    pub name: String,
+    /// Inferred type; `packed` when `fields` is set.
+    pub ty: String,
+    /// Fields sharing the member's slot.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<StorageField>,
+}
+
+impl StorageVar {
+    /// The name of the struct the variable's elements hold: `Struct_3` for `stor_3`,
+    /// `RecordsEntry` for `records`.
+    #[must_use]
+    pub fn struct_name(&self) -> String {
+        match self.name.strip_prefix("stor_") {
+            Some(suffix) => format!("Struct_{suffix}"),
+            None => {
+                let mut cs = self.name.chars();
+                let first = cs.next().map(|c| c.to_ascii_uppercase()).unwrap_or('S');
+                format!("{first}{}Entry", cs.as_str())
+            }
+        }
+    }
+
+    /// The declared type, with the struct's name where the elements are structs.
+    #[must_use]
+    pub fn declared_type(&self) -> String {
+        if self.members.is_empty() {
+            return self.ty.clone();
+        }
+        let name = self.struct_name();
+        match self.ty.rfind(" => ") {
+            Some(i) => {
+                let rest = &self.ty[i + 4..];
+                let end = rest.find([')', '[']).unwrap_or(rest.len());
+                format!("{}{}{}", &self.ty[..i + 4], name, &rest[end..])
+            }
+            None => {
+                let end = self.ty.find('[').unwrap_or(self.ty.len());
+                format!("{}{}", name, &self.ty[end..])
+            }
+        }
+    }
+}
+
+impl StructMember {
+    /// Is the member a mapping, an array or a byte string, whose slot is only the head of what
+    /// it holds?
+    #[must_use]
+    pub fn holds_many(&self) -> bool {
+        self.ty.starts_with("mapping(") || self.ty.ends_with("[]") || self.ty == "bytes"
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1206,10 +1268,14 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         selectors: selectors_called,
     } = inventories(&functions, layout, &string_slots);
     refine_storage_types(&mut storage, &env);
+    struct_members(&mut storage, &env, &hashed_slots(&functions, layout));
     name_storage_from_getters(&functions, &mut storage, layout);
     naming::name_storage(&functions, &mut storage, layout, !opts.no_sigs);
     naming::name_helpers(&mut functions, &storage, layout, !opts.no_sigs);
     naming::name_params(&mut functions, &storage, layout);
+    for var in storage.iter_mut().filter(|v| !v.members.is_empty()) {
+        var.ty = var.declared_type();
+    }
     for st in scan_strings(code, code_end, &embedded_ranges) {
         if !strings.iter().any(|x| x.contains(&st)) {
             strings.push(st);
@@ -1630,7 +1696,9 @@ fn is_array_resizer(l: &Lifted) -> bool {
 
 /// A public getter whose signature is known names the variable it returns: a function that only
 /// reads one slot (or one packed field, or one mapping entry keyed by its parameter) and returns
-/// it gives that slot its name.
+/// it gives that slot its name. A getter of one member of a struct element names the member,
+/// never the mapping that holds the structs; one that only tests a member against zero
+/// (`recordExists`) states a predicate and names nothing.
 fn name_storage_from_getters(
     functions: &[Function],
     storage: &mut [StorageVar],
@@ -1689,16 +1757,66 @@ fn name_storage_from_getters(
             continue;
         };
         let mut word = *word;
+        let mut tested = false;
         if let Node::Op(op::ISZERO, v) = expr::node(word) {
             if let Node::Op(op::ISZERO, w) = expr::node(v[0]) {
                 word = w[0];
+                tested = true;
             }
         }
+        let returned = word;
         let word = match expr::node(word) {
             Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
             Node::Op(op::AND, v) if expr::as_const(v[0]).is_some_and(|m| m.is_low_mask()) => v[1],
             _ => word,
         };
+        let read = ssa::field_read(returned)
+            .map(|f| (f.key, Some((f.bit_offset / 8, f.bits))))
+            .or_else(|| match expr::node(word) {
+                Node::SLoad(key, false, _) => Some((key, None)),
+                _ => None,
+            });
+        let member_of = read.and_then(|(key, part)| {
+            let path = ssa::slot_path(key, layout)?;
+            let var = storage.iter().position(|s| {
+                !s.members.is_empty() && U256::from_hex_str(&s.slot) == Some(path.root)
+            })?;
+            let depth = element_depth(&storage[var].ty);
+            let (offset, nested) = match path.steps.get(depth..)?.split_first() {
+                Some((Step::Offset(o), nested)) => (*o, nested),
+                _ => (0, &path.steps[depth..]),
+            };
+            Some((var, offset, part, !nested.is_empty()))
+        });
+        if let Some((var, offset, part, nested)) = member_of {
+            let Some(member) = storage[var].members.iter_mut().find(|m| m.offset == offset) else {
+                continue;
+            };
+            if member.holds_many() != nested {
+                continue;
+            }
+            let field = part.and_then(|(byte, bits)| {
+                member
+                    .fields
+                    .iter()
+                    .position(|f| f.offset == byte && f.bits == bits)
+            });
+            let ty = match field {
+                Some(i) => member.fields[i].ty.clone(),
+                None => member.ty.clone(),
+            };
+            let target = match field {
+                Some(i) => &mut member.fields[i].name,
+                None if member.fields.is_empty() => &mut member.name,
+                None => continue,
+            };
+            let predicate = tested && ty != "bool" && ty != "uint8";
+            if target.starts_with("field") && !predicate {
+                *target = name.clone();
+                taken.insert(name);
+            }
+            continue;
+        }
         let field = emit::packed_read(word);
         let root: Option<U256> = match (field, expr::node(word)) {
             (Some((k, _, _)), _) => Some(k),
@@ -1747,6 +1865,11 @@ fn name_storage_from_getters(
         }
         taken.insert(name);
     }
+}
+
+/// The number of keys and indices that select one element of a declared mapping or array type.
+fn element_depth(ty: &str) -> usize {
+    ty.matches("mapping(").count() + ty.matches("[]").count()
 }
 
 /// What printing a function needs to know about the code around it: the names and return
@@ -1858,6 +1981,23 @@ pub fn make_names(
                     .insert((slot, fld.offset, fld.bits), fld.name.clone());
                 if fld.ty == "bool" {
                     n.bool_fields.insert((slot, fld.offset, fld.bits));
+                }
+            }
+            if !s.members.is_empty() {
+                n.struct_depth.insert(slot, element_depth(&s.ty));
+            }
+            for member in &s.members {
+                n.members.insert((slot, member.offset), member.name.clone());
+                let narrow = emit::element_width(&member.ty).filter(|bits| *bits < 256);
+                for bits in narrow.into_iter().chain((member.ty == "bool").then_some(1)) {
+                    n.member_fields
+                        .insert((slot, member.offset, 0, bits), member.name.clone());
+                }
+                for fld in &member.fields {
+                    n.member_fields.insert(
+                        (slot, member.offset, fld.offset, fld.bits),
+                        fld.name.clone(),
+                    );
                 }
             }
         }
@@ -2069,6 +2209,250 @@ fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv) {
             continue;
         };
         var.ty = refine(&var.ty, root, &mut Vec::new(), env);
+    }
+}
+
+/// The shapes of storage slots whose own key is hashed: the head slot of a dynamic array or of a
+/// byte string, whose contents live at the hash.
+fn hashed_slots(functions: &[Function], layout: MappingLayout) -> BTreeSet<Shape> {
+    let mut seen: HashSet<ExprId> = HashSet::new();
+    let mut found = BTreeSet::new();
+    let mut pending: Vec<ExprId> = Vec::new();
+    for f in functions {
+        let Some(l) = &f.lifted else { continue };
+        for nd in &l.nodes {
+            pending.extend(lift::roots(nd).into_iter().map(|r| r.expr));
+        }
+    }
+    while let Some(e) = pending.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        if let Node::Keccak(words, 0) = expr::node(e) {
+            if let [head] = words.as_slice() {
+                if let Some(path) = ssa::slot_path(*head, layout) {
+                    found.insert(path.shape(SlotSpace::Persistent));
+                }
+            }
+        }
+        pending.extend(expr::children(e));
+    }
+    found
+}
+
+/// A declared type cut at `depth` keys and indices, where the element's own type goes.
+fn element_container(ty: &str, depth: usize) -> String {
+    if depth == 0 {
+        return "uint256".to_string();
+    }
+    if let Some(inner) = ty.strip_suffix("[]") {
+        return format!("{}[]", element_container(inner, depth - 1));
+    }
+    let entry = ty
+        .strip_prefix("mapping(")
+        .and_then(|r| r.strip_suffix(')'))
+        .and_then(|inner| inner.split_once(" => "));
+    match entry {
+        Some((key, value)) => {
+            format!("mapping({key} => {})", element_container(value, depth - 1))
+        }
+        None => ty.to_string(),
+    }
+}
+
+/// The type of what lies at `rest` below the storage shape `steps`: mappings by their solved
+/// key types, arrays, and the solved type of the value at the end.
+fn nested_type(
+    root: U256,
+    steps: &mut Vec<ShapeStep>,
+    rest: &[ShapeStep],
+    env: &TypeEnv,
+) -> String {
+    let Some((step, deeper)) = rest.split_first() else {
+        return env
+            .slot_type(root, steps)
+            .unwrap_or_else(|| "uint256".to_string());
+    };
+    steps.push(*step);
+    let ty = match step {
+        ShapeStep::Key => {
+            let key = env
+                .key_type(root, steps)
+                .unwrap_or_else(|| "uint256".to_string());
+            format!(
+                "mapping({key} => {})",
+                nested_type(root, steps, deeper, env)
+            )
+        }
+        _ => format!("{}[]", nested_type(root, steps, deeper, env)),
+    };
+    steps.pop();
+    ty
+}
+
+/// A storage shape the solver has a location for, and the bit range when it is part of a word.
+type Located<'a> = (&'a Shape, Option<(u32, u32)>);
+
+/// Find the mappings and arrays whose elements are structs and list their members.
+///
+/// The solver has a location for every storage shape the code reads or writes. A slot offset
+/// after a run of keys and indices selects a member of the element those keys select, and an
+/// element with a member at an offset above zero is a struct. What follows the offset is the
+/// member's own nesting: a mapping or an array held inside the struct. A member whose slot is
+/// hashed on its own is a dynamic array, or a byte string when its head carries the length
+/// flag. A member read or written through several bit ranges, or through one that does not
+/// start at bit zero, is packed: each range is a field.
+fn struct_members(storage: &mut [StorageVar], env: &TypeEnv, hashed: &BTreeSet<Shape>) {
+    #[derive(Default)]
+    struct Member {
+        fields: BTreeSet<(u32, u32)>,
+        nesting: Vec<ShapeStep>,
+    }
+    let mut shapes: BTreeMap<U256, Vec<Located<'_>>> = BTreeMap::new();
+    for loc in env.locations() {
+        let (shape, field) = match loc {
+            types::Loc::Slot(shape) => (shape, None),
+            types::Loc::Field {
+                shape,
+                bit_offset,
+                bits,
+            } => (shape, Some((*bit_offset, *bits))),
+            _ => continue,
+        };
+        if shape.space == SlotSpace::Persistent {
+            shapes.entry(shape.root).or_default().push((shape, field));
+        }
+    }
+    let is_offset = |s: &ShapeStep| matches!(s, ShapeStep::Offset(_));
+    for var in storage.iter_mut() {
+        let Some(root) = U256::from_hex_str(&var.slot) else {
+            continue;
+        };
+        let Some(found) = shapes.get(&root) else {
+            continue;
+        };
+        let depth = found
+            .iter()
+            .filter_map(|(shape, _)| shape.steps.iter().position(is_offset))
+            .min();
+        let Some(depth) = depth.filter(|d| (1..=element_depth(&var.ty)).contains(d)) else {
+            continue;
+        };
+        let mut members: BTreeMap<u64, Member> = BTreeMap::new();
+        for (shape, field) in found {
+            if shape.steps.len() < depth {
+                continue;
+            }
+            let (offset, rest) = match shape.steps[depth..].split_first() {
+                Some((ShapeStep::Offset(o), rest)) => (*o, rest),
+                _ => (0, &shape.steps[depth..]),
+            };
+            let nesting = &rest[..rest.iter().position(is_offset).unwrap_or(rest.len())];
+            let member = members.entry(offset).or_default();
+            if nesting.len() > member.nesting.len() {
+                member.nesting = nesting.to_vec();
+            }
+            if rest.is_empty() {
+                member.fields.extend(*field);
+            }
+        }
+        let element: Vec<ShapeStep> = found
+            .iter()
+            .find(|(shape, _)| shape.steps.len() >= depth)
+            .map(|(shape, _)| shape.steps[..depth].to_vec())
+            .unwrap_or_default();
+        var.ty = element_container(&var.ty, depth);
+        var.members = members
+            .iter()
+            .map(|(offset, member)| {
+                let mut steps = element.clone();
+                if *offset > 0 {
+                    steps.push(ShapeStep::Offset(*offset));
+                }
+                let name = format!("field{offset}");
+                let narrowest: BTreeMap<u32, u32> =
+                    member
+                        .fields
+                        .iter()
+                        .fold(BTreeMap::new(), |mut at, (bit_offset, bits)| {
+                            let width = at.entry(*bit_offset).or_insert(*bits);
+                            *width = (*width).min(*bits);
+                            at
+                        });
+                let fields_seen: Vec<(u32, u32)> = narrowest.into_iter().collect();
+                let packed = fields_seen.len() > 1 || fields_seen.iter().any(|(at, _)| *at > 0);
+                let field_type = |bit_offset: u32, bits: u32| {
+                    let shape = Shape {
+                        root,
+                        steps: steps.clone(),
+                        space: SlotSpace::Persistent,
+                    };
+                    env.info(&types::Loc::Field {
+                        shape,
+                        bit_offset,
+                        bits,
+                    })
+                    .and_then(|i| i.ty.solidity())
+                    .unwrap_or_else(|| match bits {
+                        160 => "address".to_string(),
+                        b if b.is_multiple_of(8) => format!("uint{b}"),
+                        b => format!("uint{}", b.div_ceil(8) * 8),
+                    })
+                };
+                let head = Shape {
+                    root,
+                    steps: steps.clone(),
+                    space: SlotSpace::Persistent,
+                };
+                let scalar = match (packed, fields_seen.first()) {
+                    (true, _) => "packed".to_string(),
+                    (false, Some((bit_offset, bits))) => field_type(*bit_offset, *bits),
+                    (false, None) => env
+                        .slot_type(root, &steps)
+                        .unwrap_or_else(|| "uint256".to_string()),
+                };
+                let flagged = packed || scalar == "bool";
+                if hashed.contains(&head) && flagged {
+                    return StructMember {
+                        offset: *offset,
+                        name,
+                        ty: "bytes".to_string(),
+                        fields: Vec::new(),
+                    };
+                }
+                if !member.nesting.is_empty() || hashed.contains(&head) {
+                    let nesting = match member.nesting.is_empty() {
+                        true => vec![ShapeStep::Index],
+                        false => member.nesting.clone(),
+                    };
+                    return StructMember {
+                        offset: *offset,
+                        name,
+                        ty: nested_type(root, &mut steps.clone(), &nesting, env),
+                        fields: Vec::new(),
+                    };
+                }
+                let fields: Vec<StorageField> = if packed {
+                    fields_seen
+                        .iter()
+                        .map(|(bit_offset, bits)| StorageField {
+                            offset: bit_offset / 8,
+                            bits: *bits,
+                            name: format!("{name}_{}", bit_offset / 8),
+                            ty: field_type(*bit_offset, *bits),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                StructMember {
+                    offset: *offset,
+                    name,
+                    ty: scalar,
+                    fields,
+                }
+            })
+            .collect();
     }
 }
 
@@ -2328,6 +2712,7 @@ fn inventories(
                 reads,
                 writes,
                 fields: fs,
+                members: Vec::new(),
             }
         })
         .collect();
@@ -2771,10 +3156,32 @@ pub fn render(c: &Contract, name: &str) -> String {
     if !c.storage.is_empty() {
         out.push_str("    // ---- storage layout ----\n");
         for s in &c.storage {
+            if !s.members.is_empty() {
+                out.push_str(&format!("    struct {} {{\n", s.struct_name()));
+                for member in &s.members {
+                    if member.fields.is_empty() {
+                        out.push_str(&format!(
+                            "        {} {}; // slot +{}\n",
+                            member.ty, member.name, member.offset
+                        ));
+                    }
+                    for fld in &member.fields {
+                        out.push_str(&format!(
+                            "        {} {}; // slot +{} bytes {}..{}\n",
+                            fld.ty,
+                            fld.name,
+                            member.offset,
+                            fld.offset,
+                            fld.offset + fld.bits.div_ceil(8)
+                        ));
+                    }
+                }
+                out.push_str("    }\n");
+            }
             if s.fields.is_empty() {
                 out.push_str(&format!(
                     "    {} {}; // slot {}, {}{} reads, {} writes\n",
-                    s.ty,
+                    s.declared_type(),
                     s.name,
                     s.slot,
                     if s.fixed_array {

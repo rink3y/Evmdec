@@ -863,3 +863,27 @@ fn struct_elements_are_declared_and_read_by_member() {
         "a count getter reads the head of the array, it does not name the array"
     );
 }
+
+/// Vyper keeps each variable at a fixed memory address, so a word there prints as a local and
+/// a word-scaled index from one as an element of the list that starts there. Byte ranges and
+/// unaligned addresses stay memory.
+#[test]
+fn vyper_fixed_addresses_read_as_locals() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vuln/curve_peth_impl.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+    let src = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
+    for line in [
+        "// Memory: loc_N is the variable kept at the fixed memory address 0xN",
+        "while (loc_280 < 2) {",
+        "loc_240[loc_280] = loc_240[loc_280] + loc_2a0;",
+        "identity.call(mem[640:740])",
+    ] {
+        assert!(src.contains(line), "missing `{line}`");
+    }
+    assert!(
+        !src.contains("mem[0x280]"),
+        "an aligned fixed address is a local"
+    );
+    assert!(src.contains("mem[0x2a4] = "), "an unaligned address is not");
+}

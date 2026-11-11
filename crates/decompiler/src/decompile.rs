@@ -3152,6 +3152,12 @@ pub fn render(c: &Contract, name: &str) -> String {
              ptrN = memory(a, b) writes its words; bytes(p) is the byte string at p.\n",
         );
     }
+    if c.functions.iter().any(|f| f.code.contains("loc_")) {
+        out.push_str(
+            "// Memory: loc_N is the variable kept at the fixed memory address 0xN; \
+             loc_N[i] is word i of the list that starts there.\n",
+        );
+    }
     out.push_str(&format!("\ncontract {} {{\n", name));
     if !c.storage.is_empty() {
         out.push_str("    // ---- storage layout ----\n");

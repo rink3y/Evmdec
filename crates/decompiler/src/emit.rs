@@ -818,6 +818,37 @@ pub fn block_literals(stmts: &[Stmt], hidden: &HashSet<usize>, n: &Names) -> Vec
     out
 }
 
+/// Bytes in a memory word.
+const WORD: u64 = 32;
+
+/// The memory word at `off`. Vyper keeps every variable at a fixed address, so a word-aligned
+/// constant address past the scratch space is a variable of its own (`loc_1a0`), and a
+/// word-scaled index added to one is an element of the list that starts there (`loc_1a0[i]`).
+pub fn fmt_mem_word(off: ExprId, n: &Names) -> String {
+    if n.layout != MappingLayout::Vyper {
+        return format!("mem[{}]", fmt_mem_off(off, n));
+    }
+    let local = |c: U256| {
+        (c.fits_u64() && c.low_u64() >= 2 * WORD && c.low_u64().is_multiple_of(WORD))
+            .then(|| format!("loc_{:x}", c.low_u64()))
+    };
+    let scaled = |e: ExprId| match expr::node(e) {
+        Node::Op(op::MUL, v) => [(v[0], v[1]), (v[1], v[0])]
+            .into_iter()
+            .find(|(_, by)| expr::as_const(*by) == Some(U256::from_u64(WORD)))
+            .map(|(index, _)| index),
+        Node::Op(op::SHL, v) if expr::as_const(v[0]) == Some(U256::from_u64(5)) => Some(v[1]),
+        _ => None,
+    };
+    let named = match expr::split_offset(off) {
+        (None, c) => local(c),
+        (Some(base), c) => local(c)
+            .zip(scaled(base))
+            .map(|(name, index)| format!("{name}[{}]", fmt_expr(index, n))),
+    };
+    named.unwrap_or_else(|| format!("mem[{}]", fmt_mem_off(off, n)))
+}
+
 /// Memory offsets print in hex when constant (`0x00..0x3f` is scratch space).
 pub fn fmt_mem_off(off: ExprId, n: &Names) -> String {
     match (expr::as_const(off), block_ref(off, n)) {
@@ -1283,7 +1314,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             }
             (format!("calldata[{}]", fmt_expr(off, n)), P_PRIMARY)
         }
-        Node::MLoad(off, _) => (format!("mem[{}]", fmt_mem_off(off, n)), P_PRIMARY),
+        Node::MLoad(off, _) => (fmt_mem_word(off, n), P_PRIMARY),
         Node::SLoad(key, transient, _) => (
             fmt_slot(key, n, SlotSpace::from_transient(transient)),
             P_PRIMARY,
@@ -1988,11 +2019,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             if *width == 1 {
                 format!("mem8[{}] = {};", fmt_mem_off(*off, n), fmt_expr(*val, n))
             } else {
-                format!(
-                    "mem[{}] = {};",
-                    fmt_mem_off(*off, n),
-                    fmt_stored_word(*val, n)
-                )
+                format!("{} = {};", fmt_mem_word(*off, n), fmt_stored_word(*val, n))
             }
         }
         Stmt::SStore {

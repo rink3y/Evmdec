@@ -72,6 +72,9 @@ Every stage is in `crates/decompiler`:
   what it is: `abi.encodeWithSelector(...)` when its words are known, `msg.data` when a proxy
   forwards its calldata, `bytes(p)` for the byte string at a pointer, and the selector with
   the leading arguments when only the head is known. Precompiles are called by name.
+  Vyper has no free pointer and keeps every variable at a fixed address, so there a word at
+  one prints as a local (`loc_280`) and a word-scaled index from one as an element of the
+  list that starts there (`loc_240[loc_280]`).
 - Names. A built-in dictionary of about 1,300 selectors, topics and errors; an optional local
   index of the whole public signature database; online lookup with `--lookup`. Where no
   signature gives a name, the code does: a variable is named by its getter, by the setter that

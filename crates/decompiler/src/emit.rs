@@ -122,7 +122,7 @@ pub enum PayloadKind {
 }
 
 /// Naming context for one function.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Names {
     /// calldata word index -> parameter name
     pub params: HashMap<u32, String>,

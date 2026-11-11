@@ -340,6 +340,14 @@ struct FnFacts {
     ref_bounds: Vec<AvailBound>,
     /// The function lets value leave: an ether call, a token transfer, or a ledger debit.
     moves_value: bool,
+    /// Writes to entries of single-level mappings, in event order.
+    ledger_writes: Vec<LedgerWrite>,
+    /// Writes to constant slots, as changes of the slot's own value.
+    total_changes: Vec<(ExprId, Change)>,
+    /// Increases of one ledger entry built on a value read before another entry's decrease.
+    stale_moves: Vec<StaleMove>,
+    /// Chains of writes that leave one ledger higher than they found it.
+    surplus_moves: Vec<SurplusMove>,
 }
 
 /// A call to an address held in a constant storage slot.
@@ -368,6 +376,217 @@ struct Debit {
     account_text: String,
     /// Printed statement.
     line: String,
+}
+
+/// How a write changes the value its slot held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Change {
+    /// The old value plus an amount.
+    Up(ExprId),
+    /// The old value minus an amount.
+    Down(ExprId),
+    /// A value that is not the old one moved by an amount.
+    Set,
+}
+
+/// A write to one entry of a single-level mapping.
+#[derive(Clone, Debug)]
+struct LedgerWrite {
+    /// Root slot of the mapping.
+    root: U256,
+    /// The entry's key, without its address mask.
+    account: ExprId,
+    /// How the entry changes.
+    change: Change,
+    /// Storage generation before the write.
+    gen: u32,
+    /// Generation at which the entry's own value was read, when the write builds on it.
+    read_gen: Option<u32>,
+    /// The inlined body holding the write; generations compare only within one body.
+    inst: usize,
+    /// Position in the function's event order.
+    at: usize,
+    /// Inside a loop body.
+    in_loop: bool,
+    /// Printed statement.
+    line: String,
+}
+
+/// Two writes to one ledger where the later one builds on a value read before the earlier.
+#[derive(Clone, Debug)]
+struct StaleMove {
+    /// Printed statements, in execution order.
+    lines: [String; 2],
+}
+
+/// A path on which one ledger's entries rise by more than they fall while no total changes.
+#[derive(Clone, Debug)]
+struct SurplusMove {
+    /// The amount left over, as printed terms.
+    surplus: Vec<String>,
+    /// Printed statements of the writes.
+    lines: Vec<String>,
+}
+
+/// `(change, generation of the value read)` for a store of `val` to `key`.
+fn change_of(val: ExprId, key: ExprId) -> (Change, Option<u32>) {
+    let own = |e: ExprId| match expr::node(e) {
+        Node::SLoad(k, false, g) if k == key => Some(g),
+        _ => None,
+    };
+    match expr::node(val) {
+        Node::Op(op::SUB, v) => match own(v[0]) {
+            Some(g) => (Change::Down(v[1]), Some(g)),
+            None => (Change::Set, None),
+        },
+        Node::Op(op::ADD, v) => match (own(v[0]), own(v[1])) {
+            (Some(g), _) => (Change::Up(v[1]), Some(g)),
+            (_, Some(g)) => (Change::Up(v[0]), Some(g)),
+            _ => (Change::Set, None),
+        },
+        _ => (Change::Set, None),
+    }
+}
+
+/// Add `sign * e` to `terms`, splitting sums and differences; anything else is one term.
+fn add_terms(e: ExprId, sign: i64, terms: &mut BTreeMap<ExprId, i64>, depth: u32) {
+    match expr::node(e) {
+        Node::Op(op::ADD, v) if depth < 16 => {
+            add_terms(v[0], sign, terms, depth + 1);
+            add_terms(v[1], sign, terms, depth + 1);
+        }
+        Node::Op(op::SUB, v) if depth < 16 => {
+            add_terms(v[0], sign, terms, depth + 1);
+            add_terms(v[1], -sign, terms, depth + 1);
+        }
+        _ => *terms.entry(e).or_insert(0) += sign,
+    }
+}
+
+/// The ledger entries and the constant-slot totals a function's events write.
+fn ledger_writes(
+    events: &[Event],
+    layout: emit::MappingLayout,
+    names: &Names,
+) -> (Vec<LedgerWrite>, Vec<(ExprId, Change)>) {
+    let mut writes = Vec::new();
+    let mut totals = Vec::new();
+    for (at, ev) in events.iter().enumerate() {
+        let Some(
+            st @ Stmt::SStore {
+                key,
+                val,
+                transient: false,
+                gen,
+            },
+        ) = &ev.stmt
+        else {
+            continue;
+        };
+        let (change, read_gen) = change_of(*val, *key);
+        if expr::is_const(*key) {
+            totals.push((*key, change));
+        } else if let Some((root, account)) = ledger_entry(*key, layout) {
+            writes.push(LedgerWrite {
+                root,
+                account: unmask(account),
+                change,
+                gen: *gen,
+                read_gen,
+                inst: ev.inst,
+                at,
+                in_loop: ev.in_loop,
+                line: emit::fmt_stmt(st, names),
+            });
+        }
+    }
+    (writes, totals)
+}
+
+/// Pairs of writes to two entries of one ledger in one body, a decrease then an increase,
+/// where the increase builds on a value read before the decrease was stored and nothing in the
+/// function compares the two keys. When both keys name the same entry the later write replaces
+/// the earlier with a value that never saw it.
+fn stale_moves(ctx: &Ctx, l: &Lifted, events: &[Event], writes: &[LedgerWrite]) -> Vec<StaleMove> {
+    let conds = guard_conds(events);
+    let told_apart = |a: ExprId, b: ExprId| {
+        conds.iter().any(|c| {
+            mentions(*c, &|n| match n {
+                Node::Op(op::EQ | op::SUB | op::XOR, v) => {
+                    let (x, y) = (unmask(v[0]), unmask(v[1]));
+                    (x == a && y == b) || (x == b && y == a)
+                }
+                _ => false,
+            })
+        })
+    };
+    let mut out = Vec::new();
+    for (i, first) in writes.iter().enumerate() {
+        for second in &writes[i + 1..] {
+            let stale = first.root == second.root
+                && first.inst == second.inst
+                && first.account != second.account
+                && matches!(first.change, Change::Down(_))
+                && matches!(second.change, Change::Up(_))
+                && first.gen < second.gen
+                && second.read_gen.is_some_and(|g| g <= first.gen)
+                && ev_reaches(ctx, l, &events[first.at], &events[second.at])
+                && !told_apart(first.account, second.account);
+            if stale {
+                out.push(StaleMove {
+                    lines: [first.line.clone(), second.line.clone()],
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Ledgers whose entries, along one chain of writes, rise by more than they fall while the
+/// function raises no total: the difference appears in the ledger from nowhere.
+fn surplus_moves(
+    ctx: &Ctx,
+    l: &Lifted,
+    events: &[Event],
+    writes: &[LedgerWrite],
+    totals: &[(ExprId, Change)],
+    names: &Names,
+) -> Vec<SurplusMove> {
+    if totals.iter().any(|(_, c)| matches!(c, Change::Up(_))) {
+        return Vec::new();
+    }
+    let mut roots: Vec<U256> = writes.iter().map(|w| w.root).collect();
+    roots.sort();
+    roots.dedup();
+    let mut out = Vec::new();
+    for root in roots {
+        let on: Vec<&LedgerWrite> = writes.iter().filter(|w| w.root == root).collect();
+        let falls = on.iter().any(|w| matches!(w.change, Change::Down(_)));
+        let plain = on.iter().all(|w| w.change != Change::Set && !w.in_loop);
+        let chained = on
+            .windows(2)
+            .all(|w| ev_reaches(ctx, l, &events[w[0].at], &events[w[1].at]));
+        if !falls || !plain || !chained {
+            continue;
+        }
+        let mut terms: BTreeMap<ExprId, i64> = BTreeMap::new();
+        for w in &on {
+            match w.change {
+                Change::Up(amount) => add_terms(amount, 1, &mut terms, 0),
+                Change::Down(amount) => add_terms(amount, -1, &mut terms, 0),
+                Change::Set => {}
+            }
+        }
+        terms.retain(|_, n| *n != 0);
+        if terms.is_empty() || terms.values().any(|n| *n < 0) {
+            continue;
+        }
+        out.push(SurplusMove {
+            surplus: terms.keys().map(|e| emit::fmt_expr(*e, names)).collect(),
+            lines: on.iter().map(|w| w.line.clone()).collect(),
+        });
+    }
+    out
 }
 
 /// One field of pooled storage: the slot shape of a mapping entry or array element and the bit
@@ -504,7 +723,19 @@ fn collect_facts(
         avail_bounds: Vec::new(),
         ref_bounds: Vec::new(),
         moves_value: false,
+        ledger_writes: Vec::new(),
+        total_changes: Vec::new(),
+        stale_moves: Vec::new(),
+        surplus_moves: Vec::new(),
     };
+    if let Some(l) = &f.lifted {
+        let own = names.clone();
+        let (writes, totals) = ledger_writes(events, ctx.c.compiler.layout, &own);
+        facts.stale_moves = stale_moves(ctx, l, events, &writes);
+        facts.surplus_moves = surplus_moves(ctx, l, events, &writes, &totals, &own);
+        facts.ledger_writes = writes;
+        facts.total_changes = totals;
+    }
     for cond in guard_conds(events) {
         if compares_sender_with_entry(cond) {
             facts.account_authorised = true;
@@ -3793,6 +4024,9 @@ pub fn analyze(c: &Contract) -> Report {
     policy_findings(&facts, &mut findings);
     chain_findings(&facts, &auth, &mut findings);
     accounting_findings(&facts, &mut findings);
+    let slot_names = c.functions.first().map(names_for).unwrap_or_default();
+    let slot_name = |slot: ExprId| emit::fmt_slot(slot, &slot_names, SlotSpace::Persistent);
+    conservation_findings(&facts, &slot_name, &mut findings);
     trust_findings(c, &facts, &mut findings);
 
     type_rules::findings(c, &c.types, names_for, &mut findings);
@@ -5175,6 +5409,103 @@ fn accounting_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
             );
             flagged.insert(i);
             break;
+        }
+    }
+}
+
+/// Findings about value a ledger should conserve: between two of its entries, and between its
+/// entries and the total that moves with them.
+fn conservation_findings(
+    facts: &[FnFacts],
+    slot_name: &dyn Fn(ExprId) -> String,
+    findings: &mut Vec<Finding>,
+) {
+    for f in facts.iter().filter(|f| f.external) {
+        if let Some(m) = f.stale_moves.first() {
+            push_fact(
+                findings,
+                "stale-ledger-write",
+                "Two entries of one ledger are written from values read before either write",
+                Severity::High,
+                Confidence::Medium,
+                f,
+                format!(
+                    "`{}` lowers one entry of a mapping and then raises another, and the value it raises was read before the first write was stored. Nothing compares the two keys, so when both name the same entry the second write replaces the first with a value that never saw the decrease: the entry ends higher than it began and the ledger holds more than it did.",
+                    f.name
+                ),
+                m.lines.to_vec(),
+                "Read the second entry after the first write is stored, or require the two keys to differ.",
+            );
+        }
+        if let Some(m) = f.surplus_moves.first() {
+            push_fact(
+                findings,
+                "unbalanced-ledger-move",
+                "A ledger's entries rise by more than they fall and no total changes",
+                Severity::Medium,
+                Confidence::Medium,
+                f,
+                format!(
+                    "Along one chain of writes in `{}` the entries of a mapping rise by {} more than they fall, and the function raises no total. The difference is not taken from any entry, so the ledger's sum grows without a record of it.",
+                    f.name,
+                    m.surplus.join(" + ")
+                ),
+                m.lines.clone(),
+                "Take every amount credited from an entry that is debited by it, or record it in the total.",
+            );
+        }
+    }
+    let rises = |c: &Change| matches!(c, Change::Up(_));
+    let amount = |c: &Change| match c {
+        Change::Up(a) | Change::Down(a) => Some(*a),
+        Change::Set => None,
+    };
+    let mut in_step: BTreeMap<U256, BTreeMap<ExprId, usize>> = BTreeMap::new();
+    for f in facts {
+        let mut seen: BTreeSet<(U256, ExprId)> = BTreeSet::new();
+        for w in &f.ledger_writes {
+            for (slot, change) in &f.total_changes {
+                let together = amount(&w.change).is_some_and(|a| !expr::is_const(a))
+                    && amount(&w.change) == amount(change)
+                    && rises(&w.change) == rises(change);
+                if together && seen.insert((w.root, *slot)) {
+                    *in_step.entry(w.root).or_default().entry(*slot).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    for (root, totals) in &in_step {
+        let Some((total, _)) = totals.iter().max_by_key(|(_, n)| **n) else {
+            continue;
+        };
+        for f in facts.iter().filter(|f| f.external && !f.init_guarded) {
+            let on: Vec<&LedgerWrite> =
+                f.ledger_writes.iter().filter(|w| w.root == *root).collect();
+            let one_way = !on.is_empty()
+                && on.iter().all(|w| rises(&w.change) && !w.in_loop)
+                && on
+                    .iter()
+                    .all(|w| amount(&w.change).is_some_and(|a| !expr::is_const(a)));
+            let total_moves = f.const_writes.iter().any(|(slot, _, _)| slot == total);
+            if !one_way || total_moves {
+                continue;
+            }
+            push_fact(
+                findings,
+                "ledger-total-mismatch",
+                "A ledger entry rises without the total that moves with it elsewhere",
+                Severity::Medium,
+                Confidence::Low,
+                f,
+                format!(
+                    "Elsewhere in this contract an entry of this mapping and `{}` change together by the same amount. `{}` raises an entry, lowers none, and leaves `{}` as it was, so the entries no longer sum to the total the other paths maintain.",
+                    slot_name(*total),
+                    f.name,
+                    slot_name(*total)
+                ),
+                on.iter().map(|w| w.line.clone()).collect(),
+                "Move the total by the same amount wherever an entry is created or removed, or take the amount from another entry.",
+            );
         }
     }
 }

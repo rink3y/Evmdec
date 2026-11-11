@@ -986,3 +986,106 @@ fn a_one_sided_entry_is_not_a_transfer_party() {
     assert!(src.contains("uint256 amount) external"), "{src}");
     assert!(!src.contains(" balances;"), "{src}");
 }
+
+/// The slot of the mapping-at-3 entry keyed by the address in calldata word `word`.
+fn account_entry(word: &str) -> String {
+    format!("PUSH1 {word} CALLDATALOAD PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256")
+}
+
+const AMOUNT: &str = "PUSH1 0x44 CALLDATALOAD";
+
+fn conservation_ids(code: &[u8]) -> Vec<String> {
+    let r = analyze::analyze(&decompile::decompile(code, &Options::default()));
+    let ours = [
+        "stale-ledger-write",
+        "unbalanced-ledger-move",
+        "ledger-total-mismatch",
+    ];
+    r.findings
+        .iter()
+        .filter(|f| ours.contains(&f.id.as_str()))
+        .map(|f| format!("{} {}", f.id, f.function.as_deref().unwrap_or_default()))
+        .collect()
+}
+
+#[test]
+fn an_entry_raised_from_a_value_read_before_the_other_was_lowered_is_reported() {
+    let (from, to) = (account_entry("0x04"), account_entry("0x24"));
+    let both_read_first = format!(
+        "{from} DUP1 SLOAD {to} DUP1 SLOAD SWAP2 {AMOUNT} SWAP1 SUB DUP4 SSTORE \
+         SWAP1 {AMOUNT} ADD SWAP1 SSTORE STOP"
+    );
+    let hits = conservation_ids(&dispatcher(&both_read_first));
+    assert_eq!(
+        hits,
+        ["stale-ledger-write func_aaaaaaaa [0xaaaaaaaa]"],
+        "{hits:?}"
+    );
+
+    let read_in_turn = format!(
+        "{from} DUP1 SLOAD {AMOUNT} SWAP1 SUB SWAP1 SSTORE \
+         {to} DUP1 SLOAD {AMOUNT} ADD SWAP1 SSTORE STOP"
+    );
+    assert!(conservation_ids(&dispatcher(&read_in_turn)).is_empty());
+
+    let keys_differ =
+        "PUSH1 0x04 CALLDATALOAD PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND \
+         PUSH1 0x24 CALLDATALOAD PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND \
+         EQ ISZERO PUSH2 @go JUMPI PUSH1 0x00 DUP1 REVERT :go JUMPDEST";
+    let guarded = format!("{keys_differ} {both_read_first}");
+    assert!(conservation_ids(&dispatcher(&guarded)).is_empty());
+}
+
+#[test]
+fn a_credit_nothing_pays_for_is_reported_when_no_total_records_it() {
+    const CALLER_ENTRY: &str =
+        "CALLER PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
+    let (from, to) = (account_entry("0x04"), account_entry("0x24"));
+    let moved = format!(
+        "{from} DUP1 SLOAD {AMOUNT} SWAP1 SUB SWAP1 SSTORE \
+         {to} DUP1 SLOAD {AMOUNT} ADD SWAP1 SSTORE"
+    );
+    let extra = format!("{CALLER_ENTRY} DUP1 SLOAD PUSH1 0x64 CALLDATALOAD ADD SWAP1 SSTORE");
+    let hits = conservation_ids(&dispatcher(&format!("{moved} {extra} STOP")));
+    assert_eq!(
+        hits,
+        ["unbalanced-ledger-move func_aaaaaaaa [0xaaaaaaaa]"],
+        "{hits:?}"
+    );
+    assert!(conservation_ids(&dispatcher(&format!("{moved} STOP"))).is_empty());
+
+    let recorded = "PUSH1 0x05 SLOAD PUSH1 0x64 CALLDATALOAD ADD PUSH1 0x05 SSTORE";
+    let with_total = format!("{moved} {extra} {recorded} STOP");
+    assert!(conservation_ids(&dispatcher(&with_total)).is_empty());
+}
+
+#[test]
+fn an_entry_raised_without_the_total_that_moves_with_it_is_reported() {
+    let to = account_entry("0x04");
+    let amount = "PUSH1 0x24 CALLDATALOAD";
+    let credit = format!("{to} DUP1 SLOAD {amount} ADD SWAP1 SSTORE");
+    let total = format!("PUSH1 0x05 SLOAD {amount} ADD PUSH1 0x05 SSTORE");
+    let code = dispatcher3(
+        &format!("{credit} {total} STOP"),
+        &format!("{credit} STOP"),
+        "STOP",
+    );
+    let hits = conservation_ids(&code);
+    assert_eq!(
+        hits,
+        ["ledger-total-mismatch func_bbbbbbbb [0xbbbbbbbb]"],
+        "{hits:?}"
+    );
+
+    let counter = format!("{to} DUP1 SLOAD PUSH1 0x01 ADD SWAP1 SSTORE");
+    let counted = "PUSH1 0x05 SLOAD PUSH1 0x01 ADD PUSH1 0x05 SSTORE";
+    let code = dispatcher3(
+        &format!("{counter} {counted} STOP"),
+        &format!("{counter} STOP"),
+        "STOP",
+    );
+    assert!(
+        conservation_ids(&code).is_empty(),
+        "a step of one is a counter, not an amount"
+    );
+}

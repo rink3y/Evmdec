@@ -275,6 +275,8 @@ pub fn slice(l: &Lifted, entry: usize) -> Lifted {
         ret_slot: l.ret_slot,
         entry_states: Vec::new(),
         node_map: HashMap::new(),
+        entry_loads: l.entry_loads.clone(),
+        mem_writes: l.mem_writes.clone(),
     }
 }
 

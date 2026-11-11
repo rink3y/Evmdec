@@ -11,7 +11,8 @@ use crate::expr::{self, konst, konst_u64, op1, op2, op3, ExprId, Node};
 use crate::opcode as op;
 use crate::u256::U256;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
 /// A side-effecting statement of a lifted node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,6 +257,11 @@ pub struct Lifted {
     pub(crate) entry_states: Vec<Option<State>>,
     /// Map from unit node id to lifted node id.
     pub node_map: HashMap<usize, usize>,
+    /// The unresolved loads that may see memory as the caller left it: loads of bytes the unit
+    /// had not itself written on every path by then.
+    pub entry_loads: MemoryReads,
+    /// What the unit may write to memory, the internal functions it calls included.
+    pub mem_writes: MemoryWrites,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,6 +289,378 @@ struct MemWrite {
     gen: u32,
 }
 
+/// The memory some code may read without the lifter knowing the value: loads that store
+/// forwarding did not resolve, and byte ranges handed to a call, a log, a hash, a copy or a
+/// return whose words are not all known. Byte ranges with constant bounds, and optionally
+/// everything from an address up.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryReads {
+    ranges: BTreeSet<(u64, u64)>,
+    open_from: Option<u64>,
+    /// Addresses read through a word-scaled index, `base + 32 * i`, where the reader had
+    /// already written the word at `base`: an element of a list the reader itself filled, if
+    /// its indices stay inside the list.
+    indexed: BTreeSet<u64>,
+}
+
+impl MemoryReads {
+    /// Every address.
+    #[must_use]
+    pub fn everything() -> MemoryReads {
+        MemoryReads {
+            open_from: Some(0),
+            ..MemoryReads::default()
+        }
+    }
+
+    /// Settle the indexed reads: dropped when the compiler checks every index against the
+    /// length of the list (Vyper has no unchecked access), else open-ended from their base.
+    #[must_use]
+    pub fn with_indices(mut self, checked: bool) -> MemoryReads {
+        let lowest = std::mem::take(&mut self.indexed).into_iter().next();
+        if let (Some(base), false) = (lowest, checked) {
+            self.open_from = Some(self.open_from.map_or(base, |o| o.min(base)));
+        }
+        self
+    }
+
+    /// Add what `other` reads; says whether anything was new.
+    pub fn add(&mut self, other: &MemoryReads) -> bool {
+        let before = (self.ranges.len(), self.open_from);
+        self.ranges.extend(other.ranges.iter().copied());
+        self.open_from = match (self.open_from, other.open_from) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        before != (self.ranges.len(), self.open_from)
+    }
+
+    /// A read at an address that is not constant: everything from its constant part up, or
+    /// everything when the rest of the address could wrap below it.
+    fn open(&mut self, from: ExprId) {
+        let (rest, at) = expr::split_offset(from);
+        let wraps = rest.is_some_and(|r| {
+            expr::contains(r, &|n| match n {
+                Node::Op(op::SUB | op::NOT | op::SIGNEXTEND | op::SDIV | op::SMOD, _) => true,
+                Node::Const(c) => c.bits() > 64,
+                _ => false,
+            })
+        });
+        let base = match at.fits_u64() && !wraps {
+            true => at.low_u64(),
+            false => 0,
+        };
+        self.open_from = Some(self.open_from.map_or(base, |o| o.min(base)));
+    }
+
+    fn range(&mut self, off: ExprId, len: ExprId) {
+        match (expr::as_const(off), expr::as_const(len)) {
+            (_, Some(l)) if l.is_zero() => {}
+            (Some(o), Some(l)) if o.fits_u64() && l.fits_u64() => {
+                let start = o.low_u64();
+                self.ranges
+                    .insert((start, start.saturating_add(l.low_u64())));
+            }
+            _ => self.open(off),
+        }
+    }
+
+    /// Add a read of `n` bytes at `off`, unless `written` already holds all of them.
+    fn note(&mut self, off: ExprId, n: u64, written: &BTreeSet<(u64, u64)>) {
+        match expr::as_const(off).filter(|c| c.fits_u64()) {
+            Some(c) => {
+                let (lo, hi) = (c.low_u64(), c.low_u64().saturating_add(n));
+                if !covers(written, lo, hi) {
+                    self.ranges.insert((lo, hi));
+                }
+            }
+            None => {
+                let (rest, at) = expr::split_offset(off);
+                let scaled = rest.is_some_and(|r| match expr::node(r) {
+                    Node::Op(op::MUL, v) => v
+                        .iter()
+                        .any(|x| expr::as_const(*x) == Some(U256::from_u64(32))),
+                    Node::Op(op::SHL, v) => expr::as_const(v[0]) == Some(U256::from_u64(5)),
+                    _ => false,
+                });
+                let base = at.fits_u64().then(|| at.low_u64());
+                match base.filter(|b| scaled && written.iter().any(|(lo, _)| lo == b)) {
+                    Some(b) => {
+                        self.indexed.insert(b);
+                    }
+                    None => self.open(off),
+                }
+            }
+        }
+    }
+
+    /// Add what `other` reads outside the byte ranges in `written`.
+    pub fn add_outside(&mut self, other: &MemoryReads, written: &BTreeSet<(u64, u64)>) -> bool {
+        let before = (self.ranges.len(), self.open_from);
+        for (lo, hi) in &other.ranges {
+            if !covers(written, *lo, *hi) {
+                self.ranges.insert((*lo, *hi));
+            }
+        }
+        if let Some(from) = other.open_from {
+            self.open_from = Some(self.open_from.map_or(from, |o| o.min(from)));
+        }
+        before != (self.ranges.len(), self.open_from)
+    }
+
+    /// Add a read of the `len` bytes at `off`, unless `written` already holds all of them.
+    pub fn range_outside(&mut self, off: ExprId, len: ExprId, written: &BTreeSet<(u64, u64)>) {
+        let mut own = MemoryReads::default();
+        own.range(off, len);
+        self.add_outside(&own, written);
+    }
+
+    /// Add the unresolved loads inside the expressions `roots`.
+    pub fn exprs(&mut self, roots: impl IntoIterator<Item = ExprId>) {
+        let mut seen: HashSet<ExprId> = HashSet::new();
+        let mut pending: Vec<ExprId> = roots.into_iter().collect();
+        while let Some(e) = pending.pop() {
+            if !seen.insert(e) {
+                continue;
+            }
+            if seen.len() > 50_000 {
+                self.open_from = Some(0);
+                return;
+            }
+            match expr::node(e) {
+                Node::MLoad(at, _) => self.range(at, expr::konst_u64(32)),
+                Node::KeccakMem(off, len, _) => self.range(off, len),
+                Node::CopiedWord(op::MCOPY, src, _) => self.open(src),
+                _ => {}
+            }
+            pending.extend(expr::children(e));
+        }
+    }
+
+    /// Add what the statement `s` reads. `callee` gives what an internal function reads, by
+    /// entry pc; an unknown one reads everything.
+    pub fn stmt<'a>(&mut self, s: &Stmt, callee: &impl Fn(usize) -> Option<&'a MemoryReads>) {
+        match s {
+            Stmt::Call {
+                in_off,
+                in_len,
+                input: None,
+                ..
+            } => self.range(*in_off, *in_len),
+            Stmt::Log {
+                off,
+                len,
+                data: None,
+                ..
+            }
+            | Stmt::Create {
+                off,
+                len,
+                init: None,
+                ..
+            } => self.range(*off, *len),
+            Stmt::Copy {
+                kind: op::MCOPY,
+                src,
+                len,
+                ..
+            } => self.range(*src, *len),
+            Stmt::Internal { callee: pc, .. } => match callee(*pc) {
+                Some(reads) => {
+                    self.add(reads);
+                }
+                None => self.open_from = Some(0),
+            },
+            _ => {}
+        }
+        self.exprs(stmt_exprs(s));
+    }
+
+    /// Add what the terminator `t` reads. A return to an internal caller reads everything when
+    /// `returns_to_reader` is set: the caller may read whatever this function wrote.
+    pub fn term(&mut self, t: &Term, returns_to_reader: bool) {
+        match t {
+            Term::Return {
+                off,
+                len,
+                data: None,
+            }
+            | Term::Revert {
+                off,
+                len,
+                data: None,
+            } => self.range(*off, *len),
+            Term::ReturnDyn { ptr } => self.open(*ptr),
+            Term::InternalReturn(_) if returns_to_reader => self.open_from = Some(0),
+            Term::Unresolved(_) | Term::Switch { .. } => self.open_from = Some(0),
+            _ => {}
+        }
+        self.exprs(term_exprs(t));
+    }
+
+    /// May any of the `len` bytes at `addr` be read?
+    #[must_use]
+    pub fn reads(&self, addr: u64, len: u64) -> bool {
+        let end = addr.saturating_add(len);
+        self.open_from.is_some_and(|from| end > from)
+            || self.ranges.iter().any(|(lo, hi)| addr < *hi && end > *lo)
+    }
+}
+
+impl Lifted {
+    /// What the unit may read of memory as its caller left it: the loads the lifter saw before
+    /// the unit had written their bytes on every path, plus the byte ranges it hands to calls,
+    /// logs, copies and reverts and what the internal functions it calls read, in each case
+    /// outside what its own statements have certainly written by then. `callee` gives the same
+    /// for an internal function by entry pc; an unknown one reads everything.
+    #[must_use]
+    pub fn entry_reads<'a>(
+        &self,
+        checked_indices: bool,
+        callee: &impl Fn(usize) -> Option<&'a MemoryReads>,
+    ) -> MemoryReads {
+        let mut reads = self.entry_loads.clone().with_indices(checked_indices);
+        let mut written_in: Vec<Option<BTreeSet<(u64, u64)>>> = vec![None; self.nodes.len()];
+        written_in[self.entry] = Some(BTreeSet::new());
+        let mut work = vec![self.entry];
+        while let Some(n) = work.pop() {
+            let Some(mut written) = written_in[n].clone() else {
+                continue;
+            };
+            let nd = &self.nodes[n];
+            let mut copied: Vec<(ExprId, ExprId)> = Vec::new();
+            for s in &nd.stmts {
+                match s {
+                    Stmt::Call {
+                        in_off: off,
+                        in_len: len,
+                        input: None,
+                        ..
+                    }
+                    | Stmt::Log {
+                        off,
+                        len,
+                        data: None,
+                        ..
+                    }
+                    | Stmt::Create {
+                        off,
+                        len,
+                        init: None,
+                        ..
+                    }
+                    | Stmt::Copy {
+                        kind: op::MCOPY,
+                        src: off,
+                        len,
+                        ..
+                    } if !copied.contains(&(*off, *len)) => {
+                        reads.range_outside(*off, *len, &written);
+                    }
+                    Stmt::Internal { callee: pc, .. } => match callee(*pc) {
+                        Some(theirs) => {
+                            reads.add_outside(theirs, &written);
+                        }
+                        None => return MemoryReads::everything(),
+                    },
+                    _ => {}
+                }
+                match s {
+                    Stmt::MStore { off, width, .. } => {
+                        if let Some(c) = expr::as_const(*off).filter(|c| c.fits_u64()) {
+                            let lo = c.low_u64();
+                            written.insert((lo, lo.saturating_add(u64::from(*width))));
+                        }
+                    }
+                    Stmt::Copy { dest, len, .. } => {
+                        let fixed = expr::as_const(*dest)
+                            .filter(|c| c.fits_u64())
+                            .zip(expr::as_const(*len).filter(|c| c.fits_u64()));
+                        match fixed {
+                            Some((d, l)) => {
+                                let lo = d.low_u64();
+                                written.insert((lo, lo.saturating_add(l.low_u64())));
+                            }
+                            None => copied.push((*dest, *len)),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match &nd.term {
+                Term::Return {
+                    off,
+                    len,
+                    data: None,
+                }
+                | Term::Revert {
+                    off,
+                    len,
+                    data: None,
+                } if !copied.contains(&(*off, *len)) => reads.range_outside(*off, *len, &written),
+                Term::ReturnDyn { ptr } => reads.open(*ptr),
+                Term::Unresolved(_) | Term::Switch { .. } => return MemoryReads::everything(),
+                _ => {}
+            }
+            for succ in &nd.succs {
+                let merged = match &written_in[*succ] {
+                    None => written.clone(),
+                    Some(theirs) => theirs.intersection(&written).copied().collect(),
+                };
+                if written_in[*succ].as_ref() != Some(&merged) {
+                    written_in[*succ] = Some(merged);
+                    work.push(*succ);
+                }
+            }
+        }
+        reads
+    }
+}
+
+/// Do the byte ranges in `written` hold every byte of `lo..hi`?
+#[must_use]
+pub fn covers(written: &BTreeSet<(u64, u64)>, lo: u64, hi: u64) -> bool {
+    let mut at = lo;
+    while at < hi {
+        let next = written
+            .iter()
+            .filter(|(a, b)| *a <= at && *b > at)
+            .map(|(_, b)| *b)
+            .max();
+        match next {
+            Some(b) => at = b,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The memory some code may write: constant byte ranges, or anything at all once a write's
+/// address or length is not constant or control leaves for code that was not recovered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryWrites {
+    ranges: BTreeSet<(u64, u64)>,
+    anywhere: bool,
+}
+
+impl MemoryWrites {
+    /// The constant byte ranges written, merged where they touch, when every write is to one.
+    #[must_use]
+    pub fn fixed(&self) -> Option<Vec<(u64, u64)>> {
+        if self.anywhere {
+            return None;
+        }
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (lo, hi) in &self.ranges {
+            match merged.last_mut() {
+                Some(last) if *lo <= last.1 => last.1 = last.1.max(*hi),
+                _ => merged.push((*lo, *hi)),
+            }
+        }
+        Some(merged)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Mem {
     writes: Vec<MemWrite>,
@@ -295,6 +673,13 @@ struct Mem {
     gen: u32,
     /// Generation after the last event that may have changed arbitrary memory (clobber, forgotten writes).
     clobber_gen: u32,
+    /// Constant byte ranges written on every path since the unit was entered.
+    written: BTreeSet<(u64, u64)>,
+    /// The unresolved loads that may see memory as it was when the unit was entered: those of
+    /// bytes not yet in `written`. Shared by every state of one lift.
+    entry_loads: Rc<RefCell<MemoryReads>>,
+    /// Everything written through this view. Shared by every state of one lift.
+    touched: Rc<RefCell<MemoryWrites>>,
 }
 
 const BIG: u64 = 1 << 40;
@@ -403,7 +788,22 @@ impl Mem {
             fresh,
             gen: 0,
             clobber_gen: 0,
+            written: BTreeSet::new(),
+            entry_loads: Rc::default(),
+            touched: Rc::default(),
         }
+    }
+
+    /// Record an unresolved read of `n` bytes at `off`.
+    fn note_load(&self, off: ExprId, n: u64) {
+        self.entry_loads.borrow_mut().note(off, n, &self.written);
+    }
+
+    /// Record an unresolved read of the `len` bytes at `off`.
+    fn note_range(&self, off: ExprId, len: ExprId) {
+        self.entry_loads
+            .borrow_mut()
+            .range_outside(off, len, &self.written);
     }
 
     /// Advance the generation (once per memory-writing statement).
@@ -444,6 +844,16 @@ impl Mem {
         origin: Option<(usize, usize)>,
     ) {
         let (base, d) = norm_offset(off);
+        match (base, len) {
+            (None, Some(l)) => {
+                let range = (d, d.saturating_add(l));
+                self.touched.borrow_mut().ranges.insert(range);
+                if !matches!(val, MVal::Unknown) {
+                    self.written.insert(range);
+                }
+            }
+            _ => self.touched.borrow_mut().anywhere = true,
+        }
         if let Some(l) = len {
             self.writes.retain(|w| {
                 !(w.base == base && w.len.is_some_and(|wl| w.off >= d && w.off + wl <= d + l))
@@ -484,6 +894,7 @@ impl Mem {
 
     /// Forget everything (after an internal call or an unknown-length write to a symbolic base).
     fn clobber(&mut self) {
+        self.touched.borrow_mut().anywhere = true;
         self.writes.clear();
         self.fresh = false;
         self.gen += 1;
@@ -636,6 +1047,7 @@ impl Mem {
         if unknown_mask.is_zero() {
             return Some(known);
         }
+        self.note_load(off, n);
         let word = expr::intern(Node::MLoad(off, self.version_for(off, n)));
         let unknown = if n == 32 {
             word
@@ -652,7 +1064,10 @@ impl Mem {
     fn load_word(&self, off: ExprId, version: u32) -> ExprId {
         match self.load_bytes(off, 32, version) {
             Some(v) => v,
-            None => expr::intern(Node::MLoad(off, self.version_for(off, 32))),
+            None => {
+                self.note_load(off, 32);
+                expr::intern(Node::MLoad(off, self.version_for(off, 32)))
+            }
         }
     }
 
@@ -734,6 +1149,9 @@ impl Mem {
                 .zip(self.writes.iter())
                 .any(|(a, b)| !(same(a, b)));
         self.writes = merged;
+        let written_before = self.written.len();
+        self.written.retain(|r| other.written.contains(r));
+        let changed_writes = changed_writes || self.written.len() != written_before;
         self.fresh &= other.fresh;
         if other.gen != self.gen || other.clobber_gen != self.clobber_gen {
             self.gen = self.gen.max(other.gen) + 1;
@@ -797,6 +1215,9 @@ pub struct Lifter<'a> {
     pub root: bool,
     /// Effect summaries of simple internal functions, by entry block.
     pub summaries: HashMap<usize, CalleeSummary>,
+    /// What each internal function may write to memory, by entry block; one that is absent may
+    /// write anywhere.
+    pub footprints: HashMap<usize, MemoryWrites>,
     /// Oracle mode: keep jump target/condition expressions instead of resolving successors.
     pub oracle: bool,
     /// Word-copy loops recognised on a first lift, keyed by (unit entry block, unit header node):
@@ -1167,6 +1588,8 @@ impl<'a> Lifter<'a> {
 
     /// Lift `unit` starting from the entry state `init`, iterating to a fixpoint.
     pub fn lift_from(&self, unit: &Unit, init: State) -> Lifted {
+        let entry_loads = init.mem.entry_loads.clone();
+        let touched = init.mem.touched.clone();
         let n = unit.nodes.len();
         let mut entries: Vec<Option<Entry>> = vec![None; n];
         let mut lnodes: Vec<Option<LNode>> = vec![None; n];
@@ -1401,6 +1824,11 @@ impl<'a> Lifter<'a> {
             .iter()
             .map(|e| e.as_ref().map(|e| e.state.clone()))
             .collect();
+        let entry_loads = entry_loads.borrow().clone();
+        let mut mem_writes = touched.borrow().clone();
+        mem_writes.anywhere |= nodes
+            .iter()
+            .any(|nd| matches!(nd.term, Term::Unresolved(_) | Term::Switch { .. }));
         Lifted {
             nodes,
             entry: map[&unit.entry],
@@ -1410,6 +1838,8 @@ impl<'a> Lifter<'a> {
             ret_slot,
             entry_states,
             node_map: map,
+            entry_loads,
+            mem_writes,
         }
     }
 
@@ -1720,17 +2150,23 @@ impl<'a> Lifter<'a> {
                                     None => expr::intern(Node::Keccak(words, tail)),
                                 }
                             }
-                            None => expr::intern(Node::KeccakMem(
+                            None => {
+                                st.mem.note_range(off, len);
+                                expr::intern(Node::KeccakMem(
+                                    off,
+                                    len,
+                                    st.mem.version_for(off, l as u64),
+                                ))
+                            }
+                        },
+                        _ => {
+                            st.mem.note_range(off, len);
+                            expr::intern(Node::KeccakMem(
                                 off,
                                 len,
-                                st.mem.version_for(off, l as u64),
-                            )),
-                        },
-                        _ => expr::intern(Node::KeccakMem(
-                            off,
-                            len,
-                            st.mem.version_for(off, u64::MAX / 4),
-                        )),
+                                st.mem.version_for(off, u64::MAX / 4),
+                            ))
+                        }
                     };
                     st.stack.push(v);
                 }
@@ -2382,7 +2818,20 @@ impl<'a> Lifter<'a> {
                 }
             }
             None => {
-                st.mem.clobber();
+                let fixed = self
+                    .footprints
+                    .get(&call.callee)
+                    .and_then(MemoryWrites::fixed);
+                match fixed {
+                    Some(ranges) => {
+                        for (lo, hi) in ranges {
+                            st.mem.store(konst_u64(lo), Some(hi - lo), MVal::Unknown);
+                        }
+                        st.mem.tick();
+                        st.version = st.mem.gen;
+                    }
+                    None => st.mem.clobber(),
+                }
                 st.storage.clear();
                 st.sgen += 1;
                 st.called = true;

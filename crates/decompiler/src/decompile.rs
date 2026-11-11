@@ -792,6 +792,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             prog: &prog,
             root: false,
             summaries: HashMap::new(),
+            footprints: HashMap::new(),
             oracle: true,
             copy_loops: Default::default(),
         };
@@ -881,6 +882,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         prog: &prog,
         root: false,
         summaries: HashMap::new(),
+        footprints: HashMap::new(),
         oracle: false,
         copy_loops: Default::default(),
     };
@@ -915,9 +917,16 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                 sums.insert(*b, sm);
             }
         }
+        let footprints: HashMap<usize, lift::MemoryWrites> = by_block
+            .iter()
+            .filter(|_| profile.kind != compiler::Kind::Solc)
+            .map(|(b, l)| (*b, l.mem_writes.clone()))
+            .collect();
         let same = sums.len() == int_lifter.summaries.len()
-            && sums.keys().all(|k| int_lifter.summaries.contains_key(k));
+            && sums.keys().all(|k| int_lifter.summaries.contains_key(k))
+            && footprints == int_lifter.footprints;
         int_lifter.summaries = sums;
+        int_lifter.footprints = footprints;
         if same {
             break;
         }
@@ -934,6 +943,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         prog: &prog,
         root: true,
         summaries: int_lifter.summaries.clone(),
+        footprints: int_lifter.footprints.clone(),
         oracle: false,
         copy_loops: Default::default(),
     };
@@ -1883,6 +1893,40 @@ pub struct Callees {
     /// The code is solc's and keeps its free memory pointer at `0x40`, so a load of that slot
     /// is the address of a memory block.
     pub free_pointer: bool,
+    /// What each internal function may read of the memory its caller left, itself or through
+    /// the functions it calls, by entry pc.
+    pub reads: std::sync::Arc<HashMap<usize, lift::MemoryReads>>,
+}
+
+/// What every internal function may read of the memory its caller left, closed over the calls
+/// between them: the least sets that satisfy every function at once.
+fn callee_reads(
+    functions: &[Function],
+    checked_indices: bool,
+) -> HashMap<usize, lift::MemoryReads> {
+    let internal: Vec<(usize, &Lifted)> = functions
+        .iter()
+        .filter(|f| f.kind == FnKind::Internal)
+        .filter_map(|f| f.lifted.as_ref().map(|l| (f.pc, l)))
+        .collect();
+    let mut reads: HashMap<usize, lift::MemoryReads> = internal
+        .iter()
+        .map(|(pc, _)| (*pc, lift::MemoryReads::default()))
+        .collect();
+    loop {
+        let mut changed = false;
+        for (pc, l) in &internal {
+            let now = l.entry_reads(checked_indices, &|callee| reads.get(&callee));
+            if reads.get(pc) != Some(&now) {
+                reads.insert(*pc, now);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    reads
 }
 
 impl Callees {
@@ -1894,6 +1938,7 @@ impl Callees {
             returns: internal().map(|f| (f.pc, f.returns.clone())).collect(),
             names: internal().map(|f| (f.pc, f.name.clone())).collect(),
             free_pointer: compiler == compiler::Kind::Solc,
+            reads: std::sync::Arc::new(callee_reads(functions, compiler == compiler::Kind::Vyper)),
         }
     }
 }
@@ -1911,6 +1956,7 @@ pub fn make_names(
     let mut n = Names {
         layout,
         callee_names: callees.names.clone(),
+        callee_reads: Some(callees.reads.clone()),
         blocks: f
             .lifted
             .as_ref()

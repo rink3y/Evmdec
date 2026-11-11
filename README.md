@@ -74,7 +74,12 @@ Every stage is in `crates/decompiler`:
   the leading arguments when only the head is known. Precompiles are called by name.
   Vyper has no free pointer and keeps every variable at a fixed address, so there a word at
   one prints as a local (`loc_280`) and a word-scaled index from one as an element of the
-  list that starts there (`loc_240[loc_280]`).
+  list that starts there (`loc_240[loc_280]`). A store to a fixed address is printed only
+  when something that runs afterwards can read it: a later load, a byte range handed to a
+  call, a hash or a return, or an internal function that loads the address before writing it
+  itself (the lifter records, load by load, whether the function had already written those
+  bytes on every path). In code without a free pointer the lifter also keeps what it knows
+  of memory across a call to an internal function whose writes are all to fixed addresses.
 - Names. A built-in dictionary of about 1,300 selectors, topics and errors; an optional local
   index of the whole public signature database; online lookup with `--lookup`. Where no
   signature gives a name, the code does: a variable is named by its getter, by the setter that

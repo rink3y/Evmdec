@@ -124,6 +124,8 @@ pub enum PayloadKind {
 /// Naming context for one function.
 #[derive(Clone, Debug, Default)]
 pub struct Names {
+    /// What each internal function may read from memory, by entry pc; absent when unknown.
+    pub callee_reads: Option<std::sync::Arc<HashMap<usize, crate::lift::MemoryReads>>>,
     /// calldata word index -> parameter name
     pub params: HashMap<u32, String>,
     /// Expressions printed under a fixed name (e.g. the pointer returned by a storage-string
@@ -694,7 +696,7 @@ pub fn number_blocks(l: &Lifted) -> Blocks {
 
 /// The block an address falls in and its offset from the block's start: the block with the
 /// same symbolic base whose start is the nearest at or below the address.
-fn block_ref(e: ExprId, n: &Names) -> Option<(u32, U256)> {
+pub(crate) fn block_ref(e: ExprId, n: &Names) -> Option<(u32, U256)> {
     let blocks = n.blocks.as_ref()?;
     let (base, offset) = expr::split_offset(e);
     blocks

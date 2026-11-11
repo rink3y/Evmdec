@@ -934,3 +934,33 @@ fn types_join_evidence_across_keys_fields_and_layouts() {
         assert!(source(file).contains(header), "{file}: missing `{header}`");
     }
 }
+
+/// A store to a fixed address is printed only when something that runs afterwards can read
+/// it: a later load in the function, a byte range handed on, or an internal function that
+/// loads the address before writing it. Values the lifter already forwarded need no store.
+#[test]
+fn stores_nothing_reads_are_left_out() {
+    let source = |path: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+        let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source
+    };
+    let pool = source("../../testdata/vuln/curve_peth_impl.hex");
+    let start = pool.find("function get_virtual_price()").expect("the view");
+    let body = &pool[start..start + pool[start..].find("\n    }").unwrap()];
+    assert!(
+        !body.contains("loc_140 = ") && !body.contains("loc_260 = "),
+        "locals no one reads after the helper calls are not stored: {body}"
+    );
+    assert!(
+        body.contains("loc_1c0 = ") && body.contains("func_0x3349("),
+        "what the helper may still read is: {body}"
+    );
+    assert!(body.contains("return (ret_3_0 * 1e18 / totalSupply);"));
+
+    let old = source("../../testdata/vuln/kotet.hex");
+    assert!(
+        !old.contains("mem[0x0] = 6;"),
+        "the scratch word of a hash the lifter resolved is not printed"
+    );
+}

@@ -977,6 +977,112 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
     dead
 }
 
+/// Word stores to constant addresses that nothing running afterwards can read: no later
+/// statement of the function loads the address or hands a range holding it to a call, a hash,
+/// a log or a return, and no internal function called later reads it. A later overwrite is
+/// not taken as ending a store's life, so a load printed after its own address was rewritten
+/// still keeps every earlier store. A store found unread stops counting as a reader itself,
+/// and the search repeats until nothing more falls out. A store into a named memory block is left alone: the
+/// block's line is built from it. Keyed by `(node, statement index)`.
+fn unread_fixed_stores(l: &Lifted, names: &Names) -> HashSet<(usize, usize)> {
+    let fixed = |s: &Stmt| match s {
+        Stmt::MStore { off, width, .. } if emit::block_ref(*off, names).is_none() => {
+            expr::as_const(*off)
+                .filter(|c| c.fits_u64())
+                .map(|c| (c.low_u64(), u64::from(*width)))
+        }
+        _ => None,
+    };
+    if !l
+        .nodes
+        .iter()
+        .flat_map(|nd| &nd.stmts)
+        .any(|s| fixed(s).is_some())
+    {
+        return HashSet::new();
+    }
+    let callee = |pc: usize| names.callee_reads.as_ref().and_then(|m| m.get(&pc));
+    let returns_to_reader = l.ret_slot.is_some();
+    let tails: Vec<lift::MemoryReads> = l
+        .nodes
+        .iter()
+        .map(|nd| {
+            let mut reads = lift::MemoryReads::default();
+            reads.term(&nd.term, returns_to_reader);
+            let carried = l
+                .edge_assigns
+                .iter()
+                .filter(|((from, _), _)| *from == nd.id)
+                .flat_map(|(_, assigns)| assigns.iter().map(|(_, v)| *v));
+            reads.exprs(carried);
+            reads
+        })
+        .collect();
+    let per_stmt: Vec<Vec<lift::MemoryReads>> = l
+        .nodes
+        .iter()
+        .map(|nd| {
+            nd.stmts
+                .iter()
+                .map(|s| {
+                    let mut reads = lift::MemoryReads::default();
+                    reads.stmt(s, &callee);
+                    reads
+                })
+                .collect()
+        })
+        .collect();
+    let nothing = lift::MemoryReads::default();
+    let mut dead: HashSet<(usize, usize)> = HashSet::new();
+    loop {
+        let read_by = |n: usize, i: usize| match dead.contains(&(n, i)) {
+            true => &nothing,
+            false => &per_stmt[n][i],
+        };
+        let mut from_here: Vec<lift::MemoryReads> = l
+            .nodes
+            .iter()
+            .map(|nd| {
+                let mut reads = tails[nd.id].clone();
+                for i in 0..nd.stmts.len() {
+                    reads.add(read_by(nd.id, i));
+                }
+                reads
+            })
+            .collect();
+        loop {
+            let mut changed = false;
+            for nd in &l.nodes {
+                for succ in &nd.succs {
+                    let ahead = from_here[*succ].clone();
+                    changed |= from_here[nd.id].add(&ahead);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut found = HashSet::new();
+        for nd in &l.nodes {
+            let mut after = tails[nd.id].clone();
+            for succ in &nd.succs {
+                after.add(&from_here[*succ]);
+            }
+            for (i, s) in nd.stmts.iter().enumerate().rev() {
+                if fixed(s).is_some_and(|(addr, len)| !after.reads(addr, len)) {
+                    found.insert((nd.id, i));
+                } else {
+                    after.add(read_by(nd.id, i));
+                }
+            }
+        }
+        if found == dead {
+            return dead;
+        }
+        dead = found;
+    }
+}
+
 /// Where an expression occurs inside a node, in evaluation order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum Pos {
@@ -2712,7 +2818,10 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         facts: Vec::new(),
         stale_plan: plan_stale_loads(l, names),
         stored: Vec::new(),
-        dead_stores: stores_dead_until_exit(l),
+        dead_stores: stores_dead_until_exit(l)
+            .into_iter()
+            .chain(unread_fixed_stores(l, names))
+            .collect(),
         skipped: Default::default(),
     };
     names.stale.borrow_mut().clear();

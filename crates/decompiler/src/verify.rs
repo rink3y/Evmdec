@@ -440,6 +440,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
         prog: &prog,
         root: false,
         summaries: HashMap::new(),
+        footprints: HashMap::new(),
         oracle: true,
         copy_loops: Default::default(),
     };

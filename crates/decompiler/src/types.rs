@@ -88,6 +88,33 @@ impl Ty {
         }
     }
 
+    /// The type an elementary Solidity type name declares for one ABI word: `address`, `bool`,
+    /// `uintN`, `intN` or `bytesN`. `None` for `uint256`, which says nothing more than a word,
+    /// and for anything that is not one word.
+    #[must_use]
+    pub fn declared(name: &str) -> Option<Ty> {
+        let width = |prefix: &str| {
+            name.strip_prefix(prefix)
+                .and_then(|n| n.parse::<u32>().ok())
+        };
+        match name {
+            "address" | "address payable" => Some(Ty::Address),
+            "bool" => Some(Ty::Bool),
+            "int" => Some(Ty::Int(256)),
+            _ => {
+                if let Some(n) = width("uint") {
+                    (n.is_multiple_of(8) && n > 0 && n < 256).then_some(Ty::Uint(n))
+                } else if let Some(n) = width("int") {
+                    (n.is_multiple_of(8) && n > 0 && n <= 256).then_some(Ty::Int(n))
+                } else {
+                    width("bytes")
+                        .filter(|n| (1..=32).contains(n))
+                        .map(Ty::Bytes)
+                }
+            }
+        }
+    }
+
     /// The type a low mask of `bits` bits cleans a value to.
     pub fn of_mask(bits: u32) -> Ty {
         match bits {
@@ -144,6 +171,15 @@ pub enum Loc {
     },
     /// The keys of a mapping: the shape of the entries it selects.
     Key(Shape),
+    /// A word of the data an external call returned.
+    Output {
+        /// Entry pc of the function making the call.
+        scope: usize,
+        /// Sequence number of the call.
+        seq: u32,
+        /// Word index in the return data.
+        word: u32,
+    },
 }
 
 impl Loc {
@@ -178,6 +214,9 @@ struct Flags {
     unsigned_cmp: bool,
     /// Receives the result of arithmetic (`add`, `sub`, `mul`, `div`, `mod`, `exp`).
     arith_def: bool,
+    /// Used where only an opaque 32-byte word fits: a hash or signature half given to
+    /// `ecrecover`, or compared for equality with a hash or a text literal.
+    word32: bool,
 }
 
 /// Is width `bits` in the `cast` bit set (bit `bits / 8` for whole-byte widths)?
@@ -198,6 +237,7 @@ impl Flags {
         self.cast |= other.cast;
         self.signed_cmp |= other.signed_cmp;
         self.unsigned_cmp |= other.unsigned_cmp;
+        self.word32 |= other.word32;
     }
 }
 
@@ -269,7 +309,8 @@ const MAX_TYPE_DEPTH: u32 = 6;
 pub struct TypeEnv {
     layout: MappingLayout,
     /// Vyper validates decoded values by range checks (`x < 2^160`, `x >> 1 == 0`); solc masks
-    /// them, so a range check in solc output is a cast or a user `require`.
+    /// them, so a range check in solc output is a cast or a user `require`. Vyper never masks a
+    /// value to its declared width, so a mask or shift there is the program unpacking a word.
     vyper: bool,
     debug: bool,
     ids: HashMap<Loc, usize>,
@@ -283,8 +324,36 @@ pub struct TypeEnv {
     results_len: HashMap<usize, Option<usize>>,
 }
 
-/// Build the environment: index every function, then solve.
-pub fn solve(functions: &[(usize, &Lifted)], layout: MappingLayout) -> TypeEnv {
+/// A calldata head word whose type a known signature declares: the function's entry pc, the
+/// word index and the type.
+pub type Declared = (usize, u32, Ty);
+
+/// The head words a signature's parameter list declares, as `(word index, type)`. Words are
+/// counted while every parameter so far takes exactly one (elementary and dynamic types do; a
+/// static tuple or fixed array takes several and ends the count).
+#[must_use]
+pub fn declared_words(params: &[String]) -> Vec<(u32, Ty)> {
+    let mut out = Vec::new();
+    for (i, p) in params.iter().enumerate() {
+        let dynamic = p == "bytes" || p == "string" || p.ends_with("[]");
+        if p.starts_with('(') || (p.ends_with(']') && !dynamic) {
+            break;
+        }
+        if let Some(t) = Ty::declared(p) {
+            out.push((i as u32, t));
+        }
+    }
+    out
+}
+
+/// Build the environment: index every function, then solve. `declared` carries what known
+/// signatures state about calldata words; it is evidence like any use and flows on to the
+/// storage, helpers and results the words reach.
+pub fn solve(
+    functions: &[(usize, &Lifted)],
+    layout: MappingLayout,
+    declared: &[Declared],
+) -> TypeEnv {
     let mut env = TypeEnv {
         layout,
         vyper: layout == MappingLayout::Vyper,
@@ -312,6 +381,15 @@ pub fn solve(functions: &[(usize, &Lifted)], layout: MappingLayout) -> TypeEnv {
     }
     for (pc, l) in functions {
         env.index(*pc, l, arity);
+    }
+    for (pc, word, ty) in declared {
+        env.hint(
+            Some(Loc::Param {
+                scope: *pc,
+                word: *word,
+            }),
+            *ty,
+        );
     }
     env.propagate();
     env.run();
@@ -453,6 +531,13 @@ impl TypeEnv {
                 .callee_of
                 .get(&(scope, seq))
                 .map(|unit| Loc::Ret { unit: *unit, index }),
+            Node::ReturnData(seq, off) => expr::as_const(off)
+                .filter(|o| o.fits_u64() && o.low_u64().is_multiple_of(32) && o.low_u64() < 1 << 16)
+                .map(|o| Loc::Output {
+                    scope,
+                    seq,
+                    word: (o.low_u64() / 32) as u32,
+                }),
             _ => None,
         }
     }
@@ -519,6 +604,14 @@ impl TypeEnv {
             if let Term::SelfDestruct(a) = &nd.term {
                 self.account(*a, pc);
             }
+            if let Term::Branch {
+                cond, t: Some(t), ..
+            } = &nd.term
+            {
+                if lift::always_reverts(l, *t) {
+                    self.shift_validator(*cond, pc);
+                }
+            }
             let conds: HashSet<ExprId> = condition_exprs(nd).into_iter().collect();
             for root in lift::roots(nd) {
                 let context = if root.payload {
@@ -561,10 +654,24 @@ impl TypeEnv {
                     None => self.def(Loc::Slot(shape), *val, pc),
                 }
             }
-            Stmt::Call { addr, value, .. } => {
+            Stmt::Call {
+                addr,
+                value,
+                input,
+                input_head,
+                ..
+            } => {
                 self.account(*addr, pc);
                 if let Some(v) = value {
                     self.arith(*v, pc, op::CALLVALUE);
+                }
+                if expr::as_const(*addr) == Some(U256::ONE) {
+                    let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
+                    for i in [0, 2, 3] {
+                        if let Some(w) = words.get(i) {
+                            self.word32(*w, pc);
+                        }
+                    }
                 }
             }
             Stmt::Copy {
@@ -586,6 +693,12 @@ impl TypeEnv {
         let loc = self.location(inner, scope);
         self.hint(loc.clone(), Ty::Address);
         self.flag(loc, |f| f.account = true);
+    }
+
+    /// `e` is used as an opaque 32-byte word.
+    fn word32(&mut self, e: ExprId, scope: usize) {
+        let loc = self.location(e, scope);
+        self.flag(loc, |f| f.word32 = true);
     }
 
     /// Record the key types of every mapping step on `path`.
@@ -656,6 +769,9 @@ impl TypeEnv {
                     if is_account(b) {
                         self.account(a, scope);
                     }
+                    if is_word32(b) {
+                        self.word32(a, scope);
+                    }
                     if konst(b).is_some_and(|c| c.is_zero()) {
                         self.shift_validator(a, scope);
                     }
@@ -712,6 +828,11 @@ impl TypeEnv {
                 }
             }
             op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH => self.account(v[0], scope),
+            op::SHL
+                if konst(v[0]).is_some_and(|k| k.fits_u64() && (1..8).contains(&k.low_u64())) =>
+            {
+                self.arith(v[1], scope, o);
+            }
             _ => {}
         }
     }
@@ -875,6 +996,13 @@ impl TypeEnv {
         }
     }
 
+    /// Whether the code is Vyper's, which validates by range checks and never masks a value to
+    /// its declared width.
+    #[must_use]
+    pub fn vyper(&self) -> bool {
+        self.vyper
+    }
+
     /// The type of an expression read in `scope`, from the classes it reads and its shape.
     pub fn type_of(&self, e: ExprId, scope: usize) -> Ty {
         self.type_of_at(e, scope, 0)
@@ -901,6 +1029,7 @@ impl TypeEnv {
                 _ => Ty::Unknown,
             },
             Node::Keccak(..) | Node::KeccakMem(..) => Ty::Bytes(32),
+            Node::Op(op::BLOCKHASH | op::EXTCODEHASH | op::BLOBHASH, _) => Ty::Bytes(32),
             Node::CallResult(_) => Ty::Bool,
             Node::CreateResult(_) => Ty::Address,
             Node::Op(op::AND, v) => self.masked_type(&v, scope, depth),
@@ -911,7 +1040,7 @@ impl TypeEnv {
             Node::Op(op::ISZERO | op::LT | op::GT | op::SLT | op::SGT | op::EQ, _) => Ty::Bool,
             Node::Op(op::SHR | op::DIV | op::BYTE, _) => {
                 let b = expr::value_bits(e);
-                if b > 0 && b < 256 && b.is_multiple_of(8) {
+                if !self.vyper && b > 0 && b < 256 && b.is_multiple_of(8) {
                     Ty::Uint(b)
                 } else {
                     Ty::Unknown
@@ -927,6 +1056,9 @@ impl TypeEnv {
             let Some(m) = expr::as_const(m) else { continue };
             if m.is_low_mask() {
                 let inner = self.type_of_at(x, scope, depth + 1);
+                if self.vyper {
+                    return inner;
+                }
                 let masked = Ty::of_mask(m.bits());
                 return match (inner, masked) {
                     (Ty::Address, Ty::Uint(n)) if n < 160 => Ty::Uint(n),
@@ -1030,6 +1162,11 @@ impl TypeEnv {
                 scope: scope + base,
                 word,
             },
+            Loc::Output { scope, seq, word } => Loc::Output {
+                scope: scope + base,
+                seq,
+                word,
+            },
             other => other,
         };
         self.ids = self.ids.drain().map(|(loc, id)| (shift(loc), id)).collect();
@@ -1124,6 +1261,9 @@ fn resolve(c: &Class, evidence: Evidence) -> Ty {
     if t == Ty::Unknown && f.tested && !f.arith && !f.other && !c.storage {
         t = Ty::Bool;
     }
+    if f.word32 && !f.arith && !f.account && matches!(t, Ty::Unknown | Ty::Bytes(_)) {
+        t = Ty::Bytes(32);
+    }
     match t {
         Ty::Uint(n) if n <= 8 && f.one && !f.other && !f.arith => Ty::Bool,
         Ty::Address if f.arith && !f.account => Ty::Uint(160),
@@ -1200,7 +1340,40 @@ fn const_type(c: U256) -> Ty {
     if !c.is_zero() && (192..256).contains(&tz) {
         return Ty::Bytes((256 - tz).div_ceil(8));
     }
+    if looks_like_hash(c) {
+        return Ty::Bytes(32);
+    }
     Ty::Unknown
+}
+
+/// A constant with the texture of a hash: nearly every byte significant, with no run of zero or
+/// `0xff` bytes that a number, a mask or a scaled amount would have.
+fn looks_like_hash(c: U256) -> bool {
+    let bytes = c.to_be_bytes();
+    let zeros = bytes.iter().filter(|b| **b == 0).count();
+    let ones = bytes.iter().filter(|b| **b == 0xff).count();
+    c.byte_len() >= 31 && zeros <= 2 && ones <= 2
+}
+
+/// A text literal held in a word: two or more printable ASCII bytes at the top, zeros below
+/// (`"Line"` as a `bytes32`).
+fn looks_like_text(c: U256) -> bool {
+    let bytes = c.to_be_bytes();
+    let len = bytes
+        .iter()
+        .take_while(|b| (0x20..0x7f).contains(*b))
+        .count();
+    len >= 2 && bytes[len..].iter().all(|b| *b == 0)
+}
+
+/// A hash, a hash-like constant or a text literal: what an opaque 32-byte word is compared with.
+fn is_word32(e: ExprId) -> bool {
+    match expr::node(e) {
+        Node::Keccak(..) | Node::KeccakMem(..) => true,
+        Node::Op(op::BLOCKHASH | op::EXTCODEHASH | op::BLOBHASH, _) => true,
+        Node::Const(c) => looks_like_hash(c) || looks_like_text(c),
+        _ => false,
+    }
 }
 
 /// `n` for a mask keeping the top `n` bytes (`bytesN` cleanup), else `None`.

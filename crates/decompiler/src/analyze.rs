@@ -4274,28 +4274,6 @@ fn capped_slots(c: &Contract) -> HashMap<U256, u64> {
     out
 }
 
-/// Every path from `start` ends in a revert or an invalid opcode.
-fn always_reverts(l: &Lifted, start: usize) -> bool {
-    let mut seen = HashSet::new();
-    let mut stack = vec![start];
-    while let Some(x) = stack.pop() {
-        if !seen.insert(x) || seen.len() > 2000 {
-            continue;
-        }
-        match &l.nodes[x].term {
-            Term::Revert { .. } | Term::Invalid => {}
-            Term::Return { .. }
-            | Term::ReturnDyn { .. }
-            | Term::Stop
-            | Term::InternalReturn(_)
-            | Term::SelfDestruct(_)
-            | Term::Unresolved(_) => return false,
-            _ => stack.extend(l.nodes[x].succs.iter().copied()),
-        }
-    }
-    true
-}
-
 /// Conditions that must hold for execution to go on, with their polarity: inlined helpers'
 /// guards (`Require`) hold as written; a branch (of the function or of an inlined body) whose
 /// one side only reverts holds in the polarity of the other side.
@@ -4319,9 +4297,9 @@ fn require_conds(ctx: &Ctx, l: &Lifted, events: &[Event]) -> Vec<(ExprId, bool)>
                     .and_then(|f| f.lifted.as_ref())
             };
             let Some(g) = graph else { continue };
-            if always_reverts(g, *t) {
+            if lift::always_reverts(g, *t) {
                 out.push((*cond, false));
-            } else if always_reverts(g, *f) {
+            } else if lift::always_reverts(g, *f) {
                 out.push((*cond, true));
             }
         }

@@ -609,3 +609,70 @@ fn types_follow_values_through_helpers_and_range_checks() {
     assert!(ens.contains("mapping(bytes32 => "), "{ens}");
     assert!(ens.contains("external returns (bytes32)"), "{ens}");
 }
+
+/// Evidence the bytecode carries beyond masks: a Vyper range check whose failing side reverts,
+/// an index scaled to a word offset, a word another contract returned and validated, the
+/// arguments of `ecrecover`, a block hash, and a comparison with a text literal.
+#[test]
+fn types_use_validators_precompiles_and_literals() {
+    let opts = evmdec::decompile::Options {
+        no_sigs: true,
+        ..evmdec::decompile::Options::default()
+    };
+    let source = |name: &str| -> String {
+        let code = corpus()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, code)| code)
+            .expect("fixture present");
+        evmdec::decompile::decompile(&code, &opts).source
+    };
+    let tricrypto = source("curve_tricrypto_ng");
+    for header in [
+        "function func_a9059cbb(address arg0, uint256 arg1) external returns (bool)",
+        "function func_cab4d3db() external view returns (address)",
+        "function func_59189017(uint256 arg0) external pure returns (uint256)",
+        "function func_ddca3f43() external view returns (uint256)",
+    ] {
+        assert!(tricrypto.contains(header), "missing `{header}`");
+    }
+    let uni = source("uni_token");
+    assert!(
+        uni.contains("uint256 arg3, uint8 arg4, bytes32 arg5, bytes32 arg6) external"),
+        "ecrecover arguments"
+    );
+    let multicall = source("multicall3");
+    assert!(
+        multicall.contains("function func_ee82ac5e(uint256 arg0) external view returns (bytes32)"),
+        "blockhash result"
+    );
+    let vat = source("maker_vat");
+    assert!(
+        vat.contains("function func_1a0b287e(uint256 arg0, bytes32 arg1, uint256 arg2) external"),
+        "text literal comparison"
+    );
+}
+
+/// What a known signature declares about a calldata word reaches the storage it keys.
+#[test]
+fn declared_types_flow_into_storage() {
+    use evmdec::types::{declared_words, Ty};
+    let params = |list: &[&str]| -> Vec<String> { list.iter().map(|s| s.to_string()).collect() };
+    assert_eq!(
+        declared_words(&params(&[
+            "bytes32", "address", "uint256", "uint64", "bytes", "bool"
+        ])),
+        vec![
+            (0, Ty::Bytes(32)),
+            (1, Ty::Address),
+            (3, Ty::Uint(64)),
+            (5, Ty::Bool)
+        ]
+    );
+    assert_eq!(
+        declared_words(&params(&["address", "(uint256,address)", "bool"])),
+        vec![(0, Ty::Address)],
+        "a static tuple takes several words and ends the count"
+    );
+    assert_eq!(declared_words(&params(&["uint256[3]", "address"])), vec![]);
+}

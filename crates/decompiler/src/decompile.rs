@@ -1180,7 +1180,17 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             .iter()
             .filter_map(|f| f.lifted.as_ref().map(|l| (f.pc, l)))
             .collect();
-        types::solve(&units, layout)
+        let declared: Vec<types::Declared> = functions
+            .iter()
+            .filter(|f| f.kind == FnKind::External)
+            .filter_map(|f| f.signature.as_ref().map(|sig| (f.pc, sig)))
+            .flat_map(|(pc, sig)| {
+                types::declared_words(&sigs::params_of(sig))
+                    .into_iter()
+                    .map(move |(word, ty)| (pc, word, ty))
+            })
+            .collect();
+        types::solve(&units, layout, &declared)
     };
     refine_types(&mut functions, &env);
     tick("types", &mut tt);
@@ -1898,6 +1908,10 @@ fn refine_returns(
         return;
     }
     for (i, ty) in returns.iter_mut().enumerate() {
+        let narrow_uint = ty.starts_with("uint") && ty != "uint256";
+        if env.vyper() && narrow_uint {
+            *ty = "uint256".into();
+        }
         if ty != "uint256" {
             continue;
         }

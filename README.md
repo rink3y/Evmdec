@@ -133,16 +133,19 @@ TriCrypto-NG, the CREATE2 deployer, UNI), and one on 26 exploited contracts.
 | state mutability | 509 / 515 |
 | parameter count | 513 / 515 |
 | return count | 514 / 515 |
-| parameter types, exact Solidity type | 840 / 955 |
-| return types | 339 / 380 |
+| parameter types, exact Solidity type | 885 / 955 |
+| return types | 359 / 380 |
 | events | 119 / 121 |
 | code blocks covered by some function | 10,810 / 10,810 |
 | unresolved jumps | 0 |
 | time for the corpus | about 6 s |
 
 The mutability misses are `view` functions that make external calls on a pre-0.5 compiler, or
-proxy getters that fall through to `delegatecall`. Most type misses are `bytes32` declared where
-the code treats the word as a number, which nothing in the bytecode tells apart.
+proxy getters that fall through to `delegatecall`. Most type misses are `bytes32` mapping keys,
+which the bytecode handles exactly like a number. A `bytes32` is recovered where the code shows
+it: a hash or signature half passed to `ecrecover`, a block or code hash, a hash-like constant,
+or a comparison with a text literal. With the signature dictionary on, the declared parameter
+types are used directly (931 / 955) and flow on into the storage and helpers they reach.
 
 ### Block oracle
 

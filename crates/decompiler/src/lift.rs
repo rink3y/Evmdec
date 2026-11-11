@@ -2694,6 +2694,28 @@ fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
     st.version = st.mem.gen;
 }
 
+/// Every path from `start` ends in a revert or an invalid opcode.
+pub fn always_reverts(l: &Lifted, start: usize) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 2000 {
+            continue;
+        }
+        match &l.nodes[x].term {
+            Term::Revert { .. } | Term::Invalid => {}
+            Term::Return { .. }
+            | Term::ReturnDyn { .. }
+            | Term::Stop
+            | Term::InternalReturn(_)
+            | Term::SelfDestruct(_)
+            | Term::Unresolved(_) => return false,
+            _ => stack.extend(l.nodes[x].succs.iter().copied()),
+        }
+    }
+    true
+}
+
 /// Apply `f` to every expression of a statement.
 pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
     let fv = |v: &Vec<ExprId>| v.iter().map(|e| f(*e)).collect::<Vec<_>>();

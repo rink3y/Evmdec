@@ -364,6 +364,13 @@ fn describe<'a>(c: &'a Contract, loc: &Loc) -> Option<Place<'a>> {
                 format!("a value computed in `{}`", display_name(f)),
             )
         }
+        Loc::Output { scope, .. } => {
+            let f = func(*scope)?;
+            place(
+                Some(f),
+                format!("a value another contract returned to `{}`", display_name(f)),
+            )
+        }
         Loc::Slot(shape) | Loc::Key(shape) => {
             let v = var(shape.root)?;
             let what = if matches!(loc, Loc::Key(_)) {

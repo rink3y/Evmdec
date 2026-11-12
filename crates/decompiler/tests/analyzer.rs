@@ -2168,3 +2168,82 @@ fn a_caller_check_on_a_slot_nothing_sets_is_reported_with_the_authority_map() {
     let r = report_of(&deployed(&owned, &runtime));
     assert!(finding(&r, "gate-never-set").is_none());
 }
+
+#[test]
+fn a_payment_made_before_the_entry_is_cleared_is_confirmed_by_calling_back() {
+    let pay_in = format!("CALLVALUE {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP");
+    let pays = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 CALLER GAS CALL POP";
+    let late = format!("{CALLER_ENTRY} DUP1 SLOAD {pays} POP PUSH1 0x00 SWAP1 SSTORE STOP");
+    let early = format!("{CALLER_ENTRY} DUP1 SLOAD PUSH1 0x00 DUP3 SSTORE {pays} POP POP STOP");
+    let paid_twice = |pay_out: &str| {
+        let r = report_of(&dispatcher3(&pay_in, pay_out, "STOP"));
+        r.findings
+            .iter()
+            .any(|f| f.id.starts_with("reentr") && f.confirmed && f.setup.len() == 1)
+    };
+    assert!(
+        paid_twice(&late),
+        "the entry is still set during the payment"
+    );
+    assert!(
+        !paid_twice(&early),
+        "the entry is cleared before the payment"
+    );
+}
+
+#[test]
+fn a_transfer_that_answers_false_is_run_and_a_function_that_ignores_it_is_confirmed() {
+    let pull = |check: &str| {
+        dispatcher(&format!(
+            "PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
+             ADDRESS PUSH1 0xa4 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0xc4 MSTORE \
+             PUSH1 0x20 PUSH1 0x80 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 PUSH2 0xb1b1 GAS CALL POP \
+             {check} \
+             PUSH1 0x04 CALLDATALOAD {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP"
+        ))
+    };
+    let confirmed = |code: &[u8], ids: &[&str]| {
+        let r = report_of(code);
+        r.findings
+            .iter()
+            .any(|f| ids.contains(&f.id.as_str()) && f.confirmed)
+    };
+    let ignoring = [
+        "refused-transfer-treated-as-done",
+        "erc20-return-ignored",
+        "unchecked-token-pull",
+    ];
+    assert!(confirmed(&pull(""), &ignoring));
+
+    let checked = "PUSH1 0x80 MLOAD PUSH2 @yes JUMPI PUSH1 0x00 DUP1 REVERT :yes JUMPDEST";
+    assert!(!confirmed(&pull(checked), &ignoring));
+
+    let sized = format!(
+        "RETURNDATASIZE PUSH1 0x20 EQ PUSH2 @full JUMPI PUSH1 0x00 DUP1 REVERT :full JUMPDEST \
+         {checked}"
+    );
+    assert!(confirmed(
+        &pull(&sized),
+        &["transfer-without-answer-refused"]
+    ));
+    assert!(!confirmed(
+        &pull(checked),
+        &["transfer-without-answer-refused"]
+    ));
+}
+
+#[test]
+fn work_that_grows_with_a_count_any_caller_can_raise_is_reported() {
+    let add = "PUSH1 0x05 SLOAD PUSH1 0x01 ADD PUSH1 0x05 SSTORE STOP";
+    let walk = |bound: &str| {
+        format!(
+            "PUSH1 0x00 :top JUMPDEST {bound} DUP2 LT ISZERO PUSH2 @done JUMPI \
+             DUP1 SLOAD POP PUSH1 0x01 ADD PUSH2 @top JUMP :done JUMPDEST POP STOP"
+        )
+    };
+    let open = dispatcher3(add, &walk("PUSH1 0x05 SLOAD"), "STOP");
+    assert!(finding(&report_of(&open), "cost-grows-with-open-list").is_some());
+
+    let fixed = dispatcher3(add, &walk("PUSH1 0x03"), "STOP");
+    assert!(finding(&report_of(&fixed), "cost-grows-with-open-list").is_none());
+}

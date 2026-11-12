@@ -739,6 +739,74 @@ fn phases(
     })
 }
 
+const SHORT_LIST: u64 = 2;
+const LONG_LIST: u64 = 34;
+const STEPS_PER_ITEM: usize = 8;
+const MAX_COUNTERS: usize = 4;
+
+fn growth(c: &Contract, all: &[Run], begin: &HashMap<U256, U256>, out: &mut Vec<Finding>) {
+    let mut counters: BTreeMap<U256, &Run> = BTreeMap::new();
+    for run in all.iter().filter(|r| !r.assumed) {
+        for step in &run.steps {
+            let Step::Write {
+                key,
+                slot,
+                before,
+                after,
+            } = step
+            else {
+                continue;
+            };
+            let by_one = *after == before.wrapping_add(U256::ONE);
+            if by_one && expr::as_const(*key).is_some() {
+                counters.entry(*slot).or_insert(run);
+            }
+        }
+    }
+    let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
+    for (slot, adder) in counters.into_iter().take(MAX_COUNTERS) {
+        let mut slowed: Vec<(String, usize)> = Vec::new();
+        for g in c.functions.iter().filter(|f| f.kind == FnKind::External) {
+            let code = c.code_of(g);
+            let explorer = explorers
+                .entry(code.as_ptr())
+                .or_insert_with(|| Explorer::new(code));
+            let steps_at = |length: u64| {
+                let mut inputs = path::inputs_for(exec::selector_of(g), WORDS);
+                inputs.storage = begin.clone();
+                inputs.storage.insert(slot, U256::from_u64(length));
+                let run = explorer.run(&inputs).run;
+                run.succeeded().then_some(run.steps)
+            };
+            if let (Some(short), Some(long)) = (steps_at(SHORT_LIST), steps_at(LONG_LIST)) {
+                let extra = long.saturating_sub(short);
+                if extra >= (LONG_LIST - SHORT_LIST) as usize * STEPS_PER_ITEM {
+                    slowed.push((format!("`{}`", g.name), extra));
+                }
+            }
+        }
+        let Some((_, extra)) = slowed.first() else {
+            continue;
+        };
+        let names: Vec<&str> = slowed.iter().map(|(n, _)| n.as_str()).collect();
+        report(
+            out,
+            adder,
+            "cost-grows-with-open-list",
+            "Work grows with a count that any caller can raise",
+            Severity::Medium,
+            format!(
+                "`{}` needs no role and raises {} by one each time it is called. {} do work for every unit of that count: with the count at {LONG_LIST} instead of {SHORT_LIST} a call runs {} more instructions. Nothing found caps the count, so enough calls put those functions beyond what one block can run.",
+                adder.function.name,
+                slot_text(slot),
+                names.join(", "),
+                extra,
+            ),
+            "Cap the count, or let callers process the list in bounded pieces.",
+        );
+    }
+}
+
 pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Vec<Section> {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return Vec::new();
@@ -752,5 +820,6 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Vec<Section> {
     dropped_changes(&all, out);
     clock_mix(&all, layout, out);
     let begin = deploy::storage(c);
+    growth(c, &all, &begin, out);
     phases(c, &all, &begin, out).into_iter().collect()
 }

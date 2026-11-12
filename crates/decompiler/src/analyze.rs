@@ -4746,6 +4746,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     type_rules::findings(c, &c.types, names_for, &mut findings);
 
     crate::confirm::confirm(c, &mut findings);
+    crate::confirm::confirm_wraps(c, &mut findings);
 
     crate::invariant::findings(c, &c.types, &mut findings);
     crate::props::findings(c, &mut findings);

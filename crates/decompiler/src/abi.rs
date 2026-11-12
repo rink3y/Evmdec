@@ -76,6 +76,7 @@ fn head_words(ty: &Ty) -> usize {
 struct Encoder {
     words: Vec<U256>,
     fixed: Vec<usize>,
+    elements: usize,
 }
 
 impl Encoder {
@@ -100,14 +101,14 @@ impl Encoder {
     fn tail(&mut self, ty: &Ty) {
         match ty {
             Ty::Bytes => {
-                self.fixed.push(self.words.len());
-                self.words.push(U256::from_u64(32));
+                // Two fits a byte string and also an array that was recovered as one.
+                self.words.push(U256::from_u64(2));
+                self.words.push(U256::ZERO);
                 self.words.push(U256::ZERO);
             }
             Ty::Array(inner) => {
-                self.fixed.push(self.words.len());
-                self.words.push(U256::ONE);
-                self.sequence(std::slice::from_ref(inner));
+                self.words.push(U256::from(self.elements));
+                self.sequence(&vec![(**inner).clone(); self.elements]);
             }
             Ty::Fixed(inner, n) => self.sequence(&vec![(**inner).clone(); *n]),
             Ty::Tuple(parts) => self.sequence(parts),
@@ -116,13 +117,18 @@ impl Encoder {
     }
 }
 
-// Every array gets one element and every byte string one word.
-// The offsets and lengths that make this layout valid are listed as fixed.
 pub fn layout(selector: Option<u32>, types: &[String]) -> Layout {
+    layout_with(selector, types, 1)
+}
+
+// Only offsets are fixed. A length stays free because a function may bound it,
+// and a recovered byte string may really be an array.
+pub fn layout_with(selector: Option<u32>, types: &[String], elements: usize) -> Layout {
     let items: Vec<Ty> = types.iter().map(|t| parse(t)).collect();
     let mut enc = Encoder {
         words: Vec::new(),
         fixed: Vec::new(),
+        elements,
     };
     enc.sequence(&items);
     let mut calldata = Vec::with_capacity(4 + 32 * enc.words.len());
@@ -157,16 +163,23 @@ mod tests {
     }
 
     #[test]
-    fn a_byte_string_gets_an_offset_a_length_and_one_word() {
+    fn a_byte_string_gets_an_offset_a_length_and_two_words() {
         let l = layout(Some(1), &["uint256".into(), "bytes".into()]);
-        assert_eq!(words(&l), [0, 0x40, 32, 0]);
-        assert_eq!(l.fixed, [1, 2]);
+        assert_eq!(words(&l), [0, 0x40, 2, 0, 0]);
+        assert_eq!(l.fixed, [1]);
     }
 
     #[test]
     fn an_array_of_tuples_with_bytes_nests_its_offsets() {
         let l = layout(Some(1), &["(address,bytes)[]".into()]);
-        assert_eq!(words(&l), [0x20, 1, 0x20, 0, 0x40, 32, 0]);
-        assert_eq!(l.fixed, [0, 1, 2, 4, 5]);
+        assert_eq!(words(&l), [0x20, 1, 0x20, 0, 0x40, 2, 0, 0]);
+        assert_eq!(l.fixed, [0, 2, 4]);
+    }
+
+    #[test]
+    fn an_array_can_be_given_two_elements() {
+        let l = layout_with(Some(1), &["address[]".into(), "uint256".into()], 2);
+        assert_eq!(words(&l), [0x40, 0, 2, 0, 0]);
+        assert_eq!(l.fixed, [0]);
     }
 }

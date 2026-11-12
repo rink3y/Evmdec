@@ -2,15 +2,16 @@ use crate::abi;
 use crate::analyze::{display_name, Confidence, Finding};
 use crate::decompile::{Contract, Function};
 use crate::exec::{self, FrameRun};
+use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
 use crate::hex;
 use crate::interp::{CallRecord, Outcome};
 use crate::opcode as op;
 use crate::path::{self, Explorer, Limits, Path};
 use crate::seq::{self, Entry};
-use crate::solve::{Free, Inputs};
+use crate::solve::{self, Free, Inputs, Item};
 use crate::u256::U256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
 
@@ -178,5 +179,129 @@ fn shows_effect(id: &str, run: &FrameRun) -> bool {
             run.storage.is_empty() && run.calls.is_empty() && run.logs.is_empty()
         }
         _ => false,
+    }
+}
+
+const WRAP_IDS: &[&str] = &["unchecked-arithmetic", "unchecked-block-arithmetic"];
+const MAX_WRAP_NODES: usize = 16;
+
+const WRAPPED_NOTE: &str = concat!(
+    " Confirmed: with the attached input, sent by an account holding no role to empty storage,",
+    " the function ends normally after a stored result wrapped around."
+);
+
+fn wrap_checks(val: ExprId, out: &mut Vec<ExprId>) {
+    let mut seen = HashSet::new();
+    let mut stack = vec![val];
+    while let Some(e) = stack.pop() {
+        if !seen.insert(e) || seen.len() > 400 || out.len() >= MAX_WRAP_NODES {
+            continue;
+        }
+        let from_input = |x: ExprId| expr::contains(x, &|n| matches!(n, Node::CallDataLoad(_)));
+        if let Node::Op(o, v) = expr::node(e) {
+            if let ([a, b], true) = (&v[..], from_input(e)) {
+                let check = match o {
+                    op::ADD => Some(expr::op2(op::LT, e, *a)),
+                    op::SUB => Some(expr::op2(op::LT, *a, *b)),
+                    // MAX / 0 is 0 in the EVM, so a zero factor would read as a wrap.
+                    op::MUL => {
+                        let room = expr::op2(op::DIV, expr::konst(U256::MAX), *b);
+                        let nonzero = expr::op2(op::GT, *b, expr::konst(U256::ZERO));
+                        Some(expr::op2(op::AND, nonzero, expr::op2(op::GT, *a, room)))
+                    }
+                    _ => None,
+                };
+                out.extend(check.filter(|c| expr::as_const(*c).is_none()));
+            }
+            stack.extend(v);
+        }
+    }
+}
+
+// The run is repeated with the solved input and must take the same path and still end normally.
+fn wrapping_input(code: &[u8], f: &Function) -> Option<Vec<u8>> {
+    let explorer = Explorer::new(code);
+    let selector = exec::selector_of(f);
+    let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
+    let shaped = abi::layout(selector, &types);
+    let doubled = abi::layout_with(selector, &types, 2);
+    let flat = path::inputs_for(selector, f.params.len().clamp(1, 8));
+    let starts = [
+        (flat.calldata.clone(), Vec::new()),
+        (shaped.calldata, shaped.fixed),
+        (doubled.calldata, doubled.fixed),
+    ];
+    for (calldata, fixed) in starts {
+        let free = Free {
+            words: calldata.len() / 32,
+            value: true,
+            storage: false,
+            fixed,
+        };
+        let start = Inputs {
+            calldata,
+            ..flat.clone()
+        };
+        let found = explorer.explore(&start, &free, Limits::default());
+        for p in found {
+            if !p.succeeded() {
+                continue;
+            }
+            let mut checks = Vec::new();
+            for item in &p.items {
+                if let Item::Store { val, .. } = item {
+                    wrap_checks(*val, &mut checks);
+                }
+            }
+            for cond in checks {
+                let wrap = Item::Check {
+                    cond,
+                    holds: false,
+                    pc: usize::MAX,
+                };
+                // Asked first so the later checks are repaired around the wrap, not the reverse.
+                let mut first = vec![wrap.clone()];
+                first.extend(p.items.iter().cloned());
+                let mut want = vec![true];
+                want.extend(&p.truth);
+                let Some(inputs) = solve::solve(&first, &want, &p.inputs, &free) else {
+                    continue;
+                };
+                let mut items = p.items.clone();
+                items.push(wrap);
+                let again = explorer.run(&inputs);
+                let same = again.signature() == p.signature() && again.succeeded();
+                let wrapped = solve::replay(&items, &inputs).last() == Some(&Some(true));
+                if same && wrapped {
+                    return Some(inputs.calldata);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn confirm_wraps(c: &Contract, findings: &mut [Finding]) {
+    if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
+        return;
+    }
+    for finding in findings.iter_mut() {
+        if finding.confirmed || !WRAP_IDS.contains(&finding.id.as_str()) {
+            continue;
+        }
+        let Some(name) = finding.function.as_deref() else {
+            continue;
+        };
+        let function = c
+            .functions
+            .iter()
+            .find(|f| f.kind == FnKind::External && display_name(f) == name);
+        let Some(f) = function else { continue };
+        if let Some(witness) = wrapping_input(c.code_of(f), f) {
+            finding.confirmed = true;
+            finding.witness = Some(hex::encode(&witness));
+            finding.confidence = Confidence::High;
+            finding.description.push_str(WRAPPED_NOTE);
+        }
     }
 }

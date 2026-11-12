@@ -3,7 +3,7 @@ use crate::keccak;
 use crate::lift::Stmt;
 use crate::opcode as op;
 use crate::u256::U256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inputs {
@@ -47,6 +47,7 @@ enum Place {
 }
 
 const ROUNDS: usize = 96;
+const LOOKAHEAD: usize = 8;
 
 pub fn word(calldata: &[u8], offset: usize) -> U256 {
     let mut bytes = [0u8; 32];
@@ -300,10 +301,18 @@ impl Search<'_> {
                     let (q, r) = target.div_rem(k);
                     if r.is_zero() {
                         self.force(x, q, d);
+                        // An even factor loses the top bits, so a second value gives the same product.
+                        let lost = k.trailing_zeros();
+                        if lost > 0 {
+                            self.force(x, q.wrapping_add(U256::ONE << (256 - lost)), d);
+                        }
                     }
                 }
             }
             (op::DIV, [a, b]) => {
+                if let (Some(top), false) = (val(self, *a), target.is_zero()) {
+                    self.force(*b, top.div_rem(target).0, d);
+                }
                 if let Some(k) = val(self, *b).filter(|k| !k.is_zero()) {
                     let wide = target.wrapping_mul(k);
                     if wide.div_rem(k).0 == target {
@@ -403,13 +412,17 @@ impl Search<'_> {
         let (x, y) = (self.eval.value(low), self.eval.value(high));
         let one = U256::ONE;
         if want {
+            // The exact neighbour is often not reachable through a quotient or a product.
+            // Half way is a second target with more preimages.
             if let Some(y) = y.filter(|y| !y.is_zero()) {
                 self.force(low, y.wrapping_sub(one), depth);
                 self.force(low, U256::ZERO, depth);
+                self.force(low, y >> 1, depth);
             }
             if let Some(x) = x.filter(|x| *x != U256::MAX) {
                 self.force(high, x.wrapping_add(one), depth);
                 self.force(high, U256::MAX, depth);
+                self.force(high, (x >> 1) | (one << 255), depth);
             }
         } else {
             if let Some(y) = y {
@@ -420,6 +433,29 @@ impl Search<'_> {
                 self.force(high, x, depth);
                 self.force(high, U256::ZERO, depth);
             }
+        }
+    }
+}
+
+impl Search<'_> {
+    // A check on two keyed entries can turn on whether the keys are equal.
+    // No inversion finds that, so each free word inside a key is also tried at its own value.
+    fn distinct_keys(&mut self, cond: ExprId) {
+        let mut seen = HashSet::new();
+        let mut stack = vec![(cond, false)];
+        while let Some((e, in_key)) = stack.pop() {
+            if !seen.insert((e, in_key)) || seen.len() > 2_000 || self.out.len() > 64 {
+                continue;
+            }
+            if let (true, Some(Place::Word(index))) = (in_key, self.place(e)) {
+                self.out.push((
+                    Place::Word(index),
+                    U256::from_u64(0x1001 + 2 * index as u64),
+                ));
+                continue;
+            }
+            let keyed = in_key || matches!(expr::node(e), Node::SLoad(..));
+            stack.extend(expr::children(e).into_iter().map(|c| (c, keyed)));
         }
     }
 }
@@ -451,6 +487,7 @@ fn proposals(
             Item::Check { cond, .. } => {
                 if seen == at {
                     search.truth(*cond, want, 0);
+                    search.distinct_keys(*cond);
                     break;
                 }
                 seen += 1;
@@ -496,12 +533,24 @@ pub fn solve(items: &[Item], want: &[bool], start: &Inputs, free: &Free) -> Opti
         if reached >= want.len() {
             return Some(current);
         }
-        let mut better = None;
-        for (place, value) in proposals(items, &current, free, reached, want[reached]) {
-            let next = apply(&current, place, value);
+        let mut better: Option<(usize, Inputs)> = None;
+        let offer = |better: &mut Option<(usize, Inputs)>, next: Inputs| {
             let score = agreed(&replay(items, &next), want, &observed);
             if score > reached && better.as_ref().is_none_or(|(s, _)| score > *s) {
-                better = Some((score, next));
+                *better = Some((score, next));
+            }
+        };
+        let firsts = proposals(items, &current, free, reached, want[reached]);
+        for (place, value) in &firsts {
+            offer(&mut better, apply(&current, *place, *value));
+        }
+        // A condition over two words can need both moved before it agrees.
+        if better.is_none() {
+            for (place, value) in firsts.iter().take(LOOKAHEAD) {
+                let mid = apply(&current, *place, *value);
+                for (place, value) in proposals(items, &mid, free, reached, want[reached]) {
+                    offer(&mut better, apply(&mid, place, value));
+                }
             }
         }
         let (score, next) = better?;

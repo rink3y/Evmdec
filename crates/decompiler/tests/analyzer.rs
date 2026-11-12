@@ -1909,3 +1909,34 @@ fn a_value_is_followed_back_through_the_slots_it_is_copied_from() {
         "a caller that reads back its own entry chose it"
     );
 }
+
+#[test]
+fn a_stored_product_is_confirmed_with_an_input_that_wraps_it() {
+    use evmdec::solve::word;
+    use evmdec::U256;
+
+    let wrap_ids = ["unchecked-arithmetic", "unchecked-block-arithmetic"];
+    let product = "PUSH1 0x04 CALLDATALOAD PUSH1 0x24 CALLDATALOAD MUL PUSH1 0x00 SSTORE STOP";
+    let r = analyze::analyze(&decompile::decompile(
+        &dispatcher(product),
+        &Options::default(),
+    ));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| wrap_ids.contains(&f.id.as_str()))
+        .unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(f.confirmed, "{}", f.description);
+    let data = evmdec::hex::decode(f.witness.as_deref().unwrap()).unwrap();
+    let (a, b) = (word(&data, 4), word(&data, 36));
+    assert!(!b.is_zero() && a > U256::MAX / b, "the witness must wrap");
+
+    let sum = "PUSH1 0x04 CALLDATALOAD PUSH1 0x01 SLOAD ADD PUSH1 0x00 SSTORE STOP";
+    let r = analyze::analyze(&decompile::decompile(&dispatcher(sum), &Options::default()));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| wrap_ids.contains(&f.id.as_str()))
+        .unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(!f.confirmed, "nothing stored yet, so the sum cannot wrap");
+}

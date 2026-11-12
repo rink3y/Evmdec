@@ -513,6 +513,7 @@ struct Mem {
     written: BTreeSet<(u64, u64)>,
     entry_loads: Rc<RefCell<MemoryReads>>,
     touched: Rc<RefCell<MemoryWrites>>,
+    single_run: bool,
 }
 
 const BIG: u64 = 1 << 40;
@@ -629,6 +630,7 @@ impl Mem {
             written: BTreeSet::new(),
             entry_loads: Rc::default(),
             touched: Rc::default(),
+            single_run: false,
         }
     }
 
@@ -741,16 +743,27 @@ impl Mem {
                 break;
             }
             if w.base != base {
-                if may_alias(w.base, w.off, w.len, base, d, n) {
+                // One run cannot tell where an input-sized offset lands.
+                // It is taken to miss a fixed address and the re-run catches a wrong guess.
+                let guessed = self.single_run && base.is_none() && w.base.is_some();
+                if !guessed && may_alias(w.base, w.off, w.len, base, d, n) {
                     return None;
                 }
                 continue;
             }
             let Some(wl) = w.len else {
-                if d + n > w.off {
-                    return None;
+                if d + n <= w.off {
+                    continue;
                 }
-                continue;
+                // A read past the copied length is a wrong guess here.
+                // Every answer built on it is run again on the bytecode.
+                if let (true, 0, MVal::Copy(k, src, addr)) = (self.single_run, covered, &w.val) {
+                    if d >= w.off {
+                        copy_hit = Some((*k, *src, *addr, d - w.off, w.gen));
+                        break;
+                    }
+                }
+                return None;
             };
             let lo = w.off.max(d);
             let hi = (w.off + wl).min(d + n);
@@ -1408,6 +1421,7 @@ impl<'a> Lifter<'a> {
             called: false,
             returned: 0,
         };
+        state.mem.single_run = true;
         let hidden = Hidden::default();
         let mut out = Vec::with_capacity(blocks.len());
         for id in 0..blocks.len() {

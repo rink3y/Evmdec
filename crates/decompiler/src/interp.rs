@@ -73,6 +73,7 @@ pub struct Host {
     pub seed: u64,
     pub zero_storage: bool,
     pub force_calls: Option<bool>,
+    pub forced_return: Vec<u8>,
     pub intercept_calls: bool,
     pub unset_storage: Option<U256>,
 }
@@ -105,6 +106,7 @@ impl Host {
             seed: rng.next_u64(),
             zero_storage: false,
             force_calls: None,
+            forced_return: Vec::new(),
             intercept_calls: false,
             unset_storage: None,
         }
@@ -131,6 +133,7 @@ impl Host {
             seed: 0x5eed,
             zero_storage: true,
             force_calls: Some(true),
+            forced_return: Vec::new(),
             intercept_calls: false,
             unset_storage: None,
         }
@@ -203,7 +206,7 @@ impl Host {
     }
     pub fn call_result(&self, i: usize) -> (bool, Vec<u8>) {
         if let Some(b) = self.force_calls {
-            return (b, Vec::new());
+            return (b, self.forced_return.clone());
         }
         let r = keccak::keccak256(
             &[

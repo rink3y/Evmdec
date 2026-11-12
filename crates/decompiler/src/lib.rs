@@ -27,6 +27,7 @@ pub mod invariant;
 pub mod lift;
 #[cfg(feature = "rpc")]
 pub mod rpc;
+pub mod seq;
 pub mod sigdb;
 pub mod sigs;
 pub mod slots;

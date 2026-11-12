@@ -1700,3 +1700,56 @@ fn every_path_of_a_function_is_found_by_solving_its_branches() {
         "with prior storage free, slot 7 is chosen to match"
     );
 }
+
+#[test]
+fn a_call_that_needs_earlier_storage_is_reached_through_the_call_that_writes_it() {
+    use evmdec::path::Explorer;
+    use evmdec::seq::{self, Entry};
+    use evmdec::solve;
+    use evmdec::U256;
+
+    let revert = "PUSH1 0x00 DUP1 REVERT";
+    let own_entry =
+        "CALLER PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
+    let marks = "PUSH1 0x01 PUSH1 0x09 SSTORE STOP";
+    let entry = |selector: u32, words: usize| Entry {
+        selector: Some(selector),
+        words,
+    };
+    let entries = [
+        entry(0xaaaa_aaaa, 1),
+        entry(0xbbbb_bbbb, 1),
+        entry(0xcccc_cccc, 1),
+    ];
+    let marked = |p: &evmdec::path::Path| {
+        p.succeeded() && p.run.storage.get(&U256::from_u64(9)) == Some(&U256::ONE)
+    };
+
+    let by_entry = dispatcher3(
+        &format!("PUSH1 0x04 CALLDATALOAD {own_entry} SSTORE STOP"),
+        &format!("{own_entry} SLOAD PUSH1 0x07 EQ PUSH2 @ok JUMPI {revert} :ok JUMPDEST {marks}"),
+        "STOP",
+    );
+    let explorer = Explorer::new(&by_entry);
+    let plan = seq::reach(&explorer, &entries, entries[1], &marked).expect("two calls reach it");
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(&plan.steps[0].calldata[..4], [0xaa; 4]);
+    assert_eq!(solve::word(&plan.steps[0].calldata, 4), U256::from_u64(7));
+
+    let by_owner = dispatcher3(
+        &format!("PUSH1 0x00 SLOAD ISZERO PUSH2 @new JUMPI {revert} :new JUMPDEST CALLER PUSH1 0x00 SSTORE STOP"),
+        &format!("{OWNER_GATE} {marks}"),
+        "STOP",
+    );
+    let explorer = Explorer::new(&by_owner);
+    let plan = seq::reach(&explorer, &entries, entries[1], &marked).expect("claim, then call");
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(&plan.steps[0].calldata[..4], [0xaa; 4]);
+
+    let closed = dispatcher3("STOP", &format!("{OWNER_GATE} {marks}"), "STOP");
+    let explorer = Explorer::new(&closed);
+    assert!(
+        seq::reach(&explorer, &entries, entries[1], &marked).is_none(),
+        "nothing writes the owner slot"
+    );
+}

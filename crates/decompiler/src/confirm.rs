@@ -5,6 +5,9 @@ use crate::function::FnKind;
 use crate::hex;
 use crate::interp::{CallRecord, Outcome};
 use crate::opcode as op;
+use crate::path::{self, Explorer, Limits, Path};
+use crate::seq::{self, Entry};
+use crate::solve::Free;
 use crate::u256::U256;
 use std::collections::HashMap;
 
@@ -28,6 +31,8 @@ const CONFIRMABLE: &[&str] = &[
 
 const STEP_BUDGET: usize = 120_000;
 const MAX_ATTEMPTS: usize = 200;
+// Enough words for a few offsets, lengths and elements of array arguments.
+const SOLVED_WORDS: usize = 24;
 const SOME_ETHER: U256 = U256::from_u64(100_000_000_000_000_000);
 
 const CONFIRMED_NOTE: &str = concat!(
@@ -56,12 +61,40 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         else {
             continue;
         };
-        let witness = reach(c.code_of(f), f, c.local_pc(f, pc), &finding.id);
-        if let Some(witness) = witness {
+        let code = c.code_of(f);
+        let local = c.local_pc(f, pc);
+        if let Some(witness) = reach(code, f, local, &finding.id) {
             finding.confirmed = true;
             finding.witness = Some(hex::encode(&witness));
             finding.confidence = Confidence::High;
             finding.description.push_str(CONFIRMED_NOTE);
+            continue;
+        }
+        let entry = |g: &Function| Entry {
+            selector: exec::selector_of(g),
+            words: SOLVED_WORDS,
+        };
+        let same_code = |g: &&Function| {
+            g.kind == FnKind::External && std::ptr::eq(c.code_of(g).as_ptr(), code.as_ptr())
+        };
+        let entries: Vec<Entry> = c.functions.iter().filter(same_code).map(entry).collect();
+        let id = finding.id.clone();
+        let goal = |p: &Path| p.run.reached(local) && p.succeeded() && shows_effect(&id, &p.run);
+        let explorer = Explorer::new(code);
+        if let Some(plan) = seq::reach(&explorer, &entries, entry(f), &goal) {
+            finding.confirmed = true;
+            finding.witness = Some(hex::encode(&plan.last.inputs.calldata));
+            finding.setup = plan
+                .steps
+                .iter()
+                .map(|s| hex::encode(&s.calldata))
+                .collect();
+            finding.confidence = Confidence::High;
+            finding.description.push_str(&format!(
+                " Confirmed in {} calls from empty storage: an account holding no role first makes the attached earlier call{}, then reaches this sink and the transaction keeps its effect.",
+                plan.steps.len() + 1,
+                if plan.steps.len() == 1 { "" } else { "s" },
+            ));
         }
     }
 }
@@ -88,7 +121,28 @@ fn reach(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
             }
         }
     }
-    None
+    solved(code, f, pc, id)
+}
+
+// Storage stays as it is in a fresh contract. Only the call data and the value are solved for.
+fn solved(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
+    let free = Free {
+        words: SOLVED_WORDS,
+        value: true,
+        storage: false,
+    };
+    let explorer = Explorer::new(code);
+    let mut answer = vec![0u8; 32];
+    answer[31] = 1;
+    [Vec::new(), answer].into_iter().find_map(|returned| {
+        let mut start = path::inputs_for(exec::selector_of(f), SOLVED_WORDS);
+        start.returned = returned;
+        let paths = explorer.explore(&start, free, Limits::default());
+        paths
+            .into_iter()
+            .find(|p| p.run.reached(pc) && p.succeeded() && shows_effect(id, &p.run))
+            .map(|p| p.inputs.calldata)
+    })
 }
 
 fn shows_effect(id: &str, run: &FrameRun) -> bool {

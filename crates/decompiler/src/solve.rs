@@ -13,6 +13,7 @@ pub struct Inputs {
     pub timestamp: U256,
     pub number: U256,
     pub storage: HashMap<U256, U256>,
+    pub returned: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +92,7 @@ impl Eval<'_> {
                 op::CALLDATASIZE => Some(U256::from(self.inputs.calldata.len())),
                 op::TIMESTAMP => Some(self.inputs.timestamp),
                 op::NUMBER => Some(self.inputs.number),
+                op::RETURNDATASIZE => Some(U256::from(self.inputs.returned.len())),
                 _ => None,
             },
             Node::CallDataLoad(off) | Node::CopiedWord(op::CALLDATACOPY, off, _) => self
@@ -98,6 +100,12 @@ impl Eval<'_> {
                 .and_then(|o| o.as_usize())
                 .map(|o| word(&self.inputs.calldata, o)),
             Node::SLoad(key, false, gen) => self.value(key).map(|k| self.stored(k, gen)),
+            Node::CallResult(_) => Some(U256::ONE),
+            Node::ReturnData(_, off) => self
+                .value(off)
+                .and_then(|o| o.as_usize())
+                .filter(|o| o + 32 <= self.inputs.returned.len())
+                .map(|o| word(&self.inputs.returned, o)),
             Node::Keccak(words, tail) => {
                 let mut bytes = Vec::with_capacity(32 * words.len());
                 let last = words.len().saturating_sub(1);
@@ -130,6 +138,15 @@ impl Eval<'_> {
     }
 }
 
+pub fn value_of(e: ExprId, inputs: &Inputs) -> Option<U256> {
+    let mut eval = Eval {
+        inputs,
+        writes: Vec::new(),
+        memo: HashMap::new(),
+    };
+    eval.value(e)
+}
+
 pub fn replay(items: &[Item], inputs: &Inputs) -> Vec<Option<bool>> {
     let mut eval = Eval {
         inputs,
@@ -160,7 +177,7 @@ impl Search<'_> {
     fn place(&mut self, e: ExprId) -> Option<Place> {
         match expr::node(e) {
             Node::CallDataLoad(off) | Node::CopiedWord(op::CALLDATACOPY, off, _) => {
-                let at = expr::as_const(off)?.as_usize()?;
+                let at = self.eval.value(off)?.as_usize()?;
                 let index = at.checked_sub(4)? / 32;
                 (at >= 4 && (at - 4) % 32 == 0 && index < self.free.words)
                     .then_some(Place::Word(index))
@@ -453,6 +470,7 @@ mod tests {
             timestamp: U256::from_u64(1_700_000_000),
             number: U256::from_u64(18_000_000),
             storage: HashMap::new(),
+            returned: Vec::new(),
         }
     }
 

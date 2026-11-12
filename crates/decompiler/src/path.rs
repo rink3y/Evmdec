@@ -61,6 +61,7 @@ pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
         timestamp: U256::from_u64(1_700_000_000),
         number: U256::from_u64(18_000_000),
         storage: HashMap::new(),
+        returned: Vec::new(),
     }
 }
 
@@ -80,6 +81,7 @@ impl Explorer {
         );
         host.timestamp = inputs.timestamp;
         host.number = inputs.number;
+        host.forced_return = inputs.returned.clone();
         let run = exec::run_frame(&self.prog.code, &host, inputs.storage.clone(), STEP_BUDGET);
         let blocks: Vec<usize> = run
             .order

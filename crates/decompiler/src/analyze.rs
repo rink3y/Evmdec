@@ -54,6 +54,8 @@ pub struct Finding {
     pub confirmed: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub witness: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub setup: Vec<String>,
 }
 
 fn is_one(n: &usize) -> bool {
@@ -2811,6 +2813,7 @@ pub(crate) fn push(
         recommendation: rec.into(),
         confirmed: false,
         witness: None,
+        setup: Vec::new(),
     });
 }
 
@@ -5026,6 +5029,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             sites: locked.len(),
             confirmed: false,
             witness: None,
+            setup: Vec::new(),
         });
     }
     findings.sort_by(|a, b| {
@@ -5499,6 +5503,7 @@ fn push_fact(
         sites: 1,
         confirmed: false,
         witness: None,
+        setup: Vec::new(),
     });
 }
 
@@ -6949,6 +6954,9 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         out.push_str(&format!("- Confidence: {:?}\n", f.confidence));
         if f.confirmed {
             out.push_str("- Confirmed: reached from a fresh state by an arbitrary caller\n");
+            for (i, call) in f.setup.iter().enumerate() {
+                out.push_str(&format!("- Earlier call {}: `{}`\n", i + 1, call));
+            }
             if let Some(w) = &f.witness {
                 out.push_str(&format!("- Witness calldata: `{}`\n", w));
             }

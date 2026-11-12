@@ -8,6 +8,7 @@ pub mod opcode;
 pub mod origin;
 pub mod path;
 pub mod props;
+pub mod range;
 pub mod u256;
 
 pub use u256::U256;

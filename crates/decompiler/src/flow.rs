@@ -126,6 +126,53 @@ fn credited(p: &Path, layout: MappingLayout) -> Option<U256> {
     best
 }
 
+fn entry_moves(p: &Path, layout: MappingLayout) -> (U256, U256) {
+    let mut ends: HashMap<U256, (U256, U256)> = HashMap::new();
+    for step in solve::steps(&p.effects, &p.inputs) {
+        let Step::Write {
+            key,
+            slot,
+            before,
+            after,
+        } = step
+        else {
+            continue;
+        };
+        let keyed = ssa::slot_path(key, layout).is_some_and(|path| {
+            path.steps.iter().any(|s| match s {
+                ssa::Step::Key(k) => solve::value_of(*k, &p.inputs) == Some(p.inputs.caller),
+                _ => false,
+            })
+        });
+        if keyed {
+            ends.entry(slot).or_insert((before, after)).1 = after;
+        }
+    }
+    let (mut rise, mut fall) = (U256::ZERO, U256::ZERO);
+    for (before, after) in ends.into_values() {
+        if after > before {
+            rise = sum(rise, after - before);
+        } else {
+            fall = sum(fall, before - after);
+        }
+    }
+    (rise, fall)
+}
+
+fn all_sent(p: &Path) -> U256 {
+    let moved = sent(p).into_iter();
+    moved.fold(U256::ZERO, |all, (_, amount)| sum(all, amount))
+}
+
+fn all_taken(p: &Path) -> U256 {
+    let moved = taken(p).into_iter();
+    moved.fold(U256::ZERO, |all, (_, amount)| sum(all, amount))
+}
+
+// Small amounts, so a proportion that divides shows its rounding in every one.
+const PARTS: [(u64, u64); 4] = [(3, 3), (5, 6), (7, 9), (10, 13)];
+const MAX_AMOUNT_WORDS: usize = 4;
+
 fn word_reply(value: U256) -> Vec<u8> {
     value.to_be_bytes().to_vec()
 }
@@ -144,6 +191,7 @@ struct Deposit<'a> {
     path: Path,
     taken: Vec<(Asset, U256)>,
     credit: U256,
+    unit: bool,
 }
 
 struct Pass<'a> {
@@ -206,7 +254,7 @@ impl<'a> Pass<'a> {
     fn deposits(&mut self, layout: MappingLayout) -> Vec<Deposit<'a>> {
         let mut out: Vec<Deposit<'a>> = Vec::new();
         for f in self.externals() {
-            // The smallest payment comes first. A later check needs one unit paid in.
+            // One check needs a single unit paid in. The others need room to pay out in parts.
             let sizes: [(u64, Fill); 2] = [
                 (1, |_| U256::ONE),
                 (0x1001, |i| U256::from_u64(0x1001 + 2 * i as u64)),
@@ -228,8 +276,8 @@ impl<'a> Pass<'a> {
                         path,
                         taken,
                         credit,
+                        unit: value == 1,
                     });
-                    break;
                 }
             }
             if out.len() >= MAX_DEPOSITS {
@@ -446,6 +494,85 @@ impl<'a> Pass<'a> {
         }
     }
 
+    // What a call hands the caller should round down, and what it takes should round up.
+    // For a rule that rounds down, two parts never come to more than the whole.
+    // Every amount is tried from one and the same state, so only the rounding differs.
+    fn rounding(
+        &mut self,
+        d: &Deposit,
+        g: &Function,
+        paths: &[Path],
+        layout: MappingLayout,
+        out: &mut Vec<Finding>,
+    ) {
+        let Some(base) = paths.first() else { return };
+        let skew = sum(d.credit.wrapping_mul(U256::from_u64(3)), U256::ONE);
+        let words = (base.inputs.calldata.len().saturating_sub(4) / 32).min(MAX_AMOUNT_WORDS);
+        for index in 0..words {
+            let mut measure = |amount: u64| {
+                let mut inputs = base.inputs.clone();
+                let at = 4 + 32 * index;
+                inputs.calldata[at..at + 32].copy_from_slice(&U256::from_u64(amount).to_be_bytes());
+                (inputs.balance, inputs.returned) = (skew, word_reply(skew));
+                let run = self.run(g, &inputs);
+                let (rise, fall) = entry_moves(&run, layout);
+                let gets = sum(rise, all_sent(&run));
+                let gives = sum(fall, all_taken(&run));
+                run.succeeded().then_some((gets, gives, run))
+            };
+            let (mut over, mut under, mut shown) = (0, 0, None);
+            for (a, b) in PARTS {
+                let (Some(x), Some(y), Some(whole)) = (measure(a), measure(b), measure(a + b))
+                else {
+                    continue;
+                };
+                // One side of the exchange has to follow the amount exactly.
+                // A call the word does not steer gives the same twice and proves nothing.
+                let exact =
+                    |part: U256, other: U256, all: U256| !all.is_zero() && sum(part, other) == all;
+                let more_in_parts = sum(x.0, y.0) > whole.0 && exact(x.1, y.1, whole.1);
+                let less_in_parts = sum(x.1, y.1) < whole.1 && exact(x.0, y.0, whole.0);
+                over += usize::from(more_in_parts);
+                under += usize::from(less_in_parts);
+                if more_in_parts || less_in_parts {
+                    shown.get_or_insert((a, b, x, y, whole));
+                }
+            }
+            let Some((a, b, x, y, whole)) = shown.filter(|_| over >= 2 || under >= 2) else {
+                continue;
+            };
+            let (what, parts, one) = if over >= 2 {
+                ("hands the caller", sum(x.0, y.0), whole.0)
+            } else {
+                ("takes from the caller", sum(x.1, y.1), whole.1)
+            };
+            push(
+                out,
+                "rounding-favours-caller",
+                "A division rounds in the caller's favour",
+                Severity::Medium,
+                Confidence::High,
+                Some(g),
+                None,
+                format!(
+                    "`{}` was run from one state with argument word {index} set to {a}, to {b} and to {}. What it {what} came to {} for the two parts together and {} for the whole. What a call hands out should round down and what it takes should round up, and then parts never beat the whole. Here they do, so the division rounds toward the caller and asking in small parts gains the difference each time. The state follows the attached earlier call, with the balance the contract reads set to {}.",
+                    g.name,
+                    a + b,
+                    parts.to_hex(),
+                    one.to_hex(),
+                    skew.to_hex(),
+                ),
+                Vec::new(),
+                "Round what the contract hands out down and what it takes up.",
+            );
+            if let Some(last) = out.last_mut() {
+                last.setup = vec![hex::encode(&d.path.inputs.calldata)];
+                last.confirm(&whole.2);
+            }
+            return;
+        }
+    }
+
     // A function that pays the same from empty storage is not a round trip.
     // Other rules cover a payment nothing was put in for.
     fn pays_from_nothing(&mut self, g: &Function, q: &Path, asset: Asset, back: U256) -> bool {
@@ -637,14 +764,19 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     };
     let deposits = pass.deposits(layout);
     for d in &deposits {
+        pass.uncredited(d, layout, out);
+        let larger = |o: &Deposit| o.function.pc == d.function.pc && !o.unit;
+        if d.unit && deposits.iter().any(larger) {
+            continue;
+        }
         let functions: Vec<&Function> = pass.externals().collect();
         let mut gained = false;
         for g in functions {
             let paths = pass.after(d, g);
             gained = gained || pass.gain(d, g, &paths, out);
             pass.reenter(d, g, &paths, out);
+            pass.rounding(d, g, &paths, layout, out);
         }
-        pass.uncredited(d, layout, out);
     }
     pass.answers(out);
     pass.moved_by_answer(out);

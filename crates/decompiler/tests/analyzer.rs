@@ -2325,6 +2325,46 @@ fn timed(setter_gate: &str, relation: &str, with_setter: bool) -> Vec<u8> {
     )
 }
 
+fn stored_product(narrowed: &str) -> Vec<u8> {
+    dispatcher(&format!(
+        "PUSH1 0x04 CALLDATALOAD {narrowed} PUSH1 0x24 CALLDATALOAD {narrowed} MUL \
+         PUSH1 0x00 SSTORE STOP"
+    ))
+}
+
+#[test]
+fn a_product_of_two_narrow_words_is_shown_to_stay_in_range() {
+    let r = report_of(&stored_product("PUSH2 0xffff AND"));
+    let wraps = ["unchecked-arithmetic", "unchecked-block-arithmetic"];
+    let f = r.findings.iter().find(|f| wraps.contains(&f.id.as_str()));
+    let f = f.unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(
+        !f.confirmed && f.severity == Severity::Info,
+        "{:?}",
+        f.severity
+    );
+    assert!(f.description.contains("Range analysis"));
+}
+
+fn proportional(burn: &str) -> Vec<u8> {
+    let pay_in = format!(
+        "CALLVALUE {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE \
+         PUSH1 0x01 SLOAD ADD PUSH1 0x01 SSTORE STOP"
+    );
+    let pay_out = format!(
+        "PUSH1 0x04 CALLDATALOAD {burn} {CALLER_ENTRY} DUP1 SLOAD \
+         DUP3 DUP2 LT ISZERO PUSH2 @has JUMPI {REVERT} :has JUMPDEST \
+         DUP3 SWAP1 SUB SWAP1 SSTORE \
+         PUSH1 0x01 SLOAD SUB PUSH1 0x01 SSTORE \
+         PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x04 CALLDATALOAD CALLER GAS CALL POP STOP"
+    );
+    dispatcher3(&pay_in, &pay_out, "STOP")
+}
+
+const BURN_ROUNDED_DOWN: &str = "SELFBALANCE PUSH1 0x01 SLOAD DUP3 MUL DIV SWAP1 POP";
+const BURN_ROUNDED_UP: &str = "SELFBALANCE PUSH1 0x01 DUP2 SUB PUSH1 0x01 SLOAD DUP4 MUL ADD DIV \
+     SWAP1 POP";
+
 fn clocked(clock: &str) -> Vec<u8> {
     dispatcher3(
         &format!("{clock} PUSH1 0x04 CALLDATALOAD ADD PUSH1 0x05 SSTORE STOP"),
@@ -2467,6 +2507,18 @@ fn cases() -> Vec<Case> {
             false,
             || timed("", "LT", false),
             || timed(OWNER_GATE, "LT", true),
+        ),
+        pair(
+            "unchecked-arithmetic|unchecked-block-arithmetic",
+            true,
+            || stored_product(""),
+            || stored_product("PUSH2 0xffff AND"),
+        ),
+        pair(
+            "rounding-favours-caller",
+            true,
+            || proportional(BURN_ROUNDED_DOWN),
+            || proportional(BURN_ROUNDED_UP),
         ),
         pair("phase-never-entered", false, || phased(5), || phased(2)),
         pair(

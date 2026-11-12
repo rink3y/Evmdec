@@ -1,5 +1,5 @@
 use crate::abi;
-use crate::analyze::{display_name, Confidence, Finding};
+use crate::analyze::{display_name, Confidence, Finding, Severity};
 use crate::decompile::{Contract, Function};
 use crate::deploy;
 use crate::evidence;
@@ -10,6 +10,7 @@ use crate::hex;
 use crate::interp::{CallRecord, Outcome};
 use crate::opcode as op;
 use crate::path::{self, Explorer, Limits, Path};
+use crate::range::Bounds;
 use crate::seq::{self, Entry};
 use crate::solve::{self, Free, Inputs, Item};
 use crate::u256::U256;
@@ -241,7 +242,39 @@ fn wrap_checks(val: ExprId, out: &mut Vec<ExprId>) {
 
 // The solver's model of a path can be wrong.
 // Only a second run that takes the same path and ends normally counts.
-fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Option<Path> {
+enum Wrap {
+    Shown(Box<Path>),
+    Bounded { paths: usize, results: usize },
+    Open,
+}
+
+fn stored_arithmetic(p: &Path) -> Vec<ExprId> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack: Vec<ExprId> = p
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Store { val, .. } => Some(*val),
+            Item::Check { .. } => None,
+        })
+        .collect();
+    while let Some(e) = stack.pop() {
+        if !seen.insert(e) || seen.len() > 2_000 {
+            continue;
+        }
+        if let Node::Op(o, parts) = expr::node(e) {
+            let both_vary = parts.len() == 2 && parts.iter().all(|x| expr::as_const(*x).is_none());
+            if matches!(o, op::ADD | op::SUB | op::MUL) && both_vary {
+                out.push(e);
+            }
+            stack.extend(parts);
+        }
+    }
+    out
+}
+
+fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Wrap {
     let explorer = Explorer::new(code);
     let selector = exec::selector_of(f);
     let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
@@ -253,6 +286,7 @@ fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Opt
         (shaped.calldata, shaped.fixed),
         (doubled.calldata, doubled.fixed),
     ];
+    let (mut paths, mut results, mut open) = (0, 0, false);
     for (calldata, fixed) in starts {
         let free = Free {
             words: calldata.len() / 32,
@@ -270,6 +304,11 @@ fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Opt
             if !p.succeeded() {
                 continue;
             }
+            let bounds = Bounds::from_checks(&p.items);
+            let stored = stored_arithmetic(&p);
+            paths += 1;
+            results += stored.len();
+            open |= stored.iter().any(|e| bounds.may_wrap(*e));
             let mut checks = Vec::new();
             for item in &p.items {
                 if let Item::Store { val, .. } = item {
@@ -296,12 +335,16 @@ fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Opt
                 let same = again.signature() == p.signature() && again.succeeded();
                 let wrapped = solve::replay(&items, &inputs).last() == Some(&Some(true));
                 if same && wrapped {
-                    return Some(again);
+                    return Wrap::Shown(Box::new(again));
                 }
             }
         }
     }
-    None
+    if open || results == 0 {
+        Wrap::Open
+    } else {
+        Wrap::Bounded { paths, results }
+    }
 }
 
 pub fn confirm_wraps(c: &Contract, findings: &mut [Finding]) {
@@ -325,13 +368,23 @@ pub fn confirm_wraps(c: &Contract, findings: &mut [Finding]) {
             .iter()
             .find(|f| f.kind == FnKind::External && display_name(f) == name);
         let Some(f) = function else { continue };
-        if let Some(run) = wrapping_input(c.code_of(f), f, &start) {
-            finding.confirm(&run);
-            finding.confidence = Confidence::High;
-            finding.description.push_str(&format!(
-                " Confirmed: with the attached input, sent by an account holding no role to {}, the function ends normally after a stored result wrapped around.",
-                deploy::start_text(&start),
-            ));
+        match wrapping_input(c.code_of(f), f, &start) {
+            Wrap::Shown(run) => {
+                finding.confirm(&run);
+                finding.confidence = Confidence::High;
+                finding.description.push_str(&format!(
+                    " Confirmed: with the attached input, sent by an account holding no role to {}, the function ends normally after a stored result wrapped around.",
+                    deploy::start_text(&start),
+                ));
+            }
+            Wrap::Bounded { paths, results } => {
+                finding.severity = Severity::Info;
+                finding.confidence = Confidence::High;
+                finding.description.push_str(&format!(
+                    " Range analysis of the {paths} path(s) found that end normally shows none of the {results} stored result(s) can wrap: masks and the checks on each path keep the operands small enough. Block times are taken to fit in 64 bits and a sent value in 128. Kept for the record at the lowest severity.",
+                ));
+            }
+            Wrap::Open => {}
         }
     }
 }

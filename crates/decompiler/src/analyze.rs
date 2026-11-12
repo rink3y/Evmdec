@@ -57,6 +57,16 @@ pub struct Finding {
     pub witness: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub setup: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub observed: Vec<String>,
+}
+
+impl Finding {
+    pub fn confirm(&mut self, path: &crate::path::Path) {
+        self.confirmed = true;
+        self.witness = Some(crate::hex::encode(&path.inputs.calldata));
+        self.observed = crate::evidence::observed(&path.inputs, &path.run);
+    }
 }
 
 fn is_one(n: &usize) -> bool {
@@ -2823,6 +2833,7 @@ pub(crate) fn push(
         confirmed: false,
         witness: None,
         setup: Vec::new(),
+        observed: Vec::new(),
     });
 }
 
@@ -5062,6 +5073,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             confirmed: false,
             witness: None,
             setup: Vec::new(),
+            observed: Vec::new(),
         });
     }
     findings.sort_by(|a, b| {
@@ -5536,6 +5548,7 @@ fn push_fact(
         confirmed: false,
         witness: None,
         setup: Vec::new(),
+        observed: Vec::new(),
     });
 }
 
@@ -7207,12 +7220,15 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         }
         out.push_str(&format!("- Confidence: {:?}\n", f.confidence));
         if f.confirmed {
-            out.push_str("- Confirmed: reached from a fresh state by an arbitrary caller\n");
+            out.push_str("- Confirmed by running it\n");
             for (i, call) in f.setup.iter().enumerate() {
                 out.push_str(&format!("- Earlier call {}: `{}`\n", i + 1, call));
             }
             if let Some(w) = &f.witness {
                 out.push_str(&format!("- Witness calldata: `{}`\n", w));
+            }
+            for line in &f.observed {
+                out.push_str(&format!("- Observed: {line}\n"));
             }
         }
         out.push_str(&format!("\n{}\n\n", f.description));

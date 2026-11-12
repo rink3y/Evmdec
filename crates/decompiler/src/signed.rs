@@ -4,7 +4,6 @@ use crate::decompile::{Contract, Function};
 use crate::deploy;
 use crate::exec;
 use crate::function::FnKind;
-use crate::hex;
 use crate::opcode as op;
 use crate::path::{self, Explorer, Limits, Path};
 use crate::solve::{Free, Inputs};
@@ -148,8 +147,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
             "Put a per-signer counter or a single-use mark in the signed digest and update it when the message is accepted.",
         );
         if let Some(last) = out.last_mut() {
-            last.witness = Some(hex::encode(&second.inputs.calldata));
-            last.confirmed = true;
+            last.confirm(&second);
         }
     }
 }

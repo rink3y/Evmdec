@@ -2,6 +2,7 @@ use crate::abi;
 use crate::analyze::{display_name, Confidence, Finding};
 use crate::decompile::{Contract, Function};
 use crate::deploy;
+use crate::evidence;
 use crate::exec::{self, FrameRun};
 use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
@@ -67,9 +68,10 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         };
         let code = c.code_of(f);
         let local = c.local_pc(f, pc);
-        if let Some(witness) = reach(code, f, local, &finding.id, &start) {
+        if let Some((witness, observed)) = reach(code, f, local, &finding.id, &start) {
             finding.confirmed = true;
             finding.witness = Some(hex::encode(&witness));
+            finding.observed = observed;
             finding.confidence = Confidence::High;
             finding.description.push_str(CONFIRMED_NOTE);
             continue;
@@ -86,8 +88,7 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         let goal = |p: &Path| p.run.reached(local) && p.succeeded() && shows_effect(&id, &p.run);
         let explorer = Explorer::new(code);
         if let Some(plan) = seq::reach(&explorer, &entries, entry(f), &start, &goal) {
-            finding.confirmed = true;
-            finding.witness = Some(hex::encode(&plan.last.inputs.calldata));
+            finding.confirm(&plan.last);
             finding.setup = plan
                 .steps
                 .iter()
@@ -113,7 +114,7 @@ fn reach(
     pc: usize,
     id: &str,
     start: &HashMap<U256, U256>,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, Vec<String>)> {
     let selector = exec::selector_of(f);
     let shapes = [U256::ZERO, SOME_ETHER].into_iter().flat_map(|callvalue| {
         (0..=6usize)
@@ -125,7 +126,9 @@ fn reach(
         let host = exec::caller_host(data.clone(), callvalue);
         let run = exec::run_frame(code, &host, start.clone(), STEP_BUDGET);
         if run.reached(pc) && run.succeeded() && shows_effect(id, &run) {
-            return Some(data);
+            let mut inputs = path::inputs_for(selector, 0);
+            (inputs.callvalue, inputs.storage) = (callvalue, start.clone());
+            return Some((data, evidence::observed(&inputs, &run)));
         }
     }
     solved(code, f, pc, id, start)
@@ -138,7 +141,7 @@ fn solved(
     pc: usize,
     id: &str,
     begin: &HashMap<U256, U256>,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, Vec<String>)> {
     let explorer = Explorer::new(code);
     let selector = exec::selector_of(f);
     let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
@@ -169,7 +172,8 @@ fn solved(
                 .into_iter()
                 .find(|p| p.run.reached(pc) && p.succeeded() && shows_effect(id, &p.run));
             if let Some(p) = hit {
-                return Some(p.inputs.calldata);
+                let observed = evidence::observed(&p.inputs, &p.run);
+                return Some((p.inputs.calldata, observed));
             }
         }
     }
@@ -230,7 +234,7 @@ fn wrap_checks(val: ExprId, out: &mut Vec<ExprId>) {
 }
 
 // The run is repeated with the solved input and must take the same path and still end normally.
-fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Option<Vec<u8>> {
+fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Option<Path> {
     let explorer = Explorer::new(code);
     let selector = exec::selector_of(f);
     let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
@@ -285,7 +289,7 @@ fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Opt
                 let same = again.signature() == p.signature() && again.succeeded();
                 let wrapped = solve::replay(&items, &inputs).last() == Some(&Some(true));
                 if same && wrapped {
-                    return Some(inputs.calldata);
+                    return Some(again);
                 }
             }
         }
@@ -310,9 +314,8 @@ pub fn confirm_wraps(c: &Contract, findings: &mut [Finding]) {
             .iter()
             .find(|f| f.kind == FnKind::External && display_name(f) == name);
         let Some(f) = function else { continue };
-        if let Some(witness) = wrapping_input(c.code_of(f), f, &start) {
-            finding.confirmed = true;
-            finding.witness = Some(hex::encode(&witness));
+        if let Some(run) = wrapping_input(c.code_of(f), f, &start) {
+            finding.confirm(&run);
             finding.confidence = Confidence::High;
             finding.description.push_str(&format!(
                 " Confirmed: with the attached input, sent by an account holding no role to {}, the function ends normally after a stored result wrapped around.",

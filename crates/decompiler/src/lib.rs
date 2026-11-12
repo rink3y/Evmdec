@@ -21,6 +21,7 @@ pub mod cross;
 pub mod decompile;
 pub mod deploy;
 pub mod emit;
+pub mod evidence;
 pub mod exec;
 pub mod expr;
 #[cfg(feature = "rpc")]

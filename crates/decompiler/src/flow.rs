@@ -304,7 +304,6 @@ impl<'a> Pass<'a> {
             once.to_hex(),
         );
         let setup = vec![hex::encode(&d.path.inputs.calldata)];
-        let witness = hex::encode(&q.inputs.calldata);
         let known = out.iter_mut().find(|f| {
             f.id.starts_with("reentrancy")
                 && f.function.as_deref() == Some(display_name(g).as_str())
@@ -312,7 +311,8 @@ impl<'a> Pass<'a> {
         if let Some(f) = known {
             f.description.push_str(&note);
             f.confidence = Confidence::High;
-            (f.setup, f.witness, f.confirmed) = (setup, Some(witness), true);
+            f.setup = setup;
+            f.confirm(q);
             return;
         }
         push(
@@ -331,7 +331,8 @@ impl<'a> Pass<'a> {
             "Finish every storage update before the payment, or hold a lock across it.",
         );
         if let Some(f) = out.last_mut() {
-            (f.setup, f.witness, f.confirmed) = (setup, Some(witness), true);
+            f.setup = setup;
+            f.confirm(q);
         }
     }
 
@@ -396,8 +397,7 @@ impl<'a> Pass<'a> {
         );
         if let Some(last) = out.last_mut() {
             last.sites = unanswered.len();
-            last.witness = Some(hex::encode(&silent.inputs.calldata));
-            last.confirmed = true;
+            last.confirm(&silent);
         }
     }
 
@@ -433,8 +433,7 @@ impl<'a> Pass<'a> {
                 paid(&q).to_hex(),
             ));
             finding.confidence = Confidence::High;
-            finding.witness = Some(hex::encode(&p.inputs.calldata));
-            finding.confirmed = true;
+            finding.confirm(p);
         }
     }
 
@@ -507,8 +506,7 @@ impl<'a> Pass<'a> {
         );
         if let Some(last) = out.last_mut() {
             last.setup = vec![hex::encode(&d.path.inputs.calldata)];
-            last.witness = Some(hex::encode(&q.inputs.calldata));
-            last.confirmed = true;
+            last.confirm(&q);
         }
     }
 }
@@ -548,7 +546,6 @@ fn token_out(p: &Path) -> U256 {
 fn report_refused(out: &mut Vec<Finding>, f: &Function, run: &Path) {
     const KNOWN: [&str; 2] = ["erc20-return-ignored", "unchecked-token-pull"];
     let note = " Confirmed by running it: with the attached input the transfer answers false, as an asset does when it refuses, and the function still ends normally and keeps its storage changes.";
-    let witness = hex::encode(&run.inputs.calldata);
     let name = display_name(f);
     let known = out
         .iter_mut()
@@ -556,7 +553,7 @@ fn report_refused(out: &mut Vec<Finding>, f: &Function, run: &Path) {
     if let Some(x) = known {
         x.description.push_str(note);
         x.confidence = Confidence::High;
-        (x.witness, x.confirmed) = (Some(witness), true);
+        x.confirm(run);
         return;
     }
     push(
@@ -572,7 +569,7 @@ fn report_refused(out: &mut Vec<Finding>, f: &Function, run: &Path) {
         "Require the transfer's answer to be true, or empty for assets that return nothing.",
     );
     if let Some(x) = out.last_mut() {
-        (x.witness, x.confirmed) = (Some(witness), true);
+        x.confirm(run);
     }
 }
 
@@ -615,8 +612,7 @@ fn report_gain(
     );
     if let Some(last) = out.last_mut() {
         last.setup = vec![hex::encode(&d.path.inputs.calldata)];
-        last.witness = Some(hex::encode(&q.inputs.calldata));
-        last.confirmed = true;
+        last.confirm(q);
     }
 }
 

@@ -6,7 +6,6 @@ use crate::emit::MappingLayout;
 use crate::exec;
 use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
-use crate::hex;
 use crate::lift::{Stmt, Term};
 use crate::opcode as op;
 use crate::path::{self, Explorer, Limits, Path};
@@ -159,8 +158,7 @@ fn report(
         advice,
     );
     if let Some(last) = out.last_mut() {
-        last.witness = Some(hex::encode(&run.path.inputs.calldata));
-        last.confirmed = true;
+        last.confirm(&run.path);
     }
 }
 

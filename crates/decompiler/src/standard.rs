@@ -5,7 +5,6 @@ use crate::emit::MappingLayout;
 use crate::exec;
 use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
-use crate::hex;
 use crate::interp::Outcome;
 use crate::path::{self, Explorer, Limits, Path};
 use crate::solve::{self, Free, Inputs, Item, Step};
@@ -185,8 +184,7 @@ impl Report<'_> {
             "Treat this contract by what it does, not by the interface it shows. Callers that assume the standard behaviour need to handle the difference.",
         );
         if let Some(last) = self.out.last_mut() {
-            last.witness = Some(hex::encode(&run.inputs.calldata));
-            last.confirmed = true;
+            last.confirm(run);
         }
     }
 }

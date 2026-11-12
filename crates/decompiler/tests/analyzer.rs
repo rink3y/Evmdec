@@ -1,6 +1,10 @@
 use evmdec::analyze::{self, Severity};
 use evmdec::decompile::{self, Options};
 
+thread_local! {
+    static PADDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn asm(src: &str) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut labels = std::collections::HashMap::new();
@@ -28,6 +32,9 @@ fn asm(src: &str) -> Vec<u8> {
                 .get(tok)
                 .unwrap_or_else(|| panic!("unknown mnemonic {tok}")),
         );
+        if tok == "JUMPDEST" && PADDED.with(std::cell::Cell::get) {
+            out.extend_from_slice(&[0x60, 0x00, 0x50]);
+        }
     }
     for (pos, l) in fixups {
         let t = labels[&l] as u16;
@@ -1963,14 +1970,7 @@ fn flow_ids(code: &[u8]) -> Vec<String> {
 
 #[test]
 fn a_pair_of_calls_that_returns_more_than_it_took_is_reported() {
-    let pay_in =
-        |credit: &str| format!("{credit} {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP");
-    let pay_out = format!(
-        "PUSH1 0x04 CALLDATALOAD {CALLER_ENTRY} DUP1 SLOAD \
-         DUP3 DUP2 LT ISZERO PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST \
-         DUP3 SWAP1 SUB SWAP1 SSTORE \
-         PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 CALLER GAS CALL POP STOP"
-    );
+    let pay_out = pay_out_checked();
     let doubled = dispatcher3(&pay_in("CALLVALUE PUSH1 0x02 MUL"), &pay_out, "STOP");
     assert_eq!(flow_ids(&doubled), ["two-calls-return-more"]);
 
@@ -1980,21 +1980,7 @@ fn a_pair_of_calls_that_returns_more_than_it_took_is_reported() {
 
 #[test]
 fn a_share_of_a_balance_read_from_outside_can_round_a_payment_to_nothing() {
-    let asset = "PUSH2 0xb1b1";
-    let vault = |guard: &str| {
-        dispatcher(&format!(
-            "PUSH4 0x70a08231 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE ADDRESS PUSH1 0x84 MSTORE \
-             PUSH1 0x20 PUSH1 0x80 PUSH1 0x24 PUSH1 0x80 {asset} GAS STATICCALL POP \
-             PUSH1 0x80 MLOAD PUSH1 0x01 SLOAD PUSH1 0x04 CALLDATALOAD \
-             DUP2 ISZERO PUSH2 @first JUMPI DUP3 DUP3 DUP3 MUL DIV PUSH2 @join JUMP \
-             :first JUMPDEST DUP1 :join JUMPDEST {guard} \
-             PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
-             ADDRESS PUSH1 0xa4 MSTORE DUP2 PUSH1 0xc4 MSTORE \
-             PUSH1 0x00 DUP1 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 {asset} GAS CALL POP \
-             {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE \
-             DUP3 ADD PUSH1 0x01 SSTORE STOP"
-        ))
-    };
+    let vault = share_vault;
     assert_eq!(flow_ids(&vault("")), ["inflow-credits-nothing"]);
 
     let floor = "DUP1 PUSH2 @some JUMPI PUSH1 0x00 DUP1 REVERT :some JUMPDEST";
@@ -2054,55 +2040,26 @@ fn a_confirmation_starts_from_the_storage_the_constructor_leaves() {
 
 #[test]
 fn a_signed_call_with_no_counter_in_its_digest_is_accepted_twice() {
-    let signed_payment = |extra_word: &str, digest_len: &str, after: &str| {
-        dispatcher(&format!(
-            "PUSH1 0x64 CALLDATALOAD PUSH1 0x80 MSTORE {extra_word} \
-             PUSH1 {digest_len} PUSH1 0x80 KECCAK256 PUSH1 0x80 MSTORE \
-             PUSH1 0x04 CALLDATALOAD PUSH1 0xa0 MSTORE PUSH1 0x24 CALLDATALOAD PUSH1 0xc0 MSTORE \
-             PUSH1 0x44 CALLDATALOAD PUSH1 0xe0 MSTORE \
-             PUSH1 0x20 PUSH1 0x80 PUSH1 0x80 PUSH1 0x80 PUSH1 0x01 GAS STATICCALL POP \
-             PUSH1 0x80 MLOAD PUSH1 0x00 SLOAD EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT \
-             :ok JUMPDEST {after} \
-             PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x64 CALLDATALOAD CALLER GAS CALL POP STOP"
-        ))
-    };
     let twice = |code: &[u8]| {
         let r = analyze::analyze(&decompile::decompile(code, &Options::default()));
         finding(&r, "signed-message-accepted-twice").cloned()
     };
-
-    let bare = signed_payment("", "0x20", "");
-    let f = twice(&bare).expect("nothing takes the message out of use");
+    let f = twice(&signed_payment(false)).expect("nothing takes the message out of use");
     assert!(f.confirmed && f.severity == Severity::High);
-
-    let counted = signed_payment(
-        "PUSH1 0x01 SLOAD PUSH1 0xa0 MSTORE",
-        "0x40",
-        "PUSH1 0x01 SLOAD PUSH1 0x01 ADD PUSH1 0x01 SSTORE",
+    assert!(
+        !f.observed.is_empty(),
+        "a confirmed finding says what the run did"
     );
-    assert!(twice(&counted).is_none(), "the counter changes the digest");
+    assert!(
+        twice(&signed_payment(true)).is_none(),
+        "the counter changes the digest"
+    );
 }
 
 const REVERT: &str = "PUSH1 0x00 DUP1 REVERT";
 
 fn report_of(code: &[u8]) -> analyze::Report {
     analyze::analyze(&decompile::decompile(code, &Options::default()))
-}
-
-#[test]
-fn a_value_kept_in_block_numbers_and_compared_with_the_timestamp_is_reported() {
-    let contract = |clock: &str| {
-        dispatcher3(
-            &format!("{clock} PUSH1 0x04 CALLDATALOAD ADD PUSH1 0x05 SSTORE STOP"),
-            &format!(
-                "PUSH1 0x05 SLOAD TIMESTAMP GT PUSH2 @ok JUMPI {REVERT} :ok JUMPDEST \
-                 PUSH1 0x01 PUSH1 0x06 SSTORE STOP"
-            ),
-            "STOP",
-        )
-    };
-    assert!(finding(&report_of(&contract("NUMBER")), "clock-units-mixed").is_some());
-    assert!(finding(&report_of(&contract("TIMESTAMP")), "clock-units-mixed").is_none());
 }
 
 #[test]
@@ -2169,85 +2126,6 @@ fn a_caller_check_on_a_slot_nothing_sets_is_reported_with_the_authority_map() {
     assert!(finding(&r, "gate-never-set").is_none());
 }
 
-#[test]
-fn a_payment_made_before_the_entry_is_cleared_is_confirmed_by_calling_back() {
-    let pay_in = format!("CALLVALUE {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP");
-    let pays = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 CALLER GAS CALL POP";
-    let late = format!("{CALLER_ENTRY} DUP1 SLOAD {pays} POP PUSH1 0x00 SWAP1 SSTORE STOP");
-    let early = format!("{CALLER_ENTRY} DUP1 SLOAD PUSH1 0x00 DUP3 SSTORE {pays} POP POP STOP");
-    let paid_twice = |pay_out: &str| {
-        let r = report_of(&dispatcher3(&pay_in, pay_out, "STOP"));
-        r.findings
-            .iter()
-            .any(|f| f.id.starts_with("reentr") && f.confirmed && f.setup.len() == 1)
-    };
-    assert!(
-        paid_twice(&late),
-        "the entry is still set during the payment"
-    );
-    assert!(
-        !paid_twice(&early),
-        "the entry is cleared before the payment"
-    );
-}
-
-#[test]
-fn a_transfer_that_answers_false_is_run_and_a_function_that_ignores_it_is_confirmed() {
-    let pull = |check: &str| {
-        dispatcher(&format!(
-            "PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
-             ADDRESS PUSH1 0xa4 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0xc4 MSTORE \
-             PUSH1 0x20 PUSH1 0x80 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 PUSH2 0xb1b1 GAS CALL POP \
-             {check} \
-             PUSH1 0x04 CALLDATALOAD {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP"
-        ))
-    };
-    let confirmed = |code: &[u8], ids: &[&str]| {
-        let r = report_of(code);
-        r.findings
-            .iter()
-            .any(|f| ids.contains(&f.id.as_str()) && f.confirmed)
-    };
-    let ignoring = [
-        "refused-transfer-treated-as-done",
-        "erc20-return-ignored",
-        "unchecked-token-pull",
-    ];
-    assert!(confirmed(&pull(""), &ignoring));
-
-    let checked = "PUSH1 0x80 MLOAD PUSH2 @yes JUMPI PUSH1 0x00 DUP1 REVERT :yes JUMPDEST";
-    assert!(!confirmed(&pull(checked), &ignoring));
-
-    let sized = format!(
-        "RETURNDATASIZE PUSH1 0x20 EQ PUSH2 @full JUMPI PUSH1 0x00 DUP1 REVERT :full JUMPDEST \
-         {checked}"
-    );
-    assert!(confirmed(
-        &pull(&sized),
-        &["transfer-without-answer-refused"]
-    ));
-    assert!(!confirmed(
-        &pull(checked),
-        &["transfer-without-answer-refused"]
-    ));
-}
-
-#[test]
-fn work_that_grows_with_a_count_any_caller_can_raise_is_reported() {
-    let add = "PUSH1 0x05 SLOAD PUSH1 0x01 ADD PUSH1 0x05 SSTORE STOP";
-    let walk = |bound: &str| {
-        format!(
-            "PUSH1 0x00 :top JUMPDEST {bound} DUP2 LT ISZERO PUSH2 @done JUMPI \
-             DUP1 SLOAD POP PUSH1 0x01 ADD PUSH2 @top JUMP :done JUMPDEST POP STOP"
-        )
-    };
-    let open = dispatcher3(add, &walk("PUSH1 0x05 SLOAD"), "STOP");
-    assert!(finding(&report_of(&open), "cost-grows-with-open-list").is_some());
-
-    let fixed = dispatcher3(add, &walk("PUSH1 0x03"), "STOP");
-    assert!(finding(&report_of(&fixed), "cost-grows-with-open-list").is_none());
-}
-
 fn entry_of(account: &str) -> String {
     format!(
         "{account} PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256"
@@ -2290,11 +2168,7 @@ fn ledger(credit: &str, allowance: &str) -> Vec<u8> {
 
 #[test]
 fn a_standard_interface_is_measured_and_not_taken_on_trust() {
-    let spends = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x01 PUSH1 0x20 MSTORE \
-                  PUSH1 0x40 PUSH1 0x00 KECCAK256 PUSH1 0x20 MSTORE CALLER PUSH1 0x00 MSTORE \
-                  PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD DUP3 DUP2 LT ISZERO \
-                  PUSH2 @allowed JUMPI PUSH1 0x00 DUP1 REVERT :allowed JUMPDEST \
-                  DUP3 SWAP1 SUB SWAP1 SSTORE";
+    let spends = SPENDS;
     let measured = |code: &[u8]| {
         let ours = [
             "transfer-creates-value",
@@ -2351,18 +2225,324 @@ fn a_slot_number_taken_from_the_call_is_reported_unless_it_is_bounded() {
     assert!(finding(&report_of(&hashed), "input-picks-storage-slot").is_none());
 }
 
-#[test]
-fn input_one_byte_short_of_its_argument_is_reported_when_it_is_accepted() {
-    let store = "PUSH1 0x04 CALLDATALOAD PUSH1 0x01 SSTORE STOP";
-    let lax = report_of(&dispatcher(store));
-    assert!(
-        finding(&lax, "short-input-accepted").is_some(),
-        "{:?}",
-        ids(&lax)
-    );
+struct Case {
+    rule: &'static str,
+    flawed: bool,
+    confirmed: bool,
+    build: fn() -> Vec<u8>,
+}
 
-    let strict = dispatcher(&format!(
-        "PUSH1 0x23 CALLDATASIZE GT PUSH2 @long JUMPI {REVERT} :long JUMPDEST {store}"
-    ));
-    assert!(finding(&report_of(&strict), "short-input-accepted").is_none());
+fn pay_in(credit: &str) -> String {
+    format!("{credit} {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP")
+}
+
+fn pay_out_checked() -> String {
+    format!(
+        "PUSH1 0x04 CALLDATALOAD {CALLER_ENTRY} DUP1 SLOAD \
+         DUP3 DUP2 LT ISZERO PUSH2 @ok JUMPI {REVERT} :ok JUMPDEST \
+         DUP3 SWAP1 SUB SWAP1 SSTORE \
+         PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 CALLER GAS CALL POP STOP"
+    )
+}
+
+fn pay_out_all(clear_first: bool) -> String {
+    let pays = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 CALLER GAS CALL POP";
+    match clear_first {
+        true => format!("{CALLER_ENTRY} DUP1 SLOAD PUSH1 0x00 DUP3 SSTORE {pays} POP POP STOP"),
+        false => format!("{CALLER_ENTRY} DUP1 SLOAD {pays} POP PUSH1 0x00 SWAP1 SSTORE STOP"),
+    }
+}
+
+fn share_vault(guard: &str) -> Vec<u8> {
+    let asset = "PUSH2 0xb1b1";
+    dispatcher(&format!(
+        "PUSH4 0x70a08231 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE ADDRESS PUSH1 0x84 MSTORE \
+         PUSH1 0x20 PUSH1 0x80 PUSH1 0x24 PUSH1 0x80 {asset} GAS STATICCALL POP \
+         PUSH1 0x80 MLOAD PUSH1 0x01 SLOAD PUSH1 0x04 CALLDATALOAD \
+         DUP2 ISZERO PUSH2 @first JUMPI DUP3 DUP3 DUP3 MUL DIV PUSH2 @join JUMP \
+         :first JUMPDEST DUP1 :join JUMPDEST {guard} \
+         PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
+         ADDRESS PUSH1 0xa4 MSTORE DUP2 PUSH1 0xc4 MSTORE \
+         PUSH1 0x00 DUP1 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 {asset} GAS CALL POP \
+         {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE \
+         DUP3 ADD PUSH1 0x01 SSTORE STOP"
+    ))
+}
+
+fn signed_payment(counted: bool) -> Vec<u8> {
+    let (extra, len, after) = match counted {
+        true => (
+            "PUSH1 0x01 SLOAD PUSH1 0xa0 MSTORE",
+            "0x40",
+            "PUSH1 0x01 SLOAD PUSH1 0x01 ADD PUSH1 0x01 SSTORE",
+        ),
+        false => ("", "0x20", ""),
+    };
+    dispatcher(&format!(
+        "PUSH1 0x64 CALLDATALOAD PUSH1 0x80 MSTORE {extra} \
+         PUSH1 {len} PUSH1 0x80 KECCAK256 PUSH1 0x80 MSTORE \
+         PUSH1 0x04 CALLDATALOAD PUSH1 0xa0 MSTORE PUSH1 0x24 CALLDATALOAD PUSH1 0xc0 MSTORE \
+         PUSH1 0x44 CALLDATALOAD PUSH1 0xe0 MSTORE \
+         PUSH1 0x20 PUSH1 0x80 PUSH1 0x80 PUSH1 0x80 PUSH1 0x01 GAS STATICCALL POP \
+         PUSH1 0x80 MLOAD PUSH1 0x00 SLOAD EQ PUSH2 @ok JUMPI {REVERT} \
+         :ok JUMPDEST {after} \
+         PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x64 CALLDATALOAD CALLER GAS CALL POP STOP"
+    ))
+}
+
+fn clocked(clock: &str) -> Vec<u8> {
+    dispatcher3(
+        &format!("{clock} PUSH1 0x04 CALLDATALOAD ADD PUSH1 0x05 SSTORE STOP"),
+        &format!(
+            "PUSH1 0x05 SLOAD TIMESTAMP GT PUSH2 @ok JUMPI {REVERT} :ok JUMPDEST \
+             PUSH1 0x01 PUSH1 0x06 SSTORE STOP"
+        ),
+        "STOP",
+    )
+}
+
+fn phased(last: u8) -> Vec<u8> {
+    let step = |at: u8, then: &str| {
+        format!(
+            "PUSH1 0x03 SLOAD PUSH1 {at:#04x} EQ PUSH2 @at{at} JUMPI {REVERT} \
+             :at{at} JUMPDEST {then} STOP"
+        )
+    };
+    dispatcher3(
+        &step(0, "PUSH1 0x01 PUSH1 0x03 SSTORE"),
+        &step(1, "PUSH1 0x02 PUSH1 0x03 SSTORE"),
+        &step(last, "PUSH1 0x01 PUSH1 0x07 SSTORE"),
+    )
+}
+
+fn gated_after(constructor: &str) -> Vec<u8> {
+    let runtime = dispatcher(&format!("{OWNER_GATE} CALLER SELFDESTRUCT"));
+    deployed(constructor, &runtime)
+}
+
+fn pulls(check: &str) -> Vec<u8> {
+    dispatcher(&format!(
+        "PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
+         ADDRESS PUSH1 0xa4 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0xc4 MSTORE \
+         PUSH1 0x20 PUSH1 0x80 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 PUSH2 0xb1b1 GAS CALL POP \
+         {check} \
+         PUSH1 0x04 CALLDATALOAD {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP"
+    ))
+}
+
+const ANSWER_TRUE: &str = "PUSH1 0x80 MLOAD PUSH2 @yes JUMPI PUSH1 0x00 DUP1 REVERT :yes JUMPDEST";
+
+fn answer_full() -> String {
+    format!("RETURNDATASIZE PUSH1 0x20 EQ PUSH2 @full JUMPI {REVERT} :full JUMPDEST {ANSWER_TRUE}")
+}
+
+fn walked(bound: &str) -> Vec<u8> {
+    dispatcher3(
+        "PUSH1 0x05 SLOAD PUSH1 0x01 ADD PUSH1 0x05 SSTORE STOP",
+        &format!(
+            "PUSH1 0x00 :top JUMPDEST {bound} DUP2 LT ISZERO PUSH2 @done JUMPI \
+             DUP1 SLOAD POP PUSH1 0x01 ADD PUSH2 @top JUMP :done JUMPDEST POP STOP"
+        ),
+        "STOP",
+    )
+}
+
+const SPENDS: &str = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x01 PUSH1 0x20 MSTORE \
+     PUSH1 0x40 PUSH1 0x00 KECCAK256 PUSH1 0x20 MSTORE CALLER PUSH1 0x00 MSTORE \
+     PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD DUP3 DUP2 LT ISZERO \
+     PUSH2 @allowed JUMPI PUSH1 0x00 DUP1 REVERT :allowed JUMPDEST \
+     DUP3 SWAP1 SUB SWAP1 SSTORE";
+
+const COPY_AND_CHANGE: &str =
+    "PUSH1 0x05 SLOAD PUSH1 0x80 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0x80 MSTORE";
+const AIMED_WRITE: &str = "PUSH1 0x24 CALLDATALOAD PUSH1 0x04 CALLDATALOAD SSTORE STOP";
+const STORE_WORD: &str = "PUSH1 0x04 CALLDATALOAD PUSH1 0x01 SSTORE STOP";
+const MARKS: &str = "PUSH1 0x01 PUSH1 0x09 SSTORE";
+
+fn cases() -> Vec<Case> {
+    let pair = |rule, confirmed, flawed: fn() -> Vec<u8>, sound: fn() -> Vec<u8>| {
+        [(true, flawed), (false, sound)].map(|(flawed, build)| Case {
+            rule,
+            flawed,
+            confirmed,
+            build,
+        })
+    };
+    let all = [
+        pair(
+            "two-calls-return-more",
+            true,
+            || {
+                dispatcher3(
+                    &pay_in("CALLVALUE PUSH1 0x02 MUL"),
+                    &pay_out_checked(),
+                    "STOP",
+                )
+            },
+            || dispatcher3(&pay_in("CALLVALUE"), &pay_out_checked(), "STOP"),
+        ),
+        pair(
+            "reentrancy|reentered-call-pays-again",
+            true,
+            || dispatcher3(&pay_in("CALLVALUE"), &pay_out_all(false), "STOP"),
+            || dispatcher3(&pay_in("CALLVALUE"), &pay_out_all(true), "STOP"),
+        ),
+        pair(
+            "inflow-credits-nothing",
+            true,
+            || share_vault(""),
+            || share_vault("DUP1 PUSH2 @some JUMPI PUSH1 0x00 DUP1 REVERT :some JUMPDEST"),
+        ),
+        pair(
+            "changed-copy-dropped",
+            true,
+            || dispatcher(&format!("{COPY_AND_CHANGE} STOP")),
+            || {
+                dispatcher(&format!(
+                    "{COPY_AND_CHANGE} PUSH1 0x80 MLOAD PUSH1 0x05 SSTORE STOP"
+                ))
+            },
+        ),
+        pair(
+            "signed-message-accepted-twice",
+            true,
+            || signed_payment(false),
+            || signed_payment(true),
+        ),
+        pair(
+            "clock-units-mixed",
+            true,
+            || clocked("NUMBER"),
+            || clocked("TIMESTAMP"),
+        ),
+        pair("phase-never-entered", false, || phased(5), || phased(2)),
+        pair(
+            "gate-never-set",
+            false,
+            || gated_after(MARKS),
+            || gated_after(&format!("{MARKS} CALLER PUSH1 0x00 SSTORE")),
+        ),
+        pair(
+            "refused-transfer-treated-as-done|erc20-return-ignored|unchecked-token-pull",
+            true,
+            || pulls(""),
+            || pulls(ANSWER_TRUE),
+        ),
+        pair(
+            "transfer-without-answer-refused",
+            true,
+            || pulls(&answer_full()),
+            || pulls(ANSWER_TRUE),
+        ),
+        pair(
+            "cost-grows-with-open-list",
+            true,
+            || walked("PUSH1 0x05 SLOAD"),
+            || walked("PUSH1 0x03"),
+        ),
+        pair(
+            "transfer-creates-value",
+            true,
+            || ledger("DUP1 PUSH1 0x02 MUL", SPENDS),
+            || ledger("DUP1", SPENDS),
+        ),
+        pair(
+            "transfer-delivers-less",
+            true,
+            || ledger("PUSH1 0x0a DUP2 DIV DUP2 SUB", SPENDS),
+            || ledger("DUP1", SPENDS),
+        ),
+        pair(
+            "transferfrom-ignores-allowance",
+            true,
+            || ledger("DUP1", ""),
+            || ledger("DUP1", SPENDS),
+        ),
+        pair(
+            "input-picks-storage-slot",
+            true,
+            || dispatcher(AIMED_WRITE),
+            || {
+                dispatcher(&format!(
+                    "PUSH1 0x0a PUSH1 0x04 CALLDATALOAD LT PUSH2 @in JUMPI {REVERT} \
+                     :in JUMPDEST {AIMED_WRITE}"
+                ))
+            },
+        ),
+        pair(
+            "short-input-accepted",
+            true,
+            || dispatcher(STORE_WORD),
+            || {
+                dispatcher(&format!(
+                    "PUSH1 0x23 CALLDATASIZE GT PUSH2 @long JUMPI {REVERT} \
+                     :long JUMPDEST {STORE_WORD}"
+                ))
+            },
+        ),
+    ];
+    all.into_iter().flatten().collect()
+}
+
+fn shown(case: &Case, code: &[u8]) -> bool {
+    let wanted: Vec<&str> = case.rule.split('|').collect();
+    report_of(code)
+        .findings
+        .iter()
+        .any(|f| wanted.contains(&f.id.as_str()) && (f.confirmed || !case.confirmed))
+}
+
+#[test]
+fn the_labelled_fixtures_score_every_rule_at_full_precision_and_recall() {
+    let mut score: std::collections::BTreeMap<&str, [usize; 4]> = Default::default();
+    let out_dir = std::env::var("EVMDEC_WRITE_FIXTURES").ok();
+    let mut manifest = Vec::new();
+    for (index, case) in cases().iter().enumerate() {
+        let code = (case.build)();
+        let found = shown(case, &code);
+        let cell = match (case.flawed, found) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => 3,
+        };
+        score.entry(case.rule).or_default()[cell] += 1;
+        if let Some(dir) = &out_dir {
+            let name = format!(
+                "{index:02}-{}.hex",
+                if case.flawed { "flawed" } else { "sound" }
+            );
+            std::fs::write(format!("{dir}/{name}"), evmdec::hex::encode(&code)).unwrap();
+            manifest.push(format!(
+                "  {{\"file\": \"{name}\", \"rule\": \"{}\", \"flawed\": {}, \"confirmed\": {}}}",
+                case.rule, case.flawed, case.confirmed
+            ));
+        }
+    }
+    if let Some(dir) = &out_dir {
+        let text = format!("[\n{}\n]\n", manifest.join(",\n"));
+        std::fs::write(format!("{dir}/manifest.json"), text).unwrap();
+    }
+    println!("{:<72} found missed false-alarm quiet", "rule");
+    for (rule, [hit, missed, alarm, quiet]) in &score {
+        println!("{rule:<72} {hit:>5} {missed:>6} {alarm:>11} {quiet:>5}");
+        assert_eq!((*missed, *alarm), (0, 0), "{rule}");
+    }
+}
+
+#[test]
+fn padding_the_code_changes_no_labelled_result() {
+    for case in cases() {
+        let plain = shown(&case, &(case.build)());
+        PADDED.with(|p| p.set(true));
+        let padded = (case.build)();
+        PADDED.with(|p| p.set(false));
+        assert_eq!(
+            shown(&case, &padded),
+            plain,
+            "{} ({}) changes when every jump destination is followed by a push and a pop",
+            case.rule,
+            if case.flawed { "flawed" } else { "sound" },
+        );
+    }
 }

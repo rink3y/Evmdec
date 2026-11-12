@@ -550,12 +550,12 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
             op::JUMP => {
                 let t = st.pop();
                 flow = Some(match t {
-                    AVal::Const(c) | AVal::Pc(c) => Flow::Jump(
-                        c.as_usize()
-                            .and_then(|pc| prog.target_block(pc))
-                            .into_iter()
-                            .collect(),
-                    ),
+                    AVal::Const(c) | AVal::Pc(c) => {
+                        match c.as_usize().and_then(|pc| prog.target_block(pc)) {
+                            Some(target) => Flow::Jump(vec![target]),
+                            None => Flow::Halt(op::INVALID),
+                        }
+                    }
                     AVal::Table => Flow::Jump(
                         table_targets(prog, &st.mem)
                             .into_iter()

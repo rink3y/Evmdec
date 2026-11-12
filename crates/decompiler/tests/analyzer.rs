@@ -1207,3 +1207,19 @@ fn a_memory_word_used_after_it_is_overwritten_keeps_its_old_value() {
     let used = at("stor_0 = prev_mem_ptr1;");
     assert!(saved < stored && stored < used, "{src}");
 }
+
+/// A jump to a constant that is not a jump destination always fails: the way compilers before
+/// `revert` wrote an abort. It reads as a guard, and is not counted as a jump the recovery
+/// could not follow.
+#[test]
+fn a_jump_to_no_destination_is_an_abort() {
+    let code = dispatcher(
+        "PUSH1 0x04 CALLDATALOAD PUSH1 0x02 JUMPI PUSH1 0x01 PUSH1 0x00 SSTORE PUSH1 0x24 \
+         CALLDATALOAD ISZERO PUSH2 @bad JUMPI STOP :bad JUMPDEST PUSH1 0x02 JUMP",
+    );
+    let c = decompile::decompile(&code, &Options::default());
+    assert_eq!(c.stats.unresolved_jumps, 0);
+    assert!(!c.source.contains("unresolved target"), "{}", c.source);
+    assert!(c.source.contains("require(arg0 == 0);"), "{}", c.source);
+    assert!(c.source.contains("require(arg1 != 0);"), "{}", c.source);
+}

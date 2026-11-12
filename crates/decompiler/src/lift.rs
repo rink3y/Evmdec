@@ -2318,6 +2318,20 @@ impl<'a> Lifter<'a> {
                 }
                 op::JUMP => {
                     let _target = pop!();
+                    let nowhere = expr::as_const(_target).is_some_and(|c| {
+                        c.as_usize()
+                            .and_then(|pc| self.prog.target_block(pc))
+                            .is_none()
+                    });
+                    if nowhere && !self.oracle {
+                        let zero = konst(U256::ZERO);
+                        term = Some(Term::Revert {
+                            off: zero,
+                            len: zero,
+                            data: Some(Vec::new()),
+                        });
+                        break;
+                    }
                     if self.oracle || un.computed_cut {
                         term = Some(Term::Unresolved(_target));
                         break;

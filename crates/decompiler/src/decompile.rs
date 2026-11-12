@@ -252,6 +252,10 @@ pub struct Contract {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     /// Contracts this one deploys, decompiled from embedded creation code (`Options::embedded`).
     pub embedded: Vec<Contract>,
+    /// For a contract in another's `embedded`: offset and length of its creation code inside
+    /// the code of the contract that deploys it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<(usize, usize)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// The constructor, decompiled from the creation code when the input was creation code.
     pub constructor: Option<Box<Contract>>,
@@ -275,6 +279,9 @@ pub struct Contract {
     /// chosen at run time, read and linked when the contract is fetched by address.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub call_target_slots: Vec<String>,
+    /// Fixed addresses whose code the minimal proxies (EIP-1167) this contract creates run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub clone_targets: Vec<String>,
     /// Of `call_targets` and `call_target_slots`, the ones some call may change the state of
     /// (`CALL`/`CALLCODE`); the others are only ever read with `STATICCALL`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -625,6 +632,7 @@ pub fn compose(
                 shell.selectors_called.push(v);
             }
         }
+        shell.embedded.extend(part.embedded);
         for v in part.call_targets {
             if !shell.call_targets.contains(&v) && !v.eq_ignore_ascii_case(&address) {
                 shell.call_targets.push(v);
@@ -633,6 +641,11 @@ pub fn compose(
         for v in part.library_targets {
             if !shell.library_targets.contains(&v) && !v.eq_ignore_ascii_case(&address) {
                 shell.library_targets.push(v);
+            }
+        }
+        for v in part.clone_targets {
+            if !shell.clone_targets.contains(&v) {
+                shell.clone_targets.push(v);
             }
         }
         for v in part.written_targets {
@@ -1464,6 +1477,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                     },
                 );
                 sc.source = render(&sc, &format!("Embedded_{:#x}", region.0));
+                sc.region = Some(region);
                 embedded.push(sc);
             }
         }
@@ -1475,11 +1489,24 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     let mut call_targets: Vec<String> = Vec::new();
     let mut call_target_slots: Vec<String> = Vec::new();
     let mut written_targets: Vec<String> = Vec::new();
+    let mut clone_targets: Vec<String> = Vec::new();
     let mut diamond_lookup: Option<DiamondLookup> = None;
     for f in &functions {
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
             for st in &nd.stmts {
+                if let Stmt::Create {
+                    init: Some(words),
+                    len,
+                    ..
+                } = st
+                {
+                    if let Some(target) = clone_target(words, *len) {
+                        if !clone_targets.contains(&target) {
+                            clone_targets.push(target);
+                        }
+                    }
+                }
                 if let Stmt::Call {
                     kind, addr, in_len, ..
                 } = st
@@ -1560,12 +1587,14 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         stats,
         source: String::new(),
         embedded,
+        region: None,
         constructor: None,
         delegatecall_slots: dc_slots,
         delegatecall_targets: dc_targets,
         library_targets,
         call_targets,
         call_target_slots,
+        clone_targets,
         written_targets,
         stored_targets: Vec::new(),
         linked: Vec::new(),
@@ -1583,6 +1612,28 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     };
     c.source = render(&c, "Contract");
     c
+}
+
+/// The EIP-1167 target of creation code that is a minimal proxy with a fixed address.
+pub(crate) fn clone_target(init: &[ExprId], len: ExprId) -> Option<String> {
+    const HEAD: [u8; 20] = [
+        0x3d, 0x60, 0x2d, 0x80, 0x60, 0x0a, 0x3d, 0x39, 0x81, 0xf3, 0x36, 0x3d, 0x3d, 0x37, 0x3d,
+        0x3d, 0x3d, 0x36, 0x3d, 0x73,
+    ];
+    let len = expr::as_const(len)?.as_usize()?;
+    let mut bytes = Vec::with_capacity(32 * init.len());
+    for (i, w) in init.iter().enumerate().take(3) {
+        let word = expr::as_const(*w)?;
+        let short = i == init.len() - 1 && len % 32 != 0;
+        let word = match short {
+            true => word << (8 * (32 - len % 32)) as u32,
+            false => word,
+        };
+        bytes.extend_from_slice(&word.to_be_bytes());
+    }
+    let at = bytes.windows(HEAD.len()).position(|w| w == HEAD)? + HEAD.len();
+    let address = bytes.get(at..at + 20)?;
+    Some(U256::from_be_bytes(address).to_hex_padded(20))
 }
 
 /// Code regions copied to memory and fed to CREATE/CREATE2 (embedded contracts).
@@ -1603,7 +1654,7 @@ fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
                         ) {
                             if len >= 64
                                 && off + len <= prog.code.len()
-                                && off > b.end
+                                && off >= b.end
                                 && !out.contains(&(off, len))
                             {
                                 out.push((off, len));

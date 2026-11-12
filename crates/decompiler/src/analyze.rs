@@ -123,12 +123,25 @@ pub struct ParamUse {
 pub struct ParamStore {
     /// Index of the ABI word in the call data.
     pub word: u32,
-    /// The slot, as 32 bytes of hex.
+    /// The slot, as 32 bytes of hex; an offset from `base` when that is set.
     pub slot: String,
+    /// The parameter word the slot is counted from, for code that is handed its storage
+    /// position by its caller (a library working on a storage reference).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<u32>,
     /// Some access check of the contract compares `msg.sender` with this slot.
     pub gates: bool,
     /// Printed statement.
     pub line: String,
+}
+
+/// A storage slot counted from a position the caller passes in.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RelativeSlot {
+    /// The parameter word holding the position.
+    pub base: u32,
+    /// Slots past that position, as 32 bytes of hex.
+    pub offset: String,
 }
 
 /// A parameter word passed on as an argument of a call to another contract.
@@ -163,6 +176,14 @@ pub struct FnSummary {
     /// Root slots of the mappings whose entry under `msg.sender` is tested as a flag.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gate_roles: Vec<String>,
+    /// Slots `msg.sender` is compared with that are counted from a position the caller passes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gate_relative: Vec<RelativeSlot>,
+    /// The function returns the address of a contract it creates: where that contract's code
+    /// is, as an address (a clone of the code there) or a creator's address, `#` and the offset
+    /// of the creation code inside the creator's own code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creates: Option<String>,
     /// The function recovers a signer, so an account it names may have signed for the action.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub signed: bool,
@@ -333,6 +354,13 @@ struct Ctx<'a> {
     /// What a call to a function of another contract returns, when that function only computes
     /// from its arguments: by call sequence number, in the caller's terms.
     computed_returns: RefCell<HashMap<u32, ExprId>>,
+    /// Addresses of contracts created so far in the function being replayed, as the
+    /// expression that holds each (a creation's result, or the word returned by a call to a
+    /// function that creates), with the world key of the created code.
+    made: RefCell<HashMap<ExprId, String>>,
+    /// Code the function being replayed copied to memory from its own code: destination,
+    /// offset and length.
+    code_copies: RefCell<Vec<(ExprId, usize, usize)>>,
     internals: HashMap<usize, &'a Function>,
     version: Option<(u32, u32, u32)>,
     vyper: bool,
@@ -510,6 +538,12 @@ impl<'a> World<'a> {
             if let Some(a) = &c.address {
                 members.entry(a.to_ascii_lowercase()).or_insert(c);
             }
+            let creator = c.address.as_deref().unwrap_or_default();
+            for made in &c.embedded {
+                if let Some((offset, _)) = made.region {
+                    members.entry(created_key(creator, offset)).or_insert(made);
+                }
+            }
             work.extend(c.linked.iter());
         }
         World {
@@ -523,15 +557,19 @@ impl<'a> World<'a> {
         self.members.values().any(|m| !std::ptr::eq(*m, c))
     }
 
-    /// The contract at `address`.
+    /// The contract at `address`; for a clone's key, the contract whose code the clone runs.
     fn contract(&self, address: &str) -> Option<&'a Contract> {
+        let address = address.strip_suffix(CLONE).unwrap_or(address);
         self.members.get(&address.to_ascii_lowercase()).copied()
     }
 
     /// The report of the contract at `address`, computed on first use. `None` for an address
     /// outside the world and for a contract whose analysis is already under way.
     fn report(&self, address: &str) -> Option<Rc<Report>> {
-        let key = address.to_ascii_lowercase();
+        let key = address
+            .strip_suffix(CLONE)
+            .unwrap_or(address)
+            .to_ascii_lowercase();
         if let Some(known) = self.reports.borrow().get(&key) {
             return known.clone();
         }
@@ -545,10 +583,91 @@ impl<'a> World<'a> {
     }
 }
 
-/// The address `e` names when it is another contract of the world: a constant, or the address
-/// read from a constant slot whose content was fetched.
+/// The key under which the world holds the contract `creator` deploys from the creation code
+/// at `offset` of its own code.
+fn created_key(creator: &str, offset: usize) -> String {
+    format!("{}#{offset:#x}", creator.to_ascii_lowercase())
+}
+
+/// Suffix of the world key for a minimal proxy created during a call: the address it forwards
+/// to, then this.
+const CLONE: &str = "#clone";
+
+/// A world key in words: a deployed contract by its address, a created one by its creator.
+fn describe(key: &str) -> String {
+    if let Some(target) = key.strip_suffix(CLONE) {
+        return format!("a clone of the contract at {target}, created in the same call");
+    }
+    match key.split_once('#') {
+        Some(("", _)) => "a contract this one creates".to_string(),
+        Some((creator, _)) => format!("a contract that {creator} creates"),
+        None => format!("the contract at {key}"),
+    }
+}
+
+/// Where the code of the contract created from memory at `off` is: the world key of the
+/// creation code the function copied there from its own code, or the address a minimal proxy
+/// forwards to.
+fn created_code(ctx: &Ctx, off: ExprId, len: ExprId, init: Option<&[ExprId]>) -> Option<String> {
+    if let Some(target) = init.and_then(|words| decompile::clone_target(words, len)) {
+        return Some(format!("{target}{CLONE}"));
+    }
+    let copies = ctx.code_copies.borrow();
+    let held = |offset: usize| {
+        ctx.c
+            .embedded
+            .iter()
+            .any(|made| made.region.is_some_and(|r| r.0 == offset))
+    };
+    let (_, offset, _) = copies
+        .iter()
+        .rev()
+        .find(|(dest, offset, _)| *dest == off && held(*offset))
+        .or_else(|| copies.iter().rev().find(|(_, offset, _)| held(*offset)))?;
+    Some(created_key(
+        ctx.c.address.as_deref().unwrap_or_default(),
+        *offset,
+    ))
+}
+
+/// The code behind the address the call `st` returns, when the function it reaches returns the
+/// address of a contract it creates.
+fn made_by_call(ctx: &Ctx, st: &Stmt) -> Option<String> {
+    let Stmt::Call {
+        addr,
+        input,
+        input_head,
+        in_len,
+        ..
+    } = st
+    else {
+        return None;
+    };
+    if !ctx.world.has_other(ctx.c) {
+        return None;
+    }
+    let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
+    let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
+    let selector = emit::leading_selector(*words.first()?, len)?;
+    let address = linked_address(ctx, *addr)?;
+    let report = ctx.world.report(&address)?;
+    let hex = format!("{selector:#010x}");
+    report
+        .summaries
+        .iter()
+        .find(|g| g.selector.eq_ignore_ascii_case(&hex))?
+        .creates
+        .clone()
+}
+
+/// The address `e` names when it is another contract of the world: a constant, the address
+/// read from a constant slot whose content was fetched, or the address of a contract created
+/// earlier in the function (by it, or by a function it called).
 fn linked_address(ctx: &Ctx, e: ExprId) -> Option<String> {
     let e = unmask(e);
+    if let Some(key) = ctx.made.borrow().get(&e) {
+        return linked_contract(ctx, key).map(|_| key.to_ascii_lowercase());
+    }
     let address = match expr::as_const(e) {
         Some(a) => a.to_hex_padded(20),
         None => {
@@ -1253,12 +1372,47 @@ fn collect_facts(
     facts
 }
 
+/// `e` without one width cast around it: a low mask, or the shift pair `(x << k) >> k` that
+/// older compilers emit for the same thing, also written `x * 2^k >> k` and `x * 2^k / 2^k`.
+fn uncast(e: ExprId) -> Option<ExprId> {
+    let Node::Op(o, v) = expr::node(e) else {
+        return None;
+    };
+    let power = |e: ExprId| {
+        expr::as_const(e)
+            .filter(|c| !c.is_zero() && (*c & c.wrapping_sub(U256::ONE)).is_zero())
+            .map(|c| c.trailing_zeros())
+    };
+    let shift = |e: ExprId| {
+        expr::as_const(e)
+            .filter(|c| c.fits_u64())
+            .map(|c| c.low_u64() as u32)
+    };
+    let raised = |e: ExprId| match expr::node(e) {
+        Node::Op(op::MUL, w) => power(w[1])
+            .map(|k| (w[0], k))
+            .or(power(w[0]).map(|k| (w[1], k))),
+        Node::Op(op::SHL, w) => shift(w[0]).map(|k| (w[1], k)),
+        _ => None,
+    };
+    match o {
+        op::AND if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => Some(v[0]),
+        op::SHR => raised(v[1])
+            .filter(|(_, k)| shift(v[0]) == Some(*k))
+            .map(|(x, _)| x),
+        op::DIV => raised(v[0])
+            .filter(|(_, k)| power(v[1]) == Some(*k))
+            .map(|(x, _)| x),
+        _ => None,
+    }
+}
+
 /// The call-data word `e` is, once casts are taken off: `CALLDATALOAD(4 + 32 * i)` gives `i`.
 fn param_word(e: ExprId) -> Option<u32> {
+    if let Some(inner) = uncast(e) {
+        return param_word(inner);
+    }
     match expr::node(e) {
-        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-            param_word(v[0])
-        }
         Node::CallDataLoad(off) | Node::CopiedWord(op::CALLDATACOPY, off, _) => {
             emit::calldata_word_index(off)
         }
@@ -1338,12 +1492,9 @@ fn calldata_locals(events: &[Event]) -> HashMap<u64, u32> {
 
 /// Is `e` the caller, once casts are taken off?
 fn is_caller(e: ExprId) -> bool {
-    match expr::node(e) {
-        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-            is_caller(v[0])
-        }
-        Node::Env(op::CALLER, _) => true,
-        _ => false,
+    match uncast(e) {
+        Some(inner) => is_caller(inner),
+        None => matches!(expr::node(e), Node::Env(op::CALLER, _)),
     }
 }
 
@@ -1455,6 +1606,18 @@ fn computed_result(ctx: &Ctx, st: &Stmt) -> Option<ExprId> {
     ))
 }
 
+/// Where a storage key sits: a fixed slot, or a fixed number of slots past a position held in
+/// a parameter word.
+fn slot_place(key: ExprId) -> Option<(Option<u32>, U256)> {
+    if let Some(word) = param_word(key) {
+        return Some((Some(word), U256::ZERO));
+    }
+    match expr::split_offset(key) {
+        (None, slot) => Some((None, slot)),
+        (Some(base), offset) => Some((Some(param_word(base)?), offset)),
+    }
+}
+
 /// The summary of one external function, from its event stream and collected facts.
 fn summarise(
     ctx: &Ctx,
@@ -1535,6 +1698,15 @@ fn summarise(
                     for w in key_parties(k).0 {
                         bind(w, &mut sum.bound);
                     }
+                    if let Some((Some(base), offset)) = slot_place(k) {
+                        let gate = RelativeSlot {
+                            base,
+                            offset: offset.to_hex_padded(32),
+                        };
+                        if !sum.gate_relative.contains(&gate) {
+                            sum.gate_relative.push(gate);
+                        }
+                    }
                 }
             }
         });
@@ -1564,33 +1736,36 @@ fn summarise(
                 val,
                 transient: false,
                 ..
-            } => match expr::as_const(*key) {
-                Some(slot) => {
-                    let whole = param_word(*val);
-                    let field = emit::packed_write(*key, *val).and_then(|(.., v)| param_word(v));
-                    if let Some(word) = whole.or(field) {
-                        sum.stores.push(ParamStore {
+            } => {
+                let stored = param_word(*val)
+                    .or_else(|| emit::packed_write(*key, *val).and_then(|(.., v)| param_word(v)))
+                    .or_else(|| {
+                        ssa::field_writes(*key, *val)
+                            .iter()
+                            .find_map(|w| param_word(w.value))
+                    });
+                if let (Some((base, slot)), Some(word)) = (slot_place(*key), stored) {
+                    sum.stores.push(ParamStore {
+                        word,
+                        slot: slot.to_hex_padded(32),
+                        base,
+                        gates: base.is_none() && auth.contains(key),
+                        line: emit::fmt_stmt(st, &own),
+                    });
+                }
+                let lowered = !expr::is_const(*key)
+                    && (matches!(change_of(*val, *key).0, Change::Down(a) if !expr::is_const(a))
+                        || expr::as_const(*val) == Some(U256::ZERO));
+                if lowered {
+                    let line = emit::fmt_stmt(st, &own);
+                    for word in key_parties(*key).0 {
+                        sum.lowers.push(ParamUse {
                             word,
-                            slot: slot.to_hex_padded(32),
-                            gates: auth.contains(key),
-                            line: emit::fmt_stmt(st, &own),
+                            line: line.clone(),
                         });
                     }
                 }
-                None => {
-                    let lowered = matches!(change_of(*val, *key).0, Change::Down(a) if !expr::is_const(a))
-                        || expr::as_const(*val) == Some(U256::ZERO);
-                    if lowered {
-                        let line = emit::fmt_stmt(st, &own);
-                        for word in key_parties(*key).0 {
-                            sum.lowers.push(ParamUse {
-                                word,
-                                line: line.clone(),
-                            });
-                        }
-                    }
-                }
-            },
+            }
             Stmt::Call {
                 kind,
                 addr,
@@ -1599,7 +1774,7 @@ fn summarise(
                 input_head,
                 in_len,
                 ..
-            } if *kind == op::CALL => {
+            } if *kind == op::CALL || *kind == op::DELEGATECALL => {
                 let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
                 let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
                 let selector = words
@@ -1622,6 +1797,92 @@ fn summarise(
                     .map(|i| param_word(emit::shifted_word_len(words, i, len)))
                     .collect();
                 let arg = |i: usize| args.get(i).copied().flatten();
+                if *kind == op::DELEGATECALL {
+                    let hex = format!("{sel:#010x}");
+                    let report = linked_address(ctx, *addr).and_then(|a| ctx.world.report(&a));
+                    let Some(report) = report else { continue };
+                    let Some(h) = report
+                        .summaries
+                        .iter()
+                        .find(|h| h.selector.eq_ignore_ascii_case(&hex))
+                    else {
+                        continue;
+                    };
+                    let back = |word: u32| arg(word as usize);
+                    let place = |base: Option<u32>, slot: &str| -> Option<(Option<u32>, String)> {
+                        let Some(base) = base else {
+                            return Some((None, slot.to_string()));
+                        };
+                        let position = emit::shifted_word_len(words, base as usize, len);
+                        match expr::as_const(position) {
+                            Some(start) => {
+                                let slot = start.wrapping_add(U256::from_hex_str(slot)?);
+                                Some((None, slot.to_hex_padded(32)))
+                            }
+                            None => Some((Some(param_word(position)?), slot.to_string())),
+                        }
+                    };
+                    sum.gated |= h.gated;
+                    sum.signed |= h.signed;
+                    for slot in &h.gate_slots {
+                        if !sum.gate_slots.contains(slot) {
+                            sum.gate_slots.push(slot.clone());
+                        }
+                    }
+                    for root in &h.gate_roles {
+                        if !sum.gate_roles.contains(root) {
+                            sum.gate_roles.push(root.clone());
+                        }
+                    }
+                    for gate in &h.gate_relative {
+                        match place(Some(gate.base), &gate.offset) {
+                            Some((None, slot)) if !sum.gate_slots.contains(&slot) => {
+                                sum.gate_slots.push(slot);
+                            }
+                            Some((Some(base), offset)) => {
+                                sum.gate_relative.push(RelativeSlot { base, offset });
+                            }
+                            _ => {}
+                        }
+                    }
+                    for word in h.bound.iter().filter_map(|w| back(*w)) {
+                        bind(word, &mut sum.bound);
+                    }
+                    for u in &h.lowers {
+                        if let Some(word) = back(u.word) {
+                            sum.lowers.push(ParamUse {
+                                word,
+                                line: u.line.clone(),
+                            });
+                        }
+                    }
+                    for u in &h.pays {
+                        if let Some(word) = back(u.word) {
+                            sum.pays.push(ParamUse {
+                                word,
+                                line: u.line.clone(),
+                            });
+                        }
+                    }
+                    for held in &h.stores {
+                        let placed = place(held.base, &held.slot);
+                        if let (Some(word), Some((base, slot))) = (back(held.word), placed) {
+                            sum.stores.push(ParamStore {
+                                word,
+                                slot,
+                                base,
+                                gates: held.gates && base.is_none(),
+                                line: held.line.clone(),
+                            });
+                        }
+                    }
+                    for fw in &h.forwards {
+                        if let Some(word) = back(fw.word) {
+                            sum.forwards.push(ParamForward { word, ..fw.clone() });
+                        }
+                    }
+                    continue;
+                }
                 let (from, to) = match sel {
                     SEL_TRANSFER => (None, arg(0)),
                     SEL_TRANSFER_FROM => (arg(0), arg(1)),
@@ -1663,6 +1924,15 @@ fn summarise(
             _ => {}
         }
     }
+    sum.creates = events.iter().find_map(|ev| match &ev.term {
+        Some(Term::Return {
+            data: Some(words), ..
+        }) => {
+            let made = ctx.made.borrow();
+            words.first().and_then(|w| made.get(&unmask(*w)).cloned())
+        }
+        _ => None,
+    });
     sum.returns = computed_return(events);
     sum.bound.sort_unstable();
     sum.lowers.dedup();
@@ -2485,6 +2755,8 @@ fn loop_nodes(l: &Lifted) -> HashSet<usize> {
 
 fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Event> {
     ctx.computed_returns.borrow_mut().clear();
+    ctx.made.borrow_mut().clear();
+    ctx.code_copies.borrow_mut().clear();
     ctx.inline_left.set(MAX_INLINED_EVENTS);
     let mut mem = lift::MemView::new_fresh();
     events_of_in(
@@ -2617,13 +2889,42 @@ fn events_of_in(
             .collect();
         for s in &nd.stmts {
             let s = lift::map_stmt(s, &|e| apply(e, mem));
-            if let Stmt::Call { seq, .. } = &s {
-                let computed = computed_result(ctx, &s);
-                let mut known = ctx.computed_returns.borrow_mut();
-                match computed {
-                    Some(e) => known.insert(*seq, e),
-                    None => known.remove(seq),
-                };
+            match &s {
+                Stmt::Call { seq, .. } => {
+                    let computed = computed_result(ctx, &s);
+                    match computed {
+                        Some(e) => ctx.computed_returns.borrow_mut().insert(*seq, e),
+                        None => ctx.computed_returns.borrow_mut().remove(seq),
+                    };
+                    if let Some(key) = made_by_call(ctx, &s) {
+                        let word = expr::intern(Node::ReturnData(*seq, expr::konst(U256::ZERO)));
+                        ctx.made.borrow_mut().insert(word, key);
+                    }
+                }
+                Stmt::Copy {
+                    kind: op::CODECOPY,
+                    dest,
+                    src,
+                    len,
+                    ..
+                } => {
+                    let fixed = |e: ExprId| expr::as_const(e).and_then(|c| c.as_usize());
+                    if let (Some(offset), Some(n)) = (fixed(*src), fixed(*len)) {
+                        ctx.code_copies.borrow_mut().push((*dest, offset, n));
+                    }
+                }
+                Stmt::Create {
+                    off,
+                    len,
+                    result,
+                    init,
+                    ..
+                } => {
+                    if let Some(key) = created_code(ctx, *off, *len, init.as_deref()) {
+                        ctx.made.borrow_mut().insert(*result, key);
+                    }
+                }
+                _ => {}
             }
             let depth = if ctx.inline_left.get() == 0 { 0 } else { depth };
             if let Stmt::Internal { callee: t, .. } = &s {
@@ -3242,6 +3543,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         c,
         world,
         computed_returns: RefCell::default(),
+        made: RefCell::default(),
+        code_copies: RefCell::default(),
         internals,
         version,
         vyper: c.language.starts_with("vyper"),
@@ -5110,6 +5413,13 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     report.privileged_functions = privileged;
     report.unauthenticated_state_changers = unauthenticated;
     report.external_calls = external_calls.into_iter().collect();
+    let gate_slots: HashSet<String> = summaries
+        .iter()
+        .flat_map(|g| g.gate_slots.iter().cloned())
+        .collect();
+    for held in summaries.iter_mut().flat_map(|g| g.stores.iter_mut()) {
+        held.gates |= held.base.is_none() && gate_slots.contains(&held.slot);
+    }
     report.summary = summary;
     report.summaries = summaries;
     report
@@ -6350,6 +6660,8 @@ struct Reached {
     /// Whether the called contract approves `from` as a caller: `None` when its storage was not
     /// read.
     admitted: Option<bool>,
+    /// The function belongs to a contract created during the call, not to a deployed one.
+    created: bool,
 }
 
 /// Follow argument `word` of the call `selector` on the contract at `address`, made by the
@@ -6369,7 +6681,8 @@ fn reach(
         .summaries
         .iter()
         .find(|g| g.selector.eq_ignore_ascii_case(selector))?;
-    if !g.gated && g.gate_roles.is_empty() {
+    let created = address.contains('#');
+    if !created && !g.gated && g.gate_roles.is_empty() {
         return None;
     }
     let listed = |from: &str| lc.admits.iter().any(|a| a.eq_ignore_ascii_case(from));
@@ -6391,6 +6704,7 @@ fn reach(
             .find(|st| st.word == word && st.gates)
             .map(|st| st.line.clone()),
         admitted,
+        created,
     };
     if reached.lowers.is_some() || reached.gate_store.is_some() || depth == 0 {
         return Some(reached);
@@ -6411,6 +6725,7 @@ fn reach(
                 reached.pays |= next.pays;
                 reached.function = format!("{} (through `{}`)", next.function, g.function);
                 reached.address = next.address;
+                reached.created = next.created;
                 break;
             }
         }
@@ -6445,27 +6760,29 @@ fn passed_word_findings(
         if f.account_authorised && sum.bound.is_empty() {
             continue;
         }
-        for fw in sum
+        let reached: Vec<(&ParamForward, Reached)> = sum
             .forwards
             .iter()
             .filter(|fw| !sum.bound.contains(&fw.word))
-        {
-            let Some(r) = reach(ctx.world, own, &fw.target, &fw.selector, fw.arg, 3) else {
-                continue;
-            };
-            if r.admitted == Some(false) {
-                continue;
-            }
+            .filter_map(|fw| {
+                let r = reach(ctx.world, own, &fw.target, &fw.selector, fw.arg, 3)?;
+                (r.admitted != Some(false)).then_some((fw, r))
+            })
+            .collect();
+        let lowers_an_entry = reached.iter().any(|(_, r)| r.lowers.is_some());
+        for (fw, r) in &reached {
             let confidence = match r.admitted {
                 Some(true) => Confidence::High,
                 _ => Confidence::Medium,
             };
-            let standing = match r.admitted {
-                Some(true) => {
+            let standing = match (r.created, r.admitted) {
+                (true, _) => "belongs to a contract this call creates",
+                (false, Some(true)) => {
                     "runs only for callers its contract approves, and this contract is one of them"
                 }
-                _ => "runs only for callers its contract approves",
+                (false, _) => "runs only for callers its contract approves",
             };
+            let place = describe(&r.address);
             if let Some(line) = &r.lowers {
                 if told.insert((sum.selector.clone(), r.address.clone(), fw.word, "lowers")) {
                     push_fact(
@@ -6476,11 +6793,10 @@ fn passed_word_findings(
                         confidence,
                         f,
                         format!(
-                            "`{}` takes an account from its call data (word {}) and passes it to `{}` on the contract at {} without comparing it with `msg.sender`, checking a signature from it, or reading an approval it gave the caller. That function {standing}, and it lowers the entry stored under the account it is given{}. Whoever calls `{}` therefore chooses whose entry is lowered.",
+                            "`{}` takes an account from its call data (word {}) and passes it to `{}` on {place} without comparing it with `msg.sender`, checking a signature from it, or reading an approval it gave the caller. That function {standing}, and it lowers the entry stored under the account it is given{}. Whoever calls `{}` therefore chooses whose entry is lowered.",
                             f.name,
                             fw.word,
                             r.function,
-                            r.address,
                             if r.pays { ", paying the same account" } else { "" },
                             f.name,
                         ),
@@ -6489,23 +6805,35 @@ fn passed_word_findings(
                     );
                 }
             }
-            if let Some(line) = &r.gate_store {
-                if told.insert((sum.selector.clone(), r.address.clone(), fw.word, "gate")) {
-                    push_fact(
-                        findings,
-                        "unbound-address-made-privileged",
-                        "A caller-chosen address is written to a slot another contract's access checks read",
-                        Severity::High,
-                        confidence,
-                        f,
-                        format!(
-                            "`{}` passes word {} of its call data, which it never ties to `msg.sender`, to `{}` on the contract at {}. That function {standing}, and it writes the word to a slot that contract compares `msg.sender` with. Whoever calls `{}` therefore chooses the address those checks accept.",
-                            f.name, fw.word, r.function, r.address, f.name,
-                        ),
-                        vec![fw.line.clone(), line.clone()],
-                        "Fix the address in the called contract, or let only an authorised caller choose it.",
-                    );
-                }
+            let Some(line) = &r.gate_store else { continue };
+            if r.created && !lowers_an_entry {
+                continue;
+            }
+            if told.insert((sum.selector.clone(), r.address.clone(), fw.word, "gate")) {
+                let consequence = match r.created {
+                    true => format!(
+                        "The same call lowers the entry of an account its caller names, so whoever calls `{}` chooses both whose entry is lowered and which address the new contract's checks accept.",
+                        f.name
+                    ),
+                    false => format!(
+                        "Whoever calls `{}` therefore chooses the address those checks accept.",
+                        f.name
+                    ),
+                };
+                push_fact(
+                    findings,
+                    "unbound-address-made-privileged",
+                    "A caller-chosen address is written to a slot another contract's access checks read",
+                    Severity::High,
+                    confidence,
+                    f,
+                    format!(
+                        "`{}` passes word {} of its call data, which it never ties to `msg.sender`, to `{}` on {place}. That function {standing}, and it writes the word to a slot that contract compares `msg.sender` with. {consequence}",
+                        f.name, fw.word, r.function,
+                    ),
+                    vec![fw.line.clone(), line.clone()],
+                    "Fix the address in the called contract, or let only an authorised caller choose it.",
+                );
             }
         }
     }

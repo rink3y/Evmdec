@@ -75,6 +75,10 @@ pub fn fetch(
     cache: &mut CodeCache,
     log: &mut dyn FnMut(&str),
 ) -> Result<Contract, String> {
+    let opts = &Options {
+        embedded: true,
+        ..opts.clone()
+    };
     let mut fetcher = Fetcher {
         client,
         chain,
@@ -225,6 +229,14 @@ impl Fetcher<'_> {
                 class: 0,
             });
         }
+        for target in &c.clone_targets {
+            edges.push(Edge {
+                target: target.clone(),
+                from: from.clone(),
+                how: "code run by the clones the caller creates".into(),
+                class: 0,
+            });
+        }
         for target in &c.call_targets {
             edges.push(Edge {
                 target: target.clone(),
@@ -274,6 +286,24 @@ impl Fetcher<'_> {
             let call = (from.to_ascii_lowercase(), e.target.to_ascii_lowercase());
             if !self.calls.contains(&call) {
                 self.calls.push(call);
+            }
+        }
+        for created in &c.embedded {
+            for library in &created.library_targets {
+                edges.push(Edge {
+                    target: library.clone(),
+                    from: from.clone(),
+                    how: "library of a contract the caller creates".into(),
+                    class: 0,
+                });
+            }
+            for target in &created.call_targets {
+                edges.push(Edge {
+                    target: target.clone(),
+                    from: from.clone(),
+                    how: "fixed address in a contract the caller creates".into(),
+                    class: class_of(created, target),
+                });
             }
         }
         (edges, empty)

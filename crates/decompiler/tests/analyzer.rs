@@ -1451,3 +1451,143 @@ fn targets_only_read_are_told_from_targets_a_call_may_change() {
     assert_eq!(c.call_targets, [LINKED, read], "{}", c.source);
     assert_eq!(c.written_targets, [LINKED]);
 }
+
+/// A call to `0xaaaaaaaa` on the address `target` leaves on the stack, with two argument words
+/// and `out` bytes of the answer copied to memory at 0.
+fn call_words_to(target: &str, first: &str, second: &str, out: &str) -> String {
+    format!(
+        "PUSH4 0xaaaaaaaa PUSH1 0xe0 SHL PUSH1 0x80 MSTORE {first} PUSH1 0x84 MSTORE {second} \
+         PUSH1 0xa4 MSTORE {out} PUSH1 0x00 PUSH1 0x44 PUSH1 0x80 PUSH1 0x00 {target} GAS CALL POP"
+    )
+}
+
+/// Findings of the passed-word rules on `root` analysed with `others`, each at its address.
+fn world_ids(root: &[u8], others: &[(&str, &[u8])]) -> Vec<String> {
+    let opts = Options {
+        embedded: true,
+        ..Options::default()
+    };
+    let mut c = decompile::decompile(root, &opts);
+    c.address = Some(ROOT.into());
+    for (address, code) in others {
+        let mut lc = decompile::decompile(code, &opts);
+        lc.address = Some((*address).into());
+        c.linked.push(lc);
+    }
+    analyze::analyze(&c)
+        .findings
+        .iter()
+        .filter(|f| f.id.starts_with("unbound-"))
+        .map(|f| format!("{} {:?}/{:?}", f.id, f.severity, f.confidence))
+        .collect()
+}
+
+#[test]
+fn a_library_call_is_folded_into_the_function_that_makes_it() {
+    let position = "PUSH1 0x04 CALLDATALOAD PUSH1 0x03 ADD";
+    let gate =
+        format!("{position} SLOAD CALLER EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST");
+    let store = format!("PUSH1 0x24 CALLDATALOAD {position} SSTORE STOP");
+    let gated_library = dispatcher(&format!("{gate} {store}"));
+    let open_library = dispatcher(&store);
+    let shell = dispatcher(&format!(
+        "PUSH4 0xaaaaaaaa PUSH1 0xe0 SHL PUSH1 0x80 MSTORE PUSH1 0x05 PUSH1 0x84 MSTORE PUSH1 0x04 \
+         CALLDATALOAD PUSH1 0xa4 MSTORE PUSH1 0x00 PUSH1 0x00 PUSH1 0x44 PUSH1 0x80 PUSH20 \
+         {LIBRARY} GAS DELEGATECALL POP STOP"
+    ));
+    let passes = dispatcher(&format!(
+        "{} STOP",
+        call_with_words("PUSH1 0x04 CALLDATALOAD", "PUSH1 0x00")
+    ));
+    assert_eq!(
+        world_ids(&passes, &[(LINKED, &shell), (LIBRARY, &gated_library)]),
+        ["unbound-address-made-privileged High/Medium"],
+        "the library compares the caller with slot 5 + 3 of the shell and writes the word there"
+    );
+    assert!(
+        world_ids(&passes, &[(LINKED, &shell), (LIBRARY, &open_library)]).is_empty(),
+        "no check reads the slot"
+    );
+    assert!(
+        world_ids(&passes, &[(LINKED, &shell)]).is_empty(),
+        "without the library's code the shell does nothing visible"
+    );
+}
+
+#[test]
+fn a_contract_created_during_the_call_is_read_like_a_linked_one() {
+    let made = dispatcher3(
+        "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 SSTORE STOP",
+        &format!("{OWNER_GATE} PUSH1 0x01 PUSH1 0x09 SSTORE STOP"),
+        "STOP",
+    );
+    assert!(made.len() < 244, "{}", made.len());
+    let mut creation = vec![0x60, made.len() as u8, 0x60, 0x0c, 0x60, 0x00, 0x39];
+    creation.extend_from_slice(&[0x60, made.len() as u8, 0x60, 0x00, 0xf3]);
+    creation.extend_from_slice(&made);
+    let size = format!("PUSH1 0x{:02x}", creation.len());
+    let maker = dispatcher(&format!(
+        "{size} PUSH2 @blob PUSH1 0x80 CODECOPY {size} PUSH1 0x80 PUSH1 0x00 CREATE PUSH1 0x00 \
+         MSTORE PUSH1 0x20 PUSH1 0x00 RETURN :blob 0x{}",
+        evmdec::hex::encode(&creation)
+    ));
+    let ledger = dispatcher(&format!(
+        "{OWNER_GATE} {} DUP1 SLOAD PUSH1 0x24 CALLDATALOAD SWAP1 SUB SWAP1 SSTORE STOP",
+        account_entry("0x04")
+    ));
+    let word = |n: u32| format!("PUSH1 0x{:02x} CALLDATALOAD", 4 + 32 * n);
+    let none = "PUSH1 0x00";
+    let lowers = call_words_to(&format!("PUSH20 {LIBRARY}"), &word(0), &word(1), none);
+    let makes = call_words_to(&format!("PUSH20 {LINKED}"), none, none, "PUSH1 0x20");
+    let configures = call_words_to("PUSH1 0x00 MLOAD", &word(2), none, none);
+    let world: [(&str, &[u8]); 2] = [(LINKED, &maker), (LIBRARY, &ledger)];
+
+    let both = dispatcher(&format!("{lowers} {makes} {configures} STOP"));
+    assert_eq!(
+        world_ids(&both, &world),
+        [
+            "unbound-account-passed-on High/Medium",
+            "unbound-address-made-privileged High/Medium"
+        ]
+    );
+    let only_configures = dispatcher(&format!("{makes} {configures} STOP"));
+    assert!(
+        world_ids(&only_configures, &world).is_empty(),
+        "choosing who controls a contract one creates for oneself is ordinary"
+    );
+}
+
+#[test]
+fn a_clone_created_during_the_call_runs_the_code_it_forwards_to() {
+    let implementation = dispatcher3(
+        "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 SSTORE STOP",
+        &format!("{OWNER_GATE} PUSH1 0x01 PUSH1 0x09 SSTORE STOP"),
+        "STOP",
+    );
+    let ledger = dispatcher(&format!(
+        "{OWNER_GATE} {} DUP1 SLOAD PUSH1 0x24 CALLDATALOAD SWAP1 SUB SWAP1 SSTORE STOP",
+        account_entry("0x04")
+    ));
+    let target = LINKED.trim_start_matches("0x");
+    let clones = format!(
+        "PUSH32 0x3d602d80600a3d3981f3363d3d373d3d3d363d73{} PUSH1 0x80 MSTORE \
+         PUSH32 0x{}5af43d82803e903d91602b57fd5bf3000000000000000000 PUSH1 0xa0 MSTORE \
+         PUSH1 0x37 PUSH1 0x80 PUSH1 0x00 CREATE PUSH1 0x00 MSTORE",
+        &target[..24],
+        &target[24..]
+    );
+    let word = |n: u32| format!("PUSH1 0x{:02x} CALLDATALOAD", 4 + 32 * n);
+    let none = "PUSH1 0x00";
+    let lowers = call_words_to(&format!("PUSH20 {LIBRARY}"), &word(0), &word(1), none);
+    let configures = call_words_to("PUSH1 0x00 MLOAD", &word(2), none, none);
+    let root = dispatcher(&format!("{lowers} {clones} {configures} STOP"));
+    let c = decompile::decompile(&root, &Options::default());
+    assert_eq!(c.clone_targets, [LINKED], "{}", c.source);
+    assert_eq!(
+        world_ids(&root, &[(LINKED, &implementation), (LIBRARY, &ledger)]),
+        [
+            "unbound-account-passed-on High/Medium",
+            "unbound-address-made-privileged High/Medium"
+        ]
+    );
+}

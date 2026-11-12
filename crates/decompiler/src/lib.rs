@@ -39,6 +39,7 @@ pub mod sigs;
 pub mod slots;
 pub mod solve;
 pub mod ssa;
+pub mod standard;
 pub mod structure;
 pub mod type_rules;
 pub mod types;

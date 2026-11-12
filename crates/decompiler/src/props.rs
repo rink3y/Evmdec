@@ -739,6 +739,146 @@ fn phases(
     })
 }
 
+// Words of the call that reach `e` without passing through a hash.
+// A hashed key lands on a slot nobody can aim, so only these can pick a location.
+fn raw_words(e: ExprId) -> Vec<ExprId> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 2_000 {
+            continue;
+        }
+        match expr::node(x) {
+            Node::CallDataLoad(_) => out.push(x),
+            Node::Op(..) => stack.extend(expr::children(x)),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn unbounded_word(run: &Run, place: ExprId) -> Option<ExprId> {
+    let tested = |word: ExprId| {
+        run.path.items.iter().any(|item| match item {
+            Item::Check { cond, .. } => mentions(*cond, word),
+            Item::Store { .. } => false,
+        })
+    };
+    raw_words(place).into_iter().find(|w| !tested(*w))
+}
+
+fn aimed_writes(all: &[Run], out: &mut Vec<Finding>) {
+    let mut told: BTreeSet<(usize, bool)> = BTreeSet::new();
+    for run in all.iter().filter(|r| !r.assumed) {
+        for st in &run.path.effects {
+            let (place, val, storage) = match st {
+                Stmt::SStore {
+                    key,
+                    val,
+                    transient: false,
+                    ..
+                } => (*key, *val, true),
+                Stmt::MStore { off, val, .. } => (*off, *val, false),
+                _ => continue,
+            };
+            if !from_the_call(val) || unbounded_word(run, place).is_none() {
+                continue;
+            }
+            if !told.insert((run.function.pc, storage)) {
+                continue;
+            }
+            let (id, title, severity, what, advice) = if storage {
+                (
+                    "input-picks-storage-slot",
+                    "A storage slot is chosen by the call with no bound",
+                    Severity::High,
+                    "a storage slot whose number is computed from a word of the call, not from a hash of it",
+                    "Bound the index before the write, or key the data through a mapping.",
+                )
+            } else {
+                (
+                    "input-picks-memory-offset",
+                    "A memory offset is chosen by the call with no bound",
+                    Severity::Low,
+                    "memory at an offset computed from a word of the call",
+                    "Bound the offset against the allocated length before the write.",
+                )
+            };
+            report(
+                out,
+                run,
+                id,
+                title,
+                severity,
+                format!(
+                    "`{}` writes a value taken from the call to {what}. No check on this path tests that word, so the caller picks where the write lands.",
+                    run.function.name,
+                ),
+                advice,
+            );
+        }
+    }
+}
+
+fn short_input(c: &Contract, all: &[Run], out: &mut Vec<Finding>) {
+    let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
+    let mut accepted: Vec<&Run> = Vec::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    for run in all.iter().filter(|r| !r.assumed) {
+        let inputs = &run.path.inputs;
+        let reads_last = run.path.items.iter().any(|item| {
+            let e = match item {
+                Item::Check { cond, .. } => *cond,
+                Item::Store { val, .. } => *val,
+            };
+            expr::contains(e, &|n| matches!(n, Node::CallDataLoad(_)))
+        });
+        let wrote = run.path.run.storage != inputs.storage;
+        if !reads_last
+            || !wrote
+            || run.function.params.is_empty()
+            || seen.contains(&run.function.pc)
+        {
+            continue;
+        }
+        let code = c.code_of(run.function);
+        let explorer = explorers
+            .entry(code.as_ptr())
+            .or_insert_with(|| Explorer::new(code));
+        let mut cut = inputs.clone();
+        cut.calldata
+            .truncate(4 + 32 * run.function.params.len() - 1);
+        let again = explorer.run(&cut);
+        if again.succeeded() && again.run.storage != cut.storage {
+            seen.insert(run.function.pc);
+            accepted.push(run);
+        }
+    }
+    let Some(first) = accepted.first() else {
+        return;
+    };
+    let names: Vec<String> = accepted
+        .iter()
+        .map(|r| format!("`{}`", r.function.name))
+        .collect();
+    report(
+        out,
+        first,
+        "short-input-accepted",
+        "Input shorter than the arguments is accepted",
+        Severity::Low,
+        format!(
+            "{} read their arguments, write storage and end normally when the call data stops one byte short of the last argument. The missing byte is read as zero, which shifts the value of the last argument. Code built by a current compiler refuses such input.",
+            names.join(", "),
+        ),
+        "Check the call data length against the arguments before reading them.",
+    );
+    if let Some(last) = out.last_mut() {
+        last.sites = accepted.len();
+    }
+}
+
 const SHORT_LIST: u64 = 2;
 const LONG_LIST: u64 = 34;
 const STEPS_PER_ITEM: usize = 8;
@@ -819,6 +959,8 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Vec<Section> {
     lock_left(&all, out);
     dropped_changes(&all, out);
     clock_mix(&all, layout, out);
+    aimed_writes(&all, out);
+    short_input(c, &all, out);
     let begin = deploy::storage(c);
     growth(c, &all, &begin, out);
     phases(c, &all, &begin, out).into_iter().collect()

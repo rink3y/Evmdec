@@ -2247,3 +2247,122 @@ fn work_that_grows_with_a_count_any_caller_can_raise_is_reported() {
     let fixed = dispatcher3(add, &walk("PUSH1 0x03"), "STOP");
     assert!(finding(&report_of(&fixed), "cost-grows-with-open-list").is_none());
 }
+
+fn entry_of(account: &str) -> String {
+    format!(
+        "{account} PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256"
+    )
+}
+
+fn lowered(account: &str, label: &str) -> String {
+    format!(
+        "{} DUP1 SLOAD DUP3 DUP2 LT ISZERO PUSH2 @{label} JUMPI {REVERT} :{label} JUMPDEST \
+         DUP3 SWAP1 SUB SWAP1 SSTORE",
+        entry_of(account)
+    )
+}
+
+fn ledger(credit: &str, allowance: &str) -> Vec<u8> {
+    let raised = |account: &str| format!("{} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE", entry_of(account));
+    let first = "PUSH1 0x04 CALLDATALOAD";
+    let second = "PUSH1 0x24 CALLDATALOAD";
+    let transfer = format!(
+        "{second} {} {credit} {} POP POP STOP",
+        lowered("CALLER", "paid"),
+        raised(first)
+    );
+    let transfer_from = format!(
+        "PUSH1 0x44 CALLDATALOAD {allowance} {} {} POP STOP",
+        lowered(first, "held"),
+        raised(second)
+    );
+    let balance_of = format!(
+        "{} SLOAD PUSH1 0x80 MSTORE PUSH1 0x20 PUSH1 0x80 RETURN",
+        entry_of(first)
+    );
+    asm(&format!(
+        "PUSH1 0x80 PUSH1 0x40 MSTORE PUSH1 0x00 CALLDATALOAD PUSH1 0xe0 SHR \
+         DUP1 PUSH4 0xa9059cbb EQ PUSH2 @t JUMPI DUP1 PUSH4 0x23b872dd EQ PUSH2 @f JUMPI \
+         PUSH4 0x70a08231 EQ PUSH2 @b JUMPI {REVERT} \
+         :t JUMPDEST POP {transfer} :f JUMPDEST POP {transfer_from} :b JUMPDEST {balance_of}"
+    ))
+}
+
+#[test]
+fn a_standard_interface_is_measured_and_not_taken_on_trust() {
+    let spends = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x01 PUSH1 0x20 MSTORE \
+                  PUSH1 0x40 PUSH1 0x00 KECCAK256 PUSH1 0x20 MSTORE CALLER PUSH1 0x00 MSTORE \
+                  PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD DUP3 DUP2 LT ISZERO \
+                  PUSH2 @allowed JUMPI PUSH1 0x00 DUP1 REVERT :allowed JUMPDEST \
+                  DUP3 SWAP1 SUB SWAP1 SSTORE";
+    let measured = |code: &[u8]| {
+        let ours = [
+            "transfer-creates-value",
+            "transfer-delivers-less",
+            "transfer-touches-third-entry",
+            "reported-balance-differs",
+            "transferfrom-ignores-allowance",
+            "allowance-not-spent",
+        ];
+        let r = report_of(code);
+        let section = r
+            .maps
+            .iter()
+            .any(|s| s.title.starts_with("Standard interface"));
+        assert!(section, "the interface is present, so it must be measured");
+        let found = r.findings.iter().filter(|f| ours.contains(&f.id.as_str()));
+        found.map(|f| f.id.clone()).collect::<Vec<_>>()
+    };
+
+    assert!(measured(&ledger("DUP1", spends)).is_empty());
+    assert_eq!(
+        measured(&ledger("DUP1 PUSH1 0x02 MUL", spends)),
+        ["transfer-creates-value"]
+    );
+    assert_eq!(
+        measured(&ledger("PUSH1 0x0a DUP2 DIV DUP2 SUB", spends)),
+        ["transfer-delivers-less"]
+    );
+    assert_eq!(
+        measured(&ledger("DUP1", "")),
+        ["transferfrom-ignores-allowance"]
+    );
+}
+
+#[test]
+fn a_slot_number_taken_from_the_call_is_reported_unless_it_is_bounded() {
+    let write = "PUSH1 0x24 CALLDATALOAD PUSH1 0x04 CALLDATALOAD SSTORE STOP";
+    let aimed = report_of(&dispatcher(write));
+    assert!(
+        finding(&aimed, "input-picks-storage-slot").is_some(),
+        "{:?}",
+        ids(&aimed)
+    );
+
+    let bounded = dispatcher(&format!(
+        "PUSH1 0x0a PUSH1 0x04 CALLDATALOAD LT PUSH2 @in JUMPI {REVERT} :in JUMPDEST {write}"
+    ));
+    assert!(finding(&report_of(&bounded), "input-picks-storage-slot").is_none());
+
+    let hashed = dispatcher(&format!(
+        "PUSH1 0x24 CALLDATALOAD {} SSTORE STOP",
+        entry_of("PUSH1 0x04 CALLDATALOAD")
+    ));
+    assert!(finding(&report_of(&hashed), "input-picks-storage-slot").is_none());
+}
+
+#[test]
+fn input_one_byte_short_of_its_argument_is_reported_when_it_is_accepted() {
+    let store = "PUSH1 0x04 CALLDATALOAD PUSH1 0x01 SSTORE STOP";
+    let lax = report_of(&dispatcher(store));
+    assert!(
+        finding(&lax, "short-input-accepted").is_some(),
+        "{:?}",
+        ids(&lax)
+    );
+
+    let strict = dispatcher(&format!(
+        "PUSH1 0x23 CALLDATASIZE GT PUSH2 @long JUMPI {REVERT} :long JUMPDEST {store}"
+    ));
+    assert!(finding(&report_of(&strict), "short-input-accepted").is_none());
+}

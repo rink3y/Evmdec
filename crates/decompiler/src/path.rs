@@ -32,6 +32,7 @@ pub struct Path {
     pub items: Vec<Item>,
     pub truth: Vec<bool>,
     pub effects: Vec<Stmt>,
+    pub end: Option<Term>,
     pub run: FrameRun,
 }
 
@@ -123,7 +124,10 @@ impl Explorer {
                         });
                         effects.push(st.clone());
                     }
-                    Stmt::Call { .. } | Stmt::Create { .. } | Stmt::Log { .. } => {
+                    Stmt::Call { .. }
+                    | Stmt::Create { .. }
+                    | Stmt::Log { .. }
+                    | Stmt::MStore { .. } => {
                         effects.push(st.clone());
                     }
                     _ => {}
@@ -158,6 +162,7 @@ impl Explorer {
             items,
             truth,
             effects,
+            end: nodes.last().map(|n| n.term.clone()),
             run,
         }
     }

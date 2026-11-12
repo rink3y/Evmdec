@@ -3,15 +3,16 @@ use crate::analyze::{push, Confidence, Finding, Severity};
 use crate::decompile::{Contract, Function};
 use crate::emit::MappingLayout;
 use crate::exec;
-use crate::expr::{self, ExprId};
+use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
 use crate::hex;
+use crate::lift::{Stmt, Term};
 use crate::opcode as op;
 use crate::path::{self, Explorer, Limits, Path};
-use crate::solve::{self, Free, Inputs, Step};
+use crate::solve::{self, Free, Inputs, Item, Step};
 use crate::ssa;
 use crate::u256::U256;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 const LIMITS: Limits = Limits {
     paths: 24,
@@ -328,6 +329,134 @@ fn lock_left(all: &[Run], out: &mut Vec<Finding>) {
     }
 }
 
+fn mentions(e: ExprId, target: ExprId) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if x == target {
+            return true;
+        }
+        if seen.insert(x) && seen.len() < 4_000 {
+            stack.extend(expr::children(x));
+        }
+    }
+    false
+}
+
+fn read_of_one_slot(e: ExprId) -> Option<ExprId> {
+    match expr::node(e) {
+        Node::SLoad(key, false, _) => Some(key),
+        Node::Op(_, parts) => {
+            let mut key = None;
+            for part in parts.iter().filter(|p| expr::as_const(**p).is_none()) {
+                let found = read_of_one_slot(*part)?;
+                if key.is_some_and(|k| k != found) {
+                    return None;
+                }
+                key = Some(found);
+            }
+            key
+        }
+        _ => None,
+    }
+}
+
+fn from_the_call(e: ExprId) -> bool {
+    expr::contains(e, &|n| {
+        matches!(
+            n,
+            Node::CallDataLoad(_) | Node::Env(op::CALLER | op::CALLVALUE | op::TIMESTAMP, _)
+        )
+    })
+}
+
+// Scratch space and the free pointer sit below this and are rewritten all the time.
+const FIRST_ALLOCATED: u64 = 0x80;
+
+fn dropped_change(run: &Run) -> Option<(ExprId, ExprId)> {
+    let effects = &run.path.effects;
+    let mut copies: HashMap<ExprId, ExprId> = HashMap::new();
+    let mut changed: Vec<(usize, ExprId, ExprId)> = Vec::new();
+    for (i, st) in effects.iter().enumerate() {
+        let Stmt::MStore { off, val, .. } = st else {
+            continue;
+        };
+        let allocated = expr::as_const(*off).is_some_and(|o| o >= U256::from_u64(FIRST_ALLOCATED));
+        if !allocated {
+            continue;
+        }
+        if let Some(key) = read_of_one_slot(*val) {
+            copies.insert(*off, key);
+        } else if let Some(key) = copies.remove(off) {
+            if from_the_call(*val) {
+                changed.push((i, key, *val));
+            }
+        }
+    }
+    let end_uses = |val: ExprId| match &run.path.end {
+        Some(Term::Return { data, .. }) => data
+            .as_ref()
+            .is_none_or(|words| words.iter().any(|w| mentions(*w, val))),
+        Some(Term::Stop) => false,
+        _ => true,
+    };
+    let checked = |val: ExprId| {
+        run.path.items.iter().any(|item| match item {
+            Item::Check { cond, .. } => mentions(*cond, val),
+            Item::Store { .. } => false,
+        })
+    };
+    changed.into_iter().find_map(|(at, key, val)| {
+        let used_later = effects[at + 1..].iter().any(|st| match st {
+            Stmt::SStore { key: k, val: v, .. } => *k == key || mentions(*v, val),
+            Stmt::Call { input, value, .. } => {
+                let sent = value.is_some_and(|v| mentions(v, val));
+                sent || input
+                    .as_ref()
+                    .is_none_or(|words| words.iter().any(|w| mentions(*w, val)))
+            }
+            Stmt::Log { data, topics, .. } => {
+                topics.iter().any(|t| mentions(*t, val))
+                    || data
+                        .as_ref()
+                        .is_none_or(|words| words.iter().any(|w| mentions(*w, val)))
+            }
+            Stmt::Create { .. } => true,
+            Stmt::MStore { val: v, .. } => *v != val && mentions(*v, val),
+            _ => false,
+        });
+        (!used_later && !end_uses(val) && !checked(val)).then_some((key, val))
+    })
+}
+
+fn dropped_changes(all: &[Run], out: &mut Vec<Finding>) {
+    let mut told: BTreeSet<usize> = BTreeSet::new();
+    for run in all.iter().filter(|r| !r.assumed) {
+        let Some((key, _)) = dropped_change(run) else {
+            continue;
+        };
+        if !told.insert(run.function.pc) {
+            continue;
+        }
+        let place = match solve::value_of(key, &run.path.inputs) {
+            Some(slot) => slot_text(slot),
+            None => "a stored record".to_string(),
+        };
+        report(
+            out,
+            run,
+            "changed-copy-dropped",
+            "A stored value is copied to memory, changed there and never stored back",
+            Severity::Medium,
+            format!(
+                "`{}` reads {} into memory and then overwrites that memory word with a value taken from the call. On this path the function ends normally without writing the slot, and the new value is not returned, logged, passed to a call or tested. The change is lost, which is what a record declared as a memory copy instead of a storage reference does.",
+                run.function.name, place,
+            ),
+            "Write the changed record back to storage, or work on a storage reference instead of a memory copy.",
+        );
+    }
+}
+
 pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return;
@@ -338,4 +467,5 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     out_of_step(&all, layout, &pairs, out);
     open_at_call(&all, layout, &pairs, out);
     lock_left(&all, out);
+    dropped_changes(&all, out);
 }

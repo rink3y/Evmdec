@@ -1758,6 +1758,7 @@ fn property_ids(code: &[u8]) -> Vec<String> {
         "entries-total-out-of-step",
         "total-open-at-call",
         "lock-left-set",
+        "changed-copy-dropped",
     ];
     analyze::analyze(&decompile::decompile(code, &Options::default()))
         .findings
@@ -1995,4 +1996,23 @@ fn a_share_of_a_balance_read_from_outside_can_round_a_payment_to_nothing() {
 
     let floor = "DUP1 PUSH2 @some JUMPI PUSH1 0x00 DUP1 REVERT :some JUMPDEST";
     assert!(flow_ids(&vault(floor)).is_empty());
+}
+
+#[test]
+fn a_change_made_to_a_memory_copy_of_storage_and_then_dropped_is_reported() {
+    let copy_and_change =
+        "PUSH1 0x05 SLOAD PUSH1 0x80 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0x80 MSTORE";
+    let dropped = dispatcher(&format!("{copy_and_change} STOP"));
+    assert_eq!(
+        property_ids(&dropped),
+        ["changed-copy-dropped func_aaaaaaaa [0xaaaaaaaa] High"]
+    );
+
+    let stored = dispatcher(&format!(
+        "{copy_and_change} PUSH1 0x80 MLOAD PUSH1 0x05 SSTORE STOP"
+    ));
+    assert!(property_ids(&stored).is_empty());
+
+    let returned = dispatcher(&format!("{copy_and_change} PUSH1 0x20 PUSH1 0x80 RETURN"));
+    assert!(property_ids(&returned).is_empty());
 }

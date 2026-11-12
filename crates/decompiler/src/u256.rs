@@ -82,9 +82,9 @@ impl U256 {
         256 - self.bits()
     }
     pub fn trailing_zeros(&self) -> u32 {
-        for i in 0..4 {
-            if self.0[i] != 0 {
-                return 64 * i as u32 + self.0[i].trailing_zeros();
+        for (i, limb) in self.0.iter().enumerate() {
+            if *limb != 0 {
+                return 64 * i as u32 + limb.trailing_zeros();
             }
         }
         256

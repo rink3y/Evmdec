@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 pub struct FrameRun {
     pub outcome: Outcome,
     pub visited: HashSet<usize>,
+    pub order: Vec<usize>,
     pub steps: usize,
     pub storage: HashMap<U256, U256>,
     pub logs: Vec<LogRecord>,
@@ -38,6 +39,7 @@ pub fn run_frame(
     let mut m = Machine::new(code, host);
     m.storage = init_storage;
     let mut visited = HashSet::new();
+    let mut order = Vec::new();
     let mut steps = 0;
     let outcome = loop {
         if steps >= budget {
@@ -47,6 +49,7 @@ pub fn run_frame(
             break Outcome::Stop;
         }
         visited.insert(m.pc);
+        order.push(m.pc);
         steps += 1;
         let at = m.pc;
         match m.step() {
@@ -72,6 +75,7 @@ pub fn run_frame(
     FrameRun {
         outcome,
         visited,
+        order,
         steps,
         storage: m.storage,
         logs: m.logs,

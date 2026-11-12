@@ -5,6 +5,7 @@ pub mod keccak;
 pub mod metadata;
 pub mod naming;
 pub mod opcode;
+pub mod path;
 pub mod u256;
 
 pub use u256::U256;
@@ -29,6 +30,7 @@ pub mod rpc;
 pub mod sigdb;
 pub mod sigs;
 pub mod slots;
+pub mod solve;
 pub mod ssa;
 pub mod structure;
 pub mod type_rules;

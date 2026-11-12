@@ -1,0 +1,539 @@
+use crate::expr::{self, ExprId, Node};
+use crate::keccak;
+use crate::opcode as op;
+use crate::u256::U256;
+use std::collections::HashMap;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inputs {
+    pub calldata: Vec<u8>,
+    pub caller: U256,
+    pub address: U256,
+    pub callvalue: U256,
+    pub timestamp: U256,
+    pub number: U256,
+    pub storage: HashMap<U256, U256>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Item {
+    Store {
+        key: ExprId,
+        val: ExprId,
+        gen: u32,
+    },
+    Check {
+        cond: ExprId,
+        holds: bool,
+        pc: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Free {
+    pub words: usize,
+    pub value: bool,
+    pub storage: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    Word(usize),
+    Value,
+    Slot(U256),
+}
+
+const ROUNDS: usize = 96;
+
+pub fn word(calldata: &[u8], offset: usize) -> U256 {
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = calldata.get(offset + i).copied().unwrap_or(0);
+    }
+    U256::from_be_bytes(&bytes)
+}
+
+fn set_word(calldata: &mut Vec<u8>, index: usize, value: U256) {
+    let at = 4 + 32 * index;
+    if calldata.len() < at + 32 {
+        calldata.resize(at + 32, 0);
+    }
+    calldata[at..at + 32].copy_from_slice(&value.to_be_bytes());
+}
+
+struct Eval<'a> {
+    inputs: &'a Inputs,
+    writes: Vec<(u32, U256, U256, ExprId)>,
+    memo: HashMap<ExprId, Option<U256>>,
+}
+
+impl Eval<'_> {
+    fn stored(&self, key: U256, gen: u32) -> U256 {
+        self.writes
+            .iter()
+            .rev()
+            .find(|(g, k, ..)| *g < gen && *k == key)
+            .map(|(_, _, v, _)| *v)
+            .or_else(|| self.inputs.storage.get(&key).copied())
+            .unwrap_or(U256::ZERO)
+    }
+
+    fn value(&mut self, e: ExprId) -> Option<U256> {
+        if let Some(known) = self.memo.get(&e) {
+            return *known;
+        }
+        let out = match expr::node(e) {
+            Node::Const(c) => Some(c),
+            Node::Env(o, _) => match o {
+                op::CALLER | op::ORIGIN => Some(self.inputs.caller),
+                op::ADDRESS => Some(self.inputs.address),
+                op::CALLVALUE => Some(self.inputs.callvalue),
+                op::CALLDATASIZE => Some(U256::from(self.inputs.calldata.len())),
+                op::TIMESTAMP => Some(self.inputs.timestamp),
+                op::NUMBER => Some(self.inputs.number),
+                _ => None,
+            },
+            Node::CallDataLoad(off) | Node::CopiedWord(op::CALLDATACOPY, off, _) => self
+                .value(off)
+                .and_then(|o| o.as_usize())
+                .map(|o| word(&self.inputs.calldata, o)),
+            Node::SLoad(key, false, gen) => self.value(key).map(|k| self.stored(k, gen)),
+            Node::Keccak(words, tail) => {
+                let mut bytes = Vec::with_capacity(32 * words.len());
+                let last = words.len().saturating_sub(1);
+                let mut known = true;
+                for (i, w) in words.iter().enumerate() {
+                    match self.value(*w) {
+                        Some(v) if tail > 0 && i == last => {
+                            bytes.extend_from_slice(&v.to_be_bytes()[32 - tail as usize..]);
+                        }
+                        Some(v) => bytes.extend_from_slice(&v.to_be_bytes()),
+                        None => known = false,
+                    }
+                }
+                known.then(|| U256::from_be_bytes(&keccak::keccak256(&bytes)))
+            }
+            Node::Op(o, v) => {
+                let args: Option<Vec<ExprId>> =
+                    v.iter().map(|x| self.value(*x).map(expr::konst)).collect();
+                args.and_then(|a| match a[..] {
+                    [x] => expr::as_const(expr::op1(o, x)),
+                    [x, y] => expr::as_const(expr::op2(o, x, y)),
+                    [x, y, z] => expr::as_const(expr::op3(o, x, y, z)),
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
+        self.memo.insert(e, out);
+        out
+    }
+}
+
+pub fn replay(items: &[Item], inputs: &Inputs) -> Vec<Option<bool>> {
+    let mut eval = Eval {
+        inputs,
+        writes: Vec::new(),
+        memo: HashMap::new(),
+    };
+    let mut truth = Vec::new();
+    for item in items {
+        match item {
+            Item::Store { key, val, gen } => {
+                if let (Some(k), Some(v)) = (eval.value(*key), eval.value(*val)) {
+                    eval.writes.push((*gen, k, v, *val));
+                }
+            }
+            Item::Check { cond, .. } => truth.push(eval.value(*cond).map(|v| !v.is_zero())),
+        }
+    }
+    truth
+}
+
+struct Search<'a> {
+    eval: Eval<'a>,
+    free: Free,
+    out: Vec<(Place, U256)>,
+}
+
+impl Search<'_> {
+    fn place(&mut self, e: ExprId) -> Option<Place> {
+        match expr::node(e) {
+            Node::CallDataLoad(off) | Node::CopiedWord(op::CALLDATACOPY, off, _) => {
+                let at = expr::as_const(off)?.as_usize()?;
+                let index = at.checked_sub(4)? / 32;
+                (at >= 4 && (at - 4) % 32 == 0 && index < self.free.words)
+                    .then_some(Place::Word(index))
+            }
+            Node::Env(op::CALLVALUE, _) if self.free.value => Some(Place::Value),
+            Node::SLoad(key, false, gen) if self.free.storage => {
+                let k = self.eval.value(key)?;
+                let untouched = !self
+                    .eval
+                    .writes
+                    .iter()
+                    .any(|(g, w, ..)| *g < gen && *w == k);
+                untouched.then_some(Place::Slot(k))
+            }
+            _ => None,
+        }
+    }
+
+    fn force(&mut self, e: ExprId, target: U256, depth: u32) {
+        if depth > 24 {
+            return;
+        }
+        if let Some(place) = self.place(e) {
+            self.out.push((place, target));
+            return;
+        }
+        let d = depth + 1;
+        if let Node::SLoad(key, false, gen) = expr::node(e) {
+            let written = self.eval.value(key).and_then(|k| {
+                let hit = self.eval.writes.iter().rev();
+                hit.clone()
+                    .find(|(g, w, ..)| *g < gen && *w == k)
+                    .map(|w| w.3)
+            });
+            if let Some(source) = written {
+                self.force(source, target, d);
+            }
+            return;
+        }
+        let Node::Op(o, v) = expr::node(e) else {
+            return;
+        };
+        let val = |s: &mut Self, x: ExprId| s.eval.value(x);
+        match (o, &v[..]) {
+            (op::ADD, [a, b]) => {
+                if let Some(y) = val(self, *b) {
+                    self.force(*a, target.wrapping_sub(y), d);
+                }
+                if let Some(x) = val(self, *a) {
+                    self.force(*b, target.wrapping_sub(x), d);
+                }
+            }
+            (op::SUB, [a, b]) => {
+                if let Some(y) = val(self, *b) {
+                    self.force(*a, target.wrapping_add(y), d);
+                }
+                if let Some(x) = val(self, *a) {
+                    self.force(*b, x.wrapping_sub(target), d);
+                }
+            }
+            (op::MUL, [a, b]) => {
+                for (x, other) in [(*a, *b), (*b, *a)] {
+                    let Some(k) = val(self, other).filter(|k| !k.is_zero()) else {
+                        continue;
+                    };
+                    let (q, r) = target.div_rem(k);
+                    if r.is_zero() {
+                        self.force(x, q, d);
+                    }
+                }
+            }
+            (op::DIV, [a, b]) => {
+                if let Some(k) = val(self, *b).filter(|k| !k.is_zero()) {
+                    let wide = target.wrapping_mul(k);
+                    if wide.div_rem(k).0 == target {
+                        self.force(*a, wide, d);
+                    }
+                }
+            }
+            (op::AND, [a, b]) => {
+                for (x, other) in [(*a, *b), (*b, *a)] {
+                    let Some(mask) = expr::as_const(other) else {
+                        continue;
+                    };
+                    if (target & !mask).is_zero() {
+                        let keep = val(self, x).unwrap_or(U256::ZERO) & !mask;
+                        self.force(x, target | keep, d);
+                    }
+                }
+            }
+            (op::XOR, [a, b]) => {
+                if let Some(y) = val(self, *b) {
+                    self.force(*a, target ^ y, d);
+                }
+                if let Some(x) = val(self, *a) {
+                    self.force(*b, target ^ x, d);
+                }
+            }
+            (op::NOT, [a]) => self.force(*a, !target, d),
+            (op::SHL, [s, a]) => {
+                if let Some(n) = val(self, *s).filter(|n| n.fits_u64() && n.low_u64() < 256) {
+                    let n = n.low_u64() as u32;
+                    if (target >> n) << n == target {
+                        self.force(*a, target >> n, d);
+                    }
+                }
+            }
+            (op::SHR, [s, a]) => {
+                if let Some(n) = val(self, *s).filter(|n| n.fits_u64() && n.low_u64() < 256) {
+                    let n = n.low_u64() as u32;
+                    if (target << n) >> n == target {
+                        self.force(*a, target << n, d);
+                    }
+                }
+            }
+            (op::ISZERO | op::EQ | op::LT | op::GT | op::SLT | op::SGT, _) => {
+                self.truth(e, !target.is_zero(), d);
+            }
+            _ => {}
+        }
+    }
+
+    fn truth(&mut self, e: ExprId, want: bool, depth: u32) {
+        if depth > 24 {
+            return;
+        }
+        let d = depth + 1;
+        let Node::Op(o, v) = expr::node(e) else {
+            self.force(e, U256::from(want), d);
+            return;
+        };
+        let val = |s: &mut Self, x: ExprId| s.eval.value(x);
+        let one = U256::ONE;
+        match (o, &v[..]) {
+            (op::ISZERO, [a]) => self.truth(*a, !want, d),
+            (op::EQ, [a, b]) => {
+                let (x, y) = (val(self, *a), val(self, *b));
+                let shift = if want { U256::ZERO } else { one };
+                if let Some(y) = y {
+                    self.force(*a, y.wrapping_add(shift), d);
+                }
+                if let Some(x) = x {
+                    self.force(*b, x.wrapping_add(shift), d);
+                }
+            }
+            (op::LT | op::SLT, [a, b]) => self.order(*a, *b, want, d),
+            (op::GT | op::SGT, [a, b]) => self.order(*b, *a, want, d),
+            (op::AND, [a, b]) if expr::is_boolean(*a) && expr::is_boolean(*b) => {
+                self.truth(*a, want, d);
+                self.truth(*b, want, d);
+            }
+            (op::OR, [a, b]) => {
+                self.truth(*a, want, d);
+                self.truth(*b, want, d);
+            }
+            _ => {
+                if want {
+                    for target in [one, U256::MAX] {
+                        self.force(e, target, d);
+                    }
+                } else {
+                    self.force(e, U256::ZERO, d);
+                }
+            }
+        }
+    }
+
+    fn order(&mut self, low: ExprId, high: ExprId, want: bool, depth: u32) {
+        let (x, y) = (self.eval.value(low), self.eval.value(high));
+        let one = U256::ONE;
+        if want {
+            if let Some(y) = y.filter(|y| !y.is_zero()) {
+                self.force(low, y.wrapping_sub(one), depth);
+                self.force(low, U256::ZERO, depth);
+            }
+            if let Some(x) = x.filter(|x| *x != U256::MAX) {
+                self.force(high, x.wrapping_add(one), depth);
+                self.force(high, U256::MAX, depth);
+            }
+        } else {
+            if let Some(y) = y {
+                self.force(low, y, depth);
+                self.force(low, U256::MAX, depth);
+            }
+            if let Some(x) = x {
+                self.force(high, x, depth);
+                self.force(high, U256::ZERO, depth);
+            }
+        }
+    }
+}
+
+fn proposals(
+    items: &[Item],
+    inputs: &Inputs,
+    free: Free,
+    at: usize,
+    want: bool,
+) -> Vec<(Place, U256)> {
+    let mut search = Search {
+        eval: Eval {
+            inputs,
+            writes: Vec::new(),
+            memo: HashMap::new(),
+        },
+        free,
+        out: Vec::new(),
+    };
+    let mut seen = 0;
+    for item in items {
+        match item {
+            Item::Store { key, val, gen } => {
+                if let (Some(k), Some(v)) = (search.eval.value(*key), search.eval.value(*val)) {
+                    search.eval.writes.push((*gen, k, v, *val));
+                }
+            }
+            Item::Check { cond, .. } => {
+                if seen == at {
+                    search.truth(*cond, want, 0);
+                    break;
+                }
+                seen += 1;
+            }
+        }
+    }
+    search.out
+}
+
+fn apply(inputs: &Inputs, place: Place, value: U256) -> Inputs {
+    let mut next = inputs.clone();
+    match place {
+        Place::Word(index) => set_word(&mut next.calldata, index, value),
+        Place::Value => next.callvalue = value,
+        Place::Slot(key) => {
+            next.storage.insert(key, value);
+        }
+    }
+    next
+}
+
+fn agreed(truth: &[Option<bool>], want: &[bool], observed: &[bool]) -> usize {
+    truth
+        .iter()
+        .zip(want)
+        .zip(observed)
+        .take_while(|((t, w), seen)| t.unwrap_or(**seen) == **w)
+        .count()
+}
+
+// A generator, not a decision procedure. A caller must run what it returns.
+pub fn solve(items: &[Item], want: &[bool], start: &Inputs, free: Free) -> Option<Inputs> {
+    let observed: Vec<bool> = items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Check { holds, .. } => Some(*holds),
+            Item::Store { .. } => None,
+        })
+        .collect();
+    let mut current = start.clone();
+    let mut reached = agreed(&replay(items, &current), want, &observed);
+    for _ in 0..ROUNDS {
+        if reached >= want.len() {
+            return Some(current);
+        }
+        let mut better = None;
+        for (place, value) in proposals(items, &current, free, reached, want[reached]) {
+            let next = apply(&current, place, value);
+            let score = agreed(&replay(items, &next), want, &observed);
+            if score > reached && better.as_ref().is_none_or(|(s, _)| score > *s) {
+                better = Some((score, next));
+            }
+        }
+        let (score, next) = better?;
+        reached = score;
+        current = next;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inputs() -> Inputs {
+        Inputs {
+            calldata: vec![0xaa, 0xaa, 0xaa, 0xaa],
+            caller: U256::from_u64(0xc0),
+            address: U256::from_u64(0xad),
+            callvalue: U256::ZERO,
+            timestamp: U256::from_u64(1_700_000_000),
+            number: U256::from_u64(18_000_000),
+            storage: HashMap::new(),
+        }
+    }
+
+    fn arg(index: u64) -> ExprId {
+        expr::calldataload(expr::konst_u64(4 + 32 * index))
+    }
+
+    fn check(cond: ExprId) -> Item {
+        Item::Check {
+            cond,
+            holds: false,
+            pc: 0,
+        }
+    }
+
+    const WORDS: Free = Free {
+        words: 4,
+        value: false,
+        storage: false,
+    };
+
+    #[test]
+    fn an_equality_with_a_sum_is_solved_by_inverting_the_sum() {
+        let sum = expr::op2(op::ADD, arg(0), expr::konst_u64(7));
+        let items = [check(expr::op2(op::EQ, sum, expr::konst_u64(100)))];
+        let found = solve(&items, &[true], &inputs(), WORDS).expect("solvable");
+        assert_eq!(word(&found.calldata, 4), U256::from_u64(93));
+    }
+
+    #[test]
+    fn two_checks_on_two_words_are_met_together() {
+        let below = expr::op2(op::LT, arg(0), arg(1));
+        let masked = expr::op2(op::AND, arg(1), expr::konst_u64(0xff));
+        let items = [
+            check(expr::op2(op::EQ, masked, expr::konst_u64(0x42))),
+            check(below),
+        ];
+        let found = solve(&items, &[true, true], &inputs(), WORDS).expect("solvable");
+        let (a, b) = (word(&found.calldata, 4), word(&found.calldata, 36));
+        assert!(a < b && (b & U256::from_u64(0xff)) == U256::from_u64(0x42));
+    }
+
+    #[test]
+    fn a_stored_value_is_read_back_by_a_later_check() {
+        let key = expr::konst_u64(5);
+        let load = expr::intern(Node::SLoad(key, false, 1));
+        let items = [
+            Item::Store {
+                key,
+                val: arg(0),
+                gen: 0,
+            },
+            check(expr::op2(op::EQ, load, expr::konst_u64(9))),
+        ];
+        let found = solve(&items, &[true], &inputs(), WORDS).expect("solvable");
+        assert_eq!(word(&found.calldata, 4), U256::from_u64(9));
+    }
+
+    #[test]
+    fn prior_storage_is_chosen_only_when_it_is_free() {
+        let load = expr::intern(Node::SLoad(expr::konst_u64(3), false, 0));
+        let items = [check(expr::op2(op::EQ, load, expr::env(op::CALLER)))];
+        assert!(solve(&items, &[true], &inputs(), WORDS).is_none());
+        let free = Free {
+            storage: true,
+            ..WORDS
+        };
+        let found = solve(&items, &[true], &inputs(), free).expect("solvable");
+        assert_eq!(
+            found.storage.get(&U256::from_u64(3)),
+            Some(&U256::from_u64(0xc0))
+        );
+    }
+
+    #[test]
+    fn a_check_that_depends_on_nothing_free_has_no_solution() {
+        let items = [check(expr::op2(
+            op::EQ,
+            expr::env(op::CALLER),
+            expr::konst_u64(1),
+        ))];
+        assert!(solve(&items, &[true], &inputs(), WORDS).is_none());
+    }
+}

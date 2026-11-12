@@ -1,4 +1,4 @@
-use crate::cfg::{AVal, Edge, Program, Unit};
+use crate::cfg::{AState, AVal, Edge, Program, UNode, Unit};
 use crate::expr::{self, konst, konst_u64, op1, op2, op3, ExprId, Node};
 use crate::opcode as op;
 use crate::u256::U256;
@@ -1374,6 +1374,48 @@ impl<'a> Lifter<'a> {
                 .insert((unit.entry_block, cl.entry), cl);
         }
         self.lift_from(unit, init)
+    }
+
+    pub fn lift_trace(&self, blocks: &[usize]) -> Vec<LNode> {
+        let unit = Unit {
+            entry_block: blocks.first().copied().unwrap_or(0),
+            nodes: blocks
+                .iter()
+                .enumerate()
+                .map(|(id, block)| UNode {
+                    id,
+                    block: *block,
+                    entry: AState::new(),
+                    succs: vec![],
+                    preds: vec![],
+                    call: None,
+                    returns_via: None,
+                    unresolved: true,
+                    infeasible: false,
+                    computed_cut: false,
+                })
+                .collect(),
+            entry: 0,
+            budget_exhausted: false,
+        };
+        let mut state = State {
+            stack: Vec::new(),
+            args_used: 0,
+            mem: Mem::new(true),
+            storage: Vec::new(),
+            version: 0,
+            sgen: 0,
+            called: false,
+            returned: 0,
+        };
+        let hidden = Hidden::default();
+        let mut out = Vec::with_capacity(blocks.len());
+        for id in 0..blocks.len() {
+            let (node, next) = self.run_node(&unit, id, &state, &hidden);
+            state = next;
+            out.push(node);
+        }
+        out
     }
 
     pub fn entry_state_of(l: &Lifted, unit_node: usize) -> Option<State> {

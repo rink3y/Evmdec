@@ -1633,3 +1633,70 @@ fn the_run_follows_a_library_call_into_the_calling_contract_s_storage() {
         run.description
     );
 }
+
+#[test]
+fn every_path_of_a_function_is_found_by_solving_its_branches() {
+    use evmdec::path::{inputs_for, Explorer, Limits};
+    use evmdec::solve::{self, Free, Item};
+    use evmdec::U256;
+
+    let revert = "PUSH1 0x00 DUP1 REVERT";
+    let code = dispatcher(&format!(
+        "PUSH1 0x04 CALLDATALOAD PUSH2 0x1234 EQ PUSH2 @a JUMPI {revert} :a JUMPDEST \
+         PUSH1 0x04 CALLDATALOAD PUSH1 0x24 CALLDATALOAD GT PUSH2 @b JUMPI {revert} :b JUMPDEST \
+         PUSH1 0x07 SLOAD PUSH1 0x44 CALLDATALOAD PUSH1 0x01 OR EQ PUSH2 @c JUMPI \
+         PUSH1 0x01 PUSH1 0x01 SSTORE STOP :c JUMPDEST PUSH1 0x02 PUSH1 0x01 SSTORE STOP"
+    ));
+    let explorer = Explorer::new(&code);
+    let start = inputs_for(Some(0xaaaa_aaaa), 3);
+    let words = Free {
+        words: 3,
+        value: false,
+        storage: false,
+    };
+    let paths = explorer.explore(&start, words, Limits::default());
+
+    for p in &paths {
+        let replayed = solve::replay(&p.items, &p.inputs);
+        for (lifted, real) in replayed.iter().zip(&p.truth) {
+            assert!(
+                lifted.is_none_or(|t| t == *real),
+                "the lifted path disagrees with the run"
+            );
+        }
+    }
+    let stored = |p: &evmdec::path::Path| p.run.storage.get(&U256::ONE).copied();
+    let finished: Vec<_> = paths.iter().filter(|p| p.succeeded()).collect();
+    assert!(
+        finished.iter().any(|p| stored(p) == Some(U256::ONE)),
+        "the first two guards are passed"
+    );
+    assert!(
+        !finished
+            .iter()
+            .any(|p| stored(p) == Some(U256::from_u64(2))),
+        "slot 7 holds zero and a word with its low bit set is never zero"
+    );
+    let checks = |p: &evmdec::path::Path| {
+        p.items
+            .iter()
+            .filter(|i| matches!(i, Item::Check { .. }))
+            .count()
+    };
+    assert!(
+        paths.iter().map(checks).max() >= Some(4),
+        "the dispatcher and three guards"
+    );
+
+    let with_state = Free {
+        storage: true,
+        ..words
+    };
+    let paths = explorer.explore(&start, with_state, Limits::default());
+    assert!(
+        paths
+            .iter()
+            .any(|p| p.succeeded() && stored(p) == Some(U256::from_u64(2))),
+        "with prior storage free, slot 7 is chosen to match"
+    );
+}

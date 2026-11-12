@@ -1844,3 +1844,68 @@ fn a_path_that_leaves_a_toggled_slot_set_is_reported() {
     ));
     assert!(property_ids(&restores).is_empty());
 }
+
+fn origin_ids(code: &[u8]) -> Vec<String> {
+    let ours = ["stored-input-call-target", "gate-on-open-slot"];
+    analyze::analyze(&decompile::decompile(code, &Options::default()))
+        .findings
+        .iter()
+        .filter(|f| ours.contains(&f.id.as_str()))
+        .map(|f| {
+            format!(
+                "{} {} {:?}",
+                f.id,
+                f.function.as_deref().unwrap_or_default(),
+                f.severity
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_value_is_followed_back_through_the_slots_it_is_copied_from() {
+    let marks = "PUSH1 0x01 PUSH1 0x09 SSTORE STOP";
+    let proposes = "PUSH1 0x04 CALLDATALOAD PUSH1 0x01 SSTORE STOP";
+    let accepts = "PUSH1 0x01 SLOAD PUSH1 0x00 SSTORE STOP";
+    let two_hops = dispatcher3(proposes, accepts, &format!("{OWNER_GATE} {marks}"));
+    assert_eq!(
+        origin_ids(&two_hops),
+        ["gate-on-open-slot func_cccccccc [0xcccccccc] High"],
+        "slot 0 is filled from slot 1, which anyone fills"
+    );
+    let gate_b = OWNER_GATE.replace("@ok", "@okb").replace(":ok", ":okb");
+    let guarded = dispatcher3(
+        proposes,
+        &format!("{gate_b} {accepts}"),
+        &format!("{OWNER_GATE} {marks}"),
+    );
+    assert!(
+        origin_ids(&guarded).is_empty(),
+        "the copy is behind the gate"
+    );
+
+    let entry = account_entry("0x04");
+    let own_entry =
+        "CALLER PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
+    let call =
+        |target: &str| format!("PUSH1 0x00 DUP1 DUP1 DUP1 DUP1 {target} SLOAD GAS CALL POP STOP");
+    let registry = dispatcher3(
+        &format!("PUSH1 0x24 CALLDATALOAD {entry} SSTORE STOP"),
+        &call(&entry),
+        "STOP",
+    );
+    assert_eq!(
+        origin_ids(&registry),
+        ["stored-input-call-target func_bbbbbbbb [0xbbbbbbbb] Medium"],
+        "anyone fills any entry and anyone triggers the call"
+    );
+    let self_service = dispatcher3(
+        &format!("PUSH1 0x04 CALLDATALOAD {own_entry} SSTORE STOP"),
+        &call(own_entry),
+        "STOP",
+    );
+    assert!(
+        origin_ids(&self_service).is_empty(),
+        "a caller that reads back its own entry chose it"
+    );
+}

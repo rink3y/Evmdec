@@ -7,6 +7,7 @@ use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
+use crate::origin::{self, Model};
 use crate::sigs;
 use crate::ssa;
 use crate::type_rules;
@@ -3319,6 +3320,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     let mut unauthenticated: Vec<String> = Vec::new();
     let mut facts: Vec<FnFacts> = Vec::new();
     let mut summaries: Vec<FnSummary> = Vec::new();
+    let mut stores: Vec<origin::Store> = Vec::new();
+    let mut uses: Vec<StoredUse> = Vec::new();
     let mut lock_slots: HashMap<ExprId, HashSet<usize>> = HashMap::new();
     let mut any_payable = false;
     let mut any_ether_out = false;
@@ -3338,6 +3341,15 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         let caller_checked = any_caller_check(&ctx, f);
         let fact = collect_facts(&ctx, f, &events, caller_checked, &names);
         summaries.extend(summarise(&ctx, &fact, &events, &auth, &names));
+        stored_uses(
+            &ctx,
+            &fact,
+            facts.len(),
+            &events,
+            &names,
+            &mut stores,
+            &mut uses,
+        );
         facts.push(fact);
         let loop_cap: Option<u64> = {
             let mut keys: Vec<U256> = Vec::new();
@@ -4728,6 +4740,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     conservation_findings(&facts, &slot_name, &mut findings);
     link_findings(&ctx, &facts, &mut findings);
     passed_word_findings(&ctx, &facts, &summaries, &mut findings);
+    origin_findings(&ctx, &facts, &stores, &uses, &mut findings);
     trust_findings(&ctx, &facts, &mut findings);
 
     type_rules::findings(c, &c.types, names_for, &mut findings);
@@ -6232,6 +6245,161 @@ fn link_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 "Review the linked contract's finding before relying on this call, and check what this contract does when the call misbehaves.",
                 findings,
             );
+        }
+    }
+}
+
+enum UseKind {
+    CallTarget { delegated: bool },
+    Gate,
+}
+
+struct StoredUse {
+    function: usize,
+    kind: UseKind,
+    value: ExprId,
+    loc: origin::Loc,
+    own_entry: bool,
+    line: String,
+}
+
+fn stored_uses(
+    ctx: &Ctx,
+    fact: &FnFacts,
+    function: usize,
+    events: &[Event],
+    names: &Names,
+    stores: &mut Vec<origin::Store>,
+    uses: &mut Vec<StoredUse>,
+) {
+    let layout = ctx.c.compiler.layout;
+    let gated = fact.caller_checked || fact.init_guarded;
+    let own = names.clone();
+    let read_from = |e: ExprId| -> Option<(origin::Loc, bool)> {
+        let mut found = None;
+        walk(e, &mut HashSet::new(), &mut |_, n| {
+            if let (Node::SLoad(k, false, _), None) = (n, &found) {
+                found = origin::loc_of(*k, layout).map(|loc| (loc, key_parties(*k).1));
+            }
+        });
+        found
+    };
+    for ev in events {
+        match &ev.stmt {
+            Some(Stmt::SStore {
+                key,
+                val,
+                transient: false,
+                ..
+            }) => {
+                if let Some(loc) = origin::loc_of(*key, layout) {
+                    stores.push(origin::Store {
+                        loc,
+                        gated,
+                        value: *val,
+                    });
+                }
+            }
+            Some(st @ Stmt::Call { kind, addr, .. }) if *kind != op::STATICCALL => {
+                if let Some((loc, own_entry)) = read_from(*addr) {
+                    uses.push(StoredUse {
+                        function,
+                        kind: UseKind::CallTarget {
+                            delegated: *kind == op::DELEGATECALL,
+                        },
+                        value: *addr,
+                        loc,
+                        own_entry,
+                        line: emit::fmt_stmt(st, &own),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    for cond in guard_conds(events) {
+        walk(cond, &mut HashSet::new(), &mut |_, n| {
+            let Node::Op(op::EQ | op::SUB | op::XOR, v) = n else {
+                return;
+            };
+            for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                let Node::SLoad(k, false, _) = expr::node(unmask(b)) else {
+                    continue;
+                };
+                if let (true, Some(loc)) = (is_caller(a), origin::loc_of(k, layout)) {
+                    uses.push(StoredUse {
+                        function,
+                        kind: UseKind::Gate,
+                        value: b,
+                        loc,
+                        own_entry: key_parties(k).1,
+                        line: emit::fmt_cond(cond, &own),
+                    });
+                }
+            }
+        });
+    }
+}
+
+// A fixed slot that an ungated function fills straight from its input is the older rules' ground.
+// These two report what they cannot see: values that arrive through other slots or sit in mappings.
+fn origin_findings(
+    ctx: &Ctx,
+    facts: &[FnFacts],
+    stores: &[origin::Store],
+    uses: &[StoredUse],
+    findings: &mut Vec<Finding>,
+) {
+    let model = Model::build(stores, ctx.c.compiler.layout);
+    let mut told: HashSet<(usize, origin::Loc, bool)> = HashSet::new();
+    for u in uses {
+        let f = &facts[u.function];
+        let fixed = u.loc.1 == 0;
+        if !f.external || !model.of(u.value).open() || (fixed && model.set_directly(u.loc)) {
+            continue;
+        }
+        match u.kind {
+            UseKind::CallTarget { delegated } => {
+                if f.caller_checked || (u.own_entry && !delegated) {
+                    continue;
+                }
+                if told.insert((u.function, u.loc, false)) {
+                    push_fact(
+                        findings,
+                        "stored-input-call-target",
+                        "A call target is read from storage any caller can fill",
+                        if delegated { Severity::High } else { Severity::Medium },
+                        Confidence::Medium,
+                        f,
+                        format!(
+                            "`{}` needs no role and {} an address it reads from storage. Following every store into that location back through the slots it is copied from, the value can be an argument or the caller of a function that needs no role either, so whoever calls first decides where this call goes.",
+                            f.name,
+                            if delegated { "runs the code at" } else { "calls" },
+                        ),
+                        vec![u.line.clone()],
+                        "Let only an authorised caller fill the location, or check the address against a fixed set before using it.",
+                    );
+                }
+            }
+            UseKind::Gate => {
+                if !fixed || !told.insert((usize::MAX, u.loc, true)) {
+                    continue;
+                }
+                push_fact(
+                    findings,
+                    "gate-on-open-slot",
+                    "An access check compares the caller with a value any caller can put there",
+                    Severity::High,
+                    Confidence::Medium,
+                    f,
+                    format!(
+                        "`{}` compares `msg.sender` with a slot. No function stores an argument there directly, but following the stores back through the slots the value is copied from, it can be an argument or the caller of a function that needs no role. The check then passes for whoever made those calls.",
+                        f.name,
+                    ),
+                    vec![u.line.clone()],
+                    "Gate every function on the path that fills the slot.",
+                );
+            }
         }
     }
 }

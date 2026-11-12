@@ -5,6 +5,7 @@ pub mod keccak;
 pub mod metadata;
 pub mod naming;
 pub mod opcode;
+pub mod origin;
 pub mod path;
 pub mod props;
 pub mod u256;

@@ -687,6 +687,19 @@ struct Mem {
 
 const BIG: u64 = 1 << 40;
 
+/// Marks the return data of a block reached from paths whose last calls differ.
+const MERGED_RETURN: u32 = 1 << 31;
+
+/// A stamp for the return data the call at statement `index` of node `node` leaves: stable
+/// across the rounds the node is lifted in, and never zero.
+fn call_stamp(node: usize, index: usize) -> u32 {
+    ((node as u32) << 10 | (index as u32 & 0x3ff)).wrapping_add(1) & !MERGED_RETURN
+}
+
+/// The most memory writes a state keeps. Past it the oldest are forgotten, and with them the
+/// knowledge that untouched memory is zero.
+const MAX_TRACKED_WRITES: usize = 256;
+
 /// The memory slot solc keeps its free memory pointer in.
 pub const FREE_POINTER: u64 = 0x40;
 
@@ -862,7 +875,7 @@ impl Mem {
                 !(w.base == base && w.len.is_some_and(|wl| w.off >= d && w.off + wl <= d + l))
             });
         }
-        if self.writes.len() > 256 {
+        if self.writes.len() > MAX_TRACKED_WRITES {
             self.writes.drain(..64);
             self.fresh = false;
             self.clobber_gen = self.gen + 1;
@@ -1121,31 +1134,53 @@ impl Mem {
         let same = |a: &MemWrite, b: &MemWrite| {
             a.base == b.base && a.off == b.off && a.len == b.len && a.val == b.val
         };
+        let identical = self.gen == other.gen
+            && self.clobber_gen == other.clobber_gen
+            && self.fresh == other.fresh
+            && self.written == other.written
+            && self.writes.len() == other.writes.len()
+            && self
+                .writes
+                .iter()
+                .zip(&other.writes)
+                .all(|(a, b)| a.gen == b.gen && same(a, b));
+        if identical {
+            return false;
+        }
+        type Place = (Option<ExprId>, u64, Option<u64>);
+        let place = |w: &MemWrite| -> Place { (w.base, w.off, w.len) };
+        let by_place = |writes: &[MemWrite]| {
+            let mut index: HashMap<Place, Vec<usize>> = HashMap::new();
+            for (i, w) in writes.iter().enumerate() {
+                index.entry(place(w)).or_default().push(i);
+            }
+            index
+        };
+        let (mine, theirs) = (by_place(&self.writes), by_place(&other.writes));
+        let at = |index: &HashMap<Place, Vec<usize>>, writes: &[MemWrite], w: &MemWrite| {
+            let there = index.get(&place(w)).map(Vec::as_slice).unwrap_or(&[]);
+            let agrees = there.iter().any(|i| writes[*i].val == w.val);
+            let latest = there.iter().map(|i| writes[*i].gen).max();
+            (agrees, latest)
+        };
         let mut merged: Vec<MemWrite> = Vec::new();
         for w in &self.writes {
-            if other.writes.iter().any(|o| same(o, w)) {
+            let (agrees, latest) = at(&theirs, &other.writes, w);
+            if agrees {
                 merged.push(w.clone());
             } else {
-                let theirs = other
-                    .writes
-                    .iter()
-                    .filter(|o| o.base == w.base && o.off == w.off && o.len == w.len)
-                    .map(|o| o.gen)
-                    .max();
                 merged.push(MemWrite {
                     val: MVal::Unknown,
                     origin: None,
-                    gen: w.gen.max(theirs.unwrap_or(0)),
+                    gen: w.gen.max(latest.unwrap_or(0)),
                     ..w.clone()
                 });
             }
         }
+        let mut placed: HashSet<Place> = mine.keys().copied().collect();
         for o in &other.writes {
-            if !self.writes.iter().any(|w| same(o, w))
-                && !merged
-                    .iter()
-                    .any(|m| m.base == o.base && m.off == o.off && m.len == o.len)
-            {
+            let (agrees, _) = at(&mine, &self.writes, o);
+            if !agrees && placed.insert(place(o)) {
                 merged.push(MemWrite {
                     val: MVal::Unknown,
                     origin: None,
@@ -1153,6 +1188,8 @@ impl Mem {
                 });
             }
         }
+        let overflow = merged.len().saturating_sub(MAX_TRACKED_WRITES);
+        merged.drain(..overflow);
         let changed_writes = merged.len() != self.writes.len()
             || merged
                 .iter()
@@ -1162,8 +1199,8 @@ impl Mem {
         let written_before = self.written.len();
         self.written.retain(|r| other.written.contains(r));
         let changed_writes = changed_writes || self.written.len() != written_before;
-        self.fresh &= other.fresh;
-        if other.gen != self.gen || other.clobber_gen != self.clobber_gen {
+        self.fresh &= other.fresh && overflow == 0;
+        if overflow > 0 || other.gen != self.gen || other.clobber_gen != self.clobber_gen {
             self.gen = self.gen.max(other.gen) + 1;
             self.clobber_gen = self.gen;
         }
@@ -1187,6 +1224,9 @@ pub struct State {
     sgen: u32,
     /// An external call or create has happened on this path (return data may be non-empty).
     called: bool,
+    /// Which call last set the return data: the return-data size read before a call and the
+    /// one read after it are different values. Zero until a call happens.
+    returned: u32,
 }
 
 impl State {
@@ -1546,6 +1586,7 @@ impl<'a> Lifter<'a> {
             version: 0,
             sgen: 0,
             called: !fresh,
+            returned: 0,
         };
         self.lift_from(unit, state)
     }
@@ -1677,6 +1718,7 @@ impl<'a> Lifter<'a> {
                                 version: 0,
                                 sgen: exit.sgen,
                                 called: exit.called,
+                                returned: exit.returned,
                             },
                         });
                         true
@@ -1690,13 +1732,15 @@ impl<'a> Lifter<'a> {
                             version: 0,
                             sgen: exit.sgen,
                             called: exit.called,
+                            returned: exit.returned,
                         };
                         let changed = e.state.stack != new_state.stack
                             || e.state.mem.writes != new_state.mem.writes
                             || e.state.mem.fresh != new_state.mem.fresh
                             || e.state.mem.gen != new_state.mem.gen
                             || e.state.storage != new_state.storage
-                            || e.state.sgen != new_state.sgen;
+                            || e.state.sgen != new_state.sgen
+                            || e.state.returned != new_state.returned;
                         e.state = new_state;
                         e.phis = vec![false; e.state.stack.len()];
                         changed
@@ -2075,7 +2119,7 @@ impl<'a> Lifter<'a> {
                 op::MSIZE | op::GAS => st.stack.push(expr::env_seq(o)),
                 op::RETURNDATASIZE => {
                     st.stack.push(if st.called {
-                        expr::env(o)
+                        expr::intern(Node::Env(o, st.returned))
                     } else {
                         konst(U256::ZERO)
                     });
@@ -2573,6 +2617,7 @@ impl<'a> Lifter<'a> {
                     });
                     st.stack.push(result);
                     st.called = true;
+                    st.returned = call_stamp(nid, stmts.len());
                 }
                 op::CREATE | op::CREATE2 => {
                     let value = pop!();
@@ -2603,6 +2648,7 @@ impl<'a> Lifter<'a> {
                     });
                     st.stack.push(result);
                     st.called = true;
+                    st.returned = call_stamp(nid, stmts.len());
                 }
                 op::RETURN | op::REVERT => {
                     let off = pop!();
@@ -2855,6 +2901,7 @@ impl<'a> Lifter<'a> {
                 st.storage.clear();
                 st.sgen += 1;
                 st.called = true;
+                st.returned = call_stamp(un.id, stmts.len());
             }
         }
         if transparent {
@@ -3022,6 +3069,14 @@ fn merge_into(
         e.state.sgen = e.state.sgen.max(exit.sgen) + 1;
         changed = true;
     }
+    let merged_return = match exit.returned == e.state.returned {
+        true => exit.returned,
+        false => MERGED_RETURN | node as u32,
+    };
+    if merged_return != e.state.returned {
+        e.state.returned = merged_return;
+        changed = true;
+    }
     if exit.called && !e.state.called {
         e.state.called = true;
         changed = true;
@@ -3094,6 +3149,7 @@ impl MemView {
             version: self.version,
             sgen: 0,
             called: false,
+            returned: 0,
         };
         apply_mcopy(&mut st, dest, src, len);
         self.mem = st.mem;

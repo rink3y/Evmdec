@@ -1205,36 +1205,67 @@ fn bindable(e: ExprId) -> bool {
 
 /// Sub-expressions of `e` that are worth binding, with the number of times each occurs,
 /// operands before the expression that uses them and left to right (the order the source would
-/// introduce locals in). An operand of a repeated sub-expression counts once per repetition.
+/// introduce locals in). An operand of a repeated sub-expression counts once per repetition;
+/// the counts are carried down the shared graph, never by walking a repetition again.
 ///
 /// Storage keys and hashes are left whole (a bound key would lose the slot's name), and so is
 /// the ABI packing of an `encoded` word: its shifts, ors and masks are what the printer undoes
 /// to show the arguments, so only the arguments themselves are candidates.
 fn bindable_subexprs(e: ExprId, encoded: bool, out: &mut Vec<(ExprId, usize)>) {
-    fn go(x: ExprId, encoded: bool, depth: usize, out: &mut Vec<(ExprId, usize)>) {
-        if depth > 64 {
-            return;
-        }
-        let packing = encoded
+    let packs = |x: ExprId, encoded: bool| {
+        encoded
             && matches!(expr::node(x), Node::Op(o, _) if matches!(o, op::OR | op::SHL | op::SHR | op::AND | op::MUL | op::DIV))
             && expr::children(x)
                 .iter()
-                .any(|c| expr::as_const(*c).is_some());
-        match expr::node(x) {
-            Node::SLoad(..) | Node::Keccak(..) | Node::KeccakMem(..) => return,
-            _ => {}
+                .any(|c| expr::as_const(*c).is_some())
+    };
+    let whole = |x: ExprId| {
+        matches!(
+            expr::node(x),
+            Node::SLoad(..) | Node::Keccak(..) | Node::KeccakMem(..)
+        )
+    };
+    let operands = |x: ExprId| match whole(x) {
+        true => Vec::new(),
+        false => expr::children(x),
+    };
+    let mut order: Vec<(ExprId, bool)> = Vec::new();
+    let mut seen: HashSet<(ExprId, bool)> = HashSet::new();
+    let mut stack: Vec<((ExprId, bool), bool)> = vec![((e, encoded), false)];
+    while let Some((state, done)) = stack.pop() {
+        if done {
+            order.push(state);
+            continue;
         }
-        for c in expr::children(x) {
-            go(c, packing, depth + 1, out);
+        if !seen.insert(state) {
+            continue;
         }
-        if !packing && bindable(x) {
-            match out.iter_mut().find(|(y, _)| *y == x) {
-                Some((_, n)) => *n += 1,
-                None => out.push((x, 1)),
-            }
+        stack.push((state, true));
+        let inner = packs(state.0, state.1);
+        for c in operands(state.0).into_iter().rev() {
+            stack.push(((c, inner), false));
         }
     }
-    go(e, encoded, 0, out);
+    let mut times: HashMap<(ExprId, bool), usize> = HashMap::from([((e, encoded), 1)]);
+    for state in order.iter().rev() {
+        let n = times.get(state).copied().unwrap_or(0);
+        let inner = packs(state.0, state.1);
+        for c in operands(state.0) {
+            let t = times.entry((c, inner)).or_insert(0);
+            *t = t.saturating_add(n);
+        }
+    }
+    for state in &order {
+        let (x, encoded) = *state;
+        if whole(x) || packs(x, encoded) || !bindable(x) {
+            continue;
+        }
+        let n = times.get(state).copied().unwrap_or(0);
+        match out.iter_mut().find(|(y, _)| *y == x) {
+            Some((_, total)) => *total = total.saturating_add(n),
+            None => out.push((x, n)),
+        }
+    }
 }
 
 /// Expressions a terminator evaluates, apart from memory addressing: `(expression, encoded)`.

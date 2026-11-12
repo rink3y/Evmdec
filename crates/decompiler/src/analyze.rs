@@ -2745,46 +2745,89 @@ pub fn analyze(c: &Contract) -> Report {
             }
             out
         };
-        let guarded_slot = |i: usize| -> Option<ExprId> {
-            let mut tested: HashSet<ExprId> = HashSet::new();
-            let mut before: HashSet<ExprId> = HashSet::new();
-            let mut after: HashSet<ExprId> = HashSet::new();
-            for (j, e) in events.iter().enumerate() {
-                if let Some(Stmt::SStore { key, val, .. }) = &e.stmt {
-                    if expr::is_const(*key) {
-                        let restores_const = expr::is_const(*val)
-                            || emit::packed_write(*key, *val)
-                                .is_some_and(|(_, _, _, v)| expr::is_const(v));
-                        if j < i {
-                            before.insert(*key);
-                        } else if j > i && restores_const {
-                            after.insert(*key);
-                        }
-                    }
-                }
-                if j < i {
-                    if let Some(Stmt::Require { cond, .. }) = &e.stmt {
-                        tested.extend(const_sloads(*cond));
-                    }
-                    if let Some(Term::Branch { cond, .. }) = &e.term {
-                        tested.extend(const_sloads(*cond));
-                    }
-                }
+        let const_store = |e: &Event| match &e.stmt {
+            Some(Stmt::SStore { key, val, .. }) if expr::is_const(*key) => {
+                let restores_const = expr::is_const(*val)
+                    || emit::packed_write(*key, *val).is_some_and(|(_, _, _, v)| expr::is_const(v));
+                Some((*key, restores_const))
             }
-            before
-                .iter()
-                .find(|k| after.contains(k) && tested.contains(k))
-                .copied()
+            _ => None,
         };
-
+        let mut last_restore: HashMap<ExprId, usize> = HashMap::new();
+        for (j, e) in events.iter().enumerate() {
+            if let Some((key, true)) = const_store(e) {
+                last_restore.insert(key, j);
+            }
+        }
+        let mut stored: Vec<ExprId> = Vec::new();
+        let mut tested: HashSet<ExprId> = HashSet::new();
+        let mut guarded_calls: HashSet<usize> = HashSet::new();
         for (i, ev) in events.iter().enumerate() {
             if matches!(&ev.stmt, Some(Stmt::Call { kind, .. }) if *kind == op::CALL || *kind == op::CALLCODE)
             {
-                if let Some(slot) = guarded_slot(i) {
-                    lock_slots.entry(slot).or_default().insert(f.pc);
+                let guarded = stored
+                    .iter()
+                    .find(|k| tested.contains(*k) && last_restore.get(*k).is_some_and(|j| *j > i));
+                if let Some(slot) = guarded {
+                    lock_slots.entry(*slot).or_default().insert(f.pc);
+                    guarded_calls.insert(i);
                 }
             }
+            if let Some((key, _)) = const_store(ev) {
+                if !stored.contains(&key) {
+                    stored.push(key);
+                }
+            }
+            if let Some(Stmt::Require { cond, .. }) = &ev.stmt {
+                tested.extend(const_sloads(*cond));
+            }
+            if let Some(Term::Branch { cond, .. }) = &ev.term {
+                tested.extend(const_sloads(*cond));
+            }
         }
+        let seqs_in = |roots: Vec<ExprId>, pick: &dyn Fn(&Node) -> Option<u32>| {
+            let mut found: HashSet<u32> = HashSet::new();
+            let mut seen: HashSet<ExprId> = HashSet::new();
+            let mut pending = roots;
+            while let Some(x) = pending.pop() {
+                if !seen.insert(x) {
+                    continue;
+                }
+                found.extend(pick(&expr::node(x)));
+                pending.extend(expr::children(x));
+            }
+            found
+        };
+        let carried: Vec<ExprId> = l.edge_assigns.values().flatten().map(|(_, v)| *v).collect();
+        let checked: Vec<ExprId> = events
+            .iter()
+            .flat_map(|e| {
+                let stmt = match &e.stmt {
+                    Some(Stmt::Drop(_)) | None => Vec::new(),
+                    Some(other) => stmt_exprs(other),
+                };
+                let term = match &e.term {
+                    Some(Term::Branch { cond, .. }) => vec![*cond],
+                    Some(Term::Return { data: Some(d), .. }) => d.clone(),
+                    _ => Vec::new(),
+                };
+                stmt.into_iter().chain(term)
+            })
+            .chain(carried.iter().copied())
+            .collect();
+        let used_results = seqs_in(checked, &|n| match n {
+            Node::CallResult(s) => Some(*s),
+            _ => None,
+        });
+        let everything: Vec<ExprId> = events
+            .iter()
+            .flat_map(event_exprs)
+            .chain(carried.iter().copied())
+            .collect();
+        let read_returns = seqs_in(everything, &|n| match n {
+            Node::ReturnData(s, _) => Some(*s),
+            _ => None,
+        });
         for (i, ev) in events.iter().enumerate() {
             let Some(stmt) = &ev.stmt else { continue };
             let names = &names;
@@ -2894,7 +2937,7 @@ pub fn analyze(c: &Contract) -> Report {
                         });
                         let hook = selector.is_some_and(|s| CALLBACK_SELECTORS.contains(&s));
                         if later_write && !precompile {
-                            let (id, sev, conf, extra) = if guarded_slot(i).is_some() {
+                            let (id, sev, conf, extra) = if guarded_calls.contains(&i) {
                                 ("reentrancy", Severity::Info, Confidence::Medium, " A storage lock written before and after the call looks like a reentrancy guard, so this is reported for awareness only.")
                             } else if fixed_in_storage(&ctx, *addr) && !hook {
                                 ("reentrancy-fixed-callee", Severity::Info, Confidence::Low, " The callee address is held in storage that no runtime code writes, so it was fixed at deployment: only that one contract could re-enter, and only if it is malicious or compromised.")
@@ -2915,43 +2958,7 @@ pub fn analyze(c: &Contract) -> Report {
                                 format!("`{}` performs an external call to `{}` and writes storage afterwards. A malicious callee can re-enter before the state update is applied (checks-effects-interactions violated).{}", f.name, target, extra),
                                 vec![line.clone()], "Apply the checks-effects-interactions pattern (update state before calling out) or use a reentrancy guard.");
                         }
-                        let used = events.iter().any(|e2| {
-                            e2.stmt.as_ref().is_some_and(|s2| match s2 {
-                                Stmt::Drop(_) => false,
-                                other => lift::node_exprs(&lift::LNode {
-                                    id: 0,
-                                    block: 0,
-                                    pc: 0,
-                                    stmts: vec![other.clone()],
-                                    term: Term::Stop,
-                                    preds: vec![],
-                                    succs: vec![],
-                                    entry_stack: vec![],
-                                    exit_stack: vec![],
-                                })
-                                .iter()
-                                .any(|e| {
-                                    mentions(
-                                        *e,
-                                        &|n| matches!(n, Node::CallResult(s) if *s == *seq),
-                                    )
-                                }),
-                            }) || e2.term.as_ref().is_some_and(|t| match t {
-                                Term::Branch { cond, .. } => mentions(
-                                    *cond,
-                                    &|n| matches!(n, Node::CallResult(s) if *s == *seq),
-                                ),
-                                Term::Return { data: Some(d), .. } => d.iter().any(|e| {
-                                    mentions(
-                                        *e,
-                                        &|n| matches!(n, Node::CallResult(s) if *s == *seq),
-                                    )
-                                }),
-                                _ => false,
-                            })
-                        }) || l.edge_assigns.values().flatten().any(|(_, v)| {
-                            mentions(*v, &|n| matches!(n, Node::CallResult(s) if *s == *seq))
-                        });
+                        let used = used_results.contains(seq);
                         if !used && !precompile {
                             push(&mut findings, "unchecked-call", "Return value of external call ignored", if value_nonzero { Severity::Medium } else { Severity::Low }, Confidence::High, Some(f), Some(ev.pc),
                                 format!("`{}` ignores the success flag of a low-level call to `{}`. If the call fails (reverting callee, out of gas, non-contract address) execution continues as if it succeeded{}.", f.name, target, if value_nonzero { ", and the ether is kept by this contract while state may assume it was sent" } else { "" }),
@@ -2960,48 +2967,8 @@ pub fn analyze(c: &Contract) -> Report {
                         if input.is_some() {
                             if let Some(sel) = selector {
                                 if matches!(sel, SEL_TRANSFER | SEL_TRANSFER_FROM | SEL_APPROVE) {
-                                    let ret_read = |e: ExprId| {
-                                        mentions(
-                                            e,
-                                            &|n| matches!(n, Node::ReturnData(s, _) if *s == *seq),
-                                        )
-                                    };
                                     let out_zero = expr::as_const(*out_len) == Some(U256::ZERO);
-                                    let decoded = events.iter().any(|e2| {
-                                        e2.stmt.as_ref().is_some_and(|s2| {
-                                            lift::node_exprs(&lift::LNode {
-                                                id: 0,
-                                                block: 0,
-                                                pc: 0,
-                                                stmts: vec![s2.clone()],
-                                                term: Term::Stop,
-                                                preds: vec![],
-                                                succs: vec![],
-                                                entry_stack: vec![],
-                                                exit_stack: vec![],
-                                            })
-                                            .iter()
-                                            .any(|e| ret_read(*e))
-                                        }) || e2.term.as_ref().is_some_and(|t| {
-                                            lift::node_exprs(&lift::LNode {
-                                                id: 0,
-                                                block: 0,
-                                                pc: 0,
-                                                stmts: vec![],
-                                                term: t.clone(),
-                                                preds: vec![],
-                                                succs: vec![],
-                                                entry_stack: vec![],
-                                                exit_stack: vec![],
-                                            })
-                                            .iter()
-                                            .any(|e| ret_read(*e))
-                                        })
-                                    }) || l
-                                        .edge_assigns
-                                        .values()
-                                        .flatten()
-                                        .any(|(_, v)| ret_read(*v));
+                                    let decoded = read_returns.contains(seq);
                                     let window_end = events[i + 1..]
                                         .iter()
                                         .position(|e2| matches!(e2.stmt, Some(Stmt::Call { .. })))

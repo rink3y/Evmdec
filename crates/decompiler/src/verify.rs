@@ -734,6 +734,9 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         let d = ev.eval(*dest, &mut memo);
                         let sv = ev.eval(*src, &mut memo);
                         let l = ev.eval(*len, &mut memo).as_usize().unwrap_or(0);
+                        if sv.wrapping_add(U256::from(l as u64)) < sv {
+                            ev.inconclusive = Some("copy source wraps the address space".into());
+                        }
                         let data = match *kind {
                             op::CALLDATACOPY => copy_from(&host.calldata, sv, l),
                             op::CODECOPY => copy_from(code, sv, l),

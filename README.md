@@ -341,8 +341,9 @@ callouts keyed to the findings beside it, a band of the trusted contracts the an
 (each one opens in place), and tabs for the report, storage and events, the call graph,
 disassembly and JSON. The call graph says how each contract was reached (which contract calls
 it, how, how many calls away, and whether its storage approves that caller) and lists the call
-targets that were seen and not fetched, each with its reason. Results are linkable as `/?chain=mainnet&address=0x...`. The page meets
-WCAG 2.2 AA on both colour schemes and runs no third-party scripts.
+targets that were seen and not fetched, each with its reason. Results are linkable as
+`/?chain=mainnet&address=0x...`. The page meets WCAG 2.2 AA on both colour schemes and runs
+no third-party scripts.
 
 ```
 POST /api/decompile      {"address": "0x...", "chain": "mainnet"}  or  {"bytecode": "0x..."}

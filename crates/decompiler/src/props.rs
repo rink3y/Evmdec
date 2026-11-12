@@ -13,12 +13,16 @@ use crate::solve::{self, Free, Inputs, Item, Step};
 use crate::ssa;
 use crate::u256::U256;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 const LIMITS: Limits = Limits {
     paths: 24,
     runs: 96,
+    until: None,
 };
 const WORDS: usize = 12;
+const BUDGET: Duration = Duration::from_secs(3);
+const GROWTH_BUDGET: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Place {
@@ -73,6 +77,10 @@ fn runs(c: &Contract) -> Vec<Run<'_>> {
     let mut out = Vec::new();
     let begin = deploy::storage(c);
     let from = deploy::start_text(&begin);
+    let limits = Limits {
+        until: Some(Instant::now() + BUDGET),
+        ..LIMITS
+    };
     let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
     for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
         let code = c.code_of(f);
@@ -105,7 +113,7 @@ fn runs(c: &Contract) -> Vec<Run<'_>> {
                     storage: begin.clone(),
                     ..flat.clone()
                 };
-                for path in explorer.explore(&start, &free, LIMITS) {
+                for path in explorer.explore(&start, &free, limits) {
                     if !path.succeeded() {
                         continue;
                     }
@@ -902,9 +910,13 @@ fn growth(c: &Contract, all: &[Run], begin: &HashMap<U256, U256>, out: &mut Vec<
         }
     }
     let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
+    let deadline = Instant::now() + GROWTH_BUDGET;
     for (slot, adder) in counters.into_iter().take(MAX_COUNTERS) {
         let mut slowed: Vec<(String, usize)> = Vec::new();
         for g in c.functions.iter().filter(|f| f.kind == FnKind::External) {
+            if Instant::now() >= deadline {
+                break;
+            }
             let code = c.code_of(g);
             let explorer = explorers
                 .entry(code.as_ptr())

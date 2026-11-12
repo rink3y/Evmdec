@@ -14,6 +14,7 @@ use crate::seq::{self, Entry};
 use crate::solve::{self, Free, Inputs, Item};
 use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
 
@@ -35,6 +36,7 @@ const CONFIRMABLE: &[&str] = &[
 
 const STEP_BUDGET: usize = 120_000;
 const MAX_ATTEMPTS: usize = 200;
+const BUDGET: Duration = Duration::from_secs(4);
 // Enough words for a few offsets, lengths and elements of array arguments.
 const SOLVED_WORDS: usize = 24;
 const SOME_ETHER: U256 = U256::from_u64(100_000_000_000_000_000);
@@ -52,7 +54,11 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         return;
     }
     let start = deploy::storage(c);
+    let deadline = Instant::now() + BUDGET;
     for finding in findings.iter_mut() {
+        if Instant::now() >= deadline {
+            break;
+        }
         if finding.confirmed || !CONFIRMABLE.contains(&finding.id.as_str()) {
             continue;
         }
@@ -303,7 +309,11 @@ pub fn confirm_wraps(c: &Contract, findings: &mut [Finding]) {
         return;
     }
     let start = deploy::storage(c);
+    let deadline = Instant::now() + BUDGET;
     for finding in findings.iter_mut() {
+        if Instant::now() >= deadline {
+            break;
+        }
         if finding.confirmed || !WRAP_IDS.contains(&finding.id.as_str()) {
             continue;
         }

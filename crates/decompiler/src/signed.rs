@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 const LIMITS: Limits = Limits {
     paths: 16,
     runs: 64,
+    until: None,
 };
 const WORDS: usize = 12;
 const MAX_FUNCTIONS: usize = 32;
@@ -83,9 +84,18 @@ fn start_for(f: &Function, begin: &HashMap<U256, U256>) -> (Inputs, Free) {
     (inputs, free)
 }
 
-fn repeated(explorer: &Explorer, f: &Function, begin: &HashMap<U256, U256>) -> Option<Path> {
+fn repeated(
+    explorer: &Explorer,
+    f: &Function,
+    begin: &HashMap<U256, U256>,
+    deadline: Instant,
+) -> Option<Path> {
     let (start, free) = start_for(f, begin);
-    for p in explorer.explore(&start, &free, LIMITS) {
+    let limits = Limits {
+        until: Some(deadline),
+        ..LIMITS
+    };
+    for p in explorer.explore(&start, &free, limits) {
         let Some(digest) = digest_of(&p) else {
             continue;
         };
@@ -123,7 +133,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         let explorer = explorers
             .entry(code.as_ptr())
             .or_insert_with(|| Explorer::new(code));
-        let Some(second) = repeated(explorer, f, &begin) else {
+        let Some(second) = repeated(explorer, f, &begin, deadline) else {
             continue;
         };
         let severity = if moves_value(&second) {

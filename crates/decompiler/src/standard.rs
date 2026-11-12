@@ -11,6 +11,7 @@ use crate::solve::{self, Free, Inputs, Item, Step};
 use crate::ssa;
 use crate::u256::U256;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 const SEL_TRANSFER: u32 = 0xa905_9cbb;
 const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
@@ -20,7 +21,9 @@ const SEL_TOTAL: u32 = 0x1816_0ddd;
 const LIMITS: Limits = Limits {
     paths: 24,
     runs: 96,
+    until: None,
 };
+const BUDGET: Duration = Duration::from_secs(2);
 const HOLDER: U256 = U256::from_u64(0xf00d_f00d_f00d_f00d);
 const RECEIVER: U256 = U256::from_u64(0x7070_7070_7070_7070);
 const AMOUNT: U256 = U256::from_u64(0x1001);
@@ -42,6 +45,7 @@ struct Bench<'a> {
     layout: MappingLayout,
     begin: HashMap<U256, U256>,
     explorers: HashMap<*const u8, Explorer>,
+    deadline: Instant,
 }
 
 impl<'a> Bench<'a> {
@@ -69,7 +73,11 @@ impl<'a> Bench<'a> {
             storage: true,
             fixed: Vec::new(),
         };
-        let found = self.explorer(f).explore(&start, &free, LIMITS);
+        let limits = Limits {
+            until: Some(self.deadline),
+            ..LIMITS
+        };
+        let found = self.explorer(f).explore(&start, &free, limits);
         let moved = |p: &Path| p.succeeded() && p.run.storage != p.inputs.storage;
         found.into_iter().find(moved)
     }
@@ -408,6 +416,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Option<Section> {
         layout: c.compiler.layout,
         begin: deploy::storage(c),
         explorers: HashMap::new(),
+        deadline: Instant::now() + BUDGET,
     };
     bench.function(SEL_BALANCE_OF)?;
     let mut report = Report {

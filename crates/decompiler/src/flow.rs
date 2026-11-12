@@ -22,8 +22,13 @@ const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
 const LIMITS: Limits = Limits {
     paths: 12,
     runs: 48,
+    until: None,
 };
-const PROBE: Limits = Limits { paths: 6, runs: 16 };
+const PROBE: Limits = Limits {
+    paths: 6,
+    runs: 16,
+    until: None,
+};
 const WORDS: usize = 8;
 const MAX_FUNCTIONS: usize = 32;
 const MAX_DEPOSITS: usize = 6;
@@ -163,6 +168,10 @@ impl<'a> Pass<'a> {
             .explorers
             .entry(code.as_ptr())
             .or_insert_with(|| Explorer::new(code));
+        let limits = Limits {
+            until: Some(self.deadline),
+            ..limits
+        };
         explorer.explore(start, free, limits)
     }
 

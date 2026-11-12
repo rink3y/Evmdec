@@ -5,6 +5,7 @@ use crate::lift::{Lifter, Stmt, Term};
 use crate::solve::{self, Free, Inputs, Item};
 use crate::u256::U256;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 const STEP_BUDGET: usize = 200_000;
 const MAX_BLOCKS: usize = 2_048;
@@ -15,6 +16,7 @@ const DEFAULT_BALANCE: U256 = U256::from_u64(1_000_000_000_000_000_000);
 pub struct Limits {
     pub paths: usize,
     pub runs: usize,
+    pub until: Option<Instant>,
 }
 
 impl Default for Limits {
@@ -22,6 +24,7 @@ impl Default for Limits {
         Limits {
             paths: 48,
             runs: 240,
+            until: None,
         }
     }
 }
@@ -182,7 +185,8 @@ impl Explorer {
         while let Some((index, bound)) = queue.pop_front() {
             let last = paths[index].truth.len().min(bound + MAX_FLIPS_PER_PATH);
             for flip in bound..last {
-                if runs >= limits.runs || paths.len() >= limits.paths {
+                let late = limits.until.is_some_and(|t| Instant::now() >= t);
+                if late || runs >= limits.runs || paths.len() >= limits.paths {
                     return paths;
                 }
                 let base = &paths[index];

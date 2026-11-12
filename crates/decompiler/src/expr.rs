@@ -800,6 +800,45 @@ pub fn substitute(
     r
 }
 
+/// `e` with every memory read stamped `version`: reads taken in one frame of reference (an
+/// inlined function's own generations) restated in another's.
+pub fn restamp_memory(e: ExprId, version: u32, memo: &mut HashMap<ExprId, ExprId>) -> ExprId {
+    if let Some(r) = memo.get(&e) {
+        return *r;
+    }
+    let mut again = |x: ExprId| restamp_memory(x, version, memo);
+    let r = match node(e) {
+        Node::Op(o, v) => {
+            let nv: Vec<ExprId> = v.iter().map(|x| again(*x)).collect();
+            if nv == v {
+                e
+            } else {
+                match nv.len() {
+                    1 => op1(o, nv[0]),
+                    2 => op2(o, nv[0], nv[1]),
+                    _ => op3(o, nv[0], nv[1], nv[2]),
+                }
+            }
+        }
+        Node::Keccak(v, t) => {
+            let nv: Vec<ExprId> = v.iter().map(|x| again(*x)).collect();
+            intern(Node::Keccak(nv, t))
+        }
+        Node::MLoad(a, _) => intern(Node::MLoad(again(a), version)),
+        Node::SLoad(a, t, ver) => intern(Node::SLoad(again(a), t, ver)),
+        Node::CallDataLoad(a) => intern(Node::CallDataLoad(again(a))),
+        Node::ReturnData(s, a) => intern(Node::ReturnData(s, again(a))),
+        Node::CopiedWord(k, a, ver) => intern(Node::CopiedWord(k, again(a), ver)),
+        Node::KeccakMem(a, b, _) => {
+            let (a, b) = (again(a), again(b));
+            intern(Node::KeccakMem(a, b, version))
+        }
+        _ => e,
+    };
+    memo.insert(e, r);
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -111,11 +111,13 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
             off: a,
             val: v32,
             width: 32,
+            ..
         },
         Stmt::MStore {
             off: a32,
             val: lenv,
             width: 32,
+            ..
         },
     ) = (&sn.stmts[kk - 2], &sn.stmts[kk - 1])
     else {
@@ -200,6 +202,7 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
             off: bo,
             val: bv,
             width: 32,
+            ..
         } = &bn.stmts[0]
         else {
             return None;
@@ -295,6 +298,7 @@ fn literal_return(stmts: &[Stmt], ptr: ExprId) -> Option<Term> {
             off,
             val,
             width: 32,
+            ..
         } = st
         {
             let (t, c) = addends(*off);
@@ -556,6 +560,7 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
             off: bo,
             val: bv,
             width: 32,
+            ..
         } = &l.nodes[b].stmts[0]
         else {
             continue;

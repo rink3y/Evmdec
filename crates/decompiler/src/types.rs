@@ -719,6 +719,7 @@ impl TypeEnv {
                     off,
                     val,
                     width: 32,
+                    ..
                 } => {
                     let (base, at) = expr::split_offset(*off);
                     Some((base, at, *val))

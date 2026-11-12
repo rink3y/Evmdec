@@ -333,11 +333,13 @@ fn encoded_bytes_logs(stmts: &[Stmt]) -> Vec<FoldedLog> {
                 off: o1,
                 val: v1,
                 width: 32,
+                ..
             },
             Stmt::MStore {
                 off: o2,
                 val: len,
                 width: 32,
+                ..
             },
             Stmt::Copy {
                 kind: op::CALLDATACOPY,
@@ -350,6 +352,7 @@ fn encoded_bytes_logs(stmts: &[Stmt]) -> Vec<FoldedLog> {
                 off: o4,
                 val: v4,
                 width: 32,
+                ..
             },
         ) = (&stmts[i - 4], &stmts[i - 3], &stmts[i - 2], &stmts[i - 1])
         else {
@@ -438,6 +441,8 @@ fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) ->
 enum Overwritten {
     Slot(ExprId),
     Balance,
+    /// The memory word at this address.
+    Memory(ExprId),
 }
 
 /// Loads of `what` with generation at most `gen` anywhere in `e`, outside `skip` (the value
@@ -458,6 +463,7 @@ fn stale_loads_in(
         let stale = match (expr::node(x), what) {
             (Node::SLoad(k, false, g), Overwritten::Slot(key)) => k == key && g <= gen,
             (Node::Env(op::SELFBALANCE, g), Overwritten::Balance) => g <= gen,
+            (Node::MLoad(at, g), Overwritten::Memory(addr)) => at == addr && g <= gen,
             _ => false,
         };
         if stale && !out.contains(&x) {
@@ -483,8 +489,63 @@ fn overwrites(st: &Stmt, names: &Names) -> Option<(Overwritten, u32)> {
             ..
         } if !names.pure_callees.contains(callee) => Some((Overwritten::Balance, *g)),
         Stmt::Create { gen, .. } => Some((Overwritten::Balance, *gen)),
+        Stmt::MStore {
+            off,
+            width: 32,
+            gen,
+            ..
+        } if *gen > 0 && !(names.blocks.is_some() && emit::is_free_pointer(*off)) => {
+            Some((Overwritten::Memory(*off), *gen - 1))
+        }
         _ => None,
     }
+}
+
+/// The lowest generation among the unresolved loads of each memory address in the function: a
+/// store can only have stale loads when one of its address is stamped at or below it.
+fn earliest_loads(l: &Lifted) -> HashMap<ExprId, u32> {
+    let mut earliest: HashMap<ExprId, u32> = HashMap::new();
+    let mut seen: HashSet<ExprId> = HashSet::new();
+    let mut pending: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
+    pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
+    while let Some(e) = pending.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        if let Node::MLoad(addr, version) = expr::node(e) {
+            let first = earliest.entry(addr).or_insert(version);
+            *first = (*first).min(version);
+        }
+        pending.extend(expr::children(e));
+    }
+    earliest
+}
+
+/// The value statement `i` stores to a memory word, when the rest of its block can print that
+/// value as the word itself: a full-word store the lifter executed, of a value that is not a
+/// constant, with nothing after it in the block that writes memory.
+fn memory_forward(stmts: &[Stmt], i: usize) -> Option<ExprId> {
+    let Stmt::MStore {
+        val,
+        width: 32,
+        gen,
+        ..
+    } = &stmts[i]
+    else {
+        return None;
+    };
+    let writes_memory = |s: &Stmt| {
+        matches!(
+            s,
+            Stmt::MStore { .. }
+                | Stmt::Copy { .. }
+                | Stmt::Call { .. }
+                | Stmt::Create { .. }
+                | Stmt::Internal { .. }
+        )
+    };
+    let plain = *gen > 0 && !expr::is_const(*val) && !stmts[i + 1..].iter().any(writes_memory);
+    plain.then_some(*val)
 }
 
 /// A temporary name for the old value of a slot or of the balance: `prev_<name>`, with the
@@ -493,6 +554,7 @@ fn prev_name(what: Overwritten, names: &Names) -> String {
     let base = match what {
         Overwritten::Slot(key) => emit::fmt_slot(key, names, emit::SlotSpace::Persistent),
         Overwritten::Balance => "balance".to_string(),
+        Overwritten::Memory(addr) => emit::fmt_mem_word(addr, names),
     };
     let mut id = String::new();
     for c in base.chars() {
@@ -513,18 +575,28 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
     let mut plan: HashMap<(usize, usize), Vec<(ExprId, String)>> = HashMap::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
     let mut found: Vec<(usize, usize, Overwritten, u32, Vec<ExprId>)> = Vec::new();
+    let earliest = earliest_loads(l);
     for nd in &l.nodes {
         for (i, st) in nd.stmts.iter().enumerate() {
             let Some((what, gen)) = overwrites(st, names) else {
                 continue;
             };
+            if let Overwritten::Memory(addr) = what {
+                if earliest.get(&addr).is_none_or(|first| *first > gen) {
+                    continue;
+                }
+            }
             let mut after: Vec<ExprId> = Vec::new();
             for later in &nd.stmts[i + 1..] {
                 after.extend(lift::stmt_exprs(later));
             }
             after.extend(lift::term_exprs(&nd.term));
+            let in_block_only = matches!(what, Overwritten::Memory(_));
             let mut seen = HashSet::new();
-            let mut stack: Vec<usize> = nd.succs.clone();
+            let mut stack: Vec<usize> = match in_block_only {
+                true => Vec::new(),
+                false => nd.succs.clone(),
+            };
             while let Some(x) = stack.pop() {
                 if !seen.insert(x) || seen.len() > 5000 {
                     continue;
@@ -541,9 +613,10 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
                 Stmt::SStore { val, .. } if !expr::is_const(*val) => Some(*val),
                 _ => None,
             };
+            let skip = forwarded.or(memory_forward(&nd.stmts, i));
             let mut stale: Vec<ExprId> = Vec::new();
             for e in after {
-                stale_loads_in(e, what, gen, forwarded, &mut stale);
+                stale_loads_in(e, what, gen, skip, &mut stale);
             }
             if stale.is_empty() {
                 continue;
@@ -559,9 +632,10 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
         }
     }
     for (node, i, what, gen, stale) in found {
+        let per_store = matches!(what, Overwritten::Memory(_));
         let mine: Vec<ExprId> = stale
             .into_iter()
-            .filter(|e| first_gen.get(e) == Some(&gen))
+            .filter(|e| per_store || first_gen.get(e) == Some(&gen))
             .collect();
         if mine.is_empty() {
             continue;
@@ -1728,6 +1802,7 @@ impl<'a> Printer<'a> {
                     off,
                     val,
                     width: 32,
+                    ..
                 } = s
                 {
                     stores.push((*off, *val));
@@ -1970,7 +2045,15 @@ impl<'a> Printer<'a> {
         for lit in &literals {
             dead.extend(lit.rest.iter().copied());
         }
+        let mut replaced: Vec<(ExprId, String)> = Vec::new();
         for (i, s) in self.l.nodes[n].stmts.iter().enumerate() {
+            self.names.replace_stale_in_block(replaced.drain(..));
+            if let (Stmt::MStore { off, .. }, Some(stale)) = (s, self.stale_plan.get(&(n, i))) {
+                let current = emit::fmt_mem_word(*off, self.names);
+                let def = format!("uint256 {} = {};", stale[0].1, current);
+                replaced = stale.clone();
+                self.line(depth, &def);
+            }
             if dead.contains(&i) || self.skipped.borrow().contains(&(n, i)) {
                 continue;
             }
@@ -1983,7 +2066,8 @@ impl<'a> Printer<'a> {
                 self.line(depth, &txt);
                 continue;
             }
-            if let Some(stale) = self.stale_plan.get(&(n, i)) {
+            let rewrites_memory = matches!(s, Stmt::MStore { .. });
+            if let Some(stale) = self.stale_plan.get(&(n, i)).filter(|_| !rewrites_memory) {
                 let (loads, tmp) = (stale.clone(), stale[0].1.clone());
                 let (what, _) =
                     overwrites(s, self.names).expect("stale plan entries overwrite something");
@@ -1992,12 +2076,11 @@ impl<'a> Printer<'a> {
                         emit::fmt_slot(key, self.names, emit::SlotSpace::Persistent)
                     }
                     Overwritten::Balance => "address(this).balance".to_string(),
+                    Overwritten::Memory(addr) => emit::fmt_mem_word(addr, self.names),
                 };
                 let def = format!("uint256 {} = {};", tmp, current);
                 self.line(depth, &def);
-                for (e, t) in loads {
-                    self.names.stale.borrow_mut().insert(e, t);
-                }
+                self.names.replace_stale(loads);
             }
             if let Stmt::Internal { results, .. } = s {
                 if !results.is_empty() && results.iter().all(|r| self.names.aliases.contains_key(r))
@@ -2025,6 +2108,12 @@ impl<'a> Printer<'a> {
             }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
+            if let (Stmt::MStore { off, .. }, Some(val)) =
+                (s, memory_forward(&self.l.nodes[n].stmts, i))
+            {
+                let word = emit::fmt_mem_word(*off, self.names);
+                self.names.forward(val, word);
+            }
             if let Stmt::SStore {
                 key,
                 val,
@@ -2042,6 +2131,7 @@ impl<'a> Printer<'a> {
                 }
             }
         }
+        self.names.replace_stale_in_block(replaced);
     }
 
     /// Edge copies are simultaneous: print them in an order where no right-hand side reads a
@@ -2900,9 +2990,46 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         p.out
     };
     Structured {
-        text: drop_empty_else(&text),
+        text: drop_empty_else(&drop_unused_previous(&text)),
         gotos: p.gotos,
     }
+}
+
+/// Drop the locals that keep an old value (`uint256 prev_x = x;`) and are never read: every use
+/// the planner saw was in a statement that is not printed.
+fn drop_unused_previous(text: &str) -> String {
+    let declared = |line: &str| -> Option<String> {
+        let rest = line.trim_start().strip_prefix("uint256 prev")?;
+        let name = rest.split(" = ").next()?;
+        let whole = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        (whole && rest.ends_with(';')).then(|| format!("prev{name}"))
+    };
+    let mentions = |line: &str, name: &str| {
+        line.match_indices(name).any(|(at, _)| {
+            let after = line[at + name.len()..].chars().next();
+            let before = line[..at].chars().next_back();
+            let part = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            !part(before) && !part(after)
+        })
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let unused = declared(line).is_some_and(|name| {
+            !lines
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != i && mentions(other, &name))
+        });
+        if !unused {
+            kept.push(line);
+        }
+    }
+    let mut out = kept.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// Empty branches: `} else {` directly followed by `}` loses the else; `if (...) {` directly

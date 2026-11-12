@@ -1185,3 +1185,25 @@ fn an_approval_is_held_against_what_the_spender_lets_callers_do() {
     );
     assert!(link_ids(&root, &dispatcher("STOP")).is_empty());
 }
+
+/// A memory word loaded, then overwritten, then used: the use is of the old value, so it is
+/// kept in a local declared before the store. A value just stored reads as the word that holds
+/// it for the rest of its block.
+#[test]
+fn a_memory_word_used_after_it_is_overwritten_keeps_its_old_value() {
+    let code = dispatcher(
+        "PUSH1 0x01 PUSH1 0x24 CALLDATALOAD MSTORE PUSH1 0x80 MLOAD PUSH1 0x07 PUSH1 0x80 MSTORE \
+         PUSH1 0x00 SSTORE PUSH1 0x44 CALLDATALOAD PUSH1 0x80 LOG0 STOP",
+    );
+    let src = source_of(&code);
+    let body: Vec<&str> = src.lines().map(str::trim).collect();
+    let at = |line: &str| {
+        body.iter()
+            .position(|l| *l == line)
+            .unwrap_or_else(|| panic!("missing `{line}` in {src}"))
+    };
+    let saved = at("uint256 prev_mem_ptr1 = mem[ptr1];");
+    let stored = at("mem[ptr1] = 7;");
+    let used = at("stor_0 = prev_mem_ptr1;");
+    assert!(saved < stored && stored < used, "{src}");
+}

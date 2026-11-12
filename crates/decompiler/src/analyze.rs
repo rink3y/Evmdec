@@ -2049,6 +2049,7 @@ fn events_of_in(
                     off,
                     val,
                     width: 32,
+                    ..
                 } => mem.store(*off, *val),
                 Stmt::MStore { off, .. } => mem.unknown(*off, Some(1)),
                 Stmt::Copy {

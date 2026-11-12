@@ -32,6 +32,9 @@ pub enum Stmt {
         val: ExprId,
         /// Width in bytes: 32 for `MSTORE`, 1 for `MSTORE8`.
         width: u8,
+        /// Memory generation this write starts: an unresolved load of the same address stamped
+        /// below it read what the write replaces. Zero for a store the lifter did not execute.
+        gen: u32,
     },
     /// Storage store (`SSTORE`, or `TSTORE` when `transient`).
     SStore {
@@ -1123,9 +1126,16 @@ impl Mem {
             if other.writes.iter().any(|o| same(o, w)) {
                 merged.push(w.clone());
             } else {
+                let theirs = other
+                    .writes
+                    .iter()
+                    .filter(|o| o.base == w.base && o.off == w.off && o.len == w.len)
+                    .map(|o| o.gen)
+                    .max();
                 merged.push(MemWrite {
                     val: MVal::Unknown,
                     origin: None,
+                    gen: w.gen.max(theirs.unwrap_or(0)),
                     ..w.clone()
                 });
             }
@@ -1314,6 +1324,7 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                     off,
                     val,
                     width: 32,
+                    ..
                 } => sum.mstores.push((*off, *val)),
                 Stmt::MStore { .. } => return fail_summary(201),
                 Stmt::Copy {
@@ -1880,6 +1891,7 @@ impl<'a> Lifter<'a> {
                         off,
                         val,
                         width: 32,
+                        ..
                     }) = bn.stmts.iter().find(|s| matches!(s, Stmt::MStore { .. }))
                     else {
                         return None;
@@ -1906,6 +1918,7 @@ impl<'a> Lifter<'a> {
                         off,
                         val,
                         width: 32,
+                        ..
                     }) = bn.stmts.iter().find(|s| matches!(s, Stmt::MStore { .. }))
                     else {
                         return None;
@@ -2204,12 +2217,14 @@ impl<'a> Lifter<'a> {
                     let off = pop!();
                     let val = pop!();
                     let origin = Some((nid, stmts.len()));
+                    let gen = st.mem.gen + 1;
                     if o == op::MSTORE {
                         st.mem.store_from(off, Some(32), MVal::Word(val), origin);
                         stmts.push(Stmt::MStore {
                             off,
                             val,
                             width: 32,
+                            gen,
                         });
                     } else {
                         let b = op2(op::AND, val, konst_u64(0xff));
@@ -2218,6 +2233,7 @@ impl<'a> Lifter<'a> {
                             off,
                             val: b,
                             width: 1,
+                            gen,
                         });
                     }
                     next_version(&mut st);
@@ -2688,10 +2704,12 @@ impl<'a> Lifter<'a> {
         let summary = self.summaries.get(&call.callee);
         let free_pointer = konst(U256::from_u64(FREE_POINTER));
         let free_now = st.mem.load_word(free_pointer, st.version);
+        let entry_gen = st.mem.gen;
         let subst = |e: ExprId| -> ExprId {
+            let restamped = expr::restamp_memory(e, entry_gen, &mut HashMap::new());
             let mut memo = HashMap::new();
             expr::substitute(
-                e,
+                restamped,
                 &|n| match n {
                     Node::Arg(i) => Some(at(*i as usize)),
                     Node::MLoad(a, _) if *a == free_pointer => Some(free_now),
@@ -2782,11 +2800,13 @@ impl<'a> Lifter<'a> {
                     let (o, v) = (subst(*off), subst(*val));
                     if transparent {
                         let origin = Some((un.id, stmts.len()));
+                        let gen = st.mem.gen + 1;
                         st.mem.store_from(o, Some(32), MVal::Word(v), origin);
                         stmts.push(Stmt::MStore {
                             off: o,
                             val: v,
                             width: 32,
+                            gen,
                         });
                     } else {
                         st.mem.store(o, Some(32), MVal::Word(v));
@@ -3193,10 +3213,16 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             var: f(*var),
             value: f(*value),
         },
-        Stmt::MStore { off, val, width } => Stmt::MStore {
+        Stmt::MStore {
+            off,
+            val,
+            width,
+            gen,
+        } => Stmt::MStore {
             off: f(*off),
             val: f(*val),
             width: *width,
+            gen: *gen,
         },
         Stmt::SStore {
             key,

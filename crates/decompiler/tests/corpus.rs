@@ -958,6 +958,15 @@ fn stores_nothing_reads_are_left_out() {
     );
     assert!(body.contains("return (ret_3_0 * 1e18 / totalSupply);"));
 
+    assert!(
+        pool.contains("loc_220 = loc_220 + 1;\n            if (loc_220 != 2) {"),
+        "a counter tested after its increment reads as the counter"
+    );
+    assert!(
+        pool.contains("if (loc_2c0 <= prev_loc_2c0) {"),
+        "the value before a store is held in a local where it is compared with the new one"
+    );
+
     let old = source("../../testdata/vuln/kotet.hex");
     assert!(
         !old.contains("mem[0x0] = 6;"),

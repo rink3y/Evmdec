@@ -585,7 +585,9 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
             let mut acc = Accesses::default();
             for s in &ln.stmts {
                 match s {
-                    Stmt::MStore { off, val, width } => {
+                    Stmt::MStore {
+                        off, val, width, ..
+                    } => {
                         let o = ev.eval(*off, &mut memo);
                         let v = ev.eval(*val, &mut memo);
                         let bytes = v.to_be_bytes();

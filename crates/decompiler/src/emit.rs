@@ -158,6 +158,8 @@ pub struct Names {
     /// Loads that read a slot's value from before a store printed earlier on the path: printed
     /// under the temporary that saved that value. Filled by the structurer as it prints.
     pub stale: RefCell<HashMap<ExprId, String>>,
+    /// The loads `stale` renames only until the block being printed ends.
+    pub block_stale: RefCell<Vec<ExprId>>,
     /// The value just stored to a slot, printed as the slot while no later store intervenes:
     /// the compiler forwards the stored value instead of reloading it. Filled by the structurer.
     pub forwarded: RefCell<HashMap<ExprId, String>>,
@@ -219,6 +221,38 @@ impl Names {
     pub fn end_block(&self) {
         self.temp_of.borrow_mut().clear();
         self.memo.borrow_mut().clear();
+        let mut stale = self.stale.borrow_mut();
+        for e in self.block_stale.borrow_mut().drain(..) {
+            stale.remove(&e);
+        }
+    }
+
+    /// As [`Names::replace_stale`], until the block ends: what tells an old memory value from
+    /// a new one holds only within the block that overwrites it.
+    pub fn replace_stale_in_block(&self, loads: impl IntoIterator<Item = (ExprId, String)>) {
+        let loads: Vec<(ExprId, String)> = loads.into_iter().collect();
+        self.block_stale
+            .borrow_mut()
+            .extend(loads.iter().map(|(e, _)| *e));
+        self.replace_stale(loads);
+    }
+
+    /// Print `value` as `name` until the block ends: the location `name` now holds it.
+    pub fn forward(&self, value: ExprId, name: String) {
+        self.forwarded.borrow_mut().insert(value, name);
+        self.memo.borrow_mut().clear();
+    }
+
+    /// Print `loads` under the names of the locals that hold their old values from here on.
+    /// Text already rendered in this block may contain them under their own names, so it is
+    /// dropped.
+    pub fn replace_stale(&self, loads: impl IntoIterator<Item = (ExprId, String)>) {
+        let mut stale = self.stale.borrow_mut();
+        let before = stale.len();
+        stale.extend(loads);
+        if stale.len() != before {
+            self.memo.borrow_mut().clear();
+        }
     }
     fn seq(&self, s: u32) -> u32 {
         let mut m = self.seqs.borrow_mut();
@@ -626,7 +660,7 @@ fn is_signed_op(o: u8) -> bool {
 /// for a constant address) -> `(constant part, block number)`.
 pub type Blocks = HashMap<Option<ExprId>, Vec<(U256, u32)>>;
 
-fn is_free_pointer(off: ExprId) -> bool {
+pub(crate) fn is_free_pointer(off: ExprId) -> bool {
     expr::as_const(off) == Some(U256::from_u64(FREE_POINTER))
 }
 
@@ -661,6 +695,7 @@ pub fn number_blocks(l: &Lifted) -> Blocks {
                 off,
                 val,
                 width: 32,
+                ..
             } = st
             {
                 if is_free_pointer(*off) {
@@ -762,6 +797,7 @@ pub fn block_literals(stmts: &[Stmt], hidden: &HashSet<usize>, n: &Names) -> Vec
             off,
             val,
             width: 32,
+            ..
         } = s
         else {
             return None;
@@ -2017,7 +2053,9 @@ fn fmt_call_head(head: &[ExprId], n: &Names) -> (Option<String>, Vec<String>) {
 pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
     match s {
         Stmt::Assign { var, value } => format!("{} = {};", fmt_expr(*var, n), fmt_expr(*value, n)),
-        Stmt::MStore { off, val, width } => {
+        Stmt::MStore {
+            off, val, width, ..
+        } => {
             if *width == 1 {
                 format!("mem8[{}] = {};", fmt_mem_off(*off, n), fmt_expr(*val, n))
             } else {

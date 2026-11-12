@@ -1,25 +1,3 @@
-//! Running a transaction across several contracts.
-//!
-//! [`crate::exec`] runs one frame and answers external calls from a seed, which is enough to
-//! confirm a finding that lives inside one contract. A composed finding spans a call edge: a
-//! function of one contract passes an account its caller named to a function of another, which
-//! lowers that account's entry. Confirming it means the call has to really run, in the callee's
-//! own code and storage.
-//!
-//! A [`World`] holds contracts by address, each with its own storage, and runs a transaction
-//! through them the way the EVM does:
-//!
-//! - `CALL` and `STATICCALL` run the callee's code in the callee's storage, with the calling
-//!   contract as `msg.sender`;
-//! - `DELEGATECALL` and `CALLCODE` run the callee's code in the calling contract's storage;
-//! - `CREATE` and `CREATE2` run the init code and place what it returns at a new address;
-//! - a frame that fails takes every storage write made under it back, nested frames included,
-//!   and a `STATICCALL` leaves no write behind.
-//!
-//! A call to an address outside the world succeeds and returns nothing. Every storage write
-//! that survives is recorded with the value it replaced, so a caller can ask what a run did to
-//! one contract.
-
 use crate::disasm;
 use crate::interp::{CallRecord, CreateRecord, Host, Machine, Outcome};
 use crate::opcode as op;
@@ -27,80 +5,55 @@ use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-/// Steps one transaction may take across every frame before it is abandoned.
 const BUDGET: usize = 600_000;
-/// Nested frames deep the driver goes before a call is answered as one out of the world.
 const MAX_DEPTH: usize = 12;
-/// Addresses of created contracts count up from here.
 const FIRST_MADE: u64 = 0xc0de_0000_0000;
 
-/// One storage write that survived the transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Write {
-    /// The contract whose storage was written.
     pub address: U256,
-    /// The slot.
     pub slot: U256,
-    /// The value the slot held before the write.
     pub before: U256,
-    /// The value written.
     pub after: U256,
 }
 
-/// What a frame runs as: whose storage it uses and what it sees as its caller.
 #[derive(Clone, Debug)]
 struct Frame {
-    /// The executing account: `ADDRESS`, and the storage the frame reads and writes.
     account: U256,
-    /// `CALLER`.
     caller: U256,
-    /// `CALLVALUE`.
     value: U256,
-    /// Call data.
     data: Vec<u8>,
 }
 
-/// The parts of the world a failed frame takes back.
 struct Saved {
     storage: HashMap<U256, HashMap<U256, U256>>,
     codes: HashMap<U256, Rc<Vec<u8>>>,
     writes: usize,
 }
 
-/// Contracts by address, each with its own storage, and the record of one transaction.
 #[derive(Default)]
 pub struct World {
-    /// Runtime code by address.
     codes: HashMap<U256, Rc<Vec<u8>>>,
-    /// Storage by address.
     storage: HashMap<U256, HashMap<U256, U256>>,
-    /// Storage writes of the transaction in order, without those a failed frame took back.
     writes: Vec<Write>,
-    /// The account that sent the transaction (`ORIGIN`).
     origin: U256,
-    /// Steps left in the transaction.
     budget: usize,
-    /// Contracts created so far in the transaction.
     made: u64,
 }
 
 impl World {
-    /// An empty world.
     pub fn new() -> World {
         World::default()
     }
 
-    /// Place `code` at `address`.
     pub fn place(&mut self, address: U256, code: Vec<u8>) {
         self.codes.insert(address, Rc::new(code));
     }
 
-    /// Set slot `slot` of `address` to `value` before the transaction runs.
     pub fn seed(&mut self, address: U256, slot: U256, value: U256) {
         self.storage.entry(address).or_default().insert(slot, value);
     }
 
-    /// The value `address` holds at `slot`; zero when nothing was stored there.
     pub fn stored(&self, address: U256, slot: U256) -> U256 {
         self.storage
             .get(&address)
@@ -109,18 +62,14 @@ impl World {
             .unwrap_or(U256::ZERO)
     }
 
-    /// The storage writes of the last transaction that survived, in order.
     pub fn writes(&self) -> &[Write] {
         &self.writes
     }
 
-    /// Was `address` created during the last transaction?
     pub fn was_made(&self, address: U256) -> bool {
         address.fits_u64() && (FIRST_MADE + 1..=FIRST_MADE + self.made).contains(&address.low_u64())
     }
 
-    /// Run a transaction from `caller` to `address` with `data` and `value`. Returns whether
-    /// the outermost frame ended normally; when it did not, storage is as it was before.
     pub fn run(&mut self, address: U256, caller: U256, value: U256, data: Vec<u8>) -> bool {
         self.budget = BUDGET;
         self.writes.clear();
@@ -157,8 +106,6 @@ impl World {
         self.writes.truncate(saved.writes);
     }
 
-    /// Run `code` as `frame`. Returns `(success, returned or reverted data)`. On success the
-    /// frame's storage is written back; on failure nothing is, and the caller restores the rest.
     fn frame(&mut self, code: &[u8], frame: &Frame, depth: usize) -> (bool, Vec<u8>) {
         let jumpdests: HashSet<usize> = disasm::jumpdests(code).into_iter().collect();
         let mut host =
@@ -249,9 +196,6 @@ impl World {
         }
     }
 
-    /// Resolve one call made by `from`: run the callee when it is in the world, in the storage
-    /// and under the caller its call kind gives it, and take its writes back when it fails or
-    /// was only allowed to read.
     fn call(&mut self, record: &CallRecord, from: &Frame, depth: usize) -> (bool, Vec<u8>) {
         if record.addr == U256::from_u64(4) {
             return (true, record.input.clone());
@@ -291,8 +235,6 @@ impl World {
         (success, output)
     }
 
-    /// Run the init code of one creation by `from` at a new address and place the code it
-    /// returns there. Returns the address, or zero when the creation failed.
     fn create(&mut self, record: &CreateRecord, from: &Frame, depth: usize) -> U256 {
         if depth >= MAX_DEPTH {
             return U256::ZERO;
@@ -324,8 +266,6 @@ mod tests {
     const FIRST: U256 = U256::from_u64(0xf1);
     const SECOND: U256 = U256::from_u64(0xf2);
 
-    /// Code that stores 1 at the slot named by its first call-data word and then ends with
-    /// the opcode `end`.
     fn stores_then(end: &[u8]) -> Vec<u8> {
         let mut code = vec![
             op::PUSH1,
@@ -339,7 +279,6 @@ mod tests {
         code
     }
 
-    /// Code that passes its own call data to `SECOND` with the call opcode `kind` and stops.
     fn passes_on(kind: u8) -> Vec<u8> {
         let mut code = vec![
             op::CALLDATASIZE,
@@ -363,7 +302,6 @@ mod tests {
         code
     }
 
-    /// Call data whose first word after the selector is `slot`.
     fn naming(slot: u8) -> Vec<u8> {
         let mut data = vec![0u8; 36];
         data[35] = slot;

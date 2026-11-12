@@ -1,33 +1,21 @@
-//! 256-bit unsigned integer with full EVM arithmetic semantics, written from scratch.
-//!
-//! Representation: four little-endian 64-bit limbs (`limbs[0]` is least significant).
-
 use std::cmp::Ordering;
 use std::fmt;
 
-/// A 256-bit unsigned integer with EVM semantics, stored as four little-endian `u64` limbs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct U256(pub [u64; 4]);
 
 impl U256 {
-    /// The value zero.
     pub const ZERO: U256 = U256([0, 0, 0, 0]);
-    /// The value one.
     pub const ONE: U256 = U256([1, 0, 0, 0]);
-    /// The largest value, `2^256 - 1` (all bits set; `-1` when read as two's complement).
     pub const MAX: U256 = U256([u64::MAX; 4]);
 
-    /// Widens a `u64`.
     pub const fn from_u64(v: u64) -> U256 {
         U256([v, 0, 0, 0])
     }
-    /// Widens a `u128`.
     pub const fn from_u128(v: u128) -> U256 {
         U256([v as u64, (v >> 64) as u64, 0, 0])
     }
 
-    /// Builds a value from big-endian bytes, left-padding shorter inputs with zero.
-    /// Only the last 32 bytes of a longer slice are used.
     pub fn from_be_bytes(bytes: &[u8]) -> U256 {
         let mut buf = [0u8; 32];
         let n = bytes.len().min(32);
@@ -43,7 +31,6 @@ impl U256 {
         U256(limbs)
     }
 
-    /// The value as 32 big-endian bytes (one EVM word).
     pub fn to_be_bytes(&self) -> [u8; 32] {
         let mut out = [0u8; 32];
         for i in 0..4 {
@@ -55,23 +42,18 @@ impl U256 {
         out
     }
 
-    /// True if the value is zero.
     pub fn is_zero(&self) -> bool {
         self.0 == [0, 0, 0, 0]
     }
-    /// The least-significant 64 bits; higher bits are discarded.
     pub fn low_u64(&self) -> u64 {
         self.0[0]
     }
-    /// The least-significant 128 bits; higher bits are discarded.
     pub fn low_u128(&self) -> u128 {
         self.0[0] as u128 | ((self.0[1] as u128) << 64)
     }
-    /// True if the value is representable as a `u64` (the upper three limbs are zero).
     pub fn fits_u64(&self) -> bool {
         self.0[1] == 0 && self.0[2] == 0 && self.0[3] == 0
     }
-    /// The value as a `usize`, or `None` if it does not fit.
     pub fn as_usize(&self) -> Option<usize> {
         if self.fits_u64() && self.0[0] <= usize::MAX as u64 {
             Some(self.0[0] as usize)
@@ -79,7 +61,6 @@ impl U256 {
             None
         }
     }
-    /// Number of significant bits: one plus the index of the highest set bit, or 0 for zero.
     pub fn bits(&self) -> u32 {
         for i in (0..4).rev() {
             if self.0[i] != 0 {
@@ -88,22 +69,18 @@ impl U256 {
         }
         0
     }
-    /// Number of bytes needed to hold the value without leading zero bytes (0 for zero).
     pub fn byte_len(&self) -> usize {
         self.bits().div_ceil(8) as usize
     }
-    /// Bit `i` (0 = least significant); indices of 256 or more read as `false`.
     pub fn bit(&self, i: u32) -> bool {
         if i >= 256 {
             return false;
         }
         (self.0[(i / 64) as usize] >> (i % 64)) & 1 == 1
     }
-    /// Number of leading zero bits in the 256-bit representation (256 for zero).
     pub fn leading_zeros(&self) -> u32 {
         256 - self.bits()
     }
-    /// Number of trailing zero bits (256 for zero).
     pub fn trailing_zeros(&self) -> u32 {
         for i in 0..4 {
             if self.0[i] != 0 {
@@ -112,20 +89,16 @@ impl U256 {
         }
         256
     }
-    /// Number of set bits.
     pub fn count_ones(&self) -> u32 {
         self.0.iter().map(|l| l.count_ones()).sum()
     }
-    /// True if exactly one bit is set.
     pub fn is_power_of_two(&self) -> bool {
         self.count_ones() == 1
     }
-    /// True if the value is `2^n - 1` for some n in 1..=256 (a contiguous low mask).
     pub fn is_low_mask(&self) -> bool {
         !self.is_zero() && (*self + U256::ONE).is_power_of_two() || *self == U256::MAX
     }
 
-    /// Addition modulo `2^256`, also reporting whether a carry out of bit 255 occurred.
     pub fn overflowing_add(self, rhs: U256) -> (U256, bool) {
         let mut r = [0u64; 4];
         let mut carry = 0u64;
@@ -137,7 +110,6 @@ impl U256 {
         }
         (U256(r), carry != 0)
     }
-    /// Subtraction modulo `2^256`, also reporting whether it borrowed (i.e. `self < rhs`).
     pub fn overflowing_sub(self, rhs: U256) -> (U256, bool) {
         let mut r = [0u64; 4];
         let mut borrow = 0u64;
@@ -149,15 +121,12 @@ impl U256 {
         }
         (U256(r), borrow != 0)
     }
-    /// Addition modulo `2^256` (EVM `ADD`).
     pub fn wrapping_add(self, rhs: U256) -> U256 {
         self.overflowing_add(rhs).0
     }
-    /// Subtraction modulo `2^256` (EVM `SUB`).
     pub fn wrapping_sub(self, rhs: U256) -> U256 {
         self.overflowing_sub(rhs).0
     }
-    /// Multiplication modulo `2^256` (EVM `MUL`); the high 256 bits of the product are dropped.
     pub fn wrapping_mul(self, rhs: U256) -> U256 {
         let mut r = [0u64; 8];
         for i in 0..4 {
@@ -180,7 +149,6 @@ impl U256 {
         }
         U256([r[0], r[1], r[2], r[3]])
     }
-    /// Full 512-bit product as (low, high).
     pub fn full_mul(self, rhs: U256) -> (U256, U256) {
         let mut r = [0u64; 8];
         for i in 0..4 {
@@ -198,7 +166,6 @@ impl U256 {
         )
     }
 
-    /// Arithmetic shift right (EVM SAR).
     pub fn sar(self, n: u32) -> U256 {
         let neg = self.bit(255);
         if n >= 256 {
@@ -212,7 +179,6 @@ impl U256 {
         }
     }
 
-    /// Unsigned division and remainder. Division by zero yields (0, 0) as in the EVM.
     pub fn div_rem(self, rhs: U256) -> (U256, U256) {
         if rhs.is_zero() {
             return (U256::ZERO, U256::ZERO);
@@ -252,11 +218,10 @@ impl U256 {
         (q, rem)
     }
 
-    /// True if bit 255 is set, i.e. the value is negative as a two's-complement `int256`.
     pub fn is_negative(&self) -> bool {
         self.bit(255)
     }
-    /// Two's-complement absolute value; `-2^255` maps to itself since `2^255` is not representable.
+    // -2^255 maps to itself. 2^255 is not representable.
     pub fn abs(self) -> U256 {
         if self.is_negative() {
             -self
@@ -264,9 +229,6 @@ impl U256 {
             self
         }
     }
-    /// Signed division truncating toward zero (EVM `SDIV`).
-    ///
-    /// Division by zero yields zero, and `-2^255 / -1` yields `-2^255` as the EVM does.
     pub fn sdiv(self, rhs: U256) -> U256 {
         if rhs.is_zero() {
             return U256::ZERO;
@@ -282,7 +244,6 @@ impl U256 {
             q
         }
     }
-    /// Signed remainder taking the sign of the dividend (EVM `SMOD`); a zero divisor yields zero.
     pub fn smod(self, rhs: U256) -> U256 {
         if rhs.is_zero() {
             return U256::ZERO;
@@ -294,7 +255,6 @@ impl U256 {
             r
         }
     }
-    /// Compares the two values as signed two's-complement integers (EVM `SLT`/`SGT`).
     pub fn scmp(&self, other: &U256) -> Ordering {
         match (self.is_negative(), other.is_negative()) {
             (true, false) => Ordering::Less,
@@ -302,7 +262,6 @@ impl U256 {
             _ => self.cmp(other),
         }
     }
-    /// `(self + b) mod m` without intermediate overflow (EVM `ADDMOD`); a zero modulus yields zero.
     pub fn addmod(self, b: U256, m: U256) -> U256 {
         if m.is_zero() {
             return U256::ZERO;
@@ -320,9 +279,6 @@ impl U256 {
             t
         }
     }
-    /// `(self * b) mod m` computed on the full 512-bit product (EVM `MULMOD`).
-    ///
-    /// A zero modulus yields zero.
     pub fn mulmod(self, b: U256, m: U256) -> U256 {
         if m.is_zero() {
             return U256::ZERO;
@@ -343,7 +299,6 @@ impl U256 {
         }
         rem
     }
-    /// Exponentiation modulo `2^256` by square-and-multiply (EVM `EXP`); `x^0` is one.
     pub fn pow(self, mut exp: U256) -> U256 {
         let mut base = self;
         let mut acc = U256::ONE;
@@ -358,7 +313,6 @@ impl U256 {
         }
         acc
     }
-    /// EVM SIGNEXTEND: `b` is the byte index of the sign byte.
     pub fn signextend(b: U256, x: U256) -> U256 {
         if b >= U256::from_u64(31) {
             return x;
@@ -370,7 +324,6 @@ impl U256 {
             x & ((U256::ONE << (bit + 1)).wrapping_sub(U256::ONE))
         }
     }
-    /// EVM BYTE: the i-th byte (big-endian, 0 = most significant).
     pub fn byte(i: U256, x: U256) -> U256 {
         if i >= U256::from_u64(32) {
             return U256::ZERO;
@@ -379,7 +332,6 @@ impl U256 {
         U256::from_u64(bytes[i.low_u64() as usize] as u64)
     }
 
-    /// Lower-case `0x`-prefixed hex without leading zeros; zero is `0x0`.
     pub fn to_hex(&self) -> String {
         if self.is_zero() {
             return "0x0".into();
@@ -400,8 +352,6 @@ impl U256 {
         }
         s
     }
-    /// Lower-case `0x`-prefixed hex of the low `bytes` bytes (at most 32), zero-padded to that
-    /// width.
     pub fn to_hex_padded(&self, bytes: usize) -> String {
         let b = self.to_be_bytes();
         let mut s = String::from("0x");
@@ -410,7 +360,6 @@ impl U256 {
         }
         s
     }
-    /// The value in decimal without leading zeros.
     pub fn to_decimal(&self) -> String {
         if self.is_zero() {
             return "0".into();
@@ -433,9 +382,6 @@ impl U256 {
         }
         s
     }
-    /// Parses an unsigned decimal string; `None` on any non-digit.
-    ///
-    /// An empty string parses as zero and values of `2^256` or more wrap silently.
     pub fn from_dec_str(s: &str) -> Option<U256> {
         let mut v = U256::ZERO;
         for c in s.bytes() {
@@ -448,8 +394,6 @@ impl U256 {
         }
         Some(v)
     }
-    /// Parses 1 to 64 hex digits with an optional `0x` prefix; `None` if empty, too long or not
-    /// hex.
     pub fn from_hex_str(s: &str) -> Option<U256> {
         let s = s.strip_prefix("0x").unwrap_or(s);
         if s.is_empty() || s.len() > 64 {
@@ -573,7 +517,6 @@ impl fmt::LowerHex for U256 {
     }
 }
 
-/// Logical shift left; shifts of 256 or more yield zero (EVM `SHL`).
 impl std::ops::Shl<u32> for U256 {
     type Output = U256;
     fn shl(self, n: u32) -> U256 {
@@ -594,7 +537,6 @@ impl std::ops::Shl<u32> for U256 {
     }
 }
 
-/// Logical shift right; shifts of 256 or more yield zero (EVM `SHR`).
 impl std::ops::Shr<u32> for U256 {
     type Output = U256;
     fn shr(self, n: u32) -> U256 {
@@ -615,7 +557,6 @@ impl std::ops::Shr<u32> for U256 {
     }
 }
 
-/// Unsigned division; division by zero yields zero (EVM `DIV`).
 impl std::ops::Div for U256 {
     type Output = U256;
     fn div(self, rhs: U256) -> U256 {
@@ -623,7 +564,6 @@ impl std::ops::Div for U256 {
     }
 }
 
-/// Unsigned remainder; a zero divisor yields zero (EVM `MOD`).
 impl std::ops::Rem for U256 {
     type Output = U256;
     fn rem(self, rhs: U256) -> U256 {
@@ -631,7 +571,6 @@ impl std::ops::Rem for U256 {
     }
 }
 
-/// Two's-complement negation (wrapping).
 impl std::ops::Neg for U256 {
     type Output = U256;
     fn neg(self) -> U256 {

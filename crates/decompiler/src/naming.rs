@@ -1,15 +1,3 @@
-//! Names the code implies where no signature gives one.
-//!
-//! A storage variable is named by the setter that writes it, by the event announcing its
-//! change, or by its role: the address the contract's guards compare with the caller, the slot
-//! toggled as a lock, the ledger a transfer debits and credits with the allowance and supply
-//! that move with it, a timestamp. An internal function is named by what it does: the event it
-//! emits, the call it makes, the variable it writes, the caller check it performs. A parameter
-//! is named by how it is used: the account debited, the account credited, the amount, a
-//! deadline, the parts of a signature, a call target. Every rule reads the lifted code; none
-//! lists contracts, and a name is given only where the default (`stor_3`, `func_0x1fbb`,
-//! `arg0`) would otherwise stand.
-
 use crate::decompile::{Function, StorageVar};
 use crate::emit::{self, MappingLayout};
 use crate::expr::{self, ExprId, Node};
@@ -21,54 +9,32 @@ use crate::ssa::{self, Step};
 use crate::u256::U256;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-/// A storage variable or one packed field of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Target {
-    /// The variable rooted at this slot (a scalar, a mapping, an array).
     Var(U256),
-    /// The field at this byte offset and bit width of a packed slot.
     Field(U256, u32, u32),
-    /// What an element of the mapping or array rooted at this slot holds at this slot offset,
-    /// byte offset and bit width: a struct member, or the element itself where there is no
-    /// struct.
     Member(U256, u64, u32, u32),
 }
 
-/// One ledger movement: `entry = entry - amount` or `entry = entry + amount`.
 #[derive(Clone, Debug)]
 struct Movement {
-    /// Root slot of the mapping.
     root: U256,
-    /// Keys from the root to the entry.
     keys: Vec<ExprId>,
-    /// The amount moved.
     amount: ExprId,
-    /// The entry grew.
     credit: bool,
 }
 
-/// What one function's own statements do, as far as naming cares.
 #[derive(Clone, Debug, Default)]
 struct Facts {
-    /// Every store: where and what.
     stores: Vec<(Target, ExprId)>,
-    /// Mapping entries raised or lowered by an amount.
     movements: Vec<Movement>,
-    /// Constant slots raised or lowered by an amount: `(slot, amount, grew)`.
     scalar_moves: Vec<(U256, ExprId, bool)>,
-    /// Names of the events emitted, where the topic is known.
     events: BTreeSet<String>,
-    /// Some event with an unknown topic is emitted.
     unknown_event: bool,
-    /// Names of the functions called on other contracts, where the selector is known.
     calls: BTreeSet<String>,
-    /// Some call on another contract has an unknown selector.
     unknown_call: bool,
-    /// Ether is sent with an empty payload.
     sends_value: bool,
-    /// Storage the caller is compared with in a guard.
     caller_guards: BTreeSet<Target>,
-    /// Internal functions called.
     callees: Vec<usize>,
 }
 
@@ -91,7 +57,6 @@ fn is_caller(e: ExprId) -> bool {
     matches!(expr::node(unmask(e)), Node::Env(op::CALLER, _))
 }
 
-/// The variable, field or element member a store writes.
 fn store_target(key: ExprId, val: ExprId, layout: MappingLayout) -> Option<Target> {
     let path = ssa::slot_path(key, layout)?;
     let field = || ssa::field_write(key, val).map(|w| (w.bit_offset / 8, w.bits));
@@ -111,7 +76,6 @@ fn store_target(key: ExprId, val: ExprId, layout: MappingLayout) -> Option<Targe
     }
 }
 
-/// The constant slot or packed field `e` reads, through a width mask.
 fn read_target(e: ExprId) -> Option<Target> {
     if let Some((slot, offset, bits)) = emit::packed_read(e) {
         return Some(if offset == 0 && bits >= 160 {
@@ -126,7 +90,6 @@ fn read_target(e: ExprId) -> Option<Target> {
     }
 }
 
-/// Storage compared for equality with the caller anywhere in `cond`.
 fn caller_comparisons(cond: ExprId, out: &mut BTreeSet<Target>) {
     let mut seen = HashSet::new();
     let mut stack = vec![cond];
@@ -259,7 +222,6 @@ fn facts(l: &Lifted, layout: MappingLayout, use_sigs: bool) -> Facts {
     f
 }
 
-/// `facts` of every lifted function, by entry pc.
 fn all_facts(
     functions: &[Function],
     layout: MappingLayout,
@@ -275,7 +237,6 @@ fn all_facts(
         .collect()
 }
 
-/// The functions reachable from `pc` through internal calls, `pc` included.
 fn reach(pc: usize, all: &BTreeMap<usize, Facts>) -> Vec<usize> {
     let mut seen = BTreeSet::new();
     let mut stack = vec![pc];
@@ -290,8 +251,6 @@ fn reach(pc: usize, all: &BTreeMap<usize, Facts>) -> Vec<usize> {
     seen.into_iter().collect()
 }
 
-/// `fee` for `Fee`, `ttl` for `TTL`, `uriPrefix` for `URIPrefix`: a leading run of capitals
-/// is one word, up to the capital that starts the next.
 fn lower_first(s: &str) -> String {
     let run = s.chars().take_while(char::is_ascii_uppercase).count();
     let word = match run {
@@ -310,7 +269,6 @@ fn upper_first(s: &str) -> String {
     }
 }
 
-/// `fee` for `setFee`, `updateFee`, `changeFee` and `set_fee`.
 fn setter_stem(name: &str) -> Option<String> {
     ["set", "update", "change"].iter().find_map(|p| {
         let rest = name.strip_prefix(p)?;
@@ -321,7 +279,6 @@ fn setter_stem(name: &str) -> Option<String> {
     })
 }
 
-/// `fee` for `FeeUpdated`, `FeeChanged`, `FeeSet`, `NewFee`, `SetFee` and `UpdateFee`.
 fn event_stem(name: &str) -> Option<String> {
     let suffix = ["Updated", "Changed", "Set"]
         .iter()
@@ -334,7 +291,6 @@ fn event_stem(name: &str) -> Option<String> {
     suffix.or(prefix).map(lower_first)
 }
 
-/// Words a name must not be: they would read as the language, not as a variable.
 const RESERVED: &[&str] = &[
     "address",
     "bool",
@@ -394,15 +350,12 @@ fn usable(name: &str) -> bool {
         && name.len() <= 48
 }
 
-/// The names in use and the renaming of storage that still carries a default name.
 struct Namer<'a> {
     storage: &'a mut [StorageVar],
     taken: HashSet<String>,
 }
 
 impl<'a> Namer<'a> {
-    /// A variable may share its name with an external function, as a public variable does with
-    /// its getter; it may not share one with another variable or with an internal function.
     fn new(storage: &'a mut [StorageVar], functions: &[Function]) -> Namer<'a> {
         let mut taken: HashSet<String> = functions
             .iter()
@@ -416,8 +369,6 @@ impl<'a> Namer<'a> {
         Namer { storage, taken }
     }
 
-    /// Whether `t` exists and still has its default name. A mapping or array of structs is not
-    /// named here: a store that looks like a write of the variable is a write of one member.
     fn unnamed(&self, t: Target) -> bool {
         match canonical(self.storage, t) {
             Target::Var(slot) => self.storage.iter().any(|v| {
@@ -450,7 +401,6 @@ impl<'a> Namer<'a> {
         }
     }
 
-    /// Give `t` the name, if it is still unnamed and the name is free.
     fn name(&mut self, t: Target, name: &str) -> bool {
         if !usable(name) || self.taken.contains(name) || !self.unnamed(t) {
             return false;
@@ -487,7 +437,6 @@ impl<'a> Namer<'a> {
         true
     }
 
-    /// The suffix of a default name: `3` for `stor_3`.
     fn suffix(&self, t: Target) -> Option<String> {
         let t = canonical(self.storage, t);
         self.storage.iter().find_map(|v| match t {
@@ -504,8 +453,6 @@ impl<'a> Namer<'a> {
     }
 }
 
-/// Mappings some function both lowers and raises by one key: a ledger whose entries are
-/// balances moved between parties.
 fn ledger_roots(all: &BTreeMap<usize, Facts>) -> BTreeSet<U256> {
     let mut out = BTreeSet::new();
     for facts in all.values() {
@@ -526,9 +473,6 @@ fn ledger_roots(all: &BTreeMap<usize, Facts>) -> BTreeSet<U256> {
     out
 }
 
-/// Name storage variables and struct members that still have a default name: by the one
-/// variable a setter writes (the plainest setter name wins where several write it), by the one
-/// variable written where a change event is emitted, then by role.
 pub fn name_storage(
     functions: &[Function],
     storage: &mut [StorageVar],
@@ -717,8 +661,6 @@ pub fn name_storage(
     }
 }
 
-/// `t` as the layout declares it: a write through a mask to a slot that holds one variable is
-/// that variable, and a whole-word read of a packed slot's first field is that field.
 fn canonical(storage: &[StorageVar], t: Target) -> Target {
     let var = |slot: U256| storage.iter().find(|v| slot_of(v) == Some(slot));
     match t {
@@ -742,7 +684,6 @@ fn canonical(storage: &[StorageVar], t: Target) -> Target {
     }
 }
 
-/// The printed name of a variable or field.
 fn label_in(storage: &[StorageVar], t: Target) -> Option<String> {
     let t = canonical(storage, t);
     storage.iter().find_map(|v| match t {
@@ -767,7 +708,6 @@ fn label_in(storage: &[StorageVar], t: Target) -> Option<String> {
     })
 }
 
-/// Name internal functions that still have a default name by what their own statements do.
 pub fn name_helpers(
     functions: &mut [Function],
     storage: &[StorageVar],
@@ -854,37 +794,22 @@ pub fn name_helpers(
     }
 }
 
-/// How a function uses one of its inputs, strongest first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Role {
-    /// Key of a ledger entry that is lowered.
     From,
-    /// Key of a ledger entry that is raised.
     To,
-    /// The amount an entry or a counter moves by.
     Amount,
-    /// Compared with the block timestamp in a guard.
     Deadline,
-    /// The recovery byte given to `ecrecover`.
     SigV,
-    /// The first half of a signature given to `ecrecover`.
     SigR,
-    /// The second half of a signature given to `ecrecover`.
     SigS,
-    /// The hash given to `ecrecover`.
     Digest,
-    /// Address ether is sent to, or the beneficiary of a self-destruct.
     Recipient,
-    /// Address a call is made on.
     Target,
-    /// Key of a mapping entry that is written or read.
     Account,
 }
 
 impl Role {
-    /// The name for an input of Solidity type `ty`, or `None` when the type does not fit the
-    /// role: only an address is a party to a transfer or a call target, only an unsigned
-    /// integer an amount or a deadline. A mapping key that is not an address is a `key`.
     fn name_for(self, ty: &str) -> Option<&'static str> {
         let address = ty.starts_with("address");
         let unsigned = ty.starts_with("uint");
@@ -905,21 +830,16 @@ impl Role {
     }
 }
 
-/// An input of a function: a calldata head word, or a parameter of an internal function in
-/// declaration order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Input {
     Word(u32),
     Param(u32),
 }
 
-/// What is known about one input: its strongest role, and where it is stored as it is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Use {
     role: Option<Role>,
-    /// The scalar variable or field the input is stored into unchanged.
     variable: Option<Target>,
-    /// The input is stored unchanged somewhere: a variable, a mapping entry, an array.
     stored: bool,
 }
 
@@ -956,8 +876,6 @@ fn input_of(e: ExprId, arity: usize) -> Option<Input> {
     }
 }
 
-/// What the statements of `l` say about its inputs. `callee` gives what is already known for
-/// an internal function's parameters, so a value passed on takes the use it has there.
 fn uses(
     l: &Lifted,
     layout: MappingLayout,
@@ -1092,11 +1010,6 @@ fn uses(
     out
 }
 
-/// Name parameters that still have a default name by what the code does with them: the name of
-/// the variable an input is stored into, else its role. Two inputs with the same name are
-/// numbered; a name a storage variable already has gets a trailing underscore, so a parameter
-/// never reads as the variable. An input stored somewhere without a name of its own is a
-/// `value` only when nothing better is known and it is the function's only such input.
 pub fn name_params(functions: &mut [Function], storage: &[StorageVar], layout: MappingLayout) {
     let arities: HashMap<usize, usize> = functions
         .iter()

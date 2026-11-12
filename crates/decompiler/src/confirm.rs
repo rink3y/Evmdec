@@ -1,14 +1,3 @@
-//! Confirming findings by reaching their sink.
-//!
-//! A static rule says a pattern is present; it cannot say the pattern is reachable. For the
-//! findings whose whole claim is "an arbitrary caller reaches this sink" — an unprotected owner
-//! write, an unguarded withdrawal, an open `selfdestruct`, an attacker-controlled delegatecall —
-//! this pass tries to prove it: it runs the real dispatcher ([`crate::exec`]) from a fresh state
-//! with the caller set to an account that holds no role, searching a small space of calldata,
-//! and checks whether execution reaches the sink instruction. When it does, the finding carries
-//! the calldata that got there and is marked confirmed; when it does not, nothing changes
-//! (a bounded search finding no witness is not a proof of safety).
-
 use crate::analyze::{display_name, Confidence, Finding};
 use crate::decompile::{Contract, Function};
 use crate::exec::{self, FrameRun};
@@ -19,12 +8,10 @@ use crate::opcode as op;
 use crate::u256::U256;
 use std::collections::HashMap;
 
-/// Selector of `transferFrom(address,address,uint256)`.
 const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
 
-/// Finding ids whose claim is exactly "an arbitrary caller reaches the sink from a fresh state".
-/// For these a reached sink is a confirmation; other rules (reentrancy, which needs a seeded
-/// balance; arithmetic, which is about values not reachability) are left untouched.
+// Only rules whose whole claim is reachability from a fresh state.
+// Reentrancy needs a seeded balance and arithmetic is about values.
 const CONFIRMABLE: &[&str] = &[
     "unprotected-ether-withdrawal",
     "unprotected-owner-write",
@@ -39,21 +26,15 @@ const CONFIRMABLE: &[&str] = &[
     "silent-auth-failure",
 ];
 
-/// Steps a single run may take before it is abandoned (bounds loops).
 const STEP_BUDGET: usize = 120_000;
-/// Calldata shapes tried per finding before giving up.
 const MAX_ATTEMPTS: usize = 200;
-/// Ether sent in the second round of attempts, for sinks behind a payment.
 const SOME_ETHER: U256 = U256::from_u64(100_000_000_000_000_000);
 
-/// Appended to a confirmed finding's description.
 const CONFIRMED_NOTE: &str = concat!(
     " Confirmed: a caller holding no role reaches this sink from a fresh state and the",
     " transaction keeps its effect (a reproducing input is attached)."
 );
 
-/// Try to confirm the reachable findings of `c` in place. Setting `EVMDEC_NO_CONFIRM` in the
-/// environment skips the pass (the search runs the bytecode and costs time).
 pub fn confirm(c: &Contract, findings: &mut [Finding]) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() {
         return;
@@ -85,15 +66,9 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
     }
 }
 
-/// Search a small calldata space for an input under which `f`, called by the role-less account,
-/// enters the block at `pc`, ends normally and shows the effect the rule `id` claims. Returns
-/// the calldata on the first hit.
-///
-/// `pc` is an offset into `code` (a composite's finding pcs are translated first).
-/// A finding's `pc` is the start of the block holding the sink, so entering it is necessary but
-/// not sufficient: the block may still revert on a guard inlined ahead of the sink, and a frame
-/// that reverts later undoes the write or the call. The run must therefore end normally and
-/// leave the trace the claim is about ([`shows_effect`]).
+// Entering the sink's block is not enough.
+// A guard ahead of the sink or a later revert undoes the effect.
+// So the run must end normally and show it.
 fn reach(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
     let selector = exec::selector_of(f);
     let mut attempts = 0;
@@ -116,7 +91,6 @@ fn reach(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
     None
 }
 
-/// Did the run leave the trace that the rule `id` claims a role-less caller can produce?
 fn shows_effect(id: &str, run: &FrameRun) -> bool {
     let call_of = |pred: &dyn Fn(&CallRecord) -> bool| run.calls.iter().any(pred);
     match id {

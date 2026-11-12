@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""Harvest the runtime bytecode of contracts touched by recent mainnet blocks (no ABI needed).
-
-Usage: corpus/harvest.py --out DIR [--blocks 20] [--rpc URL] [--max 150]
-Writes DIR/<address>.hex for every distinct `to` address with code.
-"""
 import argparse, json, os, sys, random
 
 def rpc(url, method, params):

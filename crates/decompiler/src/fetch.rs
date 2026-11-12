@@ -1,19 +1,3 @@
-//! Fetching a contract by address and assembling what it really is.
-//!
-//! A contract's code is rarely the whole story: a proxy forwards to an implementation, a
-//! diamond routes each selector to a facet, and all of them call other contracts whose
-//! behaviour is part of theirs. This module fetches the code at an address, resolves the
-//! pattern it implements, fetches the code it forwards to and composes the pieces into one
-//! [`Contract`] ([`crate::decompile::compose`]) so the analyzer sees what callers see.
-//!
-//! It then walks the call graph from there. Level by level, every call target of the contracts
-//! fetched so far (a fixed address, a library, the address a storage slot holds) is fetched and
-//! resolved the same way, libraries and targets whose state a call may change first, targets
-//! that are only read last. The walk ends at the configured depth, at the limit on contracts per
-//! request, or when its time is up, and what it saw without fetching is listed with the reason.
-//! Finally each fetched contract's own storage is asked whether it approves the contracts that
-//! call it, at the slots and mapping entries its access checks read.
-
 use crate::analyze;
 use crate::clock;
 use crate::decompile::{self, Contract, Link, Options, PartInput, PartRole, ProxyRef, Unfollowed};
@@ -24,21 +8,13 @@ use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// What to fetch beyond the code at the address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
-    /// Resolve proxies and diamonds and compose them with their code.
     pub follow: bool,
-    /// Call targets fetched from one contract, at most.
     pub max_linked: usize,
-    /// Code units fetched for one request, at most, across parts and dependencies.
     pub max_total: usize,
-    /// Call edges to follow from the contract asked for: 1 fetches what it calls, 2 also what
-    /// those contracts call, and so on. 0 fetches no dependency.
     pub depth: usize,
-    /// Time one dependency may take to decompile before it is left out.
     pub contract_time: Duration,
-    /// Time the walk over dependencies may take before it stops fetching.
     pub walk_time: Duration,
 }
 
@@ -55,17 +31,11 @@ impl Default for Policy {
     }
 }
 
-/// Gate locations read per contract when asking whom it approves, at most.
 const MAX_GATES_READ: usize = 8;
-/// Calling contracts checked against one contract's gates, at most.
 const MAX_CALLERS_CHECKED: usize = 4;
 
-/// Code already fetched, by lower-case address, so a second pass over the same request (for
-/// instance after an online signature lookup) decompiles again without asking the node again.
 pub type CodeCache = HashMap<String, Vec<u8>>;
 
-/// Fetch, resolve and compose the contract at `address` on `chain`. Progress lines go to
-/// `log`; the result is the composed contract with its dependencies in `linked`.
 pub fn fetch(
     client: &Client,
     address: &str,
@@ -99,26 +69,18 @@ pub fn fetch(
     Ok(fetcher.walk(root))
 }
 
-/// A call target waiting to be fetched.
 struct Edge {
-    /// Address of the target.
     target: String,
-    /// Address of the contract that calls it.
     from: String,
-    /// How the caller names it.
     how: String,
-    /// Fetch order: libraries, then targets a call may change, then targets only read.
     class: u8,
 }
 
-/// A storage slot as short hex, for messages: `0x5` rather than 32 bytes.
 fn short_slot(slot: &str) -> String {
     let digits = slot.trim_start_matches("0x").trim_start_matches('0');
     format!("0x{}", if digits.is_empty() { "0" } else { digits })
 }
 
-/// One request's fetching state: the connection and options it runs with, and what it may
-/// still fetch.
 struct Fetcher<'a> {
     client: &'a Client,
     chain: &'a str,
@@ -126,21 +88,14 @@ struct Fetcher<'a> {
     policy: Policy,
     cache: &'a mut CodeCache,
     log: &'a mut dyn FnMut(&str),
-    /// Addresses already fetched in this request (lower-case).
     seen: HashSet<String>,
-    /// Code units left to fetch.
     left: usize,
-    /// Decompilations by code hash: the same code at a second address is decompiled once.
     decompiled: HashMap<[u8; 32], Contract>,
-    /// The time one decompilation may take; unlimited for the contract asked for.
     time: Option<Duration>,
-    /// Call edges seen so far, fetched or not: `(caller, target)`, lower-case.
     calls: Vec<(String, String)>,
 }
 
 impl Fetcher<'_> {
-    /// Claim a fetch of `address`; `false` when it was fetched already in this request or
-    /// nothing is left.
     fn take(&mut self, address: &str) -> bool {
         if self.left == 0 || !self.seen.insert(address.to_ascii_lowercase()) {
             return false;
@@ -149,7 +104,6 @@ impl Fetcher<'_> {
         true
     }
 
-    /// The code at `address`, from the cache when this request saw it before.
     fn code(&mut self, address: &str) -> Result<Vec<u8>, String> {
         let key = address.to_ascii_lowercase();
         if let Some(code) = self.cache.get(&key) {
@@ -160,8 +114,6 @@ impl Fetcher<'_> {
         Ok(code)
     }
 
-    /// Decompile `code`, reusing the result for code seen before. `None` when it took longer
-    /// than the time a dependency is given.
     fn decompile(&mut self, code: &[u8]) -> Option<Contract> {
         let hash = keccak::keccak256(code);
         if let Some(known) = self.decompiled.get(&hash) {
@@ -176,7 +128,6 @@ impl Fetcher<'_> {
         Some(c)
     }
 
-    /// Fetch the code at `address`, decompile it and resolve the proxy or diamond it is.
     fn one(&mut self, address: &str) -> Result<Contract, String> {
         if !self.take(address) {
             return Err("already fetched in this request, or the fetch limit is reached".into());
@@ -203,7 +154,6 @@ impl Fetcher<'_> {
         Ok(self.resolve(c, address, &code))
     }
 
-    /// The reason given for a dependency whose decompilation was abandoned.
     fn too_slow(&self) -> String {
         format!(
             "decompiling it took longer than {} s",
@@ -211,8 +161,6 @@ impl Fetcher<'_> {
         )
     }
 
-    /// The call targets of `c`, with the slots that hold one read from the chain (and recorded
-    /// in `c.stored_targets`), and the slots that hold none.
     fn edges(&mut self, c: &mut Contract) -> (Vec<Edge>, Vec<Unfollowed>) {
         let from = c.address.clone().unwrap_or_default();
         let mut edges: Vec<Edge> = Vec::new();
@@ -309,8 +257,6 @@ impl Fetcher<'_> {
         (edges, empty)
     }
 
-    /// Walk the call graph from `root`, level by level, and return it with every contract
-    /// reached in `linked` and every target left out in `unfollowed`.
     fn walk(&mut self, root: Contract) -> Contract {
         let started = Instant::now();
         let policy = self.policy;
@@ -412,9 +358,6 @@ impl Fetcher<'_> {
         root
     }
 
-    /// Ask each contract's storage whether it approves the contracts that call it: at the slots
-    /// its access checks compare `msg.sender` with, and at the mapping entries they test under
-    /// `msg.sender`.
     fn read_gates(&mut self, all: &mut [Contract]) {
         for c in all.iter_mut() {
             let Some(address) = c.address.clone() else {
@@ -476,8 +419,6 @@ impl Fetcher<'_> {
         }
     }
 
-    /// Resolve the routing pattern of `c` and compose it with the code it forwards to. A
-    /// resolution that fails leaves `c` as the plain decompilation of the shell.
     fn resolve(&mut self, c: Contract, address: &str, code: &[u8]) -> Contract {
         let has_selector = |sel: &str| {
             c.functions.iter().any(|f| {
@@ -520,7 +461,6 @@ impl Fetcher<'_> {
         }
     }
 
-    /// Fetch every facet of `d` and compose it with the shell `c`.
     fn compose_diamond(&mut self, c: Contract, d: rpc::DiamondInfo) -> Contract {
         (self.log)(&format!(
             "EIP-2535 diamond: {} facets (from {}) — fetching...",
@@ -557,7 +497,6 @@ impl Fetcher<'_> {
         decompile::compose(c, &kind, None, parts)
     }
 
-    /// Fetch the implementation behind the proxy `p` and compose it with the shell `c`.
     fn compose_proxy(&mut self, mut c: Contract, p: rpc::ProxyInfo) -> Contract {
         (self.log)(&format!(
             "{}: implementation {} — fetching...",

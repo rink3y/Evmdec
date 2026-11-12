@@ -1,24 +1,3 @@
-//! A local copy of the full signature database (Sourcify's 4byte export, ~10.7 million
-//! entries) as one sorted index file searched in place.
-//!
-//! The file is never loaded: a lookup is a binary search over fixed-width entries read with
-//! positional reads, so a process pays nothing at start-up and the operating system's page cache
-//! keeps the hot part of the file in memory. Format (`EVMSIG1`, little-endian):
-//!
-//! ```text
-//! 0..8    magic "EVMSIG1\n"
-//! 8..16   u64 entry count n
-//! 16..24  u64 absolute offset of the string pool
-//! 24..    n entries of 12 bytes: u64 prefix (first 8 bytes of the keccak256 hash, big-endian),
-//!         u32 offset of the signature inside the pool; sorted by (prefix, offset)
-//! pool    NUL-terminated signatures
-//! ```
-//!
-//! A 4-byte selector selects the entries whose prefix starts with it; a 32-byte topic selects
-//! the entries with the same 8-byte prefix and the candidate is confirmed by hashing it.
-//! `corpus/build_sigs.py` builds the file from the Parquet export; [`write()`] builds one from
-//! memory (tests, small custom dictionaries).
-
 use crate::keccak;
 use std::collections::HashSet;
 use std::fs::File;
@@ -29,15 +8,11 @@ use std::sync::OnceLock;
 const MAGIC: &[u8; 8] = b"EVMSIG1\n";
 const HEADER_LEN: u64 = 24;
 const ENTRY_LEN: u64 = 12;
-/// Longest signature the reader accepts (the export's longest is about 1,200 bytes).
 const MAX_SIG: usize = 8192;
-/// Most entries one selector or prefix may map to; more than this is a corrupt file.
+// More than this means a corrupt file.
 const MAX_FANOUT: usize = 256;
 
-/// An open index file.
-///
-/// The index is advisory: a read error during a lookup (a truncated or corrupt file) is reported
-/// as "no signature", never as a failure of the decompilation that asked.
+// The index is advisory. A read error means no signature, never a failed decompilation.
 #[derive(Debug)]
 pub struct SigDb {
     file: File,
@@ -46,12 +21,9 @@ pub struct SigDb {
     len: u64,
 }
 
-/// Which part of the stored hash prefix a lookup compares.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Match {
-    /// The top 4 bytes: a function or error selector.
     Selector,
-    /// All 8 bytes: an event topic, to be confirmed by hashing the candidate.
     Prefix,
 }
 
@@ -84,10 +56,6 @@ fn read_at(file: &File, off: u64, buf: &mut [u8]) -> io::Result<()> {
 }
 
 impl SigDb {
-    /// Open an index file, checking its header.
-    ///
-    /// # Errors
-    /// The file cannot be read, or it is not an `EVMSIG1` index.
     pub fn open(path: &Path) -> io::Result<SigDb> {
         let file = File::open(path)?;
         let mut header = [0u8; HEADER_LEN as usize];
@@ -120,14 +88,12 @@ impl SigDb {
         })
     }
 
-    /// Number of signatures in the index.
     #[must_use]
     pub fn len(&self) -> usize {
         usize::try_from(self.entries)
             .expect("a file with more than usize::MAX entries cannot be read")
     }
 
-    /// Whether the index holds no signatures.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries == 0
@@ -142,7 +108,6 @@ impl SigDb {
         ))
     }
 
-    /// First entry whose prefix is at least `prefix`.
     fn lower_bound(&self, prefix: u64) -> io::Result<u64> {
         let (mut lo, mut hi) = (0u64, self.entries);
         while lo < hi {
@@ -178,8 +143,6 @@ impl SigDb {
         ))
     }
 
-    /// Up to `limit` signatures stored under `prefix` (an 8-byte hash prefix) or, with
-    /// `Match::Selector`, under its top 4 bytes, in file order.
     fn candidates(&self, prefix: u64, what: Match, limit: usize) -> io::Result<Vec<String>> {
         let mut out = Vec::new();
         let mut i = self.lower_bound(match what {
@@ -201,9 +164,7 @@ impl SigDb {
         Ok(out)
     }
 
-    /// Function or error signatures for a 4-byte selector, shortest first (the canonical name
-    /// of a collision is almost always the shorter one). The index stores no kind, so a
-    /// selector that is both a function and a custom error returns both. Empty on a read error.
+    // Shortest first. The canonical name of a collision is almost always the shorter one.
     #[must_use]
     pub fn selector(&self, selector: u32) -> Vec<String> {
         let mut v = self
@@ -214,8 +175,6 @@ impl SigDb {
         v
     }
 
-    /// The event signature whose keccak256 is `topic`, if the index holds one. `None` on a read
-    /// error.
     #[must_use]
     pub fn topic(&self, topic: &[u8; 32]) -> Option<String> {
         let prefix = u64::from_be_bytes(topic[0..8].try_into().expect("topic[0..8] is 8 bytes"));
@@ -226,11 +185,6 @@ impl SigDb {
     }
 }
 
-/// Build an index file from `(keccak256 hash, signature)` pairs. Duplicate signatures are kept
-/// once.
-///
-/// # Errors
-/// The file cannot be written.
 pub fn write(path: &Path, entries: impl IntoIterator<Item = ([u8; 32], String)>) -> io::Result<()> {
     let mut pool: Vec<u8> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -260,7 +214,6 @@ pub fn write(path: &Path, entries: impl IntoIterator<Item = ([u8; 32], String)>)
     out.flush()
 }
 
-/// Where the index is looked for when `EVMDEC_SIGS` is not set.
 fn default_paths() -> Vec<PathBuf> {
     let mut v = vec![PathBuf::from("sigs.idx")];
     if let Ok(exe) = std::env::current_exe() {
@@ -275,9 +228,6 @@ fn default_paths() -> Vec<PathBuf> {
     v
 }
 
-/// The process-wide index: `EVMDEC_SIGS` names the file (an empty value disables the lookup),
-/// otherwise the first of `./sigs.idx`, `<binary dir>/sigs.idx`, `/var/lib/evmdec/sigs.idx`
-/// and `~/.evmdec/sigs.idx` that opens. `None` when there is none.
 #[must_use]
 pub fn global() -> Option<&'static SigDb> {
     static DB: OnceLock<Option<SigDb>> = OnceLock::new();
@@ -300,8 +250,6 @@ mod tests {
         keccak::keccak256(s.as_bytes())
     }
 
-    /// A fresh directory under the system temp dir, removed when dropped (also on a failed
-    /// assertion).
     struct TempDir(PathBuf);
 
     impl TempDir {

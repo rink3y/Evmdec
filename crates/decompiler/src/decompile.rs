@@ -1,5 +1,3 @@
-//! Whole-contract decompilation: orchestration and the output model.
-
 use crate::cfg::{self, Program, Recovered};
 use crate::compiler;
 use crate::emit::{self, MappingLayout, Names, SlotSpace};
@@ -18,118 +16,73 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 #[derive(Clone, Debug, Default)]
-/// Knobs for one decompilation run.
 pub struct Options {
-    /// Emit labels/gotos instead of structured code.
     pub flat: bool,
-    /// Include per-node program counters as comments.
     pub pcs: bool,
-    /// Decompile embedded creation code (contracts deployed by this one).
     pub embedded: bool,
-    /// Do not use the built-in signature dictionary (for measuring inference).
     pub no_sigs: bool,
-    /// Additional function signatures by selector (e.g. from an online lookup or an ABI).
     pub extra_sigs: HashMap<u32, String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-/// One decompiled function: an external entry point, an internal helper or an orphan region.
 pub struct Function {
-    /// External entry, fallback, receive, constructor, internal helper or orphan region.
     pub kind: FnKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// 4-byte selector as `0x`-prefixed hex; external functions only.
     pub selector: Option<String>,
-    /// Printed name: from the signature when known, else `func_<selector>` or `func_<pc>`.
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// Canonical signature (`name(type,...)`) when the selector is in a dictionary.
     pub signature: Option<String>,
-    /// Inferred state mutability (`pure`, `view`, `nonpayable` or `payable`).
     pub mutability: Mutability,
-    /// Parameters: from the signature when known, inferred from calldata use otherwise.
     pub params: Vec<Param>,
-    /// Inferred return types.
     pub returns: Vec<String>,
-    /// Entry program counter.
     pub pc: usize,
-    /// Body rendered as pseudo-Solidity, without the header line.
     pub code: String,
-    /// Number of nodes in the lifted control-flow graph (a size measure).
     pub nodes: usize,
-    /// State the function touches, including through the internal functions it calls.
     pub effects: function::Effects,
     #[serde(skip)]
-    /// The lifted graph the code was rendered from; kept for later analysis, not serialised.
     pub lifted: Option<Lifted>,
-    /// Internal functions this one calls (entry pcs).
     pub calls: Vec<usize>,
-    /// Number of stack arguments an internal unit takes.
     pub n_args: usize,
-    /// Number of values an internal unit returns (the largest `InternalReturn` seen).
     pub n_rets: usize,
-    /// Internal helper whose every call site was inlined: not printed.
     #[serde(default)]
     pub inlined: bool,
-    /// Phi variables the type solver found to be booleans.
     #[serde(skip)]
     pub bool_vars: Vec<u32>,
-    /// Index into [`Contract::parts`] of the part whose code holds this function; 0 is the
-    /// contract's own code.
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub part: usize,
-    /// Address of the part whose code holds this function, when it is not the contract's own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
 }
 
-/// Serde helper: skip a zero.
 fn is_zero_usize(n: &usize) -> bool {
     *n == 0
 }
 
 #[derive(Clone, Debug, Serialize)]
-/// A storage slot the contract reads or writes, as listed in the contract header.
 pub struct StorageVar {
-    /// The variable is a fixed-size array laid out from this slot (`uint[256] owners`): its
-    /// elements occupy the following slots rather than `keccak256(slot) + i`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub fixed_array: bool,
-    /// Root slot as `0x`-prefixed hex (the base slot for mappings and arrays).
     pub slot: String,
-    /// Printed name: `stor_<slot>` (decimal for small slots, hex otherwise).
     pub name: String,
-    /// Inferred type (`mapping(…)`, `address`, `string`, …); `packed` when `fields` is set.
     pub ty: String,
-    /// Number of `SLOAD`s of this slot, or of a key rooted at it, across all functions.
     pub reads: usize,
-    /// Number of `SSTORE`s to this slot, or to a key rooted at it, across all functions.
     pub writes: usize,
-    /// Fields of a packed slot (several variables share the 32 bytes).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<StorageField>,
-    /// Members of the struct each element holds, when the elements span several slots.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<StructMember>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-/// One member of the struct a mapping or array element holds.
 pub struct StructMember {
-    /// Slot offset within the element.
     pub offset: u64,
-    /// Printed name: `field<offset>` until something names it.
     pub name: String,
-    /// Inferred type; `packed` when `fields` is set.
     pub ty: String,
-    /// Fields sharing the member's slot.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<StorageField>,
 }
 
 impl StorageVar {
-    /// The name of the struct the variable's elements hold: `Struct_3` for `stor_3`,
-    /// `RecordsEntry` for `records`.
     #[must_use]
     pub fn struct_name(&self) -> String {
         match self.name.strip_prefix("stor_") {
@@ -142,7 +95,6 @@ impl StorageVar {
         }
     }
 
-    /// The declared type, with the struct's name where the elements are structs.
     #[must_use]
     pub fn declared_type(&self) -> String {
         if self.members.is_empty() {
@@ -164,8 +116,6 @@ impl StorageVar {
 }
 
 impl StructMember {
-    /// Is the member a mapping, an array or a byte string, whose slot is only the head of what
-    /// it holds?
     #[must_use]
     pub fn holds_many(&self) -> bool {
         self.ty.starts_with("mapping(") || self.ty.ends_with("[]") || self.ty == "bytes"
@@ -173,181 +123,101 @@ impl StructMember {
 }
 
 #[derive(Clone, Debug, Serialize)]
-/// One variable of a packed storage slot.
 pub struct StorageField {
-    /// Byte offset within the slot (0 = least significant).
     pub offset: u32,
-    /// Width in bits.
     pub bits: u32,
-    /// Printed name: `<slot name>_<byte offset>`.
     pub name: String,
-    /// Type inferred from the width and the constants written (`bool`, `address`, `uintN`, `intN`).
     pub ty: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
-/// Coverage and size figures for one code body, printed in the header comment.
 pub struct Stats {
-    /// Length of the analysed bytecode in bytes.
     pub code_bytes: usize,
-    /// Number of decoded instructions.
     pub instructions: usize,
-    /// Number of basic blocks, data and dead regions included.
     pub blocks: usize,
-    /// Blocks the EVM could enter, excluding the metadata trailer and embedded creation code.
     pub code_blocks: usize,
-    /// Of `code_blocks`, those reached by the main unit, an internal function or an orphan.
     pub covered_blocks: usize,
-    /// Jumps whose target could not be resolved.
     pub unresolved_jumps: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    /// Program counters of the unresolved jumps, as hex.
     pub unresolved_jump_pcs: Vec<String>,
-    /// Control-flow recovery gave up early on some unit, so the output may be incomplete.
     pub budget_exhausted: bool,
-    /// Number of external functions (dispatcher entries).
     pub external_functions: usize,
-    /// Number of internal functions, inlined ones included.
     pub internal_functions: usize,
-    /// Number of orphan regions (code reached by nothing).
     pub orphans: usize,
-    /// Nodes the lifter processed more than once while reaching a fixpoint, summed over units.
     pub lift_reprocess: usize,
-    /// Wall-clock time of the decompilation in milliseconds.
     pub time_ms: u128,
 }
 
 #[derive(Clone, Debug, Serialize)]
-/// The decompilation of one code body: the JSON the CLI prints and the web UI shows.
 pub struct Contract {
-    /// Bytecode layout: creation/runtime split, constructor arguments and metadata trailer.
     pub info: BytecodeInfo,
-    /// Whether the input was runtime code or creation (deployment) code.
     pub kind: CodeKind,
-    /// Compiler and version (`solc 0.8.19`), or the bounds the bytecode fingerprints give
-    /// without metadata (`solc >= 0.8.0 (no metadata)`).
     pub language: String,
-    /// The compiler profile: family, version bounds and code-generation features.
     pub compiler: compiler::Profile,
-    /// The solved types of every parameter, helper argument, storage slot and phi variable;
-    /// kept for the analyzer, not serialised.
     #[serde(skip)]
     pub types: TypeEnv,
-    /// Every recovered function: external entries first, then internal helpers and orphans.
     pub functions: Vec<Function>,
-    /// Storage variables, ordered by slot.
     pub storage: Vec<StorageVar>,
-    /// Event declarations (`Name(type indexed name, …)` or a placeholder with the topic hash).
     pub events: Vec<String>,
-    /// Custom error declarations the code reverts with.
     pub errors: Vec<String>,
-    /// String constants found in revert payloads, stored values and the code bytes.
     pub strings: Vec<String>,
-    /// `0xselector signature` of the external functions this contract calls.
     pub selectors_called: Vec<String>,
-    /// Coverage and size figures.
     pub stats: Stats,
-    /// The whole contract rendered as pseudo-Solidity.
     pub source: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    /// Contracts this one deploys, decompiled from embedded creation code (`Options::embedded`).
     pub embedded: Vec<Contract>,
-    /// For a contract in another's `embedded`: offset and length of its creation code inside
-    /// the code of the contract that deploys it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<(usize, usize)>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// The constructor, decompiled from the creation code when the input was creation code.
     pub constructor: Option<Box<Contract>>,
-    /// Storage slots whose value is used as a DELEGATECALL target (proxy implementation slots).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub delegatecall_slots: Vec<String>,
-    /// Constant addresses the whole calldata is forwarded to with DELEGATECALL: what a proxy
-    /// with a fixed implementation does.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub delegatecall_targets: Vec<String>,
-    /// Constant addresses called with DELEGATECALL and a payload the code builds itself: linked
-    /// libraries, whose code runs in this contract's storage but is not its implementation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub library_targets: Vec<String>,
-    /// Constant addresses this contract calls (`CALL`/`STATICCALL`/`CALLCODE` to a literal
-    /// address): hard-coded dependencies such as tokens, oracles and registries. Precompiles
-    /// (1..=9) are excluded.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub call_targets: Vec<String>,
-    /// Storage slots whose value is called with `CALL`/`STATICCALL`/`CALLCODE`: dependencies
-    /// chosen at run time, read and linked when the contract is fetched by address.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub call_target_slots: Vec<String>,
-    /// Fixed addresses whose code the minimal proxies (EIP-1167) this contract creates run.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub clone_targets: Vec<String>,
-    /// Of `call_targets` and `call_target_slots`, the ones some call may change the state of
-    /// (`CALL`/`CALLCODE`); the others are only ever read with `STATICCALL`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub written_targets: Vec<String>,
-    /// The addresses found in `call_target_slots` when fetched: `(slot, address)`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stored_targets: Vec<(String, String)>,
-    /// Every contract fetched because this one, or one fetched with it, calls it: one flat list
-    /// on the contract that was asked for, each entry saying in `link` how it was reached. Each
-    /// is resolved like the root (a proxy with its implementation, a diamond with its facets).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub linked: Vec<Contract>,
-    /// How this contract was reached, when it was fetched as a dependency.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<Link>,
-    /// Call targets that were seen but not fetched, with the reason, on the contract that was
-    /// asked for.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unfollowed: Vec<Unfollowed>,
-    /// Addresses the contract's own storage approves as callers of its gated functions, read
-    /// when it was fetched: the address held in a slot `msg.sender` is compared with, or one
-    /// whose entry in a mapping tested under `msg.sender` is set. Only contracts fetched in the
-    /// same run are looked up.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub admits: Vec<String>,
-    /// The lookup behind `admits` was made, so an address missing from it is not approved.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub gates_read: bool,
-    /// Filled when the contract was fetched by address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// Chain the contract was fetched from, when fetched by address.
     pub chain: Option<String>,
-    /// Implementation behind this proxy, when resolved on-chain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyRef>,
-    /// Internal helpers that copy a storage string to memory: entry pc -> slot.
     #[serde(skip)]
     pub string_loaders: HashMap<usize, U256>,
-    /// The code units this contract is assembled from, when it is a composite ([`compose`]):
-    /// index 0 is the contract's own code (the proxy or diamond shell), the rest the
-    /// implementation or facets whose code runs in its storage through `DELEGATECALL`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub parts: Vec<Part>,
-    /// How the composite was assembled, when it is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub composite: Option<Composite>,
-    /// The selector-keyed storage lookup the fallback delegatecalls through, when the code is
-    /// an EIP-2535 diamond shell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diamond_lookup: Option<DiamondLookup>,
 }
 
-/// Where a diamond shell keeps its selector-to-facet mapping.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct DiamondLookup {
-    /// Root slot of the `mapping(bytes4 => ...)`, as 32-byte hex.
     pub slot: String,
-    /// Slots past the mapping entry at which the facet address sits (0 for a plain mapping or
-    /// a struct whose first member is the address).
     pub offset: u64,
 }
 
-/// A storage read whose key is a mapping entry under the call's own selector: the facet lookup
-/// of a diamond shell. Returns the mapping's root and the struct offset of the entry read.
 fn selector_lookup(key: ExprId, layout: MappingLayout) -> Option<DiamondLookup> {
     let path = ssa::slot_path(key, layout)?;
     let (k, offset) = match &path.steps[..] {
@@ -361,11 +231,9 @@ fn selector_lookup(key: ExprId, layout: MappingLayout) -> Option<DiamondLookup> 
     })
 }
 
-/// Nodes visited when looking for the selector under a mapping key; a key is a small
-/// expression, so a larger one is not a selector lookup.
+// A key is a small expression. A larger one is not a selector lookup.
 const SELECTOR_SEARCH_LIMIT: usize = 2_000;
 
-/// Does `e` derive from the first calldata word, which holds the selector?
 fn reads_selector(e: ExprId) -> bool {
     let mut stack = vec![e];
     let mut seen = HashSet::new();
@@ -383,71 +251,46 @@ fn reads_selector(e: ExprId) -> bool {
     false
 }
 
-/// One code unit of a composite contract.
 #[derive(Clone, Debug, Serialize)]
 pub struct Part {
-    /// What the unit is to the contract.
     pub role: PartRole,
-    /// The unit's address.
     pub address: String,
-    /// Selectors the shell routes to this unit, as `0x`-prefixed 4-byte hex. Empty for the
-    /// shell and for an implementation that receives every call the shell does not answer.
     pub selectors: Vec<String>,
-    /// Offset added to every pc of this unit so pcs are unique across the composite.
     #[serde(skip)]
     pub base: usize,
-    /// The unit's runtime code, which the executor runs in the composite's storage.
     #[serde(skip)]
     pub runtime: Vec<u8>,
-    /// Compiler of the unit, as the header prints it.
     pub compiler: String,
-    /// The unit's own storage layout.
     pub storage: Vec<StorageVar>,
-    /// The unit's own decompiled source.
     pub source: String,
-    /// Size and coverage of the unit.
     pub stats: Stats,
 }
 
-/// The role of a part in a composite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PartRole {
-    /// The contract's own code: the proxy or diamond shell that routes calls.
     Shell,
-    /// The single implementation a proxy forwards to.
     Implementation,
-    /// One facet of a diamond.
     Facet,
 }
 
-/// How a composite was assembled.
 #[derive(Clone, Debug, Serialize)]
 pub struct Composite {
-    /// The routing pattern, e.g. `EIP-1967 proxy` or `EIP-2535 diamond`.
     pub kind: String,
-    /// Admin address, for patterns that have one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin: Option<String>,
-    /// Storage slots two parts declare with incompatible types (see [`StorageCollision`]).
     pub collisions: Vec<StorageCollision>,
-    /// Routed selectors the shell answers itself as well, so the shell wins.
     pub shadowed: Vec<String>,
 }
 
-/// Two parts declaring the same storage slot with different types.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct StorageCollision {
-    /// The slot.
     pub slot: String,
-    /// The first part and the type it uses.
     pub first: (usize, String),
-    /// The second part and the type it uses.
     pub second: (usize, String),
 }
 
 impl Contract {
-    /// The runtime code that holds `f`: its part's code in a composite, else the contract's.
     #[must_use]
     pub fn code_of(&self, f: &Function) -> &[u8] {
         match self.parts.get(f.part) {
@@ -456,26 +299,21 @@ impl Contract {
         }
     }
 
-    /// The pc offset of the part that holds `f` (0 outside a composite).
     #[must_use]
     pub fn base_of(&self, f: &Function) -> usize {
         self.parts.get(f.part).map_or(0, |p| p.base)
     }
 
-    /// The pc `pc` of `f` as an offset into the part's own code.
     #[must_use]
     pub fn local_pc(&self, f: &Function, pc: usize) -> usize {
         pc.saturating_sub(self.base_of(f))
     }
 }
 
-/// Distance between the pc ranges of consecutive parts; EVM code is below 2^15 bytes.
+// EVM code is under 2^15 bytes, so the pc ranges of parts never overlap.
 pub const PART_STRIDE: usize = 1 << 24;
 
 impl Contract {
-    /// Add `base` to every program counter so this contract's functions can sit next to
-    /// another's without colliding: function entries, callee lists, lifted node pcs, internal
-    /// call targets, string loaders and the type environment's scopes.
     pub fn rebase(&mut self, base: usize) {
         if base == 0 {
             return;
@@ -508,24 +346,14 @@ impl Contract {
     }
 }
 
-/// A code unit to compose with a shell.
 #[derive(Debug)]
 pub struct PartInput {
-    /// What the unit is to the contract.
     pub role: PartRole,
-    /// The unit's address.
     pub address: String,
-    /// Selectors the shell routes to it; empty for an implementation that receives every
-    /// selector the shell does not answer.
     pub selectors: Vec<String>,
-    /// The unit's own decompilation.
     pub contract: Contract,
 }
 
-/// Assemble a proxy or diamond and the code it forwards to into one contract: the shell's
-/// functions, every routed function of every other part and the parts' internal helpers in one
-/// list, their storage layouts and type environments merged, so the analyzer sees the contract
-/// users call rather than its pieces.
 pub fn compose(
     mut shell: Contract,
     kind: &str,
@@ -686,8 +514,6 @@ pub fn compose(
     shell
 }
 
-/// Do two type families agree wherever both say something? `*` matches anything at its level,
-/// so `mapping(address => *)` agrees with `mapping(address => uint)` but not with `address`.
 fn compatible(a: &str, b: &str) -> bool {
     if a == "*" || b == "*" || a == b {
         return true;
@@ -708,10 +534,6 @@ fn compatible(a: &str, b: &str) -> bool {
     }
 }
 
-/// A storage type with its widths erased, for the collision check: two parts that read the
-/// same mapping as `uint16` and `uint256` values agree on its shape, while `address` against
-/// `mapping(...)` or `bool` against `address` do not. A full word (`uint256`, `bytes32`, an
-/// unknown type) says nothing about the shape and becomes `*`, which never collides.
 fn type_family(ty: &str) -> String {
     let ty = ty.trim();
     if let Some(inner) = ty
@@ -735,46 +557,29 @@ fn type_family(ty: &str) -> String {
 }
 
 #[derive(Clone, Debug, Serialize)]
-/// The implementation a proxy contract forwards to.
 pub struct ProxyRef {
-    /// Human-readable pattern name, e.g. `EIP-1967 proxy` or `EIP-1167 minimal proxy`.
     pub kind: String,
-    /// Implementation address.
     pub implementation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// Admin address, for patterns that have one.
     pub admin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// The implementation's own decompilation, when its code was fetched.
     pub contract: Option<Box<Contract>>,
 }
 
-/// The call edge a dependency was fetched along.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Link {
-    /// Address of the contract that calls this one.
     pub from: String,
-    /// How the caller names it: a fixed address, a library, the address in a storage slot.
     pub how: String,
-    /// Call edges between the contract that was asked for and this one.
     pub depth: usize,
 }
 
-/// A call target that was not fetched.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Unfollowed {
-    /// The target: an address, or the slot holding it when the slot was not read.
     pub target: String,
-    /// Address of the contract that calls it.
     pub from: String,
-    /// Why it was left out.
     pub reason: String,
 }
 
-/// Decompile a bytecode blob: runtime code, or creation code with its constructor.
-///
-/// Creation code yields the runtime contract with `constructor` filled in; the rendered source of
-/// the whole thing lands in `Contract::source`.
 pub fn decompile(code: &[u8], opts: &Options) -> Contract {
     let t0 = std::time::Instant::now();
     let code: &[u8] = if code.is_empty() { &[op::STOP] } else { code };
@@ -807,11 +612,6 @@ pub fn decompile(code: &[u8], opts: &Options) -> Contract {
     c
 }
 
-/// Decompile one code body (`info` says how it sits in the input) into a [`Contract`].
-///
-/// Recovers the control flow, lifts internal functions, the dispatcher and orphans, infers
-/// signatures and the storage layout, then renders every function. Embedded creation code is
-/// treated as data unless `opts.embedded` is set.
 pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Contract {
     let t0 = std::time::Instant::now();
     let timing = std::env::var("EVMDEC_TIMING").is_ok();
@@ -1614,7 +1414,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     c
 }
 
-/// The EIP-1167 target of creation code that is a minimal proxy with a fixed address.
 pub(crate) fn clone_target(init: &[ExprId], len: ExprId) -> Option<String> {
     const HEAD: [u8; 20] = [
         0x3d, 0x60, 0x2d, 0x80, 0x60, 0x0a, 0x3d, 0x39, 0x81, 0xf3, 0x36, 0x3d, 0x3d, 0x37, 0x3d,
@@ -1636,7 +1435,6 @@ pub(crate) fn clone_target(init: &[ExprId], len: ExprId) -> Option<String> {
     Some(U256::from_be_bytes(address).to_hex_padded(20))
 }
 
-/// Code regions copied to memory and fed to CREATE/CREATE2 (embedded contracts).
 fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
     for u in std::iter::once(&rec.main).chain(rec.functions.values()) {
@@ -1669,19 +1467,13 @@ fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
     out
 }
 
-/// Element value types of mappings and dynamic arrays, from how their entries are written and
-/// read: an entry written as `| 1` / `& ~0xff` and read through an 8-bit mask is a `bool`, one
-/// written or read through a 160-bit mask an `address`, a narrower one `uintN`.
 fn element_types(functions: &[Function]) -> HashMap<U256, String> {
-    /// What the accesses to one root's entries show. Writes decide when there are any: a read
-    /// mask may be ABI packing (`uint32(x)` of an address straddling two payload words), a
-    /// write mask never is.
+    // Writes decide when there are any.
+    // A read mask may be ABI packing. A write mask never is.
     #[derive(Default)]
     struct Accesses {
         write_widths: BTreeSet<u32>,
-        /// Constants written as bool-sized values (0 or 1).
         flags: Vec<U256>,
-        /// Some write was neither 0 nor 1.
         other_write: bool,
         read_widths: BTreeSet<u32>,
     }
@@ -1794,8 +1586,6 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
         .collect()
 }
 
-/// Element type of an array or mapping type string (`address[]` -> `address`,
-/// `mapping(address => bool)` -> `bool`), when it is a concrete value type.
 fn element_type(ty: &str) -> Option<String> {
     let t = if let Some(elem) = ty.strip_suffix("[]") {
         elem
@@ -1808,9 +1598,6 @@ fn element_type(ty: &str) -> Option<String> {
         .then(|| t.to_string())
 }
 
-/// The compiler's array-resize helper: `old = sload(slot); sstore(slot, n);` then, when the
-/// array shrinks, the dropped elements are zeroed. Two parameters, the slot and the new length,
-/// the slot stored to directly.
 fn is_array_resizer(l: &Lifted) -> bool {
     let k = l.ret_slot.map(|k| k as usize).unwrap_or(l.n_args);
     let is_arg = |e: ExprId| matches!(expr::node(e), Node::Arg(i) if (i as usize) < k);
@@ -1836,11 +1623,6 @@ fn is_array_resizer(l: &Lifted) -> bool {
     k == 2 && stores_arg_to_arg && clears
 }
 
-/// A public getter whose signature is known names the variable it returns: a function that only
-/// reads one slot (or one packed field, or one mapping entry keyed by its parameter) and returns
-/// it gives that slot its name. A getter of one member of a struct element names the member,
-/// never the mapping that holds the structs; one that only tests a member against zero
-/// (`recordExists`) states a predicate and names nothing.
 fn name_storage_from_getters(
     functions: &[Function],
     storage: &mut [StorageVar],
@@ -2009,29 +1791,18 @@ fn name_storage_from_getters(
     }
 }
 
-/// The number of keys and indices that select one element of a declared mapping or array type.
 fn element_depth(ty: &str) -> usize {
     ty.matches("mapping(").count() + ty.matches("[]").count()
 }
 
-/// What printing a function needs to know about the code around it: the names and return
-/// types of the internal functions it may call, by entry pc, and the compiler's memory model.
 #[derive(Clone, Debug, Default)]
 pub struct Callees {
-    /// Return types in declaration order.
     pub returns: HashMap<usize, Vec<String>>,
-    /// Printed name.
     pub names: HashMap<usize, String>,
-    /// The code is solc's and keeps its free memory pointer at `0x40`, so a load of that slot
-    /// is the address of a memory block.
     pub free_pointer: bool,
-    /// What each internal function may read of the memory its caller left, itself or through
-    /// the functions it calls, by entry pc.
     pub reads: std::sync::Arc<HashMap<usize, lift::MemoryReads>>,
 }
 
-/// What every internal function may read of the memory its caller left, closed over the calls
-/// between them: the least sets that satisfy every function at once.
 fn callee_reads(
     functions: &[Function],
     checked_indices: bool,
@@ -2062,7 +1833,6 @@ fn callee_reads(
 }
 
 impl Callees {
-    /// The internal functions of `functions`.
     #[must_use]
     pub fn of(functions: &[Function], compiler: compiler::Kind) -> Callees {
         let internal = || functions.iter().filter(|f| f.kind == FnKind::Internal);
@@ -2075,9 +1845,6 @@ impl Callees {
     }
 }
 
-/// Naming context for printing `f`: parameters, internal-unit arguments, storage variables and
-/// packed fields, aliases for the results of storage-string loaders, the names of the helpers
-/// it calls and which of their results are booleans.
 pub fn make_names(
     f: &Function,
     storage: &[StorageVar],
@@ -2209,9 +1976,6 @@ pub fn make_names(
     n
 }
 
-/// Fill in the types the direct heuristics left at `uint256` from the solved environment:
-/// calldata parameters, return words, internal parameters and results, and the phi variables
-/// that are booleans.
 fn refine_types(functions: &mut [Function], env: &TypeEnv) {
     let debug = std::env::var("EVMDEC_DEBUG_TYPES").is_ok();
     for f in functions.iter_mut() {
@@ -2231,9 +1995,6 @@ fn refine_types(functions: &mut [Function], env: &TypeEnv) {
     }
 }
 
-/// Calldata parameters: the solver sees the same decoder masks as the direct inference plus
-/// every use of the word, so it decides integer widths and `address`; the direct inference still
-/// decides dynamic types and the words decoded in helpers it sees through.
 fn refine_params(pc: usize, params: &mut [Param], env: &TypeEnv) {
     for p in params.iter_mut() {
         if p.ty == "address" || p.ty.starts_with("uint") {
@@ -2248,8 +2009,6 @@ fn refine_params(pc: usize, params: &mut [Param], env: &TypeEnv) {
     }
 }
 
-/// Return words of an external function: every `return` must agree on the shape for a position
-/// to be typed.
 fn refine_returns(
     returns: &mut [String],
     l: &Lifted,
@@ -2302,7 +2061,6 @@ fn refine_returns(
     }
 }
 
-/// Parameters of an internal unit: the direct address heuristic first, the solver otherwise.
 fn internal_params(l: &Lifted, pc: usize, n_args: usize, env: &TypeEnv) -> Vec<Param> {
     let arity = ssa::arity(l);
     let direct = function::internal_param_types(l, n_args);
@@ -2323,7 +2081,6 @@ fn internal_params(l: &Lifted, pc: usize, n_args: usize, env: &TypeEnv) -> Vec<P
         .collect()
 }
 
-/// Results of an internal unit: declaration position `i` is result `n - 1 - i` (deepest first).
 fn refine_results(returns: &mut [String], pc: usize, env: &TypeEnv) {
     let n = returns.len();
     for (i, ty) in returns.iter_mut().enumerate() {
@@ -2335,7 +2092,6 @@ fn refine_results(returns: &mut [String], pc: usize, env: &TypeEnv) {
     }
 }
 
-/// The phi variables of a function the solver found to be booleans.
 fn bool_vars(pc: usize, l: &Lifted, env: &TypeEnv) -> Vec<u32> {
     let mut vars: Vec<u32> = ssa::phi_defs(l)
         .keys()
@@ -2348,8 +2104,6 @@ fn bool_vars(pc: usize, l: &Lifted, env: &TypeEnv) -> Vec<u32> {
     vars
 }
 
-/// Replace the `uint256` leaves and keys of the storage declarations by what the solver found
-/// for the corresponding element and key shapes.
 fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv) {
     fn refine(ty: &str, root: U256, steps: &mut Vec<ShapeStep>, env: &TypeEnv) -> String {
         if let Some(inner) = ty
@@ -2393,8 +2147,6 @@ fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv) {
     }
 }
 
-/// The shapes of storage slots whose own key is hashed: the head slot of a dynamic array or of a
-/// byte string, whose contents live at the hash.
 fn hashed_slots(functions: &[Function], layout: MappingLayout) -> BTreeSet<Shape> {
     let mut seen: HashSet<ExprId> = HashSet::new();
     let mut found = BTreeSet::new();
@@ -2421,7 +2173,6 @@ fn hashed_slots(functions: &[Function], layout: MappingLayout) -> BTreeSet<Shape
     found
 }
 
-/// A declared type cut at `depth` keys and indices, where the element's own type goes.
 fn element_container(ty: &str, depth: usize) -> String {
     if depth == 0 {
         return "uint256".to_string();
@@ -2441,8 +2192,6 @@ fn element_container(ty: &str, depth: usize) -> String {
     }
 }
 
-/// The type of what lies at `rest` below the storage shape `steps`: mappings by their solved
-/// key types, arrays, and the solved type of the value at the end.
 fn nested_type(
     root: U256,
     steps: &mut Vec<ShapeStep>,
@@ -2471,18 +2220,8 @@ fn nested_type(
     ty
 }
 
-/// A storage shape the solver has a location for, and the bit range when it is part of a word.
 type Located<'a> = (&'a Shape, Option<(u32, u32)>);
 
-/// Find the mappings and arrays whose elements are structs and list their members.
-///
-/// The solver has a location for every storage shape the code reads or writes. A slot offset
-/// after a run of keys and indices selects a member of the element those keys select, and an
-/// element with a member at an offset above zero is a struct. What follows the offset is the
-/// member's own nesting: a mapping or an array held inside the struct. A member whose slot is
-/// hashed on its own is a dynamic array, or a byte string when its head carries the length
-/// flag. A member read or written through several bit ranges, or through one that does not
-/// start at bit zero, is packed: each range is a field.
 fn struct_members(storage: &mut [StorageVar], env: &TypeEnv, hashed: &BTreeSet<Shape>) {
     #[derive(Default)]
     struct Member {
@@ -2637,19 +2376,13 @@ fn struct_members(storage: &mut [StorageVar], env: &TypeEnv, hashed: &BTreeSet<S
     }
 }
 
-/// Packed storage fields: slot -> (byte offset, bits) -> constant values written (for typing).
 type PackedFields = BTreeMap<U256, BTreeMap<(u32, u32), Vec<Option<U256>>>>;
 
-/// What a contract's functions reference, collected for the contract header.
 struct Inventories {
     storage: Vec<StorageVar>,
-    /// Event declarations (`Name(type indexed name, …)` or the raw topic).
     events: Vec<String>,
-    /// Custom error declarations.
     errors: Vec<String>,
-    /// String constants the code reverts with or stores.
     strings: Vec<String>,
-    /// `0xselector signature` of the external functions the contract calls.
     selectors: Vec<String>,
 }
 
@@ -2906,10 +2639,7 @@ fn inventories(
     }
 }
 
-/// `Transfer(address,address,uint256)` with 2 topics besides the signature becomes
-/// `Transfer(address indexed, address indexed, uint256)`. Solidity emits indexed parameters as
-/// topics in declaration order and they are conventionally declared first, so the first `n`
-/// parameters are marked.
+// Indexed parameters are conventionally declared first, so the first n are marked. This is a guess.
 fn with_indexed(sig: &str, n: usize) -> String {
     let Some(open) = sig.find('(') else {
         return sig.to_string();
@@ -2975,9 +2705,6 @@ fn note_slot(
     }
 }
 
-/// First slots of fixed-size arrays: constants `c` in keys of the form `index + c` where the
-/// index is neither constant nor hashed. Nearby constants (`index + 3` for an array at 2, from
-/// `owners[n + 1]`) fold onto the lowest one of their cluster.
 fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
     let mut seen: BTreeSet<U256> = BTreeSet::new();
     let mut keys: Vec<(ExprId, usize)> = Vec::new();
@@ -3058,9 +2785,7 @@ fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
     bases
 }
 
-/// Root slot of a storage key and the shape of the variable it implies. A key that happens to
-/// be zero or one where it is used says nothing about the key type, so it is left for the
-/// solver, which sees every key of the mapping.
+// A key that happens to be zero or one where it is used says nothing about the key type.
 fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>, Option<String>) {
     if let Some(c) = expr::as_const(key) {
         if let Some((s, _)) = emit::hashed_slot(c) {
@@ -3117,7 +2842,6 @@ fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>,
     }
 }
 
-/// Packed-field reads anywhere in `e` (see `emit::packed_read`).
 fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
     let mut seen = HashSet::new();
     let mut stack = vec![root.expr];
@@ -3192,11 +2916,6 @@ fn collect_sloads(
     }
 }
 
-/// Printable ASCII runs in the code's data area (strings longer than 32 bytes are stored as data
-/// and loaded with CODECOPY by older compilers).
-/// Printable `PUSH` immediates (string constants a compiler placed in code), whole immediates
-/// only, so that fragments straddling instruction boundaries are not reported.
-/// `skip` lists embedded code regions as `(offset, length)`.
 fn scan_strings(code: &[u8], code_end: usize, skip: &[(usize, usize)]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let end = code_end.min(code.len());
@@ -3296,7 +3015,6 @@ fn mutability_str(m: Mutability) -> &'static str {
     }
 }
 
-/// Render the whole contract as pseudo-Solidity.
 pub fn render(c: &Contract, name: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -3450,7 +3168,6 @@ pub fn render(c: &Contract, name: &str) -> String {
     out
 }
 
-/// The banner that opens the functions of part `index` in a composite's source.
 fn part_banner(c: &Contract, index: usize) -> String {
     let Some(p) = c.parts.get(index) else {
         return String::new();
@@ -3466,7 +3183,6 @@ fn part_banner(c: &Contract, index: usize) -> String {
     )
 }
 
-/// The header comment of a composite: what it is and which parts it was assembled from.
 fn composite_header(c: &Contract) -> String {
     let Some(comp) = &c.composite else {
         return String::new();
@@ -3483,7 +3199,6 @@ fn composite_header(c: &Contract) -> String {
     out
 }
 
-/// The `function …(…) … {` line of a function, preceded by its selector comment.
 pub fn fmt_function_header(f: &Function) -> String {
     let mut s = String::new();
     match f.kind {

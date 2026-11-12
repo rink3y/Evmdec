@@ -1,6 +1,4 @@
 #!/bin/sh
-# Decompile and verify every .hex in DIR; print a per-contract line and totals.
-# Usage: DIR=path RUNS=3 corpus/run_sample.sh
 BIN=${BIN:-target/release/evmdec}
 DIR=${DIR:-sample}
 RUNS=${RUNS:-3}

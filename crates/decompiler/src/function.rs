@@ -1,5 +1,3 @@
-//! Public function discovery (dispatcher analysis) and function properties.
-
 use crate::emit::{self, calldata_word_index};
 use crate::expr::{self, ExprId, Node};
 use crate::lift::{self, Lifted, Root, Stmt, Term};
@@ -8,57 +6,37 @@ use crate::u256::U256;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-/// The role a recovered function plays in the contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FnKind {
-    /// Selector-dispatched function reachable from the dispatcher.
     External,
-    /// Code run when no selector matches (or the whole entry region when there is no dispatcher).
     Fallback,
-    /// Code run for empty calldata (the `calldatasize == 0` branch of the dispatcher).
     Receive,
-    /// Entry point of creation code: the fallback of a constructor unit, reclassified.
     Constructor,
-    /// Internal helper reached by jump-and-return calls, never dispatched directly.
     Internal,
-    /// Code region reached by no recovered jump or call (`orphan_<pc>`).
     Orphan,
 }
 
-/// Solidity state mutability of a function, inferred from its side effects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mutability {
-    /// Neither reads nor writes state (storage, chain environment, external calls).
     Pure,
-    /// Reads storage or the chain environment, or makes static calls, but never writes state.
     View,
-    /// May change state and rejects a non-zero `msg.value`.
     NonPayable,
-    /// Accepts `msg.value`: no check reverts on a non-zero call value.
     Payable,
 }
 
-/// An external function found in the dispatcher: its selector and body entry.
 #[derive(Clone, Debug)]
 pub struct Discovered {
-    /// Four-byte function selector the dispatcher compares against.
     pub selector: u32,
-    /// Entry node (in the main lifted graph).
     pub entry: usize,
 }
 
-/// Result of dispatcher analysis on the main lifted graph.
 #[derive(Clone, Debug)]
 pub struct Dispatch {
-    /// Selector-dispatched functions, sorted by selector.
     pub functions: Vec<Discovered>,
-    /// Entry node of the fallback body: a non-reverting dispatcher exit that is not a function.
     pub fallback: Option<usize>,
-    /// Entry node of the receive body (the `calldatasize == 0` branch), if any.
     pub receive: Option<usize>,
-    /// Nodes forming the dispatcher itself.
     pub dispatcher: HashSet<usize>,
 }
 
@@ -80,7 +58,6 @@ fn branch_polarity(cond: ExprId) -> Option<(u32, bool)> {
     None
 }
 
-/// The dispatcher itself rejects `msg.value` (the whole contract is non-payable).
 pub fn dispatcher_nonpayable(main: &Lifted, dispatcher: &HashSet<usize>) -> bool {
     for &n in dispatcher {
         if let Term::Branch { cond, t, f } = &main.nodes[n].term {
@@ -107,7 +84,6 @@ fn mentions(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
     expr::contains(e, pred)
 }
 
-/// Find the external functions reachable from the dispatcher of the main lifted unit.
 pub fn discover(main: &Lifted) -> Dispatch {
     let mut functions: Vec<Discovered> = Vec::new();
     let mut entries: HashSet<usize> = HashSet::new();
@@ -231,7 +207,6 @@ fn is_plain_revert(l: &Lifted, n: usize) -> bool {
     }
 }
 
-/// Copy the sub-graph reachable from `entry` into a new `Lifted`.
 pub fn slice(l: &Lifted, entry: usize) -> Lifted {
     let mut order = Vec::new();
     let mut seen = HashSet::new();
@@ -297,32 +272,20 @@ fn remap(t: &Term, map: &HashMap<usize, usize>) -> Term {
     }
 }
 
-/// Side-effect summary of a lifted graph (before considering internal callees).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Effects {
-    /// Contains an `SSTORE`.
     pub writes_storage: bool,
-    /// Reads a storage slot (`SLOAD`).
     pub reads_storage: bool,
-    /// Emits an event (`LOG0`..`LOG4`).
     pub logs: bool,
-    /// Makes a non-static external call (`CALL`, `CALLCODE` or `DELEGATECALL`).
     pub calls: bool,
-    /// Makes a `STATICCALL`.
     pub static_calls: bool,
-    /// Deploys a contract (`CREATE` or `CREATE2`).
     pub creates: bool,
-    /// Ends in `SELFDESTRUCT`.
     pub selfdestruct: bool,
-    /// Makes a `DELEGATECALL` or `CALLCODE` (runs foreign code in this contract's context).
     pub delegatecall: bool,
-    /// Reads chain or transaction environment (`CALLER`, `TIMESTAMP`, `BALANCE`, ...).
     pub reads_env: bool,
-    /// Entry pcs of the internal functions called directly, in first-call order, no duplicates.
     pub internal_callees: Vec<usize>,
 }
 
-/// Summarises the side effects of a lifted graph, ignoring those of its internal callees.
 pub fn effects(l: &Lifted) -> Effects {
     let mut e = Effects::default();
     for nd in &l.nodes {
@@ -365,7 +328,6 @@ pub fn effects(l: &Lifted) -> Effects {
     e
 }
 
-/// Is the function non-payable (checks `msg.value == 0` and reverts otherwise)?
 pub fn is_nonpayable(l: &Lifted) -> bool {
     for nd in &l.nodes {
         if let Term::Branch { cond, t, f } = &nd.term {
@@ -393,20 +355,13 @@ pub fn is_nonpayable(l: &Lifted) -> bool {
     false
 }
 
-/// A recovered calldata parameter.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Param {
-    /// Zero-based position among the ABI head words.
     pub index: u32,
-    /// Inferred Solidity type (`uint256` when nothing narrows it).
     pub ty: String,
-    /// Printed name: the one the code implies, else `arg<index>`.
     pub name: String,
 }
 
-/// Expressions of a function plus those of the internal functions it calls (two levels), with
-/// callee arguments substituted by the caller's actual values, so that decoding done in helper
-/// functions (solc >= 0.8) is visible.
 pub fn exprs_with_callees<'a>(
     l: &Lifted,
     resolve: &dyn Fn(usize) -> Option<&'a Lifted>,
@@ -418,8 +373,6 @@ pub fn exprs_with_callees<'a>(
         .collect()
 }
 
-/// [`exprs_with_callees`], each root tagged with whether it is a payload word (see
-/// [`lift::Root`]).
 pub fn exprs_with_callees_tagged<'a>(
     l: &Lifted,
     resolve: &dyn Fn(usize) -> Option<&'a Lifted>,
@@ -467,16 +420,11 @@ pub fn exprs_with_callees_tagged<'a>(
     out
 }
 
-/// Infer calldata parameters from usage.
 pub fn infer_params(l: &Lifted) -> Vec<Param> {
     let roots: Vec<Root> = l.nodes.iter().flat_map(lift::roots).collect();
     infer_params_from(&roots)
 }
 
-/// Masks and shifts that carve a piece of a value for a packed payload word (`x & 0xffffffff
-/// << 224 | y >> 32`): the operands of an `OR`, `SHL` or power-of-two `MUL`, and the root of a
-/// payload word (the 4-byte tail of a `4 + 32n` payload is `x & 0xffffffff` on its own). They
-/// say nothing about the type of what they mask.
 pub fn packing_masks(roots: &[Root]) -> HashSet<ExprId> {
     let mut out = HashSet::new();
     let mut seen = HashSet::new();
@@ -504,11 +452,6 @@ pub fn packing_masks(roots: &[Root]) -> HashSet<ExprId> {
     out
 }
 
-/// Infers calldata parameters from a set of expression roots, each tagged with whether it is a
-/// payload word.
-///
-/// Masks and sign-extensions give the types; the ABI head-size check (or, failing that, the
-/// highest calldata word read) gives the count.
 pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
     let mut max_idx: Option<u32> = None;
     let mut types: HashMap<u32, String> = HashMap::new();
@@ -670,7 +613,6 @@ pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
         .collect()
 }
 
-/// Infer return types from `return` payloads.
 pub fn infer_returns(l: &Lifted) -> Vec<String> {
     let mut best: Vec<String> = Vec::new();
     for nd in &l.nodes {
@@ -749,9 +691,6 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
     best
 }
 
-/// Return types of an internal unit with `n_rets` results: a position that only ever returns
-/// the constants 0 and 1, with 1 seen, or only comparisons, is a `bool`; everything else is
-/// `uint256`.
 pub fn infer_internal_returns(l: &Lifted, n_rets: usize) -> Vec<String> {
     let mut tys = vec!["uint256".to_string(); n_rets];
     let rets: Vec<&Vec<ExprId>> = l
@@ -779,9 +718,6 @@ pub fn infer_internal_returns(l: &Lifted, n_rets: usize) -> Vec<String> {
     tys
 }
 
-/// Parameter types of an internal unit with `n_params` parameters (`arg0` is the deepest):
-/// `address` for a parameter used as a call target, a `selfdestruct` beneficiary, compared with
-/// `msg.sender` or masked to 160 bits; `uint256` otherwise.
 pub fn internal_param_types(l: &Lifted, n_params: usize) -> Vec<String> {
     let mut tys = vec!["uint256".to_string(); n_params];
     let k = l.ret_slot.map(|k| k as usize).unwrap_or(l.n_args);
@@ -844,7 +780,6 @@ pub fn internal_param_types(l: &Lifted, n_params: usize) -> Vec<String> {
     tys
 }
 
-/// Best-effort Solidity type of a value from the shape of its expression (`uint256` by default).
 pub fn type_of_value(e: ExprId) -> String {
     match expr::node(e) {
         Node::Op(op::AND, v) => {

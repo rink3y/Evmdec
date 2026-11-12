@@ -1,18 +1,3 @@
-//! Basic blocks and compositional control-flow recovery.
-//!
-//! Jump targets in EVM code are stack values. We recover them with a *summary* analysis: every
-//! block is executed abstractly from a symbolic entry stack (`Slot(i)` is the i-th entry below
-//! the top at entry, `Mem(o)` the memory word at `o` at entry) and the result describes how
-//! control leaves the region reachable from it: a return through some slot/memory token, a halt,
-//! or an unresolved jump, together with the net stack effect. A jump to a constant target is
-//! resolved by composing the target's summary; when the target's return token evaluates to a
-//! constant code address at the call site, the jump is an internal call and the constant is the
-//! continuation. This keeps the analysis linear in the number of call sites (no product of
-//! nested contexts) and recovers internal functions with their argument and return counts.
-//!
-//! `Unit`s are the explicit graphs the lifter consumes: one for the public entry (dispatcher and
-//! external function bodies), one per internal function, one per orphan block.
-
 use crate::disasm::{self, Instruction};
 use crate::opcode as op;
 use crate::u256::U256;
@@ -21,46 +6,28 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
-/// A maximal straight-line run of instructions, ending at a terminator or before a JUMPDEST.
 #[derive(Clone, Debug, Serialize)]
 pub struct Block {
-    /// Index of this block in `Program::blocks`.
     pub id: usize,
-    /// Byte offset of the first instruction.
     pub start: usize,
-    /// Exclusive byte end.
     pub end: usize,
-    /// Index range into `Program::insns`.
     pub first: usize,
-    /// Index of the last instruction in `Program::insns` (inclusive).
     pub last: usize,
-    /// Opcode of the last instruction.
     pub terminator: u8,
-    /// Starts with JUMPDEST.
     pub is_jumpdest: bool,
 }
 
-/// Disassembled runtime code split into basic blocks.
 #[derive(Debug)]
 pub struct Program {
-    /// Raw bytecode.
     pub code: Vec<u8>,
-    /// Instructions in code order.
     pub insns: Vec<Instruction>,
-    /// Basic blocks in code order.
     pub blocks: Vec<Block>,
-    /// Block id by start byte offset.
     pub block_at_pc: BTreeMap<usize, usize>,
-    /// Byte offsets of every JUMPDEST (the valid jump targets).
     pub jumpdests: HashSet<usize>,
-    /// Candidate targets of computed jumps (block id -> target blocks), derived from the shape of
-    /// the target expression (alignment masks, shifts): hand-written dispatchers that jump to
-    /// `calldata[i] & 0x3ff0`-style addresses.
     pub computed_jumps: HashMap<usize, Vec<usize>>,
 }
 
 impl Program {
-    /// Disassemble `code` and split it into blocks at terminators and JUMPDESTs.
     pub fn new(code: Vec<u8>) -> Program {
         let insns = disasm::disassemble(&code);
         let jumpdests: HashSet<usize> = disasm::jumpdests(&code).into_iter().collect();
@@ -104,9 +71,6 @@ impl Program {
         }
     }
 
-    /// Can the EVM ever enter this block? Only the entry, JUMPDEST-started blocks and the
-    /// fall-through of a JUMPI can be executed; bytes after a terminator without a JUMPDEST are
-    /// data or dead by construction.
     pub fn is_potential_code(&self, b: usize) -> bool {
         let blk = &self.blocks[b];
         blk.start == 0
@@ -115,12 +79,10 @@ impl Program {
             || (b > 0 && !op::is_terminator(self.blocks[b - 1].terminator))
     }
 
-    /// Instructions of block `b`.
     pub fn block_insns(&self, b: &Block) -> &[Instruction] {
         &self.insns[b.first..=b.last]
     }
 
-    /// Block index of a valid jump target.
     pub fn target_block(&self, pc: usize) -> Option<usize> {
         if self.jumpdests.contains(&pc) {
             self.block_at_pc.get(&pc).copied()
@@ -129,7 +91,6 @@ impl Program {
         }
     }
 
-    /// Block following `b` in code order, if any.
     pub fn next_block(&self, b: usize) -> Option<usize> {
         if b + 1 < self.blocks.len() {
             Some(b + 1)
@@ -138,7 +99,6 @@ impl Program {
         }
     }
 
-    /// Block containing `pc`.
     pub fn block_containing(&self, pc: usize) -> Option<usize> {
         self.block_at_pc
             .range(..=pc)
@@ -148,25 +108,17 @@ impl Program {
     }
 }
 
-/// Abstract value for control-flow recovery.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum AVal {
-    /// A known constant.
     Const(U256),
-    /// A constant derived from `PC` (Vyper < 0.3 computes return addresses as `PC + k`).
     Pc(U256),
-    /// The i-th stack entry below the top at the entry of the region being analysed.
     Slot(u16),
-    /// The memory word at a constant offset at the entry of the region being analysed.
     Mem(u32),
-    /// Some value derived from a constant code region copied into memory (a jump table entry).
     Table,
-    /// Anything else.
     Unk,
 }
 
 impl AVal {
-    /// The constant value, if known (plain or `PC`-derived).
     pub fn konst(&self) -> Option<U256> {
         match self {
             AVal::Const(c) | AVal::Pc(c) => Some(*c),
@@ -180,13 +132,9 @@ impl AVal {
 
 #[derive(Clone)]
 struct AMem {
-    /// Known 32-byte words at constant offsets (word writes only).
     words: Rc<BTreeMap<u32, AVal>>,
-    /// Known bytes (from CODECOPY and constant stores) for jump-table recovery.
     bytes: Rc<Vec<Option<u8>>>,
-    /// Code regions copied into memory: (mem dest, code offset, len).
     regions: Rc<Vec<(usize, usize, usize)>>,
-    /// Some write with an unknown offset happened (entry-relative `Mem` tokens are no longer valid).
     clobbered: bool,
 }
 
@@ -278,16 +226,11 @@ impl AMem {
     }
 }
 
-/// Abstract machine state during a walk.
 #[derive(Clone)]
 pub struct AState {
-    /// Explicit part of the stack (top at the end). Entries below it are `Slot(consumed..)`.
     pub stack: Vec<AVal>,
-    /// How many entry slots have been popped (materialised) so far.
     pub consumed: u16,
     mem: AMem,
-    /// A real call frame: the entry stack is empty and memory is zero, so popping below the
-    /// explicit stack is infeasible (the EVM would have reverted) and untouched memory reads 0.
     pub root: bool,
 }
 
@@ -298,7 +241,6 @@ impl Default for AState {
 }
 
 impl AState {
-    /// State at the entry of a region: every stack entry and memory word is a symbolic token.
     pub fn new() -> AState {
         AState {
             stack: Vec::new(),
@@ -307,7 +249,6 @@ impl AState {
             root: false,
         }
     }
-    /// State at the start of a real call frame (pc 0 of a runtime): empty stack, zero memory.
     pub fn root() -> AState {
         AState {
             stack: Vec::new(),
@@ -316,11 +257,9 @@ impl AState {
             root: true,
         }
     }
-    /// The path popped below the stack a real frame started with.
     pub fn underflowed(&self) -> bool {
         self.root && self.consumed > 0
     }
-    /// Entry stack of a region: everything is a slot.
     fn pop(&mut self) -> AVal {
         match self.stack.pop() {
             Some(v) => v,
@@ -349,12 +288,10 @@ impl AState {
             self.stack.push(v);
         }
     }
-    /// Value of the i-th entry below the top (0 = top), materialising slots as needed.
     pub fn at(&mut self, i: usize) -> AVal {
         self.peek(i + 1)
     }
 
-    /// Identity of a node within a unit walk: positions of code addresses and tokens.
     fn sig(&self, prog: &Program) -> Sig {
         let mut items = Vec::new();
         for (i, v) in self.stack.iter().rev().enumerate() {
@@ -407,8 +344,6 @@ enum SigVal {
     Mem(u32),
 }
 
-/// Identity of a node within a unit walk: the positions of code addresses and entry tokens on
-/// the stack and in memory. Two states with the same `Sig` at the same block are one node.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Sig {
     items: Vec<(u16, SigVal)>,
@@ -416,8 +351,6 @@ pub struct Sig {
 }
 
 impl Sig {
-    /// Do the two signatures place the same code addresses, whatever entry tokens each still
-    /// holds on the stack or has copied into memory (a parameter hashed from scratch memory)?
     fn same_code_shape(&self, other: &Sig) -> bool {
         let code = |s: &Sig| -> Vec<(u16, SigVal)> {
             s.items
@@ -437,55 +370,35 @@ impl Sig {
     }
 }
 
-/// How control leaves a block.
 #[derive(Clone, Debug)]
 pub enum Flow {
-    /// Jump to constant targets (one for JUMP, several for a jump table).
     Jump(Vec<usize>),
-    /// Conditional: true targets (constant) and fall-through block.
     Branch {
-        /// Constant targets taken when the condition is non-zero.
         targets: Vec<usize>,
-        /// Block executed when the condition is zero, if any.
         fallthrough: Option<usize>,
     },
-    /// JUMP to a value that is not a constant: a return through `token` (Slot/Mem) or unknown.
     Return(AVal),
-    /// No terminator: execution continues into the given block.
     Fallthrough(usize),
-    /// Execution ends here; carries the terminating opcode (STOP, RETURN, REVERT, INVALID, ...).
     Halt(u8),
-    /// JUMPI whose target is not constant; fall-through is still possible.
     BranchUnresolved {
-        /// The non-constant jump target.
         target: AVal,
-        /// Block executed when the condition is zero, if any.
         fallthrough: Option<usize>,
     },
 }
 
-/// Whether a walk takes the candidates of a computed jump (one whose target is not a constant).
-///
-/// Orphan units ignore them so that the unreachable handlers of a jump-table dispatcher do not
-/// each re-explore the whole program.
+// Orphan units ignore computed jumps.
+// Otherwise each unreachable handler of a jump table re-explores the whole program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ComputedJumps {
-    /// Follow every resolved candidate target.
     Follow,
-    /// Stop at computed jumps.
     Ignore,
 }
 
-/// Outcome of abstractly executing one block.
 #[derive(Debug)]
 pub struct BlockExit {
-    /// Abstract state at the end of the block.
     pub state: AState,
-    /// How control leaves the block.
     pub flow: Flow,
-    /// Memory word offsets written with constant offsets.
     pub mem_written: Vec<u32>,
-    /// Some memory write in the block had an unknown offset.
     pub mem_clobbered: bool,
 }
 
@@ -520,7 +433,6 @@ fn to_usize(v: AVal) -> Option<usize> {
     v.konst().and_then(|c| c.as_usize())
 }
 
-/// Abstractly execute block `b` from `state`. Never fails.
 pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
     let mut st = state.clone();
     let mut mem_written = Vec::new();
@@ -823,7 +735,6 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
     }
 }
 
-/// Every plausible 2-byte big-endian jump destination inside the code regions copied into memory.
 fn table_targets(prog: &Program, mem: &AMem) -> Vec<usize> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -845,31 +756,20 @@ fn table_targets(prog: &Program, mem: &AMem) -> Vec<usize> {
     out
 }
 
-/// One way control can leave the region reachable from a block, with its net stack effect.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Exit {
-    /// Return token (Slot/Mem) through which the JUMP leaves, or `Unk`.
     pub via: AVal,
-    /// Entry stack slots consumed on the way to this exit.
     pub consumed: u16,
-    /// Stack left above the remaining entry slots at the exit (top last).
     pub pushed: Vec<AVal>,
 }
 
-/// How control can leave the region reachable from a block (see the module docs).
 #[derive(Clone, Debug, Default)]
 pub struct Summary {
-    /// Ways of leaving the region through a non-constant JUMP (at most `MAX_EXITS`).
     pub exits: Vec<Exit>,
-    /// Some path halts (STOP/RETURN/REVERT/...) instead of exiting.
     pub may_halt: bool,
-    /// Some jump in the region could not be resolved, or the walk ran out of budget.
     pub unresolved: bool,
-    /// Memory words (constant offsets) that may be written before any exit.
     pub mem_written: Vec<u32>,
-    /// Some path writes memory at an unknown offset before an exit.
     pub mem_clobbered: bool,
-    /// Blocks reachable within the region (for coverage accounting).
     pub blocks: Vec<usize>,
 }
 
@@ -880,35 +780,25 @@ enum Memo {
     Complete,
 }
 
-/// Summary analysis over a `Program`: memoised block summaries and the internal-call targets
-/// they reveal.
 pub struct Analysis<'a> {
-    /// The program being analysed.
     pub prog: &'a Program,
     summaries: RefCell<Vec<Summary>>,
     memo: RefCell<Vec<Option<Memo>>>,
     stack_depth: RefCell<usize>,
-    /// Blocks used as internal-call targets with a constant continuation.
     pub call_targets: RefCell<HashSet<usize>>,
-    /// Abstract instructions executed so far (bounded by `MAX_STEPS`).
     pub steps: RefCell<usize>,
-    /// Set once a step or recursion budget was hit; results are then incomplete.
     pub budget_exhausted: RefCell<bool>,
 }
 
 const MAX_EXITS: usize = 24;
-/// Total nodes across all orphan units (unreached code is decompiled best-effort).
 const MAX_ORPHAN_NODES: usize = 60_000;
-/// Distinct contexts a single block may have inside one unit walk. Loops that push or pop a
-/// stack entry per iteration (Vyper buffer copies) would otherwise create a node per iteration.
+// Loops that push or pop a stack entry per iteration would make a node per iteration.
 const MAX_BLOCK_CONTEXTS: usize = 12;
 const MAX_WALK_NODES: usize = 6000;
 const MAX_STEPS: usize = 3_000_000;
 const MAX_RECURSION: usize = 3000;
 const MAX_PROVISIONAL_RECOMPUTES: u32 = 6;
 
-/// Substitute tokens of `v` (relative to a callee's entry) with the values of `st` (the caller's
-/// state at the call), materialising slots as needed.
 fn resolve(v: AVal, st: &mut AState) -> AVal {
     match v {
         AVal::Slot(i) => st.at(i as usize),
@@ -926,7 +816,6 @@ fn resolve(v: AVal, st: &mut AState) -> AVal {
     }
 }
 
-/// Apply an exit's stack effect to the caller state.
 fn apply_exit(ex: &Exit, st: &mut AState) {
     let mut pre = st.clone();
     let resolved: Vec<AVal> = ex.pushed.iter().map(|v| resolve(*v, &mut pre)).collect();
@@ -969,7 +858,6 @@ fn add_exit(exits: &mut Vec<Exit>, ex: Exit) -> bool {
 }
 
 impl<'a> Analysis<'a> {
-    /// Analysis of `prog` with empty memo tables.
     pub fn new(prog: &'a Program) -> Analysis<'a> {
         Analysis {
             prog,
@@ -982,7 +870,6 @@ impl<'a> Analysis<'a> {
         }
     }
 
-    /// Summary of the region reachable from block `b`, computed and memoised on demand.
     pub fn summary(&self, b: usize) -> Summary {
         let m = self.memo.borrow()[b];
         match m {
@@ -1037,12 +924,10 @@ impl<'a> Analysis<'a> {
         self.summaries.borrow()[b].clone()
     }
 
-    /// Is `b` currently being computed (part of a cycle through the caller)?
     fn is_pending(&self, b: usize) -> bool {
         matches!(self.memo.borrow()[b], Some(Memo::Pending))
     }
 
-    /// Walk the region from `b` with a symbolic entry stack and collect its exits.
     fn walk_summary(&self, b: usize) -> (Summary, bool) {
         let prog = self.prog;
         let mut summary = Summary::default();
@@ -1197,75 +1082,46 @@ impl<'a> Analysis<'a> {
     }
 }
 
-/// Kind of a successor edge in a `Unit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Edge {
-    /// The block has no terminator and continues into the next one.
     Fallthrough,
-    /// Unconditional JUMP to a resolved target.
     Jump,
-    /// JUMPI taken.
     True,
-    /// JUMPI not taken (fall-through).
     False,
-    /// Continuation after an internal call returns.
     Return,
 }
 
-/// An internal call made by the JUMP at the end of a node.
 #[derive(Clone, Debug)]
 pub struct CallInfo {
-    /// Entry block of the called function.
     pub callee: usize,
-    /// Stack entries consumed by the callee (including the return address).
     pub consumed: u16,
-    /// Values pushed by the callee (relative to the caller's stack before the call).
     pub pushed: Vec<AVal>,
-    /// Index (from the top, after popping the target) of the return address.
     pub ret_slot: Option<u16>,
 }
 
-/// A block in a specific stack context: one node of a `Unit` graph.
 #[derive(Clone, Debug)]
 pub struct UNode {
-    /// Index of this node in `Unit::nodes`.
     pub id: usize,
-    /// The basic block this node executes.
     pub block: usize,
-    /// Abstract state at the start of the block in this context.
     pub entry: AState,
-    /// Successor nodes with the kind of edge leading to each.
     pub succs: Vec<(usize, Edge)>,
-    /// Predecessor node ids.
     pub preds: Vec<usize>,
-    /// Set when the block's JUMP is an internal call: the continuation nodes are `Return` succs.
     pub call: Option<CallInfo>,
-    /// The block ends by returning from this unit through a token (Slot/Mem).
     pub returns_via: Option<AVal>,
-    /// The block's jump target could not be resolved to code.
     pub unresolved: bool,
-    /// The path into this node underflows the real frame's stack and cannot execute.
     pub infeasible: bool,
-    /// A computed jump that this (orphan) unit does not follow; its targets are shown where the
-    /// main unit dispatches on it.
     pub computed_cut: bool,
 }
 
-/// Explicit control-flow graph of one region (public entry, internal function or orphan block).
 #[derive(Clone, Debug)]
 pub struct Unit {
-    /// Basic block the unit starts at.
     pub entry_block: usize,
-    /// Nodes indexed by `UNode::id`.
     pub nodes: Vec<UNode>,
-    /// Id of the entry node.
     pub entry: usize,
-    /// The walk hit a node or context limit and the graph is incomplete.
     pub budget_exhausted: bool,
 }
 
 impl<'a> Analysis<'a> {
-    /// Build the explicit graph for the region starting at `entry_block` with `entry_state`.
     pub fn build_unit(&self, entry_block: usize, entry_state: AState) -> Unit {
         self.build_unit_opts(
             entry_block,
@@ -1275,8 +1131,6 @@ impl<'a> Analysis<'a> {
         )
     }
 
-    /// Like [`build_unit`](Self::build_unit) with an explicit computed-jump policy and node
-    /// budget.
     pub fn build_unit_opts(
         &self,
         entry_block: usize,
@@ -1510,7 +1364,6 @@ impl<'a> Analysis<'a> {
 }
 
 impl Unit {
-    /// The sub-unit reachable from node `entry` (ids remapped), for lifting a region separately.
     pub fn slice(&self, entry: usize) -> (Unit, HashMap<usize, usize>) {
         let mut order = Vec::new();
         let mut seen = HashSet::new();
@@ -1550,22 +1403,15 @@ impl Unit {
     }
 }
 
-/// Whole-program recovery result.
 #[derive(Debug)]
 pub struct Recovered {
-    /// The public entry: dispatcher and external function bodies.
     pub main: Unit,
-    /// Internal functions: entry block -> unit.
     pub functions: BTreeMap<usize, Unit>,
-    /// Orphan regions (blocks reached by nothing), by entry block.
     pub orphans: BTreeMap<usize, Unit>,
-    /// End offsets of blocks whose jump could not be resolved, sorted and deduplicated.
     pub unresolved_jumps: Vec<usize>,
-    /// Some walk or summary ran out of budget; the result is incomplete.
     pub budget_exhausted: bool,
 }
 
-/// Recover the control flow of a whole runtime.
 pub fn recover(prog: &Program, code_end: usize) -> Recovered {
     let an = Analysis::new(prog);
     if prog.blocks.is_empty() {

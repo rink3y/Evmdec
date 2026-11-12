@@ -1,5 +1,4 @@
 #!/bin/sh
-# Run the block oracle over every contract in testdata/mainnet and print a table.
 BIN=${BIN:-target/release/evmdec}
 DIR=${DIR:-testdata/mainnet}
 RUNS=${RUNS:-8}

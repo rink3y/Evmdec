@@ -55,8 +55,7 @@ surrounding code before reporting.
 - A `bool` parameter is a smell; prefer a two-variant enum named after what it
   selects. Named-field structs over tuples of more than two elements.
 - Return `Option` for "no value", `Result` for recoverable errors, and panic
-  only for programmer errors that callers cannot handle. Document every panic
-  under a `# Panics` heading.
+  only for programmer errors that callers cannot handle.
 - Prefer `expect("why this cannot fail")` over `unwrap()`, and pattern matching
   (`if let`, `let else`, `match`) over check-then-unwrap
   (`if x.is_some() { x.unwrap() }`). Assertions carry a context string.
@@ -84,12 +83,19 @@ surrounding code before reporting.
 - Lifetimes on public items are descriptive (`'code`, `'arena`) when more than
   one is in scope.
 
-## Documentation
+## Comments
 
-- Every public item has a `///` doc comment: a one-sentence summary line, then
-  details. Every public module has a `//!` summary. Panics, errors, and safety
-  are documented under `# Panics`, `# Errors`, `# Safety` headings.
-- Comments explain why, not what. No commented-out code.
+This repository overrides the guide here. See the Comments section of
+`CONTRIBUTING.md`, which is the authority.
+
+- No `///` or `//!` documentation comments on functions, types or files. Report
+  any that appear.
+- A comment may only say why: the reason behind a choice, a warning about
+  something that could break, or a workaround. Report a comment that describes
+  what the code does, and one that would not stop a future mistake.
+- Short plain sentences, no semicolons. No commented-out code.
+- Text a program shows its user (command-line help) lives in an attribute or a
+  string, never in a doc comment.
 
 ## Implementation concerns
 

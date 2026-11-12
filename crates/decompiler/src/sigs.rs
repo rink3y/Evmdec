@@ -1,26 +1,18 @@
-//! Built-in dictionary of function, event and error signatures. Selectors and topic hashes are
-//! computed with our own keccak at first use, so every entry is correct by construction.
-
 use crate::keccak;
 use crate::sigdb;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// The signature dictionary indexed by hash, built once from the string tables below.
 #[derive(Debug)]
 pub struct Sigs {
-    /// 4-byte selector to every function signature that hashes to it (collisions keep all).
     pub functions: HashMap<u32, Vec<&'static str>>,
-    /// Event topic0 (keccak256 of the signature) to the event signature.
     pub events: HashMap<[u8; 32], &'static str>,
-    /// 4-byte selector to custom error signature.
     pub errors: HashMap<u32, &'static str>,
 }
 
 static SIGS: OnceLock<Sigs> = OnceLock::new();
 
-/// The process-wide dictionary, hashed lazily on first use.
 pub fn get() -> &'static Sigs {
     SIGS.get_or_init(|| {
         let mut functions: HashMap<u32, Vec<&'static str>> = HashMap::new();
@@ -46,8 +38,6 @@ pub fn get() -> &'static Sigs {
     })
 }
 
-/// Function signature for a selector: the built-in dictionary first (the first listed wins on
-/// a collision), then the local index ([`crate::sigdb`]) when one is installed.
 pub fn function(selector: u32) -> Option<Cow<'static, str>> {
     if let Some(s) = get().functions.get(&selector).and_then(|v| v.first()) {
         return Some(Cow::Borrowed(s));
@@ -57,7 +47,6 @@ pub fn function(selector: u32) -> Option<Cow<'static, str>> {
         .map(Cow::Owned)
 }
 
-/// Event signature for a topic0 hash, from the built-in dictionary or the local index.
 pub fn event(topic: &[u8; 32]) -> Option<Cow<'static, str>> {
     if let Some(s) = get().events.get(topic) {
         return Some(Cow::Borrowed(s));
@@ -67,9 +56,6 @@ pub fn event(topic: &[u8; 32]) -> Option<Cow<'static, str>> {
         .map(Cow::Owned)
 }
 
-/// Custom error signature for a selector, from the built-in dictionary or the local index.
-/// The index does not record kinds, so for a selector outside the dictionary this is the same
-/// lookup as [`function`]: a function signature can come back where revert data is decoded.
 pub fn error(selector: u32) -> Option<Cow<'static, str>> {
     if let Some(s) = get().errors.get(&selector) {
         return Some(Cow::Borrowed(s));
@@ -79,8 +65,6 @@ pub fn error(selector: u32) -> Option<Cow<'static, str>> {
         .map(Cow::Owned)
 }
 
-/// Look up unknown selectors in the openchain.xyz signature database (falls back to 4byte.directory).
-/// Returns the first signature per selector. Network failures are not errors: the result is simply empty.
 #[cfg(feature = "rpc")]
 pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
     let mut out = HashMap::new();
@@ -138,12 +122,10 @@ pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
     out
 }
 
-/// Name part of a signature: `transfer(address,uint256)` -> `transfer`.
 pub fn name_of(sig: &str) -> &str {
     sig.split('(').next().unwrap_or(sig)
 }
 
-/// Parameter types of a signature, split at top-level commas.
 pub fn params_of(sig: &str) -> Vec<String> {
     let inner = match (sig.find('('), sig.rfind(')')) {
         (Some(a), Some(b)) if b > a => &sig[a + 1..b],
@@ -174,7 +156,6 @@ pub fn params_of(sig: &str) -> Vec<String> {
     out
 }
 
-/// Function signatures in canonical ABI form, grouped by the protocols they come from.
 pub const FUNCTIONS: &[&str] = &[
     "name()", "symbol()", "decimals()", "totalSupply()", "balanceOf(address)", "transfer(address,uint256)", "transferFrom(address,address,uint256)",
     "approve(address,uint256)", "allowance(address,address)", "increaseAllowance(address,uint256)", "decreaseAllowance(address,uint256)",
@@ -269,7 +250,6 @@ pub const FUNCTIONS: &[&str] = &[
     "fallback()", "receive()", "proxyOwner()", "transferProxyOwnership(address)", "upgradeTo(string,address)", "upgradeToAndCall(string,address,bytes)", "setImplementation(address)", "setPendingImplementation(address)", "acceptImplementation()", "_setImplementation(address,bool,bytes)", "comptrollerImplementation()", "pendingComptrollerImplementation()", "_become(address)",
 ];
 
-/// Event signatures in canonical ABI form.
 pub const EVENTS: &[&str] = &[
     "Transfer(address,address,uint256)", "Approval(address,address,uint256)", "Transfer(address,address,uint256,bytes)", "TransferSingle(address,address,address,uint256,uint256)", "TransferBatch(address,address,address,uint256[],uint256[])", "ApprovalForAll(address,address,bool)", "URI(string,uint256)",
     "OwnershipTransferred(address,address)", "OwnershipTransferStarted(address,address)", "OwnerNominated(address)", "OwnerChanged(address,address)", "AdminChanged(address,address)", "Upgraded(address)", "BeaconUpgraded(address)", "Initialized(uint8)", "Initialized(uint64)",
@@ -292,7 +272,6 @@ pub const EVENTS: &[&str] = &[
     "AnswerUpdated(int256,uint256,uint256)", "NewRound(uint256,address,uint256)", "SwapAndLiquify(uint256,uint256,uint256)", "MinTokensBeforeSwapUpdated(uint256)", "SwapAndLiquifyEnabledUpdated(bool)", "MaxTxAmountUpdated(uint256)", "ExcludeFromFee(address)", "Snapshot(uint256)", "Mint(address,uint256)", "Burned(address,uint256)", "Minted(address,uint256)", "TokensMinted(address,uint256)", "TokensBurned(address,uint256)", "Locked(address,uint256)", "Unlocked(address,uint256)", "Stake(address,uint256)", "Unstake(address,uint256)", "Harvest(address,uint256)", "EmergencyWithdraw(address,uint256,uint256)", "Deposit(address,uint256,uint256)", "Withdraw(address,uint256,uint256)", "ImplementationUpdated(address,address)", "ProxyOwnershipTransferred(address,address)", "ProxyUpdated(address,address)", "NewImplementation(address,address)", "NewPendingImplementation(address,address)",
 ];
 
-/// Custom error signatures in canonical ABI form.
 pub const ERRORS: &[&str] = &[
     "Error(string)",
     "Panic(uint256)",

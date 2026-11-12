@@ -1,5 +1,3 @@
-//! Keccak-256 (the Ethereum variant, padding 0x01), written from scratch.
-
 const RC: [u64; 24] = [
     0x0000000000000001,
     0x0000000000008082,
@@ -63,7 +61,6 @@ fn keccakf(st: &mut [u64; 25]) {
     }
 }
 
-/// Keccak-256 of `data`: the EVM `SHA3` hash, which pads differently from NIST SHA3-256.
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
     const RATE: usize = 136;
     let mut st = [0u64; 25];
@@ -92,13 +89,11 @@ fn absorb(st: &mut [u64; 25], block: &[u8]) {
     keccakf(st);
 }
 
-/// First four bytes of keccak256 of a canonical signature string, e.g. `transfer(address,uint256)`.
 pub fn selector(sig: &str) -> [u8; 4] {
     let h = keccak256(sig.as_bytes());
     [h[0], h[1], h[2], h[3]]
 }
 
-/// The function selector of `sig` as a big-endian `u32`.
 pub fn selector_u32(sig: &str) -> u32 {
     u32::from_be_bytes(selector(sig))
 }

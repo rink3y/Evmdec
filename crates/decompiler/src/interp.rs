@@ -1,22 +1,15 @@
-//! A concrete EVM interpreter for single-frame execution (the reference side of the oracle).
-//! External effects (calls, creates, environment, other accounts) are provided by a deterministic
-//! pseudo-random host so that both sides of a comparison see the same world.
-
 use crate::keccak;
 use crate::opcode as op;
 use crate::u256::U256;
 use std::collections::HashMap;
 
-/// Deterministic PRNG (xorshift64*).
 #[derive(Clone, Debug)]
 pub struct Rng(pub u64);
 impl Rng {
-    /// Creates a generator from `seed`; the state is forced odd so it is never the all-zero
-    /// fixed point of xorshift.
+    // The state is forced odd. Zero is a fixed point of xorshift.
     pub fn new(seed: u64) -> Rng {
         Rng(seed.wrapping_mul(0x9e3779b97f4a7c15) | 1)
     }
-    /// Advances the state and returns the next 64-bit output.
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
@@ -25,7 +18,6 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545f4914f6cdd1d)
     }
-    /// A value in `0..n` (`0` when `n == 0`).
     pub fn below(&mut self, n: u64) -> u64 {
         if n == 0 {
             0
@@ -33,7 +25,6 @@ impl Rng {
             self.next_u64() % n
         }
     }
-    /// A uniformly random 256-bit word.
     pub fn word(&mut self) -> U256 {
         U256([
             self.next_u64(),
@@ -42,11 +33,9 @@ impl Rng {
             self.next_u64(),
         ])
     }
-    /// `n` random bytes.
     pub fn bytes(&mut self, n: usize) -> Vec<u8> {
         (0..n).map(|_| self.next_u64() as u8).collect()
     }
-    /// A stack value drawn from a distribution that exercises offsets, small ints, addresses and full words.
     pub fn value(&mut self) -> U256 {
         match self.below(12) {
             0..=2 => U256::from_u64(self.below(64)),
@@ -64,61 +53,31 @@ fn h(data: &[u8]) -> U256 {
     U256::from_be_bytes(&keccak::keccak256(data))
 }
 
-/// The world outside the frame: environment values and deterministic external effects.
 #[derive(Clone, Debug)]
 pub struct Host {
-    /// Address of the executing account (`ADDRESS`).
     pub address: U256,
-    /// Immediate caller of the frame (`CALLER`).
     pub caller: U256,
-    /// Transaction sender (`ORIGIN`).
     pub origin: U256,
-    /// Value sent with the call (`CALLVALUE`).
     pub callvalue: U256,
-    /// Input data of the frame (`CALLDATALOAD`, `CALLDATASIZE`, `CALLDATACOPY`).
     pub calldata: Vec<u8>,
-    /// Gas price of the transaction (`GASPRICE`).
     pub gasprice: U256,
-    /// Block beneficiary (`COINBASE`).
     pub coinbase: U256,
-    /// Block timestamp (`TIMESTAMP`).
     pub timestamp: U256,
-    /// Block number (`NUMBER`); also bounds the range `blockhash` answers for.
     pub number: U256,
-    /// Beacon chain randomness (`PREVRANDAO`).
     pub prevrandao: U256,
-    /// Block gas limit (`GASLIMIT`).
     pub gaslimit: U256,
-    /// Chain identifier (`CHAINID`).
     pub chainid: U256,
-    /// Balance of the executing account (`SELFBALANCE`).
     pub selfbalance: U256,
-    /// Block base fee (`BASEFEE`).
     pub basefee: U256,
-    /// Blob base fee (`BLOBBASEFEE`).
     pub blobbasefee: U256,
-    /// Seed from which every external effect (balances, code, storage, call and create results)
-    /// is derived, so two machines sharing a host observe the same world.
     pub seed: u64,
-    /// When set, `storage` reads as zero for every key not written in the frame (a freshly
-    /// deployed, empty contract), instead of the seed-derived value. Used by the executor so a
-    /// confirmation run starts from a clean, chosen state.
     pub zero_storage: bool,
-    /// When set, every external call returns this success flag with empty data, instead of the
-    /// seed-derived outcome. Lets a confirmation run assume the worst (or best) case of a callee.
     pub force_calls: Option<bool>,
-    /// When set, a CALL-family instruction or a creation records itself and yields
-    /// [`Outcome::Call`] or [`Outcome::Create`] instead of resolving against the seed, so a
-    /// driver can run the real code across contracts.
     pub intercept_calls: bool,
-    /// When set, every storage key not written in the frame reads as this value, ahead of
-    /// `zero_storage` and the seed: a ledger in which every entry already holds something.
     pub unset_storage: Option<U256>,
 }
 
 impl Host {
-    /// Draws a plausible environment from `rng`: 20-byte addresses, up to 260 bytes of calldata,
-    /// recent-looking block values and a fresh effect `seed`.
     pub fn random(rng: &mut Rng) -> Host {
         Host {
             address: U256::from_be_bytes(&rng.bytes(20)),
@@ -151,12 +110,7 @@ impl Host {
         }
     }
 
-    /// A controlled environment for a confirmation run: `caller` is both the immediate caller
-    /// and the transaction origin (the account whose reach is being tested), `calldata` is the
-    /// input, storage reads as zero unless written, and the block values are fixed. External
-    /// calls succeed with empty return data (plain transfers land and the caller's own contracts
-    /// cooperate), which is the case a reachability witness is about. Every field is
-    /// deterministic so a reached sink is reproducible.
+    // Every field is deterministic so a reached sink is reproducible.
     pub fn controlled(address: U256, caller: U256, calldata: Vec<u8>, callvalue: U256) -> Host {
         Host {
             address,
@@ -181,13 +135,11 @@ impl Host {
             unset_storage: None,
         }
     }
-    /// Balance of account `a` (`BALANCE`): seed-derived, limited to 64 bits.
     pub fn balance(&self, a: U256) -> U256 {
         h(&[&self.seed.to_be_bytes()[..], b"bal", &a.to_be_bytes()].concat())
             & U256::from_u64(u64::MAX)
     }
-    /// Code size of account `a` (`EXTCODESIZE`): seed-derived, below 300 bytes. The zero address
-    /// never holds code, so an unset storage slot read as an address has none.
+    // The zero address never holds code. An unset slot read as an address must have none.
     pub fn extcodesize(&self, a: U256) -> U256 {
         if a.is_zero() {
             return U256::ZERO;
@@ -196,15 +148,12 @@ impl Host {
             h(&[&self.seed.to_be_bytes()[..], b"size", &a.to_be_bytes()].concat()).low_u64() % 300,
         )
     }
-    /// Code hash of account `a` (`EXTCODEHASH`): seed-derived, not the hash of `extcode`; zero
-    /// for the zero address, which has no code.
     pub fn extcodehash(&self, a: U256) -> U256 {
         if a.is_zero() {
             return U256::ZERO;
         }
         h(&[&self.seed.to_be_bytes()[..], b"hash", &a.to_be_bytes()].concat())
     }
-    /// Code of account `a` (`EXTCODECOPY`): `extcodesize(a)` seed-derived bytes.
     pub fn extcode(&self, a: U256) -> Vec<u8> {
         let n = self.extcodesize(a).low_u64() as usize;
         let mut v = Vec::new();
@@ -224,7 +173,6 @@ impl Host {
         v.truncate(n);
         v
     }
-    /// Hash of block `n` (`BLOCKHASH`): zero unless `n` is one of the 256 blocks before `number`.
     pub fn blockhash(&self, n: U256) -> U256 {
         if n >= self.number || self.number.wrapping_sub(n) > U256::from_u64(256) {
             U256::ZERO
@@ -232,7 +180,6 @@ impl Host {
             h(&[&self.seed.to_be_bytes()[..], b"bh", &n.to_be_bytes()].concat())
         }
     }
-    /// Versioned hash of blob `i` (`BLOBHASH`): zero for indices of 3 and above.
     pub fn blobhash(&self, i: U256) -> U256 {
         if i >= U256::from_u64(3) {
             U256::ZERO
@@ -240,7 +187,6 @@ impl Host {
             h(&[&self.seed.to_be_bytes()[..], b"blob", &i.to_be_bytes()].concat())
         }
     }
-    /// Initial storage value of a key (random but deterministic).
     pub fn storage(&self, k: U256) -> U256 {
         if let Some(held) = self.unset_storage {
             return held;
@@ -255,7 +201,6 @@ impl Host {
             r
         }
     }
-    /// Outcome of the i-th external call: (success, return data).
     pub fn call_result(&self, i: usize) -> (bool, Vec<u8>) {
         if let Some(b) = self.force_calls {
             return (b, Vec::new());
@@ -279,7 +224,6 @@ impl Host {
         data.truncate(n);
         (success, data)
     }
-    /// Address returned by the i-th `CREATE`/`CREATE2`; zero (failure) for roughly one in five.
     pub fn create_result(&self, i: usize) -> U256 {
         let r = h(&[
             &self.seed.to_be_bytes()[..],
@@ -293,119 +237,70 @@ impl Host {
             r & crate::expr::mask_bits(160)
         }
     }
-    /// Gas available when the frame starts: between one and two million, seed-derived.
     pub fn initial_gas(&self) -> u64 {
         1_000_000 + (self.seed % 1_000_000)
     }
 }
 
-/// Operands of one external call, recorded so both sides of a comparison can be checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallRecord {
-    /// The opcode: `CALL`, `CALLCODE`, `DELEGATECALL` or `STATICCALL`.
     pub kind: u8,
-    /// Gas operand.
     pub gas: U256,
-    /// Callee address.
     pub addr: U256,
-    /// Value operand (zero for `DELEGATECALL` and `STATICCALL`, which have none).
     pub value: U256,
-    /// Input bytes read from memory.
     pub input: Vec<u8>,
-    /// Memory offset the return data is written to.
     pub out_off: U256,
-    /// Maximum number of return-data bytes written to memory.
     pub out_len: U256,
 }
 
-/// Operands of one contract creation, recorded so both sides of a comparison can be checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateRecord {
-    /// The opcode: `CREATE` or `CREATE2`.
     pub kind: u8,
-    /// Value endowed to the new account.
     pub value: U256,
-    /// Init code read from memory.
     pub init: Vec<u8>,
-    /// Salt operand; present only for `CREATE2`.
     pub salt: Option<U256>,
 }
 
-/// One emitted log (`LOG0`..`LOG4`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {
-    /// Topics in operand order (zero to four).
     pub topics: Vec<U256>,
-    /// Payload read from memory.
     pub data: Vec<u8>,
 }
 
-/// How a block's execution ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// Block ended with JUMP to this target value.
     Jump(U256),
-    /// JUMPI: (target, condition).
     JumpI(U256, U256),
-    /// Fell through to the next block.
     Fallthrough,
-    /// `STOP`.
     Stop,
-    /// `RETURN` with the returned bytes.
     Return(Vec<u8>),
-    /// `REVERT` with the revert data.
     Revert(Vec<u8>),
-    /// `SELFDESTRUCT` with the beneficiary address.
     SelfDestruct(U256),
-    /// `INVALID` or an undefined opcode.
     Invalid,
-    /// Exceptional halt inside the block (stack underflow/overflow, bad opcode).
     Exception(String),
-    /// A CALL-family instruction whose result the driver supplies, when `Host::intercept_calls`
-    /// is set: the index into [`Machine::calls`] of the call to resolve. The driver runs the
-    /// callee and then calls [`Machine::resume_after_call`] before continuing.
     Call(usize),
-    /// A creation whose result the driver supplies, when `Host::intercept_calls` is set: the
-    /// index into [`Machine::creates`]. The driver runs the init code and then calls
-    /// [`Machine::resume_after_create`] before continuing.
     Create(usize),
 }
 
-/// Execution state of one frame: the EVM machine state plus a record of every external effect.
 #[derive(Clone, Debug)]
 pub struct Machine<'a> {
-    /// The bytecode being executed.
     pub code: &'a [u8],
-    /// Environment and external effects.
     pub host: &'a Host,
-    /// Operand stack, bottom first.
     pub stack: Vec<U256>,
-    /// Memory, always a whole number of 32-byte words.
     pub memory: Vec<u8>,
-    /// Storage overrides (reads fall back to `host.storage`).
     pub storage: HashMap<U256, U256>,
-    /// Transient storage (`TLOAD`/`TSTORE`); unset keys read as zero.
     pub transient: HashMap<U256, U256>,
-    /// Return data of the last call or create (`RETURNDATASIZE`/`RETURNDATACOPY`).
     pub returndata: Vec<u8>,
-    /// Remaining gas, decremented by each instruction's static cost.
     pub gas: u64,
-    /// Logs emitted so far, in order.
     pub logs: Vec<LogRecord>,
-    /// External calls made so far, in order; the index selects `Host::call_result`.
     pub calls: Vec<CallRecord>,
-    /// Creations made so far, in order; the index selects `Host::create_result`.
     pub creates: Vec<CreateRecord>,
-    /// Values observed by GAS and MSIZE, in order (the lifter treats them as opaque).
     pub gas_obs: Vec<U256>,
-    /// Values observed by `MSIZE`, in order.
     pub msize_obs: Vec<U256>,
-    /// Offset of the next instruction to execute.
     pub pc: usize,
 }
 
 impl<'a> Machine<'a> {
-    /// A machine at offset 0 with empty stack, memory and effects, and the host's initial gas.
     pub fn new(code: &'a [u8], host: &'a Host) -> Machine<'a> {
         Machine {
             code,
@@ -425,7 +320,6 @@ impl<'a> Machine<'a> {
         }
     }
 
-    /// Current value of storage key `k`: a write made in this frame, else the host's initial value.
     pub fn sload(&self, k: U256) -> U256 {
         self.storage
             .get(&k)
@@ -448,8 +342,6 @@ impl<'a> Machine<'a> {
         }
         Ok(())
     }
-    /// Reads `len` bytes at `off`, expanding memory first; fails when the range exceeds the
-    /// memory limit.
     pub fn mread(&mut self, off: U256, len: usize) -> Result<Vec<u8>, String> {
         if len == 0 {
             return Ok(vec![]);
@@ -461,8 +353,6 @@ impl<'a> Machine<'a> {
         self.expand(o, len)?;
         Ok(self.memory[o..o + len].to_vec())
     }
-    /// Writes `data` at `off`, expanding memory first; fails when the range exceeds the memory
-    /// limit.
     pub fn mwrite(&mut self, off: U256, data: &[u8]) -> Result<(), String> {
         if data.is_empty() {
             return Ok(());
@@ -475,9 +365,6 @@ impl<'a> Machine<'a> {
         self.memory[o..o + data.len()].copy_from_slice(data);
         Ok(())
     }
-    /// Write `data` (truncated to the call's `out_len`) to the output region of a resolved
-    /// call, set the return data and push the success flag. Shared by the seed-resolved path and
-    /// the intercepted path.
     fn deliver_call(
         &mut self,
         out_off: U256,
@@ -499,8 +386,6 @@ impl<'a> Machine<'a> {
         self.push(U256::from(success))
     }
 
-    /// Supply the result of the call that yielded [`Outcome::Call`] at index `idx`, then the
-    /// frame is ready to continue from the instruction after the call.
     pub fn resume_after_call(
         &mut self,
         idx: usize,
@@ -512,8 +397,6 @@ impl<'a> Machine<'a> {
         self.deliver_call(out_off, out_len, success, data)
     }
 
-    /// Supply the result of the creation that yielded [`Outcome::Create`]: the new account's
-    /// address, or zero when the creation failed.
     pub fn resume_after_create(&mut self, address: U256) -> Result<(), String> {
         self.returndata = Vec::new();
         self.push(address)
@@ -551,7 +434,6 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
-    /// Execute instructions from `pc` until the end of the block (`end` exclusive) or a terminator.
     pub fn run_block(&mut self, start: usize, end: usize) -> Outcome {
         self.pc = start;
         while self.pc < end && self.pc < self.code.len() {
@@ -564,7 +446,6 @@ impl<'a> Machine<'a> {
         Outcome::Fallthrough
     }
 
-    /// Execute one instruction. Returns Some(outcome) if the block ends here.
     pub fn step(&mut self) -> Result<Option<Outcome>, String> {
         let o = self.code[self.pc];
         let info = op::info(o);

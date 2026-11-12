@@ -1,42 +1,27 @@
-//! Compiler metadata (the CBOR trailer solc and vyper append) and creation/runtime splitting.
-
 use crate::disasm;
 use crate::hex;
 use crate::opcode;
 use crate::u256::U256;
 use serde::Serialize;
 
-/// Decoded CBOR metadata trailer that solc and vyper append after the runtime code.
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 pub struct Metadata {
-    /// "solc" or "vyper".
     pub compiler: String,
-    /// Version as "major.minor.patch" when encoded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// IPFS multihash of the source metadata JSON, as plain hex.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ipfs: Option<String>,
-    /// Swarm hash of the source metadata as `bzzr0:<hex>` or `bzzr1:<hex>`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bzzr: Option<String>,
-    /// solc's `experimental` flag (ABIEncoderV2 or other experimental features enabled).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub experimental: bool,
-    /// Byte offset where the metadata trailer begins (code ends here).
     pub offset: usize,
-    /// Total trailer size in bytes, including the two-byte length suffix.
     pub length: usize,
-    /// Every key present in the CBOR map, in order, so unknown ones are not lost.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub raw_keys: Vec<String>,
 }
 
 impl Metadata {
-    /// The IPFS content identifier (CIDv0, `Qm…`) of the source metadata JSON.
-    ///
-    /// solc stores the hash as a raw multihash: `0x12` (sha2-256), `0x20` (32 bytes), digest.
-    /// Returns `None` when no hash is present or it is not of that form.
     pub fn ipfs_cid(&self) -> Option<String> {
         let bytes = hex::decode(self.ipfs.as_deref()?).ok()?;
         if bytes.len() != 34 || bytes[0] != 0x12 || bytes[1] != 0x20 {
@@ -45,16 +30,14 @@ impl Metadata {
         Some(base58(&bytes))
     }
 
-    /// solc started encoding its version in the metadata with 0.5.9 and switched the
-    /// source hash from `bzzr0` to `bzzr1` in 0.5.11; a `bzzr0`-only trailer therefore
-    /// pins the compiler below 0.5.9.
+    // solc put its version in the metadata from 0.5.9 and moved to bzzr1 in 0.5.11.
+    // A bzzr0-only trailer pins the compiler below 0.5.9.
     pub fn implies_pre_0_5_9(&self) -> bool {
         self.compiler == "solc"
             && self.version.is_none()
             && self.bzzr.as_deref().is_some_and(|b| b.starts_with("bzzr0"))
     }
 
-    /// `version` parsed as `(major, minor, patch)`, if present and well-formed.
     pub fn version_tuple(&self) -> Option<(u32, u32, u32)> {
         let v = self.version.as_ref()?;
         let mut it = v.split('.').map(|p| p.parse::<u32>().ok());
@@ -146,7 +129,6 @@ fn cbor_read(data: &[u8], pos: &mut usize, depth: u32) -> Option<Cbor> {
     })
 }
 
-/// Parse the CBOR metadata trailer, if `code` ends with one.
 pub fn parse_metadata(code: &[u8]) -> Option<Metadata> {
     if code.len() < 4 {
         return None;
@@ -227,47 +209,31 @@ pub fn parse_metadata(code: &[u8]) -> Option<Metadata> {
     Some(md)
 }
 
-/// Whether the input bytecode is deployed code or the init code that deploys it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeKind {
-    /// Deployed (runtime) code, as returned by `eth_getCode`.
     Runtime,
-    /// Creation (init) code: constructor, embedded runtime, then constructor arguments.
     Creation,
 }
 
-/// How the input bytecode splits into constructor, runtime and arguments, plus its metadata.
 #[derive(Clone, Debug, Serialize)]
 pub struct BytecodeInfo {
-    /// What the input was recognised as.
     pub kind: CodeKind,
-    /// The runtime code (the input itself for runtime code; the returned region for creation code).
     #[serde(skip)]
     pub runtime: Vec<u8>,
-    /// For creation code: the constructor bytecode (prefix before the runtime).
     #[serde(skip)]
     pub constructor: Vec<u8>,
-    /// For creation code: ABI-encoded constructor arguments appended after the runtime.
     #[serde(skip)]
     pub constructor_args: Vec<u8>,
-    /// Byte offset of the runtime code within the input (0 for runtime code).
     pub runtime_offset: usize,
-    /// Length of the runtime code in bytes.
     pub runtime_len: usize,
-    /// Length of the constructor arguments in bytes (0 for runtime code).
     pub constructor_args_len: usize,
-    /// Metadata trailer of the runtime code, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
-    /// Metadata trailer of the constructor code, if the input is creation code and it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub constructor_metadata: Option<Metadata>,
 }
 
-/// Simulate the constant stack through a straight-line prefix of instructions.
-/// Unknown values are `None`. Only PUSH/DUP/SWAP/POP are modelled exactly; every other
-/// instruction pops/pushes unknowns.
 pub fn constant_stack(insns: &[disasm::Instruction]) -> Vec<Option<U256>> {
     let mut st: Vec<Option<U256>> = Vec::new();
     for i in insns {
@@ -304,16 +270,9 @@ pub fn constant_stack(insns: &[disasm::Instruction]) -> Vec<Option<U256>> {
     st
 }
 
-/// Detect creation code of the shape `... CODECOPY(dest, offset, len) ... RETURN(dest, len)` where the
-/// copied region lies after the constructor, and split it.
-///
-/// Runtime code can show the same shape: a contract that keeps constants in a data area after
-/// its code loads them with `CODECOPY`, and when such a load sits in a block that returns, the
-/// block looks like a deploy prologue. Two facts tell the cases apart. A constructor never reads
-/// calldata, because a creation transaction carries none, so calldata reads before the copied
-/// region mean runtime code. And a metadata trailer at the very end of the code belongs to the
-/// code as a whole: creation code ends in the runtime's trailer followed by the constructor
-/// arguments, so a trailer the candidate region does not contain means runtime code too.
+// Runtime code that loads constants with CODECOPY in a returning block has the same shape.
+// A constructor never reads calldata.
+// Creation code ends in the runtime's trailer plus its arguments.
 fn detect_creation(code: &[u8]) -> Option<(usize, usize)> {
     let insns = disasm::disassemble(code);
     let (off, len) = creation_split(code, &insns)?;
@@ -330,7 +289,6 @@ fn detect_creation(code: &[u8]) -> Option<(usize, usize)> {
     Some((off, len))
 }
 
-/// The copy-and-return split of `code`, before the checks in [`detect_creation`].
 fn creation_split(code: &[u8], insns: &[disasm::Instruction]) -> Option<(usize, usize)> {
     let mut block_start = 0;
     let mut i = 0;
@@ -397,7 +355,6 @@ fn creation_split(code: &[u8], insns: &[disasm::Instruction]) -> Option<(usize, 
     best
 }
 
-/// Classify `code` as creation or runtime, split it accordingly and parse its metadata.
 pub fn analyze(code: &[u8]) -> BytecodeInfo {
     if let Some((off, len)) = detect_creation(code) {
         let runtime = code[off..off + len].to_vec();
@@ -430,7 +387,6 @@ pub fn analyze(code: &[u8]) -> BytecodeInfo {
     }
 }
 
-/// Base58btc (the Bitcoin/IPFS alphabet) encoding of `bytes`, as used for CIDv0 (`Qm…`).
 fn base58(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     let mut digits: Vec<u8> = vec![0];
@@ -471,7 +427,6 @@ mod tests {
         assert_eq!(Metadata::default().ipfs_cid(), None);
     }
 
-    /// `PUSH1 len PUSH1 off PUSH1 0 CODECOPY PUSH1 len PUSH1 0 RETURN` around `runtime`.
     fn wrap(runtime: &[u8]) -> Vec<u8> {
         let mut v = vec![0x60, runtime.len() as u8, 0x60, 0x0c, 0x60, 0x00, 0x39];
         v.extend_from_slice(&[0x60, runtime.len() as u8, 0x60, 0x00, 0xf3]);

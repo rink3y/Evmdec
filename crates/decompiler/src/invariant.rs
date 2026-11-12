@@ -1,12 +1,3 @@
-//! Invariant checking: search for a public path that breaks a property the contract should keep.
-//!
-//! The pattern rules and the confirmation pass ([`crate::confirm`]) reason about one sink. An
-//! invariant is a property of the whole transaction: here, "no unprivileged caller can increase
-//! its own token balance out of nothing". Most losses are such logic bugs rather than a single
-//! flagged opcode. This pass infers the balance mappings from the recovered types, then runs
-//! each state-changing entry point ([`crate::exec`]) from a fresh state as an account that holds
-//! nothing and sends nothing, and reports any call that leaves that account with a balance.
-
 use crate::analyze::{display_name, push, Confidence, Finding, Severity};
 use crate::decompile::{Contract, Function};
 use crate::emit::MappingLayout;
@@ -22,13 +13,9 @@ use crate::types::{Loc, Ty, TypeEnv};
 use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
 
-/// Steps a single run may take (bounds loops).
 const STEP_BUDGET: usize = 120_000;
-/// Calldata shapes tried per function.
 const MAX_ATTEMPTS: usize = 200;
 
-/// Run the invariant checks over `c`. Setting `EVMDEC_NO_CONFIRM` in the environment skips the
-/// pass, as for [`crate::confirm`].
 pub fn findings(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return;
@@ -43,20 +30,12 @@ pub fn findings(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     self_credit(c, &ledgers, out);
 }
 
-/// A `mapping(address => uint)` that behaves like a balance ledger.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ledger {
-    /// Slot of the declared mapping.
     pub(crate) root: U256,
-    /// Some entry is compared as an unsigned number (a solvency check such as
-    /// `require(balance >= amount)`), which pins the values as non-negative.
     pub(crate) compared_unsigned: bool,
 }
 
-/// Is the `mapping(address => uint)` at `root` a ledger rather than a counter? A ledger is
-/// debited somewhere (an entry is written with a value that subtracts from a read of the same
-/// mapping) or pays out (an entry is read into the value or payload of an outgoing call). A
-/// nonce or counter mapping only ever grows and never leaves the contract.
 pub(crate) fn is_ledger(c: &Contract, root: U256) -> bool {
     let layout = c.compiler.layout;
     let entry_of = |key: ExprId| is_entry_of(key, root, layout);
@@ -89,9 +68,6 @@ pub(crate) fn is_ledger(c: &Contract, root: U256) -> bool {
     false
 }
 
-/// The `mapping(address => uintN)` variables: candidate balance ledgers. The value is a
-/// number: a resolved unsigned width, or an untyped word that only ever meets arithmetic (a
-/// full-width `uint256` has no narrowing evidence to resolve from).
 pub(crate) fn balance_mappings(env: &TypeEnv) -> Vec<Ledger> {
     let mut out: Vec<Ledger> = Vec::new();
     for loc in env.locations() {
@@ -118,10 +94,6 @@ pub(crate) fn balance_mappings(env: &TypeEnv) -> Vec<Ledger> {
     out
 }
 
-/// Does an entry of the mapping at `root` feed a signed operation (`SDIV`, `SLT`, `SAR`, ...)
-/// through plain arithmetic, directly or as the argument of an internal helper whose parameter
-/// the solver saw used signed? Then the values are signed accounting (dividend offsets, debts),
-/// which may legitimately go "negative", not an unsigned balance.
 fn is_signed(c: &Contract, env: &TypeEnv, root: U256) -> bool {
     let layout = c.compiler.layout;
     let entry_of = |key: ExprId| is_entry_of(key, root, layout);
@@ -171,14 +143,11 @@ fn is_signed(c: &Contract, env: &TypeEnv, root: U256) -> bool {
     false
 }
 
-/// Is `key` the slot of some entry of the single-level mapping at `root`?
 fn is_entry_of(key: ExprId, root: U256, layout: MappingLayout) -> bool {
     ssa::slot_path(key, layout)
         .is_some_and(|p| p.root == root && matches!(p.steps[..], [Step::Key(_)]))
 }
 
-/// Keys of the persistent `SLOAD`s reachable from `e` through `ADD`, `SUB` and `MUL` only: the
-/// loads whose sign the operation on `e` speaks for.
 fn arith_sload_keys(e: ExprId) -> Vec<ExprId> {
     let mut keys = Vec::new();
     let mut stack = vec![e];
@@ -196,7 +165,6 @@ fn arith_sload_keys(e: ExprId) -> Vec<ExprId> {
     keys
 }
 
-/// Keys of every persistent `SLOAD` inside `e`.
 fn sload_keys(e: ExprId) -> Vec<ExprId> {
     let mut keys = Vec::new();
     walk(e, &mut |n| {
@@ -207,7 +175,6 @@ fn sload_keys(e: ExprId) -> Vec<ExprId> {
     keys
 }
 
-/// Left operands of every subtraction inside `e`: the values something is taken from.
 fn minuends(e: ExprId) -> Vec<ExprId> {
     let mut out = Vec::new();
     walk(e, &mut |n| {
@@ -218,7 +185,6 @@ fn minuends(e: ExprId) -> Vec<ExprId> {
     out
 }
 
-/// Visit every node of `e` once, without holding the arena borrow across the visit.
 fn walk(e: ExprId, visit: &mut impl FnMut(&Node)) {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
@@ -232,7 +198,6 @@ fn walk(e: ExprId, visit: &mut impl FnMut(&Node)) {
     }
 }
 
-/// The storage key of `mapping[account]` for a single-level mapping at `root`.
 fn entry_key(root: U256, account: U256, layout: MappingLayout) -> U256 {
     let mut pre = Vec::with_capacity(64);
     if layout == MappingLayout::Vyper {
@@ -245,8 +210,6 @@ fn entry_key(root: U256, account: U256, layout: MappingLayout) -> U256 {
     U256::from_be_bytes(&keccak::keccak256(&pre))
 }
 
-/// Report any state-changing entry point that lets the role-less caller end a zero-value call with a
-/// non-zero balance in one of the ledgers.
 fn self_credit(c: &Contract, ledgers: &[Ledger], out: &mut Vec<Finding>) {
     let caller = exec::CALLER;
     let keys: Vec<(Ledger, U256)> = ledgers
@@ -285,25 +248,16 @@ fn self_credit(c: &Contract, ledgers: &[Ledger], out: &mut Vec<Finding>) {
     }
 }
 
-/// A function worth testing: an external, state-changing entry point that is not a view.
 fn creditable(f: &Function) -> bool {
     f.kind == FnKind::External && !matches!(f.mutability, Mutability::View | Mutability::Pure)
 }
 
-/// A call that left the caller with a balance.
 struct Credit {
-    /// The calldata that did it.
     witness: Vec<u8>,
-    /// Slot of the ledger credited.
     root: U256,
-    /// The balance is the wrap of a subtraction below zero rather than a positive amount.
     wrapped: bool,
 }
 
-/// Search calldata for a zero-value call to `f` that leaves the caller with a balance; returns
-/// the first hit. A wrapped value (top bit set) counts only for a ledger the contract compares
-/// unsigned elsewhere: without that, the mapping may hold signed accounting that legitimately
-/// goes negative, and the bytecode gives no way to tell.
 fn search_credit(code: &[u8], f: &Function, keys: &[(Ledger, U256)]) -> Option<Credit> {
     let selector = exec::selector_of(f);
     let mut attempts = 0;

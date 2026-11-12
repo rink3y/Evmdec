@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""Analyzer recall on known-exploited contracts (testdata/vuln) and false-positive load on the
-audited corpus (testdata/mainnet).
-
-    python3 corpus/vuln_bench.py            # table + totals
-    python3 corpus/vuln_bench.py -v         # also list every finding id per contract
-"""
 import argparse, json, os, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

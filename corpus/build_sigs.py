@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""Build the local signature index (`sigs.idx`) from Sourcify's signature export.
-
-Run once when the product is built or deployed; the output is a single file that
-`evmdec` searches in place (see `crates/decompiler/src/sigdb.rs` for the format).
-
-    python3 corpus/build_sigs.py --out sigs.idx
-
-Downloads the Parquet shards of https://export.sourcify.dev/?prefix=v2/signatures/
-(about 540 MB, cached under --cache so a rerun only fetches new shards), then writes
-the index in one pass. Needs `pyarrow` and `numpy`; peak memory is about 1.5 GB.
-"""
 
 from __future__ import annotations
 
@@ -21,6 +10,18 @@ import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+DESCRIPTION = """Build the local signature index (`sigs.idx`) from Sourcify's signature export.
+
+Run once when the product is built or deployed; the output is a single file that
+`evmdec` searches in place (see `crates/decompiler/src/sigdb.rs` for the format).
+
+    python3 corpus/build_sigs.py --out sigs.idx
+
+Downloads the Parquet shards of https://export.sourcify.dev/?prefix=v2/signatures/
+(about 540 MB, cached under --cache so a rerun only fetches new shards), then writes
+the index in one pass. Needs `pyarrow` and `numpy`; peak memory is about 1.5 GB.
+"""
 
 LISTING = "https://export.sourcify.dev/?prefix=v2/signatures/"
 BASE = "https://export.sourcify.dev/"
@@ -35,7 +36,6 @@ def log(msg: str) -> None:
 
 
 def shard_keys() -> list[str]:
-    """Names of the Parquet shards in the export bucket."""
     with urllib.request.urlopen(LISTING, timeout=60) as r:
         root = ET.fromstring(r.read())
     keys = []
@@ -48,7 +48,6 @@ def shard_keys() -> list[str]:
 
 
 def download(key: str, cache: Path) -> Path:
-    """Fetch one shard into the cache, skipping shards already there."""
     dest = cache / Path(key).name
     if dest.exists() and dest.stat().st_size > 0:
         return dest
@@ -127,7 +126,7 @@ def build(shards: list[Path], out: Path) -> int:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="sigs.idx", help="index file to write (default sigs.idx)")
     ap.add_argument("--cache", default=".sigs-cache", help="where downloaded shards are kept")
     ap.add_argument("--shards", nargs="*", help="use these local Parquet files instead of downloading")

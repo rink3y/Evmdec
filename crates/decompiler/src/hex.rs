@@ -1,8 +1,3 @@
-//! Hex encoding helpers.
-
-/// Decodes a hex string into bytes, ignoring whitespace and an optional `0x`/`0X` prefix.
-///
-/// Errors on odd length or a non-hex character.
 pub fn decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     let s = s
@@ -31,7 +26,6 @@ pub fn decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Lower-case hex with a `0x` prefix.
 pub fn encode(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2 + 2);
     s.push_str("0x");
@@ -41,7 +35,6 @@ pub fn encode(b: &[u8]) -> String {
     s
 }
 
-/// Lower-case hex without a prefix.
 pub fn encode_plain(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }

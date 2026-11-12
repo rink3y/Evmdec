@@ -1,53 +1,28 @@
-//! Hash-consed expression IR. Every expression is an `ExprId` into a thread-local arena, so
-//! structural equality is pointer equality and shared sub-expressions cost nothing.
-
 use crate::opcode as op;
 use crate::u256::U256;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// Handle to an interned expression: an index into the thread-local arena.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ExprId(pub u32);
 
-/// One expression node; children are `ExprId`s, so trees are DAGs shared by construction.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Node {
-    /// A 256-bit constant.
     Const(U256),
-    /// Opcode with no operands (CALLER, CALLVALUE, TIMESTAMP, ...). `PC` and `MSIZE`/`GAS`
-    /// carry a sequence number so distinct evaluations are not merged.
     Env(u8, u32),
-    /// Unary/binary/ternary EVM operation on expressions.
     Op(u8, Vec<ExprId>),
-    /// `MLOAD(offset)` whose value is not known from earlier writes; `version` separates
-    /// loads separated by unknown writes.
     MLoad(ExprId, u32),
-    /// `SLOAD(key)` / `TLOAD(key)`: `transient` distinguishes TLOAD.
     SLoad(ExprId, bool, u32),
-    /// `CALLDATALOAD(offset)`.
     CallDataLoad(ExprId),
-    /// KECCAK256 of known memory words (each 32 bytes, last may be partial: `tail_bytes`).
     Keccak(Vec<ExprId>, u8),
-    /// KECCAK256 of a memory range whose content is unknown: (offset, length, memory version).
     KeccakMem(ExprId, ExprId, u32),
-    /// Result (success flag) of a CALL-family instruction; `seq` is the statement sequence number.
     CallResult(u32),
-    /// Result (address) of CREATE/CREATE2.
     CreateResult(u32),
-    /// A value flowing in from predecessors that differs between them (SSA phi), or a stack
-    /// slot of unknown origin at a function entry (`Arg`).
     Var(u32),
-    /// Stack slot `n` of unknown origin at a function entry (see `Var`).
     Arg(u32),
-    /// Return-data word: value loaded from the output region of call `seq` at word `off`.
     ReturnData(u32, ExprId),
-    /// Bytes read from a copied region (CALLDATACOPY/CODECOPY/RETURNDATACOPY/EXTCODECOPY/MCOPY):
-    /// `kind` is the copying opcode, then (source offset, memory version).
     CopiedWord(u8, ExprId, u32),
-    /// The j-th result of internal call `seq`.
     IntRet(u32, u16),
-    /// Memory word of unknown content at (offset) after an internal call `seq`... (reserved)
     Unknown(u32),
 }
 
@@ -61,7 +36,6 @@ thread_local! {
     static ARENA: RefCell<Arena> = RefCell::new(Arena { nodes: Vec::new(), map: HashMap::new(), seq: 0 });
 }
 
-/// Intern `n`, returning the existing id when a structurally equal node is already in the arena.
 pub fn intern(n: Node) -> ExprId {
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
@@ -75,17 +49,14 @@ pub fn intern(n: Node) -> ExprId {
     })
 }
 
-/// Clone of the node behind `id`.
 pub fn node(id: ExprId) -> Node {
     ARENA.with(|a| a.borrow().nodes[id.0 as usize].clone())
 }
 
-/// Run `f` on the node behind `id` without cloning it.
 pub fn with_node<R>(id: ExprId, f: impl FnOnce(&Node) -> R) -> R {
     ARENA.with(|a| f(&a.borrow().nodes[id.0 as usize]))
 }
 
-/// Fresh sequence number for versioned nodes.
 pub fn next_seq() -> u32 {
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
@@ -94,20 +65,16 @@ pub fn next_seq() -> u32 {
     })
 }
 
-/// Number of distinct nodes interned so far.
 pub fn arena_size() -> usize {
     ARENA.with(|a| a.borrow().nodes.len())
 }
 
-/// Constant expression.
 pub fn konst(v: U256) -> ExprId {
     intern(Node::Const(v))
 }
-/// Constant expression from a `u64`.
 pub fn konst_u64(v: u64) -> ExprId {
     konst(U256::from_u64(v))
 }
-/// The value of `id` if it is a constant.
 pub fn as_const(id: ExprId) -> Option<U256> {
     with_node(id, |n| {
         if let Node::Const(v) = n {
@@ -117,32 +84,25 @@ pub fn as_const(id: ExprId) -> Option<U256> {
         }
     })
 }
-/// Is `id` a constant?
 pub fn is_const(id: ExprId) -> bool {
     as_const(id).is_some()
 }
-/// Phi variable `n`.
 pub fn var(n: u32) -> ExprId {
     intern(Node::Var(n))
 }
-/// Function argument `n`.
 pub fn arg(n: u32) -> ExprId {
     intern(Node::Arg(n))
 }
-/// Environment opcode `o` without a sequence number (merged across evaluations).
 pub fn env(o: u8) -> ExprId {
     intern(Node::Env(o, 0))
 }
-/// Environment opcode `o` with a fresh sequence number, so this evaluation stays distinct.
 pub fn env_seq(o: u8) -> ExprId {
     intern(Node::Env(o, next_seq()))
 }
-/// `CALLDATALOAD(off)`.
 pub fn calldataload(off: ExprId) -> ExprId {
     intern(Node::CallDataLoad(off))
 }
 
-/// Mask with the low `bits` bits set (`U256::MAX` for 256 or more).
 pub fn mask_bits(bits: u32) -> U256 {
     if bits >= 256 {
         U256::MAX
@@ -151,7 +111,6 @@ pub fn mask_bits(bits: u32) -> U256 {
     }
 }
 
-/// Split `e` into `(base, constant offset)`: `ADD(x, c)` → `(Some(x), c)`, `c` → `(None, c)`.
 pub fn split_offset(e: ExprId) -> (Option<ExprId>, U256) {
     match node(e) {
         Node::Const(c) => (None, c),
@@ -178,7 +137,6 @@ pub fn split_offset(e: ExprId) -> (Option<ExprId>, U256) {
     }
 }
 
-/// `e + c`, or `e` itself when `c` is zero.
 pub fn add_const(e: ExprId, c: U256) -> ExprId {
     if c.is_zero() {
         e
@@ -240,7 +198,6 @@ fn fold2(o: u8, a: U256, b: U256) -> Option<U256> {
     })
 }
 
-/// Build a unary op with simplification.
 pub fn op1(o: u8, a: ExprId) -> ExprId {
     if let Some(c) = as_const(a) {
         match o {
@@ -275,7 +232,6 @@ pub fn op1(o: u8, a: ExprId) -> ExprId {
     intern(Node::Op(o, vec![a]))
 }
 
-/// True if the expression can only evaluate to 0 or 1.
 pub fn is_boolean(e: ExprId) -> bool {
     match node(e) {
         Node::Op(o, _) => matches!(o, op::LT | op::GT | op::SLT | op::SGT | op::EQ | op::ISZERO),
@@ -290,15 +246,12 @@ thread_local! {
     static BOOL_VARS: RefCell<std::collections::HashSet<ExprId>> = RefCell::new(std::collections::HashSet::new());
 }
 
-/// Record that a phi variable only ever holds boolean values (found while printing).
 pub fn mark_boolean(var: ExprId) {
     if matches!(node(var), Node::Var(_)) {
         BOOL_VARS.with(|b| b.borrow_mut().insert(var));
     }
 }
 
-/// Bits of `e` that may be set (a superset): constants exactly, masks, shifts and ors
-/// structurally, everything else from its width.
 pub fn may_bits(e: ExprId) -> U256 {
     fn go(e: ExprId, depth: u32) -> U256 {
         if depth > 12 {
@@ -328,8 +281,6 @@ pub fn may_bits(e: ExprId) -> U256 {
     go(e, 0)
 }
 
-/// Build a binary op with constant folding and algebraic normalisation.
-/// Operand order follows the EVM: `op2(SUB, a, b)` is `a - b` where `a` was the top of stack.
 pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
     let (ca, cb) = (as_const(a), as_const(b));
     if let (Some(x), Some(y)) = (ca, cb) {
@@ -619,7 +570,6 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
     intern(Node::Op(o, vec![a, b]))
 }
 
-/// Build a ternary op (ADDMOD/MULMOD), folding when every operand is constant.
 pub fn op3(o: u8, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
     if let (Some(x), Some(y), Some(z)) = (as_const(a), as_const(b), as_const(c)) {
         match o {
@@ -631,7 +581,6 @@ pub fn op3(o: u8, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
     intern(Node::Op(o, vec![a, b, c]))
 }
 
-/// Upper bound on the number of significant bits of a value, from its shape.
 pub fn value_bits(e: ExprId) -> u32 {
     match node(e) {
         Node::Const(c) => c.bits(),
@@ -699,7 +648,6 @@ pub fn value_bits(e: ExprId) -> u32 {
     }
 }
 
-/// Size of the expression tree counting shared nodes once per occurrence (capped).
 pub fn size(e: ExprId) -> usize {
     fn go(e: ExprId, budget: &mut usize) -> usize {
         if *budget == 0 {
@@ -723,7 +671,6 @@ pub fn size(e: ExprId) -> usize {
     go(e, &mut budget)
 }
 
-/// Direct children of an expression.
 pub fn children(e: ExprId) -> Vec<ExprId> {
     match node(e) {
         Node::Op(_, v) | Node::Keccak(v, _) => v,
@@ -737,7 +684,6 @@ pub fn children(e: ExprId) -> Vec<ExprId> {
     }
 }
 
-/// Does `e` contain a node satisfying `pred`? Bounded traversal.
 pub fn contains(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![e];
@@ -753,7 +699,6 @@ pub fn contains(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
     false
 }
 
-/// Replace every `Var(i)` / `Arg(i)` according to `f` (returns None to keep). Memoised.
 pub fn substitute(
     e: ExprId,
     f: &dyn Fn(&Node) -> Option<ExprId>,
@@ -800,8 +745,6 @@ pub fn substitute(
     r
 }
 
-/// `e` with every memory read stamped `version`: reads taken in one frame of reference (an
-/// inlined function's own generations) restated in another's.
 pub fn restamp_memory(e: ExprId, version: u32, memo: &mut HashMap<ExprId, ExprId>) -> ExprId {
     if let Some(r) = memo.get(&e) {
         return *r;

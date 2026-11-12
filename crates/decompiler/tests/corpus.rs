@@ -1,5 +1,3 @@
-//! Integration tests over the mainnet corpus in `testdata/mainnet`.
-
 use std::path::PathBuf;
 
 fn corpus() -> Vec<(String, Vec<u8>)> {
@@ -178,7 +176,6 @@ fn creation_code_is_split_and_minimal_proxy_detected() {
     assert_eq!(info.runtime, rt);
 }
 
-/// `a && b` compiles to `v = a; if (a) { v = b }`; the structurer must print `&&`, not `||`.
 #[test]
 fn short_circuit_and_is_not_inverted() {
     fn asm(src: &str) -> Vec<u8> {
@@ -225,9 +222,6 @@ fn short_circuit_and_is_not_inverted() {
     );
 }
 
-/// A solc 0.8 contract whose revert reasons go through a shared `revert(ptr, sub(end, ptr))`
-/// tail, whose arithmetic is the compiler's checked helpers, and whose loop carries several
-/// variables at once (BOB_POOL on Ethereum Classic).
 #[test]
 fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vuln/bob_pool.hex");
@@ -327,10 +321,6 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
     );
 }
 
-/// The original multi-owner wallet (Gav Wood's Wallet.sol as deployed on mainnet, no metadata):
-/// pre-0.4 modifiers reach the rest of a function both by falling through and by a jump with a
-/// return address, the owner list is a fixed-size array, and the pending-operation index is a
-/// dynamic array whose data slot the compiler precomputed.
 #[test]
 fn old_multiowned_wallet_reads_as_source() {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -444,9 +434,6 @@ fn old_multiowned_wallet_reads_as_source() {
     assert!(r.findings.iter().any(|f| f.id == "silent-auth-failure"));
 }
 
-/// Balancer V1 BPool (solc 0.5.12): a `_lock_` modifier released through a packed-field mask,
-/// a `_logs_` modifier that ABI-encodes `msg.data` into an event, pool-token list elements
-/// addressed as `keccak256(9) - 1`, and the 2026 reverse-quote rounding drain.
 #[test]
 fn balancer_bpool_reads_as_source() {
     let p =
@@ -504,10 +491,6 @@ fn balancer_bpool_reads_as_source() {
     );
 }
 
-/// A solc 0.4 contract (a lobby-created "tribe" on Ethereum Classic) whose `BuyIn(address)`
-/// reassigns its parameter on one path: control-flow recovery used to duplicate the whole body
-/// per path. Its `members`/`waiting` state is an `address[]` and a `mapping(address => bool)`
-/// written through the compiler's resize helper and byte masks.
 #[test]
 fn tribe_reads_as_source_and_is_rated_by_its_logic() {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/tribe.hex");
@@ -555,8 +538,6 @@ fn tribe_reads_as_source_and_is_rated_by_its_logic() {
     );
 }
 
-/// The lobby that deploys tribes from its own embedded code and calls the new contract: that
-/// callee is as fixed as the contract itself, and the embedded code's metadata is not a string.
 #[test]
 fn lobby_calls_into_its_own_deployment() {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/lobby.hex");
@@ -610,9 +591,6 @@ fn types_follow_values_through_helpers_and_range_checks() {
     assert!(ens.contains("external returns (bytes32)"), "{ens}");
 }
 
-/// Evidence the bytecode carries beyond masks: a Vyper range check whose failing side reverts,
-/// an index scaled to a word offset, a word another contract returned and validated, the
-/// arguments of `ecrecover`, a block hash, and a comparison with a text literal.
 #[test]
 fn types_use_validators_precompiles_and_literals() {
     let opts = evmdec::decompile::Options {
@@ -653,7 +631,6 @@ fn types_use_validators_precompiles_and_literals() {
     );
 }
 
-/// What a known signature declares about a calldata word reaches the storage it keys.
 #[test]
 fn declared_types_flow_into_storage() {
     use evmdec::types::{declared_words, Ty};
@@ -677,8 +654,6 @@ fn declared_types_flow_into_storage() {
     assert_eq!(declared_words(&params(&["uint256[3]", "address"])), vec![]);
 }
 
-/// Names the code implies where no signature supplies one: storage by role, helpers by what
-/// they do, parameters by how they are used.
 #[test]
 fn defaults_give_way_to_names_the_code_implies() {
     let source = |name: &str| -> String {
@@ -720,9 +695,6 @@ fn defaults_give_way_to_names_the_code_implies() {
     );
 }
 
-/// A statement in a helper shared by two external functions is one finding, whatever each
-/// caller names the argument it passes: the Safe's two module entry points reach the same
-/// call and the same delegatecall.
 #[test]
 fn a_shared_helper_site_is_one_finding_under_any_parameter_names() {
     let code = corpus()
@@ -753,10 +725,6 @@ fn a_shared_helper_site_is_one_finding_under_any_parameter_names() {
         .contains("The same code is reached from"));
 }
 
-/// Every allocation moves the free memory pointer, including one made inside a helper the
-/// lifter inlines: three structs decoded from calldata are three blocks, the outer one holding
-/// pointers to the other two. Before the pointer updates were kept in the helper's summary, all
-/// three were written to the same address.
 #[test]
 fn allocations_in_inlined_helpers_are_separate_blocks() {
     let path =
@@ -777,8 +745,6 @@ fn allocations_in_inlined_helpers_are_separate_blocks() {
     assert!(src.contains("// Memory: ptrN is a block"), "legend");
 }
 
-/// Payloads that are not a fixed list of words still read as what they are: the calldata a
-/// proxy forwards, and a string literal built in memory.
 #[test]
 fn payloads_and_literals_read_as_values() {
     let source = |name: &str| -> String {
@@ -804,9 +770,6 @@ fn payloads_and_literals_read_as_values() {
     );
 }
 
-/// Elements with members at several slot offsets are declared as structs and read by member:
-/// plain members, members packed into one slot, a byte string, and an array and a mapping held
-/// inside the element.
 #[test]
 fn struct_elements_are_declared_and_read_by_member() {
     let source = |path: &str| {
@@ -865,9 +828,6 @@ fn struct_elements_are_declared_and_read_by_member() {
     );
 }
 
-/// Vyper keeps each variable at a fixed memory address, so a word there prints as a local and
-/// a word-scaled index from one as an element of the list that starts there. Byte ranges and
-/// unaligned addresses stay memory.
 #[test]
 fn vyper_fixed_addresses_read_as_locals() {
     let path =
@@ -889,10 +849,6 @@ fn vyper_fixed_addresses_read_as_locals() {
     assert!(src.contains("mem[0x2a4] = "), "an unaligned address is not");
 }
 
-/// Types that take evidence from more than one place: a mapping keyed by a hash somewhere types
-/// every key of it, a 160-bit field used in arithmetic is an amount and so is what is stored
-/// into it, the words of a packed signature and of a typed-data digest are 32-byte words, and
-/// a multiplied value is not an account whatever it later flows into.
 #[test]
 fn types_join_evidence_across_keys_fields_and_layouts() {
     let source = |name: &str| {
@@ -936,9 +892,6 @@ fn types_join_evidence_across_keys_fields_and_layouts() {
     }
 }
 
-/// A store to a fixed address is printed only when something that runs afterwards can read
-/// it: a later load in the function, a byte range handed on, or an internal function that
-/// loads the address before writing it. Values the lifter already forwarded need no store.
 #[test]
 fn stores_nothing_reads_are_left_out() {
     let source = |path: &str| {

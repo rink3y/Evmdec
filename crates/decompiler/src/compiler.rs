@@ -1,12 +1,3 @@
-//! Compiler profile: which compiler produced the code, its version (exact or bounded) and the
-//! code-generation features that follow from it.
-//!
-//! The metadata trailer gives the exact version when present. Without it, or to cross-check it,
-//! the bytecode itself carries fingerprints: each compiler release introduced idioms (the
-//! `Panic(uint256)` revert, the `0x80` free-memory pointer, the calldata head-size checks,
-//! `PUSH0`) that bound the version from below or above. Later passes ask the profile rather than
-//! the metadata, so a stripped contract is still printed and judged by the compiler that made it.
-
 use crate::disasm::{self, Instruction};
 use crate::emit::{MappingLayout, SEL_ERROR, SEL_PANIC};
 use crate::expr;
@@ -16,32 +7,23 @@ use crate::u256::U256;
 use serde::Serialize;
 use std::fmt;
 
-/// Compiler family.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
-    /// Solidity (`solc`).
     Solc,
-    /// Vyper.
     Vyper,
-    /// Neither recognised: hand-written, another compiler, or too little code to tell.
     #[default]
     Unknown,
 }
 
-/// A compiler release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Version {
-    /// Major version.
     pub major: u32,
-    /// Minor version.
     pub minor: u32,
-    /// Patch version.
     pub patch: u32,
 }
 
 impl Version {
-    /// `major.minor.patch`.
     pub const fn new(major: u32, minor: u32, patch: u32) -> Version {
         Version {
             major,
@@ -63,53 +45,32 @@ impl fmt::Display for Version {
     }
 }
 
-/// What is known about the compiler that produced a code body.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Profile {
-    /// Compiler family.
     pub kind: Kind,
-    /// Exact version, from the metadata trailer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<Version>,
-    /// Lowest version consistent with the fingerprints (inclusive).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at_least: Option<Version>,
-    /// Lowest version ruled out by the fingerprints (exclusive upper bound).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub below: Option<Version>,
-    /// The code carries a metadata trailer.
     pub metadata: bool,
-    /// The compiler emits overflow, division-by-zero and similar checks itself
-    /// (solc >= 0.8, every Vyper).
     pub checked_arithmetic: bool,
-    /// Reverts with `Panic(uint256)` for the compiler's own assertions (solc >= 0.8).
     pub panic_errors: bool,
-    /// Reverts with `Error(string)` for `require` reasons (solc >= 0.4.22).
     pub error_strings: bool,
-    /// The ABI decoder checks `calldatasize` against the head size before reading parameters
-    /// (solc >= 0.5).
     pub abi_size_checks: bool,
-    /// The ABI decoder validates `address` and `bool` parameters by masking and comparing
-    /// (solc >= 0.5).
     pub abi_validation: bool,
-    /// `PUSH0` is used (solc >= 0.8.20 targeting Shanghai or later).
     pub push0: bool,
-    /// Compiled through the Yul IR pipeline (`via-ir`), recognised from its prologue.
     pub via_ir: bool,
-    /// Initial value of the free-memory pointer written by the prologue (`0x80` since solc
-    /// 0.4.22, `0x60` before), when a prologue was found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_memory_pointer: Option<u64>,
-    /// Mapping slot layout of this compiler family.
     #[serde(skip)]
     pub layout: MappingLayout,
-    /// Fingerprints found in the code, for the report.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
 }
 
 impl Profile {
-    /// Does the profile establish that the version is at least `v`?
     pub fn is_at_least(&self, v: Version) -> bool {
         match (self.version, self.at_least) {
             (Some(x), _) => x >= v,
@@ -118,7 +79,6 @@ impl Profile {
         }
     }
 
-    /// Does the profile establish that the version is below `v`?
     pub fn is_below(&self, v: Version) -> bool {
         match (self.version, self.below) {
             (Some(x), _) => x < v,
@@ -127,14 +87,10 @@ impl Profile {
         }
     }
 
-    /// The version to judge compiler-dependent behaviour by: the exact one, else the lower
-    /// bound the fingerprints establish.
     pub fn effective_version(&self) -> Option<Version> {
         self.version.or(self.at_least)
     }
 
-    /// The version range the fingerprints establish (`>= 0.8.0, < 0.8.20`), when the exact
-    /// version is unknown and some bound is.
     pub fn bounds(&self) -> Option<String> {
         if self.version.is_some() {
             return None;
@@ -150,7 +106,6 @@ impl Profile {
     }
 }
 
-/// `solc 0.8.19`, `solc >= 0.8.0, < 0.8.20 (no metadata)`, `vyper < 0.3.10 (no metadata)`.
 impl fmt::Display for Profile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self.kind {
@@ -173,35 +128,21 @@ impl fmt::Display for Profile {
     }
 }
 
-/// Fingerprints read from one code body.
 #[derive(Default)]
 struct Fingerprints {
-    /// `Panic(uint256)` selector pushed somewhere.
     panic: bool,
-    /// `Error(string)` selector pushed somewhere.
     error_string: bool,
-    /// `PUSH0` used.
     push0: bool,
-    /// Shift instructions used.
     shifts: bool,
-    /// Initial free-memory pointer written by the prologue.
     free_pointer: Option<u64>,
-    /// `calldatasize - 4 < n` / `calldatasize < 4 + n` head-size checks.
     head_checks: bool,
-    /// `AND 0xff..ff (160 bits)` applied to a `CALLDATALOAD` then compared `EQ`: the >= 0.5
-    /// decoder validator.
     validators: bool,
-    /// `PUSH1 3|4 CALLDATASIZE` at the entry: Vyper's dispatcher.
     vyper_prologue: bool,
-    /// `PUSH1 0x80 PUSH1 0x40 MSTORE` (or the via-IR variant) at the entry.
     solc_prologue: bool,
-    /// The prologue duplicates the pointer before storing it: the Yul pipeline.
     via_ir: bool,
-    /// Selector read as `calldataload(0) / 2^224` (pre-shift compilers).
     div_selector: bool,
 }
 
-/// Instructions looked back over for a multi-instruction idiom.
 const WINDOW: usize = 5;
 
 fn fingerprint(code: &[u8]) -> Fingerprints {
@@ -240,9 +181,6 @@ fn fingerprint(code: &[u8]) -> Fingerprints {
     p
 }
 
-/// Legacy codegen opens with `PUSH1 0x80 PUSH1 0x40 MSTORE`; the Yul pipeline (via-IR)
-/// duplicates the pointer first: `PUSH1 0x40 PUSH1 0x80 DUP2 MSTORE`. Vyper opens with
-/// `PUSH1 4 CALLDATASIZE LT` (or `PUSH1 3 ... GT`).
 fn prologue(insns: &[Instruction], p: &mut Fingerprints) {
     let head = &insns[..insns.len().min(6)];
     if let Some(ms) = head.iter().position(|x| x.opcode == op::MSTORE) {
@@ -269,7 +207,6 @@ fn prologue(insns: &[Instruction], p: &mut Fingerprints) {
     }
 }
 
-/// `calldatasize PUSH 4 ... sub PUSH n slt` or `PUSH n calldatasize lt`.
 fn is_head_check(window: &[Instruction]) -> bool {
     window.iter().any(|x| x.opcode == op::CALLDATASIZE)
         && window
@@ -283,7 +220,6 @@ fn is_head_check(window: &[Instruction]) -> bool {
         })
 }
 
-/// `calldataload dup1 PUSH mask and eq` validates an address parameter.
 fn is_validator(window: &[Instruction], mask160: U256) -> bool {
     window
         .iter()
@@ -292,7 +228,6 @@ fn is_validator(window: &[Instruction], mask160: U256) -> bool {
         && window.iter().any(|x| x.opcode == op::AND)
 }
 
-/// Version bounds accumulated from fingerprints, each with its reason.
 #[derive(Default)]
 struct Bounds {
     lo: Option<Version>,
@@ -301,7 +236,6 @@ struct Bounds {
 }
 
 impl Bounds {
-    /// The compiler is at least `v`.
     fn raise(&mut self, v: Version, why: &str) {
         if self.lo.is_none_or(|l| v > l) {
             self.lo = Some(v);
@@ -309,7 +243,6 @@ impl Bounds {
         self.evidence.push(format!("{} (solc >= {})", why, v));
     }
 
-    /// The compiler is below `v`.
     fn cap(&mut self, v: Version, why: &str) {
         if self.hi.is_none_or(|h| v < h) {
             self.hi = Some(v);
@@ -317,7 +250,6 @@ impl Bounds {
         self.evidence.push(format!("{} (solc < {})", why, v));
     }
 
-    /// Bounds that contradict each other are kept as evidence only.
     fn consistent(&self) -> bool {
         self.lo.zip(self.hi).is_none_or(|(l, h)| l < h)
     }
@@ -333,7 +265,6 @@ fn detect_kind(md: Option<&Metadata>, p: &Fingerprints) -> Kind {
     }
 }
 
-/// What the fingerprints say about a solc release.
 fn solc_bounds(md: Option<&Metadata>, p: &Fingerprints) -> Bounds {
     let mut b = Bounds::default();
     match p.free_pointer {
@@ -378,8 +309,6 @@ fn solc_bounds(md: Option<&Metadata>, p: &Fingerprints) -> Bounds {
     b
 }
 
-/// Build the profile of `code` (the runtime body, metadata trailer included or not) from its
-/// metadata trailer and its fingerprints.
 pub fn profile(code: &[u8], md: Option<&Metadata>) -> Profile {
     let body = match md {
         Some(m) if m.offset <= code.len() => &code[..m.offset],

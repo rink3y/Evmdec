@@ -1,11 +1,3 @@
-//! A time limit for one piece of work on this thread.
-//!
-//! Recovering control flow and lifting are bounded by step counts, but a step can be slow on
-//! unusual code, and a contract fetched only because another one calls it must not hold the
-//! whole request. [`run`] gives a closure a fixed time; the long loops call [`check`], which
-//! abandons the closure once the time has passed. Abandoning unwinds the stack up to [`run`],
-//! so no half-built result is ever returned: the work either finishes or yields nothing.
-
 use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 use std::time::{Duration, Instant};
@@ -14,11 +6,8 @@ thread_local! {
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
-/// The payload [`check`] unwinds with.
 struct Expired;
 
-/// Run `work` with `time` to finish. `None` when it was abandoned at a [`check`] after the time
-/// had passed. A limit already in force that ends sooner stays in force.
 pub fn run<R>(time: Duration, work: impl FnOnce() -> R) -> Option<R> {
     let previous = DEADLINE.with(Cell::get);
     let wanted = Instant::now() + time;
@@ -32,8 +21,7 @@ pub fn run<R>(time: Duration, work: impl FnOnce() -> R) -> Option<R> {
     }
 }
 
-/// Abandon the work in progress when its limit has passed; return at once when there is no
-/// limit or time is left.
+// Unwinds up to run. A half-built result must never be returned.
 pub fn check() {
     if DEADLINE
         .with(Cell::get)

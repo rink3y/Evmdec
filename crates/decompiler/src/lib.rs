@@ -1,10 +1,3 @@
-//! `evmdec`: a from-scratch EVM bytecode decompiler and security analyzer.
-//!
-//! Pipeline: bytes → [`disasm`] → [`cfg`](mod@cfg) (context-sensitive jump resolution) → [`lift`] (lifting
-//! to expression IR) → [`structure`] → [`emit`] (pseudo-Solidity) and [`analyze`] (findings).
-
-#![warn(missing_docs)]
-
 pub mod disasm;
 pub mod hex;
 pub mod idiom;

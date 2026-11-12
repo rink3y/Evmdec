@@ -1,43 +1,24 @@
-//! Whole-frame concrete execution: run a contract from its entry, following jumps across blocks
-//! until it halts or a step budget runs out.
-//!
-//! The oracle ([`crate::verify`]) runs one block at a time from a random state to check the
-//! lifter. This module instead runs the whole frame from a chosen, controlled state
-//! ([`Host::controlled`]), so a pass can ask a concrete question: does execution reach this
-//! instruction under this input, and what does storage look like when it halts. It is the
-//! substrate of the confirmation pass ([`crate::confirm`]) and the invariant checks.
-
 use crate::disasm;
 use crate::interp::{CallRecord, Host, LogRecord, Machine, Outcome};
 use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
 
-/// The result of running one frame to its end (or the budget).
 #[derive(Clone, Debug)]
 pub struct FrameRun {
-    /// How the frame ended.
     pub outcome: Outcome,
-    /// Program counters of every instruction executed (capped at the step budget).
     pub visited: HashSet<usize>,
-    /// Instructions executed.
     pub steps: usize,
-    /// Storage after the frame: `init_storage` plus every key written during it. Keys never
-    /// written do not appear (a controlled host reads them as zero).
     pub storage: HashMap<U256, U256>,
-    /// Logs emitted, in order.
     pub logs: Vec<LogRecord>,
-    /// External calls made, in order.
     pub calls: Vec<CallRecord>,
 }
 
 impl FrameRun {
-    /// Did the frame execute the instruction at `pc`?
     #[must_use]
     pub fn reached(&self, pc: usize) -> bool {
         self.visited.contains(&pc)
     }
 
-    /// Did the frame end without reverting or faulting?
     #[must_use]
     pub fn succeeded(&self) -> bool {
         matches!(
@@ -47,11 +28,6 @@ impl FrameRun {
     }
 }
 
-/// Run `code` from offset 0 under `host`, with `init_storage` written before the first
-/// instruction, following jumps for at most `budget` steps.
-///
-/// A jump to a target that is not a `JUMPDEST` halts the frame as the EVM would (`Invalid`); so
-/// does running past the step budget (reported as an `Exception`), which bounds loops.
 pub fn run_frame(
     code: &[u8],
     host: &Host,
@@ -103,18 +79,13 @@ pub fn run_frame(
     }
 }
 
-/// The account whose reach is tested: a non-zero address holding no role in a fresh contract.
 pub const CALLER: U256 = U256::from_u64(0xaaaa_aaaa_aaaa_aaaa);
-/// The executing contract's own address in a controlled run.
 pub const SELF: U256 = U256::from_u64(0xcccc_cccc_cccc_cccc);
 
-/// A controlled host for a run by [`CALLER`] against [`SELF`] with `calldata` and `callvalue`.
 pub fn caller_host(calldata: Vec<u8>, callvalue: U256) -> Host {
     Host::controlled(SELF, CALLER, calldata, callvalue)
 }
 
-/// Values tried in each calldata argument slot: zero, the caller's own address (for `to` and
-/// `owner` parameters), one, a round ether amount and the all-ones word.
 pub const CANDIDATES: [U256; 5] = [
     U256::ZERO,
     CALLER,
@@ -123,9 +94,7 @@ pub const CANDIDATES: [U256; 5] = [
     U256::MAX,
 ];
 
-/// The argument vectors tried for a function of `nargs` words, cheapest first: every argument
-/// the same candidate, then one argument varied with the rest zero (reaches guards keyed on a
-/// single parameter). The order is fixed so a witness is reproducible.
+// The order is fixed so a witness is reproducible.
 pub fn arg_shapes(nargs: usize) -> Vec<Vec<U256>> {
     let mut shapes: Vec<Vec<U256>> = CANDIDATES.iter().map(|c| vec![*c; nargs]).collect();
     for pos in 0..nargs {
@@ -138,7 +107,6 @@ pub fn arg_shapes(nargs: usize) -> Vec<Vec<U256>> {
     shapes
 }
 
-/// `selector ++ args` as ABI-style calldata, each argument one 32-byte word.
 pub fn calldata(selector: Option<u32>, args: &[U256]) -> Vec<u8> {
     let mut data = Vec::with_capacity(4 + 32 * args.len());
     if let Some(sel) = selector {
@@ -150,14 +118,12 @@ pub fn calldata(selector: Option<u32>, args: &[U256]) -> Vec<u8> {
     data
 }
 
-/// The 4-byte selector of `f` as a number, when it has one.
 pub fn selector_of(f: &crate::decompile::Function) -> Option<u32> {
     f.selector
         .as_deref()
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
 }
 
-/// A jump target as a code offset, when it names a `JUMPDEST`.
 fn jump_target(t: U256, jumpdests: &HashSet<usize>) -> Option<usize> {
     t.as_usize().filter(|pc| jumpdests.contains(pc))
 }
@@ -167,7 +133,6 @@ mod tests {
     use super::*;
     use crate::hex;
 
-    /// A controlled host with `calldata` and no value.
     fn host(calldata: Vec<u8>) -> Host {
         Host::controlled(
             U256::from_u64(0xc0),
@@ -177,7 +142,6 @@ mod tests {
         )
     }
 
-    /// `slot0 = 1; if calldata[0..32] != 0 { slot1 = 2 }; stop`: a forward conditional branch.
     #[test]
     fn runs_across_jumps_and_records_storage() {
         let code = hex::decode("6001600055600035156012576002600155005b00").expect("hex");

@@ -1,10 +1,3 @@
-//! Block-level lifting oracle.
-//!
-//! Every basic block is executed from random states twice: by the concrete interpreter
-//! (`interp`) and by evaluating the lifted statements (`lift`) with the same inputs. The exit
-//! stack, memory, storage writes, logs, calls and the control decision must agree. This checks the
-//! lifter and the expression simplifier on the whole program, reachable or not.
-
 use crate::cfg::{AState, Program, UNode, Unit};
 use crate::expr::{self, ExprId, Node};
 use crate::interp::{Host, Machine, Outcome, Rng};
@@ -15,40 +8,24 @@ use crate::u256::U256;
 use serde::Serialize;
 use std::collections::HashMap;
 
-/// Totals of one verification pass, per run and per block.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct VerifyStats {
-    /// Basic blocks in the program.
     pub blocks: usize,
-    /// Runs in which the reference interpreter completed the block.
     pub runs: usize,
-    /// Runs in which both sides agreed.
     pub agree: usize,
-    /// Runs in which the two sides diverged.
     pub mismatch: usize,
-    /// Runs that proved nothing (unsupported terminator, memory aliasing between symbolic bases,
-    /// or a block for which no executable state was ever found).
     pub inconclusive: usize,
-    /// Instructions in blocks whose every run agreed.
     pub instructions_total: usize,
-    /// Instructions in verified blocks.
     pub instructions_verified: usize,
-    /// Blocks with at least one agreeing run and no mismatch.
     pub blocks_verified: usize,
-    /// Blocks with at least one mismatching run.
     pub blocks_mismatched: usize,
-    /// Blocks with neither an agreeing nor a mismatching run.
     pub blocks_inconclusive: usize,
-    /// Number of inconclusive runs per reason.
     pub inconclusive_reasons: HashMap<String, usize>,
-    /// Descriptions of the first mismatches found (at most 50), with the block's start offset.
     pub mismatches: Vec<String>,
 }
 
-/// Concrete memory ranges touched through a symbolic base, for the aliasing check.
 #[derive(Default)]
 struct Accesses {
-    /// (base expression or None for constants, start, end)
     ranges: Vec<(Option<ExprId>, u64, u64)>,
 }
 
@@ -62,8 +39,6 @@ impl Accesses {
             self.ranges.push((base, s as u64, s as u64 + len as u64));
         }
     }
-    /// Two accesses with different symbolic bases overlapping concretely: the lifter's
-    /// no-alias assumption does not hold for this input.
     fn aliased(&self) -> bool {
         for (i, a) in self.ranges.iter().enumerate() {
             for b in &self.ranges[i + 1..] {
@@ -86,7 +61,6 @@ struct Eval<'a> {
     creates: Vec<U256>,
     gas_obs: Vec<U256>,
     msize_obs: Vec<U256>,
-    /// Sequence number of each GAS / MSIZE node in program order (rank = observation index).
     gas_rank: HashMap<u32, usize>,
     msize_rank: HashMap<u32, usize>,
     code: &'a [u8],
@@ -354,7 +328,6 @@ impl<'a> Eval<'a> {
     }
 }
 
-/// The lifter numbers calls as `seq_base + k`; in a single-node unit the base is 0.
 fn call_index(seq: u32) -> usize {
     (seq & 0x3ff) as usize
 }
@@ -399,7 +372,6 @@ fn copy_from(src: &[u8], s: U256, n: usize) -> Vec<u8> {
     buf
 }
 
-/// Required stack depth of a block (how many entries it pops below what it pushes).
 fn required_depth(prog: &Program, b: usize) -> usize {
     let mut depth: i64 = 0;
     let mut min: i64 = 0;
@@ -421,19 +393,13 @@ fn required_depth(prog: &Program, b: usize) -> usize {
     (-min) as usize
 }
 
-/// Parameters of a verification pass.
 #[derive(Clone, Debug)]
 pub struct VerifyOptions {
-    /// Completed reference runs wanted per block; up to ten times as many states are tried.
     pub runs: usize,
-    /// Seed of the random states, making a pass reproducible.
     pub seed: u64,
-    /// Print each mismatch with the block's lifted statements and exit stack to stderr.
     pub verbose: bool,
 }
 
-/// Lifts every block of `code` in isolation and compares it against the interpreter on random
-/// states, returning the totals.
 pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
     let prog = Program::new(code.to_vec());
     let lifter = Lifter {

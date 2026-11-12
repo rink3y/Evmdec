@@ -1,14 +1,9 @@
-//! Idiom recognition on lifted graphs: compiler boilerplate that is folded into one statement
-//! after lifting, before structuring.
-
 use crate::expr::{self, ExprId, Node};
 use crate::lift::{CopyLoop, CopyShape, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::u256::U256;
 use std::collections::HashSet;
 
-/// Memory/storage loads rewritten to version 0, so that `mem[0x40]` read at different points
-/// compares equal (the idioms below never write the free memory pointer in between).
 fn unversioned(e: ExprId) -> ExprId {
     let mut memo = std::collections::HashMap::new();
     expr::substitute(
@@ -24,7 +19,6 @@ fn unversioned(e: ExprId) -> ExprId {
     )
 }
 
-/// Flatten an addition tree into its non-constant addends (sorted, unversioned) and its constant.
 pub(crate) fn addends(e: ExprId) -> (Vec<ExprId>, U256) {
     let mut terms = Vec::new();
     let mut c = U256::ZERO;
@@ -43,7 +37,7 @@ pub(crate) fn addends(e: ExprId) -> (Vec<ExprId>, U256) {
     (terms, c)
 }
 
-/// Does `e` mention `mem[p]` (any version)? Walks owned nodes, so it may intern while comparing.
+// Walks owned nodes, so it may intern while comparing.
 fn mentions_mload_of(e: ExprId, p: ExprId) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
@@ -75,19 +69,10 @@ fn u(n: u64) -> U256 {
 
 struct DynReturn {
     ptr: ExprId,
-    /// Statements removed from the end of the head node (after trailing assignments).
     dropped: usize,
     dead: Vec<usize>,
 }
 
-/// The solc (0.4 – 0.7) encoder for returning one `bytes`/`string` value held in memory at `p`:
-///
-/// ```text
-/// S: mem[a] = 32; mem[a + 32] = mem[p]; v = 0
-/// H: while (v < mem[p]) { B: mem[a + 64 + v] = mem[p + 32 + v]; v += 32 }
-/// E…: zero the padding of the last word
-/// R: return mem[a : end]
-/// ```
 fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
     let sn = &l.nodes[s];
     let mut k = sn.stmts.len();
@@ -287,8 +272,6 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
     })
 }
 
-/// `return p` where the same node stored a constant-length payload at `p` (`mem[p] = len`,
-/// `mem[p + 32..] = data`): the ABI-encoded `bytes`/`string` return `(32, len, data...)`.
 fn literal_return(stmts: &[Stmt], ptr: ExprId) -> Option<Term> {
     let (pt, pc) = addends(ptr);
     let mut len: Option<u64> = None;
@@ -336,7 +319,6 @@ fn literal_return(stmts: &[Stmt], ptr: ExprId) -> Option<Term> {
     })
 }
 
-/// Fold recognised idioms in place. Returns the number of rewrites.
 pub fn fold(l: &mut Lifted) -> usize {
     let mut count = 0;
     for s in 0..l.nodes.len() {
@@ -385,9 +367,6 @@ pub fn fold(l: &mut Lifted) -> usize {
     count
 }
 
-/// Is `l` the helper that copies a storage `string`/`bytes` variable to memory and returns the
-/// pointer? (solc 0.4 – 0.7: it reads one slot `k`, decodes the short/long length with
-/// `slot & 1` and `>> 1` or `/ 2`, and returns the free memory pointer.)
 pub fn storage_string_loader(l: &Lifted) -> Option<U256> {
     let mut returns = 0;
     let mut and1: HashSet<U256> = HashSet::new();
@@ -476,7 +455,6 @@ pub fn storage_string_loader(l: &Lifted) -> Option<U256> {
     }
 }
 
-/// Does `ptr` hold the memory pointer returned by a storage-string loader call in `l`?
 pub fn is_string_pointer(
     l: &Lifted,
     ptr: ExprId,
@@ -500,9 +478,6 @@ pub fn is_string_pointer(
     None
 }
 
-/// Word-copy loops in a lifted graph, described for the lifter (unit node ids). Three forms:
-/// a while-loop with the phi on the condition node, a rotated loop with the phi on the body
-/// and the test after it, and a body that loops on itself.
 pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
     let mut inv: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for (u, ln) in &l.node_map {

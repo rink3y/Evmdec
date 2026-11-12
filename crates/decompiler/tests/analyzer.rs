@@ -1,10 +1,6 @@
-//! The analyzer on hand-assembled contracts with known defects.
-
 use evmdec::analyze::{self, Severity};
 use evmdec::decompile::{self, Options};
 
-/// Tiny assembler: mnemonics with immediates, e.g. "PUSH1 0x80". Labels: `:name` defines,
-/// `PUSH2 @name` references (patched to 2 bytes).
 fn asm(src: &str) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut labels = std::collections::HashMap::new();
@@ -41,7 +37,6 @@ fn asm(src: &str) -> Vec<u8> {
     out
 }
 
-/// Dispatcher: selector 0xaaaaaaaa -> body at label `f`, anything else reverts.
 fn dispatcher(body: &str) -> Vec<u8> {
     asm(&format!(
         "PUSH1 0x80 PUSH1 0x40 MSTORE PUSH1 0x00 CALLDATALOAD PUSH1 0xe0 SHR PUSH4 0xaaaaaaaa EQ PUSH2 @f JUMPI PUSH1 0x00 DUP1 REVERT :f JUMPDEST {body}"
@@ -124,7 +119,6 @@ fn report_renders() {
     assert!(serde_json::to_string(&r).is_ok());
 }
 
-/// solc < 0.5.9 metadata trailer: `{"bzzr0": <32 bytes>}` followed by its 2-byte length.
 fn bzzr0_trailer() -> Vec<u8> {
     let mut t = vec![0xa1, 0x65, b'b', b'z', b'z', b'r', b'0', 0x58, 0x20];
     t.extend(std::iter::repeat_n(0x11, 32));
@@ -210,7 +204,6 @@ fn erc20_transfer_result_ignored_is_reported() {
     );
 }
 
-/// Three selectors -> three bodies, anything else reverts.
 fn dispatcher3(a: &str, b: &str, c: &str) -> Vec<u8> {
     asm(&format!(
         "PUSH1 0x80 PUSH1 0x40 MSTORE PUSH1 0x00 CALLDATALOAD PUSH1 0xe0 SHR DUP1 PUSH4 0xaaaaaaaa EQ PUSH2 @a JUMPI DUP1 PUSH4 0xbbbbbbbb EQ PUSH2 @b JUMPI PUSH4 0xcccccccc EQ PUSH2 @c JUMPI PUSH1 0x00 DUP1 REVERT :a JUMPDEST POP {a} :b JUMPDEST POP {b} :c JUMPDEST {c}"
@@ -655,8 +648,6 @@ fn a_proxy_composite_takes_every_implementation_function_and_flags_slot_collisio
     assert!(finding(&r, "storage-collision").is_some(), "{:?}", ids(&r));
 }
 
-/// `CALL(gas, SLOAD(slot), 0, mem[0..len], out 0)` with the 4-byte `selector` at memory 0 and
-/// `extra` assembled before the call (for payload words after the selector).
 fn call_stored(slot: u8, selector: u32, extra: &str, len: u8) -> String {
     format!(
         "PUSH4 {selector:#010x} PUSH1 0xe0 SHL PUSH1 0x00 MSTORE {extra} PUSH1 0x00 PUSH1 0x00 PUSH1 {len:#04x} PUSH1 0x00 PUSH1 0x00 PUSH1 {slot:#04x} SLOAD GAS CALL POP STOP"
@@ -753,21 +744,16 @@ fn a_sync_after_a_state_changing_call_is_reported() {
     );
 }
 
-/// `mapping[slot][calldata[4]]` read, ending in SLOAD. Key is a calldata word so the entry is
-/// pooled (a `ShapeStep::Key`), the shape the rule looks for.
 fn mread(slot: u8) -> String {
     format!(
         "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x{slot:02x} PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 SLOAD"
     )
 }
 
-/// A payout limited by `avail >= calldata[0x24]`, then `calldata[0x24]` wei sent to the caller.
 fn bounded_payout(avail: &str, bad: &str) -> String {
     limited_payout(avail, "0x24", bad)
 }
 
-/// `avail >= calldata[cmp]`, then `calldata[0x24]` wei sent to the caller: the limit caps the
-/// payout only when `cmp` is `0x24`.
 fn limited_payout(avail: &str, cmp: &str, bad: &str) -> String {
     format!(
         "{avail} PUSH1 {cmp} CALLDATALOAD GT PUSH2 @{bad} JUMPI \
@@ -776,12 +762,10 @@ fn limited_payout(avail: &str, cmp: &str, bad: &str) -> String {
     )
 }
 
-/// The low 128 bits of `x`.
 fn low128(x: &str) -> String {
     format!("{x} PUSH16 0xffffffffffffffffffffffffffffffff AND")
 }
 
-/// The high 128 bits of `x`.
 fn high128(x: &str) -> String {
     format!("{x} PUSH1 0x80 SHR")
 }
@@ -860,7 +844,6 @@ fn a_limit_that_does_not_cap_the_payout_is_not_compared() {
     );
 }
 
-/// The high 128 bits of `x`, read in place with a high mask and no shift.
 fn high128_in_place(x: &str) -> String {
     format!("{x} PUSH32 0xffffffffffffffffffffffffffffffff00000000000000000000000000000000 AND")
 }
@@ -940,8 +923,6 @@ fn source_of(code: &[u8]) -> String {
 fn names_come_from_roles_the_code_shows() {
     const OWNER_ONLY: &str =
         "PUSH1 0x07 SLOAD CALLER EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST";
-    // Two functions compare the caller with slot 7; a third moves an amount between two
-    // entries of the mapping at slot 3.
     let gated_a = OWNER_ONLY.replace("@ok", "@oka").replace(":ok", ":oka");
     let gated_b = OWNER_ONLY.replace("@ok", "@okb").replace(":ok", ":okb");
     let entry = |word: &str| {
@@ -979,7 +960,6 @@ fn names_come_from_roles_the_code_shows() {
 
 #[test]
 fn a_one_sided_entry_is_not_a_transfer_party() {
-    // records[key] += amount, with nothing lowered anywhere: the key is not a recipient.
     let credit = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD PUSH1 0x24 CALLDATALOAD ADD SWAP1 SSTORE STOP";
     let src = source_of(&dispatcher(credit));
     assert!(!src.contains(" to,") && !src.contains(" from,"), "{src}");
@@ -987,7 +967,6 @@ fn a_one_sided_entry_is_not_a_transfer_party() {
     assert!(!src.contains(" balances;"), "{src}");
 }
 
-/// The slot of the mapping-at-3 entry keyed by the address in calldata word `word`.
 fn account_entry(word: &str) -> String {
     format!("PUSH1 {word} CALLDATALOAD PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256")
 }
@@ -1092,7 +1071,6 @@ fn an_entry_raised_without_the_total_that_moves_with_it_is_reported() {
 
 const LINKED: &str = "0x00000000000000000000000000000000000000b1";
 
-/// A call with the four-byte payload `selector` and `value` wei to the fixed address `to`.
 fn call_fixed(to: &str, selector: &str, value: &str) -> String {
     format!(
         "PUSH4 {selector} PUSH1 0xe0 SHL PUSH1 0x80 MSTORE PUSH1 0x00 PUSH1 0x00 PUSH1 0x04 \
@@ -1100,7 +1078,6 @@ fn call_fixed(to: &str, selector: &str, value: &str) -> String {
     )
 }
 
-/// Findings of the linked-contract rules on `root` analysed with `linked` fetched at `LINKED`.
 fn link_ids(root: &[u8], linked: &[u8]) -> Vec<String> {
     let mut c = decompile::decompile(root, &Options::default());
     let mut lc = decompile::decompile(linked, &Options::default());
@@ -1186,9 +1163,6 @@ fn an_approval_is_held_against_what_the_spender_lets_callers_do() {
     assert!(link_ids(&root, &dispatcher("STOP")).is_empty());
 }
 
-/// A memory word loaded, then overwritten, then used: the use is of the old value, so it is
-/// kept in a local declared before the store. A value just stored reads as the word that holds
-/// it for the rest of its block.
 #[test]
 fn a_memory_word_used_after_it_is_overwritten_keeps_its_old_value() {
     let code = dispatcher(
@@ -1208,9 +1182,6 @@ fn a_memory_word_used_after_it_is_overwritten_keeps_its_old_value() {
     assert!(saved < stored && stored < used, "{src}");
 }
 
-/// A jump to a constant that is not a jump destination always fails: the way compilers before
-/// `revert` wrote an abort. It reads as a guard, and is not counted as a jump the recovery
-/// could not follow.
 #[test]
 fn a_jump_to_no_destination_is_an_abort() {
     let code = dispatcher(
@@ -1224,8 +1195,6 @@ fn a_jump_to_no_destination_is_an_abort() {
     assert!(c.source.contains("require(arg1 != 0);"), "{}", c.source);
 }
 
-/// A delegatecall is a proxy's when it forwards the whole calldata. One that sends a payload
-/// the code built itself to a fixed address runs a library, which is not an implementation.
 #[test]
 fn a_library_call_is_not_a_proxy() {
     let library = "0x00000000000000000000000000000000000000c7";
@@ -1253,7 +1222,6 @@ fn a_library_call_is_not_a_proxy() {
 const ROOT: &str = "0x00000000000000000000000000000000000000a0";
 const LIBRARY: &str = "0x00000000000000000000000000000000000000b2";
 
-/// A call to `0xaaaaaaaa` on `LINKED` whose two argument words are left by `first` and `second`.
 fn call_with_words(first: &str, second: &str) -> String {
     format!(
         "PUSH4 0xaaaaaaaa PUSH1 0xe0 SHL PUSH1 0x80 MSTORE {first} PUSH1 0x84 MSTORE {second} \
@@ -1262,9 +1230,6 @@ fn call_with_words(first: &str, second: &str) -> String {
     )
 }
 
-/// Findings of the passed-word rules on `root`, analysed with `linked` at `LINKED` and
-/// `library` at `LIBRARY`. `admits` states what the linked contract's storage says about the
-/// root as a caller, when it was read.
 fn passed_on(
     root: &[u8],
     linked: &[u8],
@@ -1452,8 +1417,6 @@ fn targets_only_read_are_told_from_targets_a_call_may_change() {
     assert_eq!(c.written_targets, [LINKED]);
 }
 
-/// A call to `0xaaaaaaaa` on the address `target` leaves on the stack, with two argument words
-/// and `out` bytes of the answer copied to memory at 0.
 fn call_words_to(target: &str, first: &str, second: &str, out: &str) -> String {
     format!(
         "PUSH4 0xaaaaaaaa PUSH1 0xe0 SHL PUSH1 0x80 MSTORE {first} PUSH1 0x84 MSTORE {second} \
@@ -1461,7 +1424,6 @@ fn call_words_to(target: &str, first: &str, second: &str, out: &str) -> String {
     )
 }
 
-/// Findings of the passed-word rules on `root` analysed with `others`, each at its address.
 fn world_ids(root: &[u8], others: &[(&str, &[u8])]) -> Vec<String> {
     let opts = Options {
         embedded: true,
@@ -1592,9 +1554,6 @@ fn a_clone_created_during_the_call_runs_the_code_it_forwards_to() {
     );
 }
 
-/// The `unbound-account-passed-on` finding on `root`, analysed with `linked` at `LINKED` and
-/// `library` at `LIBRARY`. `approved` states whether the linked contract's storage was read to
-/// approve the root as a caller.
 fn passed_on_finding(
     root: &[u8],
     linked: &[u8],

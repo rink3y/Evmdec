@@ -19,52 +19,64 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Show bytecode facts: kind, size, compiler metadata.
+    #[command(about = "Show bytecode facts: kind, size, compiler metadata")]
     Info { file: PathBuf },
-    /// Linear disassembly.
+    #[command(about = "Linear disassembly")]
     Disasm { file: PathBuf },
-    /// Control-flow recovery statistics.
+    #[command(about = "Control-flow recovery statistics")]
     Cfg { file: PathBuf },
-    /// Decompile to pseudo-Solidity. INPUT is a file (binary or hex), a hex string, or a 0x address.
+    #[command(
+        about = "Decompile to pseudo-Solidity. INPUT is a file (binary or hex), a hex string, or a 0x address"
+    )]
     Decompile {
         input: String,
-        /// JSON-RPC endpoint(s), comma-separated (default: public endpoints of --chain, or $EVMDEC_RPC_URL).
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "JSON-RPC endpoint(s), comma-separated (default: public endpoints of --chain, or $EVMDEC_RPC_URL)"
+        )]
         rpc: Option<String>,
-        /// Chain name or id for address lookups.
-        #[arg(long, default_value = "mainnet")]
+        #[arg(
+            long,
+            default_value = "mainnet",
+            help = "Chain name or id for address lookups"
+        )]
         chain: String,
-        /// Do not resolve and decompile the implementation behind a proxy.
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Do not resolve and decompile the implementation behind a proxy"
+        )]
         no_follow_proxy: bool,
-        /// Call edges to follow from the contract: 1 fetches what it calls, 2 also what those
-        /// contracts call. At most 3; 0 fetches no dependency.
-        #[arg(long, default_value_t = 2)]
+        #[arg(
+            long,
+            default_value_t = 2,
+            help = "Call edges to follow from the contract: 1 fetches what it calls, 2 also what those contracts call. At most 3; 0 fetches no dependency"
+        )]
         depth: usize,
-        /// Labels and gotos instead of structured code.
-        #[arg(long)]
+        #[arg(long, help = "Labels and gotos instead of structured code")]
         flat: bool,
-        /// JSON output with all facts.
-        #[arg(long)]
+        #[arg(long, help = "JSON output with all facts")]
         json: bool,
-        /// Also decompile embedded contracts (CREATE/CREATE2 payloads).
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Also decompile embedded contracts (CREATE/CREATE2 payloads)"
+        )]
         embedded: bool,
-        /// Disable the built-in signature dictionary.
-        #[arg(long)]
+        #[arg(long, help = "Disable the built-in signature dictionary")]
         no_sigs: bool,
-        /// Append the security report (markdown) after the code.
-        #[arg(long)]
+        #[arg(long, help = "Append the security report (markdown) after the code")]
         report: bool,
-        /// Resolve unknown selectors online (openchain.xyz, 4byte.directory).
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Resolve unknown selectors online (openchain.xyz, 4byte.directory)"
+        )]
         lookup: bool,
     },
-    /// Block-level oracle: execute every basic block concretely and through the lifted IR.
+    #[command(
+        about = "Block-level oracle: execute every basic block concretely and through the lifted IR"
+    )]
     Verify {
         file: PathBuf,
-        /// Random states per block.
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 8, help = "Random states per block")]
         runs: usize,
         #[arg(long, default_value_t = 1)]
         seed: u64,
@@ -73,16 +85,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Security analysis report (markdown, or JSON with --json).
+    #[command(about = "Security analysis report (markdown, or JSON with --json)")]
     Analyze {
         file: PathBuf,
         #[arg(long)]
         json: bool,
     },
-    /// Look up selectors (8 hex digits) or event topics (64 hex digits) in the signature
-    /// dictionary and the local index; with no argument, report which index is in use.
+    #[command(
+        about = "Look up selectors (8 hex digits) or event topics (64 hex digits) in the signature dictionary and the local index; with no argument, report which index is in use"
+    )]
     Sigs {
-        /// 4-byte selectors or 32-byte topic hashes, with or without 0x.
+        #[arg(help = "4-byte selectors or 32-byte topic hashes, with or without 0x")]
         hashes: Vec<String>,
     },
 }
@@ -99,7 +112,6 @@ fn load(file: &PathBuf) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
-/// A file path, or a hex string given directly on the command line.
 fn load_input(input: &str) -> Result<Vec<u8>> {
     let p = PathBuf::from(input);
     if p.exists() {
@@ -112,8 +124,6 @@ fn load_input(input: &str) -> Result<Vec<u8>> {
     anyhow::bail!("'{}' is neither a file, a hex string nor an address", input)
 }
 
-/// Fetch the contract at `address` on `chain` and, under `policy`, resolve and compose it with
-/// the code it forwards to. Progress goes to stderr.
 fn fetch_and_decompile(
     address: &str,
     rpc: Option<&str>,

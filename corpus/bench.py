@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""Accuracy benchmark: compare evmdec's recovered interface against verified ABIs.
-
-Usage: corpus/bench.py [--bin target/release/evmdec] [--dir testdata/mainnet] [--sigs]
-
-For every `<name>.hex` with a `<name>.abi.json` (Sourcify format) it reports selector
-recall/precision, state-mutability accuracy, parameter-count and return-count accuracy and
-event recall. The signature dictionary is disabled by default so that *inference* is measured.
-"""
 import argparse, json, os, subprocess, sys
 
 RC = [0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000, 0x000000000000808b, 0x0000000080000001,

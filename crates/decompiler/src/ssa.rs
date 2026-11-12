@@ -1,10 +1,3 @@
-//! The SSA view of lifted graphs: where phi variables get their values, how internal calls bind
-//! arguments and results, and the canonical path of every storage access.
-//!
-//! Lifting already produces SSA values (phi `Var`s, versioned loads); this module indexes them so
-//! the type solver and later passes can follow a value through phis, calls and storage without
-//! pattern-matching the raw graph.
-
 use crate::emit::{hashed_slot, MappingLayout, SlotSpace};
 use crate::expr::{self, ExprId, Node};
 use crate::lift::{Lifted, Stmt, Term};
@@ -12,52 +5,34 @@ use crate::opcode as op;
 use crate::u256::U256;
 use std::collections::HashMap;
 
-/// One step from a storage root to an element.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Step {
-    /// Mapping entry under this key.
     Key(ExprId),
-    /// Array element at this index.
     Index(ExprId),
-    /// Struct member this many slots past the element start.
     Offset(u64),
 }
 
-/// A storage key decomposed into its declared variable (the root slot) and the path to the
-/// element: `keccak(k . keccak(j . 5)) + 1` is root 5, steps `[Key(j), Key(k), Offset(1)]`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SlotPath {
-    /// Slot of the declared variable.
     pub root: U256,
-    /// Steps from the root to the element.
     pub steps: Vec<Step>,
 }
 
-/// A path step without its key or index value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ShapeStep {
-    /// Some mapping entry.
     Key,
-    /// Some array element.
     Index,
-    /// Struct member at this slot offset.
     Offset(u64),
 }
 
-/// What every element of one declared storage variable shares: the root and the kinds of
-/// steps, which is the unit of typing (all entries of a mapping have the value type).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Shape {
-    /// Slot of the declared variable.
     pub root: U256,
-    /// Kinds of steps from the root.
     pub steps: Vec<ShapeStep>,
-    /// Persistent or transient storage.
     pub space: SlotSpace,
 }
 
 impl SlotPath {
-    /// The shape of this path in `space`.
     pub fn shape(&self, space: SlotSpace) -> Shape {
         Shape {
             root: self.root,
@@ -75,7 +50,6 @@ impl SlotPath {
     }
 }
 
-/// The storage space of a load or store flagged `transient`.
 pub fn space_of(transient: bool) -> SlotSpace {
     if transient {
         SlotSpace::Transient
@@ -84,8 +58,6 @@ pub fn space_of(transient: bool) -> SlotSpace {
     }
 }
 
-/// Which of the two hashed words is the key: Vyper hashes `slot . key`, Solidity `key . slot`;
-/// a small constant first word with a non-constant second is a slot whichever the compiler.
 fn key_and_slot(words: &[ExprId], layout: MappingLayout) -> (ExprId, ExprId) {
     let small = |e: ExprId| expr::as_const(e).is_some_and(|c| c.bits() <= 16);
     if layout == MappingLayout::Vyper || (small(words[0]) && !small(words[1])) {
@@ -95,18 +67,12 @@ fn key_and_slot(words: &[ExprId], layout: MappingLayout) -> (ExprId, ExprId) {
     }
 }
 
-/// Nesting depth past which a key is not decomposed.
 const MAX_PATH_DEPTH: u32 = 8;
 
-/// Decompose a storage key into its root and path, for the shapes compilers emit: constants
-/// (including precomputed `keccak256(slot) + k`), `keccak256(key . slot)` mapping entries,
-/// `keccak256(slot) + i` array elements and `+ c` struct members.
 pub fn slot_path(key: ExprId, layout: MappingLayout) -> Option<SlotPath> {
     slot_path_at(key, layout, 0)
 }
 
-/// `keccak256(root) + k` for a constant: element `k` of the array at `root`. A constant just
-/// below a hash (`k < 0`) is not an element of that array.
 fn precomputed_element(c: U256) -> Option<Option<(U256, u64)>> {
     match hashed_slot(c) {
         Some((root, k)) if k >= 0 => Some(Some((root, k as u64))),
@@ -185,29 +151,20 @@ fn slot_path_at(key: ExprId, layout: MappingLayout, depth: u32) -> Option<SlotPa
     }
 }
 
-/// A read of part of a slot's word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldRef {
-    /// The slot read.
     pub key: ExprId,
-    /// Bit offset of the field within the word.
     pub bit_offset: u32,
-    /// Width of the field in bits.
     pub bits: u32,
 }
 
-/// A write of part of a slot's word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldWrite {
-    /// Bit offset of the field within the word.
     pub bit_offset: u32,
-    /// Width of the field in bits.
     pub bits: u32,
-    /// The value written into the field (before masking).
     pub value: ExprId,
 }
 
-/// `(key, bit offset)` of `slot`, `slot >> s` or `slot / 2^s` when `s` is whole bytes.
 fn shifted_slot(e: ExprId) -> Option<(ExprId, u32)> {
     match expr::node(e) {
         Node::SLoad(k, false, _) => Some((k, 0)),
@@ -231,8 +188,6 @@ fn shifted_slot(e: ExprId) -> Option<(ExprId, u32)> {
     }
 }
 
-/// A read of part of a slot's word: `slot >> s & mask`, `slot / 2^s & mask`,
-/// `signextend(n, slot >> s)` and a bare `slot >> s` (the top field).
 pub fn field_read(e: ExprId) -> Option<FieldRef> {
     let field = |key, bit_offset, bits| FieldRef {
         key,
@@ -265,7 +220,6 @@ pub fn field_read(e: ExprId) -> Option<FieldRef> {
     }
 }
 
-/// `(value << s) & (mask << s)`: the new field value masked after it is moved into place.
 fn shifted_then_masked(e: ExprId) -> Option<FieldWrite> {
     let Node::Op(op::AND, w) = expr::node(e) else {
         return None;
@@ -287,9 +241,6 @@ fn shifted_then_masked(e: ExprId) -> Option<FieldWrite> {
     })
 }
 
-/// Every field a store of `val` to `key` writes: one for the plain read-modify-write, several
-/// when the compiler merges the values of neighbouring fields into one store
-/// (`old & keep | a | b << s`). Each merged value must sit inside bits `keep` clears.
 pub fn field_writes(key: ExprId, val: ExprId) -> Vec<FieldWrite> {
     if let Some(w) = field_write(key, val) {
         return vec![w];
@@ -353,9 +304,6 @@ pub fn field_writes(key: ExprId, val: ExprId) -> Vec<FieldWrite> {
     out
 }
 
-/// A write of part of a slot's word: the compiler's read-modify-write
-/// `(old & ~(mask << s)) | ((value & mask) << s)`, where `old` reads `key`. With nothing merged
-/// in, `old & ~(mask << s)` writes zero to the field.
 pub fn field_write(key: ExprId, val: ExprId) -> Option<FieldWrite> {
     if let Node::Op(op::AND, w) = expr::node(val) {
         for (a, b) in [(w[0], w[1]), (w[1], w[0])] {
@@ -427,8 +375,6 @@ pub fn field_write(key: ExprId, val: ExprId) -> Option<FieldWrite> {
     None
 }
 
-/// Every phi variable of `l` with the values flowing into it: edge copies and explicit
-/// assignments.
 pub fn phi_defs(l: &Lifted) -> HashMap<ExprId, Vec<ExprId>> {
     let mut defs: HashMap<ExprId, Vec<ExprId>> = HashMap::new();
     for assigns in l.edge_assigns.values() {
@@ -446,21 +392,14 @@ pub fn phi_defs(l: &Lifted) -> HashMap<ExprId, Vec<ExprId>> {
     defs
 }
 
-/// An internal call with its arguments bound to the callee's parameter positions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallSite {
-    /// Entry pc of the callee.
     pub callee: usize,
-    /// Sequence number of the call (`IntRet(seq, j)` are its results).
     pub seq: u32,
-    /// `(parameter index in declaration order, value passed)`.
     pub args: Vec<(u32, ExprId)>,
-    /// `(result index j, the expression holding it in the caller)`.
     pub results: Vec<(u16, ExprId)>,
 }
 
-/// The internal calls of `l`. `arity(callee)` gives the callee's parameter count (the depth of
-/// its return address); parameter `j` in declaration order is `Arg(arity - 1 - j)` of the callee.
 pub fn call_sites(l: &Lifted, arity: impl Fn(usize) -> Option<usize>) -> Vec<CallSite> {
     let mut out = Vec::new();
     for nd in &l.nodes {
@@ -497,13 +436,10 @@ pub fn call_sites(l: &Lifted, arity: impl Fn(usize) -> Option<usize>) -> Vec<Cal
     out
 }
 
-/// The parameter count of an internal unit: the stack depth of its return address, or every
-/// entry argument when the unit has no return address.
 pub fn arity(l: &Lifted) -> usize {
     l.ret_slot.map_or(l.n_args, |k| k as usize)
 }
 
-/// The values an internal unit returns, per `InternalReturn` (deepest first).
 pub fn returns(l: &Lifted) -> Vec<&[ExprId]> {
     l.nodes
         .iter()
@@ -514,8 +450,6 @@ pub fn returns(l: &Lifted) -> Vec<&[ExprId]> {
         .collect()
 }
 
-/// The constant slot an address expression is loaded from: `SLOAD(k)`, or `SLOAD(k) & mask`
-/// for an address mask.
 pub fn stored_address_slot(e: ExprId) -> Option<ExprId> {
     let inner = match expr::node(e) {
         Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],

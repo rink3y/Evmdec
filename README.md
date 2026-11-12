@@ -387,10 +387,10 @@ python3 corpus/vuln_bench.py
 RUNS=8 ./corpus/verify_all.sh
 ```
 
-The Rust crates follow Google's Rust style guide with `rustfmt.toml` as committed, the crate
-root turns on `#![warn(missing_docs)]`, and clippy is kept at zero warnings.
-`.claude/agents/rust-style-reviewer.md` reviews a change against the guide. See
-`CONTRIBUTING.md` for the rules a new analyzer rule has to meet.
+The Rust crates follow Google's Rust style guide with `rustfmt.toml` as committed, and clippy
+is kept at zero warnings. Comments are few and only say why. There are no documentation
+comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the guide. See
+`CONTRIBUTING.md` for the comment rules and for what a new analyzer rule has to meet.
 
 ## Known limitations
 

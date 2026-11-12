@@ -1,5 +1,3 @@
-//! evmdec web service: decompile by address or bytecode, serve the single-page UI.
-
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse};
@@ -22,7 +20,6 @@ const FAVICON: &str = include_str!("../static/favicon.svg");
 #[derive(Clone)]
 struct AppState {
     cache: Arc<Mutex<HashMap<String, Arc<Value>>>>,
-    /// Decompilations in flight at once; the rest wait their turn.
     slots: Arc<Semaphore>,
 }
 
@@ -35,9 +32,7 @@ impl Default for AppState {
     }
 }
 
-/// Decompilations run at once per process.
 const MAX_IN_FLIGHT: usize = 4;
-/// Time a single request may take, fetching and analysing included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Deserialize, Default)]
@@ -48,9 +43,7 @@ struct DecompileReq {
     rpc: Option<String>,
     #[serde(default)]
     no_follow_proxy: bool,
-    /// Call edges to follow from the contract; the default when absent, at most 3.
     depth: Option<usize>,
-    /// Resolve unknown selectors online.
     #[serde(default)]
     lookup: bool,
 }
@@ -59,7 +52,6 @@ fn error(status: StatusCode, msg: impl Into<String>) -> axum::response::Response
     (status, Json(json!({"error": msg.into()}))).into_response()
 }
 
-/// Selectors of `c` and its parts that have no known signature, for an online lookup.
 fn unknown_selectors(c: &Contract) -> Vec<u32> {
     c.functions
         .iter()
@@ -69,21 +61,14 @@ fn unknown_selectors(c: &Contract) -> Vec<u32> {
         .collect()
 }
 
-/// Whether unknown selectors are looked up online.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lookup {
-    /// The built-in dictionary only.
     Offline,
-    /// Ask openchain.xyz and 4byte.directory, then decompile again with what they return.
     Online,
 }
 
-/// What a request decompiles: pasted bytecode, or the contract at an address.
 enum Source<'a> {
-    /// Bytecode as given.
     Bytecode(&'a [u8]),
-    /// The contract at `address` on `chain`, fetched under `policy` through `rpc` (or the
-    /// chain's public endpoints).
     Address {
         address: &'a str,
         chain: &'a str,
@@ -93,7 +78,6 @@ enum Source<'a> {
 }
 
 impl Source<'_> {
-    /// The address shown in titles.
     fn title(&self) -> &str {
         match self {
             Source::Bytecode(_) => "bytecode",
@@ -101,8 +85,6 @@ impl Source<'_> {
         }
     }
 
-    /// Decompile, resolving and composing the contract at an address. `cache` keeps the code
-    /// fetched so a second pass does not ask the node again.
     fn obtain(&self, opts: &Options, cache: &mut CodeCache) -> Result<Contract, String> {
         match self {
             Source::Bytecode(code) => Ok(evmdec::decompile::decompile(code, opts)),
@@ -119,7 +101,6 @@ impl Source<'_> {
     }
 }
 
-/// Run the decompiler and analyzer; returns the JSON document the UI consumes.
 fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
     let mut opts = Options::default();
     let mut cache = CodeCache::new();
@@ -288,8 +269,6 @@ async fn api_address(
     .await
 }
 
-/// The page, with `__ORIGIN__` (used by the Open Graph tags, which need absolute URLs) replaced
-/// by the scheme and host this request arrived on.
 async fn index(headers: header::HeaderMap) -> Html<String> {
     let host = headers
         .get(header::HOST)
@@ -343,8 +322,6 @@ async fn chains() -> Json<Value> {
         .collect::<Vec<_>>()))
 }
 
-/// What this server can name: the size of the local signature index, or zero when none is
-/// installed and only the built-in dictionary is in use.
 async fn status() -> Json<Value> {
     let signatures = evmdec::sigdb::global().map_or(0, evmdec::sigdb::SigDb::len);
     Json(json!({"signature_index": signatures}))

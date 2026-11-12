@@ -1,11 +1,3 @@
-//! Lifting: symbolic execution of a recovered unit into expression statements.
-//!
-//! Every node of a `cfg::Unit` is executed with a stack of expressions, a symbolic memory and a
-//! storage cache. Values that reach a node from several predecessors with different expressions
-//! become `Var`s (phis) assigned on the incoming edges. Processing iterates to a fixpoint: a
-//! node is re-run when its entry state changes (phis only ever increase, memory knowledge only
-//! ever shrinks, so this terminates).
-
 use crate::cfg::{AVal, Edge, Program, Unit};
 use crate::expr::{self, konst, konst_u64, op1, op2, op3, ExprId, Node};
 use crate::opcode as op;
@@ -14,256 +6,139 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
-/// A side-effecting statement of a lifted node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stmt {
-    /// `var = value` (phi copies live on edges; this is for explicit temporaries).
     Assign {
-        /// The `Var` being assigned.
         var: ExprId,
-        /// Expression assigned to `var`.
         value: ExprId,
     },
-    /// Memory store (`MSTORE` or `MSTORE8`).
     MStore {
-        /// Memory offset written.
         off: ExprId,
-        /// Value stored (already masked to one byte for `MSTORE8`).
         val: ExprId,
-        /// Width in bytes: 32 for `MSTORE`, 1 for `MSTORE8`.
         width: u8,
-        /// Memory generation this write starts: an unresolved load of the same address stamped
-        /// below it read what the write replaces. Zero for a store the lifter did not execute.
         gen: u32,
     },
-    /// Storage store (`SSTORE`, or `TSTORE` when `transient`).
     SStore {
-        /// Storage slot written.
         key: ExprId,
-        /// Value stored.
         val: ExprId,
-        /// Transient storage (`TSTORE`) rather than persistent storage.
         transient: bool,
-        /// Storage generation before this write: an `SLoad` of the same slot whose generation is
-        /// at most this read the value the write replaces.
         gen: u32,
     },
-    /// Event emission (`LOG0`..`LOG4`).
     Log {
-        /// Memory offset of the event data.
         off: ExprId,
-        /// Length of the event data in bytes.
         len: ExprId,
-        /// Topic expressions, in opcode order.
         topics: Vec<ExprId>,
-        /// Event data words, when `len` is constant and every byte is known.
         data: Option<Vec<ExprId>>,
     },
-    /// `input_head` holds the first memory words of the payload (the selector lives in the top
-    /// four bytes of the first) even when the whole payload could not be decoded into `input`.
     Call {
-        /// Sequence number identifying this call (`CallResult`/`ReturnData` refer to it).
         seq: u32,
-        /// Opcode: `CALL`, `CALLCODE`, `DELEGATECALL` or `STATICCALL`.
         kind: u8,
-        /// Gas forwarded to the callee.
         gas: ExprId,
-        /// Callee address.
         addr: ExprId,
-        /// Wei sent; `None` for `DELEGATECALL`/`STATICCALL`, which carry no value.
         value: Option<ExprId>,
-        /// Memory offset of the input payload.
         in_off: ExprId,
-        /// Length of the input payload in bytes.
         in_len: ExprId,
-        /// Memory offset the return data is copied to.
         out_off: ExprId,
-        /// Number of return-data bytes copied to `out_off`.
         out_len: ExprId,
-        /// Input payload words, when `in_len` is constant and every byte is known.
         input: Option<Vec<ExprId>>,
-        /// Leading payload words, available even when `input` is `None`.
         input_head: Vec<ExprId>,
-        /// The `CallResult(seq)` expression pushed as the success flag.
         result: ExprId,
-        /// Storage generation before the call when the call advances it (every call but
-        /// `STATICCALL`): loads of that generation or older read values from before the call.
         gen: Option<u32>,
     },
-    /// Contract creation (`CREATE` or `CREATE2`).
     Create {
-        /// Sequence number identifying this creation (`CreateResult` refers to it).
         seq: u32,
-        /// Opcode: `CREATE` or `CREATE2`.
         kind: u8,
-        /// Wei endowed to the new contract.
         value: ExprId,
-        /// Memory offset of the init code.
         off: ExprId,
-        /// Length of the init code in bytes.
         len: ExprId,
-        /// Salt for `CREATE2`; `None` for `CREATE`.
         salt: Option<ExprId>,
-        /// The `CreateResult(seq)` expression pushed as the new contract's address.
         result: ExprId,
-        /// Init code words, when `len` is constant and every byte is known.
         init: Option<Vec<ExprId>>,
-        /// Storage generation before the creation (which always advances it).
         gen: u32,
     },
-    /// CALLDATACOPY / CODECOPY / RETURNDATACOPY / EXTCODECOPY / MCOPY.
     Copy {
-        /// The copying opcode.
         kind: u8,
-        /// Destination memory offset.
         dest: ExprId,
-        /// Source offset in calldata, code, return data, external code or memory (per `kind`).
         src: ExprId,
-        /// Number of bytes copied.
         len: ExprId,
-        /// Address whose code is copied; `EXTCODECOPY` only.
         addr: Option<ExprId>,
     },
-    /// Call of the internal function (another unit) whose entry is at pc `callee`.
     Internal {
-        /// Sequence number identifying this call (`IntRet` refers to it).
         seq: u32,
-        /// Program counter of the callee's entry block.
         callee: usize,
-        /// Argument expressions (deepest first), excluding the return address.
         args: Vec<ExprId>,
-        /// Values the call leaves on the stack; empty when the callee was inlined.
         results: Vec<ExprId>,
-        /// Storage generation before the call when the callee has side effects (it then
-        /// advances the generation like an external call).
         gen: Option<u32>,
     },
-    /// Explicit `POP` of a value that had side effects (a call result that is ignored).
     Drop(ExprId),
-    /// A guard taken over from an inlined helper: execution continues only if `cond` holds,
-    /// otherwise the helper reverted with `data` (decoded payload words), or hit INVALID.
     Require {
-        /// Condition that must hold for execution to continue.
         cond: ExprId,
-        /// Decoded revert payload words of the failing side, when known.
         data: Option<Vec<ExprId>>,
-        /// The failing side hit `INVALID` (an assert) rather than reverting.
         invalid: bool,
     },
 }
 
-/// How control leaves a lifted node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Term {
-    /// Unconditional jump to the lifted node.
     Jump(usize),
-    /// `t == None`: the true branch jumps to an invalid destination (reverts).
     Branch {
-        /// Branch condition; the true branch is taken when it is non-zero.
         cond: ExprId,
-        /// Lifted node of the true branch; `None` when it is an invalid destination.
         t: Option<usize>,
-        /// Lifted node of the false branch.
         f: usize,
     },
-    /// Computed jump with several possible targets.
     Switch {
-        /// The jump target expression dispatched on.
         target: ExprId,
-        /// Lifted nodes the jump may reach.
         cases: Vec<usize>,
     },
-    /// `RETURN` of `len` bytes of memory at `off`.
     Return {
-        /// Memory offset of the returned data.
         off: ExprId,
-        /// Length of the returned data in bytes.
         len: ExprId,
-        /// Returned words, when `len` is constant (outside oracle mode, unknown words are allowed).
         data: Option<Vec<ExprId>>,
     },
-    /// Return of one dynamic `bytes`/`string` value held in memory at `ptr` (length word first),
-    /// recognised from the compiler's encoding boilerplate.
     ReturnDyn {
-        /// Memory pointer to the length word of the returned value.
         ptr: ExprId,
     },
-    /// `REVERT` with `len` bytes of memory at `off`.
     Revert {
-        /// Memory offset of the revert payload.
         off: ExprId,
-        /// Length of the revert payload in bytes.
         len: ExprId,
-        /// Payload words, when `len` is constant and every byte is known.
         data: Option<Vec<ExprId>>,
     },
-    /// `STOP`: halt successfully without return data.
     Stop,
-    /// `INVALID`, or an unknown opcode: exceptional halt.
     Invalid,
-    /// `SELFDESTRUCT` sending the balance to the given address.
     SelfDestruct(ExprId),
-    /// Return from an internal function unit with these values (deepest first).
     InternalReturn(Vec<ExprId>),
-    /// Jump whose target could not be resolved.
     Unresolved(ExprId),
-    /// Oracle mode only: a JUMPI with its condition and target expressions.
     CondJump {
-        /// Condition of the jump.
         cond: ExprId,
-        /// Target expression of the jump.
         target: ExprId,
     },
-    /// A branch to an invalid jump destination, or stack underflow in a real frame.
     Infeasible,
 }
 
-/// A lifted node: the statements and terminator produced by executing one unit node.
 #[derive(Clone, Debug)]
 pub struct LNode {
-    /// Index of this node in `Lifted::nodes`.
     pub id: usize,
-    /// Basic block (index into `Program::blocks`) the node executes.
     pub block: usize,
-    /// Program counter where that block starts.
     pub pc: usize,
-    /// Statements in execution order.
     pub stmts: Vec<Stmt>,
-    /// How control leaves the node.
     pub term: Term,
-    /// Lifted node ids of the predecessors.
     pub preds: Vec<usize>,
-    /// Lifted node ids of the successors, as given by `term`.
     pub succs: Vec<usize>,
-    /// Entry stack expressions (deepest first). Phi slots hold `Var`s.
     pub entry_stack: Vec<ExprId>,
-    /// Stack expressions on leaving the node (deepest first).
     pub exit_stack: Vec<ExprId>,
 }
 
-/// The result of lifting one unit: an expression-level control-flow graph.
 #[derive(Clone, Debug)]
 pub struct Lifted {
-    /// Lifted nodes, indexed by `LNode::id`.
     pub nodes: Vec<LNode>,
-    /// Id of the entry node.
     pub entry: usize,
-    /// Phi copies to perform when taking edge (from, to): `(var, value)`.
     pub edge_assigns: HashMap<(usize, usize), Vec<(ExprId, ExprId)>>,
-    /// Number of entry-stack arguments the unit consumes (`Arg(0..n)`).
     pub n_args: usize,
-    /// Number of node re-runs performed to reach the fixpoint.
     pub reprocess_count: usize,
-    /// Stack slot (from the top at entry) holding the return address, for internal units.
     pub ret_slot: Option<u32>,
-    /// Entry state of every node (indexed by the *unit* node id), for re-lifting sub-regions.
     pub(crate) entry_states: Vec<Option<State>>,
-    /// Map from unit node id to lifted node id.
     pub node_map: HashMap<usize, usize>,
-    /// The unresolved loads that may see memory as the caller left it: loads of bytes the unit
-    /// had not itself written on every path by then.
     pub entry_loads: MemoryReads,
-    /// What the unit may write to memory, the internal functions it calls included.
     pub mem_writes: MemoryWrites,
 }
 
@@ -271,11 +146,8 @@ pub struct Lifted {
 enum MVal {
     Word(ExprId),
     Byte(ExprId),
-    /// Copied region: opcode, source offset expression, external address (EXTCODECOPY).
     Copy(u8, ExprId, Option<ExprId>),
-    /// Output region of call `seq`.
     CallOut(u32),
-    /// Bytes whose value differs between merged predecessors: a read hitting them is unknown.
     Unknown,
 }
 
@@ -283,31 +155,20 @@ enum MVal {
 struct MemWrite {
     base: Option<ExprId>,
     off: u64,
-    /// Length in bytes; `None` when symbolic.
     len: Option<u64>,
     val: MVal,
-    /// Statement that produced this write: (unit node, statement index).
     origin: Option<(usize, usize)>,
-    /// Memory generation *after* the statement that made this write.
     gen: u32,
 }
 
-/// The memory some code may read without the lifter knowing the value: loads that store
-/// forwarding did not resolve, and byte ranges handed to a call, a log, a hash, a copy or a
-/// return whose words are not all known. Byte ranges with constant bounds, and optionally
-/// everything from an address up.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryReads {
     ranges: BTreeSet<(u64, u64)>,
     open_from: Option<u64>,
-    /// Addresses read through a word-scaled index, `base + 32 * i`, where the reader had
-    /// already written the word at `base`: an element of a list the reader itself filled, if
-    /// its indices stay inside the list.
     indexed: BTreeSet<u64>,
 }
 
 impl MemoryReads {
-    /// Every address.
     #[must_use]
     pub fn everything() -> MemoryReads {
         MemoryReads {
@@ -316,8 +177,6 @@ impl MemoryReads {
         }
     }
 
-    /// Settle the indexed reads: dropped when the compiler checks every index against the
-    /// length of the list (Vyper has no unchecked access), else open-ended from their base.
     #[must_use]
     pub fn with_indices(mut self, checked: bool) -> MemoryReads {
         let lowest = std::mem::take(&mut self.indexed).into_iter().next();
@@ -327,7 +186,6 @@ impl MemoryReads {
         self
     }
 
-    /// Add what `other` reads; says whether anything was new.
     pub fn add(&mut self, other: &MemoryReads) -> bool {
         let before = (self.ranges.len(), self.open_from);
         self.ranges.extend(other.ranges.iter().copied());
@@ -338,8 +196,6 @@ impl MemoryReads {
         before != (self.ranges.len(), self.open_from)
     }
 
-    /// A read at an address that is not constant: everything from its constant part up, or
-    /// everything when the rest of the address could wrap below it.
     fn open(&mut self, from: ExprId) {
         let (rest, at) = expr::split_offset(from);
         let wraps = rest.is_some_and(|r| {
@@ -368,7 +224,6 @@ impl MemoryReads {
         }
     }
 
-    /// Add a read of `n` bytes at `off`, unless `written` already holds all of them.
     fn note(&mut self, off: ExprId, n: u64, written: &BTreeSet<(u64, u64)>) {
         match expr::as_const(off).filter(|c| c.fits_u64()) {
             Some(c) => {
@@ -397,7 +252,6 @@ impl MemoryReads {
         }
     }
 
-    /// Add what `other` reads outside the byte ranges in `written`.
     pub fn add_outside(&mut self, other: &MemoryReads, written: &BTreeSet<(u64, u64)>) -> bool {
         let before = (self.ranges.len(), self.open_from);
         for (lo, hi) in &other.ranges {
@@ -411,14 +265,12 @@ impl MemoryReads {
         before != (self.ranges.len(), self.open_from)
     }
 
-    /// Add a read of the `len` bytes at `off`, unless `written` already holds all of them.
     pub fn range_outside(&mut self, off: ExprId, len: ExprId, written: &BTreeSet<(u64, u64)>) {
         let mut own = MemoryReads::default();
         own.range(off, len);
         self.add_outside(&own, written);
     }
 
-    /// Add the unresolved loads inside the expressions `roots`.
     pub fn exprs(&mut self, roots: impl IntoIterator<Item = ExprId>) {
         let mut seen: HashSet<ExprId> = HashSet::new();
         let mut pending: Vec<ExprId> = roots.into_iter().collect();
@@ -440,8 +292,6 @@ impl MemoryReads {
         }
     }
 
-    /// Add what the statement `s` reads. `callee` gives what an internal function reads, by
-    /// entry pc; an unknown one reads everything.
     pub fn stmt<'a>(&mut self, s: &Stmt, callee: &impl Fn(usize) -> Option<&'a MemoryReads>) {
         match s {
             Stmt::Call {
@@ -479,8 +329,6 @@ impl MemoryReads {
         self.exprs(stmt_exprs(s));
     }
 
-    /// Add what the terminator `t` reads. A return to an internal caller reads everything when
-    /// `returns_to_reader` is set: the caller may read whatever this function wrote.
     pub fn term(&mut self, t: &Term, returns_to_reader: bool) {
         match t {
             Term::Return {
@@ -501,7 +349,6 @@ impl MemoryReads {
         self.exprs(term_exprs(t));
     }
 
-    /// May any of the `len` bytes at `addr` be read?
     #[must_use]
     pub fn reads(&self, addr: u64, len: u64) -> bool {
         let end = addr.saturating_add(len);
@@ -511,11 +358,6 @@ impl MemoryReads {
 }
 
 impl Lifted {
-    /// What the unit may read of memory as its caller left it: the loads the lifter saw before
-    /// the unit had written their bytes on every path, plus the byte ranges it hands to calls,
-    /// logs, copies and reverts and what the internal functions it calls read, in each case
-    /// outside what its own statements have certainly written by then. `callee` gives the same
-    /// for an internal function by entry pc; an unknown one reads everything.
     #[must_use]
     pub fn entry_reads<'a>(
         &self,
@@ -620,7 +462,6 @@ impl Lifted {
     }
 }
 
-/// Do the byte ranges in `written` hold every byte of `lo..hi`?
 #[must_use]
 pub fn covers(written: &BTreeSet<(u64, u64)>, lo: u64, hi: u64) -> bool {
     let mut at = lo;
@@ -638,8 +479,6 @@ pub fn covers(written: &BTreeSet<(u64, u64)>, lo: u64, hi: u64) -> bool {
     true
 }
 
-/// The memory some code may write: constant byte ranges, or anything at all once a write's
-/// address or length is not constant or control leaves for code that was not recovered.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryWrites {
     ranges: BTreeSet<(u64, u64)>,
@@ -647,7 +486,6 @@ pub struct MemoryWrites {
 }
 
 impl MemoryWrites {
-    /// The constant byte ranges written, merged where they touch, when every write is to one.
     #[must_use]
     pub fn fixed(&self) -> Option<Vec<(u64, u64)>> {
         if self.anywhere {
@@ -667,43 +505,31 @@ impl MemoryWrites {
 #[derive(Clone, Debug)]
 struct Mem {
     writes: Vec<MemWrite>,
-    /// Untouched bytes read as zero (true at the start of a call frame).
     fresh: bool,
-    /// Memory generation: advanced once per memory-writing statement. An unknown read is
-    /// stamped with the generation of the last write that may alias it, so `mem[x]` denotes the
-    /// memory at a precise program point (the oracle relies on this) while unrelated writes in
-    /// between do not change the expression.
+    // An unknown read carries the generation of the last write that may alias it.
+    // The oracle relies on this.
     gen: u32,
-    /// Generation after the last event that may have changed arbitrary memory (clobber, forgotten writes).
     clobber_gen: u32,
-    /// Constant byte ranges written on every path since the unit was entered.
     written: BTreeSet<(u64, u64)>,
-    /// The unresolved loads that may see memory as it was when the unit was entered: those of
-    /// bytes not yet in `written`. Shared by every state of one lift.
     entry_loads: Rc<RefCell<MemoryReads>>,
-    /// Everything written through this view. Shared by every state of one lift.
     touched: Rc<RefCell<MemoryWrites>>,
 }
 
 const BIG: u64 = 1 << 40;
 
-/// Marks the return data of a block reached from paths whose last calls differ.
 const MERGED_RETURN: u32 = 1 << 31;
 
-/// A stamp for the return data the call at statement `index` of node `node` leaves: stable
-/// across the rounds the node is lifted in, and never zero.
+// Must be stable across the rounds a node is lifted in, and never zero.
 fn call_stamp(node: usize, index: usize) -> u32 {
     ((node as u32) << 10 | (index as u32 & 0x3ff)).wrapping_add(1) & !MERGED_RETURN
 }
 
-/// The most memory writes a state keeps. Past it the oldest are forgotten, and with them the
-/// knowledge that untouched memory is zero.
+// Past this the oldest writes are forgotten.
+// With them goes the knowledge that untouched memory is zero.
 const MAX_TRACKED_WRITES: usize = 256;
 
-/// The memory slot solc keeps its free memory pointer in.
 pub const FREE_POINTER: u64 = 0x40;
 
-/// Normalise an offset into `(base, delta)` with a small delta.
 fn norm_offset(e: ExprId) -> (Option<ExprId>, u64) {
     let (b, d) = expr::split_offset(e);
     if d.fits_u64() && d.low_u64() < BIG {
@@ -713,18 +539,14 @@ fn norm_offset(e: ExprId) -> (Option<ExprId>, u64) {
     }
 }
 
-/// A memory base that may equal any address: it holds a loop variable, argument, call result
-/// or other unknown rather than free-memory-pointer arithmetic.
 fn wild_base(b: ExprId) -> bool {
     expr::contains(b, &|x| {
         !matches!(x, Node::Const(_) | Node::Op(..) | Node::MLoad(..))
     })
 }
 
-/// Could a write through base `wb` (`woff`, `wlen` bytes) alias a read through base `rb`
-/// (`roff`, `rlen` bytes) when the bases differ? Only when one side is an unknown pointer.
-/// Such a pointer is unsigned and memory never wraps, so `p + k` lies at or above `k`; it also
-/// never points into the scratch area below 0x80.
+// Sound only because an unknown pointer is unsigned and memory never wraps.
+// So p + k lies at or above k. It also never points into the scratch area below 0x80.
 fn may_alias(
     wb: Option<ExprId>,
     woff: u64,
@@ -810,26 +632,20 @@ impl Mem {
         }
     }
 
-    /// Record an unresolved read of `n` bytes at `off`.
     fn note_load(&self, off: ExprId, n: u64) {
         self.entry_loads.borrow_mut().note(off, n, &self.written);
     }
 
-    /// Record an unresolved read of the `len` bytes at `off`.
     fn note_range(&self, off: ExprId, len: ExprId) {
         self.entry_loads
             .borrow_mut()
             .range_outside(off, len, &self.written);
     }
 
-    /// Advance the generation (once per memory-writing statement).
     fn tick(&mut self) {
         self.gen += 1;
     }
 
-    /// Version stamp for an unknown read of `n` bytes at `off`: the generation of the latest
-    /// write that may alias it (same base and overlapping, or symbolic length on the same base),
-    /// else the last clobber.
     fn version_for(&self, off: ExprId, n: u64) -> u32 {
         let (base, d) = norm_offset(off);
         let mut v = self.clobber_gen;
@@ -890,7 +706,6 @@ impl Mem {
         });
     }
 
-    /// Origins of the word writes that a read of `n` bytes at `off` would consume.
     fn consumers(&self, off: ExprId, n: u64) -> Vec<(usize, usize)> {
         let (base, d) = norm_offset(off);
         let mut out = Vec::new();
@@ -908,7 +723,6 @@ impl Mem {
         out
     }
 
-    /// Forget everything (after an internal call or an unknown-length write to a symbolic base).
     fn clobber(&mut self) {
         self.touched.borrow_mut().anywhere = true;
         self.writes.clear();
@@ -917,7 +731,6 @@ impl Mem {
         self.clobber_gen = self.gen;
     }
 
-    /// Read `n` bytes (n <= 32) at `off` as a word (right-aligned), if known.
     fn load_bytes(&self, off: ExprId, n: u64, version: u32) -> Option<ExprId> {
         let (base, d) = norm_offset(off);
         let mut pieces: Vec<Option<(ExprId, u64)>> = vec![None; n as usize];
@@ -1087,7 +900,6 @@ impl Mem {
         }
     }
 
-    /// Known words of a region of `len` bytes (len multiple-of-32 or with a tail).
     fn read_region(&self, off: ExprId, len: u64, version: u32) -> Option<(Vec<ExprId>, u8)> {
         if len > 8192 {
             return None;
@@ -1109,8 +921,6 @@ impl Mem {
         Some((words, tail))
     }
 
-    /// Words of a small region, with unknown words left as memory reads, provided at least one
-    /// word is known (so that a return of `(32, len, <copied data>)` keeps its decoded head).
     fn read_region_lossy(&self, off: ExprId, len: u64, version: u32) -> Option<Vec<ExprId>> {
         if len == 0 || !len.is_multiple_of(32) || len > 8 * 32 {
             return None;
@@ -1127,7 +937,6 @@ impl Mem {
         Some(words)
     }
 
-    /// Intersection with another memory (merge point).
     fn intersect(&mut self, other: &Mem) -> bool {
         let fresh_before = self.fresh;
         let gen_before = self.gen;
@@ -1208,24 +1017,15 @@ impl Mem {
     }
 }
 
-/// Symbolic execution state at a program point: stack, memory and storage knowledge.
-///
-/// Opaque to callers; obtained from `Lifter::entry_state_of` to re-lift a sub-region.
 #[derive(Clone, Debug)]
 pub struct State {
     stack: Vec<ExprId>,
-    /// Lazily materialised entry arguments (`Arg(i)`), count.
     args_used: usize,
     mem: Mem,
-    /// Storage cache: writes known on this path (key -> value) in order.
     storage: Vec<(ExprId, ExprId, bool)>,
     version: u32,
-    /// Storage generation: bumped when storage may have changed in an unknown way.
     sgen: u32,
-    /// An external call or create has happened on this path (return data may be non-empty).
     called: bool,
-    /// Which call last set the return data: the return-data size read before a call and the
-    /// one read after it are different values. Zero until a call happens.
     returned: u32,
 }
 
@@ -1256,88 +1056,42 @@ impl State {
     }
 }
 
-/// Lifts the units of a program into `Lifted` graphs.
 #[derive(Debug)]
 pub struct Lifter<'a> {
-    /// The program whose units are lifted.
     pub prog: &'a Program,
-    /// Root frame semantics (main unit): empty stack, zero memory.
     pub root: bool,
-    /// Effect summaries of simple internal functions, by entry block.
     pub summaries: HashMap<usize, CalleeSummary>,
-    /// What each internal function may write to memory, by entry block; one that is absent may
-    /// write anywhere.
     pub footprints: HashMap<usize, MemoryWrites>,
-    /// Oracle mode: keep jump target/condition expressions instead of resolving successors.
     pub oracle: bool,
-    /// Word-copy loops recognised on a first lift, keyed by (unit entry block, unit header node):
-    /// on the next lift of that unit the loop is replaced by one memory copy.
     pub copy_loops: RefCell<HashMap<(usize, usize), CopyLoop>>,
 }
 
-/// A loop that copies memory word by word, summarised as one copy (unit node ids).
 #[derive(Clone, Debug)]
 pub struct CopyLoop {
-    /// Node the pre-header enters (the condition node for a while-loop, the body for a rotated
-    /// do-while loop).
     pub entry: usize,
-    /// Node holding the loop condition.
     pub latch: usize,
-    /// Node holding the copying store; equal to `latch` for a self-looping body.
     pub body: usize,
-    /// Node control reaches once the loop finishes.
     pub exit: usize,
-    /// Which copy-loop idiom this is and where its variables live on the stack.
     pub shape: CopyShape,
 }
 
-/// The recognised form of a word-copy loop.
 #[derive(Clone, Debug)]
 pub enum CopyShape {
-    /// `mem[dst + i] = mem[src + i]` with `i += 32`: the counter is stack slot `slot` (from the
-    /// top of the stack entering `entry`). `rotated`: the body runs first and the test
-    /// `i + 32 < len` follows, so the counter leaves the loop at the last index copied.
-    Index {
-        /// Stack slot of the counter (from the top of the stack entering `entry`).
-        slot: usize,
-        /// The body runs before the test, so the counter leaves the loop at the last
-        /// index copied.
-        rotated: bool,
-    },
-    /// `while (n >= 32) { mem[d] = mem[s]; n -= 32; d += 32; s += 32 }` with the three
-    /// variables in stack slots (from the top) `n`, `d`, `s` entering the condition node.
-    Countdown {
-        /// Stack slot (from the top) of the remaining byte count.
-        n: usize,
-        /// Stack slot (from the top) of the destination pointer.
-        d: usize,
-        /// Stack slot (from the top) of the source pointer.
-        s: usize,
-    },
+    Index { slot: usize, rotated: bool },
+    Countdown { n: usize, d: usize, s: usize },
 }
 
-/// What a *simple* internal function does, in terms of its entry-stack arguments `Arg(i)`:
-/// straight-line (apart from require-style reverts), no calls, no loops.
 #[derive(Clone, Debug, Default)]
 pub struct CalleeSummary {
-    /// Returned values (deepest first), excluding the return address.
     pub returns: Vec<ExprId>,
-    /// 32-byte memory writes in order.
     pub mstores: Vec<(ExprId, ExprId)>,
-    /// Writes storage, logs, calls or creates.
     pub side_effects: bool,
-    /// Every path reverts with this payload (offset, length, decoded words): a panic/revert helper.
     pub reverts: Option<(ExprId, ExprId, Option<Vec<ExprId>>)>,
-    /// Conditions that must hold on the summarised path (the other side of each branch reverts),
-    /// with the revert payload of the failing side and whether it is an INVALID (assert).
     pub guards: Vec<(ExprId, Option<Vec<ExprId>>, bool)>,
-    /// Memory-to-memory copies `(dest, src, len)` in order (from summarised copy loops).
     pub copies: Vec<(ExprId, ExprId, ExprId)>,
-    /// Word offsets written on only some paths (padding stores): unknown after the call.
     pub maybe_mstores: Vec<ExprId>,
 }
 
-/// Record why a unit could not be summarised (with `EVMDEC_DEBUG_SUMMARY`) and yield `None`.
 fn fail_summary(code: u32) -> Option<CalleeSummary> {
     if std::env::var("EVMDEC_DEBUG_SUMMARY").is_ok() {
         eprintln!("[summary] not summarisable (reason {})", code);
@@ -1345,10 +1099,6 @@ fn fail_summary(code: u32) -> Option<CalleeSummary> {
     None
 }
 
-/// Compute a `CalleeSummary` from a lifted internal function, if it is simple enough.
-///
-/// Returns `None` for anything with loops, calls, non-word memory stores or several return
-/// paths (`EVMDEC_DEBUG_SUMMARY` prints the reason code).
 pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
     let mut n = l.entry;
     let mut seen = HashSet::new();
@@ -1541,12 +1291,10 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
     }
 }
 
-/// Memory writes whose only purpose was to feed a hash, log, return, revert or call payload that
-/// was decoded: they are dropped from the output as encoding noise.
 #[derive(Default)]
 struct Hidden {
-    /// Per consuming node (cleared each time that node is re-run, so that a decode that only
-    /// succeeded on an early, single-predecessor run does not hide stores for good).
+    // Cleared each time the node is re-run.
+    // A decode that only succeeded on an early run must not hide stores for good.
     by_node: RefCell<HashMap<usize, HashSet<(usize, usize)>>>,
 }
 
@@ -1569,13 +1317,10 @@ impl Hidden {
 #[derive(Clone)]
 struct Entry {
     state: State,
-    /// Which stack positions (from the bottom of the entry stack) are phis.
     phis: Vec<bool>,
 }
 
 impl<'a> Lifter<'a> {
-    /// Lift `unit` starting from `initial` (entry stack, deepest first, and whether memory is
-    /// fresh); by default an empty stack with fresh memory exactly in root mode.
     pub fn lift(&self, unit: &Unit, initial: Option<(Vec<ExprId>, bool)>) -> Lifted {
         let (init_stack, fresh) = initial.unwrap_or((Vec::new(), self.root));
         let state = State {
@@ -1591,7 +1336,6 @@ impl<'a> Lifter<'a> {
         self.lift_from(unit, state)
     }
 
-    /// Lift, then lift again with every word-copy loop of the unit summarised as one copy.
     pub fn lift_summarizing(&self, unit: &Unit, initial: Option<(Vec<ExprId>, bool)>) -> Lifted {
         let l = self.lift(unit, initial.clone());
         let loops = crate::idiom::copy_loops(&l);
@@ -1618,7 +1362,6 @@ impl<'a> Lifter<'a> {
         self.lift(unit, initial)
     }
 
-    /// Like [`lift_summarizing`](Self::lift_summarizing), starting from an explicit entry state.
     pub fn lift_from_summarizing(&self, unit: &Unit, init: State) -> Lifted {
         let l = self.lift_from(unit, init.clone());
         let loops = crate::idiom::copy_loops(&l);
@@ -1633,12 +1376,11 @@ impl<'a> Lifter<'a> {
         self.lift_from(unit, init)
     }
 
-    /// Entry state of a lifted node, to lift a sub-region starting there separately.
     pub fn entry_state_of(l: &Lifted, unit_node: usize) -> Option<State> {
         l.entry_states.get(unit_node).cloned().flatten()
     }
 
-    /// Lift `unit` starting from the entry state `init`, iterating to a fixpoint.
+    // Terminates because phis only grow and memory knowledge only shrinks.
     pub fn lift_from(&self, unit: &Unit, init: State) -> Lifted {
         let entry_loads = init.mem.entry_loads.clone();
         let touched = init.mem.touched.clone();
@@ -1899,9 +1641,6 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    /// Execute one node from its entry state.
-    /// Replace a recognised copy loop entered with state `entering` by one memory copy: returns
-    /// the statement to show and the state that reaches the loop's exit.
     fn summarize_copy_loop(
         &self,
         unit: &Unit,
@@ -3001,7 +2740,6 @@ fn remap_term(t: &Term, map: &HashMap<usize, usize>) -> Term {
     }
 }
 
-/// Merge an exit state into a successor's entry. Returns true if the entry changed.
 fn merge_into(
     e: &mut Entry,
     exit: &State,
@@ -3099,8 +2837,6 @@ fn merge_into(
     changed
 }
 
-/// All expressions referenced by a node's statements and terminator (for analyses).
-/// Split a loop condition into the bound: `LT(i, len)` / `GT(len, i)` and `ISZERO` of either.
 fn loop_bound(cond: ExprId) -> Option<ExprId> {
     match expr::node(cond) {
         Node::Op(op::LT, v) => Some(v[1]),
@@ -3110,7 +2846,6 @@ fn loop_bound(cond: ExprId) -> Option<ExprId> {
     }
 }
 
-/// A sequential memory model for analyses that replay statements in order.
 #[derive(Clone, Debug)]
 pub struct MemView {
     mem: Mem,
@@ -3124,37 +2859,31 @@ impl Default for MemView {
 }
 
 impl MemView {
-    /// A view whose unwritten bytes are unknown.
     pub fn new() -> MemView {
         MemView {
             mem: Mem::new(false),
             version: 0,
         }
     }
-    /// A view of the memory of a freshly entered call frame: never-written bytes read as zero.
     pub fn new_fresh() -> MemView {
         MemView {
             mem: Mem::new(true),
             version: 0,
         }
     }
-    /// Stop treating unwritten bytes as zero (unknown writes may have happened).
     pub fn unfresh(&mut self) {
         self.mem.fresh = false;
     }
-    /// `len` bytes at `off` (symbolic length when `None`) now hold unknown values.
     pub fn unknown(&mut self, off: ExprId, len: Option<u64>) {
         self.mem.store(off, len, MVal::Unknown);
         self.mem.tick();
         self.version = self.mem.gen;
     }
-    /// Store the 32-byte word `val` at `off`.
     pub fn store(&mut self, off: ExprId, val: ExprId) {
         self.mem.store(off, Some(32), MVal::Word(val));
         self.mem.tick();
         self.version = self.mem.gen;
     }
-    /// Copy `len` bytes of memory from `src` to `dest` (`MCOPY` semantics).
     pub fn copy(&mut self, dest: ExprId, src: ExprId, len: ExprId) {
         let mut st = State {
             stack: Vec::new(),
@@ -3170,7 +2899,6 @@ impl MemView {
         self.mem = st.mem;
         self.version = st.version;
     }
-    /// The word at `off` if every byte of it is known.
     pub fn load(&self, off: ExprId) -> Option<ExprId> {
         let w = self.mem.load_bytes(off, 32, self.version)?;
         if expr::contains(w, &|n| matches!(n, Node::MLoad(..))) {
@@ -3181,7 +2909,6 @@ impl MemView {
     }
 }
 
-/// keccak256 of a region whose words are all constants (the last `tail` bytes right-aligned).
 fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
     let mut bytes = Vec::with_capacity(words.len() * 32);
     for (i, w) in words.iter().enumerate() {
@@ -3196,8 +2923,6 @@ fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
     Some(U256::from_be_bytes(&crate::keccak::keccak256(&bytes)))
 }
 
-/// Copy `len` bytes of memory from `src` to `dest` in `st`: known words are copied as words,
-/// the rest as an opaque copy.
 fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
     let l = expr::as_const(len)
         .and_then(|v| v.as_usize())
@@ -3235,8 +2960,6 @@ fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
 }
 
 impl Lifted {
-    /// The value of the free memory pointer when the unit is entered: a constant when the
-    /// dispatcher has just set it, otherwise the load of its slot.
     #[must_use]
     pub fn entry_free_pointer(&self) -> Option<ExprId> {
         let unit_entry = self
@@ -3253,7 +2976,6 @@ impl Lifted {
     }
 }
 
-/// Every path from `start` ends in a revert or an invalid opcode.
 pub fn always_reverts(l: &Lifted, start: usize) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![start];
@@ -3275,7 +2997,6 @@ pub fn always_reverts(l: &Lifted, start: usize) -> bool {
     true
 }
 
-/// Apply `f` to every expression of a statement.
 pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
     let fv = |v: &Vec<ExprId>| v.iter().map(|e| f(*e)).collect::<Vec<_>>();
     let fo = |v: &Option<Vec<ExprId>>| v.as_ref().map(fv);
@@ -3406,7 +3127,6 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
     }
 }
 
-/// Apply `f` to every expression of a terminator.
 pub fn map_term(t: &Term, f: &dyn Fn(ExprId) -> ExprId) -> Term {
     let fv = |v: &Vec<ExprId>| v.iter().map(|e| f(*e)).collect::<Vec<_>>();
     match t {
@@ -3444,24 +3164,19 @@ pub fn map_term(t: &Term, f: &dyn Fn(ExprId) -> ExprId) -> Term {
     }
 }
 
-/// Every expression referenced by the statements and terminator of `n` (not its stacks).
 pub fn node_exprs(n: &LNode) -> Vec<ExprId> {
     let mut v: Vec<ExprId> = n.stmts.iter().flat_map(stmt_exprs).collect();
     v.extend(term_exprs(&n.term));
     v
 }
 
-/// An expression root of a node, tagged with whether it is a word of an ABI-encoded payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Root {
-    /// The expression.
     pub expr: ExprId,
-    /// A payload word (call input, event data, init code, revert data): pieces of values packed
-    /// at 4-byte offsets, so a mask or shift found at its root is encoding, not a type.
+    // A mask or shift at the root of a payload word is encoding, not a type.
     pub payload: bool,
 }
 
-/// Every expression root of a node, tagged (see [`Root`]).
 pub fn roots(n: &LNode) -> Vec<Root> {
     let payload: HashSet<ExprId> = payload_exprs(n).into_iter().collect();
     node_exprs(n)
@@ -3473,8 +3188,6 @@ pub fn roots(n: &LNode) -> Vec<Root> {
         .collect()
 }
 
-/// The expression roots of a node that are words of an ABI-encoded payload (call input, event
-/// data, init code, revert data).
 pub fn payload_exprs(n: &LNode) -> Vec<ExprId> {
     let mut v = Vec::new();
     for s in &n.stmts {
@@ -3499,7 +3212,6 @@ pub fn payload_exprs(n: &LNode) -> Vec<ExprId> {
     v
 }
 
-/// Every expression referenced by one statement (assignment targets included).
 pub fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
     let mut v = Vec::new();
     match s {
@@ -3589,7 +3301,6 @@ pub fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
     v
 }
 
-/// Every expression referenced by a terminator.
 pub fn term_exprs(t: &Term) -> Vec<ExprId> {
     let mut v = Vec::new();
     match t {
@@ -3615,9 +3326,6 @@ pub fn term_exprs(t: &Term) -> Vec<ExprId> {
     v
 }
 
-/// Bits a computed jump target may have set, from the shape of its expression (`x & 0x3ff0`,
-/// `y << 6`, `byte(..) * 64`): the set of JUMPDESTs compatible with that pattern is the set of
-/// possible targets. `None` when the expression gives no usable constraint.
 pub fn jump_target_bits(e: ExprId) -> Option<U256> {
     match expr::node(e) {
         Node::Const(c) => Some(c),
@@ -3683,7 +3391,6 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
     }
 }
 
-/// Leaves of an expression that are not constants (unknown inputs).
 pub fn unknown_leaves(e: ExprId) -> Vec<ExprId> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -3701,10 +3408,6 @@ pub fn unknown_leaves(e: ExprId) -> Vec<ExprId> {
     out
 }
 
-/// Candidate code addresses for a computed jump target: when the expression has a single
-/// unknown input, substitute a range of small values, powers of two and masks for it and keep the
-/// results that are jump destinations (exact for shift-selected targets and calldata-byte
-/// dispatchers); otherwise, or additionally, every destination compatible with the bit pattern.
 pub fn jump_candidates(e: ExprId, jumpdests: &HashSet<usize>, code_len: usize) -> Vec<usize> {
     let mut out: HashSet<usize> = HashSet::new();
     let leaves = unknown_leaves(e);
@@ -3758,7 +3461,6 @@ pub fn jump_candidates(e: ExprId, jumpdests: &HashSet<usize>, code_len: usize) -
     v
 }
 
-/// Reachable set from the entry.
 pub fn reachable(l: &Lifted) -> HashSet<usize> {
     let mut seen = HashSet::new();
     let mut stack = vec![l.entry];

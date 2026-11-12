@@ -1,28 +1,15 @@
-//! Names for storage slots that standards and widely used libraries fix in advance.
-//!
-//! A proxy keeps its implementation at `keccak256("eip1967.proxy.implementation") - 1`, a
-//! diamond its routing table at `keccak256("diamond.standard.diamond.storage")`, an
-//! OpenZeppelin 5 contract its state under ERC-7201 namespaces. Such a slot is a 32-byte
-//! constant in the bytecode; naming it says what the variable is without any guess about the
-//! contract. Every slot here is derived from its label at first use, so no hash is written down.
-
 use crate::keccak::keccak256;
 use crate::u256::U256;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// How a label becomes a slot.
 #[derive(Clone, Copy)]
 enum Scheme {
-    /// `keccak256(label) - 1` (EIP-1967).
     HashMinusOne,
-    /// `keccak256(label)` (diamond storage, ZeppelinOS).
     Hash,
-    /// `keccak256(uint256(keccak256(label)) - 1) & ~0xff` (ERC-7201), plus a member offset.
     Erc7201(u64),
 }
 
-/// `(label, scheme, name)`.
 const KNOWN: &[(&str, Scheme, &str)] = &[
     (
         "eip1967.proxy.implementation",
@@ -127,7 +114,6 @@ const KNOWN: &[(&str, Scheme, &str)] = &[
     ),
 ];
 
-/// The slot a label and scheme name.
 fn slot_of(label: &str, scheme: Scheme) -> U256 {
     let h = U256::from_be_bytes(&keccak256(label.as_bytes()));
     match scheme {
@@ -141,7 +127,6 @@ fn slot_of(label: &str, scheme: Scheme) -> U256 {
     }
 }
 
-/// The name of a well-known storage slot, if `slot` is one.
 pub fn well_known(slot: U256) -> Option<&'static str> {
     static TABLE: OnceLock<HashMap<U256, &'static str>> = OnceLock::new();
     TABLE

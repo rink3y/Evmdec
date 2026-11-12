@@ -1,5 +1,3 @@
-//! Security analysis over the lifted IR: a rule engine producing findings with evidence.
-
 use crate::compiler;
 use crate::cross::World as CrossWorld;
 use crate::decompile::{self, Contract, Function};
@@ -18,66 +16,42 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
-/// Impact of a finding, worst first; the derived ordering is what the report sorts by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
-    /// Direct loss of funds or full takeover by an unprivileged caller.
     Critical,
-    /// Serious damage that needs some precondition or a privileged but unexpected actor.
     High,
-    /// Exploitable under narrower conditions, or a weakness that amplifies another bug.
     Medium,
-    /// Minor robustness issue with little direct impact.
     Low,
-    /// Not a defect: a fact about the contract worth knowing (compiler, coverage, kind).
     Info,
 }
 
-/// How sure a rule is that its finding is real, given the lifted IR it had to work from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Confidence {
-    /// The pattern is unambiguous in the bytecode.
     High,
-    /// Plausible, but the rule relies on a heuristic (names, shapes) that can misfire.
     Medium,
-    /// Speculative: the rule saw something suspicious but could not confirm the data flow.
     Low,
 }
 
-/// One issue reported by a rule, with the evidence that triggered it.
 #[derive(Clone, Debug, Serialize)]
 pub struct Finding {
-    /// Stable, kebab-case rule identifier such as `reentrancy` or `arbitrary-delegatecall`.
     pub id: String,
-    /// One-line human-readable headline.
     pub title: String,
-    /// Impact if the finding is real.
     pub severity: Severity,
-    /// How sure the rule is.
     pub confidence: Confidence,
-    /// Display name of the function the finding is in; absent for contract-wide findings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<String>,
-    /// Program counter of the offending instruction, when the finding points at one site.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pc: Option<usize>,
-    /// What was found and why it matters, in prose.
     pub description: String,
-    /// Decompiled statements (Solidity-like) that triggered the rule.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
-    /// What to do about it.
     pub recommendation: String,
-    /// Number of code sites folded into this finding (same rule, same function).
     #[serde(skip_serializing_if = "is_one")]
     pub sites: usize,
-    /// The confirmation pass reached this finding's sink from a fresh state with an arbitrary
-    /// caller: the vulnerability is not merely a pattern but reachable.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub confirmed: bool,
-    /// The calldata (0x-prefixed) that reached the sink, when `confirmed`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub witness: Option<String>,
 }
@@ -86,128 +60,76 @@ fn is_one(n: &usize) -> bool {
     *n == 1
 }
 
-/// The result of [`analyze`]: findings plus the contract-wide facts they were judged against.
 #[derive(Clone, Debug, Serialize, Default)]
 pub struct Report {
-    /// Standards the contract appears to implement, from its selectors ("ERC20 token",
-    /// "Upgradeable (UUPS/transparent admin)", ...). Empty when nothing matched.
     pub contract_kind: Vec<String>,
-    /// Deduplicated and merged findings, sorted by severity then function name.
     pub findings: Vec<Finding>,
-    /// State-changing functions gated by a msg.sender check somewhere on their path.
     pub privileged_functions: Vec<String>,
-    /// External functions that change state (storage, calls, creates, selfdestruct) and have no
-    /// msg.sender check anywhere on their path.
     pub unauthenticated_state_changers: Vec<String>,
-    /// Every call out of the contract as `function: statement`, sorted and deduplicated.
     pub external_calls: Vec<String>,
-    /// Number of findings per severity, keyed by the lowercase severity name.
     pub summary: BTreeMap<String, usize>,
-    /// Per external function: what it does with its parameters and what gates it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub summaries: Vec<FnSummary>,
-    /// 0..100, derived from the findings: the worst one (weighted by confidence) sets the level
-    /// and the others add a little, so one confirmed critical outweighs many notes.
     pub risk_score: u32,
 }
 
-/// One use a function makes of a parameter word.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ParamUse {
-    /// Index of the ABI word in the call data (`0` is the first parameter).
     pub word: u32,
-    /// Printed statement.
     pub line: String,
 }
 
-/// A parameter word written whole to a fixed storage slot.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ParamStore {
-    /// Index of the ABI word in the call data.
     pub word: u32,
-    /// The slot, as 32 bytes of hex; an offset from `base` when that is set.
     pub slot: String,
-    /// The parameter word the slot is counted from, for code that is handed its storage
-    /// position by its caller (a library working on a storage reference).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<u32>,
-    /// Some access check of the contract compares `msg.sender` with this slot.
     pub gates: bool,
-    /// Printed statement.
     pub line: String,
 }
 
-/// A storage slot counted from a position the caller passes in.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RelativeSlot {
-    /// The parameter word holding the position.
     pub base: u32,
-    /// Slots past that position, as 32 bytes of hex.
     pub offset: String,
 }
 
-/// A parameter word passed on as an argument of a call to another contract.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ParamForward {
-    /// Index of the ABI word in this function's call data.
     pub word: u32,
-    /// Index of the ABI word it becomes in the call's payload.
     pub arg: u32,
-    /// The callee: an address, or `slot 0x..` for an address read from a fixed slot.
     pub target: String,
-    /// Selector the call sends.
     pub selector: String,
-    /// Printed statement.
     pub line: String,
 }
 
-/// What one external function does with each word of its call data and what a caller needs to
-/// reach it, stated so that a call from another contract can be held against it.
 #[derive(Clone, Debug, Serialize, Default, PartialEq, Eq)]
 pub struct FnSummary {
-    /// Display name of the function.
     pub function: String,
-    /// The 4-byte selector as `0x`-prefixed hex.
     pub selector: String,
-    /// A `msg.sender` check guards the function.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub gated: bool,
-    /// Fixed slots whose address `msg.sender` is compared with, as 32 bytes of hex.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gate_slots: Vec<String>,
-    /// Root slots of the mappings whose entry under `msg.sender` is tested as a flag.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gate_roles: Vec<String>,
-    /// Slots `msg.sender` is compared with that are counted from a position the caller passes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub gate_relative: Vec<RelativeSlot>,
-    /// The function returns the address of a contract it creates: where that contract's code
-    /// is, as an address (a clone of the code there) or a creator's address, `#` and the offset
-    /// of the creation code inside the creator's own code.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creates: Option<String>,
-    /// The function recovers a signer, so an account it names may have signed for the action.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub signed: bool,
-    /// Parameter words tied to the caller: compared with `msg.sender`, or keying an entry that
-    /// is compared with it or read under it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bound: Vec<u32>,
-    /// Parameter words naming an account whose stored entry the function lowers or clears, or
-    /// whose tokens it moves.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub lowers: Vec<ParamUse>,
-    /// Parameter words naming an account the function sends ether or tokens to.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pays: Vec<ParamUse>,
-    /// Parameter words written whole to a fixed slot.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stores: Vec<ParamStore>,
-    /// Parameter words passed on to another contract.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<ParamForward>,
-    /// The word the function returns when it only computes from its call data: no storage, no
-    /// calls, no logs. A handle into the expression arena of the analysis that made it.
     #[serde(skip)]
     pub(crate) returns: Option<ExprId>,
 }
@@ -248,7 +170,6 @@ fn event_exprs(e: &Event) -> Vec<ExprId> {
     v
 }
 
-/// Does `e` contain the exact expression `target`?
 fn contains_expr(e: ExprId, target: ExprId) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
@@ -270,18 +191,12 @@ fn mentions_returndata(e: ExprId, seq: u32) -> bool {
 
 const SEL_TRANSFER: u32 = 0xa9059cbb;
 const SEL_TRANSFER_FROM: u32 = 0x23b872dd;
-/// `sync()` of a Uniswap V2 pair.
 const SEL_SYNC: u32 = 0xfff6cae9;
-/// `skim(address)` of a Uniswap V2 pair.
 const SEL_SKIM: u32 = 0xbc25cf77;
-/// `getReserves()` of a Uniswap V2 pair.
 const SEL_GET_RESERVES: u32 = 0x0902f1ac;
-/// `token0()` of a Uniswap V2 pair.
 const SEL_TOKEN0: u32 = 0x0dfe1681;
-/// `token1()` of a Uniswap V2 pair.
 const SEL_TOKEN1: u32 = 0xd21220a7;
-/// Selectors only a pool-type contract answers, a secondary sign that a stored address is one:
-/// Uniswap V2 pairs, V3 pools, the V4 manager, Curve pools and Balancer vaults.
+// Secondary evidence only. A rule must still fire without this list.
 const POOL_SELECTORS: &[u32] = &[
     SEL_SYNC,
     SEL_SKIM,
@@ -313,226 +228,118 @@ const SEL_APPROVE: u32 = 0x095ea7b3;
 const SEL_BALANCE_OF: u32 = 0x70a08231;
 const SEL_LATEST_ROUND_DATA: u32 = 0xfeaf968c;
 const SEL_LATEST_ANSWER: u32 = 0x50d25bcd;
-/// Token transfers that invoke a receiver hook on the destination (ERC721 / ERC1155 / ERC777).
 const CALLBACK_SELECTORS: &[u32] = &[
     0x42842e0e, 0xb88d4fde, 0xf242432a, 0x2eb2c2d6, 0x150b7a02, 0xf23a6e61, 0xbc197c81, 0x0023de29,
     0x9bd9bbc6, 0x62ad1b83,
 ];
-/// secp256k1 half order: `s` values above it are the malleable twin of a valid signature.
 const SECP_HALF_ORDER: &str = "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0";
 
-/// Events inlined helpers may add to one function's event stream.
+// Helpers that call helpers multiply. Ordinary functions stay under 9,000 events.
 const MAX_INLINED_EVENTS: usize = 12_000;
 
-/// Flattened event stream of a function including inlined internal callees (depth-limited),
-/// used by order-sensitive rules.
 #[derive(Clone)]
 struct Event {
-    /// Node of the function being analysed that this event belongs to (the call-site node for
-    /// events inlined from internal callees), so it indexes `l.nodes` and works with `reaches`.
     node: usize,
-    /// Program counter of the node that holds the statement (inside the callee when inlined).
     pc: usize,
-    /// Entry pc of the internal function whose body holds the statement, when inlined.
     callee: Option<usize>,
-    /// Which inlined body the event belongs to: 0 for the function itself, otherwise a number
-    /// unique to one inlining of one helper, so two events with the same `inst` share a graph.
     inst: usize,
-    /// Node id inside that body (`inner` indexes the helper's own `Lifted` when `inst != 0`).
     inner: usize,
-    /// The inlining path from the function down to the event: `(inst, callee entry pc, node in
-    /// that body)` per level, the last entry being the event's own body and node.
     path: Vec<(usize, Option<usize>, usize)>,
     stmt: Option<Stmt>,
     term: Option<Term>,
-    /// Inside a loop body.
     in_loop: bool,
 }
 
 struct Ctx<'a> {
     c: &'a Contract,
-    /// The contracts analysed with this one.
     world: &'a World<'a>,
-    /// What a call to a function of another contract returns, when that function only computes
-    /// from its arguments: by call sequence number, in the caller's terms.
     computed_returns: RefCell<HashMap<u32, ExprId>>,
-    /// Addresses of contracts created so far in the function being replayed, as the
-    /// expression that holds each (a creation's result, or the word returned by a call to a
-    /// function that creates), with the world key of the created code.
     made: RefCell<HashMap<ExprId, String>>,
-    /// Code the function being replayed copied to memory from its own code: destination,
-    /// offset and length.
     code_copies: RefCell<Vec<(ExprId, usize, usize)>>,
     internals: HashMap<usize, &'a Function>,
     version: Option<(u32, u32, u32)>,
     vyper: bool,
-    /// Memory an internal function (transitively) writes: constant offsets with lengths, or
-    /// `None` when it writes through a pointer.
     callee_writes: RefCell<HashMap<usize, Option<MemWrites>>>,
-    /// Counter handing out `Event::inst` numbers.
     inst_seq: std::cell::Cell<usize>,
-    /// Events one function's stream may still take from inlined helpers. Helpers that call
-    /// helpers multiply; once this is spent the remaining internal calls stay calls.
     inline_left: std::cell::Cell<usize>,
-    /// Whether an internal function (transitively) divides, by entry pc.
     divides: RefCell<HashMap<usize, bool>>,
-    /// Root slots of caller-keyed mappings that act as roles: every function writing them is
-    /// itself gated (by an owner comparison or by a role), or nothing writes them at runtime.
-    /// A test of `mapping[msg.sender]` is an access check only for these; for the others it is
-    /// a balance or stake check anyone can satisfy.
     roles: HashSet<U256>,
-    /// Constant slots some runtime code writes whole.
     slot_writes: HashSet<U256>,
-    /// Packed fields some runtime code writes: (slot, byte offset, bits).
     field_writes: HashSet<(U256, u32, u32)>,
-    /// The bytecode uses transient storage (`TLOAD`/`TSTORE`).
     transient_storage: bool,
-    /// An ordinary external function copies calldata to memory (calldata arrays or tuples
-    /// passed on, re-encoded).
     calldata_copies: bool,
-    /// Constant slots some external function without an access check increments
-    /// (`length + 1`, helpers included), with the names of those functions: arrays anyone can
-    /// add an entry to.
     unguarded_extenders: HashMap<U256, Vec<String>>,
 }
 
-/// Constant-offset memory writes of a unit: `(offset, length)` with `None` for an unknown length.
 type MemWrites = Vec<(ExprId, Option<u64>)>;
 
-/// What one entry point does, kept for the cross-function passes: the access-control policy
-/// the contract follows (and the functions that deviate from it) and multi-step attack chains.
 struct FnFacts {
-    /// Display name (`display_name`).
     name: String,
-    /// The 4-byte selector as `0x`-prefixed hex, for external functions.
     selector: Option<String>,
-    /// Entry pc, used as the finding's location.
     pc: usize,
-    /// An externally callable function (not fallback/receive/constructor).
     external: bool,
-    /// Writes storage, calls out, creates or self-destructs.
     state_changing: bool,
-    /// A msg.sender comparison guards it somewhere on its path (helpers included).
     caller_checked: bool,
-    /// Constant storage slots its msg.sender checks compare against, with their printed names.
     auth_slots: Vec<(ExprId, String)>,
-    /// Constant (non-mapping) storage slots it writes: slot, how the value is chosen, printed
-    /// statement.
     const_writes: Vec<(ExprId, WriteSource, String)>,
-    /// Calls that carry ether: target, amount, printed statement.
     ether_out: Vec<(ExprId, ExprId, String)>,
-    /// `selfdestruct` beneficiaries with the printed statement.
     selfdestructs: Vec<(ExprId, String)>,
-    /// `delegatecall` targets with the printed statement.
     delegatecalls: Vec<(ExprId, String)>,
-    /// Some guard compares against the block number or timestamp.
     time_gated: bool,
-    /// Some guard tests a constant slot for "not yet set" (`require(owner == 0)`): an
-    /// initializer, reachable only while the contract is uninitialised.
     init_guarded: bool,
-    /// Calls whose target is an address held in a constant storage slot: the slot, the
-    /// payload selector when known, whether the call is static, and whether the payload
-    /// carries `msg.sender`.
     stored_callees: Vec<StoredCall>,
-    /// Writes that subtract from a balance entry: the ledger root, the entry key, the printed
-    /// statement.
     debits: Vec<Debit>,
-    /// Mapping keys whose allowance for `msg.sender` the function reads (`allowance[k][sender]`).
     allowance_of: Vec<ExprId>,
-    /// `sync()`/`skim()` calls on a pair.
     syncs: Vec<PairSync>,
-    /// Constant slots written with an address another contract returned: a factory-made pool,
-    /// a router's pair, a manager, whatever the design calls it.
     factory_slots: Vec<ExprId>,
-    /// Constant slots whose address the function's guards compare with a transfer party (a
-    /// calldata word, the caller, an argument): the token singles this address out, as every
-    /// pool-aware token does for fees, limits or cooldowns.
     compared_slots: Vec<ExprId>,
-    /// `(ledger root, slot)`: ledger entries read under an address held in a constant slot,
-    /// the way a token prices or limits against its pool's balance.
     ledger_reads: Vec<(U256, ExprId)>,
-    /// The function (or a helper it calls) authorises per account: it reads an entry keyed by
-    /// `msg.sender` under another account (`allowance[owner][sender]`, operator approvals) or
-    /// compares `msg.sender` with a mapping value (`approved[tokenId]`, `owners[id]`).
     account_authorised: bool,
-    /// The function recovers a signer (`ecrecover`): accounts may be authorised by signature.
     signature_authorised: bool,
-    /// Payout limits of the shape `deposits - liabilities` that gate value leaving this function.
     avail_bounds: Vec<AvailBound>,
-    /// Every limit of that shape the function states, whether or not it caps a payout: in any
-    /// comparison, or as a returned value (a view reporting what is available). Used only as the
-    /// reference another function's payout limit is held against.
     ref_bounds: Vec<AvailBound>,
-    /// The function lets value leave: an ether call, a token transfer, or a ledger debit.
     moves_value: bool,
-    /// Calls and approvals that reach a contract fetched with this one.
     linked_calls: Vec<LinkedCall>,
-    /// Writes to entries of single-level mappings, in event order.
     ledger_writes: Vec<LedgerWrite>,
-    /// Writes to constant slots, as changes of the slot's own value.
     total_changes: Vec<(ExprId, Change)>,
-    /// Increases of one ledger entry built on a value read before another entry's decrease.
     stale_moves: Vec<StaleMove>,
-    /// Chains of writes that leave one ledger higher than they found it.
     surplus_moves: Vec<SurplusMove>,
 }
 
-/// A call to an address held in a constant storage slot.
 #[derive(Clone, Debug)]
 struct StoredCall {
-    /// The constant slot key.
     slot: ExprId,
-    /// Selector of the payload, when it is known.
     selector: Option<u32>,
-    /// `STATICCALL`.
     is_static: bool,
-    /// The payload mentions `msg.sender`.
     passes_sender: bool,
-    /// Printed statement.
     line: String,
 }
 
-/// A write that lowers a balance entry.
 #[derive(Clone, Debug)]
 struct Debit {
-    /// Root slot of the ledger mapping.
     root: U256,
-    /// The entry key (the account).
     key: ExprId,
-    /// The account as the printer shows it.
     account_text: String,
-    /// Printed statement.
     line: String,
 }
 
-/// A call this function makes to a contract fetched with this one, or an approval naming one.
 #[derive(Clone, Debug)]
 struct LinkedCall {
-    /// Address of the linked contract, lower case.
     address: String,
-    /// Selector of the payload, when it is known.
     selector: Option<u32>,
-    /// The call carries ether.
     sends_value: bool,
-    /// The linked contract is the spender of an `approve` sent to a token, not the callee.
     approval: bool,
-    /// Printed statement.
     line: String,
 }
 
-/// The contracts analysed together: the one asked about and every contract fetched with it,
-/// each with its own report once that has been computed. A report is computed at most once,
-/// when a call edge first asks for it.
 struct World<'a> {
-    /// Every contract with a known address, by lower-case address.
     members: HashMap<String, &'a Contract>,
-    /// Reports computed so far. `None` marks a contract whose analysis is under way, so a
-    /// cycle of calls between contracts ends instead of recursing.
+    // None marks a contract whose analysis is under way.
+    // It stops two contracts that call each other from recursing forever.
     reports: RefCell<HashMap<String, Option<Rc<Report>>>>,
 }
 
 impl<'a> World<'a> {
-    /// The world of `root`: itself and the contracts fetched with it, at any depth.
     fn of(root: &'a Contract) -> World<'a> {
         let mut members = HashMap::new();
         let mut work = vec![root];
@@ -554,19 +361,15 @@ impl<'a> World<'a> {
         }
     }
 
-    /// Does the world hold a contract other than `c`?
     fn has_other(&self, c: &Contract) -> bool {
         self.members.values().any(|m| !std::ptr::eq(*m, c))
     }
 
-    /// The contract at `address`; for a clone's key, the contract whose code the clone runs.
     fn contract(&self, address: &str) -> Option<&'a Contract> {
         let address = address.strip_suffix(CLONE).unwrap_or(address);
         self.members.get(&address.to_ascii_lowercase()).copied()
     }
 
-    /// The report of the contract at `address`, computed on first use. `None` for an address
-    /// outside the world and for a contract whose analysis is already under way.
     fn report(&self, address: &str) -> Option<Rc<Report>> {
         let key = address
             .strip_suffix(CLONE)
@@ -585,17 +388,12 @@ impl<'a> World<'a> {
     }
 }
 
-/// The key under which the world holds the contract `creator` deploys from the creation code
-/// at `offset` of its own code.
 fn created_key(creator: &str, offset: usize) -> String {
     format!("{}#{offset:#x}", creator.to_ascii_lowercase())
 }
 
-/// Suffix of the world key for a minimal proxy created during a call: the address it forwards
-/// to, then this.
 const CLONE: &str = "#clone";
 
-/// A world key in words: a deployed contract by its address, a created one by its creator.
 fn describe(key: &str) -> String {
     if let Some(target) = key.strip_suffix(CLONE) {
         return format!("a clone of the contract at {target}, created in the same call");
@@ -607,9 +405,6 @@ fn describe(key: &str) -> String {
     }
 }
 
-/// Where the code of the contract created from memory at `off` is: the world key of the
-/// creation code the function copied there from its own code, or the address a minimal proxy
-/// forwards to.
 fn created_code(ctx: &Ctx, off: ExprId, len: ExprId, init: Option<&[ExprId]>) -> Option<String> {
     if let Some(target) = init.and_then(|words| decompile::clone_target(words, len)) {
         return Some(format!("{target}{CLONE}"));
@@ -632,8 +427,6 @@ fn created_code(ctx: &Ctx, off: ExprId, len: ExprId, init: Option<&[ExprId]>) ->
     ))
 }
 
-/// The code behind the address the call `st` returns, when the function it reaches returns the
-/// address of a contract it creates.
 fn made_by_call(ctx: &Ctx, st: &Stmt) -> Option<String> {
     let Stmt::Call {
         addr,
@@ -662,9 +455,6 @@ fn made_by_call(ctx: &Ctx, st: &Stmt) -> Option<String> {
         .clone()
 }
 
-/// The address `e` names when it is another contract of the world: a constant, the address
-/// read from a constant slot whose content was fetched, or the address of a contract created
-/// earlier in the function (by it, or by a function it called).
 fn linked_address(ctx: &Ctx, e: ExprId) -> Option<String> {
     let e = unmask(e);
     if let Some(key) = ctx.made.borrow().get(&e) {
@@ -685,64 +475,43 @@ fn linked_address(ctx: &Ctx, e: ExprId) -> Option<String> {
     linked_contract(ctx, &address).map(|_| address.to_ascii_lowercase())
 }
 
-/// The other contract of the world that lives at `address`.
 fn linked_contract<'a>(ctx: &Ctx<'a>, address: &str) -> Option<&'a Contract> {
     ctx.world
         .contract(address)
         .filter(|lc| !std::ptr::eq(*lc, ctx.c))
 }
 
-/// How a write changes the value its slot held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Change {
-    /// The old value plus an amount.
     Up(ExprId),
-    /// The old value minus an amount.
     Down(ExprId),
-    /// A value that is not the old one moved by an amount.
     Set,
 }
 
-/// A write to one entry of a single-level mapping.
 #[derive(Clone, Debug)]
 struct LedgerWrite {
-    /// Root slot of the mapping.
     root: U256,
-    /// The entry's key, without its address mask.
     account: ExprId,
-    /// How the entry changes.
     change: Change,
-    /// Storage generation before the write.
     gen: u32,
-    /// Generation at which the entry's own value was read, when the write builds on it.
     read_gen: Option<u32>,
-    /// The inlined body holding the write; generations compare only within one body.
     inst: usize,
-    /// Position in the function's event order.
     at: usize,
-    /// Inside a loop body.
     in_loop: bool,
-    /// Printed statement.
     line: String,
 }
 
-/// Two writes to one ledger where the later one builds on a value read before the earlier.
 #[derive(Clone, Debug)]
 struct StaleMove {
-    /// Printed statements, in execution order.
     lines: [String; 2],
 }
 
-/// A path on which one ledger's entries rise by more than they fall while no total changes.
 #[derive(Clone, Debug)]
 struct SurplusMove {
-    /// The amount left over, as printed terms.
     surplus: Vec<String>,
-    /// Printed statements of the writes.
     lines: Vec<String>,
 }
 
-/// `(change, generation of the value read)` for a store of `val` to `key`.
 fn change_of(val: ExprId, key: ExprId) -> (Change, Option<u32>) {
     let own = |e: ExprId| match expr::node(e) {
         Node::SLoad(k, false, g) if k == key => Some(g),
@@ -762,7 +531,6 @@ fn change_of(val: ExprId, key: ExprId) -> (Change, Option<u32>) {
     }
 }
 
-/// Add `sign * e` to `terms`, splitting sums and differences; anything else is one term.
 fn add_terms(e: ExprId, sign: i64, terms: &mut BTreeMap<ExprId, i64>, depth: u32) {
     match expr::node(e) {
         Node::Op(op::ADD, v) if depth < 16 => {
@@ -777,7 +545,6 @@ fn add_terms(e: ExprId, sign: i64, terms: &mut BTreeMap<ExprId, i64>, depth: u32
     }
 }
 
-/// The ledger entries and the constant-slot totals a function's events write.
 fn ledger_writes(
     events: &[Event],
     layout: emit::MappingLayout,
@@ -817,10 +584,6 @@ fn ledger_writes(
     (writes, totals)
 }
 
-/// Pairs of writes to two entries of one ledger in one body, a decrease then an increase,
-/// where the increase builds on a value read before the decrease was stored and nothing in the
-/// function compares the two keys. When both keys name the same entry the later write replaces
-/// the earlier with a value that never saw it.
 fn stale_moves(ctx: &Ctx, l: &Lifted, events: &[Event], writes: &[LedgerWrite]) -> Vec<StaleMove> {
     let conds = guard_conds(events);
     let told_apart = |a: ExprId, b: ExprId| {
@@ -856,8 +619,6 @@ fn stale_moves(ctx: &Ctx, l: &Lifted, events: &[Event], writes: &[LedgerWrite]) 
     out
 }
 
-/// Ledgers whose entries, along one chain of writes, rise by more than they fall while the
-/// function raises no total: the difference appears in the ledger from nowhere.
 fn surplus_moves(
     ctx: &Ctx,
     l: &Lifted,
@@ -903,52 +664,32 @@ fn surplus_moves(
     out
 }
 
-/// One field of pooled storage: the slot shape of a mapping entry or array element and the bit
-/// range a read extracts from it, so the two halves of a packed slot are different fields.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Field {
-    /// Slot shape (root and step kinds), independent of the concrete key.
     shape: ssa::Shape,
-    /// Lowest bit of the field within the slot.
     lo: u32,
-    /// Width in bits.
     width: u32,
 }
 
-/// A payout limit of the form `credits - liabilities`: one side of an ordering comparison that
-/// adds some pooled fields and subtracts others. Two functions that limit value over the same
-/// pooled record must subtract the same liability fields.
 #[derive(Clone, Debug)]
 struct AvailBound {
-    /// Fields summed as available credit.
     added: BTreeSet<Field>,
-    /// Fields subtracted as owed.
     subbed: BTreeSet<Field>,
-    /// A readable name for each field, for the finding's evidence.
     names: HashMap<Field, String>,
-    /// The printed limit expression.
     line: String,
 }
 
-/// A `sync()`/`skim()` call on a pair.
 #[derive(Clone, Debug)]
 struct PairSync {
-    /// The pair as the printer shows it.
     target: String,
-    /// A storage write or a state-changing call on a path that reaches this call precedes it.
     after_mutation: bool,
-    /// Printed statement.
     line: String,
 }
 
-/// Where the value stored into a constant slot comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WriteSource {
-    /// A calldata word stored as is (an address mask on it is allowed): the caller picks it.
     Calldata,
-    /// `msg.sender` stored as is.
     Caller,
-    /// Anything else: a computed value, a constant, another slot.
     Other,
 }
 
@@ -975,7 +716,6 @@ fn write_source(val: ExprId) -> WriteSource {
     }
 }
 
-/// The `require` and branch conditions along a function's events, helpers included.
 fn guard_conds(events: &[Event]) -> Vec<ExprId> {
     let mut out = Vec::new();
     for e in events {
@@ -989,14 +729,12 @@ fn guard_conds(events: &[Event]) -> Vec<ExprId> {
     out
 }
 
-/// A condition on the block number or timestamp (a deadline, a lock-up, a vesting schedule).
 fn is_time_cond(cond: ExprId) -> bool {
     mentions(cond, &|n| {
         matches!(n, Node::Env(op::TIMESTAMP | op::NUMBER, _))
     })
 }
 
-/// Does the expression read the (persistent) storage slot `slot`?
 fn reads_slot(e: ExprId, slot: ExprId) -> bool {
     mentions(e, &|n| matches!(n, Node::SLoad(k, false, _) if *k == slot))
 }
@@ -1374,8 +1112,6 @@ fn collect_facts(
     facts
 }
 
-/// `e` without one width cast around it: a low mask, or the shift pair `(x << k) >> k` that
-/// older compilers emit for the same thing, also written `x * 2^k >> k` and `x * 2^k / 2^k`.
 fn uncast(e: ExprId) -> Option<ExprId> {
     let Node::Op(o, v) = expr::node(e) else {
         return None;
@@ -1409,7 +1145,6 @@ fn uncast(e: ExprId) -> Option<ExprId> {
     }
 }
 
-/// The call-data word `e` is, once casts are taken off: `CALLDATALOAD(4 + 32 * i)` gives `i`.
 fn param_word(e: ExprId) -> Option<u32> {
     if let Some(inner) = uncast(e) {
         return param_word(inner);
@@ -1422,9 +1157,6 @@ fn param_word(e: ExprId) -> Option<u32> {
     }
 }
 
-/// Fixed memory words that hold one call-data word for the whole function: every store to the
-/// word writes the same parameter, and no copy or call output lands on it. Code that keeps its
-/// parameters in memory at fixed addresses reads them back from there after each call.
 fn calldata_locals(events: &[Event]) -> HashMap<u64, u32> {
     let mut held: HashMap<u64, Option<u32>> = HashMap::new();
     let mut open_from = u64::MAX;
@@ -1492,7 +1224,6 @@ fn calldata_locals(events: &[Event]) -> HashMap<u64, u32> {
         .collect()
 }
 
-/// Is `e` the caller, once casts are taken off?
 fn is_caller(e: ExprId) -> bool {
     match uncast(e) {
         Some(inner) => is_caller(inner),
@@ -1500,7 +1231,6 @@ fn is_caller(e: ExprId) -> bool {
     }
 }
 
-/// Visit every node of `e` once, up to a fixed number of nodes.
 fn walk(e: ExprId, seen: &mut HashSet<ExprId>, visit: &mut dyn FnMut(ExprId, &Node)) {
     let mut stack = vec![e];
     while let Some(x) = stack.pop() {
@@ -1513,8 +1243,6 @@ fn walk(e: ExprId, seen: &mut HashSet<ExprId>, visit: &mut dyn FnMut(ExprId, &No
     }
 }
 
-/// What a storage key is hashed from: the parameter words among its mapping keys and array
-/// indices, and whether the caller is one of them.
 fn key_parties(key: ExprId) -> (Vec<u32>, bool) {
     let mut words = Vec::new();
     let mut caller = false;
@@ -1533,8 +1261,6 @@ fn key_parties(key: ExprId) -> (Vec<u32>, bool) {
     (words, caller)
 }
 
-/// The one word a function returns on every path, when its events touch nothing but call data
-/// and constants.
 fn computed_return(events: &[Event]) -> Option<ExprId> {
     let mut out: Option<ExprId> = None;
     for ev in events {
@@ -1570,8 +1296,6 @@ fn computed_return(events: &[Event]) -> Option<ExprId> {
     })
 }
 
-/// What the call `st` returns in the caller's terms, when it reaches a function of another
-/// contract of the world that only computes from its arguments.
 fn computed_result(ctx: &Ctx, st: &Stmt) -> Option<ExprId> {
     let Stmt::Call {
         addr,
@@ -1608,8 +1332,6 @@ fn computed_result(ctx: &Ctx, st: &Stmt) -> Option<ExprId> {
     ))
 }
 
-/// Where a storage key sits: a fixed slot, or a fixed number of slots past a position held in
-/// a parameter word.
 fn slot_place(key: ExprId) -> Option<(Option<u32>, U256)> {
     if let Some(word) = param_word(key) {
         return Some((Some(word), U256::ZERO));
@@ -1620,7 +1342,6 @@ fn slot_place(key: ExprId) -> Option<(Option<u32>, U256)> {
     }
 }
 
-/// The summary of one external function, from its event stream and collected facts.
 fn summarise(
     ctx: &Ctx,
     facts: &FnFacts,
@@ -1944,8 +1665,6 @@ fn summarise(
     Some(sum)
 }
 
-/// Constant-offset memory writes of some nodes (`None`: a write through a pointer or into
-/// an unknown callee).
 fn writes_of<'a>(
     ctx: &Ctx,
     nodes: impl Iterator<Item = &'a lift::LNode>,
@@ -2006,7 +1725,6 @@ fn callee_writes(
     r
 }
 
-/// Forget what `mem` knows about the bytes `writes` touch (everything, for pointer writes).
 fn forget_writes(mem: &mut lift::MemView, writes: Option<Vec<(ExprId, Option<u64>)>>) {
     match writes {
         Some(ws) => {
@@ -2021,7 +1739,6 @@ fn forget_writes(mem: &mut lift::MemView, writes: Option<Vec<(ExprId, Option<u64
 fn mentions(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
     expr::contains(e, pred)
 }
-/// Does `e` mention `target` anywhere outside the subtree `excluded`?
 fn mentions_outside(e: ExprId, target: ExprId, excluded: ExprId) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
@@ -2045,8 +1762,6 @@ fn from_calldata(e: ExprId) -> bool {
         )
     })
 }
-/// `e` without an address mask (`x & (2^160 - 1)`), so the same account compares equal
-/// whether or not a cast was printed around it.
 fn unmask(e: ExprId) -> ExprId {
     match expr::node(e) {
         Node::Op(op::AND, v) if expr::as_const(v[1]) == Some(expr::mask_bits(160)) => unmask(v[0]),
@@ -2054,7 +1769,6 @@ fn unmask(e: ExprId) -> ExprId {
     }
 }
 
-/// `(root, account)` when `key` is an entry of a single-level mapping: `keccak(account . root)`.
 fn ledger_entry(key: ExprId, layout: emit::MappingLayout) -> Option<(U256, ExprId)> {
     let path = ssa::slot_path(key, layout)?;
     match path.steps[..] {
@@ -2063,9 +1777,6 @@ fn ledger_entry(key: ExprId, layout: emit::MappingLayout) -> Option<(U256, ExprI
     }
 }
 
-/// The pooled field `e` reads: `SLOAD(k)`, optionally shifted right by a constant and masked
-/// with a low mask, where `k` is a mapping entry or array element. A global scalar slot is not
-/// pooled state and gives `None`.
 fn pooled_field(e: ExprId, layout: emit::MappingLayout) -> Option<Field> {
     let mut x = e;
     let mut width = 256u32;
@@ -2106,10 +1817,6 @@ fn pooled_field(e: ExprId, layout: emit::MappingLayout) -> Option<Field> {
     })
 }
 
-/// Accumulate the linear combination `e` into signed coefficients per pooled field, so
-/// `a + a - a` keeps one `a` and `a - a` cancels. Only sums, differences and width casts are
-/// followed: a field inside a product, a quotient or a comparison is a factor, not a balance
-/// term, and is left out.
 fn linear_fields(
     e: ExprId,
     sign: i32,
@@ -2152,8 +1859,6 @@ fn linear_fields(
     }
 }
 
-/// Debug aid: the additive leaves of `e` that are memory reads or internal-call results, which
-/// `linear_fields` cannot place, with the sign they carry.
 fn unplaced_terms(e: ExprId, sign: i32, names: &Names, out: &mut Vec<String>, budget: &mut u32) {
     if *budget == 0 {
         return;
@@ -2187,8 +1892,6 @@ fn unplaced_terms(e: ExprId, sign: i32, names: &Names, out: &mut Vec<String>, bu
     }
 }
 
-/// Debug aid (`EVMDEC_DEBUG_UNPLACED`): every difference in the function that subtracts pooled
-/// fields but also holds memory reads or internal-call results the accounting rule cannot place.
 fn debug_unplaced(name: &str, events: &[Event], layout: emit::MappingLayout, names: &Names) {
     let mut seen = HashSet::new();
     for ev in events {
@@ -2228,8 +1931,6 @@ fn debug_unplaced(name: &str, events: &[Event], layout: emit::MappingLayout, nam
     }
 }
 
-/// `e` as a limit, `credits - liabilities`: at least one pooled field with a positive net
-/// coefficient and at least one with a negative one.
 fn linear_bound(e: ExprId, layout: emit::MappingLayout, names: &Names) -> Option<AvailBound> {
     let mut coef = BTreeMap::new();
     let mut labels = HashMap::new();
@@ -2253,8 +1954,6 @@ fn linear_bound(e: ExprId, layout: emit::MappingLayout, names: &Names) -> Option
     })
 }
 
-/// Does a limit compared with `other` cap one of `outflows`? It does when `other` is the amount
-/// that leaves, sits inside it, contains it, or reads the same calldata word.
 fn limits_outflow(other: ExprId, outflows: &[ExprId]) -> bool {
     let calldata = |e: ExprId| {
         let mut words = HashSet::new();
@@ -2280,9 +1979,6 @@ fn limits_outflow(other: ExprId, outflows: &[ExprId]) -> bool {
     })
 }
 
-/// Every payout limit in `e`: each side of an ordering comparison (`<`, `>`, signed or not)
-/// that adds at least one pooled field and subtracts at least one. Each side is read on its
-/// own, so the amount being limited never mixes into the limit's fields.
 fn limits_in(
     e: ExprId,
     layout: emit::MappingLayout,
@@ -2315,7 +2011,6 @@ fn limits_in(
     }
 }
 
-/// `Some(amount)` when `val` is `SLOAD(key) - amount`: the entry lowered rather than set.
 fn subtracts_from(val: ExprId, key: ExprId) -> Option<ExprId> {
     let Node::Op(op::SUB, v) = expr::node(val) else {
         return None;
@@ -2324,7 +2019,6 @@ fn subtracts_from(val: ExprId, key: ExprId) -> Option<ExprId> {
     reads_entry.then_some(v[1])
 }
 
-/// Does `e` read a mapping entry keyed by `msg.sender` under another key (`x[a][sender]`)?
 fn reads_under_sender(e: ExprId, layout: emit::MappingLayout) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
@@ -2346,8 +2040,6 @@ fn reads_under_sender(e: ExprId, layout: emit::MappingLayout) -> bool {
     false
 }
 
-/// Does `e` compare `msg.sender` with a value loaded from a mapping entry (`approved[id] ==
-/// sender`, `owner[id] == sender`)?
 fn compares_sender_with_entry(e: ExprId) -> bool {
     let entry_load = |x: ExprId| {
         let x = unmask(x);
@@ -2370,8 +2062,6 @@ fn compares_sender_with_entry(e: ExprId) -> bool {
     false
 }
 
-/// Constant slots whose stored address `cond` compares with a transfer party: `to == pair`,
-/// `from != pair` (also written `from - pair` as a branch condition).
 fn slots_compared_with_party(cond: ExprId) -> Vec<ExprId> {
     let party = |e: ExprId| {
         let e = unmask(e);
@@ -2400,8 +2090,6 @@ fn slots_compared_with_party(cond: ExprId) -> Vec<ExprId> {
     out
 }
 
-/// Record `(root, slot)` for every single-level mapping entry read under an address held in a
-/// constant slot (`balanceOf[pair]`).
 fn collect_ledger_reads_under_slots(
     e: ExprId,
     layout: emit::MappingLayout,
@@ -2426,8 +2114,6 @@ fn collect_ledger_reads_under_slots(
     }
 }
 
-/// Record the outer keys of two-level mapping reads whose inner key is `msg.sender`:
-/// `allowance[owner][msg.sender]`.
 fn collect_allowance_keys(e: ExprId, layout: emit::MappingLayout, out: &mut Vec<ExprId>) {
     let mut keys = Vec::new();
     let mut seen = HashSet::new();
@@ -2464,9 +2150,6 @@ fn is_const_addr(e: ExprId) -> bool {
     expr::as_const(e).is_some()
 }
 
-/// Does `e` depend on msg.sender: directly, through a phi variable whose every incoming value
-/// does, or through the result of a call whose payload named msg.sender (`crops(msg.sender)`,
-/// a registry mapping the caller to its account)?
 fn caller_derived(l: &Lifted, events: &[Event], e: ExprId, depth: usize) -> bool {
     if from_caller(e) {
         return true;
@@ -2522,8 +2205,6 @@ fn caller_derived(l: &Lifted, events: &[Event], e: ExprId, depth: usize) -> bool
     false
 }
 
-/// Is `addr` a contract this function deployed from its own code (a `CREATE` whose init code
-/// was copied out of the running bytecode)? Such a callee is as trusted as the contract itself.
 fn self_deployed(events: &[Event], addr: ExprId) -> bool {
     let addr = match expr::node(addr) {
         Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
@@ -2549,8 +2230,6 @@ fn self_deployed(events: &[Event], addr: ExprId) -> bool {
     })
 }
 
-/// The dynamic storage array an expression indexes into (`stor_4[i]` reads
-/// `sload(keccak256(4) + i)`): its root slot.
 fn array_root_of(e: ExprId) -> Option<U256> {
     let mut found = None;
     let mut seen = HashSet::new();
@@ -2569,8 +2248,6 @@ fn array_root_of(e: ExprId) -> Option<U256> {
     found
 }
 
-/// Is `e` an address read from storage that no runtime code writes (a slot or packed field set
-/// only at deployment)? Such a callee is fixed: calling it is a call into one known contract.
 fn fixed_in_storage(ctx: &Ctx, e: ExprId) -> bool {
     let e = match expr::node(e) {
         Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
@@ -2594,8 +2271,6 @@ fn fixed_in_storage(ctx: &Ctx, e: ExprId) -> bool {
     }
 }
 
-/// Does `e` mention a node matching `pred`, looking through helper results into the helper's
-/// returned expressions (and their helpers, to a small depth)?
 fn deep_mentions(
     ctx: &Ctx,
     events: &[Event],
@@ -2644,8 +2319,6 @@ fn deep_mentions(
     })
 }
 
-/// `deep_mentions` inside one lifted graph (a helper body): helper results resolve through the
-/// graph's own internal calls.
 fn graph_mentions(
     ctx: &Ctx,
     l: &Lifted,
@@ -2696,7 +2369,6 @@ fn graph_mentions(
     })
 }
 
-/// Loop membership of nodes (back edges via DFS).
 fn loop_nodes(l: &Lifted) -> HashSet<usize> {
     const UNSEEN: usize = usize::MAX;
     let n = l.nodes.len();
@@ -2775,9 +2447,6 @@ fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Ev
     )
 }
 
-/// Can `b` execute after `a` on some path? The two inlining paths are walked together: at the
-/// deepest body both events share, their nodes in that body decide (the same node counts, since
-/// `b` follows `a` in event order; otherwise that body's graph is asked).
 fn ev_reaches(ctx: &Ctx, l: &Lifted, a: &Event, b: &Event) -> bool {
     for (i, ((ia, ca, na), (ib, _, nb))) in a.path.iter().zip(b.path.iter()).enumerate() {
         if ia != ib {
@@ -2797,10 +2466,6 @@ fn ev_reaches(ctx: &Ctx, l: &Lifted, a: &Event, b: &Event) -> bool {
     true
 }
 
-/// `subst` maps the helper's `Arg(i)` to the caller's actual values, so inlined statements read
-/// in the caller's terms (`msg.sender` rather than `arg1`). `mem` replays the memory writes seen
-/// so far; inside a helper, reads of memory the helper could not know (a payload the caller
-/// built and passed by pointer) are resolved through it.
 #[allow(
     clippy::too_many_arguments,
     reason = "the replay threads the inlining path, substitution and memory view through every level"
@@ -3074,7 +2739,6 @@ fn events_of_in(
     out
 }
 
-/// Can node `b` be reached from node `a` (inclusive of a == b)?
 fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![a];
@@ -3090,7 +2754,6 @@ fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
     false
 }
 
-/// `0x1234…cdef`: an address shortened for a table cell.
 fn short_address(a: &str) -> String {
     if a.len() > 12 {
         format!("{}…{}", &a[..6], &a[a.len() - 4..])
@@ -3119,7 +2782,6 @@ pub(crate) fn display_name(f: &Function) -> String {
     }
 }
 
-/// Append a finding. One positional constructor keeps the ~50 rule sites to a single call each.
 #[allow(
     clippy::too_many_arguments,
     reason = "a finding is built from its fields in one call at every rule site"
@@ -3152,8 +2814,6 @@ pub(crate) fn push(
     });
 }
 
-/// The root slot of a mapping key (`keccak256(k . slot)`, nested mappings included): the small
-/// constant among the hashed words, innermost first.
 fn mapping_root(key: ExprId) -> Option<U256> {
     match expr::node(key) {
         Node::Keccak(words, _) => {
@@ -3173,13 +2833,10 @@ fn mapping_root(key: ExprId) -> Option<U256> {
     }
 }
 
-/// `msg.sender == <slot | constant | this | origin>`: the comparison shape of an access check.
 fn is_owner_cond(cond: ExprId) -> bool {
     is_auth_cond(cond) && role_test_root(cond).is_none()
 }
 
-/// The mapping whose caller-keyed entry `cond` tests as a boolean (`require(roles[msg.sender])`,
-/// `if (!m[msg.sender])`): its root slot.
 fn role_test_root(cond: ExprId) -> Option<U256> {
     fn strip(e: ExprId) -> ExprId {
         match expr::node(e) {
@@ -3196,8 +2853,6 @@ fn role_test_root(cond: ExprId) -> Option<U256> {
     }
 }
 
-/// An access check in this contract: an owner comparison, or a test of a role mapping (see
-/// `Ctx::roles`). A test of any other caller-keyed mapping is accounting, not authorisation.
 fn is_auth_cond_in(cond: ExprId, roles: &HashSet<U256>) -> bool {
     match role_test_root(cond) {
         Some(root) => roles.contains(&root),
@@ -3205,9 +2860,6 @@ fn is_auth_cond_in(cond: ExprId, roles: &HashSet<U256>) -> bool {
     }
 }
 
-/// Which caller-keyed mappings are roles: iterate to a fixpoint from the mappings every writer
-/// of which compares msg.sender against a slot or constant, adding mappings whose writers are
-/// gated by an already known role (or by the mapping itself, as a multi-owner wallet is).
 fn role_mappings(ctx: &Ctx) -> HashSet<U256> {
     struct Writer {
         owner: bool,
@@ -3284,18 +2936,12 @@ fn role_mappings(ctx: &Ctx) -> HashSet<U256> {
     roles
 }
 
-/// Where a contract's access checks look in its own storage: what a caller has to be, or to
-/// hold, to pass them.
 #[derive(Clone, Debug, Default)]
 pub struct Gates {
-    /// Fixed slots whose address `msg.sender` is compared with.
     pub slots: Vec<U256>,
-    /// Storage keys tested as a flag that are built from `msg.sender` and constants only, such
-    /// as `approved[msg.sender]` or `roles[ROLE][msg.sender]`.
     pub keys: Vec<ExprId>,
 }
 
-/// The gate locations of `c`, read off every condition its code tests.
 pub fn gates(c: &Contract) -> Gates {
     fn strip(e: ExprId) -> ExprId {
         match expr::node(e) {
@@ -3340,8 +2986,6 @@ pub fn gates(c: &Contract) -> Gates {
     out
 }
 
-/// The storage slot `key` names when `msg.sender` is `caller`: for a key built from the caller
-/// and constants only (see [`Gates::keys`]).
 pub fn key_for(key: ExprId, caller: U256) -> Option<U256> {
     match expr::node(key) {
         Node::Const(c) => Some(c),
@@ -3362,9 +3006,6 @@ pub fn key_for(key: ExprId, caller: U256) -> Option<U256> {
     }
 }
 
-/// Does `cond` have the shape of an authorization check on msg.sender: `msg.sender == <storage
-/// or constant address>`, or a caller-keyed storage flag used directly as a boolean
-/// (`roles[msg.sender]`)? Shape only: see `is_auth_cond_in` for the contract-aware test.
 pub fn is_auth_cond(cond: ExprId) -> bool {
     fn strip(e: ExprId) -> ExprId {
         match expr::node(e) {
@@ -3405,8 +3046,6 @@ pub fn is_auth_cond(cond: ExprId) -> bool {
     }
 }
 
-/// Does the function check `msg.sender` (owner/role/constant) before `node`?
-/// Conditions a node tests: its branch condition and the inlined guards (`require`) it holds.
 fn node_conds(nd: &lift::LNode) -> Vec<ExprId> {
     let mut v: Vec<ExprId> = nd
         .stmts
@@ -3438,7 +3077,6 @@ fn has_caller_check(l: &Lifted, before: Option<usize>, roles: &HashSet<U256>) ->
     false
 }
 
-/// All internal functions reachable from `f` through internal calls (transitively, `f` excluded).
 fn transitive_callees<'a>(ctx: &'a Ctx, f: &Function) -> Vec<&'a Function> {
     let mut out = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
@@ -3467,7 +3105,6 @@ fn any_caller_check(ctx: &Ctx, f: &Function) -> bool {
     })
 }
 
-/// Storage slots compared against msg.sender anywhere (owner/admin/role slots).
 fn auth_slots(ctx: &Ctx) -> HashSet<ExprId> {
     let mut slots = HashSet::new();
     for f in &ctx.c.functions {
@@ -3503,9 +3140,6 @@ const EIP1967_IMPL: &str = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920
 const EIP1967_ADMIN: &str = "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
 const EIP1967_BEACON: &str = "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50";
 
-/// What a pre-0.8 compiler leaves out, for the `legacy-compiler` finding: overflow checks
-/// always, and before 0.5 also the validation of the upper bits of `address` and `bool`
-/// arguments during ABI decoding.
 fn legacy_consequence(before_0_5: bool) -> &'static str {
     if before_0_5 {
         "Arithmetic does not check for overflow and ABI decoding does not validate the upper bits of address and bool arguments."
@@ -3514,7 +3148,6 @@ fn legacy_consequence(before_0_5: bool) -> &'static str {
     }
 }
 
-/// Run every rule over a decompiled contract and assemble the [`Report`].
 pub fn analyze(c: &Contract) -> Report {
     let world = World::of(c);
     if let Some(a) = &c.address {
@@ -3526,7 +3159,6 @@ pub fn analyze(c: &Contract) -> Report {
     analyze_in(c, &world)
 }
 
-/// [`analyze`] for one contract of `world`.
 fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     let internals: HashMap<usize, &Function> = c
         .functions
@@ -5427,7 +5059,6 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     report
 }
 
-/// Does the internal function at `pc` (or anything it calls) divide?
 fn callee_divides(ctx: &Ctx, pc: usize, seen: &mut HashSet<usize>) -> bool {
     if !seen.insert(pc) {
         return false;
@@ -5458,7 +5089,6 @@ fn callee_divides(ctx: &Ctx, pc: usize, seen: &mut HashSet<usize>) -> bool {
     result
 }
 
-/// Is `e` the result of a division, directly or through an internal call whose body divides?
 fn computed_by_division(ctx: &Ctx, events: &[Event], e: ExprId) -> bool {
     if mentions(e, &|n| matches!(n, Node::Op(op::DIV | op::SDIV, _))) {
         return true;
@@ -5483,7 +5113,6 @@ fn computed_by_division(ctx: &Ctx, events: &[Event], e: ExprId) -> bool {
     })
 }
 
-/// Constant storage slots read anywhere in `e`.
 fn const_slot_keys(e: ExprId) -> Vec<U256> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -5504,9 +5133,6 @@ fn const_slot_keys(e: ExprId) -> Vec<U256> {
     out
 }
 
-/// Storage counters the contract caps: every write to the slot is a reset to a constant, a
-/// decrement, or an increment by one guarded by `slot < C` (or `C > slot`) in the same
-/// function. Maps the slot to the largest such `C`.
 fn capped_slots(c: &Contract) -> HashMap<U256, u64> {
     let mut writes: HashMap<U256, Vec<(usize, ExprId)>> = HashMap::new();
     let mut bounds: HashMap<(usize, U256), u64> = HashMap::new();
@@ -5591,9 +5217,6 @@ fn capped_slots(c: &Contract) -> HashMap<U256, u64> {
     out
 }
 
-/// Conditions that must hold for execution to go on, with their polarity: inlined helpers'
-/// guards (`Require`) hold as written; a branch (of the function or of an inlined body) whose
-/// one side only reverts holds in the polarity of the other side.
 fn require_conds(ctx: &Ctx, l: &Lifted, events: &[Event]) -> Vec<(ExprId, bool)> {
     let mut out = Vec::new();
     for e in events {
@@ -5624,9 +5247,6 @@ fn require_conds(ctx: &Ctx, l: &Lifted, events: &[Event]) -> Vec<(ExprId, bool)>
     out
 }
 
-/// How the guards along the path bound `amt` from below: `Some(true)` when a nonzero test is
-/// the only lower bound (other direct comparisons are upper bounds or caller-supplied limits),
-/// `Some(false)` when another lower bound exists, `None` when nothing tests it for zero.
 fn only_nonzero_bound(ctx: &Ctx, l: &Lifted, events: &[Event], amt: ExprId) -> Option<bool> {
     let mut zero_test = false;
     for (c0, holds) in require_conds(ctx, l, events) {
@@ -5670,11 +5290,6 @@ fn only_nonzero_bound(ctx: &Ctx, l: &Lifted, events: &[Event], amt: ExprId) -> O
     }
 }
 
-/// The caller names the amount it receives and the contract computes the amount it gives.
-/// Returns `(given amount, what the caller fixed, how the given amount is bounded)`.
-///
-/// Join shape: `transferFrom(caller, this, computed)` with a storage credit of a calldata word.
-/// Exit shape: `transfer(to, calldata)` with a storage debit of a computed amount.
 fn reverse_quote(
     ctx: &Ctx,
     l: &Lifted,
@@ -5765,9 +5380,6 @@ fn reverse_quote(
     }
 }
 
-/// From `start`, every path halts normally (return/stop/internal return) without touching
-/// state: no store, log, call, create or selfdestruct. `None` when a path reverts or the walk
-/// runs away.
 fn effect_free_exit(l: &Lifted, start: usize) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![start];
@@ -5800,9 +5412,6 @@ fn effect_free_exit(l: &Lifted, start: usize) -> bool {
     true
 }
 
-/// A msg.sender test whose failing side returns normally, with nothing changed, instead of
-/// reverting (`if (!isOwner(msg.sender)) return;`, or a pre-0.4 modifier whose body is simply
-/// skipped). Reported on the function that holds the test; helpers name their external callers.
 fn silent_guard_findings(ctx: &Ctx, findings: &mut Vec<Finding>) {
     for f in &ctx.c.functions {
         if f.kind == FnKind::Orphan || f.inlined {
@@ -5902,10 +5511,6 @@ fn join_names(names: &[&str], max: usize) -> String {
     }
 }
 
-/// Rules about what a contract hands to the addresses it stores. A role that is also a callee
-/// on a public path means the gate authenticates a contract this contract drives; a balance
-/// taken from an account the caller does not own is a confiscation primitive; a pair
-/// synchronised after state was moved prices that move in at once.
 fn trust_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let c = ctx.c;
     let slot_const = |e: ExprId| expr::as_const(e);
@@ -6104,17 +5709,11 @@ fn trust_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
     }
 }
 
-/// What a fetched dependency exposes, computed once per contract.
 struct LinkedSummary {
-    /// Functions anyone can call that make a state-changing call out.
     forwarders: Vec<String>,
-    /// Selectors the contract calls on other contracts.
     selectors_called: Vec<String>,
 }
 
-/// When the contract was fetched with its dependencies, does the contract held in slot `slot`
-/// expose a function anyone can call that calls out again (the loop that opens `gated`)? A
-/// note for the finding when it does. `called` is the selector this contract sends it.
 fn linked_forwards(
     ctx: &Ctx,
     slot: U256,
@@ -6183,10 +5782,6 @@ fn linked_forwards(
     ))
 }
 
-/// Access control by intent: when several state-changing functions compare msg.sender against
-/// the same slot, that is the contract's policy. A state-changing function without the check
-/// that still does what the gated ones do (moves ether, self-destructs, delegatecalls, or writes
-/// a configuration slot otherwise written only behind the check) is reported as a deviation.
 fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let gated: Vec<&FnFacts> = facts
         .iter()
@@ -6324,8 +5919,6 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     }
 }
 
-/// Multi-step attacks assembled from per-function facts: a write that anyone can make, followed
-/// by a function that trusts the written slot.
 fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<Finding>) {
     let mut reported: HashSet<(String, String)> = HashSet::new();
     for x in facts.iter().filter(|x| x.external && !x.caller_checked) {
@@ -6426,12 +6019,6 @@ fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<
     }
 }
 
-/// Functions that release value must agree on what the shared balance already owes. When one
-/// function limits a transfer by `deposits - liabilities` over some storage, and another limits
-/// a transfer over the same deposits while subtracting strictly more liability fields, the first
-/// treats as free balance what the second counts as owed, so it can release more than the pool
-/// holds. The rule is a bytecode fact: it compares the sets of storage fields the two limits add
-/// and subtract, and names no contract, token or protocol.
 fn accounting_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let mut flagged: HashSet<usize> = HashSet::new();
     for (i, f) in facts.iter().enumerate() {
@@ -6485,10 +6072,6 @@ fn accounting_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     }
 }
 
-/// Hold every call, value transfer and approval that reaches a contract fetched with this one
-/// against that contract's own code and report: a selector it does not answer, value sent to
-/// code that rejects it, a called function its own report rates high, and an approval given to
-/// a spender that moves tokens from accounts its caller picks.
 fn link_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let mut told: HashSet<(usize, String, &str)> = HashSet::new();
     for f in facts.iter().filter(|f| f.external) {
@@ -6647,28 +6230,16 @@ fn link_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
     }
 }
 
-/// What a gated function of another contract does with one argument word.
 struct Reached {
-    /// Address of the contract holding the function.
     address: String,
-    /// Display name of the function.
     function: String,
-    /// The function lowers or clears the entry stored under the word, or moves its tokens.
     lowers: Option<String>,
-    /// The function sends ether or tokens to the word.
     pays: bool,
-    /// The function writes the word to a slot its contract's access checks read.
     gate_store: Option<String>,
-    /// Whether the called contract approves `from` as a caller: `None` when its storage was not
-    /// read.
     admitted: Option<bool>,
-    /// The function belongs to a contract created during the call, not to a deployed one.
     created: bool,
 }
 
-/// Follow argument `word` of the call `selector` on the contract at `address`, made by the
-/// contract at `from`, to the gated function that receives it, and on through the calls that
-/// function makes with it to further contracts of the world.
 fn reach(
     world: &World,
     from: Option<&str>,
@@ -6735,7 +6306,6 @@ fn reach(
     Some(reached)
 }
 
-/// Appended to a finding [`confirm_passed`] confirmed.
 const PASSED_ON_CONFIRMED: &str = concat!(
     " Confirmed by running the call across the fetched contracts, each linked contract",
     " approving only the callers its storage was read to approve: with a balance in the named",
@@ -6744,19 +6314,14 @@ const PASSED_ON_CONFIRMED: &str = concat!(
     " is attached)."
 );
 
-/// Two accounts to name in a forwarded word: distinct, not zero, and neither the caller of the
-/// run nor a contract of the world.
+// Not zero, not the caller, not a contract of the world.
 const NAMED: [U256; 2] = [
     U256::from_u64(0x1111_2222_3333_4444),
     U256::from_u64(0x5555_6666_7777_8888),
 ];
 
-/// Runs tried per account in the second round of a cross-contract confirmation, at most.
 const MAX_SHAPES: usize = 18;
 
-/// Place `c` in `world` as it is deployed: its code at its address, the units it forwards to at
-/// theirs with the slot naming a single implementation filled, and the addresses its storage
-/// was read to hold. Returns its address.
 fn place_contract(world: &mut CrossWorld, c: &Contract) -> Option<U256> {
     let address = U256::from_hex_str(c.address.as_deref()?)?;
     if c.info.runtime.is_empty() {
@@ -6790,21 +6355,8 @@ fn place_contract(world: &mut CrossWorld, c: &Contract) -> Option<U256> {
     Some(address)
 }
 
-/// Try to confirm a finding of [`passed_word_findings`] by running it: function `f` of this
-/// contract, called by an account holding no role with call-data word `word` naming an account,
-/// across the contracts fetched with it.
-///
-/// The state is what was read from the chain and nothing more: every contract's code, the
-/// addresses held in the slots that were read, and each linked contract's gates set for the
-/// callers its own storage approved (`Contract::admits`). A gate nobody was read to pass stays
-/// shut, so the run fails there and nothing is confirmed.
-///
-/// Two rounds, each run once per account of [`NAMED`]. The first, with every other argument
-/// zero, finds the slots of the far contract that are written for one named account and not
-/// for the other. The second gives exactly those slots a balance and tries a few argument
-/// shapes. The finding is confirmed when, for both accounts, the call completes and the
-/// account's own slot ends below the balance it was given. Returns the call data of that run.
-/// `None` is no verdict: the search is bounded and the state minimal.
+// Gates are opened only for callers the contract's storage was read to approve.
+// An unread gate must stay shut, or an unverified finding gets confirmed.
 fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec<u8>> {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() {
         return None;
@@ -6890,12 +6442,6 @@ fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec
     })
 }
 
-/// Hold each word a function passes to another contract of the world against what the called
-/// function does with it. A function anyone can call that takes an account from its call data,
-/// never ties it to `msg.sender`, and hands it to a function that runs only for approved callers
-/// and lowers that account's entry lets every caller choose whose entry is lowered; the same
-/// path into a slot the called contract's access checks read lets every caller choose who
-/// passes them.
 fn passed_word_findings(
     ctx: &Ctx,
     facts: &[FnFacts],
@@ -7004,8 +6550,6 @@ fn passed_word_findings(
     }
 }
 
-/// Findings about value a ledger should conserve: between two of its entries, and between its
-/// entries and the total that moves with them.
 fn conservation_findings(
     facts: &[FnFacts],
     slot_name: &dyn Fn(ExprId) -> String,
@@ -7101,8 +6645,6 @@ fn conservation_findings(
     }
 }
 
-/// 0..100: the worst finding sets the level (weighted by its confidence), the rest add a little.
-/// A single confirmed critical scores higher than twenty informational notes.
 fn risk_score(findings: &[Finding]) -> u32 {
     let weight = |f: &Finding| -> f64 {
         let base = match f.severity {
@@ -7151,24 +6693,15 @@ fn w0_selector(input: &Option<Vec<ExprId>>, in_len: ExprId) -> Option<u32> {
         })
 }
 
-/// What a compiler bug needs in the code to matter; what the bytecode shows decides whether the
-/// bug is reported, and how loudly.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BugNeeds {
-    /// Transient storage opcodes: the bug is dropped when the bytecode has none.
     TransientStorage,
-    /// Calldata copied to memory by an ordinary function: dropped when none is.
     CalldataCopy,
-    /// A compiler setting or source construct the bytecode cannot show (`--via-ir`, inline
-    /// assembly, optimizer internals): reported for information only.
     Unknowable,
 }
 
-/// A solc release range affected by a notable compiler bug.
 struct CompilerBug {
-    /// First affected version (inclusive).
     first: (u32, u32, u32),
-    /// Last affected version (inclusive).
     last: (u32, u32, u32),
     title: &'static str,
     description: &'static str,
@@ -7220,8 +6753,6 @@ const COMPILER_BUGS: &[CompilerBug] = &[
     },
 ];
 
-/// Rewrite storage/memory loads to version 0 so that structurally equal expressions compare
-/// equal across store generations.
 fn strip_versions(e: ExprId, memo: &mut HashMap<ExprId, ExprId>) -> ExprId {
     expr::substitute(
         e,
@@ -7241,10 +6772,6 @@ fn strip_versions(e: ExprId, memo: &mut HashMap<ExprId, ExprId>) -> ExprId {
     )
 }
 
-/// The evidence of `f` with its function's parameter names put back to their positions
-/// (`arg0`, `arg1`): a helper's statement is printed with each caller's arguments substituted,
-/// and two callers may name the same position differently. A word followed by a colon is a
-/// call option (`value:`), not a parameter.
 fn positional_evidence(
     f: &Finding,
     params: &HashMap<String, Vec<(String, String)>>,
@@ -7282,9 +6809,6 @@ fn positional_evidence(
         .collect()
 }
 
-/// Fold findings that describe one defect several times: the same rule firing at several sites
-/// of one function (a loop body with many calls), and the same site reached from several
-/// external functions through a shared helper. The report then has one entry per defect.
 fn merge_findings(
     findings: Vec<Finding>,
     params: &HashMap<String, Vec<(String, String)>>,
@@ -7375,8 +6899,6 @@ fn merge_findings(
     out
 }
 
-/// Render a report as a Markdown document: header, findings, then the contract-wide
-/// sections (privileged functions, external calls, storage layout, events, selectors).
 pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!("# Security report: {}\n\n", title));

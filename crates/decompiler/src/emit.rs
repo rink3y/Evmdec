@@ -1,5 +1,3 @@
-//! Rendering expressions and statements as pseudo-Solidity.
-
 use crate::expr::{self, ExprId, Node};
 use crate::keccak;
 use crate::lift::{Lifted, Stmt, Term, FREE_POINTER};
@@ -10,17 +8,10 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
-/// How many small slots the hashed-slot table covers.
 const HASHED_SLOTS: u64 = 4096;
 
-/// Offsets around a precomputed hash that still count as that array (`keccak256(s) - 1` for
-/// `arr[arr.length - 1]`, `keccak256(s) + 2` for a struct field).
 const HASH_OFFSET_RANGE: i64 = 16;
 
-/// The slot `s` whose dynamic-array data lives at `keccak256(s)`, and the element offset `k`,
-/// for a constant `c = keccak256(s) + k` with small `s` and `|k| <= 16`. Compilers precompute
-/// that hash for state variables (and fold small offsets into it), so the constant shows up in
-/// the code as is.
 pub fn hashed_slot(c: U256) -> Option<(U256, i64)> {
     static TABLE: OnceLock<HashMap<U256, (u64, i64)>> = OnceLock::new();
     let table = TABLE.get_or_init(|| {
@@ -44,7 +35,6 @@ pub fn hashed_slot(c: U256) -> Option<(U256, i64)> {
     table.get(&c).map(|(s, k)| (U256::from_u64(*s), *k))
 }
 
-/// `idx + k` / `idx - k` for an element offset folded into a hash constant.
 fn offset_index(idx: &str, k: i64) -> String {
     match k {
         0 => idx.to_string(),
@@ -53,8 +43,6 @@ fn offset_index(idx: &str, k: i64) -> String {
     }
 }
 
-/// An index into a storage array rather than a hashed slot: not a constant, not a
-/// `keccak256(...)` and not `keccak256(...) + k` (a mapping value used as the index is fine).
 pub fn is_plain_index(e: ExprId) -> bool {
     if expr::as_const(e).is_some() {
         return false;
@@ -66,8 +54,6 @@ pub fn is_plain_index(e: ExprId) -> bool {
     }
 }
 
-/// `slot_in_fixed_array`: a key `x + c` with a small constant `c` addresses element `x + (c - b)`
-/// of the fixed-size array whose first slot `b` is the nearest known base at or below `c`.
 fn fixed_array_base(c: U256, bases: &BTreeSet<U256>) -> Option<(U256, U256)> {
     if c.bits() > 32 {
         return None;
@@ -81,28 +67,20 @@ fn fixed_array_base(c: U256, bases: &BTreeSet<U256>) -> Option<(U256, U256)> {
     }
 }
 
-/// How a compiler lays out mapping slots: `keccak(key . slot)` (Solidity) or `keccak(slot . key)`
-/// (Vyper).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum MappingLayout {
-    /// Solidity: the key precedes the slot in the hashed preimage.
     #[default]
     Solidity,
-    /// Vyper: the slot precedes the key in the hashed preimage.
     Vyper,
 }
 
-/// Which storage a slot expression addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SlotSpace {
-    /// Persistent storage (`SLOAD` / `SSTORE`), printed as `stor…`.
     Persistent,
-    /// Transient storage (`TLOAD` / `TSTORE`, EIP-1153), printed as `tstor…`.
     Transient,
 }
 
 impl SlotSpace {
-    /// The space a statement's `transient` flag selects.
     pub fn from_transient(transient: bool) -> SlotSpace {
         if transient {
             SlotSpace::Transient
@@ -112,97 +90,51 @@ impl SlotSpace {
     }
 }
 
-/// What an ABI-encoded payload is for; decides how a selector-led payload is rendered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PayloadKind {
-    /// Data handed to `RETURN`.
     Return,
-    /// Data handed to `REVERT`: `Error(string)`, `Panic(uint256)` and custom errors are decoded.
     Revert,
 }
 
-/// Naming context for one function.
 #[derive(Clone, Debug, Default)]
 pub struct Names {
-    /// What each internal function may read from memory, by entry pc; absent when unknown.
     pub callee_reads: Option<std::sync::Arc<HashMap<usize, crate::lift::MemoryReads>>>,
-    /// calldata word index -> parameter name
     pub params: HashMap<u32, String>,
-    /// Expressions printed under a fixed name (e.g. the pointer returned by a storage-string
-    /// loader prints as the storage variable).
     pub aliases: HashMap<ExprId, String>,
-    /// Packed storage fields: (slot, byte offset, bits) -> name.
     pub fields: HashMap<(U256, u32, u32), String>,
-    /// internal-unit argument index -> name
     pub args: HashMap<u32, String>,
-    /// entry pc of an internal function -> its name
     pub callee_names: HashMap<usize, String>,
-    /// Call payloads the structurer has a better text for than the memory range: the offset of
-    /// the payload -> what it holds (`msg.data` after a copy of the whole calldata).
     pub payload_overrides: RefCell<HashMap<ExprId, String>>,
-    /// Memory blocks at solc's free pointer, numbered in code order: each value the pointer
-    /// takes starts a block, keyed by the symbolic part of its address with the constant part
-    /// and the block's number (`ptr1`, `ptr2`, …). `None` when the code keeps no free pointer.
     pub blocks: Option<Blocks>,
-    /// storage slot (constant) -> name
     pub storage: HashMap<U256, String>,
-    /// Struct members of mapping and array elements: (root slot, slot offset in the element)
-    /// -> member name.
     pub members: HashMap<(U256, u64), String>,
-    /// Packed fields of struct members: (root slot, slot offset, byte offset, bits) -> name.
     pub member_fields: HashMap<(U256, u64, u32, u32), String>,
-    /// Roots whose elements are structs -> number of keys and indices that select an element.
     pub struct_depth: HashMap<U256, usize>,
-    /// First slots of fixed-size storage arrays (`uint[256] owners` occupies `base..base+256`).
     pub array_bases: BTreeSet<U256>,
-    /// Loads that read a slot's value from before a store printed earlier on the path: printed
-    /// under the temporary that saved that value. Filled by the structurer as it prints.
     pub stale: RefCell<HashMap<ExprId, String>>,
-    /// The loads `stale` renames only until the block being printed ends.
     pub block_stale: RefCell<Vec<ExprId>>,
-    /// The value just stored to a slot, printed as the slot while no later store intervenes:
-    /// the compiler forwards the stored value instead of reloading it. Filled by the structurer.
     pub forwarded: RefCell<HashMap<ExprId, String>>,
-    /// Number of temporaries handed out so far (names stay unique across blocks).
     pub temp_seq: RefCell<u32>,
-    /// Sequence numbers renamed to small indices.
     pub seqs: RefCell<HashMap<u32, u32>>,
-    /// Phi variables renamed to small indices (`v1`, `v2`, …) in order of first use.
     pub vars: RefCell<HashMap<u32, u32>>,
-    /// Mapping slot layout of the source compiler.
     pub layout: MappingLayout,
-    /// solc >= 0.8: the compiler's own overflow / division-by-zero panics are not printed.
     pub hide_checked: bool,
-    /// Large shared sub-expressions are hoisted into temporaries: pending definitions.
     pub temps: RefCell<Vec<(String, String)>>,
-    /// Expression -> temporary name, for expressions already hoisted.
     pub temp_of: RefCell<HashMap<ExprId, String>>,
-    /// Entry pcs of internal functions without side effects (view/pure): a call to one does
-    /// not move ether, whatever the lifter's conservative storage model assumed.
     pub pure_callees: HashSet<usize>,
-    /// Expressions known to be booleans beyond their shape: results of helpers that return
-    /// `bool`.
     pub bools: HashSet<ExprId>,
-    /// Packed storage fields of type `bool`: (slot, byte offset, bits).
     pub bool_fields: HashSet<(U256, u32, u32)>,
-    /// Which of the current function's return positions (declaration order) are `bool`.
     pub bool_returns: Vec<bool>,
-    /// Root slots of dynamic storage arrays: the bare slot is the array's length.
     pub dyn_arrays: HashSet<U256>,
-    /// Element value type of mappings and arrays, by root slot: `bool`, `address`, `uintN`.
     pub elem_types: HashMap<U256, String>,
-    /// Entry pcs of the compiler's array-resize helpers (`slot.length = n`, clearing the
-    /// dropped elements).
     pub array_resizers: HashSet<usize>,
-    /// Rendered text and precedence of the expressions printed so far.
     pub memo: RefCell<HashMap<ExprId, (String, u8)>>,
 }
 
-/// Rendered expressions longer than this become temporaries (keeps output linear in size).
+// Keeps the output linear in size.
 const TEMP_THRESHOLD: usize = 160;
 
 impl Names {
-    /// The printed name of the internal function at `pc`.
     #[must_use]
     pub fn callee_name(&self, pc: usize) -> String {
         self.callee_names
@@ -211,13 +143,12 @@ impl Names {
             .unwrap_or_else(|| format!("func_{pc:#x}"))
     }
 
-    /// Temporaries created while rendering the last statement(s); the caller prints them first.
     pub fn take_temps(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.temps.borrow_mut())
     }
 
-    /// Forget the temporaries of the block just printed: a temporary is declared where it is
-    /// first used, so a later block must not refer to one declared inside another branch.
+    // A temporary is declared where it is first used.
+    // A later block must not refer to one declared inside another branch.
     pub fn end_block(&self) {
         self.temp_of.borrow_mut().clear();
         self.memo.borrow_mut().clear();
@@ -227,8 +158,6 @@ impl Names {
         }
     }
 
-    /// As [`Names::replace_stale`], until the block ends: what tells an old memory value from
-    /// a new one holds only within the block that overwrites it.
     pub fn replace_stale_in_block(&self, loads: impl IntoIterator<Item = (ExprId, String)>) {
         let loads: Vec<(ExprId, String)> = loads.into_iter().collect();
         self.block_stale
@@ -237,15 +166,11 @@ impl Names {
         self.replace_stale(loads);
     }
 
-    /// Print `value` as `name` until the block ends: the location `name` now holds it.
     pub fn forward(&self, value: ExprId, name: String) {
         self.forwarded.borrow_mut().insert(value, name);
         self.memo.borrow_mut().clear();
     }
 
-    /// Print `loads` under the names of the locals that hold their old values from here on.
-    /// Text already rendered in this block may contain them under their own names, so it is
-    /// dropped.
     pub fn replace_stale(&self, loads: impl IntoIterator<Item = (ExprId, String)>) {
         let mut stale = self.stale.borrow_mut();
         let before = stale.len();
@@ -278,8 +203,6 @@ const P_EXP: u8 = 10;
 const P_UNARY: u8 = 11;
 const P_PRIMARY: u8 = 12;
 
-/// A constant in its most readable form: decimal, `type(uintN).max`, `NeK`, `2**K`, an address,
-/// or hex.
 pub fn fmt_const(c: U256) -> String {
     if c.is_zero() {
         return "0".into();
@@ -317,7 +240,6 @@ fn fmt_int_const(c: U256) -> String {
     }
 }
 
-/// Is `e` the function selector, `calldataload(0) >> 224` in one of the shapes solc emits?
 pub fn is_selector_expr(e: ExprId) -> bool {
     match expr::node(e) {
         Node::Op(op::SHR, v) => {
@@ -337,7 +259,6 @@ pub fn is_selector_expr(e: ExprId) -> bool {
     }
 }
 
-/// Extract the selector constant from a comparison `sel == C` / `C == sel`.
 pub fn selector_compare(e: ExprId) -> Option<u32> {
     if let Node::Op(op::EQ, v) = expr::node(e) {
         return selector_operands(&v);
@@ -345,7 +266,6 @@ pub fn selector_compare(e: ExprId) -> Option<u32> {
     None
 }
 
-/// `sel XOR C` / `sel - C` / `C - sel`: zero exactly when the selector matches.
 pub fn selector_mismatch(e: ExprId) -> Option<u32> {
     if let Node::Op(o, v) = expr::node(e) {
         if o == op::XOR || o == op::SUB {
@@ -368,7 +288,6 @@ fn selector_operands(v: &[ExprId]) -> Option<u32> {
     None
 }
 
-/// Index of the ABI word at a constant calldata offset `4 + 32*i`; `None` for anything else.
 pub fn calldata_word_index(off: ExprId) -> Option<u32> {
     let c = expr::as_const(off)?;
     if c < U256::from_u64(4) || !c.fits_u64() {
@@ -390,7 +309,6 @@ fn paren(s: String, inner: u8, outer: u8) -> String {
     }
 }
 
-/// Render an expression; sub-expressions longer than the threshold become temporaries.
 pub fn fmt_expr(e: ExprId, n: &Names) -> String {
     fmt_prec(e, 0, n)
 }
@@ -423,8 +341,6 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     paren(s, p, outer)
 }
 
-/// An event emission from its topics and already-printed data arguments: `emit Name(...)` when
-/// topic0 is a known signature, a placeholder name for an unknown one, `logN(...)` otherwise.
 pub fn fmt_log_parts(topics: &[ExprId], data_args: Vec<String>, n: &Names) -> String {
     let mut args: Vec<String> = Vec::new();
     let mut name = None;
@@ -451,7 +367,6 @@ pub fn fmt_log_parts(topics: &[ExprId], data_args: Vec<String>, n: &Names) -> St
     }
 }
 
-/// Is `e` the sum `base + k`?
 pub fn is_add_const(e: ExprId, base: ExprId, k: u64) -> bool {
     match expr::node(e) {
         Node::Op(op::ADD, v) => {
@@ -462,7 +377,6 @@ pub fn is_add_const(e: ExprId, base: ExprId, k: u64) -> bool {
     }
 }
 
-/// Every expression a statement mentions.
 fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
     crate::lift::node_exprs(&crate::lift::LNode {
         id: 0,
@@ -477,7 +391,6 @@ fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
     })
 }
 
-/// The constant byte range a statement writes to memory, when it is a plain store.
 fn written_range(s: &Stmt) -> Option<(u64, u64)> {
     match s {
         Stmt::MStore { off, width, .. } => {
@@ -493,7 +406,6 @@ fn written_range(s: &Stmt) -> Option<(u64, u64)> {
     }
 }
 
-/// Could the statement read memory? Anything but a store whose operands are memory-free.
 fn reads_memory(s: &Stmt) -> bool {
     match s {
         Stmt::MStore { .. } | Stmt::SStore { .. } | Stmt::Assign { .. } | Stmt::Drop(_) => {
@@ -506,9 +418,6 @@ fn reads_memory(s: &Stmt) -> bool {
     }
 }
 
-/// Statements of one block that store to memory and are overwritten by a later store of the
-/// same block before anything could read them, plus `mem[x] = mem[x]` no-ops. The lifted IR is
-/// left as is (the oracle checks it); only the printout drops them.
 pub fn dead_memory_stores(stmts: &[Stmt]) -> HashSet<usize> {
     let mut dead = HashSet::new();
     for (i, s) in stmts.iter().enumerate() {
@@ -542,8 +451,6 @@ pub fn dead_memory_stores(stmts: &[Stmt]) -> HashSet<usize> {
     dead
 }
 
-/// solc's ABI decoder validators on a calldata word: `x == address(x)` (the word is a clean
-/// address) and `x == bool(x)`. The parameter type already says so.
 fn is_abi_validator(cond: ExprId) -> bool {
     let Node::Op(op::EQ, v) = expr::node(cond) else {
         return false;
@@ -564,9 +471,6 @@ fn is_abi_validator(cond: ExprId) -> bool {
     (is_param(v[0]) && cleaned(v[0], v[1])) || (is_param(v[1]) && cleaned(v[1], v[0]))
 }
 
-/// A `require` the printer leaves out: an ABI decoder validator (the parameter type says it),
-/// or, on solc >= 0.8, a panic the compiler adds on its own: arithmetic overflow, division by
-/// zero, or a memory allocation past the allocator's limit.
 pub fn is_hidden_require(cond: ExprId, data: Option<&[ExprId]>, n: &Names) -> bool {
     if is_abi_validator(cond) {
         return true;
@@ -588,18 +492,12 @@ pub fn is_hidden_require(cond: ExprId, data: Option<&[ExprId]>, n: &Names) -> bo
     )
 }
 
-/// Selector of `Panic(uint256)`.
 pub const SEL_PANIC: u32 = 0x4e487b71;
-/// Selector of `Error(string)`.
 pub const SEL_ERROR: u32 = 0x08c379a0;
-/// `Panic` code for arithmetic overflow.
 const PANIC_OVERFLOW: u64 = 0x11;
-/// `Panic` code for division by zero.
 const PANIC_DIV_BY_ZERO: u64 = 0x12;
-/// `Panic` code for a memory allocation that is too large or overflows the free pointer.
 const PANIC_ALLOCATION: u64 = 0x41;
 
-/// Is `e` boolean-valued: by its shape, as a helper's `bool` result, or as a `bool` field?
 pub fn is_bool(e: ExprId, n: &Names) -> bool {
     expr::is_boolean(e)
         || n.bools.contains(&e)
@@ -607,7 +505,6 @@ pub fn is_bool(e: ExprId, n: &Names) -> bool {
         || bool_element(e, n)
 }
 
-/// A read of a mapping or array element whose declared type is `bool` (masked or not).
 fn bool_element(e: ExprId, n: &Names) -> bool {
     let load = element_typed_load(e, n).unwrap_or(e);
     match expr::node(load) {
@@ -618,7 +515,6 @@ fn bool_element(e: ExprId, n: &Names) -> bool {
     }
 }
 
-/// A condition as a boolean: `x` when boolean-valued, `x != 0` otherwise.
 pub fn fmt_cond(cond: ExprId, n: &Names) -> String {
     if let Some(text) = difference_test(cond, n) {
         return text;
@@ -630,9 +526,6 @@ pub fn fmt_cond(cond: ExprId, n: &Names) -> String {
     }
 }
 
-/// A condition as it is tested for truth, without `!= 0`. A difference or an exclusive-or
-/// tested for truth is an inequality (`a - b` is how newer solc writes `a != b`), and its
-/// negation an equality; the constant goes on the right.
 pub fn fmt_truth(cond: ExprId, n: &Names) -> String {
     difference_test(cond, n).unwrap_or_else(|| fmt_expr(cond, n))
 }
@@ -656,14 +549,12 @@ fn difference_test(cond: ExprId, n: &Names) -> Option<String> {
     ))
 }
 
-/// Name of an event whose signature is unknown: `Event_<first four bytes of topic0>`.
 pub fn event_placeholder_name(topic0: U256) -> String {
     let b = topic0.to_be_bytes();
     format!("Event_{:08x}", u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// `slt(sub(calldatasize, c), k)` and friends: solc's ABI-size checks are signed compares on a
-/// value that cannot be negative. Printed as the unsigned comparison with the constants folded.
+// solc's ABI size checks are signed compares on a value that cannot be negative.
 fn size_compare(o: u8, a: ExprId, b: ExprId, n: &Names) -> Option<String> {
     let k = expr::as_const(b)?;
     let (base, c) = expr::split_offset(a);
@@ -684,18 +575,12 @@ fn is_signed_op(o: u8) -> bool {
     matches!(o, op::SLT | op::SGT | op::SDIV | op::SMOD | op::SAR)
 }
 
-/// Memory offsets print in hex (0x40 is the free memory pointer, 0x00..0x3f scratch).
-/// The starts of the memory blocks of one function: the symbolic part of each start (`None`
-/// for a constant address) -> `(constant part, block number)`.
 pub type Blocks = HashMap<Option<ExprId>, Vec<(U256, u32)>>;
 
 pub(crate) fn is_free_pointer(off: ExprId) -> bool {
     expr::as_const(off) == Some(U256::from_u64(FREE_POINTER))
 }
 
-/// The memory blocks of `l`: every value its free pointer has, in code order. solc allocates by
-/// reading the pointer and moving it past the new block, so the pointer's value on entry and
-/// each value stored to it afterwards is where a block starts.
 #[must_use]
 pub fn number_blocks(l: &Lifted) -> Blocks {
     let mut starts: Vec<ExprId> = l.entry_free_pointer().into_iter().collect();
@@ -758,8 +643,6 @@ pub fn number_blocks(l: &Lifted) -> Blocks {
     blocks
 }
 
-/// The block an address falls in and its offset from the block's start: the block with the
-/// same symbolic base whose start is the nearest at or below the address.
 pub(crate) fn block_ref(e: ExprId, n: &Names) -> Option<(u32, U256)> {
     let blocks = n.blocks.as_ref()?;
     let (base, offset) = expr::split_offset(e);
@@ -779,8 +662,6 @@ fn fmt_block_ref(number: u32, offset: U256) -> String {
     }
 }
 
-/// A value written into memory: a constant that is exactly where a block starts is that
-/// block's address, so the word points at it.
 fn fmt_stored_word(val: ExprId, n: &Names) -> String {
     match (expr::as_const(val), block_ref(val, n)) {
         (Some(_), Some((number, offset))) if offset.is_zero() => format!("ptr{number}"),
@@ -788,8 +669,6 @@ fn fmt_stored_word(val: ExprId, n: &Names) -> String {
     }
 }
 
-/// Indices of the statements that move the free memory pointer: bookkeeping the named blocks
-/// already show.
 #[must_use]
 pub fn free_pointer_updates(stmts: &[Stmt], n: &Names) -> HashSet<usize> {
     if n.blocks.is_none() {
@@ -803,22 +682,14 @@ pub fn free_pointer_updates(stmts: &[Stmt], n: &Names) -> HashSet<usize> {
         .collect()
 }
 
-/// Stores that fill a memory block word by word, as one line.
 #[derive(Clone, Debug)]
 pub struct BlockLiteral {
-    /// Index of the first statement the line stands for.
     pub first: usize,
-    /// Indices of the other statements it stands for.
     pub rest: Vec<usize>,
-    /// `ptrN = memory(a, b, c);`
     pub text: String,
 }
 
-/// The blocks `stmts` fill (skipping the indices in `hidden`). Within a run of consecutive
-/// word stores into blocks, whose values read no memory, the stores to one block may be
-/// gathered: blocks do not overlap, so their order among the others does not matter. A block
-/// becomes one line when the run stores its words `0..n` each exactly once; two words are the
-/// least worth a line.
+// Blocks do not overlap, so the stores to one may be gathered past stores to others.
 #[must_use]
 pub fn block_literals(stmts: &[Stmt], hidden: &HashSet<usize>, n: &Names) -> Vec<BlockLiteral> {
     let word_of = |s: &Stmt| -> Option<(u32, u64, ExprId)> {
@@ -885,12 +756,8 @@ pub fn block_literals(stmts: &[Stmt], hidden: &HashSet<usize>, n: &Names) -> Vec
     out
 }
 
-/// Bytes in a memory word.
 const WORD: u64 = 32;
 
-/// The memory word at `off`. Vyper keeps every variable at a fixed address, so a word-aligned
-/// constant address past the scratch space is a variable of its own (`loc_1a0`), and a
-/// word-scaled index added to one is an element of the list that starts there (`loc_1a0[i]`).
 pub fn fmt_mem_word(off: ExprId, n: &Names) -> String {
     if n.layout != MappingLayout::Vyper {
         return format!("mem[{}]", fmt_mem_off(off, n));
@@ -916,7 +783,6 @@ pub fn fmt_mem_word(off: ExprId, n: &Names) -> String {
     named.unwrap_or_else(|| format!("mem[{}]", fmt_mem_off(off, n)))
 }
 
-/// Memory offsets print in hex when constant (`0x00..0x3f` is scratch space).
 pub fn fmt_mem_off(off: ExprId, n: &Names) -> String {
     match (expr::as_const(off), block_ref(off, n)) {
         (Some(_), Some((number, offset))) => fmt_block_ref(number, offset),
@@ -936,9 +802,6 @@ fn fmt_signed(e: ExprId, n: &Names) -> String {
     }
 }
 
-/// Storage location rendering: `stor_5`, `stor_3[key]`, `stor_7[k1][k2]`, `stor_9[i]`.
-/// A read of a packed storage field: `(slot, byte offset, bits)` for `slot & mask`,
-/// `(slot >> 8k) & mask`, `(slot / 2^8k) & mask` and the top field `slot >> 8k`.
 pub fn packed_read(e: ExprId) -> Option<(U256, u32, u32)> {
     fn shifted_slot(e: ExprId) -> Option<(U256, u32)> {
         match expr::node(e) {
@@ -1004,8 +867,6 @@ pub fn packed_read(e: ExprId) -> Option<(U256, u32, u32)> {
     }
 }
 
-/// A write of a packed storage field: `slot = slot & ~(mask << 8k) | (value << 8k)` gives
-/// `(slot, byte offset, bits, value)`.
 pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)> {
     let k = expr::as_const(key)?;
     if let Node::Op(op::AND, w) = expr::node(val) {
@@ -1071,10 +932,8 @@ pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)
     None
 }
 
-/// A write of a mapping or array element of known width that keeps the slot's other bytes
-/// (`x | slot & 0xff..00`, or `slot & 0xff..00` for zero): the root slot and the value written.
-/// Only when the element's declared type fills exactly the cleared bytes, so that the kept bytes
-/// are known to be zero and the mask is noise.
+// Only when the declared type fills exactly the cleared bytes.
+// Then the kept bytes are known to be zero and the mask is noise.
 pub fn element_write(key: ExprId, val: ExprId, n: &Names) -> Option<(U256, ExprId)> {
     let root = element_root(key)?;
     let width_bits = element_width(n.elem_types.get(&root)?)?;
@@ -1098,7 +957,6 @@ pub fn element_write(key: ExprId, val: ExprId, n: &Names) -> Option<(U256, ExprI
     }
 }
 
-/// `element & mask` where the element's declared type is exactly `mask` wide: the bare load.
 fn element_typed_load(e: ExprId, n: &Names) -> Option<ExprId> {
     let Node::Op(op::AND, v) = expr::node(e) else {
         return None;
@@ -1119,7 +977,6 @@ fn element_typed_load(e: ExprId, n: &Names) -> Option<ExprId> {
     None
 }
 
-/// Width in bits of a concrete element type (`bool`, `address`, `uintN`).
 pub fn element_width(ty: &str) -> Option<u32> {
     match ty {
         "bool" => Some(8),
@@ -1128,7 +985,6 @@ pub fn element_width(ty: &str) -> Option<u32> {
     }
 }
 
-/// Root slot of a mapping entry or dynamic array element key.
 pub fn element_root(key: ExprId) -> Option<U256> {
     match expr::node(key) {
         Node::Keccak(words, 0) if words.len() == 2 => words
@@ -1145,7 +1001,6 @@ pub fn element_root(key: ExprId) -> Option<U256> {
     }
 }
 
-/// The name of constant slot `s` as the base of an element access (never `.length`).
 fn slot_name(s: U256, n: &Names, prefix: &str) -> String {
     if let Some(name) = n.storage.get(&s) {
         return name.clone();
@@ -1157,7 +1012,6 @@ fn slot_name(s: U256, n: &Names, prefix: &str) -> String {
     }
 }
 
-/// The base of an element access: a constant slot by name, anything else rendered as a slot.
 fn base_name(e: ExprId, n: &Names, space: SlotSpace) -> String {
     let prefix = match space {
         SlotSpace::Persistent => "stor",
@@ -1169,8 +1023,6 @@ fn base_name(e: ExprId, n: &Names, space: SlotSpace) -> String {
     }
 }
 
-/// The struct member a storage key selects: the root, the member's slot offset in the element
-/// and its name. A key that selects a whole element of a struct root is the member at offset 0.
 fn struct_member(e: ExprId, n: &Names) -> Option<(U256, u64, &String)> {
     if n.struct_depth.is_empty() {
         return None;
@@ -1192,7 +1044,6 @@ fn struct_member(e: ExprId, n: &Names) -> Option<(U256, u64, &String)> {
     Some((path.root, offset, name))
 }
 
-/// `element.field` for a read of a packed field of a struct member.
 fn member_field_read(e: ExprId, n: &Names) -> Option<String> {
     if n.member_fields.is_empty() {
         return None;
@@ -1201,7 +1052,6 @@ fn member_field_read(e: ExprId, n: &Names) -> Option<String> {
     member_field(field.key, field.bit_offset, field.bits, n)
 }
 
-/// `element.field` for the packed field at `bit_offset` of the struct member `key` selects.
 fn member_field(key: ExprId, bit_offset: u32, bits: u32, n: &Names) -> Option<String> {
     let (root, offset, member) = struct_member(key, n)?;
     let name = n.member_fields.get(&(root, offset, bit_offset / 8, bits))?;
@@ -1209,8 +1059,6 @@ fn member_field(key: ExprId, bit_offset: u32, bits: u32, n: &Names) -> Option<St
     Some(format!("{}{}", whole.strip_suffix(member.as_str())?, name))
 }
 
-/// Render a storage key: a named variable or `stor_N` for a constant, `name[key]` for mapping and
-/// array elements, `name[key].member` for the members of a struct element.
 pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
     let text = fmt_slot_path(e, n, space);
     match struct_member(e, n) {
@@ -1219,7 +1067,6 @@ pub fn fmt_slot(e: ExprId, n: &Names, space: SlotSpace) -> String {
     }
 }
 
-/// `fmt_slot` without the member a bare struct element stands for.
 fn fmt_slot_path(e: ExprId, n: &Names, space: SlotSpace) -> String {
     let prefix = match space {
         SlotSpace::Persistent => "stor",
@@ -1752,8 +1599,6 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
     }
 }
 
-/// `b == 1` / `b == 0` with `b` boolean-valued: the boolean and whether the comparison holds
-/// when it is true.
 fn bool_against_const(a: ExprId, b: ExprId, n: &Names) -> Option<(ExprId, bool)> {
     for (x, c) in [(a, b), (b, a)] {
         if let Some(k) = expr::as_const(c) {
@@ -1770,7 +1615,6 @@ fn bool_against_const(a: ExprId, b: ExprId, n: &Names) -> Option<(ExprId, bool)>
     None
 }
 
-/// Right-hand side of a comparison, annotating selectors.
 fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
     if is_selector_expr(lhs) {
         if let Some(c) = expr::as_const(rhs) {
@@ -1785,10 +1629,6 @@ fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
     fmt_prec(rhs, prec, n)
 }
 
-/// Decode a revert/return payload into a readable form.
-/// The 4-byte selector at the start of a payload word, if the word is `sel << 224 | rest` where
-/// `rest` is anything with its top 32 bits clear (constant, or an OR with such a constant), or a
-/// short right-aligned word.
 pub fn leading_selector(word0: ExprId, len: Option<usize>) -> Option<u32> {
     let first_bytes = len.map(|l| l.min(32)).unwrap_or(32) as u32;
     if first_bytes < 4 {
@@ -1819,8 +1659,6 @@ pub fn leading_selector(word0: ExprId, len: Option<usize>) -> Option<u32> {
     None
 }
 
-/// Render ABI-encoded payload words: a revert reason string, `Panic(…)`, a custom error with its
-/// arguments, a returned string, or the words joined with commas.
 pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, kind: PayloadKind) -> String {
     if words.is_empty() {
         return String::new();
@@ -1889,9 +1727,6 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, kind: Payload
     parts.join(", ")
 }
 
-/// ABI word `i` of a payload that starts with a 4-byte selector: bytes `4 + 32*i .. 36 + 32*i`,
-/// which straddle memory words `i` and `i + 1`. The last word of a payload whose length is not a
-/// multiple of 32 holds its `len % 32` bytes right-aligned and is left-aligned here first.
 pub fn shifted_word_len(words: &[ExprId], i: usize, len: Option<usize>) -> ExprId {
     let align = |j: usize| -> ExprId {
         let w = words
@@ -1930,7 +1765,6 @@ fn panic_name(code: u64) -> String {
     }
 }
 
-/// Decode `Error(string)` payload words (selector-shifted) into the string.
 pub fn decode_string_payload(words: &[ExprId], payload_len: Option<usize>) -> Option<String> {
     let offset = expr::as_const(shifted_word_len(words, 0, payload_len))?;
     if offset != U256::from_u64(0x20) {
@@ -1954,7 +1788,6 @@ pub fn decode_string_payload(words: &[ExprId], payload_len: Option<usize>) -> Op
     Some(escape(&String::from_utf8_lossy(&bytes)))
 }
 
-/// Decode a string from plain (unshifted) words: [len, data...].
 pub fn decode_plain_string(words: &[ExprId]) -> Option<String> {
     let len = expr::as_const(*words.first()?)?.as_usize()?;
     if len == 0 || len > 1024 || words.len() < 2 {
@@ -1980,7 +1813,6 @@ pub fn decode_plain_string(words: &[ExprId]) -> Option<String> {
     Some(escape(&String::from_utf8_lossy(&bytes)))
 }
 
-/// Escape a string for a double-quoted Solidity literal.
 pub fn escape(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -1999,7 +1831,6 @@ pub fn escape(s: &str) -> String {
     out
 }
 
-/// Render the input of an external call: `abi.encodeWithSelector(...)` decoded when possible.
 pub fn fmt_call_input(
     words: &[ExprId],
     in_len: Option<U256>,
@@ -2031,7 +1862,6 @@ pub fn fmt_call_input(
     (None, words.iter().map(|w| fmt_expr(*w, n)).collect())
 }
 
-/// The name of the precompiled contract at a constant address.
 fn precompile_name(addr: U256) -> Option<&'static str> {
     if !addr.fits_u64() {
         return None;
@@ -2051,8 +1881,6 @@ fn precompile_name(addr: U256) -> Option<&'static str> {
     })
 }
 
-/// The pointer `p` when the range `off .. off + len` is the contents of the byte string at
-/// `p`: its length word at `p`, its bytes from `p + 32`.
 #[must_use]
 pub fn bytes_value(off: ExprId, len: ExprId) -> Option<ExprId> {
     let Node::MLoad(pointer, _) = expr::node(len) else {
@@ -2061,9 +1889,6 @@ pub fn bytes_value(off: ExprId, len: ExprId) -> Option<ExprId> {
     (expr::add_const(pointer, U256::from_u64(32)) == off).then_some(pointer)
 }
 
-/// The function and the leading arguments of a payload whose first words are known but whose
-/// tail is not (dynamic data the lifter did not follow): the selector's name and the head
-/// words after it.
 fn fmt_call_head(head: &[ExprId], n: &Names) -> (Option<String>, Vec<String>) {
     let Some(sel) = head.first().and_then(|w| leading_selector(*w, None)) else {
         return (None, vec![]);
@@ -2078,7 +1903,6 @@ fn fmt_call_head(head: &[ExprId], n: &Names) -> (Option<String>, Vec<String>) {
     (Some(name), args)
 }
 
-/// Render one statement as a line of pseudo-Solidity, without indentation.
 pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
     match s {
         Stmt::Assign { var, value } => format!("{} = {};", fmt_expr(*var, n), fmt_expr(*value, n)),
@@ -2382,7 +2206,6 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
     }
 }
 
-/// Remove one pair of enclosing parentheses when they wrap the whole string.
 fn strip_outer_parens(s: &str) -> &str {
     let b = s.as_bytes();
     if b.len() < 2 || b[0] != b'(' || b[b.len() - 1] != b')' {
@@ -2404,8 +2227,6 @@ fn strip_outer_parens(s: &str) -> &str {
     &s[1..s.len() - 1]
 }
 
-/// Render a terminator that ends the function (`return`, `revert`, `selfdestruct`, …) or has no
-/// structured form (an unresolved `jump`); `None` for branches and jumps within the function.
 pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
     Some(match t {
         Term::Return { off, len, data } => match data {
@@ -2497,7 +2318,6 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
     })
 }
 
-/// Unstructured rendering: labels and gotos. Used as the fallback and for debugging.
 pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     let mut out = String::new();
     let reach = crate::lift::reachable(l);

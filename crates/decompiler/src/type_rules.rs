@@ -1,12 +1,3 @@
-//! Rules over recovered types and widths.
-//!
-//! The type solver ([`crate::types`]) knows the width, signedness and uses of every parameter,
-//! helper argument, storage slot and packed field. These rules ask the questions that only make
-//! sense with that knowledge: was a wide value narrowed without a check, is one value treated as
-//! both signed and unsigned, is an account computed with arithmetic, is a hash used as a number,
-//! does a narrow storage counter advance. Every rule is stated in widths and uses, never in
-//! names, so it applies to any contract.
-
 use crate::analyze::{display_name, push, Confidence, Finding, Severity};
 use crate::compiler::Kind;
 use crate::decompile::{Contract, Function, StorageVar};
@@ -21,10 +12,8 @@ use crate::types::{self, Loc, Ty, TypeEnv};
 use crate::u256::U256;
 use std::collections::HashSet;
 
-/// Nodes visited per expression walk before giving up.
 const MAX_VISITED: usize = 20_000;
 
-/// Run every type-based rule.
 pub fn findings(
     c: &Contract,
     env: &TypeEnv,
@@ -38,14 +27,10 @@ pub fn findings(
     narrow_counters(c, env, out);
 }
 
-/// Where a narrowed value ends up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sink {
-    /// Written to storage.
     Stored,
-    /// Sent to another contract (call payload or value).
     Passed,
-    /// Returned to the caller.
     Returned,
 }
 
@@ -59,33 +44,20 @@ impl Sink {
     }
 }
 
-/// A statement whose expressions are a sink for a narrowed value.
 struct SinkSite {
     sink: Sink,
-    /// The expressions the statement consumes.
     exprs: Vec<ExprId>,
-    /// The rendered statement, used as evidence.
     line: String,
 }
 
-/// The function being judged and the body (itself or a helper it calls) being scanned.
 struct Downcast<'a> {
     c: &'a Contract,
     env: &'a TypeEnv,
-    /// The external function the finding is reported on.
     f: &'a Function,
-    /// The body being scanned: `f` or one of its helpers.
     body: &'a Function,
-    /// Declared parameter types of `f`, when its signature is known and has only value types.
     declared: Option<&'a [String]>,
 }
 
-/// A `uint256` (or wider than the mask) value cut down to `N` bits with no range check first:
-/// the high bits vanish instead of reverting. Solc >= 0.8 masks only for explicit `uintN(x)`
-/// casts (declared `uintN` values are validated, not masked), so a bare mask on an arithmetic
-/// result there is an unchecked downcast. The decoder and the cleanup of narrow types also mask
-/// parameters, so a parameter counts only when the signature declares it wider or the code uses
-/// it unmasked elsewhere.
 fn unchecked_downcasts(
     c: &Contract,
     env: &TypeEnv,
@@ -160,8 +132,6 @@ fn report_downcast(
 }
 
 impl Downcast<'_> {
-    /// Is the value masked to `bits` wider than that, and unchecked? Returns how sure the rule
-    /// is and a description of the value.
     fn source(&self, x: ExprId, bits: u32) -> Option<(Confidence, String)> {
         let info = self
             .env
@@ -196,7 +166,6 @@ impl Downcast<'_> {
     }
 }
 
-/// The function and the internal helpers it calls, transitively.
 fn bodies<'a>(c: &'a Contract, f: &'a Function) -> Vec<&'a Function> {
     let mut out = vec![f];
     let mut seen: HashSet<usize> = HashSet::new();
@@ -217,8 +186,6 @@ fn bodies<'a>(c: &'a Contract, f: &'a Function) -> Vec<&'a Function> {
     out
 }
 
-/// The declared type of every calldata head word, from the signature, when it has only value
-/// types (tuples and static arrays would need a layout).
 fn declared_param_types(f: &Function) -> Option<Vec<String>> {
     let sig = f.signature.as_ref()?;
     let params = sigs::params_of(sig);
@@ -228,7 +195,6 @@ fn declared_param_types(f: &Function) -> Option<Vec<String>> {
     Some(params)
 }
 
-/// The printed name of calldata head word `word` of `f`.
 fn param_name(f: &Function, word: u32) -> String {
     f.params
         .iter()
@@ -237,7 +203,6 @@ fn param_name(f: &Function, word: u32) -> String {
         .unwrap_or_else(|| format!("arg{}", word))
 }
 
-/// Statements of a node whose expressions are a sink for a narrowed value.
 fn sink_statements(nd: &lift::LNode, names: &Names) -> Vec<SinkSite> {
     let mut out = Vec::new();
     for s in &nd.stmts {
@@ -277,8 +242,6 @@ fn sink_statements(nd: &lift::LNode, names: &Names) -> Vec<SinkSite> {
     out
 }
 
-/// `(masked value, width)` for every `x & (2^N - 1)` under `roots` that is a narrowing (8 to
-/// 248 bits, whole bytes) and not a packing piece.
 fn masks_in(roots: &[ExprId], packing: &HashSet<ExprId>) -> Vec<(ExprId, u32)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -304,7 +267,6 @@ fn masks_in(roots: &[ExprId], packing: &HashSet<ExprId>) -> Vec<(ExprId, u32)> {
     out
 }
 
-/// Does the declared ABI type hold more than `bits` bits?
 fn wider_than(ty: &str, bits: u32) -> bool {
     match ty {
         "uint" | "int" | "uint256" | "int256" | "bytes32" => true,
@@ -316,11 +278,8 @@ fn wider_than(ty: &str, bits: u32) -> bool {
     }
 }
 
-/// Where a location lives, for the report.
 struct Place<'a> {
-    /// The function it belongs to, when any.
     function: Option<&'a Function>,
-    /// A phrase naming it (`parameter \`arg0\` of \`transfer\``).
     phrase: String,
 }
 
@@ -397,8 +356,6 @@ fn describe<'a>(c: &'a Contract, loc: &Loc) -> Option<Place<'a>> {
     }
 }
 
-/// The same value compared as a signed number in one place and as an unsigned number in
-/// another: one of the two comparisons is wrong for every value with the top bit set.
 fn sign_confusion(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     for loc in env.locations() {
         if !matches!(loc, Loc::Param { .. } | Loc::Slot(_) | Loc::Field { .. }) {
@@ -430,8 +387,6 @@ fn sign_confusion(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     }
 }
 
-/// An account computed with arithmetic (`add`, `mul`, ...) rather than decoded, loaded or
-/// derived from a hash: either a packing mistake or an address meant to be forged.
 fn arithmetic_accounts(
     c: &Contract,
     env: &TypeEnv,
@@ -479,9 +434,6 @@ fn arithmetic_accounts(
     }
 }
 
-/// A `bytes32` parameter or storage value (a hash) used in arithmetic. Reducing a hash to a
-/// range (`% n`) is the weak-randomness rule's job; this covers hashes added to, subtracted
-/// from or multiplied (commitment arithmetic, hand-rolled identifiers).
 fn hashes_as_numbers(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     for loc in env.locations() {
         if !matches!(loc, Loc::Param { .. } | Loc::Slot(_) | Loc::Field { .. }) {
@@ -510,7 +462,6 @@ fn hashes_as_numbers(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     }
 }
 
-/// The text of a narrow-counter finding.
 struct CounterMessage {
     title: &'static str,
     description: String,
@@ -518,8 +469,6 @@ struct CounterMessage {
     severity: Severity,
 }
 
-/// A storage counter or timestamp of 64 bits or less that advances: it wraps silently before
-/// solc 0.8 and reverts for good after it.
 fn narrow_counters(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     for loc in env.locations() {
         if !matches!(loc, Loc::Slot(_) | Loc::Field { .. }) {
@@ -594,7 +543,6 @@ fn counter_message(
     }
 }
 
-/// `x + c` (possibly masked back to the field's width) where `x` reads `loc` itself.
 fn increments_self(e: ExprId, scope: usize, loc: &Loc, env: &TypeEnv) -> bool {
     let e = match expr::node(e) {
         Node::Op(op::AND, v) if v.iter().any(|m| expr::as_const(*m).is_some()) => v
@@ -612,14 +560,12 @@ fn increments_self(e: ExprId, scope: usize, loc: &Loc, env: &TypeEnv) -> bool {
         && v.iter().any(|x| expr::as_const(*x).is_some())
 }
 
-/// Does the expression read the block clock?
 fn mentions_clock(e: ExprId) -> bool {
     expr::contains(e, &|n| {
         matches!(n, Node::Env(op::TIMESTAMP | op::NUMBER, _))
     })
 }
 
-/// `2^bits - 1` as prose.
 fn max_value(bits: u32) -> String {
     match bits {
         8 => "255".into(),
@@ -630,7 +576,6 @@ fn max_value(bits: u32) -> String {
     }
 }
 
-/// The phrase with its first letter upper-cased, to start a sentence.
 fn capitalise(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {

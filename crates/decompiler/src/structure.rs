@@ -1,6 +1,3 @@
-//! Control-flow structuring: turns the lifted graph into nested `if`/`else`/`while`/`require`
-//! with `break`/`continue`, falling back to labelled `goto` only when the graph is irreducible.
-
 use crate::emit::{self, Names, PayloadKind};
 use crate::expr::{self, ExprId, Node};
 use crate::lift::{self, Lifted, Stmt, Term};
@@ -200,7 +197,6 @@ impl Graph {
     }
 }
 
-/// A node (or jump chain) that only reverts / fails, with no other side effects.
 fn is_noreturn_leaf(l: &Lifted, mut x: usize) -> bool {
     let mut seen = HashSet::new();
     loop {
@@ -223,7 +219,6 @@ fn is_noreturn_leaf(l: &Lifted, mut x: usize) -> bool {
 
 struct Loop {
     body: HashSet<usize>,
-    /// Nodes outside the loop that are jumped to from inside.
     exits: Vec<usize>,
 }
 
@@ -276,46 +271,26 @@ struct Printer<'a> {
     names: &'a Names,
     out: String,
     emitted: HashSet<usize>,
-    /// Nodes that have been referenced by a goto and so need a label.
     labels: HashSet<usize>,
-    /// Loop context stack: (header, exit node to break to, body depth).
     loop_stack: Vec<(usize, Option<usize>, usize)>,
     gotos: usize,
-    /// Nodes currently being emitted as a structured region (to avoid re-entering).
     active: HashSet<usize>,
-    /// Fresh variable ids for the temporaries of cyclic parallel copies.
     next_tmp: u32,
-    /// Every expression a non-`Drop` statement or terminator mentions (a dropped value that is
-    /// used elsewhere - a call result tested later - is not "ignored").
     used: Vec<ExprId>,
-    /// Boolean facts known on the current path: (condition, value).
     facts: Vec<(ExprId, bool)>,
-    /// Per store statement `(node, index)`: loads of the same slot from before the store that
-    /// are still used afterwards, each with the temporary that keeps the old value.
     stale_plan: HashMap<(usize, usize), Vec<(ExprId, String)>>,
-    /// Values stored to a slot, by the node that stored them: `(node, slot name, value)`.
-    /// Printed as the slot in the statements that follow (see `Names::forwarded`).
     stored: Vec<(usize, String, ExprId)>,
-    /// Memory stores nothing reads before the function ends (not printed).
     dead_stores: HashSet<(usize, usize)>,
-    /// Statements folded into an earlier line (the element store of a `push`): not printed.
-    /// Filled while the printer's `&self` rendering methods run, hence the cell.
+    // Filled while the printer's &self methods run, hence the cell.
     skipped: RefCell<HashSet<(usize, usize)>>,
 }
 
-/// A log whose data is the ABI encoding of a calldata range, with the stores that built it.
 struct FoldedLog {
-    /// Index of the `Log` statement in the block.
     index: usize,
-    /// Printed data argument (`abi.encode(msg.data)`).
     text: String,
-    /// Indices of the encoding stores the printed form stands for.
     hidden: Vec<usize>,
 }
 
-/// `emit E(..., bytes data)` where `data` is a calldata range: the compiler writes the ABI
-/// encoding of a `bytes` value (`0x20`, the length, the bytes, zero padding) at the free pointer
-/// and logs that region.
 fn encoded_bytes_logs(stmts: &[Stmt]) -> Vec<FoldedLog> {
     let mut out = Vec::new();
     for (i, s) in stmts.iter().enumerate() {
@@ -390,9 +365,6 @@ fn encoded_bytes_logs(stmts: &[Stmt]) -> Vec<FoldedLog> {
     out
 }
 
-/// A copy of calldata into memory that the next statement sends on as a call's whole payload:
-/// the call prints with `msg.data` (or the slice copied) and the copy is not printed. Returns
-/// the indices of the copies and records each payload's text in `names`.
 fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) -> Vec<usize> {
     let live: Vec<usize> = (0..stmts.len()).filter(|i| !hidden.contains(i)).collect();
     let mut folded = Vec::new();
@@ -435,18 +407,13 @@ fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) ->
     folded
 }
 
-/// What a statement overwrites, for the stale-load planner: a persistent storage slot, or the
-/// contract's own balance (every statement that advances the storage generation may move ether).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Overwritten {
     Slot(ExprId),
     Balance,
-    /// The memory word at this address.
     Memory(ExprId),
 }
 
-/// Loads of `what` with generation at most `gen` anywhere in `e`, outside `skip` (the value
-/// the statement stores, which later prints as the slot itself).
 fn stale_loads_in(
     e: ExprId,
     what: Overwritten,
@@ -473,7 +440,6 @@ fn stale_loads_in(
     }
 }
 
-/// The slot or balance a statement overwrites, with the generation its stale loads carry.
 fn overwrites(st: &Stmt, names: &Names) -> Option<(Overwritten, u32)> {
     match st {
         Stmt::SStore {
@@ -501,8 +467,6 @@ fn overwrites(st: &Stmt, names: &Names) -> Option<(Overwritten, u32)> {
     }
 }
 
-/// The lowest generation among the unresolved loads of each memory address in the function: a
-/// store can only have stale loads when one of its address is stamped at or below it.
 fn earliest_loads(l: &Lifted) -> HashMap<ExprId, u32> {
     let mut earliest: HashMap<ExprId, u32> = HashMap::new();
     let mut seen: HashSet<ExprId> = HashSet::new();
@@ -521,9 +485,6 @@ fn earliest_loads(l: &Lifted) -> HashMap<ExprId, u32> {
     earliest
 }
 
-/// The value statement `i` stores to a memory word, when the rest of its block can print that
-/// value as the word itself: a full-word store the lifter executed, of a value that is not a
-/// constant, with nothing after it in the block that writes memory.
 fn memory_forward(stmts: &[Stmt], i: usize) -> Option<ExprId> {
     let Stmt::MStore {
         val,
@@ -548,8 +509,6 @@ fn memory_forward(stmts: &[Stmt], i: usize) -> Option<ExprId> {
     plain.then_some(*val)
 }
 
-/// A temporary name for the old value of a slot or of the balance: `prev_<name>`, with the
-/// characters of a mapping key folded into the identifier (`prev_stor_8_msg_sender`).
 fn prev_name(what: Overwritten, names: &Names) -> String {
     let base = match what {
         Overwritten::Slot(key) => emit::fmt_slot(key, names, emit::SlotSpace::Persistent),
@@ -567,10 +526,7 @@ fn prev_name(what: Overwritten, names: &Names) -> String {
     format!("prev_{}", id.trim_end_matches('_'))
 }
 
-/// For every store to a slot and every call that may move ether, the loads of that slot (or of
-/// the balance) taken before the statement and used after it, in the rest of the block or
-/// anywhere reachable from it. Printing those as the slot name or `address(this).balance`
-/// would read the new value, so each gets a temporary saved just before the statement.
+// Printing these loads as the slot name would read the new value.
 fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(ExprId, String)>> {
     let mut plan: HashMap<(usize, usize), Vec<(ExprId, String)>> = HashMap::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
@@ -656,11 +612,8 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
     plan
 }
 
-/// A recognised peeled iteration: the phi copies `(loop variable, value)` that start the loop
-/// from the peeled state, and the `(copy node, loop node)` pairs.
 type Peel = (Vec<(ExprId, ExprId)>, Vec<(usize, usize)>);
 
-/// Substitute phi variables by their initial values.
 fn with_init(e: ExprId, init: &HashMap<ExprId, ExprId>) -> ExprId {
     expr::substitute(
         e,
@@ -672,13 +625,6 @@ fn with_init(e: ExprId, init: &HashMap<ExprId, ExprId>) -> ExprId {
     )
 }
 
-/// Control-flow recovery sometimes runs the first iteration of a loop on its own: the header, the
-/// body and the exit each get a copy specialised to the state before the loop (`i = 0`, a
-/// parameter still in its slot), and the loop proper starts at the second iteration. Printed as
-/// is, that reads as an unrolled iteration before a `while`. When the copy is provably one
-/// iteration of the loop (node for node, its statements, conditions and phi copies equal the
-/// loop's with the loop's variables replaced by the copy's values), the edges into the copied
-/// header are redirected to the real header, with those values as the phi copies.
 fn reroll_peeled_loops(l: &Lifted) -> Lifted {
     let g = Graph::new(l);
     let loops = find_loops(&g);
@@ -778,9 +724,6 @@ fn reroll_peeled_loops(l: &Lifted) -> Lifted {
     out
 }
 
-/// Is `hp` (outside the loop) a copy of loop node `q0` that runs one iteration of the loop
-/// specialised to the state before it? On success, the phi copies that start the loop from that
-/// state (`(loop variable, value)`) and the pairs `(copy node, loop node)`.
 fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
     let debug = std::env::var("EVMDEC_DEBUG_PEEL").is_ok();
     let fail = |why: &str| {
@@ -943,7 +886,6 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
     Some((init, pairs))
 }
 
-/// Replace node ids in a terminator.
 fn remap_term_nodes(t: &Term, m: &HashMap<usize, usize>) -> Term {
     let map = |x: usize| *m.get(&x).unwrap_or(&x);
     match t {
@@ -961,9 +903,6 @@ fn remap_term_nodes(t: &Term, m: &HashMap<usize, usize>) -> Term {
     }
 }
 
-/// Memory stores (at any offset) after which nothing on any path to the end of the function
-/// reads memory: the returndata copies of a `(bool ok,) = x.call(...)` whose bytes are dropped,
-/// for instance. Keyed by `(node, statement index)`.
 fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
     let mentions_memory = |e: ExprId| {
         expr::contains(e, &|n| {
@@ -1051,13 +990,8 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
     dead
 }
 
-/// Word stores to constant addresses that nothing running afterwards can read: no later
-/// statement of the function loads the address or hands a range holding it to a call, a hash,
-/// a log or a return, and no internal function called later reads it. A later overwrite is
-/// not taken as ending a store's life, so a load printed after its own address was rewritten
-/// still keeps every earlier store. A store found unread stops counting as a reader itself,
-/// and the search repeats until nothing more falls out. A store into a named memory block is left alone: the
-/// block's line is built from it. Keyed by `(node, statement index)`.
+// A later overwrite does not end a store's life.
+// A store into a named block is left alone. The block's line is built from it.
 fn unread_fixed_stores(l: &Lifted, names: &Names) -> HashSet<(usize, usize)> {
     let fixed = |s: &Stmt| match s {
         Stmt::MStore { off, width, .. } if emit::block_ref(*off, names).is_none() => {
@@ -1157,7 +1091,6 @@ fn unread_fixed_stores(l: &Lifted, names: &Names) -> HashSet<(usize, usize)> {
     }
 }
 
-/// Where an expression occurs inside a node, in evaluation order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum Pos {
     Stmt(usize),
@@ -1165,7 +1098,6 @@ enum Pos {
     Edge,
 }
 
-/// Operator nodes in `e` (leaves and masks do not count): the cost of reading it again.
 fn weight(e: ExprId) -> usize {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
@@ -1186,10 +1118,7 @@ fn weight(e: ExprId) -> usize {
     w
 }
 
-/// An expression worth a temporary when it is used more than once: some arithmetic over at
-/// least one non-constant input (storage, balance, return data, calldata, a parameter, a
-/// variable, the environment), not reading memory (whose version semantics a temporary would
-/// hide) and not a condition.
+// Memory reads are never bound. A temporary would hide which version of memory they read.
 fn bindable(e: ExprId) -> bool {
     if expr::is_boolean(e) || expr::is_const(e) || weight(e) < 2 {
         return false;
@@ -1203,14 +1132,9 @@ fn bindable(e: ExprId) -> bool {
     !reads_memory
 }
 
-/// Sub-expressions of `e` that are worth binding, with the number of times each occurs,
-/// operands before the expression that uses them and left to right (the order the source would
-/// introduce locals in). An operand of a repeated sub-expression counts once per repetition;
-/// the counts are carried down the shared graph, never by walking a repetition again.
-///
-/// Storage keys and hashes are left whole (a bound key would lose the slot's name), and so is
-/// the ABI packing of an `encoded` word: its shifts, ors and masks are what the printer undoes
-/// to show the arguments, so only the arguments themselves are candidates.
+// Counts are carried down the shared graph. Walking each repetition again is exponential.
+// Storage keys and hashes stay whole. A bound key would lose the slot's name.
+// The packing of an encoded word stays whole. The printer undoes it to show the arguments.
 fn bindable_subexprs(e: ExprId, encoded: bool, out: &mut Vec<(ExprId, usize)>) {
     let packs = |x: ExprId, encoded: bool| {
         encoded
@@ -1268,7 +1192,6 @@ fn bindable_subexprs(e: ExprId, encoded: bool, out: &mut Vec<(ExprId, usize)>) {
     }
 }
 
-/// Expressions a terminator evaluates, apart from memory addressing: `(expression, encoded)`.
 fn term_reads(t: &Term) -> Vec<(ExprId, bool)> {
     match t {
         Term::Branch { cond, .. } => vec![(*cond, false)],
@@ -1281,7 +1204,6 @@ fn term_reads(t: &Term) -> Vec<(ExprId, bool)> {
     }
 }
 
-/// The `Var`s an expression reads.
 fn vars_in(e: ExprId) -> HashSet<ExprId> {
     let mut out = HashSet::new();
     let mut seen = HashSet::new();
@@ -1298,9 +1220,6 @@ fn vars_in(e: ExprId) -> HashSet<ExprId> {
     out
 }
 
-/// Expressions a statement evaluates, as `(expression, encoded)`: assignment targets, memory
-/// addressing, storage keys and packed-field writes are left out, as is a statement the printer
-/// drops. `encoded` marks ABI-packed payload words.
 fn stmt_reads(s: &Stmt, names: &Names) -> Vec<(ExprId, bool)> {
     let plain = |v: &[ExprId]| v.iter().map(|e| (*e, false)).collect::<Vec<_>>();
     let words = |v: &[ExprId]| v.iter().map(|e| (*e, true)).collect::<Vec<_>>();
@@ -1367,7 +1286,6 @@ fn stmt_reads(s: &Stmt, names: &Names) -> Vec<(ExprId, bool)> {
     }
 }
 
-/// Sequence numbers of the calls, creations and helper calls whose results `e` reads.
 fn result_seqs(e: ExprId) -> HashSet<u32> {
     let mut out = HashSet::new();
     let mut seen = HashSet::new();
@@ -1390,7 +1308,6 @@ fn result_seqs(e: ExprId) -> HashSet<u32> {
     out
 }
 
-/// Nearest common dominator of `nodes`.
 fn common_dominator(g: &Graph, nodes: &[usize]) -> usize {
     let chain = |mut x: usize| -> Vec<usize> {
         let mut v = vec![x];
@@ -1411,8 +1328,6 @@ fn common_dominator(g: &Graph, nodes: &[usize]) -> usize {
     common[0]
 }
 
-/// The newest storage generation an expression's loads (of storage or of the balance) carry:
-/// the expression was evaluated while that generation was current.
 fn newest_gen(e: ExprId) -> u32 {
     let mut g = 0;
     let mut seen = HashSet::new();
@@ -1430,11 +1345,6 @@ fn newest_gen(e: ExprId) -> u32 {
     g
 }
 
-/// Would evaluating `e` at the end of node `d` give the value every frontier use reads? True
-/// when nothing between `d` and those uses can change what `e` reads: every store or call on
-/// the way comes after the loads `e` carries (its generation is at least theirs, so the loaded
-/// values predate it), no variable `e` reads is assigned, and none of the results it reads is
-/// produced on the way.
 fn available_at(
     l: &Lifted,
     g: &Graph,
@@ -1518,7 +1428,6 @@ fn available_at(
     true
 }
 
-/// Does `a` reach `b` (through a's successors onward)?
 fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
     let mut seen = HashSet::new();
     let mut stack: Vec<usize> = l.nodes[a].succs.clone();
@@ -1534,7 +1443,6 @@ fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
     false
 }
 
-/// Does `a` reach `b` through nodes of `within` (a's successors onward)?
 fn reaches_within(l: &Lifted, a: usize, b: usize, within: &HashSet<usize>) -> bool {
     let mut seen = HashSet::new();
     let mut stack: Vec<usize> = l.nodes[a].succs.clone();
@@ -1550,11 +1458,6 @@ fn reaches_within(l: &Lifted, a: usize, b: usize, within: &HashSet<usize>) -> bo
     false
 }
 
-/// Bind sub-expressions that several statements evaluate to temporaries, defined where the first
-/// of them runs, the way the source held them in locals. A binding is made only where the
-/// first use dominates every other use and none of the variables it reads is reassigned on the
-/// way, so each use still denotes the same value; the printed code then also keeps the value a
-/// later store or call would otherwise appear to change.
 fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
     let g = Graph::new(l);
     let debug = std::env::var("EVMDEC_DEBUG_BIND").is_ok();
@@ -1798,7 +1701,6 @@ impl<'a> Printer<'a> {
         self.l.nodes[n].pc
     }
 
-    /// Is `n` a small terminal region (ends the call frame within a few nodes, no branches)?
     fn is_small_terminal(&self, mut n: usize) -> bool {
         let mut count = 0;
         let mut seen = HashSet::new();
@@ -1816,7 +1718,6 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// Is `n` a plain revert (possibly with a reason) with no other side effects?
     fn revert_reason(&self, mut n: usize) -> Option<Option<String>> {
         let mut seen = HashSet::new();
         let mut stores: Vec<(ExprId, ExprId)> = Vec::new();
@@ -1889,8 +1790,6 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// `success = to.call{value: v, gas: (v == 0) * 2300}(""); require(success);` is Solidity's
-    /// `to.transfer(v)`: print it that way and continue on the success path.
     fn try_transfer_idiom(&mut self, n: usize, stop: Option<usize>, depth: usize) -> bool {
         let nd = &self.l.nodes[n];
         let Term::Branch {
@@ -1952,10 +1851,6 @@ impl<'a> Printer<'a> {
         true
     }
 
-    /// Render a call of the array-resize helper on `slot` to `new_len`: `push` when the length
-    /// grows by one and the next statement stores the new last element (that store is then
-    /// skipped), `pop` when it shrinks by one, `length = n` otherwise. `None` when `slot` is
-    /// not a constant.
     fn array_resize(
         &self,
         node: usize,
@@ -2026,7 +1921,6 @@ impl<'a> Printer<'a> {
         ))
     }
 
-    /// Make the stored values of the nodes dominating `n` print as their slots in `n`.
     fn refresh_forwarded(&self, n: usize) {
         let mut fw = self.names.forwarded.borrow_mut();
         fw.clear();
@@ -2165,9 +2059,7 @@ impl<'a> Printer<'a> {
         self.names.replace_stale_in_block(replaced);
     }
 
-    /// Edge copies are simultaneous: print them in an order where no right-hand side reads a
-    /// variable assigned above it, saving a variable's old value in a temporary when the copies
-    /// form a cycle (`a = b; b = a`).
+    // Edge copies are simultaneous.
     fn assign_lines(&mut self, assigns: &[(ExprId, ExprId)], depth: usize) {
         let mut rem: Vec<(ExprId, ExprId)> =
             assigns.iter().copied().filter(|(a, b)| a != b).collect();
@@ -2212,14 +2104,11 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// Emit control transfer to `to` from `from` at the end of a region: either falls through to
-    /// `stop`, breaks/continues, or emits the node inline / a goto.
     fn transfer(&mut self, from: usize, to: usize, stop: Option<usize>, depth: usize) {
         self.edge_assigns(from, to, depth);
         self.go(to, stop, depth);
     }
 
-    /// Continue emission at node `n` until `stop`.
     fn go(&mut self, n: usize, stop: Option<usize>, depth: usize) {
         if Some(n) == stop {
             return;
@@ -2269,7 +2158,6 @@ impl<'a> Printer<'a> {
         self.emit_node(n, stop, depth);
     }
 
-    /// Emit a copy of a small terminal chain.
     fn emit_dup(&mut self, mut n: usize, depth: usize) {
         loop {
             self.stmts(n, depth);
@@ -2462,7 +2350,6 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// Is `cond` known true/false on the current path?
     fn known(&self, cond: ExprId) -> Option<bool> {
         let ncond = expr::op1(op::ISZERO, cond);
         for (c, v) in self.facts.iter().rev() {
@@ -2612,7 +2499,6 @@ impl<'a> Printer<'a> {
         self.active.remove(&n);
     }
 
-    /// Statements of `n` the printer would show.
     fn visible_stmts(&self, n: usize) -> Vec<&Stmt> {
         let dead = emit::dead_memory_stores(&self.l.nodes[n].stmts);
         self.l.nodes[n]
@@ -2629,7 +2515,6 @@ impl<'a> Printer<'a> {
             .collect()
     }
 
-    /// The node `n` stands for once empty nodes that only jump on are skipped.
     fn skip_empty(&self, mut n: usize) -> usize {
         for _ in 0..8 {
             let has_edges = self
@@ -2645,7 +2530,6 @@ impl<'a> Printer<'a> {
         n
     }
 
-    /// Do nodes `a` and `b` print the same and continue the same way?
     fn same_side(&self, a: usize, b: usize) -> bool {
         self.same_side_depth(a, b, 3)
     }
@@ -2712,8 +2596,6 @@ impl<'a> Printer<'a> {
         edges(a) == edges(b)
     }
 
-    /// `return (c)` / `return (!c)` for a branch whose two sides return the constants of a
-    /// single `bool` result and nothing else.
     fn try_bool_return(&self, cond: ExprId, t: usize, f: usize) -> Option<String> {
         if self.names.bool_returns.as_slice() != [true] {
             return None;
@@ -2771,7 +2653,6 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// Edge copies of a side that is either the join itself or a statement-free node jumping to it.
     fn side_assigns(&self, n: usize, side: usize, join: usize) -> Option<Vec<(ExprId, ExprId)>> {
         if side == join {
             return Some(
@@ -2857,8 +2738,6 @@ impl<'a> Printer<'a> {
         Some(txt)
     }
 
-    /// Does the region starting at `start` never reach `join` (every path halts, breaks or continues)?
-    /// With no join, the region must be small and every path must end in a halt.
     fn region_is_terminal(&self, start: usize, join: Option<usize>) -> bool {
         let mut seen = HashSet::new();
         let mut stack = vec![start];
@@ -2904,15 +2783,11 @@ fn reason_suffix(reason: &Option<String>) -> String {
 }
 
 #[derive(Clone, Debug)]
-/// Structured rendering of one function body.
 pub struct Structured {
-    /// The body as indented pseudo-Solidity.
     pub text: String,
-    /// Number of `goto`s that were needed because the graph is irreducible.
     pub gotos: usize,
 }
 
-/// Structure and render `l` at `base_depth` levels of indentation (four spaces each).
 pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     let g = Graph::new(l);
     let loops = find_loops(&g);
@@ -3026,8 +2901,6 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     }
 }
 
-/// Drop the locals that keep an old value (`uint256 prev_x = x;`) and are never read: every use
-/// the planner saw was in a statement that is not printed.
 fn drop_unused_previous(text: &str) -> String {
     let declared = |line: &str| -> Option<String> {
         let rest = line.trim_start().strip_prefix("uint256 prev")?;
@@ -3063,9 +2936,7 @@ fn drop_unused_previous(text: &str) -> String {
     out
 }
 
-/// Empty branches: `} else {` directly followed by `}` loses the else; `if (...) {` directly
-/// followed by `}` (and no else) disappears entirely (conditions are pure). Repeated until stable,
-/// since removing an else can expose an empty if and vice versa.
+// Repeated until stable. Removing an else can expose an empty if.
 fn drop_empty_else(text: &str) -> String {
     let mut cur = text.to_string();
     for _ in 0..16 {
@@ -3113,10 +2984,6 @@ fn drop_empty_once(text: &str) -> String {
     s
 }
 
-/// Structured rendering of `l`, indented by `indent` (a multiple of four spaces); the
-/// counterpart of [`emit::fmt_flat`].
-/// Structured rendering of a lifted unit, after re-rolling peeled first iterations and binding
-/// shared sub-expressions to temporaries (`structure` alone does neither).
 pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
     let depth = indent.len() / 4;
     let rolled = reroll_peeled_loops(l);
@@ -3124,7 +2991,6 @@ pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
     structure(&bound, n, depth).text
 }
 
-/// The memory image at `ptr` written by constant word stores, as 32-byte words plus its length.
 fn payload_from_stores(stores: &[(ExprId, ExprId)], ptr: ExprId) -> Option<(Vec<ExprId>, u64)> {
     let (pt, pc) = crate::idiom::addends(ptr);
     let mut image: Vec<u8> = Vec::new();

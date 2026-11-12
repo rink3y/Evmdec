@@ -275,14 +275,25 @@ pub struct Contract {
     /// chosen at run time, read and linked when the contract is fetched by address.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub call_target_slots: Vec<String>,
+    /// Of `call_targets` and `call_target_slots`, the ones some call may change the state of
+    /// (`CALL`/`CALLCODE`); the others are only ever read with `STATICCALL`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub written_targets: Vec<String>,
     /// The addresses found in `call_target_slots` when fetched: `(slot, address)`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stored_targets: Vec<(String, String)>,
-    /// Contracts fetched and decompiled at this contract's hard-coded call targets, one level
-    /// deep, when following links over RPC. Each is taken as found: a target that is itself a
-    /// proxy appears as its stub, and the JSON output carries the contracts without reports.
+    /// Every contract fetched because this one, or one fetched with it, calls it: one flat list
+    /// on the contract that was asked for, each entry saying in `link` how it was reached. Each
+    /// is resolved like the root (a proxy with its implementation, a diamond with its facets).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub linked: Vec<Contract>,
+    /// How this contract was reached, when it was fetched as a dependency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<Link>,
+    /// Call targets that were seen but not fetched, with the reason, on the contract that was
+    /// asked for.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unfollowed: Vec<Unfollowed>,
     /// Addresses the contract's own storage approves as callers of its gated functions, read
     /// when it was fetched: the address held in a slot `msg.sender` is compared with, or one
     /// whose entry in a mapping tested under `msg.sender` is set. Only contracts fetched in the
@@ -624,6 +635,11 @@ pub fn compose(
                 shell.library_targets.push(v);
             }
         }
+        for v in part.written_targets {
+            if !shell.written_targets.contains(&v) {
+                shell.written_targets.push(v);
+            }
+        }
         for v in part.call_target_slots {
             if !shell.call_target_slots.contains(&v) {
                 shell.call_target_slots.push(v);
@@ -718,6 +734,28 @@ pub struct ProxyRef {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// The implementation's own decompilation, when its code was fetched.
     pub contract: Option<Box<Contract>>,
+}
+
+/// The call edge a dependency was fetched along.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct Link {
+    /// Address of the contract that calls this one.
+    pub from: String,
+    /// How the caller names it: a fixed address, a library, the address in a storage slot.
+    pub how: String,
+    /// Call edges between the contract that was asked for and this one.
+    pub depth: usize,
+}
+
+/// A call target that was not fetched.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct Unfollowed {
+    /// The target: an address, or the slot holding it when the slot was not read.
+    pub target: String,
+    /// Address of the contract that calls it.
+    pub from: String,
+    /// Why it was left out.
+    pub reason: String,
 }
 
 /// Decompile a bytecode blob: runtime code, or creation code with its constructor.
@@ -972,6 +1010,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     tick("lift main", &mut tt);
     let mut orphans: BTreeMap<usize, Lifted> = BTreeMap::new();
     for (b, unit) in &rec.orphans {
+        crate::clock::check();
         let t1 = std::time::Instant::now();
         orphans.insert(prog.blocks[*b].start, int_lifter.lift(unit, None));
         if timing && t1.elapsed().as_millis() > 200 {
@@ -1346,6 +1385,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             .lifted
             .as_ref()
             .expect("functions are lifted before they are printed");
+        crate::clock::check();
         let t1 = std::time::Instant::now();
         let body = if opts.flat {
             emit::fmt_flat(l, &names, "        ")
@@ -1434,6 +1474,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     let mut library_targets: Vec<String> = Vec::new();
     let mut call_targets: Vec<String> = Vec::new();
     let mut call_target_slots: Vec<String> = Vec::new();
+    let mut written_targets: Vec<String> = Vec::new();
     let mut diamond_lookup: Option<DiamondLookup> = None;
     for f in &functions {
         let Some(l) = &f.lifted else { continue };
@@ -1454,6 +1495,9 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                         {
                             if let Some(c) = expr::as_const(k) {
                                 let h = c.to_hex_padded(32);
+                                if *kind != op::STATICCALL && !written_targets.contains(&h) {
+                                    written_targets.push(h.clone());
+                                }
                                 if !call_target_slots.contains(&h) {
                                     call_target_slots.push(h);
                                 }
@@ -1487,6 +1531,9 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                                 low.fits_u64() && (1..=0x11).contains(&low.low_u64());
                             if !low.is_zero() && !is_precompile {
                                 let h = low.to_hex_padded(20);
+                                if *kind != op::STATICCALL && !written_targets.contains(&h) {
+                                    written_targets.push(h.clone());
+                                }
                                 if !call_targets.contains(&h) {
                                     call_targets.push(h);
                                 }
@@ -1519,8 +1566,11 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         library_targets,
         call_targets,
         call_target_slots,
+        written_targets,
         stored_targets: Vec::new(),
         linked: Vec::new(),
+        link: None,
+        unfollowed: Vec::new(),
         admits: Vec::new(),
         gates_read: false,
         address: None,

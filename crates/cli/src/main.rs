@@ -37,6 +37,10 @@ enum Cmd {
         /// Do not resolve and decompile the implementation behind a proxy.
         #[arg(long)]
         no_follow_proxy: bool,
+        /// Call edges to follow from the contract: 1 fetches what it calls, 2 also what those
+        /// contracts call. At most 3; 0 fetches no dependency.
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
         /// Labels and gotos instead of structured code.
         #[arg(long)]
         flat: bool,
@@ -254,6 +258,7 @@ fn main() -> Result<()> {
             rpc,
             chain,
             no_follow_proxy,
+            depth,
             flat,
             json,
             embedded,
@@ -302,6 +307,7 @@ fn main() -> Result<()> {
                     &chain,
                     Policy {
                         follow: !no_follow_proxy,
+                        depth: depth.min(3),
                         ..Policy::default()
                     },
                     &opts,

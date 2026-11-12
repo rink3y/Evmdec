@@ -17,6 +17,7 @@ pub mod u256;
 pub use u256::U256;
 pub mod analyze;
 pub mod cfg;
+pub mod clock;
 pub mod compiler;
 pub mod confirm;
 pub mod decompile;

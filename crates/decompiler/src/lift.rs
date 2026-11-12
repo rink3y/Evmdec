@@ -1664,6 +1664,7 @@ impl<'a> Lifter<'a> {
         let mut max_args = 0usize;
 
         while let Some(nid) = work.pop_front() {
+            crate::clock::check();
             queued[nid] = false;
             runs[nid] += 1;
             if runs[nid] > 24 {

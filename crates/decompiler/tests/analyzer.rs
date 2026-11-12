@@ -1399,3 +1399,55 @@ fn a_word_passed_on_into_a_gate_slot_is_reported() {
     );
     assert!(passed_on(&passes, &sets_other, None, None).is_empty());
 }
+
+#[test]
+fn gate_locations_are_read_off_the_access_checks() {
+    use evmdec::U256;
+    let by_slot = decompile::decompile(
+        &dispatcher(&format!("{OWNER_GATE} STOP")),
+        &Options::default(),
+    );
+    let gates = analyze::gates(&by_slot);
+    assert_eq!(gates.slots, [U256::ZERO]);
+    assert!(gates.keys.is_empty());
+
+    let by_flag = dispatcher(
+        "CALLER PUSH1 0x00 MSTORE PUSH1 0x01 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 \
+         SLOAD PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST PUSH1 0x01 PUSH1 0x09 SSTORE \
+         STOP",
+    );
+    let by_flag = decompile::decompile(&by_flag, &Options::default());
+    let gates = analyze::gates(&by_flag);
+    assert!(gates.slots.is_empty());
+    assert_eq!(gates.keys.len(), 1, "{}", by_flag.source);
+    let caller = U256::from_hex_str(ROOT).unwrap();
+    let mut preimage = caller.to_be_bytes().to_vec();
+    preimage.extend_from_slice(&U256::ONE.to_be_bytes());
+    assert_eq!(
+        analyze::key_for(gates.keys[0], caller),
+        Some(U256::from_be_bytes(&evmdec::keccak::keccak256(&preimage))),
+        "the entry of the mapping at slot 1 under the caller"
+    );
+
+    let balance_test = dispatcher(
+        "CALLER PUSH1 0x00 MSTORE PUSH1 0x01 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256 \
+         SLOAD PUSH1 0x04 CALLDATALOAD GT PUSH2 @ok JUMPI STOP :ok JUMPDEST PUSH1 0x00 DUP1 REVERT",
+    );
+    let balance_test = decompile::decompile(&balance_test, &Options::default());
+    assert!(
+        analyze::gates(&balance_test).keys.is_empty(),
+        "an entry compared with an amount is not a flag"
+    );
+}
+
+#[test]
+fn targets_only_read_are_told_from_targets_a_call_may_change() {
+    let read = "0x00000000000000000000000000000000000000c1";
+    let code = dispatcher(&format!(
+        "{} PUSH1 0x00 PUSH1 0x00 PUSH1 0x04 PUSH1 0x80 PUSH20 {read} GAS STATICCALL POP STOP",
+        call_fixed(LINKED, "0xaaaaaaaa", "PUSH1 0x00")
+    ));
+    let c = decompile::decompile(&code, &Options::default());
+    assert_eq!(c.call_targets, [LINKED, read], "{}", c.source);
+    assert_eq!(c.written_targets, [LINKED]);
+}

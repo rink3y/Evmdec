@@ -2936,6 +2936,84 @@ fn role_mappings(ctx: &Ctx) -> HashSet<U256> {
     roles
 }
 
+/// Where a contract's access checks look in its own storage: what a caller has to be, or to
+/// hold, to pass them.
+#[derive(Clone, Debug, Default)]
+pub struct Gates {
+    /// Fixed slots whose address `msg.sender` is compared with.
+    pub slots: Vec<U256>,
+    /// Storage keys tested as a flag that are built from `msg.sender` and constants only, such
+    /// as `approved[msg.sender]` or `roles[ROLE][msg.sender]`.
+    pub keys: Vec<ExprId>,
+}
+
+/// The gate locations of `c`, read off every condition its code tests.
+pub fn gates(c: &Contract) -> Gates {
+    fn strip(e: ExprId) -> ExprId {
+        match expr::node(e) {
+            Node::Op(op::ISZERO, v) => strip(v[0]),
+            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
+                strip(v[0])
+            }
+            _ => e,
+        }
+    }
+    let mut out = Gates::default();
+    for f in &c.functions {
+        let Some(l) = &f.lifted else { continue };
+        for cond in l.nodes.iter().flat_map(node_conds) {
+            let tested = strip(cond);
+            if let Node::SLoad(k, false, _) = expr::node(tested) {
+                let closed = !mentions(k, &|n| {
+                    !matches!(
+                        n,
+                        Node::Const(_) | Node::Op(..) | Node::Keccak(..) | Node::Env(op::CALLER, _)
+                    )
+                });
+                if closed && from_caller(k) && !out.keys.contains(&k) {
+                    out.keys.push(k);
+                }
+            }
+            walk(tested, &mut HashSet::new(), &mut |_, n| {
+                let Node::Op(op::EQ | op::SUB | op::XOR, v) = n else {
+                    return;
+                };
+                for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                    let slot = ssa::stored_address_slot(b).and_then(expr::as_const);
+                    if let (true, Some(slot)) = (is_caller(a), slot) {
+                        if !out.slots.contains(&slot) {
+                            out.slots.push(slot);
+                        }
+                    }
+                }
+            });
+        }
+    }
+    out
+}
+
+/// The storage slot `key` names when `msg.sender` is `caller`: for a key built from the caller
+/// and constants only (see [`Gates::keys`]).
+pub fn key_for(key: ExprId, caller: U256) -> Option<U256> {
+    match expr::node(key) {
+        Node::Const(c) => Some(c),
+        Node::Env(op::CALLER, _) => Some(caller),
+        Node::Keccak(words, 0) => {
+            let mut bytes = Vec::with_capacity(32 * words.len());
+            for w in words {
+                bytes.extend_from_slice(&key_for(w, caller)?.to_be_bytes());
+            }
+            Some(U256::from_be_bytes(&crate::keccak::keccak256(&bytes)))
+        }
+        Node::Op(o, v) if v.len() == 2 => {
+            let a = expr::konst(key_for(v[0], caller)?);
+            let b = expr::konst(key_for(v[1], caller)?);
+            expr::as_const(expr::op2(o, a, b))
+        }
+        _ => None,
+    }
+}
+
 /// Does `cond` have the shape of an authorization check on msg.sender: `msg.sender == <storage
 /// or constant address>`, or a caller-keyed storage flag used directly as a boolean
 /// (`roles[msg.sender]`)? Shape only: see `is_auth_cond_in` for the contract-aware test.
@@ -6248,8 +6326,11 @@ fn reach(
     if !g.gated && g.gate_roles.is_empty() {
         return None;
     }
-    let admitted = match (lc.gates_read, from) {
-        (true, Some(from)) => Some(lc.admits.iter().any(|a| a.eq_ignore_ascii_case(from))),
+    let listed = |from: &str| lc.admits.iter().any(|a| a.eq_ignore_ascii_case(from));
+    let located = !g.gate_slots.is_empty() || !g.gate_roles.is_empty();
+    let admitted = match from {
+        Some(from) if listed(from) => Some(true),
+        Some(_) if lc.gates_read && located => Some(false),
         _ => None,
     };
     let line_of = |uses: &[ParamUse]| uses.iter().find(|u| u.word == word).map(|u| u.line.clone());
@@ -6873,6 +6954,43 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         out.push_str("Addresses whose code this contract runs in its own storage through a call it builds itself (a linked library, not an implementation):\n\n");
         for t in &c.library_targets {
             out.push_str(&format!("- `0x{}`\n", t.trim_start_matches("0x")));
+        }
+        out.push('\n');
+    }
+    if !c.linked.is_empty() {
+        out.push_str("## Contracts fetched with this one\n\n");
+        out.push_str(
+            "| Address | Reached | Calls away | Approves its caller |\n|---|---|---|---|\n",
+        );
+        for lc in &c.linked {
+            let address = lc.address.as_deref().unwrap_or("?");
+            let (how, depth, approves) = match &lc.link {
+                Some(link) => {
+                    let listed = lc.admits.iter().any(|a| a.eq_ignore_ascii_case(&link.from));
+                    let approves = match (listed, lc.gates_read) {
+                        (true, _) => "yes",
+                        (false, true) => "no",
+                        (false, false) => "not read",
+                    };
+                    let how = format!("{}, from {}", link.how, short_address(&link.from));
+                    (how, link.depth.to_string(), approves)
+                }
+                None => ("call target".to_string(), "1".to_string(), "not read"),
+            };
+            out.push_str(&format!("| `{address}` | {how} | {depth} | {approves} |\n"));
+        }
+        out.push('\n');
+    }
+    if !c.unfollowed.is_empty() {
+        out.push_str("## Call targets not fetched\n\n");
+        out.push_str("| Target | Called by | Why |\n|---|---|---|\n");
+        for u in &c.unfollowed {
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} |\n",
+                u.target,
+                short_address(&u.from),
+                u.reason
+            ));
         }
         out.push('\n');
     }

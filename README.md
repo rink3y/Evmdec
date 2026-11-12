@@ -104,17 +104,37 @@ flowchart TD
     C --> F[compose: one function list,<br/>one storage layout, one report]
     D --> F
     E --> F
-    F --> G[hard-coded call targets]
+    F --> G[fixed call targets<br/>and libraries]
     F --> H[targets held in storage<br/>read from the chain]
     G --> I[fetched, resolved the same way,<br/>analysed with the root]
     H --> I
+    I -->|next level, until the depth<br/>or a limit is reached| G
+    I --> J[each contract's storage is asked<br/>whether it approves its callers]
 ```
 
 Each function is marked with the address whose code holds it. Slots that two parts type
 differently are reported as storage collisions, and a function the shell answers itself is
 reported as shadowed. Linked contracts carry their own code and report; a rule on the root
 can use what it learned from a linked callee (a hook that forwards calls, a pool interface).
-Budgets: 8 linked contracts per part, 24 code units per request, one level of dependencies.
+
+The walk over call targets goes level by level. At each level the targets of every contract
+fetched so far are collected and fetched in this order: libraries (their code runs in the
+caller's storage), then targets some call may change, then targets that are only read. A
+target is fetched once however many contracts call it, the same code at two addresses is
+decompiled once, and every contract says how it was reached (which contract calls it, through
+a fixed address, a library call or which storage slot, and how many calls away it is).
+
+How far it goes: 2 call edges from the contract asked for by default (`--depth`, at most 3;
+`depth` in the server's request), at most 8 targets fetched from one contract, at most 40 code
+units per request across parts and dependencies, 20 seconds to decompile one dependency and
+120 seconds for the whole walk. Whatever was seen and not fetched is listed with its reason
+(a limit, the depth, an empty slot, no code, too slow), in the report and in the JSON
+(`unfollowed`), so the edge of what was analysed is always stated.
+
+After the walk, each fetched contract's storage is read at the places its own access checks
+look (the slots `msg.sender` is compared with, the mapping entries tested under `msg.sender`)
+for the contracts that call it. The answer (`admits`) says whether the callee approves the
+caller, which is what turns "this function is gated" into "and this contract gets through".
 `--no-follow-proxy` turns all of this off.
 
 ## Security report

@@ -1055,6 +1055,7 @@ impl<'a> Analysis<'a> {
         let mut mem_written: HashSet<u32> = HashSet::new();
         while let Some((blk, st)) = work.pop_front() {
             *self.steps.borrow_mut() += 1;
+            crate::clock::check();
             if seen.len() > MAX_WALK_NODES || *self.steps.borrow() > MAX_STEPS {
                 *self.budget_exhausted.borrow_mut() = true;
                 summary.unresolved = true;
@@ -1339,6 +1340,7 @@ impl<'a> Analysis<'a> {
         };
         let entry = intern(entry_block, &entry_state, &mut nodes, &mut index, &mut work);
         while let Some(n) = work.pop_front() {
+            crate::clock::check();
             if nodes.len() > max_nodes {
                 budget_exhausted = true;
                 break;
@@ -1590,6 +1592,7 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
         if !done.insert(f) {
             continue;
         }
+        crate::clock::check();
         let unit = an.build_unit(f, AState::new());
         for n in &unit.nodes {
             if let Some(c) = &n.call {

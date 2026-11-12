@@ -1,31 +1,45 @@
 //! Fetching a contract by address and assembling what it really is.
 //!
 //! A contract's code is rarely the whole story: a proxy forwards to an implementation, a
-//! diamond routes each selector to a facet, and both call fixed addresses whose behaviour is
-//! part of the contract's. This module fetches the code at an address, resolves the pattern it
-//! implements, fetches the code it forwards to and composes the pieces into one
-//! [`Contract`] ([`crate::decompile::compose`]) so the analyzer sees what callers see. It then
-//! fetches the hard-coded dependencies and resolves each the same way, one level deep, so a
-//! dependency that is itself a proxy appears as its implementation.
+//! diamond routes each selector to a facet, and all of them call other contracts whose
+//! behaviour is part of theirs. This module fetches the code at an address, resolves the
+//! pattern it implements, fetches the code it forwards to and composes the pieces into one
+//! [`Contract`] ([`crate::decompile::compose`]) so the analyzer sees what callers see.
+//!
+//! It then walks the call graph from there. Level by level, every call target of the contracts
+//! fetched so far (a fixed address, a library, the address a storage slot holds) is fetched and
+//! resolved the same way, libraries and targets whose state a call may change first, targets
+//! that are only read last. The walk ends at the configured depth, at the limit on contracts per
+//! request, or when its time is up, and what it saw without fetching is listed with the reason.
+//! Finally each fetched contract's own storage is asked whether it approves the contracts that
+//! call it, at the slots and mapping entries its access checks read.
 
-use crate::decompile::{self, Contract, Options, PartInput, PartRole, ProxyRef};
+use crate::analyze;
+use crate::clock;
+use crate::decompile::{self, Contract, Link, Options, PartInput, PartRole, ProxyRef, Unfollowed};
 use crate::expr;
+use crate::keccak;
 use crate::rpc::{self, Client};
 use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 /// What to fetch beyond the code at the address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
     /// Resolve proxies and diamonds and compose them with their code.
     pub follow: bool,
-    /// Hard-coded call targets fetched per contract, at most.
+    /// Call targets fetched from one contract, at most.
     pub max_linked: usize,
     /// Code units fetched for one request, at most, across parts and dependencies.
     pub max_total: usize,
-    /// Levels of hard-coded dependencies to follow: 1 fetches the contract's dependencies,
-    /// each resolved as a proxy or diamond but with its own dependencies left alone.
+    /// Call edges to follow from the contract asked for: 1 fetches what it calls, 2 also what
+    /// those contracts call, and so on. 0 fetches no dependency.
     pub depth: usize,
+    /// Time one dependency may take to decompile before it is left out.
+    pub contract_time: Duration,
+    /// Time the walk over dependencies may take before it stops fetching.
+    pub walk_time: Duration,
 }
 
 impl Default for Policy {
@@ -33,11 +47,18 @@ impl Default for Policy {
         Policy {
             follow: true,
             max_linked: 8,
-            max_total: 24,
-            depth: 1,
+            max_total: 40,
+            depth: 2,
+            contract_time: Duration::from_secs(20),
+            walk_time: Duration::from_secs(120),
         }
     }
 }
+
+/// Gate locations read per contract when asking whom it approves, at most.
+const MAX_GATES_READ: usize = 8;
+/// Calling contracts checked against one contract's gates, at most.
+const MAX_CALLERS_CHECKED: usize = 4;
 
 /// Code already fetched, by lower-case address, so a second pass over the same request (for
 /// instance after an online signature lookup) decompiles again without asking the node again.
@@ -63,8 +84,33 @@ pub fn fetch(
         log,
         seen: HashSet::new(),
         left: policy.max_total,
+        decompiled: HashMap::new(),
+        time: None,
+        calls: Vec::new(),
     };
-    fetcher.fetch(address, policy.depth)
+    let root = fetcher.one(address)?;
+    if !policy.follow || policy.depth == 0 {
+        return Ok(root);
+    }
+    Ok(fetcher.walk(root))
+}
+
+/// A call target waiting to be fetched.
+struct Edge {
+    /// Address of the target.
+    target: String,
+    /// Address of the contract that calls it.
+    from: String,
+    /// How the caller names it.
+    how: String,
+    /// Fetch order: libraries, then targets a call may change, then targets only read.
+    class: u8,
+}
+
+/// A storage slot as short hex, for messages: `0x5` rather than 32 bytes.
+fn short_slot(slot: &str) -> String {
+    let digits = slot.trim_start_matches("0x").trim_start_matches('0');
+    format!("0x{}", if digits.is_empty() { "0" } else { digits })
 }
 
 /// One request's fetching state: the connection and options it runs with, and what it may
@@ -80,6 +126,12 @@ struct Fetcher<'a> {
     seen: HashSet<String>,
     /// Code units left to fetch.
     left: usize,
+    /// Decompilations by code hash: the same code at a second address is decompiled once.
+    decompiled: HashMap<[u8; 32], Contract>,
+    /// The time one decompilation may take; unlimited for the contract asked for.
+    time: Option<Duration>,
+    /// Call edges seen so far, fetched or not: `(caller, target)`, lower-case.
+    calls: Vec<(String, String)>,
 }
 
 impl Fetcher<'_> {
@@ -104,12 +156,26 @@ impl Fetcher<'_> {
         Ok(code)
     }
 
-    fn fetch(&mut self, address: &str, depth: usize) -> Result<Contract, String> {
+    /// Decompile `code`, reusing the result for code seen before. `None` when it took longer
+    /// than the time a dependency is given.
+    fn decompile(&mut self, code: &[u8]) -> Option<Contract> {
+        let hash = keccak::keccak256(code);
+        if let Some(known) = self.decompiled.get(&hash) {
+            return Some(known.clone());
+        }
+        let opts = self.opts;
+        let c = match self.time {
+            Some(time) => clock::run(time, || decompile::decompile(code, opts))?,
+            None => decompile::decompile(code, opts),
+        };
+        self.decompiled.insert(hash, c.clone());
+        Some(c)
+    }
+
+    /// Fetch the code at `address`, decompile it and resolve the proxy or diamond it is.
+    fn one(&mut self, address: &str) -> Result<Contract, String> {
         if !self.take(address) {
-            return Err(format!(
-                "{} already fetched in this request, or the fetch budget is spent",
-                address
-            ));
+            return Err("already fetched in this request, or the fetch limit is reached".into());
         }
         (self.log)(&format!(
             "fetching code of {} on {}...",
@@ -122,71 +188,260 @@ impl Fetcher<'_> {
                 address, self.chain
             ));
         }
-        let mut c = decompile::decompile(&code, self.opts);
+        let Some(mut c) = self.decompile(&code) else {
+            return Err(self.too_slow());
+        };
         c.address = Some(address.to_string());
         c.chain = Some(self.chain.to_string());
         if !self.policy.follow {
             return Ok(c);
         }
-        c = self.resolve(c, address, &code);
-        if depth > 0 {
-            self.link(&mut c, address, depth - 1);
-        }
-        Ok(c)
+        Ok(self.resolve(c, address, &code))
     }
 
-    /// Fetch the call targets of `c` (every part's hard-coded ones, then the ones held in
-    /// storage, read from the chain) into `c.linked`.
-    fn link(&mut self, c: &mut Contract, address: &str, depth: usize) {
+    /// The reason given for a dependency whose decompilation was abandoned.
+    fn too_slow(&self) -> String {
+        format!(
+            "decompiling it took longer than {} s",
+            self.time.unwrap_or_default().as_secs()
+        )
+    }
+
+    /// The call targets of `c`, with the slots that hold one read from the chain (and recorded
+    /// in `c.stored_targets`), and the slots that hold none.
+    fn edges(&mut self, c: &mut Contract) -> (Vec<Edge>, Vec<Unfollowed>) {
+        let from = c.address.clone().unwrap_or_default();
+        let mut edges: Vec<Edge> = Vec::new();
+        let mut empty: Vec<Unfollowed> = Vec::new();
+        let class_of = |c: &Contract, key: &str| match c.written_targets.iter().any(|w| w == key) {
+            true => 1,
+            false => 2,
+        };
+        for library in &c.library_targets {
+            edges.push(Edge {
+                target: library.clone(),
+                from: from.clone(),
+                how: "library, run in the caller's storage".into(),
+                class: 0,
+            });
+        }
+        for target in &c.call_targets {
+            edges.push(Edge {
+                target: target.clone(),
+                from: from.clone(),
+                how: "fixed address in the code".into(),
+                class: class_of(c, target),
+            });
+        }
+        for slot in c.call_target_slots.clone() {
+            match self.client.get_storage(&from, &slot) {
+                Ok(v) => {
+                    let a = v & expr::mask_bits(160);
+                    if a.is_zero() {
+                        empty.push(Unfollowed {
+                            target: format!("slot {}", short_slot(&slot)),
+                            from: from.clone(),
+                            reason: "the slot holds no address".into(),
+                        });
+                        continue;
+                    }
+                    let target = rpc::addr_to_string(a);
+                    c.stored_targets.push((slot.clone(), target.clone()));
+                    edges.push(Edge {
+                        target,
+                        from: from.clone(),
+                        how: format!("address held in slot {}", short_slot(&slot)),
+                        class: class_of(c, &slot),
+                    });
+                }
+                Err(e) => empty.push(Unfollowed {
+                    target: format!("slot {}", short_slot(&slot)),
+                    from: from.clone(),
+                    reason: format!("the slot could not be read: {e}"),
+                }),
+            }
+        }
         let own: Vec<String> = c
             .parts
             .iter()
             .map(|p| p.address.to_ascii_lowercase())
             .collect();
-        let mut targets: Vec<String> = c.call_targets.clone();
-        for library in &c.library_targets {
-            if !targets.iter().any(|t| t.eq_ignore_ascii_case(library)) {
-                targets.push(library.clone());
+        edges.retain(|e| {
+            let target = e.target.to_ascii_lowercase();
+            !own.contains(&target) && !target.eq_ignore_ascii_case(&from)
+        });
+        for e in &edges {
+            let call = (from.to_ascii_lowercase(), e.target.to_ascii_lowercase());
+            if !self.calls.contains(&call) {
+                self.calls.push(call);
             }
         }
-        for slot in c.call_target_slots.clone() {
-            match self.client.get_storage(address, &slot) {
-                Ok(v) => {
-                    let a = v & expr::mask_bits(160);
-                    if !a.is_zero() {
-                        let t = rpc::addr_to_string(a);
-                        c.stored_targets.push((slot, t.clone()));
-                        if !targets.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
-                            targets.push(t);
-                        }
+        (edges, empty)
+    }
+
+    /// Walk the call graph from `root`, level by level, and return it with every contract
+    /// reached in `linked` and every target left out in `unfollowed`.
+    fn walk(&mut self, root: Contract) -> Contract {
+        let started = Instant::now();
+        let policy = self.policy;
+        let mut all: Vec<Contract> = vec![root];
+        let mut level: Vec<usize> = vec![0];
+        let mut unfollowed: Vec<Unfollowed> = Vec::new();
+        self.time = Some(policy.contract_time);
+        for depth in 1..=policy.depth {
+            let mut edges: Vec<Edge> = Vec::new();
+            for i in level.drain(..) {
+                let (found, empty) = self.edges(&mut all[i]);
+                edges.extend(found);
+                unfollowed.extend(empty);
+            }
+            edges.sort_by_key(|e| e.class);
+            let mut fetched_from: HashMap<String, usize> = HashMap::new();
+            for e in edges {
+                if self.seen.contains(&e.target.to_ascii_lowercase()) {
+                    continue;
+                }
+                let from_this = fetched_from.entry(e.from.clone()).or_insert(0);
+                let reason = if self.left == 0 {
+                    Some(format!(
+                        "the limit of {} contracts per request was reached",
+                        policy.max_total
+                    ))
+                } else if started.elapsed() > policy.walk_time {
+                    Some(format!(
+                        "the walk over dependencies had run for {} s",
+                        policy.walk_time.as_secs()
+                    ))
+                } else if *from_this >= policy.max_linked {
+                    Some(format!(
+                        "{} targets of this contract were fetched already",
+                        policy.max_linked
+                    ))
+                } else {
+                    None
+                };
+                let outcome = match reason {
+                    Some(reason) => Err(reason),
+                    None => self.one(&e.target),
+                };
+                match outcome {
+                    Ok(mut lc) => {
+                        *from_this += 1;
+                        lc.link = Some(Link {
+                            from: e.from,
+                            how: e.how,
+                            depth,
+                        });
+                        level.push(all.len());
+                        all.push(lc);
+                    }
+                    Err(reason) => {
+                        (self.log)(&format!("call target {}: {}", e.target, reason));
+                        unfollowed.push(Unfollowed {
+                            target: e.target,
+                            from: e.from,
+                            reason,
+                        });
                     }
                 }
-                Err(e) => (self.log)(&format!("slot {}: {}", slot, e)),
             }
-        }
-        let targets: Vec<String> = targets
-            .into_iter()
-            .filter(|t| !own.contains(&t.to_ascii_lowercase()))
-            .filter(|t| !t.eq_ignore_ascii_case(address))
-            .collect();
-        if targets.len() > self.policy.max_linked {
-            (self.log)(&format!(
-                "{} hard-coded call targets; fetching the first {}",
-                targets.len(),
-                self.policy.max_linked
-            ));
-        }
-        for t in targets.iter().take(self.policy.max_linked) {
-            if self.left == 0 {
-                (self.log)("fetch budget spent; remaining dependencies left unfetched");
+            if level.is_empty() {
                 break;
             }
-            match self.fetch(t, depth) {
-                Ok(mut lc) => {
-                    lc.source = decompile::render(&lc, "Linked");
-                    c.linked.push(lc);
+        }
+        for i in level {
+            let c = &all[i];
+            let from = c.address.clone().unwrap_or_default();
+            let fixed = c.library_targets.iter().chain(&c.call_targets).cloned();
+            let held = c
+                .call_target_slots
+                .iter()
+                .map(|slot| format!("slot {}", short_slot(slot)));
+            for target in fixed.chain(held) {
+                if self.seen.contains(&target.to_ascii_lowercase()) {
+                    continue;
                 }
-                Err(e) => (self.log)(&format!("call target {}: {}", t, e)),
+                unfollowed.push(Unfollowed {
+                    target,
+                    from: from.clone(),
+                    reason: format!(
+                        "it is more than {} call edges from the contract asked for",
+                        policy.depth
+                    ),
+                });
+            }
+        }
+        self.read_gates(&mut all);
+        let mut contracts = all.into_iter();
+        let mut root = contracts.next().expect("the walk starts from the root");
+        for mut lc in contracts {
+            lc.source = decompile::render(&lc, "Linked");
+            root.linked.push(lc);
+        }
+        root.unfollowed = unfollowed;
+        root
+    }
+
+    /// Ask each contract's storage whether it approves the contracts that call it: at the slots
+    /// its access checks compare `msg.sender` with, and at the mapping entries they test under
+    /// `msg.sender`.
+    fn read_gates(&mut self, all: &mut [Contract]) {
+        for c in all.iter_mut() {
+            let Some(address) = c.address.clone() else {
+                continue;
+            };
+            let callers: Vec<String> = self
+                .calls
+                .iter()
+                .filter(|(_, to)| to.eq_ignore_ascii_case(&address))
+                .map(|(from, _)| from.clone())
+                .take(MAX_CALLERS_CHECKED)
+                .collect();
+            if callers.is_empty() {
+                continue;
+            }
+            let gates = analyze::gates(c);
+            if gates.slots.is_empty() && gates.keys.is_empty() {
+                continue;
+            }
+            let mut read = true;
+            let admit = |caller: &str, admits: &mut Vec<String>| {
+                if !admits.iter().any(|a| a.eq_ignore_ascii_case(caller)) {
+                    admits.push(caller.to_string());
+                }
+            };
+            for slot in gates.slots.iter().take(MAX_GATES_READ) {
+                match self.client.get_storage(&address, &slot.to_hex_padded(32)) {
+                    Ok(v) => {
+                        let held = rpc::addr_to_string(v & expr::mask_bits(160));
+                        for caller in callers.iter().filter(|a| a.eq_ignore_ascii_case(&held)) {
+                            admit(caller, &mut c.admits);
+                        }
+                    }
+                    Err(_) => read = false,
+                }
+            }
+            for key in gates.keys.iter().take(MAX_GATES_READ) {
+                for caller in &callers {
+                    let slot = U256::from_hex_str(caller).and_then(|a| analyze::key_for(*key, a));
+                    let Some(slot) = slot else {
+                        read = false;
+                        continue;
+                    };
+                    match self.client.get_storage(&address, &slot.to_hex_padded(32)) {
+                        Ok(v) if !v.is_zero() => admit(caller, &mut c.admits),
+                        Ok(_) => {}
+                        Err(_) => read = false,
+                    }
+                }
+            }
+            c.gates_read = read;
+            if !c.admits.is_empty() {
+                (self.log)(&format!(
+                    "{} approves {} as a caller",
+                    address,
+                    c.admits.join(", ")
+                ));
             }
         }
     }
@@ -250,7 +505,11 @@ impl Fetcher<'_> {
             }
             match self.code(&facet.address) {
                 Ok(fc) if !fc.is_empty() => {
-                    let mut facet_contract = decompile::decompile(&fc, self.opts);
+                    let Some(mut facet_contract) = self.decompile(&fc) else {
+                        let reason = self.too_slow();
+                        (self.log)(&format!("facet {}: {}", facet.address, reason));
+                        continue;
+                    };
                     facet_contract.address = Some(facet.address.clone());
                     facet_contract.chain = Some(self.chain.to_string());
                     parts.push(PartInput {
@@ -294,7 +553,11 @@ impl Fetcher<'_> {
                 return c;
             }
         };
-        let mut ic = decompile::decompile(&impl_code, self.opts);
+        let Some(mut ic) = self.decompile(&impl_code) else {
+            let reason = self.too_slow();
+            (self.log)(&format!("implementation {}: {}", p.implementation, reason));
+            return c;
+        };
         ic.address = Some(p.implementation.clone());
         ic.chain = Some(self.chain.to_string());
         let parts = vec![PartInput {

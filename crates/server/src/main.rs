@@ -48,6 +48,8 @@ struct DecompileReq {
     rpc: Option<String>,
     #[serde(default)]
     no_follow_proxy: bool,
+    /// Call edges to follow from the contract; the default when absent, at most 3.
+    depth: Option<usize>,
     /// Resolve unknown selectors online.
     #[serde(default)]
     lookup: bool,
@@ -180,12 +182,13 @@ async fn api_decompile(
 ) -> axum::response::Response {
     let chain = req.chain.clone().unwrap_or_else(|| "mainnet".into());
     let key = format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{:?}",
         req.bytecode.as_deref().unwrap_or(""),
         req.address.as_deref().unwrap_or("").to_lowercase(),
         chain,
         req.no_follow_proxy,
-        req.lookup
+        req.lookup,
+        req.depth
     );
     if let Some(v) = st
         .cache
@@ -216,6 +219,7 @@ async fn api_decompile(
                 rpc: req.rpc.as_deref(),
                 policy: Policy {
                     follow: !req.no_follow_proxy,
+                    depth: req.depth.unwrap_or(Policy::default().depth).min(3),
                     ..Policy::default()
                 },
             };

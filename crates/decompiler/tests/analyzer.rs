@@ -1752,3 +1752,95 @@ fn a_call_that_needs_earlier_storage_is_reached_through_the_call_that_writes_it(
         "nothing writes the owner slot"
     );
 }
+
+fn property_ids(code: &[u8]) -> Vec<String> {
+    let ours = [
+        "entries-total-out-of-step",
+        "total-open-at-call",
+        "lock-left-set",
+    ];
+    analyze::analyze(&decompile::decompile(code, &Options::default()))
+        .findings
+        .iter()
+        .filter(|f| ours.contains(&f.id.as_str()))
+        .map(|f| {
+            let function = f.function.as_deref().unwrap_or_default();
+            format!("{} {} {:?}", f.id, function, f.confidence)
+        })
+        .collect()
+}
+
+#[test]
+fn a_run_that_breaks_an_inferred_property_is_reported_with_its_input() {
+    let amount = "PUSH1 0x24 CALLDATALOAD";
+    let entry = account_entry("0x04");
+    let entry_up = format!("{entry} DUP1 SLOAD {amount} ADD SWAP1 SSTORE");
+    let entry_down = format!("{entry} DUP1 SLOAD {amount} SWAP1 SUB SWAP1 SSTORE");
+    let total_up = format!("PUSH1 0x05 SLOAD {amount} ADD PUSH1 0x05 SSTORE");
+    let total_down = format!("PUSH1 0x05 SLOAD {amount} SWAP1 SUB PUSH1 0x05 SSTORE");
+
+    let leaves_total = dispatcher3(
+        &format!("{entry_up} {total_up} STOP"),
+        &format!("{entry_down} {total_down} STOP"),
+        &format!("{entry_up} STOP"),
+    );
+    assert_eq!(
+        property_ids(&leaves_total),
+        ["entries-total-out-of-step func_cccccccc [0xcccccccc] High"],
+        "two functions keep the pair in step and the third moves the entries alone"
+    );
+    let r = analyze::analyze(&decompile::decompile(&leaves_total, &Options::default()));
+    let f = finding(&r, "entries-total-out-of-step").unwrap();
+    assert!(
+        f.confirmed
+            && f.witness
+                .as_deref()
+                .is_some_and(|w| w.starts_with("0xcccccccc"))
+    );
+
+    let in_step = dispatcher3(
+        &format!("{entry_up} {total_up} STOP"),
+        &format!("{entry_down} {total_down} STOP"),
+        "STOP",
+    );
+    assert!(property_ids(&in_step).is_empty());
+
+    let call_out = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP1 PUSH1 0x04 CALLDATALOAD GAS CALL POP";
+    let open = dispatcher3(
+        &format!("{entry_up} {total_up} STOP"),
+        &format!("{entry_down} {call_out} {total_down} STOP"),
+        "STOP",
+    );
+    assert_eq!(
+        property_ids(&open),
+        ["total-open-at-call func_bbbbbbbb [0xbbbbbbbb] High"]
+    );
+    let closed = dispatcher3(
+        &format!("{entry_up} {total_up} STOP"),
+        &format!("{entry_down} {total_down} {call_out} STOP"),
+        "STOP",
+    );
+    assert!(
+        property_ids(&closed).is_empty(),
+        "both are updated before the call"
+    );
+}
+
+#[test]
+fn a_path_that_leaves_a_toggled_slot_set_is_reported() {
+    let take = "PUSH1 0x01 PUSH1 0x09 SSTORE";
+    let release = "PUSH1 0x00 PUSH1 0x09 SSTORE";
+    let work = "PUSH1 0x04 CALLDATALOAD PUSH1 0x02 SSTORE";
+    let early = "PUSH1 0x04 CALLDATALOAD PUSH1 0x07 EQ PUSH2 @out JUMPI";
+    let leaks = dispatcher(&format!(
+        "{take} {early} {work} {release} STOP :out JUMPDEST STOP"
+    ));
+    assert_eq!(
+        property_ids(&leaks),
+        ["lock-left-set func_aaaaaaaa [0xaaaaaaaa] High"]
+    );
+    let restores = dispatcher(&format!(
+        "{take} {early} {work} {release} STOP :out JUMPDEST {release} STOP"
+    ));
+    assert!(property_ids(&restores).is_empty());
+}

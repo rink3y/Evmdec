@@ -4735,6 +4735,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     crate::confirm::confirm(c, &mut findings);
 
     crate::invariant::findings(c, &c.types, &mut findings);
+    crate::props::findings(c, &mut findings);
 
     if std::env::var("EVMDEC_DEBUG_LOCKS").is_ok() {
         for (slot, fs) in &lock_slots {

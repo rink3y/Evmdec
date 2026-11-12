@@ -1,5 +1,6 @@
 use crate::expr::{self, ExprId, Node};
 use crate::keccak;
+use crate::lift::Stmt;
 use crate::opcode as op;
 use crate::u256::U256;
 use std::collections::HashMap;
@@ -146,6 +147,58 @@ pub fn value_of(e: ExprId, inputs: &Inputs) -> Option<U256> {
         memo: HashMap::new(),
     };
     eval.value(e)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Step {
+    Write {
+        key: ExprId,
+        slot: U256,
+        before: U256,
+        after: U256,
+    },
+    Call {
+        kind: u8,
+        to: Option<U256>,
+    },
+    Unknown,
+}
+
+pub fn steps(effects: &[Stmt], inputs: &Inputs) -> Vec<Step> {
+    let mut eval = Eval {
+        inputs,
+        writes: Vec::new(),
+        memo: HashMap::new(),
+    };
+    let mut out = Vec::new();
+    for st in effects {
+        match st {
+            Stmt::SStore {
+                key,
+                val,
+                transient: false,
+                gen,
+            } => match (eval.value(*key), eval.value(*val)) {
+                (Some(slot), Some(after)) => {
+                    let before = eval.stored(slot, *gen);
+                    eval.writes.push((*gen, slot, after, *val));
+                    out.push(Step::Write {
+                        key: *key,
+                        slot,
+                        before,
+                        after,
+                    });
+                }
+                _ => out.push(Step::Unknown),
+            },
+            Stmt::Call { kind, addr, .. } => out.push(Step::Call {
+                kind: *kind,
+                to: eval.value(*addr),
+            }),
+            _ => {}
+        }
+    }
+    out
 }
 
 pub fn replay(items: &[Item], inputs: &Inputs) -> Vec<Option<bool>> {

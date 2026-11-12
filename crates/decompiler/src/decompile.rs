@@ -283,6 +283,15 @@ pub struct Contract {
     /// proxy appears as its stub, and the JSON output carries the contracts without reports.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub linked: Vec<Contract>,
+    /// Addresses the contract's own storage approves as callers of its gated functions, read
+    /// when it was fetched: the address held in a slot `msg.sender` is compared with, or one
+    /// whose entry in a mapping tested under `msg.sender` is set. Only contracts fetched in the
+    /// same run are looked up.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub admits: Vec<String>,
+    /// The lookup behind `admits` was made, so an address missing from it is not approved.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub gates_read: bool,
     /// Filled when the contract was fetched by address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
@@ -1512,6 +1521,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         call_target_slots,
         stored_targets: Vec::new(),
         linked: Vec::new(),
+        admits: Vec::new(),
+        gates_read: false,
         address: None,
         chain: None,
         proxy: None,

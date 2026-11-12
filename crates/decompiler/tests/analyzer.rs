@@ -1249,3 +1249,153 @@ fn a_library_call_is_not_a_proxy() {
     assert_eq!(c.delegatecall_targets, [library]);
     assert!(c.library_targets.is_empty());
 }
+
+const ROOT: &str = "0x00000000000000000000000000000000000000a0";
+const LIBRARY: &str = "0x00000000000000000000000000000000000000b2";
+
+/// A call to `0xaaaaaaaa` on `LINKED` whose two argument words are left by `first` and `second`.
+fn call_with_words(first: &str, second: &str) -> String {
+    format!(
+        "PUSH4 0xaaaaaaaa PUSH1 0xe0 SHL PUSH1 0x80 MSTORE {first} PUSH1 0x84 MSTORE {second} \
+         PUSH1 0xa4 MSTORE PUSH1 0x00 PUSH1 0x00 PUSH1 0x44 PUSH1 0x80 PUSH1 0x00 PUSH20 {LINKED} \
+         GAS CALL POP"
+    )
+}
+
+/// Findings of the passed-word rules on `root`, analysed with `linked` at `LINKED` and
+/// `library` at `LIBRARY`. `admits` states what the linked contract's storage says about the
+/// root as a caller, when it was read.
+fn passed_on(
+    root: &[u8],
+    linked: &[u8],
+    library: Option<&[u8]>,
+    admits: Option<bool>,
+) -> Vec<String> {
+    let mut c = decompile::decompile(root, &Options::default());
+    c.address = Some(ROOT.into());
+    let mut lc = decompile::decompile(linked, &Options::default());
+    lc.address = Some(LINKED.into());
+    if let Some(admitted) = admits {
+        lc.gates_read = true;
+        if admitted {
+            lc.admits.push(ROOT.into());
+        }
+    }
+    c.linked.push(lc);
+    if let Some(code) = library {
+        let mut lib = decompile::decompile(code, &Options::default());
+        lib.address = Some(LIBRARY.into());
+        c.linked.push(lib);
+    }
+    analyze::analyze(&c)
+        .findings
+        .iter()
+        .filter(|f| f.id.starts_with("unbound-"))
+        .map(|f| format!("{} {:?}/{:?}", f.id, f.severity, f.confidence))
+        .collect()
+}
+
+#[test]
+fn an_account_passed_on_unbound_is_held_against_the_function_that_receives_it() {
+    let word0 = "PUSH1 0x04 CALLDATALOAD";
+    let word1 = "PUSH1 0x24 CALLDATALOAD";
+    let lower = format!(
+        "{} DUP1 SLOAD {word1} SWAP1 SUB SWAP1 SSTORE STOP",
+        account_entry("0x04")
+    );
+    let gated = dispatcher(&format!("{OWNER_GATE} {lower}"));
+    let open = dispatcher(&lower);
+    let passes = dispatcher(&format!("{} STOP", call_with_words(word0, word1)));
+    let lowered = "unbound-account-passed-on High/Medium";
+
+    assert_eq!(passed_on(&passes, &gated, None, None), [lowered]);
+    assert_eq!(
+        passed_on(&passes, &gated, None, Some(true)),
+        ["unbound-account-passed-on High/High"],
+        "the called contract's storage approves the root"
+    );
+    assert!(
+        passed_on(&passes, &gated, None, Some(false)).is_empty(),
+        "the called contract does not approve the root, so the call cannot get through"
+    );
+    assert!(
+        passed_on(&passes, &open, None, None).is_empty(),
+        "a function anyone can call is its own contract's finding"
+    );
+
+    let me =
+        "PUSH1 0x04 CALLDATALOAD CALLER EQ PUSH2 @me JUMPI PUSH1 0x00 DUP1 REVERT :me JUMPDEST";
+    let bound = dispatcher(&format!("{me} {} STOP", call_with_words(word0, word1)));
+    assert!(
+        passed_on(&bound, &gated, None, None).is_empty(),
+        "the account is the caller"
+    );
+    let own = dispatcher(&format!("{} STOP", call_with_words("CALLER", word1)));
+    assert!(passed_on(&own, &gated, None, None).is_empty());
+
+    let kept = dispatcher(&format!(
+        "PUSH1 0x40 PUSH1 0x04 PUSH1 0x60 CALLDATACOPY {} STOP",
+        call_with_words("PUSH1 0x60 MLOAD", "PUSH1 0x80 MLOAD")
+    ));
+    assert_eq!(
+        passed_on(&kept, &gated, None, None),
+        [lowered],
+        "parameters kept in fixed memory words are the same parameters"
+    );
+}
+
+#[test]
+fn a_value_computed_by_a_linked_library_is_read_through_the_call() {
+    let word1 = "PUSH1 0x24 CALLDATALOAD";
+    let through_library = format!(
+        "{} DUP1 SLOAD PUSH4 0xaaaaaaaa PUSH1 0xe0 SHL PUSH1 0x80 MSTORE PUSH1 0x84 MSTORE {word1} \
+         PUSH1 0xa4 MSTORE PUSH1 0x20 PUSH1 0x00 PUSH1 0x44 PUSH1 0x80 PUSH20 {LIBRARY} GAS \
+         DELEGATECALL POP PUSH1 0x00 MLOAD SWAP1 SSTORE STOP",
+        account_entry("0x04")
+    );
+    let gated = dispatcher(&format!("{OWNER_GATE} {through_library}"));
+    let difference = dispatcher(
+        "PUSH1 0x24 CALLDATALOAD PUSH1 0x04 CALLDATALOAD SUB PUSH1 0x00 MSTORE PUSH1 0x20 \
+         PUSH1 0x00 RETURN",
+    );
+    let sum = dispatcher(
+        "PUSH1 0x24 CALLDATALOAD PUSH1 0x04 CALLDATALOAD ADD PUSH1 0x00 MSTORE PUSH1 0x20 \
+         PUSH1 0x00 RETURN",
+    );
+    let passes = dispatcher(&format!(
+        "{} STOP",
+        call_with_words("PUSH1 0x04 CALLDATALOAD", word1)
+    ));
+    assert_eq!(
+        passed_on(&passes, &gated, Some(&difference), None),
+        ["unbound-account-passed-on High/Medium"],
+        "the library returns the old value less the amount"
+    );
+    assert!(
+        passed_on(&passes, &gated, Some(&sum), None).is_empty(),
+        "the library returns the old value plus the amount"
+    );
+    assert!(
+        passed_on(&passes, &gated, None, None).is_empty(),
+        "without the library's code the stored value is unknown"
+    );
+}
+
+#[test]
+fn a_word_passed_on_into_a_gate_slot_is_reported() {
+    let sets_gate = dispatcher(&format!(
+        "{OWNER_GATE} PUSH1 0x04 CALLDATALOAD PUSH1 0x00 SSTORE STOP"
+    ));
+    let sets_other = dispatcher(&format!(
+        "{OWNER_GATE} PUSH1 0x04 CALLDATALOAD PUSH1 0x09 SSTORE STOP"
+    ));
+    let passes = dispatcher(&format!(
+        "{} STOP",
+        call_with_words("PUSH1 0x04 CALLDATALOAD", "PUSH1 0x00")
+    ));
+    assert_eq!(
+        passed_on(&passes, &sets_gate, None, None),
+        ["unbound-address-made-privileged High/Medium"]
+    );
+    assert!(passed_on(&passes, &sets_other, None, None).is_empty());
+}

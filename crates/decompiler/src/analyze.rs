@@ -14,6 +14,7 @@ use crate::u256::U256;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 /// Impact of a finding, worst first; the derived ordering is what the report sorts by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -100,9 +101,92 @@ pub struct Report {
     pub external_calls: Vec<String>,
     /// Number of findings per severity, keyed by the lowercase severity name.
     pub summary: BTreeMap<String, usize>,
+    /// Per external function: what it does with its parameters and what gates it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub summaries: Vec<FnSummary>,
     /// 0..100, derived from the findings: the worst one (weighted by confidence) sets the level
     /// and the others add a little, so one confirmed critical outweighs many notes.
     pub risk_score: u32,
+}
+
+/// One use a function makes of a parameter word.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ParamUse {
+    /// Index of the ABI word in the call data (`0` is the first parameter).
+    pub word: u32,
+    /// Printed statement.
+    pub line: String,
+}
+
+/// A parameter word written whole to a fixed storage slot.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ParamStore {
+    /// Index of the ABI word in the call data.
+    pub word: u32,
+    /// The slot, as 32 bytes of hex.
+    pub slot: String,
+    /// Some access check of the contract compares `msg.sender` with this slot.
+    pub gates: bool,
+    /// Printed statement.
+    pub line: String,
+}
+
+/// A parameter word passed on as an argument of a call to another contract.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ParamForward {
+    /// Index of the ABI word in this function's call data.
+    pub word: u32,
+    /// Index of the ABI word it becomes in the call's payload.
+    pub arg: u32,
+    /// The callee: an address, or `slot 0x..` for an address read from a fixed slot.
+    pub target: String,
+    /// Selector the call sends.
+    pub selector: String,
+    /// Printed statement.
+    pub line: String,
+}
+
+/// What one external function does with each word of its call data and what a caller needs to
+/// reach it, stated so that a call from another contract can be held against it.
+#[derive(Clone, Debug, Serialize, Default, PartialEq, Eq)]
+pub struct FnSummary {
+    /// Display name of the function.
+    pub function: String,
+    /// The 4-byte selector as `0x`-prefixed hex.
+    pub selector: String,
+    /// A `msg.sender` check guards the function.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub gated: bool,
+    /// Fixed slots whose address `msg.sender` is compared with, as 32 bytes of hex.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gate_slots: Vec<String>,
+    /// Root slots of the mappings whose entry under `msg.sender` is tested as a flag.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gate_roles: Vec<String>,
+    /// The function recovers a signer, so an account it names may have signed for the action.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub signed: bool,
+    /// Parameter words tied to the caller: compared with `msg.sender`, or keying an entry that
+    /// is compared with it or read under it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bound: Vec<u32>,
+    /// Parameter words naming an account whose stored entry the function lowers or clears, or
+    /// whose tokens it moves.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lowers: Vec<ParamUse>,
+    /// Parameter words naming an account the function sends ether or tokens to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pays: Vec<ParamUse>,
+    /// Parameter words written whole to a fixed slot.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stores: Vec<ParamStore>,
+    /// Parameter words passed on to another contract.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<ParamForward>,
+    /// The word the function returns when it only computes from its call data: no storage, no
+    /// calls, no logs. A handle into the expression arena of the analysis that made it.
+    #[serde(skip)]
+    pub(crate) returns: Option<ExprId>,
 }
 
 fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
@@ -241,6 +325,11 @@ struct Event {
 
 struct Ctx<'a> {
     c: &'a Contract,
+    /// The contracts analysed with this one.
+    world: &'a World<'a>,
+    /// What a call to a function of another contract returns, when that function only computes
+    /// from its arguments: by call sequence number, in the caller's terms.
+    computed_returns: RefCell<HashMap<u32, ExprId>>,
     internals: HashMap<usize, &'a Function>,
     version: Option<(u32, u32, u32)>,
     vyper: bool,
@@ -395,31 +484,85 @@ struct LinkedCall {
     line: String,
 }
 
-/// The address `e` names when it is a contract fetched with `c`: a constant, or the address
+/// The contracts analysed together: the one asked about and every contract fetched with it,
+/// each with its own report once that has been computed. A report is computed at most once,
+/// when a call edge first asks for it.
+struct World<'a> {
+    /// Every contract with a known address, by lower-case address.
+    members: HashMap<String, &'a Contract>,
+    /// Reports computed so far. `None` marks a contract whose analysis is under way, so a
+    /// cycle of calls between contracts ends instead of recursing.
+    reports: RefCell<HashMap<String, Option<Rc<Report>>>>,
+}
+
+impl<'a> World<'a> {
+    /// The world of `root`: itself and the contracts fetched with it, at any depth.
+    fn of(root: &'a Contract) -> World<'a> {
+        let mut members = HashMap::new();
+        let mut work = vec![root];
+        while let Some(c) = work.pop() {
+            if let Some(a) = &c.address {
+                members.entry(a.to_ascii_lowercase()).or_insert(c);
+            }
+            work.extend(c.linked.iter());
+        }
+        World {
+            members,
+            reports: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Does the world hold a contract other than `c`?
+    fn has_other(&self, c: &Contract) -> bool {
+        self.members.values().any(|m| !std::ptr::eq(*m, c))
+    }
+
+    /// The contract at `address`.
+    fn contract(&self, address: &str) -> Option<&'a Contract> {
+        self.members.get(&address.to_ascii_lowercase()).copied()
+    }
+
+    /// The report of the contract at `address`, computed on first use. `None` for an address
+    /// outside the world and for a contract whose analysis is already under way.
+    fn report(&self, address: &str) -> Option<Rc<Report>> {
+        let key = address.to_ascii_lowercase();
+        if let Some(known) = self.reports.borrow().get(&key) {
+            return known.clone();
+        }
+        let c = self.contract(&key)?;
+        self.reports.borrow_mut().insert(key.clone(), None);
+        let report = Rc::new(analyze_in(c, self));
+        self.reports
+            .borrow_mut()
+            .insert(key, Some(Rc::clone(&report)));
+        Some(report)
+    }
+}
+
+/// The address `e` names when it is another contract of the world: a constant, or the address
 /// read from a constant slot whose content was fetched.
-fn linked_address(c: &Contract, e: ExprId) -> Option<String> {
+fn linked_address(ctx: &Ctx, e: ExprId) -> Option<String> {
     let e = unmask(e);
     let address = match expr::as_const(e) {
         Some(a) => a.to_hex_padded(20),
         None => {
             let slot = expr::as_const(ssa::stored_address_slot(e)?)?.to_hex_padded(32);
-            let held = c
+            let held = ctx
+                .c
                 .stored_targets
                 .iter()
                 .find(|(s, _)| s.eq_ignore_ascii_case(&slot))?;
             held.1.clone()
         }
     };
-    linked_contract(c, &address).map(|_| address.to_ascii_lowercase())
+    linked_contract(ctx, &address).map(|_| address.to_ascii_lowercase())
 }
 
-/// The contract fetched with `c` that lives at `address`.
-fn linked_contract<'a>(c: &'a Contract, address: &str) -> Option<&'a Contract> {
-    c.linked.iter().find(|lc| {
-        lc.address
-            .as_deref()
-            .is_some_and(|a| a.eq_ignore_ascii_case(address))
-    })
+/// The other contract of the world that lives at `address`.
+fn linked_contract<'a>(ctx: &Ctx<'a>, address: &str) -> Option<&'a Contract> {
+    ctx.world
+        .contract(address)
+        .filter(|lc| !std::ptr::eq(*lc, ctx.c))
 }
 
 /// How a write changes the value its slot held.
@@ -892,16 +1035,16 @@ fn collect_facts(
                     call_selector.insert(*seq, sel);
                 }
                 let is_static = *kind == op::STATICCALL;
-                if !ctx.c.linked.is_empty() {
+                if ctx.world.has_other(ctx.c) {
                     let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
                     let sends_value = value.is_some_and(|v| expr::as_const(v) != Some(U256::ZERO));
                     let spender = (selector == Some(SEL_APPROVE) && words.len() >= 2).then(|| {
                         let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
                         emit::shifted_word_len(words, 0, len)
                     });
-                    let callee = linked_address(ctx.c, *addr).map(|a| (a, false));
+                    let callee = linked_address(ctx, *addr).map(|a| (a, false));
                     let approved = spender
-                        .and_then(|sp| linked_address(ctx.c, sp))
+                        .and_then(|sp| linked_address(ctx, sp))
                         .map(|a| (a, true));
                     for (address, approval) in callee.into_iter().chain(approved) {
                         linked_sites.push((address, selector, sends_value, approval, st.clone()));
@@ -1102,6 +1245,425 @@ fn collect_facts(
         );
     }
     facts
+}
+
+/// The call-data word `e` is, once casts are taken off: `CALLDATALOAD(4 + 32 * i)` gives `i`.
+fn param_word(e: ExprId) -> Option<u32> {
+    match expr::node(e) {
+        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
+            param_word(v[0])
+        }
+        Node::CallDataLoad(off) | Node::CopiedWord(op::CALLDATACOPY, off, _) => {
+            emit::calldata_word_index(off)
+        }
+        _ => None,
+    }
+}
+
+/// Fixed memory words that hold one call-data word for the whole function: every store to the
+/// word writes the same parameter, and no copy or call output lands on it. Code that keeps its
+/// parameters in memory at fixed addresses reads them back from there after each call.
+fn calldata_locals(events: &[Event]) -> HashMap<u64, u32> {
+    let mut held: HashMap<u64, Option<u32>> = HashMap::new();
+    let mut open_from = u64::MAX;
+    let put = |at: u64, word: Option<u32>, held: &mut HashMap<u64, Option<u32>>| {
+        held.entry(at)
+            .and_modify(|w| {
+                if *w != word {
+                    *w = None;
+                }
+            })
+            .or_insert(word);
+    };
+    let small = |e: ExprId| {
+        expr::as_const(e)
+            .filter(|c| c.fits_u64())
+            .map(|c| c.low_u64())
+    };
+    for ev in events {
+        match &ev.stmt {
+            Some(Stmt::MStore {
+                off, val, width, ..
+            }) => {
+                if let Some(at) = small(*off) {
+                    let word = param_word(*val).filter(|_| *width == 32);
+                    put(at, word, &mut held);
+                }
+            }
+            Some(Stmt::Copy {
+                kind,
+                dest,
+                src,
+                len,
+                ..
+            }) => match (small(*dest), small(*len)) {
+                (Some(at), Some(n)) => {
+                    let from = small(*src).filter(|_| *kind == op::CALLDATACOPY);
+                    for k in 0..n.div_ceil(32).min(64) {
+                        let word = from
+                            .filter(|_| (k + 1) * 32 <= n)
+                            .and_then(|s| emit::calldata_word_index(expr::konst_u64(s + 32 * k)));
+                        put(at + 32 * k, word, &mut held);
+                    }
+                }
+                (Some(at), None) => open_from = open_from.min(at),
+                _ => {}
+            },
+            Some(Stmt::Call {
+                out_off, out_len, ..
+            }) => match (small(*out_off), small(*out_len)) {
+                (_, Some(0)) => {}
+                (Some(at), Some(n)) => {
+                    for k in 0..n.div_ceil(32).min(64) {
+                        put(at + 32 * k, None, &mut held);
+                    }
+                }
+                (Some(at), None) => open_from = open_from.min(at),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    held.into_iter()
+        .filter(|(at, _)| *at < open_from && *at >= 0x60)
+        .filter_map(|(at, word)| Some((at, word?)))
+        .collect()
+}
+
+/// Is `e` the caller, once casts are taken off?
+fn is_caller(e: ExprId) -> bool {
+    match expr::node(e) {
+        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
+            is_caller(v[0])
+        }
+        Node::Env(op::CALLER, _) => true,
+        _ => false,
+    }
+}
+
+/// Visit every node of `e` once, up to a fixed number of nodes.
+fn walk(e: ExprId, seen: &mut HashSet<ExprId>, visit: &mut dyn FnMut(ExprId, &Node)) {
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if seen.len() > 20_000 || !seen.insert(x) {
+            continue;
+        }
+        let n = expr::node(x);
+        visit(x, &n);
+        stack.extend(expr::children(x));
+    }
+}
+
+/// What a storage key is hashed from: the parameter words among its mapping keys and array
+/// indices, and whether the caller is one of them.
+fn key_parties(key: ExprId) -> (Vec<u32>, bool) {
+    let mut words = Vec::new();
+    let mut caller = false;
+    walk(key, &mut HashSet::new(), &mut |_, n| {
+        if let Node::Keccak(parts, _) = n {
+            for p in parts {
+                if let Some(w) = param_word(*p) {
+                    if !words.contains(&w) {
+                        words.push(w);
+                    }
+                }
+                caller |= is_caller(*p);
+            }
+        }
+    });
+    (words, caller)
+}
+
+/// The one word a function returns on every path, when its events touch nothing but call data
+/// and constants.
+fn computed_return(events: &[Event]) -> Option<ExprId> {
+    let mut out: Option<ExprId> = None;
+    for ev in events {
+        if let Some(
+            Stmt::SStore { .. } | Stmt::Call { .. } | Stmt::Create { .. } | Stmt::Log { .. },
+        ) = &ev.stmt
+        {
+            return None;
+        }
+        match &ev.term {
+            Some(Term::Return {
+                data: Some(words), ..
+            }) if words.len() == 1 => {
+                if out.is_some_and(|o| o != words[0]) {
+                    return None;
+                }
+                out = Some(words[0]);
+            }
+            Some(
+                Term::Jump(..) | Term::Branch { .. } | Term::Switch { .. } | Term::Revert { .. },
+            )
+            | Some(Term::Invalid | Term::InternalReturn { .. } | Term::Infeasible)
+            | None => {}
+            Some(_) => return None,
+        }
+    }
+    out.filter(|e| {
+        !mentions(*e, &|n| match n {
+            Node::Const(_) | Node::Op(..) => false,
+            Node::CallDataLoad(off) => emit::calldata_word_index(*off).is_none(),
+            _ => true,
+        })
+    })
+}
+
+/// What the call `st` returns in the caller's terms, when it reaches a function of another
+/// contract of the world that only computes from its arguments.
+fn computed_result(ctx: &Ctx, st: &Stmt) -> Option<ExprId> {
+    let Stmt::Call {
+        addr,
+        input,
+        input_head,
+        in_len,
+        ..
+    } = st
+    else {
+        return None;
+    };
+    if !ctx.world.has_other(ctx.c) {
+        return None;
+    }
+    let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
+    let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
+    let selector = emit::leading_selector(*words.first()?, len)?;
+    let address = linked_address(ctx, *addr)?;
+    let report = ctx.world.report(&address)?;
+    let hex = format!("{selector:#010x}");
+    let returns = report
+        .summaries
+        .iter()
+        .find(|g| g.selector.eq_ignore_ascii_case(&hex))?
+        .returns?;
+    Some(expr::substitute(
+        returns,
+        &|n| match n {
+            Node::CallDataLoad(off) => emit::calldata_word_index(*off)
+                .map(|i| emit::shifted_word_len(words, i as usize, len)),
+            _ => None,
+        },
+        &mut HashMap::new(),
+    ))
+}
+
+/// The summary of one external function, from its event stream and collected facts.
+fn summarise(
+    ctx: &Ctx,
+    facts: &FnFacts,
+    events: &[Event],
+    auth: &HashSet<ExprId>,
+    names: &Names,
+) -> Option<FnSummary> {
+    let selector = facts.selector.clone().filter(|_| facts.external)?;
+    let mut sum = FnSummary {
+        function: facts.name.clone(),
+        selector,
+        gated: facts.caller_checked,
+        signed: facts.signature_authorised,
+        ..FnSummary::default()
+    };
+    sum.gate_slots = facts
+        .auth_slots
+        .iter()
+        .filter_map(|(k, _)| expr::as_const(*k))
+        .map(|k| k.to_hex_padded(32))
+        .collect();
+    let bind = |w: u32, bound: &mut Vec<u32>| {
+        if !bound.contains(&w) {
+            bound.push(w);
+        }
+    };
+    let own = names.clone();
+    let mut seen = HashSet::new();
+    let locals = calldata_locals(events);
+    let resolved: Vec<Event>;
+    let events = if locals.is_empty() {
+        events
+    } else {
+        let memo = RefCell::new(HashMap::new());
+        let read = |e: ExprId| {
+            expr::substitute(
+                e,
+                &|n| match n {
+                    Node::MLoad(a, _) => expr::as_const(*a)
+                        .filter(|c| c.fits_u64())
+                        .and_then(|c| locals.get(&c.low_u64()))
+                        .map(|w| expr::calldataload(expr::konst_u64(4 + 32 * u64::from(*w)))),
+                    _ => None,
+                },
+                &mut memo.borrow_mut(),
+            )
+        };
+        resolved = events
+            .iter()
+            .map(|ev| Event {
+                stmt: ev.stmt.as_ref().map(|st| lift::map_stmt(st, &read)),
+                term: ev.term.as_ref().map(|t| lift::map_term(t, &read)),
+                ..ev.clone()
+            })
+            .collect();
+        &resolved[..]
+    };
+    for cond in guard_conds(events) {
+        if let Some(root) = role_test_root(cond) {
+            let root = root.to_hex_padded(32);
+            if !sum.gate_roles.contains(&root) {
+                sum.gate_roles.push(root);
+            }
+        }
+        walk(cond, &mut HashSet::new(), &mut |_, n| {
+            let Node::Op(op::EQ | op::SUB | op::XOR, v) = n else {
+                return;
+            };
+            for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                if !is_caller(a) {
+                    continue;
+                }
+                if let Some(w) = param_word(b) {
+                    bind(w, &mut sum.bound);
+                }
+                if let Node::SLoad(k, false, _) = expr::node(unmask(b)) {
+                    for w in key_parties(k).0 {
+                        bind(w, &mut sum.bound);
+                    }
+                }
+            }
+        });
+    }
+    for ev in events {
+        let exprs = ev
+            .stmt
+            .iter()
+            .flat_map(lift::stmt_exprs)
+            .chain(ev.term.iter().flat_map(lift::term_exprs));
+        for e in exprs {
+            walk(e, &mut seen, &mut |_, n| {
+                if let Node::SLoad(k, false, _) = n {
+                    let (words, caller) = key_parties(*k);
+                    if caller {
+                        for w in words {
+                            bind(w, &mut sum.bound);
+                        }
+                    }
+                }
+            });
+        }
+        let Some(st) = &ev.stmt else { continue };
+        match st {
+            Stmt::SStore {
+                key,
+                val,
+                transient: false,
+                ..
+            } => match expr::as_const(*key) {
+                Some(slot) => {
+                    let whole = param_word(*val);
+                    let field = emit::packed_write(*key, *val).and_then(|(.., v)| param_word(v));
+                    if let Some(word) = whole.or(field) {
+                        sum.stores.push(ParamStore {
+                            word,
+                            slot: slot.to_hex_padded(32),
+                            gates: auth.contains(key),
+                            line: emit::fmt_stmt(st, &own),
+                        });
+                    }
+                }
+                None => {
+                    let lowered = matches!(change_of(*val, *key).0, Change::Down(a) if !expr::is_const(a))
+                        || expr::as_const(*val) == Some(U256::ZERO);
+                    if lowered {
+                        let line = emit::fmt_stmt(st, &own);
+                        for word in key_parties(*key).0 {
+                            sum.lowers.push(ParamUse {
+                                word,
+                                line: line.clone(),
+                            });
+                        }
+                    }
+                }
+            },
+            Stmt::Call {
+                kind,
+                addr,
+                value,
+                input,
+                input_head,
+                in_len,
+                ..
+            } if *kind == op::CALL => {
+                let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
+                let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
+                let selector = words
+                    .first()
+                    .and_then(|w0| emit::leading_selector(*w0, len));
+                let sends = value.is_some_and(|v| expr::as_const(v) != Some(U256::ZERO));
+                if let (true, Some(word)) = (sends, param_word(*addr)) {
+                    sum.pays.push(ParamUse {
+                        word,
+                        line: emit::fmt_stmt(st, &own),
+                    });
+                }
+                let Some(sel) = selector else { continue };
+                let count = match len {
+                    Some(l) => l.saturating_sub(4) / 32,
+                    None => words.len().saturating_sub(1),
+                }
+                .min(12);
+                let args: Vec<Option<u32>> = (0..count)
+                    .map(|i| param_word(emit::shifted_word_len(words, i, len)))
+                    .collect();
+                let arg = |i: usize| args.get(i).copied().flatten();
+                let (from, to) = match sel {
+                    SEL_TRANSFER => (None, arg(0)),
+                    SEL_TRANSFER_FROM => (arg(0), arg(1)),
+                    _ => (None, None),
+                };
+                if let Some(word) = from {
+                    sum.lowers.push(ParamUse {
+                        word,
+                        line: emit::fmt_stmt(st, &own),
+                    });
+                }
+                if let Some(word) = to {
+                    sum.pays.push(ParamUse {
+                        word,
+                        line: emit::fmt_stmt(st, &own),
+                    });
+                }
+                let target = match linked_address(ctx, *addr) {
+                    Some(a) => Some(a),
+                    None => match expr::as_const(unmask(*addr)) {
+                        Some(a) => Some(a.to_hex_padded(20)),
+                        None => ssa::stored_address_slot(*addr)
+                            .and_then(expr::as_const)
+                            .map(|k| format!("slot {}", k.to_hex_padded(32))),
+                    },
+                };
+                let Some(target) = target else { continue };
+                for (i, word) in args.iter().enumerate() {
+                    let Some(word) = word else { continue };
+                    sum.forwards.push(ParamForward {
+                        word: *word,
+                        arg: i as u32,
+                        target: target.clone(),
+                        selector: format!("{sel:#010x}"),
+                        line: emit::fmt_stmt(st, &own),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    sum.returns = computed_return(events);
+    sum.bound.sort_unstable();
+    sum.lowers.dedup();
+    sum.pays.dedup();
+    sum.stores.dedup();
+    sum.forwards.dedup();
+    Some(sum)
 }
 
 /// Constant-offset memory writes of some nodes (`None`: a write through a pointer or into
@@ -1882,6 +2444,7 @@ fn loop_nodes(l: &Lifted) -> HashSet<usize> {
 }
 
 fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Event> {
+    ctx.computed_returns.borrow_mut().clear();
     let mut mem = lift::MemView::new_fresh();
     events_of_in(
         ctx,
@@ -1946,6 +2509,9 @@ fn events_of_in(
             e,
             &|n| match n {
                 Node::Arg(i) => subst.get(i).copied(),
+                Node::ReturnData(seq, off) if expr::as_const(*off) == Some(U256::ZERO) => {
+                    ctx.computed_returns.borrow().get(seq).copied()
+                }
                 Node::MLoad(a, _) if *a != free_ptr => {
                     let a2 = if subst.is_empty() {
                         *a
@@ -2010,6 +2576,14 @@ fn events_of_in(
             .collect();
         for s in &nd.stmts {
             let s = lift::map_stmt(s, &|e| apply(e, mem));
+            if let Stmt::Call { seq, .. } = &s {
+                let computed = computed_result(ctx, &s);
+                let mut known = ctx.computed_returns.borrow_mut();
+                match computed {
+                    Some(e) => known.insert(*seq, e),
+                    None => known.remove(seq),
+                };
+            }
             if let Stmt::Internal { callee: t, .. } = &s {
                 let inlined = depth > 0 && ctx.internals.get(t).is_some_and(|f| f.lifted.is_some());
                 if !inlined {
@@ -2516,6 +3090,18 @@ fn legacy_consequence(before_0_5: bool) -> &'static str {
 
 /// Run every rule over a decompiled contract and assemble the [`Report`].
 pub fn analyze(c: &Contract) -> Report {
+    let world = World::of(c);
+    if let Some(a) = &c.address {
+        world
+            .reports
+            .borrow_mut()
+            .insert(a.to_ascii_lowercase(), None);
+    }
+    analyze_in(c, &world)
+}
+
+/// [`analyze`] for one contract of `world`.
+fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     let internals: HashMap<usize, &Function> = c
         .functions
         .iter()
@@ -2531,6 +3117,8 @@ pub fn analyze(c: &Contract) -> Report {
     });
     let mut ctx = Ctx {
         c,
+        world,
+        computed_returns: RefCell::default(),
         internals,
         version,
         vyper: c.language.starts_with("vyper"),
@@ -2666,6 +3254,7 @@ pub fn analyze(c: &Contract) -> Report {
     let mut privileged: Vec<String> = Vec::new();
     let mut unauthenticated: Vec<String> = Vec::new();
     let mut facts: Vec<FnFacts> = Vec::new();
+    let mut summaries: Vec<FnSummary> = Vec::new();
     let mut lock_slots: HashMap<ExprId, HashSet<usize>> = HashMap::new();
     let mut any_payable = false;
     let mut any_ether_out = false;
@@ -2683,7 +3272,9 @@ pub fn analyze(c: &Contract) -> Report {
         let names = names_for(f);
         let events = events_of(&ctx, l, 5, false);
         let caller_checked = any_caller_check(&ctx, f);
-        facts.push(collect_facts(&ctx, f, &events, caller_checked, &names));
+        let fact = collect_facts(&ctx, f, &events, caller_checked, &names);
+        summaries.extend(summarise(&ctx, &fact, &events, &auth, &names));
+        facts.push(fact);
         let loop_cap: Option<u64> = {
             let mut keys: Vec<U256> = Vec::new();
             let mut graphs: Vec<&Lifted> = vec![l];
@@ -4071,8 +4662,9 @@ pub fn analyze(c: &Contract) -> Report {
     let slot_names = c.functions.first().map(names_for).unwrap_or_default();
     let slot_name = |slot: ExprId| emit::fmt_slot(slot, &slot_names, SlotSpace::Persistent);
     conservation_findings(&facts, &slot_name, &mut findings);
-    link_findings(c, &facts, &mut findings);
-    trust_findings(c, &facts, &mut findings);
+    link_findings(&ctx, &facts, &mut findings);
+    passed_word_findings(&ctx, &facts, &summaries, &mut findings);
+    trust_findings(&ctx, &facts, &mut findings);
 
     type_rules::findings(c, &c.types, names_for, &mut findings);
 
@@ -4395,6 +4987,7 @@ pub fn analyze(c: &Contract) -> Report {
     report.unauthenticated_state_changers = unauthenticated;
     report.external_calls = external_calls.into_iter().collect();
     report.summary = summary;
+    report.summaries = summaries;
     report
 }
 
@@ -4877,7 +5470,8 @@ fn join_names(names: &[&str], max: usize) -> String {
 /// on a public path means the gate authenticates a contract this contract drives; a balance
 /// taken from an account the caller does not own is a confiscation primitive; a pair
 /// synchronised after state was moved prices that move in at once.
-fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) {
+fn trust_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
+    let c = ctx.c;
     let slot_const = |e: ExprId| expr::as_const(e);
     let ledgers: HashSet<U256> = crate::invariant::balance_mappings(&c.types)
         .into_iter()
@@ -4958,7 +5552,7 @@ fn trust_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) 
             }
             let (y, sc) = callers[0];
             let via: Vec<String> = callers.iter().map(|(y, _)| y.name.clone()).collect();
-            let forwarded = linked_forwards(c, sk, x, sc.selector, &mut linked_cache);
+            let forwarded = linked_forwards(ctx, sk, x, sc.selector, &mut linked_cache);
             let (sev, tail) = match &forwarded {
                 Some(note) => (Severity::Critical, note.clone()),
                 None => (
@@ -5086,25 +5680,22 @@ struct LinkedSummary {
 /// expose a function anyone can call that calls out again (the loop that opens `gated`)? A
 /// note for the finding when it does. `called` is the selector this contract sends it.
 fn linked_forwards(
-    c: &Contract,
+    ctx: &Ctx,
     slot: U256,
     gated: &FnFacts,
     called: Option<u32>,
     cache: &mut HashMap<String, LinkedSummary>,
 ) -> Option<String> {
     let slot_hex = slot.to_hex_padded(32);
-    let address = c
+    let address = ctx
+        .c
         .stored_targets
         .iter()
         .find(|(s, _)| s.eq_ignore_ascii_case(&slot_hex))
         .map(|(_, a)| a.to_ascii_lowercase())?;
     if !cache.contains_key(&address) {
-        let lc = c.linked.iter().find(|lc| {
-            lc.address
-                .as_deref()
-                .is_some_and(|a| a.eq_ignore_ascii_case(&address))
-        })?;
-        let report = analyze(lc);
+        let lc = linked_contract(ctx, &address)?;
+        let report = ctx.world.report(&address)?;
         let forwarders = report
             .unauthenticated_state_changers
             .iter()
@@ -5462,24 +6053,20 @@ fn accounting_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
 /// against that contract's own code and report: a selector it does not answer, value sent to
 /// code that rejects it, a called function its own report rates high, and an approval given to
 /// a spender that moves tokens from accounts its caller picks.
-fn link_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) {
-    if c.linked.is_empty() {
-        return;
-    }
-    let mut reports: HashMap<String, Report> = HashMap::new();
+fn link_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let mut told: HashSet<(usize, String, &str)> = HashSet::new();
     for f in facts.iter().filter(|f| f.external) {
         for call in &f.linked_calls {
-            let Some(lc) = linked_contract(c, &call.address) else {
+            let Some(lc) = linked_contract(ctx, &call.address) else {
                 continue;
             };
             let externals = || lc.functions.iter().filter(|g| g.kind == FnKind::External);
             if externals().next().is_none() {
                 continue;
             }
-            let report = reports
-                .entry(call.address.clone())
-                .or_insert_with(|| analyze(lc));
+            let Some(report) = ctx.world.report(&call.address) else {
+                continue;
+            };
             let catch_all = |payable: bool| {
                 lc.functions.iter().any(|g| {
                     matches!(g.kind, FnKind::Fallback | FnKind::Receive)
@@ -5620,6 +6207,179 @@ fn link_findings(c: &Contract, facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 "Review the linked contract's finding before relying on this call, and check what this contract does when the call misbehaves.",
                 findings,
             );
+        }
+    }
+}
+
+/// What a gated function of another contract does with one argument word.
+struct Reached {
+    /// Address of the contract holding the function.
+    address: String,
+    /// Display name of the function.
+    function: String,
+    /// The function lowers or clears the entry stored under the word, or moves its tokens.
+    lowers: Option<String>,
+    /// The function sends ether or tokens to the word.
+    pays: bool,
+    /// The function writes the word to a slot its contract's access checks read.
+    gate_store: Option<String>,
+    /// Whether the called contract approves `from` as a caller: `None` when its storage was not
+    /// read.
+    admitted: Option<bool>,
+}
+
+/// Follow argument `word` of the call `selector` on the contract at `address`, made by the
+/// contract at `from`, to the gated function that receives it, and on through the calls that
+/// function makes with it to further contracts of the world.
+fn reach(
+    world: &World,
+    from: Option<&str>,
+    address: &str,
+    selector: &str,
+    word: u32,
+    depth: u32,
+) -> Option<Reached> {
+    let lc = world.contract(address)?;
+    let report = world.report(address)?;
+    let g = report
+        .summaries
+        .iter()
+        .find(|g| g.selector.eq_ignore_ascii_case(selector))?;
+    if !g.gated && g.gate_roles.is_empty() {
+        return None;
+    }
+    let admitted = match (lc.gates_read, from) {
+        (true, Some(from)) => Some(lc.admits.iter().any(|a| a.eq_ignore_ascii_case(from))),
+        _ => None,
+    };
+    let line_of = |uses: &[ParamUse]| uses.iter().find(|u| u.word == word).map(|u| u.line.clone());
+    let mut reached = Reached {
+        address: address.to_ascii_lowercase(),
+        function: g.function.clone(),
+        lowers: line_of(&g.lowers),
+        pays: g.pays.iter().any(|u| u.word == word),
+        gate_store: g
+            .stores
+            .iter()
+            .find(|st| st.word == word && st.gates)
+            .map(|st| st.line.clone()),
+        admitted,
+    };
+    if reached.lowers.is_some() || reached.gate_store.is_some() || depth == 0 {
+        return Some(reached);
+    }
+    for fw in g.forwards.iter().filter(|fw| fw.word == word) {
+        let next = reach(
+            world,
+            Some(address),
+            &fw.target,
+            &fw.selector,
+            fw.arg,
+            depth - 1,
+        );
+        if let Some(next) = next.filter(|n| n.admitted != Some(false)) {
+            if next.lowers.is_some() || next.gate_store.is_some() {
+                reached.lowers = next.lowers;
+                reached.gate_store = next.gate_store;
+                reached.pays |= next.pays;
+                reached.function = format!("{} (through `{}`)", next.function, g.function);
+                reached.address = next.address;
+                break;
+            }
+        }
+    }
+    Some(reached)
+}
+
+/// Hold each word a function passes to another contract of the world against what the called
+/// function does with it. A function anyone can call that takes an account from its call data,
+/// never ties it to `msg.sender`, and hands it to a function that runs only for approved callers
+/// and lowers that account's entry lets every caller choose whose entry is lowered; the same
+/// path into a slot the called contract's access checks read lets every caller choose who
+/// passes them.
+fn passed_word_findings(
+    ctx: &Ctx,
+    facts: &[FnFacts],
+    summaries: &[FnSummary],
+    findings: &mut Vec<Finding>,
+) {
+    if !ctx.world.has_other(ctx.c) {
+        return;
+    }
+    let own = ctx.c.address.as_deref();
+    let mut told: HashSet<(String, String, u32, &str)> = HashSet::new();
+    for sum in summaries.iter().filter(|s| !s.gated && !s.signed) {
+        let Some(f) = facts
+            .iter()
+            .find(|f| f.external && f.selector.as_deref() == Some(sum.selector.as_str()))
+        else {
+            continue;
+        };
+        if f.account_authorised && sum.bound.is_empty() {
+            continue;
+        }
+        for fw in sum
+            .forwards
+            .iter()
+            .filter(|fw| !sum.bound.contains(&fw.word))
+        {
+            let Some(r) = reach(ctx.world, own, &fw.target, &fw.selector, fw.arg, 3) else {
+                continue;
+            };
+            if r.admitted == Some(false) {
+                continue;
+            }
+            let confidence = match r.admitted {
+                Some(true) => Confidence::High,
+                _ => Confidence::Medium,
+            };
+            let standing = match r.admitted {
+                Some(true) => {
+                    "runs only for callers its contract approves, and this contract is one of them"
+                }
+                _ => "runs only for callers its contract approves",
+            };
+            if let Some(line) = &r.lowers {
+                if told.insert((sum.selector.clone(), r.address.clone(), fw.word, "lowers")) {
+                    push_fact(
+                        findings,
+                        "unbound-account-passed-on",
+                        "An account the caller names is passed to a contract that lowers its entry",
+                        if r.pays { Severity::Low } else { Severity::High },
+                        confidence,
+                        f,
+                        format!(
+                            "`{}` takes an account from its call data (word {}) and passes it to `{}` on the contract at {} without comparing it with `msg.sender`, checking a signature from it, or reading an approval it gave the caller. That function {standing}, and it lowers the entry stored under the account it is given{}. Whoever calls `{}` therefore chooses whose entry is lowered.",
+                            f.name,
+                            fw.word,
+                            r.function,
+                            r.address,
+                            if r.pays { ", paying the same account" } else { "" },
+                            f.name,
+                        ),
+                        vec![fw.line.clone(), line.clone()],
+                        "Require that `msg.sender` is the account, or that the account approved this caller or signed this exact action, before passing it on.",
+                    );
+                }
+            }
+            if let Some(line) = &r.gate_store {
+                if told.insert((sum.selector.clone(), r.address.clone(), fw.word, "gate")) {
+                    push_fact(
+                        findings,
+                        "unbound-address-made-privileged",
+                        "A caller-chosen address is written to a slot another contract's access checks read",
+                        Severity::High,
+                        confidence,
+                        f,
+                        format!(
+                            "`{}` passes word {} of its call data, which it never ties to `msg.sender`, to `{}` on the contract at {}. That function {standing}, and it writes the word to a slot that contract compares `msg.sender` with. Whoever calls `{}` therefore chooses the address those checks accept.",
+                            f.name, fw.word, r.function, r.address, f.name,
+                        ),
+                        vec![fw.line.clone(), line.clone()],
+                        "Fix the address in the called contract, or let only an authorised caller choose it.",
+                    );
+                }
+            }
         }
     }
 }

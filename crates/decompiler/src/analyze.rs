@@ -1,7 +1,7 @@
 //! Security analysis over the lifted IR: a rule engine producing findings with evidence.
 
 use crate::compiler;
-use crate::cross::{self, World as CrossWorld};
+use crate::cross::World as CrossWorld;
 use crate::decompile::{self, Contract, Function};
 use crate::emit::{self, Names, SlotSpace};
 use crate::exec;
@@ -6735,80 +6735,159 @@ fn reach(
     Some(reached)
 }
 
-/// Try to confirm that a role-less caller can drive `f` of the root contract, with an account
-/// of its choosing in call-data word `word`, to a state change in another contract of the world
-/// that tracks the account. Runs the real dispatcher across contracts twice, once per victim in
-/// [`cross::VICTIMS`], and returns a reproducing input when the store the far contract makes
-/// follows the account. `None` when the root has no code, the target is a contract created in
-/// the call, or no such input is found (a bounded search, not a proof of safety).
+/// Appended to a finding [`confirm_passed`] confirmed.
+const PASSED_ON_CONFIRMED: &str = concat!(
+    " Confirmed by running the call across the fetched contracts, each linked contract",
+    " approving only the callers its storage was read to approve: with a balance in the named",
+    " account's entry, a caller holding no role completes the call and that entry ends lower,",
+    " and naming a different account lowers that account's entry instead (a reproducing input",
+    " is attached)."
+);
+
+/// Two accounts to name in a forwarded word: distinct, not zero, and neither the caller of the
+/// run nor a contract of the world.
+const NAMED: [U256; 2] = [
+    U256::from_u64(0x1111_2222_3333_4444),
+    U256::from_u64(0x5555_6666_7777_8888),
+];
+
+/// Runs tried per account in the second round of a cross-contract confirmation, at most.
+const MAX_SHAPES: usize = 18;
+
+/// Place `c` in `world` as it is deployed: its code at its address, the units it forwards to at
+/// theirs with the slot naming a single implementation filled, and the addresses its storage
+/// was read to hold. Returns its address.
+fn place_contract(world: &mut CrossWorld, c: &Contract) -> Option<U256> {
+    let address = U256::from_hex_str(c.address.as_deref()?)?;
+    if c.info.runtime.is_empty() {
+        return None;
+    }
+    world.place(address, c.info.runtime.clone());
+    let units: Vec<U256> = c
+        .parts
+        .iter()
+        .skip(1)
+        .filter_map(|part| {
+            let at = U256::from_hex_str(&part.address)?;
+            world.place(at, part.runtime.clone());
+            Some(at)
+        })
+        .collect();
+    if let [implementation] = units[..] {
+        for slot in c
+            .delegatecall_slots
+            .iter()
+            .filter_map(|s| U256::from_hex_str(s))
+        {
+            world.seed(address, slot, implementation);
+        }
+    }
+    for (slot, held) in &c.stored_targets {
+        if let (Some(slot), Some(held)) = (U256::from_hex_str(slot), U256::from_hex_str(held)) {
+            world.seed(address, slot, held);
+        }
+    }
+    Some(address)
+}
+
+/// Try to confirm a finding of [`passed_word_findings`] by running it: function `f` of this
+/// contract, called by an account holding no role with call-data word `word` naming an account,
+/// across the contracts fetched with it.
+///
+/// The state is what was read from the chain and nothing more: every contract's code, the
+/// addresses held in the slots that were read, and each linked contract's gates set for the
+/// callers its own storage approved (`Contract::admits`). A gate nobody was read to pass stays
+/// shut, so the run fails there and nothing is confirmed.
+///
+/// Two rounds, each run once per account of [`NAMED`]. The first, with every other argument
+/// zero, finds the slots of the far contract that are written for one named account and not
+/// for the other. The second gives exactly those slots a balance and tries a few argument
+/// shapes. The finding is confirmed when, for both accounts, the call completes and the
+/// account's own slot ends below the balance it was given. Returns the call data of that run.
+/// `None` is no verdict: the search is bounded and the state minimal.
 fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec<u8>> {
-    if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || target.contains('#') {
+    if std::env::var("EVMDEC_NO_CONFIRM").is_ok() {
         return None;
     }
-    let root = ctx.c.address.as_deref().and_then(U256::from_hex_str)?;
-    if ctx.c.info.runtime.is_empty() {
-        return None;
-    }
+    let root = U256::from_hex_str(ctx.c.address.as_deref()?)?;
     let selector = f
         .selector
         .as_deref()
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-    let target_addr = U256::from_hex_str(target)?;
-
-    let build = || -> Option<CrossWorld> {
+    let fixed_target = match target.contains('#') {
+        true => None,
+        false => Some(U256::from_hex_str(target)?),
+    };
+    let balance = U256::ONE << 128;
+    let build = |held: &[(U256, U256)]| -> Option<CrossWorld> {
         let mut world = CrossWorld::new();
-        world.place(root, ctx.c.info.runtime.clone());
+        place_contract(&mut world, ctx.c)?;
         for lc in &ctx.c.linked {
-            if let (Some(a), false) = (
-                lc.address.as_deref().and_then(U256::from_hex_str),
-                lc.info.runtime.is_empty(),
-            ) {
-                world.place(a, lc.info.runtime.clone());
-            }
-        }
-        for (slot, held) in &ctx.c.stored_targets {
-            if let (Some(k), Some(v)) = (U256::from_hex_str(slot), U256::from_hex_str(held)) {
-                world.seed(root, k, v);
-            }
-        }
-        for lc in &ctx.c.linked {
-            let Some(a) = lc.address.as_deref().and_then(U256::from_hex_str) else {
+            let Some(address) = place_contract(&mut world, lc) else {
                 continue;
             };
-            let g = gates(lc);
-            for slot in &g.slots {
-                world.seed(a, *slot, root);
-            }
-            for key in &g.keys {
-                if let Some(slot) = key_for(*key, root) {
-                    world.seed(a, slot, U256::ONE);
+            let gate = gates(lc);
+            for caller in lc.admits.iter().filter_map(|a| U256::from_hex_str(a)) {
+                for slot in &gate.slots {
+                    world.seed(address, *slot, caller);
+                }
+                for slot in gate.keys.iter().filter_map(|key| key_for(*key, caller)) {
+                    world.seed(address, slot, U256::ONE);
                 }
             }
         }
+        for (address, slot) in held {
+            world.seed(*address, *slot, balance);
+        }
         Some(world)
     };
-
     let nargs = (word as usize + 1).max(8);
-    let run = |account: U256| -> Option<(bool, HashMap<U256, U256>)> {
-        let mut world = build()?;
-        let data = cross::calldata_naming(selector, nargs, word, account);
-        let ok = world.run(root, exec::CALLER, U256::ZERO, data);
-        Some((ok, world.storage_of(target_addr)))
+    let run = |account: U256, others: &[U256], held: &[(U256, U256)]| {
+        let mut args = others.to_vec();
+        args[word as usize] = account;
+        let data = exec::calldata(selector, &args);
+        let mut world = build(held)?;
+        world
+            .run(root, exec::CALLER, U256::ZERO, data.clone())
+            .then_some((data, world))
     };
-
-    let (ok0, store0) = run(cross::VICTIMS[0])?;
-    let (ok1, store1) = run(cross::VICTIMS[1])?;
-    let keys0: HashSet<&U256> = store0.keys().collect();
-    let keys1: HashSet<&U256> = store1.keys().collect();
-    if ok0 && ok1 && !store0.is_empty() && keys0 != keys1 {
-        return Some(cross::calldata_naming(
-            selector,
-            nargs,
-            word,
-            cross::VICTIMS[0],
-        ));
+    let far = |world: &CrossWorld, at: U256| match fixed_target {
+        Some(target) => at == target,
+        None => world.was_made(at),
+    };
+    let written = |account: U256| -> Option<HashSet<(U256, U256)>> {
+        let (_, world) = run(account, &vec![U256::ZERO; nargs], &[])?;
+        let slots = world.writes().iter().filter(|w| far(&world, w.address));
+        Some(slots.map(|w| (w.address, w.slot)).collect())
+    };
+    let (first, second) = (written(NAMED[0])?, written(NAMED[1])?);
+    let own: [Vec<(U256, U256)>; 2] = [
+        first.difference(&second).copied().collect(),
+        second.difference(&first).copied().collect(),
+    ];
+    if own.iter().any(Vec::is_empty) {
+        return None;
     }
-    None
+    let amounts = [U256::ONE, U256::from_u64(1_000_000_000_000_000_000)];
+    let mut shapes: Vec<Vec<U256>> = amounts.iter().map(|a| vec![*a; nargs]).collect();
+    for position in (0..nargs).filter(|p| *p != word as usize) {
+        for amount in amounts {
+            let mut shape = vec![U256::ZERO; nargs];
+            shape[position] = amount;
+            shapes.push(shape);
+        }
+    }
+    let lowered = |account: usize, shape: &[U256]| -> Option<Vec<u8>> {
+        let (data, world) = run(NAMED[account], shape, &own[account])?;
+        own[account]
+            .iter()
+            .any(|(address, slot)| world.stored(*address, *slot) < balance)
+            .then_some(data)
+    };
+    shapes.iter().take(MAX_SHAPES).find_map(|shape| {
+        let data = lowered(0, shape)?;
+        lowered(1, shape).map(|_| data)
+    })
 }
 
 /// Hold each word a function passes to another contract of the world against what the called
@@ -6886,7 +6965,7 @@ fn passed_word_findings(
                             last.confirmed = true;
                             last.witness = Some(crate::hex::encode(&data));
                             last.confidence = Confidence::High;
-                            last.description.push_str(" Confirmed: running the call across contracts from a fresh state, a caller holding no role drives this to a storage change in the far contract that tracks the account it chose (a reproducing input is attached).");
+                            last.description.push_str(PASSED_ON_CONFIRMED);
                         }
                     }
                 }

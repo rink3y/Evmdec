@@ -1,220 +1,346 @@
 //! Running a transaction across several contracts.
 //!
-//! [`crate::exec`] runs one frame and answers external calls from a seed, so it can confirm a
-//! finding whose whole claim is reachability inside one contract. A composed finding spans a
-//! call edge: a function of one contract passes a caller-named account to a function of another
-//! that lowers that account's entry. To confirm it, the call has to really run — the callee's
-//! own code, in the callee's own storage — so the account the caller chose reaches the store.
+//! [`crate::exec`] runs one frame and answers external calls from a seed, which is enough to
+//! confirm a finding that lives inside one contract. A composed finding spans a call edge: a
+//! function of one contract passes an account its caller named to a function of another, which
+//! lowers that account's entry. Confirming it means the call has to really run, in the callee's
+//! own code and storage.
 //!
-//! This module holds a [`World`] of contracts by address and runs a transaction through it,
-//! following `CALL` and `STATICCALL` into another contract of the world and executing it as a
-//! nested frame against that contract's persistent storage. Calls out of the world, and the
-//! other call kinds, fall back to the seed. The confirmation pass ([`crate::analyze`]) runs one
-//! function twice, with two different accounts in the forwarded word, and confirms the finding
-//! when the store the nested frame makes tracks the account.
+//! A [`World`] holds contracts by address, each with its own storage, and runs a transaction
+//! through them the way the EVM does:
+//!
+//! - `CALL` and `STATICCALL` run the callee's code in the callee's storage, with the calling
+//!   contract as `msg.sender`;
+//! - `DELEGATECALL` and `CALLCODE` run the callee's code in the calling contract's storage;
+//! - `CREATE` and `CREATE2` run the init code and place what it returns at a new address;
+//! - a frame that fails takes every storage write made under it back, nested frames included,
+//!   and a `STATICCALL` leaves no write behind.
+//!
+//! A call to an address outside the world succeeds and returns nothing. Every storage write
+//! that survives is recorded with the value it replaced, so a caller can ask what a run did to
+//! one contract.
 
 use crate::disasm;
-use crate::exec;
-use crate::interp::{Host, Machine, Outcome};
+use crate::interp::{CallRecord, CreateRecord, Host, Machine, Outcome};
+use crate::opcode as op;
 use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// Steps one transaction may take across every frame before it is abandoned.
-const BUDGET: usize = 400_000;
-/// Nested calls deep the driver follows before it stops entering new frames.
-const MAX_DEPTH: usize = 6;
+const BUDGET: usize = 600_000;
+/// Nested frames deep the driver goes before a call is answered as one out of the world.
+const MAX_DEPTH: usize = 12;
+/// Addresses of created contracts count up from here.
+const FIRST_MADE: u64 = 0xc0de_0000_0000;
 
-/// The contracts a transaction can reach, by address, each with its own persistent storage.
-pub struct World {
-    /// Runtime code by address.
-    codes: HashMap<U256, Vec<u8>>,
-    /// Storage by address, carried across the whole transaction.
-    storage: HashMap<U256, HashMap<U256, U256>>,
-    /// Steps left in the transaction.
-    budget: usize,
+/// One storage write that survived the transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Write {
+    /// The contract whose storage was written.
+    pub address: U256,
+    /// The slot.
+    pub slot: U256,
+    /// The value the slot held before the write.
+    pub before: U256,
+    /// The value written.
+    pub after: U256,
 }
 
-/// What one contract's storage did during a run: every slot written, with its final value.
-pub type Writes = HashMap<U256, U256>;
+/// What a frame runs as: whose storage it uses and what it sees as its caller.
+#[derive(Clone, Debug)]
+struct Frame {
+    /// The executing account: `ADDRESS`, and the storage the frame reads and writes.
+    account: U256,
+    /// `CALLER`.
+    caller: U256,
+    /// `CALLVALUE`.
+    value: U256,
+    /// Call data.
+    data: Vec<u8>,
+}
+
+/// The parts of the world a failed frame takes back.
+struct Saved {
+    storage: HashMap<U256, HashMap<U256, U256>>,
+    codes: HashMap<U256, Rc<Vec<u8>>>,
+    writes: usize,
+}
+
+/// Contracts by address, each with its own storage, and the record of one transaction.
+#[derive(Default)]
+pub struct World {
+    /// Runtime code by address.
+    codes: HashMap<U256, Rc<Vec<u8>>>,
+    /// Storage by address.
+    storage: HashMap<U256, HashMap<U256, U256>>,
+    /// Storage writes of the transaction in order, without those a failed frame took back.
+    writes: Vec<Write>,
+    /// The account that sent the transaction (`ORIGIN`).
+    origin: U256,
+    /// Steps left in the transaction.
+    budget: usize,
+    /// Contracts created so far in the transaction.
+    made: u64,
+}
 
 impl World {
     /// An empty world.
     pub fn new() -> World {
-        World {
-            codes: HashMap::new(),
-            storage: HashMap::new(),
-            budget: BUDGET,
-        }
+        World::default()
     }
 
     /// Place `code` at `address`.
     pub fn place(&mut self, address: U256, code: Vec<u8>) {
-        self.codes.insert(address, code);
+        self.codes.insert(address, Rc::new(code));
     }
 
-    /// Write `value` into `address`'s storage at `slot` before the transaction runs.
+    /// Set slot `slot` of `address` to `value` before the transaction runs.
     pub fn seed(&mut self, address: U256, slot: U256, value: U256) {
         self.storage.entry(address).or_default().insert(slot, value);
     }
 
-    /// The slots `address` holds, as written so far.
-    pub fn storage_of(&self, address: U256) -> HashMap<U256, U256> {
-        self.storage.get(&address).cloned().unwrap_or_default()
+    /// The value `address` holds at `slot`; zero when nothing was stored there.
+    pub fn stored(&self, address: U256, slot: U256) -> U256 {
+        self.storage
+            .get(&address)
+            .and_then(|slots| slots.get(&slot))
+            .copied()
+            .unwrap_or(U256::ZERO)
     }
 
-    /// Run a transaction from `caller` to `address` with `calldata` and `callvalue`, following
-    /// calls between contracts of the world. Returns whether the outermost frame ended normally.
-    pub fn run(&mut self, address: U256, caller: U256, callvalue: U256, calldata: Vec<u8>) -> bool {
+    /// The storage writes of the last transaction that survived, in order.
+    pub fn writes(&self) -> &[Write] {
+        &self.writes
+    }
+
+    /// Was `address` created during the last transaction?
+    pub fn was_made(&self, address: U256) -> bool {
+        address.fits_u64() && (FIRST_MADE + 1..=FIRST_MADE + self.made).contains(&address.low_u64())
+    }
+
+    /// Run a transaction from `caller` to `address` with `data` and `value`. Returns whether
+    /// the outermost frame ended normally; when it did not, storage is as it was before.
+    pub fn run(&mut self, address: U256, caller: U256, value: U256, data: Vec<u8>) -> bool {
         self.budget = BUDGET;
-        self.frame(address, caller, callvalue, calldata, 0).0
+        self.writes.clear();
+        self.made = 0;
+        self.origin = caller;
+        let Some(code) = self.codes.get(&address).cloned() else {
+            return false;
+        };
+        let saved = self.save();
+        let frame = Frame {
+            account: address,
+            caller,
+            value,
+            data,
+        };
+        let (success, _) = self.frame(&code, &frame, 0);
+        if !success {
+            self.restore(saved);
+        }
+        success
     }
 
-    /// Run the frame at `address`, called by `caller`. Returns `(success, return data)`.
-    fn frame(
-        &mut self,
-        address: U256,
-        caller: U256,
-        callvalue: U256,
-        calldata: Vec<u8>,
-        depth: usize,
-    ) -> (bool, Vec<u8>) {
-        let Some(code) = self.codes.get(&address).cloned() else {
-            return (false, Vec::new());
-        };
-        let jumpdests: HashSet<usize> = disasm::jumpdests(&code).into_iter().collect();
-        let mut host = Host::controlled(address, caller, calldata, callvalue);
+    fn save(&self) -> Saved {
+        Saved {
+            storage: self.storage.clone(),
+            codes: self.codes.clone(),
+            writes: self.writes.len(),
+        }
+    }
+
+    fn restore(&mut self, saved: Saved) {
+        self.storage = saved.storage;
+        self.codes = saved.codes;
+        self.writes.truncate(saved.writes);
+    }
+
+    /// Run `code` as `frame`. Returns `(success, returned or reverted data)`. On success the
+    /// frame's storage is written back; on failure nothing is, and the caller restores the rest.
+    fn frame(&mut self, code: &[u8], frame: &Frame, depth: usize) -> (bool, Vec<u8>) {
+        let jumpdests: HashSet<usize> = disasm::jumpdests(code).into_iter().collect();
+        let mut host =
+            Host::controlled(frame.account, frame.caller, frame.data.clone(), frame.value);
+        host.origin = self.origin;
         host.intercept_calls = true;
-        let mut m = Machine::new(&code, &host);
-        m.storage = self.storage_of(address);
+        let mut m = Machine::new(code, &host);
+        m.storage = self
+            .storage
+            .get(&frame.account)
+            .cloned()
+            .unwrap_or_default();
+        let jump = |t: U256| t.as_usize().filter(|pc| jumpdests.contains(pc));
         let outcome = loop {
             if self.budget == 0 {
-                break Outcome::Exception("budget".into());
+                break Outcome::Exception("step budget exhausted".into());
             }
             self.budget -= 1;
-            if m.pc >= code.len() {
-                break Outcome::Stop;
-            }
             let at = m.pc;
-            match m.step() {
-                Ok(None) => {}
-                Ok(Some(Outcome::Jump(t))) => match target(t, &jumpdests) {
+            let Some(opcode) = code.get(at).copied() else {
+                break Outcome::Stop;
+            };
+            if let (op::SSTORE, [.., after, slot]) = (opcode, &m.stack[..]) {
+                self.writes.push(Write {
+                    address: frame.account,
+                    slot: *slot,
+                    before: m.sload(*slot),
+                    after: *after,
+                });
+            }
+            let stepped = match m.step() {
+                Ok(stepped) => stepped,
+                Err(e) => break Outcome::Exception(e),
+            };
+            match stepped {
+                None => {}
+                Some(Outcome::Jump(t)) => match jump(t) {
                     Some(pc) => m.pc = pc,
                     None => break Outcome::Invalid,
                 },
-                Ok(Some(Outcome::JumpI(t, c))) => {
-                    if c.is_zero() {
-                        m.pc = at + 1;
-                    } else {
-                        match target(t, &jumpdests) {
-                            Some(pc) => m.pc = pc,
-                            None => break Outcome::Invalid,
-                        }
-                    }
-                }
-                Ok(Some(Outcome::Call(idx))) => {
-                    let (success, data) = self.resolve(&m.calls[idx], address, depth);
-                    if m.resume_after_call(idx, success, data).is_err() {
-                        break Outcome::Exception("resume".into());
+                Some(Outcome::JumpI(t, cond)) => match (cond.is_zero(), jump(t)) {
+                    (true, _) => m.pc = at + 1,
+                    (false, Some(pc)) => m.pc = pc,
+                    (false, None) => break Outcome::Invalid,
+                },
+                Some(Outcome::Call(index)) => {
+                    let record = m.calls[index].clone();
+                    self.storage.insert(frame.account, m.storage.clone());
+                    let (success, data) = self.call(&record, frame, depth);
+                    m.storage = self
+                        .storage
+                        .get(&frame.account)
+                        .cloned()
+                        .unwrap_or_default();
+                    if m.resume_after_call(index, success, data).is_err() {
+                        break Outcome::Exception("call result does not fit".into());
                     }
                     m.pc = at + 1;
                 }
-                Ok(Some(other)) => break other,
-                Err(e) => break Outcome::Exception(e),
+                Some(Outcome::Create(index)) => {
+                    let record = m.creates[index].clone();
+                    self.storage.insert(frame.account, m.storage.clone());
+                    let made = self.create(&record, frame, depth);
+                    m.storage = self
+                        .storage
+                        .get(&frame.account)
+                        .cloned()
+                        .unwrap_or_default();
+                    if m.resume_after_create(made).is_err() {
+                        break Outcome::Exception("stack overflow".into());
+                    }
+                    m.pc = at + 1;
+                }
+                Some(other) => break other,
             }
         };
-        let success = matches!(
-            outcome,
-            Outcome::Stop | Outcome::Return(_) | Outcome::SelfDestruct(_)
-        );
-        if success {
-            self.storage.insert(address, m.storage);
-        }
-        let data = match outcome {
-            Outcome::Return(d) | Outcome::Revert(d) => d,
-            _ => Vec::new(),
-        };
-        (success, data)
-    }
-
-    /// Resolve one call: run the callee across the world for `CALL`/`STATICCALL` into another of
-    /// its contracts, otherwise fall back to a seed-derived answer.
-    fn resolve(
-        &mut self,
-        rec: &crate::interp::CallRecord,
-        from: U256,
-        depth: usize,
-    ) -> (bool, Vec<u8>) {
-        use crate::opcode as op;
-        if rec.addr == U256::from_u64(4) {
-            return (true, rec.input.clone());
-        }
-        let followable = matches!(rec.kind, op::CALL | op::STATICCALL);
-        if followable && depth < MAX_DEPTH && self.codes.contains_key(&rec.addr) {
-            let saved = (rec.kind == op::STATICCALL).then(|| self.storage_of(rec.addr));
-            let out = self.frame(rec.addr, from, rec.value, rec.input.clone(), depth + 1);
-            if let Some(saved) = saved {
-                self.storage.insert(rec.addr, saved);
+        match outcome {
+            Outcome::Return(data) => {
+                self.storage.insert(frame.account, m.storage);
+                (true, data)
             }
-            return out;
+            Outcome::Stop | Outcome::SelfDestruct(_) => {
+                self.storage.insert(frame.account, m.storage);
+                (true, Vec::new())
+            }
+            Outcome::Revert(data) => (false, data),
+            _ => (false, Vec::new()),
         }
-        (true, Vec::new())
     }
-}
 
-impl Default for World {
-    fn default() -> World {
-        World::new()
+    /// Resolve one call made by `from`: run the callee when it is in the world, in the storage
+    /// and under the caller its call kind gives it, and take its writes back when it fails or
+    /// was only allowed to read.
+    fn call(&mut self, record: &CallRecord, from: &Frame, depth: usize) -> (bool, Vec<u8>) {
+        if record.addr == U256::from_u64(4) {
+            return (true, record.input.clone());
+        }
+        let Some(code) = self.codes.get(&record.addr).cloned() else {
+            return (true, Vec::new());
+        };
+        if depth >= MAX_DEPTH {
+            return (true, Vec::new());
+        }
+        let data = record.input.clone();
+        let inner = match record.kind {
+            op::DELEGATECALL => Frame {
+                account: from.account,
+                caller: from.caller,
+                value: from.value,
+                data,
+            },
+            op::CALLCODE => Frame {
+                account: from.account,
+                caller: from.account,
+                value: record.value,
+                data,
+            },
+            _ => Frame {
+                account: record.addr,
+                caller: from.account,
+                value: record.value,
+                data,
+            },
+        };
+        let saved = self.save();
+        let (success, output) = self.frame(&code, &inner, depth + 1);
+        if !success || record.kind == op::STATICCALL {
+            self.restore(saved);
+        }
+        (success, output)
     }
-}
 
-/// A jump target as a code offset, when it names a `JUMPDEST`.
-fn target(t: U256, jumpdests: &HashSet<usize>) -> Option<usize> {
-    let pc = t.as_usize()?;
-    jumpdests.contains(&pc).then_some(pc)
-}
-
-/// Two distinct accounts, neither the role-less caller nor zero, to put in a forwarded word so a
-/// store that tracks the account can be told from one that does not.
-pub const VICTIMS: [U256; 2] = [
-    U256::from_u64(0x1111_2222_3333_4444),
-    U256::from_u64(0x5555_6666_7777_8888),
-];
-
-/// The calldata `exec::calldata` builds, with `word` overwritten by `account`.
-pub fn calldata_naming(selector: Option<u32>, nargs: usize, word: u32, account: U256) -> Vec<u8> {
-    let mut args = vec![U256::ZERO; nargs.max(word as usize + 1)];
-    args[word as usize] = account;
-    exec::calldata(selector, &args)
+    /// Run the init code of one creation by `from` at a new address and place the code it
+    /// returns there. Returns the address, or zero when the creation failed.
+    fn create(&mut self, record: &CreateRecord, from: &Frame, depth: usize) -> U256 {
+        if depth >= MAX_DEPTH {
+            return U256::ZERO;
+        }
+        let saved = self.save();
+        self.made += 1;
+        let address = U256::from_u64(FIRST_MADE + self.made);
+        let inner = Frame {
+            account: address,
+            caller: from.account,
+            value: record.value,
+            data: Vec::new(),
+        };
+        let (success, runtime) = self.frame(&record.init, &inner, depth + 1);
+        if !success {
+            self.restore(saved);
+            return U256::ZERO;
+        }
+        self.codes.insert(address, Rc::new(runtime));
+        address
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opcode as op;
 
-    fn asm(ops: &[u8]) -> Vec<u8> {
-        ops.to_vec()
-    }
+    const CALLER: U256 = U256::from_u64(0xaaaa);
+    const FIRST: U256 = U256::from_u64(0xf1);
+    const SECOND: U256 = U256::from_u64(0xf2);
 
-    #[test]
-    fn a_call_runs_the_callee_in_its_own_storage() {
-        // Callee: store calldata word 0 (the account) as the key of slot and write 1 there.
-        // PUSH1 0x01 PUSH1 0x04 CALLDATALOAD SSTORE STOP
-        let callee = asm(&[
+    /// Code that stores 1 at the slot named by its first call-data word and then ends with
+    /// the opcode `end`.
+    fn stores_then(end: &[u8]) -> Vec<u8> {
+        let mut code = vec![
             op::PUSH1,
             0x01,
             op::PUSH1,
             0x04,
             op::CALLDATALOAD,
             op::SSTORE,
-            op::STOP,
-        ]);
-        // Caller: CALL callee with 36 bytes of our own calldata as input (copy calldata to mem).
-        // CALLDATASIZE PUSH1 0 PUSH1 0 CALLDATACOPY  then CALL(gas, callee, 0, 0, size, 0, 0)
-        let callee_addr: u64 = 0xbbbb;
-        // Copy our calldata to memory 0, then CALL(gas, callee, 0, argsOff=0, argsLen=size,
-        // retOff=0, retLen=0). CALL pops gas, addr, value, argsOff, argsLen, retOff, retLen, so
-        // they are pushed in reverse (retLen first, gas last).
+        ];
+        code.extend_from_slice(end);
+        code
+    }
+
+    /// Code that passes its own call data to `SECOND` with the call opcode `kind` and stops.
+    fn passes_on(kind: u8) -> Vec<u8> {
         let mut code = vec![
             op::CALLDATASIZE,
             op::PUSH1,
@@ -222,23 +348,119 @@ mod tests {
             op::PUSH1,
             0x00,
             op::CALLDATACOPY,
+            op::PUSH1,
+            0x00,
+            op::PUSH1,
+            0x00,
+            op::CALLDATASIZE,
+            op::PUSH1,
+            0x00,
         ];
-        code.extend_from_slice(&[op::PUSH1, 0x00]); // retLen
-        code.extend_from_slice(&[op::PUSH1, 0x00]); // retOff
-        code.push(op::CALLDATASIZE); // argsLen
-        code.extend_from_slice(&[op::PUSH1, 0x00]); // argsOff
-        code.extend_from_slice(&[op::PUSH1, 0x00]); // value
-        code.push(op::PUSH1 + 7); // addr
-        code.extend_from_slice(&callee_addr.to_be_bytes());
-        code.extend_from_slice(&[op::GAS, op::CALL, op::STOP]);
+        if kind == op::CALL {
+            code.extend_from_slice(&[op::PUSH1, 0x00]);
+        }
+        code.extend_from_slice(&[op::PUSH1, 0xf2, op::GAS, kind, op::STOP]);
+        code
+    }
+
+    /// Call data whose first word after the selector is `slot`.
+    fn naming(slot: u8) -> Vec<u8> {
+        let mut data = vec![0u8; 36];
+        data[35] = slot;
+        data
+    }
+
+    fn world(first: Vec<u8>, second: Vec<u8>) -> World {
+        let mut world = World::new();
+        world.place(FIRST, first);
+        world.place(SECOND, second);
+        world
+    }
+
+    #[test]
+    fn a_call_writes_the_storage_of_the_contract_it_reaches() {
+        let mut world = world(passes_on(op::CALL), stores_then(&[op::STOP]));
+        assert!(world.run(FIRST, CALLER, U256::ZERO, naming(0x42)));
+        assert_eq!(world.stored(SECOND, U256::from_u64(0x42)), U256::ONE);
+        assert_eq!(world.stored(FIRST, U256::from_u64(0x42)), U256::ZERO);
+        let expected = Write {
+            address: SECOND,
+            slot: U256::from_u64(0x42),
+            before: U256::ZERO,
+            after: U256::ONE,
+        };
+        assert_eq!(world.writes(), [expected]);
+    }
+
+    #[test]
+    fn a_delegated_call_writes_the_storage_of_the_contract_that_made_it() {
+        let mut world = world(passes_on(op::DELEGATECALL), stores_then(&[op::STOP]));
+        assert!(world.run(FIRST, CALLER, U256::ZERO, naming(0x42)));
+        assert_eq!(world.stored(FIRST, U256::from_u64(0x42)), U256::ONE);
+        assert_eq!(world.stored(SECOND, U256::from_u64(0x42)), U256::ZERO);
+    }
+
+    #[test]
+    fn a_call_that_fails_or_may_only_read_leaves_nothing_behind() {
+        let reverts = [op::PUSH1, 0x00, op::PUSH1, 0x00, op::REVERT];
+        let mut failing = world(passes_on(op::CALL), stores_then(&reverts));
+        assert!(failing.run(FIRST, CALLER, U256::ZERO, naming(0x42)));
+        assert_eq!(failing.stored(SECOND, U256::from_u64(0x42)), U256::ZERO);
+        assert!(failing.writes().is_empty());
+
+        let mut reading = world(passes_on(op::STATICCALL), stores_then(&[op::STOP]));
+        assert!(reading.run(FIRST, CALLER, U256::ZERO, naming(0x42)));
+        assert_eq!(reading.stored(SECOND, U256::from_u64(0x42)), U256::ZERO);
+        assert!(reading.writes().is_empty());
+    }
+
+    #[test]
+    fn created_code_is_placed_and_can_be_called() {
+        let runtime = stores_then(&[op::STOP]);
+        let size = runtime.len() as u8;
+        let mut init = vec![
+            op::PUSH1,
+            size,
+            op::PUSH1,
+            0x0c,
+            op::PUSH1,
+            0x00,
+            op::CODECOPY,
+            op::PUSH1,
+            size,
+            op::PUSH1,
+            0x00,
+            op::RETURN,
+        ];
+        init.extend_from_slice(&runtime);
+        let total = init.len() as u8;
+        let mut creator = vec![
+            op::PUSH1,
+            total,
+            op::PUSH1,
+            0x00,
+            op::PUSH1,
+            0x00,
+            op::CODECOPY,
+            op::PUSH1,
+            total,
+            op::PUSH1,
+            0x00,
+            op::PUSH1,
+            0x00,
+            op::CREATE,
+            op::STOP,
+        ];
+        creator[3] = creator.len() as u8;
+        creator.extend_from_slice(&init);
 
         let mut world = World::new();
-        world.place(U256::from_u64(0xaaaa), code);
-        world.place(U256::from_u64(callee_addr), callee);
-        let mut data = vec![0u8; 36];
-        data[35] = 0x42;
-        assert!(world.run(U256::from_u64(0xaaaa), U256::from_u64(1), U256::ZERO, data));
-        let callee_storage = world.storage_of(U256::from_u64(callee_addr));
-        assert_eq!(callee_storage.get(&U256::from_u64(0x42)), Some(&U256::ONE));
+        world.place(FIRST, creator);
+        assert!(world.run(FIRST, CALLER, U256::ZERO, Vec::new()));
+        let made = U256::from_u64(FIRST_MADE + 1);
+        assert!(world.was_made(made));
+        assert!(!world.was_made(FIRST));
+        assert!(world.run(made, CALLER, U256::ZERO, naming(0x07)));
+        assert_eq!(world.stored(made, U256::from_u64(0x07)), U256::ONE);
     }
 }

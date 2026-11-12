@@ -169,11 +169,16 @@ stake or balance mapping anyone can fill is accounting, not authorisation.
 
 Two passes run after the rules. The confirmation pass drives the concrete executor from a
 fresh state into each reachable sink and marks a finding confirmed with a witness input when
-the effect shows. A composed finding that spans a call edge is confirmed the same way but
-across contracts: the transaction is run through a world of the fetched contracts, following
-each call into the callee's real code and its own storage (seeded with the trust the on-chain
-probe found), once per account, and the finding is confirmed when the store the far contract
-makes tracks the account the caller chose. The invariant pass searches for an unprivileged
+the effect shows. A finding that spans a call edge is confirmed by running it across the
+fetched contracts (`cross`): calls run the callee's code in the callee's storage, library calls
+run in the caller's storage, creations run their init code, and a frame that fails takes its
+writes back. The state is only what was read from the chain: each contract's code, the
+addresses its slots were read to hold, and gates set for the callers a contract's own storage
+approved, so a gate nobody was read to pass stays shut. The function is run by an account
+holding no role, once for each of two named accounts. A first round finds the slots of the far
+contract written for one account and not the other; a second gives those slots a balance and
+tries a few argument shapes. The finding is confirmed, with the input, when for both accounts
+the call completes and the account's own slot ends lower. The invariant pass searches for an unprivileged
 path that credits a balance without a debit or a payment (`unprivileged-balance-credit`).
 
 ## Accuracy

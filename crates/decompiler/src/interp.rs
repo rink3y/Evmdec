@@ -107,9 +107,13 @@ pub struct Host {
     /// When set, every external call returns this success flag with empty data, instead of the
     /// seed-derived outcome. Lets a confirmation run assume the worst (or best) case of a callee.
     pub force_calls: Option<bool>,
-    /// When set, a CALL-family instruction records itself and yields [`Outcome::Call`] instead of
-    /// resolving against the seed, so a driver can run the real callee across contracts.
+    /// When set, a CALL-family instruction or a creation records itself and yields
+    /// [`Outcome::Call`] or [`Outcome::Create`] instead of resolving against the seed, so a
+    /// driver can run the real code across contracts.
     pub intercept_calls: bool,
+    /// When set, every storage key not written in the frame reads as this value, ahead of
+    /// `zero_storage` and the seed: a ledger in which every entry already holds something.
+    pub unset_storage: Option<U256>,
 }
 
 impl Host {
@@ -143,6 +147,7 @@ impl Host {
             zero_storage: false,
             force_calls: None,
             intercept_calls: false,
+            unset_storage: None,
         }
     }
 
@@ -173,6 +178,7 @@ impl Host {
             zero_storage: true,
             force_calls: Some(true),
             intercept_calls: false,
+            unset_storage: None,
         }
     }
     /// Balance of account `a` (`BALANCE`): seed-derived, limited to 64 bits.
@@ -236,6 +242,9 @@ impl Host {
     }
     /// Initial storage value of a key (random but deterministic).
     pub fn storage(&self, k: U256) -> U256 {
+        if let Some(held) = self.unset_storage {
+            return held;
+        }
         if self.zero_storage {
             return U256::ZERO;
         }
@@ -356,6 +365,10 @@ pub enum Outcome {
     /// is set: the index into [`Machine::calls`] of the call to resolve. The driver runs the
     /// callee and then calls [`Machine::resume_after_call`] before continuing.
     Call(usize),
+    /// A creation whose result the driver supplies, when `Host::intercept_calls` is set: the
+    /// index into [`Machine::creates`]. The driver runs the init code and then calls
+    /// [`Machine::resume_after_create`] before continuing.
+    Create(usize),
 }
 
 /// Execution state of one frame: the EVM machine state plus a record of every external effect.
@@ -497,6 +510,13 @@ impl<'a> Machine<'a> {
         let rec = self.calls.get(idx).ok_or("no such call")?;
         let (out_off, out_len) = (rec.out_off, rec.out_len);
         self.deliver_call(out_off, out_len, success, data)
+    }
+
+    /// Supply the result of the creation that yielded [`Outcome::Create`]: the new account's
+    /// address, or zero when the creation failed.
+    pub fn resume_after_create(&mut self, address: U256) -> Result<(), String> {
+        self.returndata = Vec::new();
+        self.push(address)
     }
 
     fn copy_in(&mut self, dest: U256, src: U256, len: U256, source: &[u8]) -> Result<(), String> {
@@ -859,6 +879,9 @@ impl<'a> Machine<'a> {
                     init,
                     salt,
                 });
+                if self.host.intercept_calls {
+                    return Ok(Some(Outcome::Create(idx)));
+                }
                 let addr = self.host.create_result(idx);
                 self.returndata = Vec::new();
                 self.push(addr)?;

@@ -1306,7 +1306,7 @@ fn an_account_passed_on_unbound_is_held_against_the_function_that_receives_it() 
     let gated = dispatcher(&format!("{OWNER_GATE} {lower}"));
     let open = dispatcher(&lower);
     let passes = dispatcher(&format!("{} STOP", call_with_words(word0, word1)));
-    let lowered = "unbound-account-passed-on High/High";
+    let lowered = "unbound-account-passed-on High/Medium";
 
     assert_eq!(passed_on(&passes, &gated, None, None), [lowered]);
     assert_eq!(
@@ -1368,7 +1368,7 @@ fn a_value_computed_by_a_linked_library_is_read_through_the_call() {
     ));
     assert_eq!(
         passed_on(&passes, &gated, Some(&difference), None),
-        ["unbound-account-passed-on High/High"],
+        ["unbound-account-passed-on High/Medium"],
         "the library returns the old value less the amount"
     );
     assert!(
@@ -1546,7 +1546,7 @@ fn a_contract_created_during_the_call_is_read_like_a_linked_one() {
     assert_eq!(
         world_ids(&both, &world),
         [
-            "unbound-account-passed-on High/High",
+            "unbound-account-passed-on High/Medium",
             "unbound-address-made-privileged High/Medium"
         ]
     );
@@ -1586,10 +1586,39 @@ fn a_clone_created_during_the_call_runs_the_code_it_forwards_to() {
     assert_eq!(
         world_ids(&root, &[(LINKED, &implementation), (LIBRARY, &ledger)]),
         [
-            "unbound-account-passed-on High/High",
+            "unbound-account-passed-on High/Medium",
             "unbound-address-made-privileged High/Medium"
         ]
     );
+}
+
+/// The `unbound-account-passed-on` finding on `root`, analysed with `linked` at `LINKED` and
+/// `library` at `LIBRARY`. `approved` states whether the linked contract's storage was read to
+/// approve the root as a caller.
+fn passed_on_finding(
+    root: &[u8],
+    linked: &[u8],
+    library: Option<&[u8]>,
+    approved: bool,
+) -> analyze::Finding {
+    let mut c = decompile::decompile(root, &Options::default());
+    c.address = Some(ROOT.into());
+    let mut lc = decompile::decompile(linked, &Options::default());
+    lc.address = Some(LINKED.into());
+    if approved {
+        lc.gates_read = true;
+        lc.admits.push(ROOT.into());
+    }
+    c.linked.push(lc);
+    if let Some(code) = library {
+        let mut lib = decompile::decompile(code, &Options::default());
+        lib.address = Some(LIBRARY.into());
+        c.linked.push(lib);
+    }
+    let r = analyze::analyze(&c);
+    finding(&r, "unbound-account-passed-on")
+        .unwrap_or_else(|| panic!("{:?}", ids(&r)))
+        .clone()
 }
 
 #[test]
@@ -1603,20 +1632,45 @@ fn a_composed_finding_is_confirmed_by_running_across_contracts() {
     let gated = dispatcher(&format!("{OWNER_GATE} {lower}"));
     let passes = dispatcher(&format!("{} STOP", call_with_words(word0, word1)));
 
-    let mut c = decompile::decompile(&passes, &Options::default());
-    c.address = Some(ROOT.into());
-    let mut lc = decompile::decompile(&gated, &Options::default());
-    lc.address = Some(LINKED.into());
-    lc.gates_read = true;
-    lc.admits.push(ROOT.into());
-    c.linked.push(lc);
-
-    let r = analyze::analyze(&c);
-    let f = finding(&r, "unbound-account-passed-on").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    let run = passed_on_finding(&passes, &gated, None, true);
+    assert!(run.confirmed, "{}", run.description);
+    assert_eq!(run.confidence, analyze::Confidence::High);
+    let witness = run.witness.expect("a confirmed finding carries its input");
     assert!(
-        f.confirmed,
-        "the account the caller names reaches the lowering store in the linked contract: {}",
-        f.description
+        witness.starts_with("0xaaaaaaaa") && witness.contains("1111222233334444"),
+        "the input calls the function and names an account that is not the caller: {witness}"
     );
-    assert!(f.witness.as_deref().is_some_and(|w| w.starts_with("0x")));
+
+    let unread = passed_on_finding(&passes, &gated, None, false);
+    assert!(
+        !unread.confirmed && unread.witness.is_none(),
+        "a gate nobody was read to pass stays shut in the run"
+    );
+    assert_eq!(unread.confidence, analyze::Confidence::Medium);
+}
+
+#[test]
+fn the_run_follows_a_library_call_into_the_calling_contract_s_storage() {
+    let word1 = "PUSH1 0x24 CALLDATALOAD";
+    let through_library = format!(
+        "{} DUP1 SLOAD PUSH4 0xaaaaaaaa PUSH1 0xe0 SHL PUSH1 0x80 MSTORE PUSH1 0x84 MSTORE {word1} \
+         PUSH1 0xa4 MSTORE PUSH1 0x20 PUSH1 0x00 PUSH1 0x44 PUSH1 0x80 PUSH20 {LIBRARY} GAS \
+         DELEGATECALL POP PUSH1 0x00 MLOAD SWAP1 SSTORE STOP",
+        account_entry("0x04")
+    );
+    let gated = dispatcher(&format!("{OWNER_GATE} {through_library}"));
+    let difference = dispatcher(
+        "PUSH1 0x24 CALLDATALOAD PUSH1 0x04 CALLDATALOAD SUB PUSH1 0x00 MSTORE PUSH1 0x20 \
+         PUSH1 0x00 RETURN",
+    );
+    let passes = dispatcher(&format!(
+        "{} STOP",
+        call_with_words("PUSH1 0x04 CALLDATALOAD", word1)
+    ));
+    let run = passed_on_finding(&passes, &gated, Some(&difference), true);
+    assert!(
+        run.confirmed,
+        "the entry ends lower only if the library's code ran: {}",
+        run.description
+    );
 }

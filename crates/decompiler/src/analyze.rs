@@ -298,6 +298,9 @@ const CALLBACK_SELECTORS: &[u32] = &[
 /// secp256k1 half order: `s` values above it are the malleable twin of a valid signature.
 const SECP_HALF_ORDER: &str = "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0";
 
+/// Events inlined helpers may add to one function's event stream.
+const MAX_INLINED_EVENTS: usize = 12_000;
+
 /// Flattened event stream of a function including inlined internal callees (depth-limited),
 /// used by order-sensitive rules.
 #[derive(Clone)]
@@ -338,6 +341,9 @@ struct Ctx<'a> {
     callee_writes: RefCell<HashMap<usize, Option<MemWrites>>>,
     /// Counter handing out `Event::inst` numbers.
     inst_seq: std::cell::Cell<usize>,
+    /// Events one function's stream may still take from inlined helpers. Helpers that call
+    /// helpers multiply; once this is spent the remaining internal calls stay calls.
+    inline_left: std::cell::Cell<usize>,
     /// Whether an internal function (transitively) divides, by entry pc.
     divides: RefCell<HashMap<usize, bool>>,
     /// Root slots of caller-keyed mappings that act as roles: every function writing them is
@@ -2420,24 +2426,58 @@ fn graph_mentions(
 
 /// Loop membership of nodes (back edges via DFS).
 fn loop_nodes(l: &Lifted) -> HashSet<usize> {
-    let mut in_loop = HashSet::new();
+    const UNSEEN: usize = usize::MAX;
     let n = l.nodes.len();
-    for x in 0..n {
-        let mut seen = HashSet::new();
-        let mut stack: Vec<usize> = l.nodes[x].succs.clone();
-        let mut found = false;
-        while let Some(y) = stack.pop() {
-            if y == x {
-                found = true;
-                break;
+    let mut index = vec![UNSEEN; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut component: Vec<usize> = Vec::new();
+    let mut in_loop = HashSet::new();
+    let mut next = 0usize;
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        let mut calls: Vec<(usize, usize)> = vec![(root, 0)];
+        while let Some(&(x, child)) = calls.last() {
+            if child == 0 {
+                index[x] = next;
+                low[x] = next;
+                next += 1;
+                component.push(x);
+                on_stack[x] = true;
             }
-            if !seen.insert(y) || seen.len() > 5000 {
+            if let Some(&y) = l.nodes[x].succs.get(child) {
+                calls.last_mut().expect("the frame being advanced").1 += 1;
+                if y >= n {
+                    continue;
+                }
+                if index[y] == UNSEEN {
+                    calls.push((y, 0));
+                } else if on_stack[y] {
+                    low[x] = low[x].min(index[y]);
+                }
                 continue;
             }
-            stack.extend(l.nodes[y].succs.iter().copied());
-        }
-        if found {
-            in_loop.insert(x);
+            calls.pop();
+            if let Some(&(parent, _)) = calls.last() {
+                low[parent] = low[parent].min(low[x]);
+            }
+            if low[x] != index[x] {
+                continue;
+            }
+            let start = component
+                .iter()
+                .rposition(|m| *m == x)
+                .expect("a root is on the stack of its component");
+            let members = component.split_off(start);
+            let cyclic = members.len() > 1 || l.nodes[x].succs.contains(&x);
+            for m in members {
+                on_stack[m] = false;
+                if cyclic {
+                    in_loop.insert(m);
+                }
+            }
         }
     }
     in_loop
@@ -2445,6 +2485,7 @@ fn loop_nodes(l: &Lifted) -> HashSet<usize> {
 
 fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Event> {
     ctx.computed_returns.borrow_mut().clear();
+    ctx.inline_left.set(MAX_INLINED_EVENTS);
     let mut mem = lift::MemView::new_fresh();
     events_of_in(
         ctx,
@@ -2584,6 +2625,7 @@ fn events_of_in(
                     None => known.remove(seq),
                 };
             }
+            let depth = if ctx.inline_left.get() == 0 { 0 } else { depth };
             if let Stmt::Internal { callee: t, .. } = &s {
                 let inlined = depth > 0 && ctx.internals.get(t).is_some_and(|f| f.lifted.is_some());
                 if !inlined {
@@ -2681,7 +2723,7 @@ fn events_of_in(
                                 in_loop,
                             });
                             ctx.inst_seq.set(ctx.inst_seq.get() + 1);
-                            out.extend(events_of_in(
+                            let inlined = events_of_in(
                                 ctx,
                                 cl,
                                 depth - 1,
@@ -2692,7 +2734,10 @@ fn events_of_in(
                                 &path,
                                 &inner,
                                 mem,
-                            ));
+                            );
+                            ctx.inline_left
+                                .set(ctx.inline_left.get().saturating_sub(inlined.len()));
+                            out.extend(inlined);
                             continue;
                         }
                     }
@@ -3202,6 +3247,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         vyper: c.language.starts_with("vyper"),
         callee_writes: Default::default(),
         inst_seq: std::cell::Cell::new(0),
+        inline_left: std::cell::Cell::new(MAX_INLINED_EVENTS),
         divides: Default::default(),
         roles: HashSet::new(),
         slot_writes: HashSet::new(),

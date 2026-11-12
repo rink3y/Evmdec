@@ -30,11 +30,12 @@ pub enum Item {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Free {
     pub words: usize,
     pub value: bool,
     pub storage: bool,
+    pub fixed: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,7 +170,7 @@ pub fn replay(items: &[Item], inputs: &Inputs) -> Vec<Option<bool>> {
 
 struct Search<'a> {
     eval: Eval<'a>,
-    free: Free,
+    free: &'a Free,
     out: Vec<(Place, U256)>,
 }
 
@@ -179,8 +180,8 @@ impl Search<'_> {
             Node::CallDataLoad(off) | Node::CopiedWord(op::CALLDATACOPY, off, _) => {
                 let at = self.eval.value(off)?.as_usize()?;
                 let index = at.checked_sub(4)? / 32;
-                (at >= 4 && (at - 4) % 32 == 0 && index < self.free.words)
-                    .then_some(Place::Word(index))
+                let open = index < self.free.words && !self.free.fixed.contains(&index);
+                (at >= 4 && (at - 4) % 32 == 0 && open).then_some(Place::Word(index))
             }
             Node::Env(op::CALLVALUE, _) if self.free.value => Some(Place::Value),
             Node::SLoad(key, false, gen) if self.free.storage => {
@@ -373,7 +374,7 @@ impl Search<'_> {
 fn proposals(
     items: &[Item],
     inputs: &Inputs,
-    free: Free,
+    free: &Free,
     at: usize,
     want: bool,
 ) -> Vec<(Place, U256)> {
@@ -428,7 +429,7 @@ fn agreed(truth: &[Option<bool>], want: &[bool], observed: &[bool]) -> usize {
 }
 
 // A generator, not a decision procedure. A caller must run what it returns.
-pub fn solve(items: &[Item], want: &[bool], start: &Inputs, free: Free) -> Option<Inputs> {
+pub fn solve(items: &[Item], want: &[bool], start: &Inputs, free: &Free) -> Option<Inputs> {
     let observed: Vec<bool> = items
         .iter()
         .filter_map(|i| match i {
@@ -486,17 +487,18 @@ mod tests {
         }
     }
 
-    const WORDS: Free = Free {
-        words: 4,
-        value: false,
-        storage: false,
-    };
+    fn words() -> Free {
+        Free {
+            words: 4,
+            ..Free::default()
+        }
+    }
 
     #[test]
     fn an_equality_with_a_sum_is_solved_by_inverting_the_sum() {
         let sum = expr::op2(op::ADD, arg(0), expr::konst_u64(7));
         let items = [check(expr::op2(op::EQ, sum, expr::konst_u64(100)))];
-        let found = solve(&items, &[true], &inputs(), WORDS).expect("solvable");
+        let found = solve(&items, &[true], &inputs(), &words()).expect("solvable");
         assert_eq!(word(&found.calldata, 4), U256::from_u64(93));
     }
 
@@ -508,7 +510,7 @@ mod tests {
             check(expr::op2(op::EQ, masked, expr::konst_u64(0x42))),
             check(below),
         ];
-        let found = solve(&items, &[true, true], &inputs(), WORDS).expect("solvable");
+        let found = solve(&items, &[true, true], &inputs(), &words()).expect("solvable");
         let (a, b) = (word(&found.calldata, 4), word(&found.calldata, 36));
         assert!(a < b && (b & U256::from_u64(0xff)) == U256::from_u64(0x42));
     }
@@ -525,7 +527,7 @@ mod tests {
             },
             check(expr::op2(op::EQ, load, expr::konst_u64(9))),
         ];
-        let found = solve(&items, &[true], &inputs(), WORDS).expect("solvable");
+        let found = solve(&items, &[true], &inputs(), &words()).expect("solvable");
         assert_eq!(word(&found.calldata, 4), U256::from_u64(9));
     }
 
@@ -533,12 +535,12 @@ mod tests {
     fn prior_storage_is_chosen_only_when_it_is_free() {
         let load = expr::intern(Node::SLoad(expr::konst_u64(3), false, 0));
         let items = [check(expr::op2(op::EQ, load, expr::env(op::CALLER)))];
-        assert!(solve(&items, &[true], &inputs(), WORDS).is_none());
+        assert!(solve(&items, &[true], &inputs(), &words()).is_none());
         let free = Free {
             storage: true,
-            ..WORDS
+            ..words()
         };
-        let found = solve(&items, &[true], &inputs(), free).expect("solvable");
+        let found = solve(&items, &[true], &inputs(), &free).expect("solvable");
         assert_eq!(
             found.storage.get(&U256::from_u64(3)),
             Some(&U256::from_u64(0xc0))
@@ -552,6 +554,6 @@ mod tests {
             expr::env(op::CALLER),
             expr::konst_u64(1),
         ))];
-        assert!(solve(&items, &[true], &inputs(), WORDS).is_none());
+        assert!(solve(&items, &[true], &inputs(), &words()).is_none());
     }
 }

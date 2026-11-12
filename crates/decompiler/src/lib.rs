@@ -9,6 +9,7 @@ pub mod path;
 pub mod u256;
 
 pub use u256::U256;
+pub mod abi;
 pub mod analyze;
 pub mod cfg;
 pub mod clock;

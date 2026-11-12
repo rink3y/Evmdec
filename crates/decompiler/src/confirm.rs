@@ -1,3 +1,4 @@
+use crate::abi;
 use crate::analyze::{display_name, Confidence, Finding};
 use crate::decompile::{Contract, Function};
 use crate::exec::{self, FrameRun};
@@ -7,7 +8,7 @@ use crate::interp::{CallRecord, Outcome};
 use crate::opcode as op;
 use crate::path::{self, Explorer, Limits, Path};
 use crate::seq::{self, Entry};
-use crate::solve::Free;
+use crate::solve::{Free, Inputs};
 use crate::u256::U256;
 use std::collections::HashMap;
 
@@ -104,21 +105,17 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
 // So the run must end normally and show it.
 fn reach(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
     let selector = exec::selector_of(f);
-    let mut attempts = 0;
-    for callvalue in [U256::ZERO, SOME_ETHER] {
-        for nargs in 0..=6usize {
-            for args in exec::arg_shapes(nargs) {
-                if attempts >= MAX_ATTEMPTS {
-                    return None;
-                }
-                attempts += 1;
-                let data = exec::calldata(selector, &args);
-                let host = exec::caller_host(data.clone(), callvalue);
-                let run = exec::run_frame(code, &host, HashMap::new(), STEP_BUDGET);
-                if run.reached(pc) && run.succeeded() && shows_effect(id, &run) {
-                    return Some(data);
-                }
-            }
+    let shapes = [U256::ZERO, SOME_ETHER].into_iter().flat_map(|callvalue| {
+        (0..=6usize)
+            .flat_map(exec::arg_shapes)
+            .map(move |args| (callvalue, args))
+    });
+    for (callvalue, args) in shapes.take(MAX_ATTEMPTS) {
+        let data = exec::calldata(selector, &args);
+        let host = exec::caller_host(data.clone(), callvalue);
+        let run = exec::run_frame(code, &host, HashMap::new(), STEP_BUDGET);
+        if run.reached(pc) && run.succeeded() && shows_effect(id, &run) {
+            return Some(data);
         }
     }
     solved(code, f, pc, id)
@@ -126,23 +123,40 @@ fn reach(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
 
 // Storage stays as it is in a fresh contract. Only the call data and the value are solved for.
 fn solved(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
-    let free = Free {
-        words: SOLVED_WORDS,
-        value: true,
-        storage: false,
-    };
     let explorer = Explorer::new(code);
+    let selector = exec::selector_of(f);
+    let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
+    let shaped = abi::layout(selector, &types);
+    let flat = path::inputs_for(selector, SOLVED_WORDS);
+    let starts = [
+        (flat.calldata.clone(), Vec::new()),
+        (shaped.calldata, shaped.fixed),
+    ];
     let mut answer = vec![0u8; 32];
     answer[31] = 1;
-    [Vec::new(), answer].into_iter().find_map(|returned| {
-        let mut start = path::inputs_for(exec::selector_of(f), SOLVED_WORDS);
-        start.returned = returned;
-        let paths = explorer.explore(&start, free, Limits::default());
-        paths
-            .into_iter()
-            .find(|p| p.run.reached(pc) && p.succeeded() && shows_effect(id, &p.run))
-            .map(|p| p.inputs.calldata)
-    })
+    for (calldata, fixed) in starts {
+        let free = Free {
+            words: SOLVED_WORDS.max(calldata.len() / 32),
+            value: true,
+            storage: false,
+            fixed,
+        };
+        for returned in [Vec::new(), answer.clone()] {
+            let start = Inputs {
+                calldata: calldata.clone(),
+                returned,
+                ..flat.clone()
+            };
+            let hit = explorer
+                .explore(&start, &free, Limits::default())
+                .into_iter()
+                .find(|p| p.run.reached(pc) && p.succeeded() && shows_effect(id, &p.run));
+            if let Some(p) = hit {
+                return Some(p.inputs.calldata);
+            }
+        }
+    }
+    None
 }
 
 fn shows_effect(id: &str, run: &FrameRun) -> bool {

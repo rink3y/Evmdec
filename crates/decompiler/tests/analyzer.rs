@@ -1651,10 +1651,9 @@ fn every_path_of_a_function_is_found_by_solving_its_branches() {
     let start = inputs_for(Some(0xaaaa_aaaa), 3);
     let words = Free {
         words: 3,
-        value: false,
-        storage: false,
+        ..Free::default()
     };
-    let paths = explorer.explore(&start, words, Limits::default());
+    let paths = explorer.explore(&start, &words, Limits::default());
 
     for p in &paths {
         let replayed = solve::replay(&p.items, &p.inputs);
@@ -1690,9 +1689,9 @@ fn every_path_of_a_function_is_found_by_solving_its_branches() {
 
     let with_state = Free {
         storage: true,
-        ..words
+        ..words.clone()
     };
-    let paths = explorer.explore(&start, with_state, Limits::default());
+    let paths = explorer.explore(&start, &with_state, Limits::default());
     assert!(
         paths
             .iter()

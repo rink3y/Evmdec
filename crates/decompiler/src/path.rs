@@ -145,7 +145,7 @@ impl Explorer {
     }
 
     // Each new path is only kept after the bytecode really ran it.
-    pub fn explore(&self, start: &Inputs, free: Free, limits: Limits) -> Vec<Path> {
+    pub fn explore(&self, start: &Inputs, free: &Free, limits: Limits) -> Vec<Path> {
         let first = self.run(start);
         let mut seen: HashSet<Vec<(usize, bool)>> = HashSet::new();
         seen.insert(first.signature());

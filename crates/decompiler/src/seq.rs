@@ -40,6 +40,7 @@ fn free(entry: Entry, storage: bool) -> Free {
         words: entry.words,
         value: true,
         storage,
+        fixed: Vec::new(),
     }
 }
 
@@ -135,7 +136,7 @@ fn write_for(
     need: &Need,
 ) -> Option<Path> {
     let start = inputs_at(entry, state);
-    let paths = explorer.explore(&start, free(entry, false), Limits::default());
+    let paths = explorer.explore(&start, &free(entry, false), Limits::default());
     for path in paths
         .iter()
         .filter(|p| p.succeeded())
@@ -156,7 +157,8 @@ fn write_for(
                 items.push(check(cond));
                 want.push(true);
             }
-            let Some(inputs) = solve::solve(&items, &want, &path.inputs, free(entry, false)) else {
+            let Some(inputs) = solve::solve(&items, &want, &path.inputs, &free(entry, false))
+            else {
                 continue;
             };
             let run = explorer.run(&inputs);
@@ -180,11 +182,11 @@ pub fn reach(
     let mut steps: Vec<Inputs> = Vec::new();
     for _ in 0..=MAX_SETUP_STEPS {
         let start = inputs_at(target, &state);
-        let direct = explorer.explore(&start, free(target, false), Limits::default());
+        let direct = explorer.explore(&start, &free(target, false), Limits::default());
         if let Some(last) = direct.into_iter().find(|p| goal(p)) {
             return replayed(explorer, steps, last, goal);
         }
-        let assumed = explorer.explore(&start, free(target, true), Limits::default());
+        let assumed = explorer.explore(&start, &free(target, true), Limits::default());
         let wanted: Vec<Need> = assumed
             .iter()
             .filter(|p| goal(p))

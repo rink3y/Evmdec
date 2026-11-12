@@ -17,14 +17,18 @@ by scripts in `corpus/`, not asserted.
 
 ```mermaid
 flowchart LR
-    A[bytes or RPC] --> B[disassembly and metadata]
+    A0[address] --> A1[fetch<br/>proxy, diamond, call graph,<br/>created contracts]
+    A1 --> B
+    A[bytes] --> B[disassembly, metadata,<br/>compiler fingerprint]
     B --> C[control-flow recovery<br/>summary analysis, internal functions]
     C --> D[symbolic lifter<br/>hash-consed IR]
     D --> E[type solver]
-    E --> F[structurer and printer]
+    E --> N[names from roles]
+    N --> F[structurer and printer]
     F --> G[pseudo-Solidity]
     D --> H[analyzer<br/>rules, intent, chains, invariants]
-    H --> I[concrete executor<br/>confirmation]
+    H --> S[function summaries composed<br/>across linked and created contracts]
+    S --> I[confirmation<br/>one-contract and cross-contract runs]
     I --> J[report]
     D -. every block, random states .-> K[block oracle]
 ```
@@ -41,12 +45,13 @@ Every stage is in `crates/decompiler`:
 | `compiler` | compiler version and feature fingerprints when the metadata is missing |
 | `analyze`, `confirm`, `invariant`, `exec`, `cross` | security rules, concrete confirmation of reachable findings, invariant search, whole-frame and cross-contract executors |
 | `interp`, `verify` | reference EVM interpreter and the block oracle |
-| `rpc`, `fetch`, `decompile`, `slots` | chain access, proxy and diamond resolution, composition, well-known storage slots |
+| `rpc`, `fetch`, `decompile`, `slots`, `clock` | chain access, proxy and diamond resolution, the walk over call targets, composition, well-known storage slots, the time limit one dependency is given |
 
 ## What it recovers
 
 - Any bytecode. Runtime or creation code, solc 0.4 to 0.8, Vyper 0.2 to 0.3, hand-written and
-  minimal proxies, embedded `CREATE` and `CREATE2` payloads. Unreferenced code is still printed
+  minimal proxies, embedded `CREATE` and `CREATE2` payloads (decompiled with `--embedded`, and
+  always when the contract is fetched by address). Unreferenced code is still printed
   as `orphan_<pc>` functions; anything unresolved is reported, not dropped.
 - The interface. Linear, binary-search, `XOR` and `SUB` dispatchers and Vyper jump tables;
   parameter and return types from ABI head checks, masks, sign extension, dynamic offsets and
@@ -104,12 +109,17 @@ flowchart TD
     C --> F[compose: one function list,<br/>one storage layout, one report]
     D --> F
     E --> F
-    F --> G[fixed call targets<br/>and libraries]
-    F --> H[targets held in storage<br/>read from the chain]
-    G --> I[fetched, resolved the same way,<br/>analysed with the root]
+    F --> T[collect its call targets]
+    T --> G[libraries, fixed addresses,<br/>code its clones run]
+    T --> H[addresses held in storage,<br/>read from the chain]
+    T --> M[contracts it creates:<br/>creation code in its own bytecode,<br/>decompiled with it]
+    M -->|their libraries and<br/>fixed addresses| G
+    G --> I[fetch in order: libraries,<br/>targets a call may change,<br/>targets only read]
     H --> I
-    I -->|next level, until the depth<br/>or a limit is reached| G
+    I -->|each fetched contract, until the<br/>depth or a limit is reached| T
+    I --> U[targets seen and not fetched<br/>are listed with the reason]
     I --> J[each contract's storage is asked<br/>whether it approves its callers]
+    J --> K[all analysed as one world;<br/>findings across a call edge<br/>are run to confirm them]
 ```
 
 Each function is marked with the address whose code holds it. Slots that two parts type
@@ -178,8 +188,10 @@ approved, so a gate nobody was read to pass stays shut. The function is run by a
 holding no role, once for each of two named accounts. A first round finds the slots of the far
 contract written for one account and not the other; a second gives those slots a balance and
 tries a few argument shapes. The finding is confirmed, with the input, when for both accounts
-the call completes and the account's own slot ends lower. The invariant pass searches for an unprivileged
-path that credits a balance without a debit or a payment (`unprivileged-balance-credit`).
+the call completes and the account's own slot ends lower.
+
+The invariant pass searches for an unprivileged path that credits a balance without a debit
+or a payment (`unprivileged-balance-credit`).
 
 ## Accuracy
 
@@ -204,7 +216,7 @@ TriCrypto-NG, the CREATE2 deployer, UNI), and one on 26 exploited contracts.
 | events | 119 / 121 |
 | code blocks covered by some function | 10,810 / 10,810 |
 | unresolved jumps | 0 |
-| time for the corpus | about 6 s |
+| time for the corpus | about 10 s |
 
 The mutability misses are `view` functions that make external calls on a pre-0.5 compiler, or
 proxy getters that fall through to `delegatecall`. Most type misses are `bytes32` mapping keys,
@@ -224,7 +236,7 @@ storage, logs, calls and the control decision are compared.
 | blocks | 13,656 |
 | runs | 109,011 |
 | mismatches | 0 |
-| inconclusive runs | 1,553 |
+| inconclusive runs | 1,582 |
 | instructions in verified blocks | 158,380 / 159,940 |
 
 A mismatch is a decompiler bug by definition. An inconclusive run is one the reference cannot
@@ -252,17 +264,30 @@ trust rules were built on and tested against.
 `corpus/harvest.py` collects the `to` address of every transaction in random recent mainnet
 blocks and `corpus/run_sample.sh` decompiles and verifies each one. The last run over 120
 contracts (`corpus/sample_ids.txt`) decompiled all of them with no unresolved jumps and no
-oracle mismatch in 592,999 instructions. The sample itself is not in the repository; the two
-scripts regenerate it.
+oracle mismatch in 589,349 instructions. The sample itself is not in the repository; the two
+scripts regenerate it, with the code each address holds on the day it is fetched.
 
 A larger run takes 579 distinct contracts from mainnet, Base, BNB Chain, Arbitrum and Polygon
 (`corpus/sample_ids_multichain.txt`, chain and address per line). 578 are decompiled, analysed
 and checked by the oracle, which finds no mismatch in 2,848,768 instructions; the median
-contract takes 0.09 s and the 99th percentile 3 s. One contract with a hundred unresolved
-jumps does not finish. The first pass over this set is what found an exponential walk in the
-printer, two quadratic scans in the analyzer, a return-data size shared across calls, and the
-transparent proxy being reported as an unguarded delegatecall; all are fixed. None of the
-three ledger rules fires on any of the 578, and the liability rule fires once.
+contract takes 0.09 s and the 99th percentile about 2 s. One contract with a hundred
+unresolved jumps does not finish on its own within three minutes; fetched as another
+contract's dependency it is given 20 seconds and then listed as not fetched. The first pass
+over this set is what found an exponential walk in the printer, two quadratic scans in the
+analyzer, a return-data size shared across calls, and the transparent proxy being reported as
+an unguarded delegatecall. Walking the call graph of live contracts later found two more in
+the analyzer: helpers inlined without a limit, and a loop search that ran once per node. All
+are fixed. None of the three ledger rules fires on any of the 578, and the liability rule
+fires once. Each of these contracts is analysed alone, from its bytecode, so this run says
+nothing about the rules that need a second contract.
+
+For those, 40 of the mainnet addresses in that list were fetched live and their call graphs
+walked with the default limits. All 40 complete, the median in 1 s and the slowest in 38 s.
+16 of them call other contracts: 61 dependencies are fetched (42 one call away, 19 two), 5
+contracts they create are decompiled with them, and 58 call targets are left out, each listed
+with its reason (the per-request limit on a large diamond, the depth, the per-contract limit,
+no code, an empty slot). Neither rule over words passed between contracts fires;
+`linked-callee-defect` fires six times and `value-to-non-payable` once.
 
 ## Quick start
 
@@ -272,6 +297,7 @@ cargo build --release
 ./target/release/evmdec decompile 0xdAC17F958D2ee523a2206206994597C13D831ec7 --report
 ./target/release/evmdec decompile 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --chain mainnet
 ./target/release/evmdec decompile 0x... --chain arbitrum --rpc https://my.node/
+./target/release/evmdec decompile 0x... --depth 3 --report
 
 solc --bin MyContract.sol | tail -1 > my.hex
 ./target/release/evmdec decompile my.hex --report
@@ -313,12 +339,14 @@ print as `func_<selector>`.
 The server serves a single-page UI: a title block, the function index, the code with numbered
 callouts keyed to the findings beside it, a band of the trusted contracts the analysis followed
 (each one opens in place), and tabs for the report, storage and events, the call graph,
-disassembly and JSON. Results are linkable as `/?chain=mainnet&address=0x...`. The page meets
+disassembly and JSON. The call graph says how each contract was reached (which contract calls
+it, how, how many calls away, and whether its storage approves that caller) and lists the call
+targets that were seen and not fetched, each with its reason. Results are linkable as `/?chain=mainnet&address=0x...`. The page meets
 WCAG 2.2 AA on both colour schemes and runs no third-party scripts.
 
 ```
 POST /api/decompile      {"address": "0x...", "chain": "mainnet"}  or  {"bytecode": "0x..."}
-                         optional: "no_follow_proxy": true, "lookup": true
+                         optional: "no_follow_proxy": true, "lookup": true, "depth": 0..3
 GET  /api/address/{chain}/{address}
 GET  /api/chains
 GET  /api/status         {"signature_index": 10780428}, or 0 when no index is installed
@@ -327,7 +355,13 @@ GET  /healthz
 
 Responses carry `contract`, `report`, `report_markdown`, `disassembly` and, when contracts
 were followed, `linked` (one entry each with the same four fields) and `parts_disassembly`.
-Requests are bounded: four decompilations in flight, five minutes each.
+A linked contract says how it was reached (`link`: the calling contract, how it names this
+one, and the number of calls away) and whom its storage approves (`admits`, with `gates_read`
+when the lookup was made); the contract asked for lists what was not fetched (`unfollowed`)
+and the contracts it creates (`embedded`). A report carries `summaries`: per external function,
+what it does with each word of its call data and what gates it. `depth` is the number of call
+edges to follow (default 2, at most 3, 0 for none). Requests are bounded: four decompilations
+in flight, five minutes each.
 
 ### Configuration
 
@@ -369,8 +403,16 @@ root turns on `#![warn(missing_docs)]`, and clippy is kept at zero warnings.
   leading arguments, then `...`; one with no known head prints as a memory range.
 - Vyper internal calls pass arguments through fixed memory, so some values in Vyper output
   print as `mem[0x...]` reads where the analyzer, which replays the callee, sees the value.
-- The confirmation pass starts from a fresh state. A finding whose path needs prior storage
-  stays unconfirmed, not refuted.
+- The confirmation pass inside one contract starts from a fresh state, and the one across
+  contracts from what was read from the chain: code, the addresses in the slots that were
+  read, and the callers each contract's storage approved. Neither replays earlier
+  transactions, so a finding whose path needs other prior storage stays unconfirmed, not
+  refuted.
+- The two rules over words passed between contracts have one true positive on deployed
+  contracts so far, besides their synthetic fixtures; on the 40 call graphs walked live they
+  do not fire.
+- What a creating contract passes to a constructor is not followed into the created
+  contract's storage; only calls made to the created contract after it exists are.
 - `pair-sync-after-state-change` looks for the Uniswap V2 `sync()` call; V3 and later pools
   have no equivalent, and the third-party debit rule covers them.
 - `inconsistent-liability-accounting` compares limits built from storage reads. Memory is

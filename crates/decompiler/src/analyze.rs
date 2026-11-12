@@ -2377,7 +2377,7 @@ pub fn is_auth_cond(cond: ExprId) -> bool {
     }
     let c = strip(cond);
     match expr::node(c) {
-        Node::Op(op::EQ, v) => {
+        Node::Op(op::EQ | op::SUB | op::XOR, v) => {
             let is_caller = |e: ExprId| matches!(expr::node(strip(e)), Node::Env(op::CALLER, _));
             for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                 if is_caller(a) {

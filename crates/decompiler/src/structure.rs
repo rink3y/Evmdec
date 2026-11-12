@@ -2537,7 +2537,7 @@ impl<'a> Printer<'a> {
         let Some(t) = t else {
             self.line(
                 depth,
-                &format!("if ({}) {{ revert(); }}", emit::fmt_expr(cond, self.names)),
+                &format!("if ({}) {{ revert(); }}", emit::fmt_truth(cond, self.names)),
             );
             self.transfer(n, f, stop, depth);
             return;
@@ -2579,7 +2579,7 @@ impl<'a> Printer<'a> {
         let first_is_true_side = first == t && first_cond == cond;
         self.line(
             depth,
-            &format!("if ({}) {{", emit::fmt_expr(first_cond, self.names)),
+            &format!("if ({}) {{", emit::fmt_truth(first_cond, self.names)),
         );
         self.active.insert(n);
         self.facts.push((cond, first_is_true_side));

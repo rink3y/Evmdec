@@ -620,11 +620,40 @@ fn bool_element(e: ExprId, n: &Names) -> bool {
 
 /// A condition as a boolean: `x` when boolean-valued, `x != 0` otherwise.
 pub fn fmt_cond(cond: ExprId, n: &Names) -> String {
+    if let Some(text) = difference_test(cond, n) {
+        return text;
+    }
     if is_bool(cond, n) {
         fmt_expr(cond, n)
     } else {
         format!("{} != 0", fmt_prec(cond, P_EQ + 1, n))
     }
+}
+
+/// A condition as it is tested for truth, without `!= 0`. A difference or an exclusive-or
+/// tested for truth is an inequality (`a - b` is how newer solc writes `a != b`), and its
+/// negation an equality; the constant goes on the right.
+pub fn fmt_truth(cond: ExprId, n: &Names) -> String {
+    difference_test(cond, n).unwrap_or_else(|| fmt_expr(cond, n))
+}
+
+fn difference_test(cond: ExprId, n: &Names) -> Option<String> {
+    let (inner, sym) = match expr::node(cond) {
+        Node::Op(op::ISZERO, v) => (v[0], "=="),
+        _ => (cond, "!="),
+    };
+    let Node::Op(op::SUB | op::XOR, v) = expr::node(inner) else {
+        return None;
+    };
+    let (left, right) = match expr::as_const(v[0]).is_some() && expr::as_const(v[1]).is_none() {
+        true => (v[1], v[0]),
+        false => (v[0], v[1]),
+    };
+    Some(format!(
+        "{} {sym} {}",
+        fmt_prec(left, P_EQ + 1, n),
+        fmt_prec(right, P_EQ + 1, n)
+    ))
 }
 
 /// Name of an event whose signature is unknown: `Event_<first four bytes of topic0>`.

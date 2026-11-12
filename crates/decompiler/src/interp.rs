@@ -107,6 +107,9 @@ pub struct Host {
     /// When set, every external call returns this success flag with empty data, instead of the
     /// seed-derived outcome. Lets a confirmation run assume the worst (or best) case of a callee.
     pub force_calls: Option<bool>,
+    /// When set, a CALL-family instruction records itself and yields [`Outcome::Call`] instead of
+    /// resolving against the seed, so a driver can run the real callee across contracts.
+    pub intercept_calls: bool,
 }
 
 impl Host {
@@ -139,6 +142,7 @@ impl Host {
             seed: rng.next_u64(),
             zero_storage: false,
             force_calls: None,
+            intercept_calls: false,
         }
     }
 
@@ -168,6 +172,7 @@ impl Host {
             seed: 0x5eed,
             zero_storage: true,
             force_calls: Some(true),
+            intercept_calls: false,
         }
     }
     /// Balance of account `a` (`BALANCE`): seed-derived, limited to 64 bits.
@@ -347,6 +352,10 @@ pub enum Outcome {
     Invalid,
     /// Exceptional halt inside the block (stack underflow/overflow, bad opcode).
     Exception(String),
+    /// A CALL-family instruction whose result the driver supplies, when `Host::intercept_calls`
+    /// is set: the index into [`Machine::calls`] of the call to resolve. The driver runs the
+    /// callee and then calls [`Machine::resume_after_call`] before continuing.
+    Call(usize),
 }
 
 /// Execution state of one frame: the EVM machine state plus a record of every external effect.
@@ -453,6 +462,43 @@ impl<'a> Machine<'a> {
         self.memory[o..o + data.len()].copy_from_slice(data);
         Ok(())
     }
+    /// Write `data` (truncated to the call's `out_len`) to the output region of a resolved
+    /// call, set the return data and push the success flag. Shared by the seed-resolved path and
+    /// the intercepted path.
+    fn deliver_call(
+        &mut self,
+        out_off: U256,
+        out_len: U256,
+        success: bool,
+        data: Vec<u8>,
+    ) -> Result<(), String> {
+        let ol = out_len
+            .as_usize()
+            .filter(|l| *l < (1 << 24))
+            .ok_or("call output too large")?;
+        if ol > 0 {
+            let mut buf = data.clone();
+            buf.truncate(ol);
+            self.expand(out_off.as_usize().ok_or("out offset too large")?, ol)?;
+            self.mwrite(out_off, &buf)?;
+        }
+        self.returndata = data;
+        self.push(U256::from(success))
+    }
+
+    /// Supply the result of the call that yielded [`Outcome::Call`] at index `idx`, then the
+    /// frame is ready to continue from the instruction after the call.
+    pub fn resume_after_call(
+        &mut self,
+        idx: usize,
+        success: bool,
+        data: Vec<u8>,
+    ) -> Result<(), String> {
+        let rec = self.calls.get(idx).ok_or("no such call")?;
+        let (out_off, out_len) = (rec.out_off, rec.out_len);
+        self.deliver_call(out_off, out_len, success, data)
+    }
+
     fn copy_in(&mut self, dest: U256, src: U256, len: U256, source: &[u8]) -> Result<(), String> {
         let n = len
             .as_usize()
@@ -844,23 +890,15 @@ impl<'a> Machine<'a> {
                     out_off,
                     out_len,
                 });
+                if self.host.intercept_calls {
+                    return Ok(Some(Outcome::Call(idx)));
+                }
                 let (success, data) = if addr == U256::from_u64(4) {
                     (true, input)
                 } else {
                     self.host.call_result(idx)
                 };
-                let ol = out_len
-                    .as_usize()
-                    .filter(|l| *l < (1 << 24))
-                    .ok_or("call output too large")?;
-                if ol > 0 {
-                    let mut buf = data.clone();
-                    buf.truncate(ol);
-                    self.expand(out_off.as_usize().ok_or("out offset too large")?, ol)?;
-                    self.mwrite(out_off, &buf)?;
-                }
-                self.returndata = data;
-                self.push(U256::from(success))?;
+                self.deliver_call(out_off, out_len, success, data)?;
             }
             op::RETURN | op::REVERT => {
                 let off = self.pop()?;

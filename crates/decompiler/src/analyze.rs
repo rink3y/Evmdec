@@ -1,8 +1,10 @@
 //! Security analysis over the lifted IR: a rule engine producing findings with evidence.
 
 use crate::compiler;
+use crate::cross::{self, World as CrossWorld};
 use crate::decompile::{self, Contract, Function};
 use crate::emit::{self, Names, SlotSpace};
+use crate::exec;
 use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
 use crate::lift::{self, Lifted, Stmt, Term};
@@ -6733,6 +6735,82 @@ fn reach(
     Some(reached)
 }
 
+/// Try to confirm that a role-less caller can drive `f` of the root contract, with an account
+/// of its choosing in call-data word `word`, to a state change in another contract of the world
+/// that tracks the account. Runs the real dispatcher across contracts twice, once per victim in
+/// [`cross::VICTIMS`], and returns a reproducing input when the store the far contract makes
+/// follows the account. `None` when the root has no code, the target is a contract created in
+/// the call, or no such input is found (a bounded search, not a proof of safety).
+fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec<u8>> {
+    if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || target.contains('#') {
+        return None;
+    }
+    let root = ctx.c.address.as_deref().and_then(U256::from_hex_str)?;
+    if ctx.c.info.runtime.is_empty() {
+        return None;
+    }
+    let selector = f
+        .selector
+        .as_deref()
+        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+    let target_addr = U256::from_hex_str(target)?;
+
+    let build = || -> Option<CrossWorld> {
+        let mut world = CrossWorld::new();
+        world.place(root, ctx.c.info.runtime.clone());
+        for lc in &ctx.c.linked {
+            if let (Some(a), false) = (
+                lc.address.as_deref().and_then(U256::from_hex_str),
+                lc.info.runtime.is_empty(),
+            ) {
+                world.place(a, lc.info.runtime.clone());
+            }
+        }
+        for (slot, held) in &ctx.c.stored_targets {
+            if let (Some(k), Some(v)) = (U256::from_hex_str(slot), U256::from_hex_str(held)) {
+                world.seed(root, k, v);
+            }
+        }
+        for lc in &ctx.c.linked {
+            let Some(a) = lc.address.as_deref().and_then(U256::from_hex_str) else {
+                continue;
+            };
+            let g = gates(lc);
+            for slot in &g.slots {
+                world.seed(a, *slot, root);
+            }
+            for key in &g.keys {
+                if let Some(slot) = key_for(*key, root) {
+                    world.seed(a, slot, U256::ONE);
+                }
+            }
+        }
+        Some(world)
+    };
+
+    let nargs = (word as usize + 1).max(8);
+    let run = |account: U256| -> Option<(bool, HashMap<U256, U256>)> {
+        let mut world = build()?;
+        let data = cross::calldata_naming(selector, nargs, word, account);
+        let ok = world.run(root, exec::CALLER, U256::ZERO, data);
+        Some((ok, world.storage_of(target_addr)))
+    };
+
+    let (ok0, store0) = run(cross::VICTIMS[0])?;
+    let (ok1, store1) = run(cross::VICTIMS[1])?;
+    let keys0: HashSet<&U256> = store0.keys().collect();
+    let keys1: HashSet<&U256> = store1.keys().collect();
+    if ok0 && ok1 && !store0.is_empty() && keys0 != keys1 {
+        return Some(cross::calldata_naming(
+            selector,
+            nargs,
+            word,
+            cross::VICTIMS[0],
+        ));
+    }
+    None
+}
+
 /// Hold each word a function passes to another contract of the world against what the called
 /// function does with it. A function anyone can call that takes an account from its call data,
 /// never ties it to `msg.sender`, and hands it to a function that runs only for approved callers
@@ -6803,6 +6881,14 @@ fn passed_word_findings(
                         vec![fw.line.clone(), line.clone()],
                         "Require that `msg.sender` is the account, or that the account approved this caller or signed this exact action, before passing it on.",
                     );
+                    if let Some(data) = confirm_passed(ctx, f, fw.word, &r.address) {
+                        if let Some(last) = findings.last_mut() {
+                            last.confirmed = true;
+                            last.witness = Some(crate::hex::encode(&data));
+                            last.confidence = Confidence::High;
+                            last.description.push_str(" Confirmed: running the call across contracts from a fresh state, a caller holding no role drives this to a storage change in the far contract that tracks the account it chose (a reproducing input is attached).");
+                        }
+                    }
                 }
             }
             let Some(line) = &r.gate_store else { continue };

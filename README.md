@@ -39,7 +39,7 @@ Every stage is in `crates/decompiler`:
 | `types`, `type_rules` | type recovery as constraint solving over parameters, storage, helpers and merges |
 | `structure`, `emit`, `function`, `sigs`, `sigdb`, `naming` | loops, conditionals and short-circuits; printing; signature dictionary and local index; names inferred from roles |
 | `compiler` | compiler version and feature fingerprints when the metadata is missing |
-| `analyze`, `confirm`, `invariant`, `exec` | security rules, concrete confirmation of reachable findings, invariant search, whole-frame executor |
+| `analyze`, `confirm`, `invariant`, `exec`, `cross` | security rules, concrete confirmation of reachable findings, invariant search, whole-frame and cross-contract executors |
 | `interp`, `verify` | reference EVM interpreter and the block oracle |
 | `rpc`, `fetch`, `decompile`, `slots` | chain access, proxy and diamond resolution, composition, well-known storage slots |
 
@@ -169,8 +169,12 @@ stake or balance mapping anyone can fill is accounting, not authorisation.
 
 Two passes run after the rules. The confirmation pass drives the concrete executor from a
 fresh state into each reachable sink and marks a finding confirmed with a witness input when
-the effect shows. The invariant pass searches for an unprivileged path that credits a balance
-without a debit or a payment (`unprivileged-balance-credit`).
+the effect shows. A composed finding that spans a call edge is confirmed the same way but
+across contracts: the transaction is run through a world of the fetched contracts, following
+each call into the callee's real code and its own storage (seeded with the trust the on-chain
+probe found), once per account, and the finding is confirmed when the store the far contract
+makes tracks the account the caller chose. The invariant pass searches for an unprivileged
+path that credits a balance without a debit or a payment (`unprivileged-balance-credit`).
 
 ## Accuracy
 

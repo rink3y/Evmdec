@@ -20,6 +20,7 @@ pub mod cfg;
 pub mod clock;
 pub mod compiler;
 pub mod confirm;
+pub mod cross;
 pub mod decompile;
 pub mod emit;
 pub mod exec;

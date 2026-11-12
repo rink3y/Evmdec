@@ -567,6 +567,105 @@ fn clock_mix(all: &[Run], layout: MappingLayout, out: &mut Vec<Finding>) {
     }
 }
 
+fn every_writer_seen(c: &Contract, all: &[Run]) -> bool {
+    let finished: BTreeSet<usize> = all.iter().map(|r| r.function.pc).collect();
+    c.functions
+        .iter()
+        .filter(|f| f.kind == FnKind::External && f.effects.writes_storage)
+        .all(|f| finished.contains(&f.pc))
+}
+
+fn time_bounds(
+    c: &Contract,
+    all: &[Run],
+    begin: &HashMap<U256, U256>,
+    layout: MappingLayout,
+    out: &mut Vec<Finding>,
+) {
+    let fixed = |key: ExprId| match place(key, layout) {
+        Some(Place::Fixed(slot)) => Some(slot),
+        _ => None,
+    };
+    let mut timed: BTreeMap<U256, &Run> = BTreeMap::new();
+    for run in all {
+        for item in &run.path.items {
+            let Item::Check { cond, .. } = item else {
+                continue;
+            };
+            if clock_of(*cond).is_none() {
+                continue;
+            }
+            for p in places_read(*cond, layout) {
+                if let Place::Fixed(slot) = p {
+                    timed.entry(slot).or_insert(run);
+                }
+            }
+        }
+    }
+    let mut written: BTreeSet<U256> = BTreeSet::new();
+    let mut set_by_call: BTreeMap<U256, &Run> = BTreeMap::new();
+    for run in all {
+        for item in &run.path.items {
+            let Item::Store { key, val, .. } = item else {
+                continue;
+            };
+            let Some(slot) = fixed(*key) else { continue };
+            written.insert(slot);
+            let from_input = expr::contains(*val, &|n| matches!(n, Node::CallDataLoad(_)));
+            if from_input && !run.assumed {
+                set_by_call.entry(slot).or_insert(run);
+            }
+        }
+    }
+    let complete = every_writer_seen(c, all);
+    for (slot, reader) in &timed {
+        if let Some(writer) = set_by_call.get(slot) {
+            report(
+                out,
+                writer,
+                "time-bound-set-by-anyone",
+                "A time bound can be set by any caller",
+                Severity::Medium,
+                format!(
+                    "`{}` compares {} with the block clock. `{}` needs no role and stores a value taken from its call there, so any caller decides when that check passes.",
+                    reader.function.name,
+                    slot_text(*slot),
+                    writer.function.name,
+                ),
+                "Let only an authorised caller set the bound, or derive it from the clock inside the contract.",
+            );
+            continue;
+        }
+        let never_passes = !all
+            .iter()
+            .any(|r| !r.assumed && r.function.pc == reader.function.pc);
+        let unset = begin.get(slot).is_none_or(|v| v.is_zero());
+        if complete && unset && never_passes && !written.contains(slot) {
+            push(
+                out,
+                "time-window-never-opens",
+                "A time check reads a slot that nothing sets",
+                Severity::Low,
+                if begin.is_empty() { Confidence::Low } else { Confidence::Medium },
+                Some(reader.function),
+                None,
+                format!(
+                    "`{}` ends normally only when {} holds a value its time check accepts. The slot starts at zero, no path found writes it, and from the starting storage the function never ends normally.{}",
+                    reader.function.name,
+                    slot_text(*slot),
+                    if begin.is_empty() {
+                        " Only runtime code was given, so a constructor that sets it cannot be ruled out."
+                    } else {
+                        ""
+                    },
+                ),
+                Vec::new(),
+                "Set the bound during construction or through an authorised function, or remove the check.",
+            );
+        }
+    }
+}
+
 type Field = (U256, u32, U256);
 
 fn field_of(e: ExprId) -> Option<Field> {
@@ -627,12 +726,7 @@ fn phases(
     out: &mut Vec<Finding>,
 ) -> Option<Section> {
     // A writer with no finished run could be the one that enters the missing phase.
-    let finished: BTreeSet<usize> = all.iter().map(|r| r.function.pc).collect();
-    let every_writer_seen = c
-        .functions
-        .iter()
-        .filter(|f| f.kind == FnKind::External && f.effects.writes_storage)
-        .all(|f| finished.contains(&f.pc));
+    let every_writer_seen = every_writer_seen(c, all);
     let small = |v: &U256| v.fits_u64() && v.low_u64() <= MAX_PHASE;
     let mut needs: BTreeMap<Field, BTreeMap<U256, BTreeSet<&str>>> = BTreeMap::new();
     for run in all {
@@ -972,6 +1066,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Vec<Section> {
     aimed_writes(&all, out);
     short_input(c, &all, out);
     let begin = deploy::storage(c);
+    time_bounds(c, &all, &begin, layout, out);
     growth(c, &all, &begin, out);
     phases(c, &all, &begin, out).into_iter().collect()
 }

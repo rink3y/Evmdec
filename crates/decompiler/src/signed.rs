@@ -114,6 +114,85 @@ fn repeated(
     None
 }
 
+type Effect = (Vec<(U256, U256, Vec<u8>)>, Vec<(U256, U256)>);
+
+fn effect(p: &Path) -> Effect {
+    let calls = p.run.calls.iter().filter(|c| c.addr != RECOVER);
+    let mut slots: Vec<(U256, U256)> = p.run.storage.iter().map(|(k, v)| (*k, *v)).collect();
+    slots.sort();
+    (
+        calls.map(|c| (c.addr, c.value, c.input.clone())).collect(),
+        slots,
+    )
+}
+
+// A word that changes what the call does while the digest stays the same is not signed.
+fn unsigned_words(explorer: &Explorer, first: &Path, fixed: &[usize]) -> Vec<(usize, Path)> {
+    let Some(digest) = digest_of(first) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let words = first.inputs.calldata.len().saturating_sub(4) / 32;
+    for index in (0..words).filter(|i| !fixed.contains(i)) {
+        let mut changed = first.inputs.clone();
+        changed.calldata[4 + 32 * index + 31] ^= 1;
+        changed.signed = Some((digest.clone(), SIGNER));
+        let run = explorer.run(&changed);
+        let same_message = digest_of(&run).as_ref() == Some(&digest);
+        if run.succeeded() && same_message && effect(&run) != effect(first) {
+            out.push((index, run));
+        }
+    }
+    out
+}
+
+fn signed_run(
+    explorer: &Explorer,
+    f: &Function,
+    begin: &HashMap<U256, U256>,
+    deadline: Instant,
+) -> Option<(Path, Vec<usize>)> {
+    let (start, free) = start_for(f, begin);
+    let limits = Limits {
+        until: Some(deadline),
+        ..LIMITS
+    };
+    let found = explorer.explore(&start, &free, limits);
+    let acted = |p: &Path| p.succeeded() && acts(p) && digest_of(p).is_some();
+    found.into_iter().find(acted).map(|p| (p, free.fixed))
+}
+
+fn report_unsigned(out: &mut Vec<Finding>, f: &Function, words: &[(usize, Path)]) {
+    let Some((_, run)) = words.first() else {
+        return;
+    };
+    let list: Vec<String> = words.iter().map(|(i, _)| i.to_string()).collect();
+    let severity = if words.iter().any(|(_, p)| moves_value(p)) {
+        Severity::High
+    } else {
+        Severity::Medium
+    };
+    push(
+        out,
+        "signed-call-leaves-word-unsigned",
+        "A signed call acts on a word the signature does not cover",
+        severity,
+        Confidence::High,
+        Some(f),
+        None,
+        format!(
+            "`{}` recovers a signer and acts on the result. Each of the argument words {} was changed in turn while recovery answered the signer only for the original digest. The digest stayed the same, the run still ended normally, and what the call did changed. Whoever submits the signed message chooses those words. Storage was chosen so the signer check passes.",
+            f.name,
+            list.join(", "),
+        ),
+        Vec::new(),
+        "Include every argument the call acts on in the signed digest.",
+    );
+    if let Some(last) = out.last_mut() {
+        last.confirm(run);
+    }
+}
+
 pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return;
@@ -133,6 +212,9 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         let explorer = explorers
             .entry(code.as_ptr())
             .or_insert_with(|| Explorer::new(code));
+        if let Some((first, fixed)) = signed_run(explorer, f, &begin, deadline) {
+            report_unsigned(out, f, &unsigned_words(explorer, &first, &fixed));
+        }
         let Some(second) = repeated(explorer, f, &begin, deadline) else {
             continue;
         };

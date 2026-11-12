@@ -4769,6 +4769,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
 
     crate::invariant::findings(c, &c.types, &mut findings);
     let begin = crate::deploy::storage(c);
+    report.maps.extend(crate::deploy::section(c));
     report
         .maps
         .extend(authority(&facts, &stores, &uses, &begin, &mut findings));

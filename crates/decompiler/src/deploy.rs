@@ -1,3 +1,4 @@
+use crate::analyze::Section;
 use crate::decompile::Contract;
 use crate::exec;
 use crate::interp::{Host, Outcome};
@@ -24,6 +25,39 @@ pub fn storage(c: &Contract) -> HashMap<U256, U256> {
         Outcome::Return(_) => run.storage,
         _ => HashMap::new(),
     }
+}
+
+const MAX_LINES: usize = 16;
+
+pub fn section(c: &Contract) -> Option<Section> {
+    let start = storage(c);
+    let args: Vec<U256> = c
+        .info
+        .constructor_args
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|word| U256::from_be_bytes(word))
+        .collect();
+    let mut slots: Vec<(&U256, &U256)> = start.iter().filter(|(_, v)| !v.is_zero()).collect();
+    slots.sort();
+    let lines: Vec<String> = slots
+        .into_iter()
+        .take(MAX_LINES)
+        .map(|(slot, value)| {
+            let from = args.iter().position(|a| a == value && !a.is_zero());
+            let what = match (from, *value == DEPLOYER) {
+                (_, true) => "the deployer".to_string(),
+                (Some(index), _) => format!("constructor argument {index}"),
+                _ => value.to_hex(),
+            };
+            format!("slot {} is set to {what}", slot.to_hex())
+        })
+        .collect();
+    (!lines.is_empty()).then_some(Section {
+        title: "Deployment".to_string(),
+        lines,
+    })
 }
 
 pub fn start_text(start: &HashMap<U256, U256>) -> &'static str {

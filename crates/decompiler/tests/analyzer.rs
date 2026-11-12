@@ -2124,6 +2124,9 @@ fn a_caller_check_on_a_slot_nothing_sets_is_reported_with_the_authority_map() {
     let owned = format!("{marks} CALLER PUSH1 0x00 SSTORE");
     let r = report_of(&deployed(&owned, &runtime));
     assert!(finding(&r, "gate-never-set").is_none());
+    let deployment = r.maps.iter().find(|s| s.title == "Deployment");
+    let lines = &deployment.expect("a section").lines;
+    assert!(lines.contains(&"slot 0x0 is set to the deployer".to_string()));
 }
 
 fn entry_of(account: &str) -> String {
@@ -2290,6 +2293,38 @@ fn signed_payment(counted: bool) -> Vec<u8> {
     ))
 }
 
+fn signed_to(receiver_signed: bool) -> Vec<u8> {
+    let (extra, len) = match receiver_signed {
+        true => ("PUSH1 0x84 CALLDATALOAD PUSH1 0xa0 MSTORE", "0x40"),
+        false => ("", "0x20"),
+    };
+    dispatcher(&format!(
+        "PUSH1 0x64 CALLDATALOAD PUSH1 0x80 MSTORE {extra} \
+         PUSH1 {len} PUSH1 0x80 KECCAK256 PUSH1 0x80 MSTORE \
+         PUSH1 0x04 CALLDATALOAD PUSH1 0xa0 MSTORE PUSH1 0x24 CALLDATALOAD PUSH1 0xc0 MSTORE \
+         PUSH1 0x44 CALLDATALOAD PUSH1 0xe0 MSTORE \
+         PUSH1 0x20 PUSH1 0x80 PUSH1 0x80 PUSH1 0x80 PUSH1 0x01 GAS STATICCALL POP \
+         PUSH1 0x80 MLOAD PUSH1 0x00 SLOAD EQ PUSH2 @ok JUMPI {REVERT} :ok JUMPDEST \
+         PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x64 CALLDATALOAD PUSH1 0x84 CALLDATALOAD GAS CALL POP \
+         STOP"
+    ))
+}
+
+fn timed(setter_gate: &str, relation: &str, with_setter: bool) -> Vec<u8> {
+    let setter = match with_setter {
+        true => format!("{setter_gate} PUSH1 0x04 CALLDATALOAD PUSH1 0x05 SSTORE STOP"),
+        false => "STOP".to_string(),
+    };
+    dispatcher3(
+        &setter,
+        &format!(
+            "PUSH1 0x05 SLOAD TIMESTAMP {relation} PUSH2 @open JUMPI {REVERT} :open JUMPDEST \
+             PUSH1 0x01 PUSH1 0x06 SSTORE STOP"
+        ),
+        "STOP",
+    )
+}
+
 fn clocked(clock: &str) -> Vec<u8> {
     dispatcher3(
         &format!("{clock} PUSH1 0x04 CALLDATALOAD ADD PUSH1 0x05 SSTORE STOP"),
@@ -2414,6 +2449,24 @@ fn cases() -> Vec<Case> {
             true,
             || clocked("NUMBER"),
             || clocked("TIMESTAMP"),
+        ),
+        pair(
+            "signed-call-leaves-word-unsigned",
+            true,
+            || signed_to(false),
+            || signed_to(true),
+        ),
+        pair(
+            "time-bound-set-by-anyone",
+            true,
+            || timed("", "GT", true),
+            || timed(OWNER_GATE, "GT", true),
+        ),
+        pair(
+            "time-window-never-opens",
+            false,
+            || timed("", "LT", false),
+            || timed(OWNER_GATE, "LT", true),
         ),
         pair("phase-never-entered", false, || phased(5), || phased(2)),
         pair(

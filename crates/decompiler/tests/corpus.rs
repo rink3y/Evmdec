@@ -835,10 +835,11 @@ fn struct_elements_are_declared_and_read_by_member() {
 
     let registry = source("../../testdata/mainnet/ens_registry.hex").source;
     for line in [
-        "address field1_0; // slot +1 bytes 0..20",
-        "uint64 field1_20; // slot +1 bytes 20..28",
+        "address owner; // slot +0",
+        "address resolver; // slot +1 bytes 0..20",
+        "uint64 ttl; // slot +1 bytes 20..28",
         "mapping(bytes32 => Struct_0) stor_0;",
-        "stor_0[key].field1_0",
+        "stor_0[key].resolver",
     ] {
         assert!(registry.contains(line), "registry: missing `{line}`");
     }

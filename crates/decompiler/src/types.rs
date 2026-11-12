@@ -1230,9 +1230,14 @@ impl TypeEnv {
         self.solidity(&Loc::Slot(persistent(root, steps)))
     }
 
-    /// The key type of the mapping step ending `steps` under `root`.
+    /// The key type of the mapping step ending `steps` under `root`. A key that is only ever
+    /// tested against zero is a number that must not be zero, not a flag.
     pub fn key_type(&self, root: U256, steps: &[ShapeStep]) -> Option<String> {
-        self.solidity(&Loc::Key(persistent(root, steps)))
+        let loc = Loc::Key(persistent(root, steps));
+        match self.final_of(&loc) {
+            Ty::Bool => None,
+            _ => self.solidity(&loc),
+        }
     }
 
     /// Is the phi variable `id` of the function at `pc` a boolean?

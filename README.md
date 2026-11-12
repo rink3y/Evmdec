@@ -60,7 +60,8 @@ Every stage is in `crates/decompiler`:
   field0; uint256 field1; bytes field2; }`) and read by member (`stor_264[key].field1`):
   members packed into one slot, byte strings, and arrays and mappings held inside the
   element each get their own type, and a member takes its name from the getter that returns
-  it.
+  it or from the setter that writes it (`struct Struct_0 { address owner; address resolver;
+  uint64 ttl; }`).
 - Readable code. Helpers (SafeMath, ABI coders, getters) inlined with their checks kept as
   `require` lines, checked arithmetic printed plain, `payable(to).transfer(v)`, `members.push(x)`,
   locals for values the source held in locals, the previous value of a slot read before it is

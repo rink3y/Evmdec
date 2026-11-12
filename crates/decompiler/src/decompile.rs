@@ -2926,7 +2926,9 @@ fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
     bases
 }
 
-/// Root slot of a storage key and the shape of the variable it implies.
+/// Root slot of a storage key and the shape of the variable it implies. A key that happens to
+/// be zero or one where it is used says nothing about the key type, so it is left for the
+/// solver, which sees every key of the mapping.
 fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>, Option<String>) {
     if let Some(c) = expr::as_const(key) {
         if let Some((s, _)) = emit::hashed_slot(c) {
@@ -2942,11 +2944,9 @@ fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>,
                 (words[0], words[1])
             };
             let (root, inner) = slot_root(s, vyper, bases);
-            let kt = function::type_of_value(k);
-            let kt = if kt == "uint256" {
-                "uint256".to_string()
-            } else {
-                kt
+            let kt = match function::type_of_value(k).as_str() {
+                "bool" => "uint256".to_string(),
+                kt => kt.to_string(),
             };
             let ty = match inner {
                 Some(t) => format!("mapping({} => {})", kt, t),

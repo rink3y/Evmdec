@@ -28,6 +28,10 @@ enum Target {
     Var(U256),
     /// The field at this byte offset and bit width of a packed slot.
     Field(U256, u32, u32),
+    /// What an element of the mapping or array rooted at this slot holds at this slot offset,
+    /// byte offset and bit width: a struct member, or the element itself where there is no
+    /// struct.
+    Member(U256, u64, u32, u32),
 }
 
 /// One ledger movement: `entry = entry - amount` or `entry = entry + amount`.
@@ -87,18 +91,24 @@ fn is_caller(e: ExprId) -> bool {
     matches!(expr::node(unmask(e)), Node::Env(op::CALLER, _))
 }
 
-/// The variable or field a store writes. Struct members are left to the struct printer.
+/// The variable, field or element member a store writes.
 fn store_target(key: ExprId, val: ExprId, layout: MappingLayout) -> Option<Target> {
     let path = ssa::slot_path(key, layout)?;
-    if path.steps.iter().any(|s| matches!(s, Step::Offset(_))) {
-        return None;
-    }
-    if path.steps.is_empty() {
-        if let Some(w) = ssa::field_write(key, val) {
-            return Some(Target::Field(path.root, w.bit_offset / 8, w.bits));
+    let field = || ssa::field_write(key, val).map(|w| (w.bit_offset / 8, w.bits));
+    match path.steps.split_last() {
+        None => Some(match field() {
+            Some((byte, bits)) => Target::Field(path.root, byte, bits),
+            None => Target::Var(path.root),
+        }),
+        Some((Step::Offset(at), element))
+            if !element.iter().any(|s| matches!(s, Step::Offset(_))) =>
+        {
+            let (byte, bits) = field().unwrap_or((0, 256));
+            Some(Target::Member(path.root, *at, byte, bits))
         }
+        Some(_) if path.steps.iter().any(|s| matches!(s, Step::Offset(_))) => None,
+        Some(_) => Some(Target::Member(path.root, 0, 0, 256)),
     }
-    Some(Target::Var(path.root))
 }
 
 /// The constant slot or packed field `e` reads, through a width mask.
@@ -280,12 +290,16 @@ fn reach(pc: usize, all: &BTreeMap<usize, Facts>) -> Vec<usize> {
     seen.into_iter().collect()
 }
 
+/// `fee` for `Fee`, `ttl` for `TTL`, `uriPrefix` for `URIPrefix`: a leading run of capitals
+/// is one word, up to the capital that starts the next.
 fn lower_first(s: &str) -> String {
-    let mut cs = s.chars();
-    match cs.next() {
-        Some(c) => format!("{}{}", c.to_ascii_lowercase(), cs.as_str()),
-        None => String::new(),
-    }
+    let run = s.chars().take_while(char::is_ascii_uppercase).count();
+    let word = match run {
+        0 => 0,
+        n if n == s.len() || n == 1 => n,
+        n => n - 1,
+    };
+    format!("{}{}", s[..word].to_ascii_lowercase(), &s[word..])
 }
 
 fn upper_first(s: &str) -> String {
@@ -418,6 +432,21 @@ impl<'a> Namer<'a> {
                         f.offset == offset && f.bits == bits && f.name.starts_with("stor_")
                     })
             }),
+            Target::Member(slot, at, byte, bits) => self.storage.iter().any(|v| {
+                slot_of(v) == Some(slot)
+                    && v.members.iter().any(|m| {
+                        m.offset == at
+                            && !m.holds_many()
+                            && match m.fields.is_empty() {
+                                true => m.name.starts_with("field"),
+                                false => m.fields.iter().any(|f| {
+                                    f.offset == byte
+                                        && f.bits == bits
+                                        && f.name.starts_with("field")
+                                }),
+                            }
+                    })
+            }),
         }
     }
 
@@ -434,6 +463,20 @@ impl<'a> Namer<'a> {
                     for f in v.fields.iter_mut() {
                         if f.offset == offset && f.bits == bits {
                             f.name = name.to_string();
+                        }
+                    }
+                }
+                Target::Member(slot, at, byte, bits) if slot_of(v) == Some(slot) => {
+                    for m in v.members.iter_mut().filter(|m| m.offset == at) {
+                        match m.fields.is_empty() {
+                            true => m.name = name.to_string(),
+                            false => {
+                                for f in m.fields.iter_mut() {
+                                    if f.offset == byte && f.bits == bits {
+                                        f.name = name.to_string();
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -483,8 +526,9 @@ fn ledger_roots(all: &BTreeMap<usize, Facts>) -> BTreeSet<U256> {
     out
 }
 
-/// Name storage variables that still have a default name: by the one variable a setter writes,
-/// by the one variable written where a change event is emitted, then by role.
+/// Name storage variables and struct members that still have a default name: by the one
+/// variable a setter writes (the plainest setter name wins where several write it), by the one
+/// variable written where a change event is emitted, then by role.
 pub fn name_storage(
     functions: &[Function],
     storage: &mut [StorageVar],
@@ -501,6 +545,7 @@ pub fn name_storage(
     };
 
     if use_sigs {
+        let mut setters: Vec<(String, Target)> = Vec::new();
         for f in functions.iter().filter(|f| f.kind == FnKind::External) {
             let Some(stem) = f
                 .signature
@@ -512,8 +557,12 @@ pub fn name_storage(
             };
             let targets = written(&reach(f.pc, &all));
             if let [t] = targets.iter().copied().collect::<Vec<_>>()[..] {
-                namer.name(t, &stem);
+                setters.push((stem, t));
             }
+        }
+        setters.sort_by(|a, b| (a.0.len(), &a.0).cmp(&(b.0.len(), &b.0)));
+        for (stem, t) in setters {
+            namer.name(t, &stem);
         }
         for (pc, facts) in &all {
             let stems: BTreeSet<String> =
@@ -679,6 +728,16 @@ fn canonical(storage: &[StorageVar], t: Target) -> Target {
         Target::Var(slot) => var(slot)
             .and_then(|v| v.fields.iter().find(|f| f.offset == 0))
             .map_or(t, |f| Target::Field(slot, 0, f.bits)),
+        Target::Member(slot, 0, _, _) if var(slot).is_some_and(|v| v.members.is_empty()) => {
+            Target::Var(slot)
+        }
+        Target::Member(slot, at, _, _)
+            if var(slot)
+                .and_then(|v| v.members.iter().find(|m| m.offset == at))
+                .is_some_and(|m| m.fields.is_empty()) =>
+        {
+            Target::Member(slot, at, 0, 256)
+        }
         other => other,
     }
 }
@@ -693,6 +752,17 @@ fn label_in(storage: &[StorageVar], t: Target) -> Option<String> {
             .iter()
             .find(|f| f.offset == offset && f.bits == bits)
             .map(|f| f.name.clone()),
+        Target::Member(slot, at, byte, bits) if slot_of(v) == Some(slot) => {
+            let member = v.members.iter().find(|m| m.offset == at)?;
+            match member.fields.is_empty() {
+                true => Some(member.name.clone()),
+                false => member
+                    .fields
+                    .iter()
+                    .find(|f| f.offset == byte && f.bits == bits)
+                    .map(|f| f.name.clone()),
+            }
+        }
         _ => None,
     })
 }
@@ -705,7 +775,12 @@ pub fn name_helpers(
     use_sigs: bool,
 ) {
     let all = all_facts(functions, layout, use_sigs);
-    let named = |t: Target| label_in(storage, t).filter(|n| !n.starts_with("stor_"));
+    let default_member = |n: &str| {
+        n.strip_prefix("field")
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    };
+    let named =
+        |t: Target| label_in(storage, t).filter(|n| !n.starts_with("stor_") && !default_member(n));
     let mut taken: HashSet<String> = functions.iter().map(|f| f.name.clone()).collect();
     taken.extend(storage.iter().map(|v| v.name.clone()));
     let mut order: Vec<usize> = (0..functions.len()).collect();

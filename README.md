@@ -219,6 +219,15 @@ contracts (`corpus/sample_ids.txt`) decompiled all of them with no unresolved ju
 oracle mismatch in 592,999 instructions. The sample itself is not in the repository; the two
 scripts regenerate it.
 
+A larger run takes 579 distinct contracts from mainnet, Base, BNB Chain, Arbitrum and Polygon
+(`corpus/sample_ids_multichain.txt`, chain and address per line). 578 are decompiled, analysed
+and checked by the oracle, which finds no mismatch in 2,848,768 instructions; the median
+contract takes 0.09 s and the 99th percentile 3 s. One contract with a hundred unresolved
+jumps does not finish. The first pass over this set is what found an exponential walk in the
+printer, two quadratic scans in the analyzer, a return-data size shared across calls, and the
+transparent proxy being reported as an unguarded delegatecall; all are fixed. None of the
+three ledger rules fires on any of the 578, and the liability rule fires once.
+
 ## Quick start
 
 ```sh

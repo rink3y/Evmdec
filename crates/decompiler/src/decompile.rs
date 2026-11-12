@@ -258,9 +258,14 @@ pub struct Contract {
     /// Storage slots whose value is used as a DELEGATECALL target (proxy implementation slots).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub delegatecall_slots: Vec<String>,
-    /// Constant addresses used as DELEGATECALL targets.
+    /// Constant addresses the whole calldata is forwarded to with DELEGATECALL: what a proxy
+    /// with a fixed implementation does.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub delegatecall_targets: Vec<String>,
+    /// Constant addresses called with DELEGATECALL and a payload the code builds itself: linked
+    /// libraries, whose code runs in this contract's storage but is not its implementation.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub library_targets: Vec<String>,
     /// Constant addresses this contract calls (`CALL`/`STATICCALL`/`CALLCODE` to a literal
     /// address): hard-coded dependencies such as tokens, oracles and registries. Precompiles
     /// (1..=9) are excluded.
@@ -603,6 +608,11 @@ pub fn compose(
         for v in part.call_targets {
             if !shell.call_targets.contains(&v) && !v.eq_ignore_ascii_case(&address) {
                 shell.call_targets.push(v);
+            }
+        }
+        for v in part.library_targets {
+            if !shell.library_targets.contains(&v) && !v.eq_ignore_ascii_case(&address) {
+                shell.library_targets.push(v);
             }
         }
         for v in part.call_target_slots {
@@ -1412,6 +1422,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
 
     let mut dc_slots: Vec<String> = Vec::new();
     let mut dc_targets: Vec<String> = Vec::new();
+    let mut library_targets: Vec<String> = Vec::new();
     let mut call_targets: Vec<String> = Vec::new();
     let mut call_target_slots: Vec<String> = Vec::new();
     let mut diamond_lookup: Option<DiamondLookup> = None;
@@ -1419,7 +1430,11 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let Some(l) = &f.lifted else { continue };
         for nd in &l.nodes {
             for st in &nd.stmts {
-                if let Stmt::Call { kind, addr, .. } = st {
+                if let Stmt::Call {
+                    kind, addr, in_len, ..
+                } = st
+                {
+                    let forwards = matches!(expr::node(*in_len), Node::Env(op::CALLDATASIZE, _));
                     let a = match expr::node(*addr) {
                         Node::Op(op::AND, v) => v[0],
                         _ => *addr,
@@ -1446,9 +1461,13 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                             }
                         }
                         Node::Const(c) if *kind == op::DELEGATECALL => {
-                            let h = c.to_hex_padded(20);
-                            if !dc_targets.contains(&h) {
-                                dc_targets.push(h);
+                            let h = (c & expr::mask_bits(160)).to_hex_padded(20);
+                            let list = match forwards {
+                                true => &mut dc_targets,
+                                false => &mut library_targets,
+                            };
+                            if !list.contains(&h) {
+                                list.push(h);
                             }
                         }
                         Node::Const(c)
@@ -1488,6 +1507,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         constructor: None,
         delegatecall_slots: dc_slots,
         delegatecall_targets: dc_targets,
+        library_targets,
         call_targets,
         call_target_slots,
         stored_targets: Vec::new(),

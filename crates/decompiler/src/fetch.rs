@@ -144,6 +144,11 @@ impl Fetcher<'_> {
             .map(|p| p.address.to_ascii_lowercase())
             .collect();
         let mut targets: Vec<String> = c.call_targets.clone();
+        for library in &c.library_targets {
+            if !targets.iter().any(|t| t.eq_ignore_ascii_case(library)) {
+                targets.push(library.clone());
+            }
+        }
         for slot in c.call_target_slots.clone() {
             match self.client.get_storage(address, &slot) {
                 Ok(v) => {

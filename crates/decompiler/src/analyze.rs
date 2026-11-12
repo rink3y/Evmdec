@@ -6108,6 +6108,14 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         }
         out.push('\n');
     }
+    if !c.library_targets.is_empty() {
+        out.push_str("## Libraries\n\n");
+        out.push_str("Addresses whose code this contract runs in its own storage through a call it builds itself (a linked library, not an implementation):\n\n");
+        for t in &c.library_targets {
+            out.push_str(&format!("- `0x{}`\n", t.trim_start_matches("0x")));
+        }
+        out.push('\n');
+    }
     if !c.storage.is_empty() {
         let composite = !c.parts.is_empty();
         let parts_of = |slot: &str| -> String {

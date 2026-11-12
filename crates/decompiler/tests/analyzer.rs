@@ -1223,3 +1223,29 @@ fn a_jump_to_no_destination_is_an_abort() {
     assert!(c.source.contains("require(arg0 == 0);"), "{}", c.source);
     assert!(c.source.contains("require(arg1 != 0);"), "{}", c.source);
 }
+
+/// A delegatecall is a proxy's when it forwards the whole calldata. One that sends a payload
+/// the code built itself to a fixed address runs a library, which is not an implementation.
+#[test]
+fn a_library_call_is_not_a_proxy() {
+    let library = "0x00000000000000000000000000000000000000c7";
+    let built = dispatcher(&format!(
+        "PUSH4 0x12345678 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE PUSH1 0x20 PUSH1 0x80 PUSH1 0x04 \
+         PUSH1 0x80 PUSH20 {library} GAS DELEGATECALL POP PUSH1 0x80 MLOAD PUSH1 0x00 SSTORE STOP"
+    ));
+    let c = decompile::decompile(&built, &Options::default());
+    assert!(
+        c.delegatecall_targets.is_empty(),
+        "{:?}",
+        c.delegatecall_targets
+    );
+    assert_eq!(c.library_targets, [library]);
+
+    let forwards = asm(&format!(
+        "CALLDATASIZE PUSH1 0x00 PUSH1 0x00 CALLDATACOPY PUSH1 0x00 PUSH1 0x00 CALLDATASIZE \
+         PUSH1 0x00 PUSH20 {library} GAS DELEGATECALL POP RETURNDATASIZE PUSH1 0x00 RETURN"
+    ));
+    let c = decompile::decompile(&forwards, &Options::default());
+    assert_eq!(c.delegatecall_targets, [library]);
+    assert!(c.library_targets.is_empty());
+}

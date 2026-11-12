@@ -70,7 +70,6 @@ fn subvalues(e: ExprId, inputs: &Inputs, out: &mut HashMap<ExprId, U256>) {
     }
 }
 
-// What the path assumed about storage that the state does not hold.
 fn needs(path: &Path, state: &HashMap<U256, U256>) -> Vec<Need> {
     let assumed: Vec<(U256, U256)> = path
         .inputs
@@ -171,7 +170,8 @@ fn write_for(
     None
 }
 
-// The plan is replayed from the starting storage before it is returned.
+// A plan is built on storage the solver assumed.
+// It is replayed from the real starting storage before it is returned.
 pub fn reach(
     explorer: &Explorer,
     entries: &[Entry],

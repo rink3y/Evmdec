@@ -233,7 +233,8 @@ fn wrap_checks(val: ExprId, out: &mut Vec<ExprId>) {
     }
 }
 
-// The run is repeated with the solved input and must take the same path and still end normally.
+// The solver's model of a path can be wrong.
+// Only a second run that takes the same path and ends normally counts.
 fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Option<Path> {
     let explorer = Explorer::new(code);
     let selector = exec::selector_of(f);

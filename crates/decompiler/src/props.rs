@@ -737,8 +737,8 @@ fn phases(
     })
 }
 
-// Words of the call that reach `e` without passing through a hash.
-// A hashed key lands on a slot nobody can aim, so only these can pick a location.
+// A hashed key lands on a slot nobody can aim.
+// Only a word that reaches the place outside a hash can pick where it lands.
 fn raw_words(e: ExprId) -> Vec<ExprId> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();

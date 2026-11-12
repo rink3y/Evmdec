@@ -29,7 +29,11 @@ flowchart LR
     D --> H[analyzer<br/>rules, intent, chains, invariants]
     H --> S[function summaries composed<br/>across linked and created contracts]
     S --> I[confirmation<br/>one-contract and cross-contract runs]
-    I --> J[report]
+    D --> P[path engine<br/>run, lift the trace, solve a branch]
+    P --> Q[checks made by running<br/>sequences, properties, value flow,<br/>callee answers, measured standards]
+    P --> I
+    Q --> J
+    I --> J[report<br/>findings, observed evidence, maps]
     D -. every block, random states .-> K[block oracle]
 ```
 
@@ -44,6 +48,8 @@ Every stage is in `crates/decompiler`:
 | `structure`, `emit`, `function`, `sigs`, `sigdb`, `naming` | loops, conditionals and short-circuits; printing; signature dictionary and local index; names inferred from roles |
 | `compiler` | compiler version and feature fingerprints when the metadata is missing |
 | `analyze`, `confirm`, `invariant`, `exec`, `cross` | security rules, concrete confirmation of reachable findings, invariant search, whole-frame and cross-contract executors |
+| `path`, `solve`, `seq`, `abi`, `deploy` | the path engine: one concrete run lifted into its branch conditions and writes, a solver that inverts a condition back to an input word, a search over short call sequences, ABI-shaped starting inputs, and the storage a constructor leaves |
+| `props`, `flow`, `signed`, `standard`, `origin`, `evidence` | checks made by running the code: properties inferred from behaviour, what calls take and return, repeated signed messages, the standard ledger interface as measured, where stored values come from, and what a confirming run was seen to do |
 | `interp`, `verify` | reference EVM interpreter and the block oracle |
 | `rpc`, `fetch`, `decompile`, `slots`, `clock` | chain access, proxy and diamond resolution, the walk over call targets, composition, well-known storage slots, the time limit one dependency is given |
 
@@ -193,6 +199,36 @@ the call completes and the account's own slot ends lower.
 The invariant pass searches for an unprivileged path that credits a balance without a debit
 or a payment (`unprivileged-balance-credit`).
 
+### Checks made by running the code
+
+The path engine runs a function on the reference interpreter, lifts the blocks that ran into
+one straight line of branch conditions and storage writes, and solves a chosen condition the
+other way to get an input that takes the other branch. The solver is a generator, not a
+decision procedure: it inverts arithmetic back to a word of the call, the value sent or, when
+asked, a storage slot, and every answer it gives is run again on the bytecode before anything
+is built on it. On the 22 audited contracts the lifted conditions agree with the interpreter
+on all 53,349 branches taken. When creation code is given, the constructor is run first and
+every check starts from the storage it leaves; with runtime code only, they start from empty
+storage and say so.
+
+| check | what is run and what is reported |
+|---|---|
+| reachability | a sink no single input reaches is tried through up to three earlier calls that write the storage it needs; the earlier calls are attached to the finding |
+| arithmetic | an input that takes a path ending normally and makes a stored sum, difference or product wrap; open when no such run exists from the starting storage |
+| properties from behaviour | a mapping and a total that at least two functions move in step, then a path that moves them apart (`entries-total-out-of-step`) or calls out between the two updates (`total-open-at-call`); a slot toggled like a lock and left set on one path (`lock-left-set`); a memory copy of storage changed and dropped (`changed-copy-dropped`); a value written from one block clock and compared with the other (`clock-units-mixed`); a storage slot or memory offset picked by an untested word of the call (`input-picks-storage-slot`, `input-picks-memory-offset`); input one byte short still accepted (`short-input-accepted`); work that grows with a count any caller can raise (`cost-grows-with-open-list`) |
+| value flow | an account pays in, then every other function is run from that state: a second call that returns more than was paid (`two-calls-return-more`); the same payment by a second account with the balance the contract reads raised from outside, credited nothing (`inflow-credits-nothing`); a payment run again with the receiver being code that repeats the call, paid twice (confirms `reentrancy`, or `reentered-call-pays-again`) |
+| callee answers | each call the contract makes can be answered separately: a transfer that answers false and is treated as done (confirms `erc20-return-ignored`, or `refused-transfer-treated-as-done`); a transfer that returns nothing and makes the function fail (`transfer-without-answer-refused`); a payout that changes when a value read from outside is halved (confirms `no-slippage-bound` and `spot-balance-price`) |
+| signed messages | a signed call is run, then run again unchanged from the state it left, with recovery answering the signer for the first digest only; accepted again means nothing takes the message out of use (`signed-message-accepted-twice`) |
+| the standard interface | a contract that shows `transfer`, `transferFrom` and `balanceOf` is not taken at its word: each is run and the entries it changes are measured against the amount asked (`transfer-creates-value`, `transfer-delivers-less`, `transfer-touches-third-entry`, `reported-balance-differs`, `transfer-changes-supply`, `transferfrom-ignores-allowance`, `allowance-not-spent`) |
+| where values come from | every store into a slot is followed back through the slots it is copied from; a call target or a caller check that reads a slot any caller can fill (`stored-input-call-target`, `gate-on-open-slot`); a caller check on a slot nothing sets (`gate-never-set`) |
+
+A confirmed finding carries the input, any earlier calls, and what the run was seen to do: who
+sent it, the slots that changed and their values before and after, the calls made, and how it
+ended. The report also has three maps that are not findings: the authority map (each slot a
+caller check reads, the functions it protects and the functions that write it), the phases
+(small fields that functions test for equality, and the moves between their values), and the
+standard interface as measured.
+
 ## Accuracy
 
 Three measurements on 22 unmodified mainnet contracts, solc 0.4.18 to 0.8.17 and Vyper 0.2.4
@@ -251,13 +287,31 @@ whose exploits are public, from The DAO to Balancer V1, with the rules that must
 | | |
 |---|---|
 | known bugs found | 24 / 25 |
-| missed | the Fence tranche pool on Avalanche: one of its two limits is computed from an in-memory copy of the record, which the accounting rule does not read |
+| missed | the Fence tranche pool on Avalanche: one of its two limits is computed from an in-memory copy of the record, which the accounting rule does not read. The `changed-copy-dropped` check covers a copy whose change is lost, which is a different shape |
 | not counted | Nomad, an upgrade-time state error outside bytecode patterns |
 | high or critical findings on the 22 audited contracts | 28, nearly all on contracts whose purpose is to execute caller-supplied calls |
 
 The audited corpus is the running false-positive budget for every rule change. The TENDRIL
 token on BSC, whose pool was drained through a hook contract the token trusted, is the case the
 trust rules were built on and tested against.
+
+### Labelled fixtures per rule
+
+`python3 corpus/rule_bench.py`. `testdata/rules` holds a flawed and a sound hand-assembled
+fixture for each of 16 rules that work by running the code, with the expected result in
+`manifest.json`.
+
+| | |
+|---|---|
+| fixtures | 32 |
+| rules at precision 1.00 and recall 1.00 | 16 / 16 |
+| results that change when the code is padded after every jump destination | 0 |
+
+These fixtures are the nearest sound pattern to each flaw, not real contracts. On the 48 real
+contracts 34 findings are confirmed by a run, and the checks added here raise only
+low-severity findings of their own. `vuln_bench.py` prints the per-rule table for the real
+corpora: labels, how many were caught, and how often each rule fires at medium or higher on
+audited code.
 
 ### Random sample
 
@@ -384,6 +438,7 @@ cargo clippy --workspace --all-targets --all-features
 cargo test --workspace
 python3 corpus/bench.py
 python3 corpus/vuln_bench.py
+python3 corpus/rule_bench.py
 RUNS=8 ./corpus/verify_all.sh
 ```
 
@@ -404,11 +459,24 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   leading arguments, then `...`; one with no known head prints as a memory range.
 - Vyper internal calls pass arguments through fixed memory, so some values in Vyper output
   print as `mem[0x...]` reads where the analyzer, which replays the callee, sees the value.
-- The confirmation pass inside one contract starts from a fresh state, and the one across
-  contracts from what was read from the chain: code, the addresses in the slots that were
-  read, and the callers each contract's storage approved. Neither replays earlier
-  transactions, so a finding whose path needs other prior storage stays unconfirmed, not
-  refuted.
+- The confirmation pass inside one contract starts from the storage the constructor leaves, or
+  from empty storage when only runtime code is known, and tries up to three earlier calls. The
+  one across contracts starts from what was read from the chain: code, the addresses in the
+  slots that were read, and the callers each contract's storage approved. A finding whose path
+  needs more prior storage than that stays unconfirmed, not refuted.
+- The solver finds inputs, it does not prove their absence. A branch it cannot invert, a hash
+  it would have to reverse, or a path past its limits is simply not explored, so a check that
+  reports nothing has not shown the property holds. Each dynamic pass also has a time limit
+  per contract.
+- The value-flow and re-entry checks need a function that takes a payment and credits the
+  payer in one call from the starting storage. Contracts that need a longer setup are not
+  reached: none of the reentrancy findings on the 26 exploited contracts is confirmed this
+  way. Payments are assumed to be backed by the contract's balance.
+- The signed-message and standard-interface checks choose storage so that the call can end
+  normally, and say so in the finding. They show what the code does in that state, not that
+  the state is reachable.
+- The checks made by running the code have true positives on their fixtures and few on
+  deployed contracts so far. On the audited corpus they add low-severity notes only.
 - The two rules over words passed between contracts have one true positive on deployed
   contracts so far, besides their synthetic fixtures; on the 40 call graphs walked live they
   do not fire.

@@ -511,7 +511,6 @@ impl<'a> Pass<'a> {
     }
 }
 
-// Code for an account that, the first time it is called, repeats one call to its caller.
 fn calls_back(data: &[u8]) -> Vec<u8> {
     const HEAD: u16 = 37;
     const PUSH2: u8 = op::PUSH1 + 1;

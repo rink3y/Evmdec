@@ -27,7 +27,8 @@ const AMOUNT: U256 = U256::from_u64(0x1001);
 
 type Entry = (U256, Vec<U256>);
 
-// The mapping in which the paying account's entry falls is taken as the ledger.
+// Several mappings can be keyed by one account.
+// The one in which the payer's entry falls is the ledger.
 fn ledger(moves: &BTreeMap<Entry, (U256, U256)>, payer: U256) -> Option<U256> {
     let falls = moves
         .iter()

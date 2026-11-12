@@ -15,6 +15,9 @@ pub struct Inputs {
     pub number: U256,
     pub storage: HashMap<U256, U256>,
     pub returned: Vec<u8>,
+    pub replies: Vec<(u32, Vec<u8>)>,
+    pub given: Vec<(u32, Vec<u8>)>,
+    pub balance: U256,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +99,7 @@ impl Eval<'_> {
                 op::TIMESTAMP => Some(self.inputs.timestamp),
                 op::NUMBER => Some(self.inputs.number),
                 op::RETURNDATASIZE => Some(U256::from(self.inputs.returned.len())),
+                op::SELFBALANCE => Some(self.inputs.balance),
                 _ => None,
             },
             Node::CallDataLoad(off) | Node::CopiedWord(op::CALLDATACOPY, off, _) => self
@@ -104,11 +108,13 @@ impl Eval<'_> {
                 .map(|o| word(&self.inputs.calldata, o)),
             Node::SLoad(key, false, gen) => self.value(key).map(|k| self.stored(k, gen)),
             Node::CallResult(_) => Some(U256::ONE),
-            Node::ReturnData(_, off) => self
-                .value(off)
-                .and_then(|o| o.as_usize())
-                .filter(|o| o + 32 <= self.inputs.returned.len())
-                .map(|o| word(&self.inputs.returned, o)),
+            Node::ReturnData(seq, off) => {
+                let inputs = self.inputs;
+                let given = inputs.given.iter().find(|(s, _)| *s == seq);
+                let data = given.map_or(&inputs.returned, |(_, data)| data);
+                let at = self.value(off).and_then(|o| o.as_usize());
+                at.filter(|o| o + 32 <= data.len()).map(|o| word(data, o))
+            }
             Node::Keccak(words, tail) => {
                 let mut bytes = Vec::with_capacity(32 * words.len());
                 let last = words.len().saturating_sub(1);
@@ -574,6 +580,9 @@ mod tests {
             number: U256::from_u64(18_000_000),
             storage: HashMap::new(),
             returned: Vec::new(),
+            replies: Vec::new(),
+            given: Vec::new(),
+            balance: U256::ZERO,
         }
     }
 

@@ -74,6 +74,7 @@ pub struct Host {
     pub zero_storage: bool,
     pub force_calls: Option<bool>,
     pub forced_return: Vec<u8>,
+    pub replies: Vec<(u32, Vec<u8>)>,
     pub intercept_calls: bool,
     pub unset_storage: Option<U256>,
 }
@@ -107,6 +108,7 @@ impl Host {
             zero_storage: false,
             force_calls: None,
             forced_return: Vec::new(),
+            replies: Vec::new(),
             intercept_calls: false,
             unset_storage: None,
         }
@@ -134,6 +136,7 @@ impl Host {
             zero_storage: true,
             force_calls: Some(true),
             forced_return: Vec::new(),
+            replies: Vec::new(),
             intercept_calls: false,
             unset_storage: None,
         }
@@ -204,9 +207,9 @@ impl Host {
             r
         }
     }
-    pub fn call_result(&self, i: usize) -> (bool, Vec<u8>) {
+    pub fn call_result(&self, i: usize, input: &[u8]) -> (bool, Vec<u8>) {
         if let Some(b) = self.force_calls {
-            return (b, self.forced_return.clone());
+            return (b, reply(&self.replies, &self.forced_return, input).to_vec());
         }
         let r = keccak::keccak256(
             &[
@@ -243,6 +246,14 @@ impl Host {
     pub fn initial_gas(&self) -> u64 {
         1_000_000 + (self.seed % 1_000_000)
     }
+}
+
+pub fn reply<'a>(replies: &'a [(u32, Vec<u8>)], default: &'a [u8], input: &[u8]) -> &'a [u8] {
+    let selector = input
+        .get(..4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let chosen = replies.iter().find(|(s, _)| Some(*s) == selector);
+    chosen.map_or(default, |(_, data)| data)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -803,7 +814,7 @@ impl<'a> Machine<'a> {
                 let (success, data) = if addr == U256::from_u64(4) {
                     (true, input)
                 } else {
-                    self.host.call_result(idx)
+                    self.host.call_result(idx, &input)
                 };
                 self.deliver_call(out_off, out_len, success, data)?;
             }

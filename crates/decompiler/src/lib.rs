@@ -24,6 +24,7 @@ pub mod exec;
 pub mod expr;
 #[cfg(feature = "rpc")]
 pub mod fetch;
+pub mod flow;
 pub mod function;
 pub mod interp;
 pub mod invariant;

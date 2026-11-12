@@ -1,6 +1,6 @@
 use crate::cfg::Program;
 use crate::exec::{self, FrameRun};
-use crate::interp::Host;
+use crate::interp::{self, Host};
 use crate::lift::{Lifter, Stmt, Term};
 use crate::solve::{self, Free, Inputs, Item};
 use crate::u256::U256;
@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 const STEP_BUDGET: usize = 200_000;
 const MAX_BLOCKS: usize = 2_048;
 const MAX_FLIPS_PER_PATH: usize = 48;
+const DEFAULT_BALANCE: U256 = U256::from_u64(1_000_000_000_000_000_000);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -62,6 +63,9 @@ pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
         number: U256::from_u64(18_000_000),
         storage: HashMap::new(),
         returned: Vec::new(),
+        replies: Vec::new(),
+        given: Vec::new(),
+        balance: DEFAULT_BALANCE,
     }
 }
 
@@ -82,6 +86,8 @@ impl Explorer {
         host.timestamp = inputs.timestamp;
         host.number = inputs.number;
         host.forced_return = inputs.returned.clone();
+        host.replies = inputs.replies.clone();
+        host.selfbalance = inputs.balance;
         let run = exec::run_frame(&self.prog.code, &host, inputs.storage.clone(), STEP_BUDGET);
         let blocks: Vec<usize> = run
             .order
@@ -135,8 +141,20 @@ impl Explorer {
                 truth.push(holds);
             }
         }
+        let mut inputs = inputs.clone();
+        let made = effects.iter().filter_map(|st| match st {
+            Stmt::Call { seq, .. } => Some(*seq),
+            _ => None,
+        });
+        inputs.given = made
+            .zip(&run.calls)
+            .map(|(seq, call)| {
+                let data = interp::reply(&inputs.replies, &inputs.returned, &call.input);
+                (seq, data.to_vec())
+            })
+            .collect();
         Path {
-            inputs: inputs.clone(),
+            inputs,
             items,
             truth,
             effects,

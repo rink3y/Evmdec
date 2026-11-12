@@ -1940,3 +1940,59 @@ fn a_stored_product_is_confirmed_with_an_input_that_wraps_it() {
         .unwrap_or_else(|| panic!("{:?}", ids(&r)));
     assert!(!f.confirmed, "nothing stored yet, so the sum cannot wrap");
 }
+
+const CALLER_ENTRY: &str =
+    "CALLER PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
+
+fn flow_ids(code: &[u8]) -> Vec<String> {
+    let ours = ["two-calls-return-more", "inflow-credits-nothing"];
+    analyze::analyze(&decompile::decompile(code, &Options::default()))
+        .findings
+        .iter()
+        .filter(|f| ours.contains(&f.id.as_str()))
+        .map(|f| {
+            assert!(f.confirmed && f.witness.is_some() && f.setup.len() == 1);
+            f.id.clone()
+        })
+        .collect()
+}
+
+#[test]
+fn a_pair_of_calls_that_returns_more_than_it_took_is_reported() {
+    let pay_in =
+        |credit: &str| format!("{credit} {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP");
+    let pay_out = format!(
+        "PUSH1 0x04 CALLDATALOAD {CALLER_ENTRY} DUP1 SLOAD \
+         DUP3 DUP2 LT ISZERO PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST \
+         DUP3 SWAP1 SUB SWAP1 SSTORE \
+         PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 CALLER GAS CALL POP STOP"
+    );
+    let doubled = dispatcher3(&pay_in("CALLVALUE PUSH1 0x02 MUL"), &pay_out, "STOP");
+    assert_eq!(flow_ids(&doubled), ["two-calls-return-more"]);
+
+    let exact = dispatcher3(&pay_in("CALLVALUE"), &pay_out, "STOP");
+    assert!(flow_ids(&exact).is_empty(), "{:?}", flow_ids(&exact));
+}
+
+#[test]
+fn a_share_of_a_balance_read_from_outside_can_round_a_payment_to_nothing() {
+    let asset = "PUSH2 0xb1b1";
+    let vault = |guard: &str| {
+        dispatcher(&format!(
+            "PUSH4 0x70a08231 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE ADDRESS PUSH1 0x84 MSTORE \
+             PUSH1 0x20 PUSH1 0x80 PUSH1 0x24 PUSH1 0x80 {asset} GAS STATICCALL POP \
+             PUSH1 0x80 MLOAD PUSH1 0x01 SLOAD PUSH1 0x04 CALLDATALOAD \
+             DUP2 ISZERO PUSH2 @first JUMPI DUP3 DUP3 DUP3 MUL DIV PUSH2 @join JUMP \
+             :first JUMPDEST DUP1 :join JUMPDEST {guard} \
+             PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
+             ADDRESS PUSH1 0xa4 MSTORE DUP2 PUSH1 0xc4 MSTORE \
+             PUSH1 0x00 DUP1 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 {asset} GAS CALL POP \
+             {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE \
+             DUP3 ADD PUSH1 0x01 SSTORE STOP"
+        ))
+    };
+    assert_eq!(flow_ids(&vault("")), ["inflow-credits-nothing"]);
+
+    let floor = "DUP1 PUSH2 @some JUMPI PUSH1 0x00 DUP1 REVERT :some JUMPDEST";
+    assert!(flow_ids(&vault(floor)).is_empty());
+}

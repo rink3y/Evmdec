@@ -1,6 +1,7 @@
 use crate::abi;
-use crate::analyze::{push, Confidence, Finding, Severity};
+use crate::analyze::{push, Confidence, Finding, Section, Severity};
 use crate::decompile::{Contract, Function};
+use crate::deploy;
 use crate::emit::MappingLayout;
 use crate::exec;
 use crate::expr::{self, ExprId, Node};
@@ -28,6 +29,7 @@ enum Place {
 
 struct Run<'a> {
     function: &'a Function,
+    from: &'static str,
     assumed: bool,
     path: Path,
     steps: Vec<Step>,
@@ -70,6 +72,8 @@ fn varied(calldata: &[u8], fixed: &[usize]) -> Vec<u8> {
 
 fn runs(c: &Contract) -> Vec<Run<'_>> {
     let mut out = Vec::new();
+    let begin = deploy::storage(c);
+    let from = deploy::start_text(&begin);
     let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
     for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
         let code = c.code_of(f);
@@ -99,6 +103,7 @@ fn runs(c: &Contract) -> Vec<Run<'_>> {
                 };
                 let start = Inputs {
                     calldata: calldata.clone(),
+                    storage: begin.clone(),
                     ..flat.clone()
                 };
                 for path in explorer.explore(&start, &free, LIMITS) {
@@ -111,6 +116,7 @@ fn runs(c: &Contract) -> Vec<Run<'_>> {
                     }
                     out.push(Run {
                         function: f,
+                        from,
                         assumed,
                         path,
                         steps,
@@ -136,8 +142,10 @@ fn report(
     description: String,
     advice: &str,
 ) {
-    let state =
-        " The input attached does this from empty storage, sent by an account holding no role.";
+    let state = format!(
+        " The input attached does this from {}, sent by an account holding no role.",
+        run.from
+    );
     push(
         out,
         id,
@@ -146,7 +154,7 @@ fn report(
         Confidence::High,
         Some(run.function),
         None,
-        description + state,
+        description + &state,
         Vec::new(),
         advice,
     );
@@ -457,9 +465,283 @@ fn dropped_changes(all: &[Run], out: &mut Vec<Finding>) {
     }
 }
 
-pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Clock {
+    Time,
+    Height,
+}
+
+impl Clock {
+    fn text(self) -> &'static str {
+        match self {
+            Clock::Time => "the block timestamp",
+            Clock::Height => "the block number",
+        }
+    }
+}
+
+fn clock_of(e: ExprId) -> Option<Clock> {
+    let has = |which: u8| expr::contains(e, &|n| matches!(n, Node::Env(o, _) if *o == which));
+    match (has(op::TIMESTAMP), has(op::NUMBER)) {
+        (true, false) => Some(Clock::Time),
+        (false, true) => Some(Clock::Height),
+        _ => None,
+    }
+}
+
+fn places_read(e: ExprId, layout: MappingLayout) -> Vec<Place> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 2_000 {
+            continue;
+        }
+        if let Node::SLoad(key, false, _) = expr::node(x) {
+            out.extend(place(key, layout));
+        } else {
+            stack.extend(expr::children(x));
+        }
+    }
+    out
+}
+
+fn clock_mix(all: &[Run], layout: MappingLayout, out: &mut Vec<Finding>) {
+    let mut written: BTreeMap<Place, BTreeSet<Clock>> = BTreeMap::new();
+    for run in all {
+        for item in &run.path.items {
+            let Item::Store { key, val, .. } = item else {
+                continue;
+            };
+            if let (Some(p), Some(clock)) = (place(*key, layout), clock_of(*val)) {
+                written.entry(p).or_default().insert(clock);
+            }
+        }
+    }
+    let mut told: BTreeSet<Place> = BTreeSet::new();
+    for run in all.iter().filter(|r| !r.assumed) {
+        for item in &run.path.items {
+            let Item::Check { cond, .. } = item else {
+                continue;
+            };
+            let Some(read) = clock_of(*cond) else {
+                continue;
+            };
+            for p in places_read(*cond, layout) {
+                let Some(kinds) = written.get(&p) else {
+                    continue;
+                };
+                let other = kinds.iter().find(|k| **k != read);
+                let (Some(other), false) = (other, kinds.contains(&read)) else {
+                    continue;
+                };
+                if !told.insert(p) {
+                    continue;
+                }
+                let where_ = match p {
+                    Place::Fixed(slot) => slot_text(slot),
+                    Place::Entry(root) => format!("the mapping at {}", slot_text(root)),
+                };
+                report(
+                    out,
+                    run,
+                    "clock-units-mixed",
+                    "A value kept in one clock is compared with the other",
+                    Severity::Medium,
+                    format!(
+                        "Every write of {where_} found takes its value from {}. `{}` compares it with {}. The two count in different units, so the comparison does not mean what either side intends.",
+                        other.text(),
+                        run.function.name,
+                        read.text(),
+                    ),
+                    "Keep and compare the value in one clock.",
+                );
+            }
+        }
+    }
+}
+
+type Field = (U256, u32, U256);
+
+fn field_of(e: ExprId) -> Option<Field> {
+    let slot_of = |x: ExprId| match expr::node(x) {
+        Node::SLoad(key, false, _) => expr::as_const(key),
+        _ => None,
+    };
+    if let Some(slot) = slot_of(e) {
+        return Some((slot, 0, U256::MAX));
+    }
+    let Node::Op(op::AND, parts) = expr::node(e) else {
+        return None;
+    };
+    let (mask, inner) = match (expr::as_const(parts[0]), expr::as_const(parts[1])) {
+        (Some(m), None) => (m, parts[1]),
+        (None, Some(m)) => (m, parts[0]),
+        _ => return None,
+    };
+    if let Some(slot) = slot_of(inner) {
+        return Some((slot, 0, mask));
+    }
+    let Node::Op(op::SHR, shifted) = expr::node(inner) else {
+        return None;
+    };
+    let by = expr::as_const(shifted[0]).filter(U256::fits_u64)?.low_u64();
+    Some((slot_of(shifted[1])?, u32::try_from(by).ok()?, mask))
+}
+
+fn required(cond: ExprId, holds: bool) -> Option<(Field, U256)> {
+    match expr::node(cond) {
+        Node::Op(op::ISZERO, inner) => match field_of(inner[0]) {
+            Some(field) if holds => Some((field, U256::ZERO)),
+            Some(_) => None,
+            None => required(inner[0], !holds),
+        },
+        Node::Op(op::EQ, sides) if holds => {
+            let (field, value) = match (expr::as_const(sides[0]), expr::as_const(sides[1])) {
+                (Some(v), None) => (field_of(sides[1])?, v),
+                (None, Some(v)) => (field_of(sides[0])?, v),
+                _ => return None,
+            };
+            Some((field, value))
+        }
+        _ => None,
+    }
+}
+
+const MAX_PHASE: u64 = 0xff;
+
+fn read_field(word: U256, field: Field) -> U256 {
+    (word >> field.1) & field.2
+}
+
+fn phases(
+    c: &Contract,
+    all: &[Run],
+    begin: &HashMap<U256, U256>,
+    out: &mut Vec<Finding>,
+) -> Option<Section> {
+    // A writer with no finished run could be the one that enters the missing phase.
+    let finished: BTreeSet<usize> = all.iter().map(|r| r.function.pc).collect();
+    let every_writer_seen = c
+        .functions
+        .iter()
+        .filter(|f| f.kind == FnKind::External && f.effects.writes_storage)
+        .all(|f| finished.contains(&f.pc));
+    let small = |v: &U256| v.fits_u64() && v.low_u64() <= MAX_PHASE;
+    let mut needs: BTreeMap<Field, BTreeMap<U256, BTreeSet<&str>>> = BTreeMap::new();
+    for run in all {
+        for item in &run.path.items {
+            let Item::Check { cond, holds, .. } = item else {
+                continue;
+            };
+            if let Some((field, value)) = required(*cond, *holds).filter(|(_, v)| small(v)) {
+                let by_value = needs.entry(field).or_default();
+                by_value
+                    .entry(value)
+                    .or_default()
+                    .insert(&run.function.name);
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    for (field, by_value) in &needs {
+        let mut moves: BTreeSet<(U256, U256, &str)> = BTreeSet::new();
+        let mut counted = false;
+        for run in all {
+            let writes: Vec<(U256, U256)> = run
+                .steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Write {
+                        slot,
+                        before,
+                        after,
+                        ..
+                    } if *slot == field.0 => Some((*before, *after)),
+                    _ => None,
+                })
+                .collect();
+            let (Some(first), Some(last)) = (writes.first(), writes.last()) else {
+                continue;
+            };
+            let (from, to) = (read_field(first.0, *field), read_field(last.1, *field));
+            let chosen_by_caller = run.path.items.iter().any(|item| match item {
+                Item::Store { key, val, .. } => {
+                    expr::as_const(*key) == Some(field.0) && from_the_call(*val)
+                }
+                Item::Check { .. } => false,
+            });
+            counted |= chosen_by_caller && from != to;
+            if from != to {
+                moves.insert((from, to, &run.function.name));
+            }
+        }
+        let all_small = moves.iter().all(|(a, b, _)| small(a) && small(b));
+        if moves.is_empty() || !all_small || counted {
+            continue;
+        }
+        let at_start = read_field(begin.get(&field.0).copied().unwrap_or(U256::ZERO), *field);
+        let name = match (field.1, field.2 == U256::MAX) {
+            (0, true) => slot_text(field.0),
+            (shift, _) => format!("{} from bit {shift}", slot_text(field.0)),
+        };
+        let mut line = format!("{name} starts at {}.", at_start.low_u64());
+        for (from, to, function) in &moves {
+            line.push_str(&format!(
+                " `{function}` moves it from {} to {}.",
+                from.low_u64(),
+                to.low_u64()
+            ));
+        }
+        for (value, functions) in by_value {
+            let list: Vec<String> = functions.iter().map(|f| format!("`{f}`")).collect();
+            line.push_str(&format!(
+                " {} run only at {}.",
+                list.join(", "),
+                value.low_u64()
+            ));
+            let entered = *value == at_start || moves.iter().any(|(_, to, _)| to == value);
+            let witness = all
+                .iter()
+                .find(|r| functions.contains(r.function.name.as_str()));
+            let effect = |r: &&Run| r.function.effects.writes_storage || r.function.effects.calls;
+            let witness = witness.filter(effect).filter(|_| every_writer_seen);
+            if let (false, Some(run)) = (entered, witness) {
+                let known = if begin.is_empty() {
+                    " Only runtime code was given, so a constructor that sets it cannot be ruled out."
+                } else {
+                    ""
+                };
+                push(
+                    out,
+                    "phase-never-entered",
+                    "Functions wait for a phase that no path enters",
+                    Severity::Low,
+                    if begin.is_empty() { Confidence::Low } else { Confidence::Medium },
+                    Some(run.function),
+                    None,
+                    format!(
+                        "{} run only while {name} holds {}. Other functions move that value between phases, but none of the paths found leaves it at {} and it does not start there, so these functions cannot be reached.{known}",
+                        list.join(", "),
+                        value.low_u64(),
+                        value.low_u64(),
+                    ),
+                    Vec::new(),
+                    "Add the missing transition, or remove the functions that wait for it.",
+                );
+            }
+        }
+        lines.push(line);
+    }
+    (!lines.is_empty()).then_some(Section {
+        title: "Phases".to_string(),
+        lines,
+    })
+}
+
+pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Vec<Section> {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
-        return;
+        return Vec::new();
     }
     let layout = c.compiler.layout;
     let all = runs(c);
@@ -468,4 +750,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     open_at_call(&all, layout, &pairs, out);
     lock_left(&all, out);
     dropped_changes(&all, out);
+    clock_mix(&all, layout, out);
+    let begin = deploy::storage(c);
+    phases(c, &all, &begin, out).into_iter().collect()
 }

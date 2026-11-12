@@ -75,6 +75,7 @@ pub struct Host {
     pub force_calls: Option<bool>,
     pub forced_return: Vec<u8>,
     pub replies: Vec<(u32, Vec<u8>)>,
+    pub signed: Option<(Vec<u8>, U256)>,
     pub intercept_calls: bool,
     pub unset_storage: Option<U256>,
 }
@@ -109,6 +110,7 @@ impl Host {
             force_calls: None,
             forced_return: Vec::new(),
             replies: Vec::new(),
+            signed: None,
             intercept_calls: false,
             unset_storage: None,
         }
@@ -137,6 +139,7 @@ impl Host {
             force_calls: Some(true),
             forced_return: Vec::new(),
             replies: Vec::new(),
+            signed: None,
             intercept_calls: false,
             unset_storage: None,
         }
@@ -207,9 +210,16 @@ impl Host {
             r
         }
     }
-    pub fn call_result(&self, i: usize, input: &[u8]) -> (bool, Vec<u8>) {
+    pub fn call_result(&self, i: usize, addr: U256, input: &[u8]) -> (bool, Vec<u8>) {
         if let Some(b) = self.force_calls {
-            return (b, reply(&self.replies, &self.forced_return, input).to_vec());
+            let data = answer(
+                &self.signed,
+                &self.replies,
+                &self.forced_return,
+                addr,
+                input,
+            );
+            return (b, data);
         }
         let r = keccak::keccak256(
             &[
@@ -248,12 +258,31 @@ impl Host {
     }
 }
 
-pub fn reply<'a>(replies: &'a [(u32, Vec<u8>)], default: &'a [u8], input: &[u8]) -> &'a [u8] {
+const RECOVER: U256 = U256::ONE;
+const SOMEONE_ELSE: U256 = U256::from_u64(0x0e15_e0e1_5e0e_15e0);
+
+// Signature recovery answers the signer for the one digest it was given.
+// Any other digest recovers someone else, as a changed message would.
+pub fn answer(
+    signed: &Option<(Vec<u8>, U256)>,
+    replies: &[(u32, Vec<u8>)],
+    default: &[u8],
+    addr: U256,
+    input: &[u8],
+) -> Vec<u8> {
+    if let (true, Some((digest, signer))) = (addr == RECOVER, signed) {
+        let who = if input.starts_with(digest) {
+            *signer
+        } else {
+            SOMEONE_ELSE
+        };
+        return who.to_be_bytes().to_vec();
+    }
     let selector = input
         .get(..4)
         .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
     let chosen = replies.iter().find(|(s, _)| Some(*s) == selector);
-    chosen.map_or(default, |(_, data)| data)
+    chosen.map_or(default, |(_, data)| data).to_vec()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -814,7 +843,7 @@ impl<'a> Machine<'a> {
                 let (success, data) = if addr == U256::from_u64(4) {
                     (true, input)
                 } else {
-                    self.host.call_result(idx, &input)
+                    self.host.call_result(idx, addr, &input)
                 };
                 self.deliver_call(out_off, out_len, success, data)?;
             }

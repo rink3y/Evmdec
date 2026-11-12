@@ -1,6 +1,7 @@
 use crate::abi;
 use crate::analyze::{display_name, Confidence, Finding};
 use crate::decompile::{Contract, Function};
+use crate::deploy;
 use crate::exec::{self, FrameRun};
 use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
@@ -49,6 +50,7 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
     if c.info.runtime.is_empty() {
         return;
     }
+    let start = deploy::storage(c);
     for finding in findings.iter_mut() {
         if finding.confirmed || !CONFIRMABLE.contains(&finding.id.as_str()) {
             continue;
@@ -65,7 +67,7 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         };
         let code = c.code_of(f);
         let local = c.local_pc(f, pc);
-        if let Some(witness) = reach(code, f, local, &finding.id) {
+        if let Some(witness) = reach(code, f, local, &finding.id, &start) {
             finding.confirmed = true;
             finding.witness = Some(hex::encode(&witness));
             finding.confidence = Confidence::High;
@@ -83,7 +85,7 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         let id = finding.id.clone();
         let goal = |p: &Path| p.run.reached(local) && p.succeeded() && shows_effect(&id, &p.run);
         let explorer = Explorer::new(code);
-        if let Some(plan) = seq::reach(&explorer, &entries, entry(f), &goal) {
+        if let Some(plan) = seq::reach(&explorer, &entries, entry(f), &start, &goal) {
             finding.confirmed = true;
             finding.witness = Some(hex::encode(&plan.last.inputs.calldata));
             finding.setup = plan
@@ -93,8 +95,9 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
                 .collect();
             finding.confidence = Confidence::High;
             finding.description.push_str(&format!(
-                " Confirmed in {} calls from empty storage: an account holding no role first makes the attached earlier call{}, then reaches this sink and the transaction keeps its effect.",
+                " Confirmed in {} calls from {}: an account holding no role first makes the attached earlier call{}, then reaches this sink and the transaction keeps its effect.",
                 plan.steps.len() + 1,
+                deploy::start_text(&start),
                 if plan.steps.len() == 1 { "" } else { "s" },
             ));
         }
@@ -104,7 +107,13 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
 // Entering the sink's block is not enough.
 // A guard ahead of the sink or a later revert undoes the effect.
 // So the run must end normally and show it.
-fn reach(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
+fn reach(
+    code: &[u8],
+    f: &Function,
+    pc: usize,
+    id: &str,
+    start: &HashMap<U256, U256>,
+) -> Option<Vec<u8>> {
     let selector = exec::selector_of(f);
     let shapes = [U256::ZERO, SOME_ETHER].into_iter().flat_map(|callvalue| {
         (0..=6usize)
@@ -114,16 +123,22 @@ fn reach(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
     for (callvalue, args) in shapes.take(MAX_ATTEMPTS) {
         let data = exec::calldata(selector, &args);
         let host = exec::caller_host(data.clone(), callvalue);
-        let run = exec::run_frame(code, &host, HashMap::new(), STEP_BUDGET);
+        let run = exec::run_frame(code, &host, start.clone(), STEP_BUDGET);
         if run.reached(pc) && run.succeeded() && shows_effect(id, &run) {
             return Some(data);
         }
     }
-    solved(code, f, pc, id)
+    solved(code, f, pc, id, start)
 }
 
-// Storage stays as it is in a fresh contract. Only the call data and the value are solved for.
-fn solved(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
+// Storage stays as deployment left it. Only the call data and the value are solved for.
+fn solved(
+    code: &[u8],
+    f: &Function,
+    pc: usize,
+    id: &str,
+    begin: &HashMap<U256, U256>,
+) -> Option<Vec<u8>> {
     let explorer = Explorer::new(code);
     let selector = exec::selector_of(f);
     let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
@@ -146,6 +161,7 @@ fn solved(code: &[u8], f: &Function, pc: usize, id: &str) -> Option<Vec<u8>> {
             let start = Inputs {
                 calldata: calldata.clone(),
                 returned,
+                storage: begin.clone(),
                 ..flat.clone()
             };
             let hit = explorer
@@ -185,11 +201,6 @@ fn shows_effect(id: &str, run: &FrameRun) -> bool {
 const WRAP_IDS: &[&str] = &["unchecked-arithmetic", "unchecked-block-arithmetic"];
 const MAX_WRAP_NODES: usize = 16;
 
-const WRAPPED_NOTE: &str = concat!(
-    " Confirmed: with the attached input, sent by an account holding no role to empty storage,",
-    " the function ends normally after a stored result wrapped around."
-);
-
 fn wrap_checks(val: ExprId, out: &mut Vec<ExprId>) {
     let mut seen = HashSet::new();
     let mut stack = vec![val];
@@ -219,7 +230,7 @@ fn wrap_checks(val: ExprId, out: &mut Vec<ExprId>) {
 }
 
 // The run is repeated with the solved input and must take the same path and still end normally.
-fn wrapping_input(code: &[u8], f: &Function) -> Option<Vec<u8>> {
+fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Option<Vec<u8>> {
     let explorer = Explorer::new(code);
     let selector = exec::selector_of(f);
     let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
@@ -240,6 +251,7 @@ fn wrapping_input(code: &[u8], f: &Function) -> Option<Vec<u8>> {
         };
         let start = Inputs {
             calldata,
+            storage: begin.clone(),
             ..flat.clone()
         };
         let found = explorer.explore(&start, &free, Limits::default());
@@ -285,6 +297,7 @@ pub fn confirm_wraps(c: &Contract, findings: &mut [Finding]) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return;
     }
+    let start = deploy::storage(c);
     for finding in findings.iter_mut() {
         if finding.confirmed || !WRAP_IDS.contains(&finding.id.as_str()) {
             continue;
@@ -297,11 +310,14 @@ pub fn confirm_wraps(c: &Contract, findings: &mut [Finding]) {
             .iter()
             .find(|f| f.kind == FnKind::External && display_name(f) == name);
         let Some(f) = function else { continue };
-        if let Some(witness) = wrapping_input(c.code_of(f), f) {
+        if let Some(witness) = wrapping_input(c.code_of(f), f, &start) {
             finding.confirmed = true;
             finding.witness = Some(hex::encode(&witness));
             finding.confidence = Confidence::High;
-            finding.description.push_str(WRAPPED_NOTE);
+            finding.description.push_str(&format!(
+                " Confirmed: with the attached input, sent by an account holding no role to {}, the function ends normally after a stored result wrapped around.",
+                deploy::start_text(&start),
+            ));
         }
     }
 }

@@ -42,6 +42,7 @@ pub struct Store {
     pub loc: Loc,
     pub gated: bool,
     pub value: ExprId,
+    pub by: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +175,7 @@ mod tests {
             loc: (U256::from_u64(n), 0),
             gated,
             value,
+            by: 0,
         }
     }
 

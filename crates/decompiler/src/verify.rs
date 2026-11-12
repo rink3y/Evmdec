@@ -644,7 +644,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         let (ok, data) = if a == U256::from_u64(4) {
                             (true, input_bytes)
                         } else {
-                            host.call_result(idx, &input_bytes)
+                            host.call_result(idx, a, &input_bytes)
                         };
                         ev.calls.push((ok, data.clone()));
                         if ol > 0 {

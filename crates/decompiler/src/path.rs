@@ -67,6 +67,7 @@ pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
         replies: Vec::new(),
         given: Vec::new(),
         balance: DEFAULT_BALANCE,
+        signed: None,
     }
 }
 
@@ -88,6 +89,7 @@ impl Explorer {
         host.number = inputs.number;
         host.forced_return = inputs.returned.clone();
         host.replies = inputs.replies.clone();
+        host.signed = inputs.signed.clone();
         host.selfbalance = inputs.balance;
         let run = exec::run_frame(&self.prog.code, &host, inputs.storage.clone(), STEP_BUDGET);
         let blocks: Vec<usize> = run
@@ -153,8 +155,9 @@ impl Explorer {
         inputs.given = made
             .zip(&run.calls)
             .map(|(seq, call)| {
-                let data = interp::reply(&inputs.replies, &inputs.returned, &call.input);
-                (seq, data.to_vec())
+                let (replies, default) = (&inputs.replies, &inputs.returned);
+                let data = interp::answer(&inputs.signed, replies, default, call.addr, &call.input);
+                (seq, data)
             })
             .collect();
         Path {

@@ -73,7 +73,15 @@ pub struct Report {
     pub summary: BTreeMap<String, usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub summaries: Vec<FnSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub maps: Vec<Section>,
     pub risk_score: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct Section {
+    pub title: String,
+    pub lines: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -4749,8 +4757,13 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     crate::confirm::confirm_wraps(c, &mut findings);
 
     crate::invariant::findings(c, &c.types, &mut findings);
-    crate::props::findings(c, &mut findings);
+    let begin = crate::deploy::storage(c);
+    report
+        .maps
+        .extend(authority(&facts, &stores, &uses, &begin, &mut findings));
+    report.maps.extend(crate::props::findings(c, &mut findings));
     crate::flow::findings(c, &mut findings);
+    crate::signed::findings(c, &mut findings);
 
     if std::env::var("EVMDEC_DEBUG_LOCKS").is_ok() {
         for (slot, fs) in &lock_slots {
@@ -6299,6 +6312,7 @@ fn stored_uses(
                         loc,
                         gated,
                         value: *val,
+                        by: function,
                     });
                 }
             }
@@ -6345,6 +6359,72 @@ fn stored_uses(
 
 // A fixed slot that an ungated function fills straight from its input is the older rules' ground.
 // These two report what they cannot see: values that arrive through other slots or sit in mappings.
+fn authority(
+    facts: &[FnFacts],
+    stores: &[origin::Store],
+    uses: &[StoredUse],
+    begin: &HashMap<U256, U256>,
+    findings: &mut Vec<Finding>,
+) -> Option<Section> {
+    let mut gates: BTreeMap<origin::Loc, BTreeSet<usize>> = BTreeMap::new();
+    for u in uses.iter().filter(|u| matches!(u.kind, UseKind::Gate)) {
+        gates.entry(u.loc).or_default().insert(u.function);
+    }
+    let name = |i: &usize| format!("`{}`", facts[*i].name);
+    let mut lines = Vec::new();
+    for (loc, gated) in &gates {
+        let place = match loc.1 {
+            0 => format!("slot {}", loc.0.to_hex()),
+            _ => format!("the mapping at slot {}", loc.0.to_hex()),
+        };
+        let setters: BTreeSet<(usize, bool)> = stores
+            .iter()
+            .filter(|s| s.loc == *loc)
+            .map(|s| (s.by, s.gated))
+            .collect();
+        let set_by = match setters.is_empty() {
+            true => "No function in the runtime code writes it.".to_string(),
+            false => {
+                let each = setters.iter().map(|(by, checked)| {
+                    let how = if *checked {
+                        "behind a caller check"
+                    } else {
+                        "with no caller check"
+                    };
+                    format!("{} ({how})", name(by))
+                });
+                format!("It is written by {}.", each.collect::<Vec<_>>().join(", "))
+            }
+        };
+        lines.push(format!(
+            "{place} decides who may call {}. {set_by}",
+            gated.iter().map(name).collect::<Vec<_>>().join(", "),
+        ));
+        let unset = !begin.is_empty() && begin.get(&loc.0).is_none_or(|v| v.is_zero());
+        if let (true, true, 0, Some(first)) = (setters.is_empty(), unset, loc.1, gated.first()) {
+            push_fact(
+                findings,
+                "gate-never-set",
+                "A caller check reads a slot that nothing ever sets",
+                Severity::Low,
+                Confidence::Medium,
+                &facts[*first],
+                format!(
+                    "{} function(s) compare the caller with slot {}. The constructor leaves that slot at zero and no function in the runtime code writes it, so no account can pass the check and what it protects cannot be called.",
+                    gated.len(),
+                    loc.0.to_hex(),
+                ),
+                Vec::new(),
+                "Set the slot during construction, or add an authorised function that sets it, or remove the dead functions.",
+            );
+        }
+    }
+    (!lines.is_empty()).then_some(Section {
+        title: "Authority map".to_string(),
+        lines,
+    })
+}
+
 fn origin_findings(
     ctx: &Ctx,
     facts: &[FnFacts],
@@ -7142,6 +7222,13 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
             out.push_str("```\n\n");
         }
         out.push_str(&format!("Recommendation: {}\n\n", f.recommendation));
+    }
+    for section in &r.maps {
+        out.push_str(&format!("## {}\n\n", section.title));
+        for line in &section.lines {
+            out.push_str(&format!("- {line}\n"));
+        }
+        out.push('\n');
     }
     if !r.privileged_functions.is_empty() {
         out.push_str("## Privileged functions (gated by msg.sender checks)\n\n");

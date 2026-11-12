@@ -18,6 +18,7 @@ pub struct Inputs {
     pub replies: Vec<(u32, Vec<u8>)>,
     pub given: Vec<(u32, Vec<u8>)>,
     pub balance: U256,
+    pub signed: Option<(Vec<u8>, U256)>,
 }
 
 #[derive(Clone, Debug)]
@@ -583,6 +584,7 @@ mod tests {
             replies: Vec::new(),
             given: Vec::new(),
             balance: U256::ZERO,
+            signed: None,
         }
     }
 

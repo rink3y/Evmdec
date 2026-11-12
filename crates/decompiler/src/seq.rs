@@ -171,20 +171,21 @@ fn write_for(
     None
 }
 
-// The plan is replayed from empty storage before it is returned.
+// The plan is replayed from the starting storage before it is returned.
 pub fn reach(
     explorer: &Explorer,
     entries: &[Entry],
     target: Entry,
+    begin: &HashMap<U256, U256>,
     goal: &dyn Fn(&Path) -> bool,
 ) -> Option<Plan> {
-    let mut state: HashMap<U256, U256> = HashMap::new();
+    let mut state: HashMap<U256, U256> = begin.clone();
     let mut steps: Vec<Inputs> = Vec::new();
     for _ in 0..=MAX_SETUP_STEPS {
         let start = inputs_at(target, &state);
         let direct = explorer.explore(&start, &free(target, false), Limits::default());
         if let Some(last) = direct.into_iter().find(|p| goal(p)) {
-            return replayed(explorer, steps, last, goal);
+            return replayed(explorer, steps, last, begin, goal);
         }
         let assumed = explorer.explore(&start, &free(target, true), Limits::default());
         let wanted: Vec<Need> = assumed
@@ -208,9 +209,10 @@ fn replayed(
     explorer: &Explorer,
     steps: Vec<Inputs>,
     last: Path,
+    begin: &HashMap<U256, U256>,
     goal: &dyn Fn(&Path) -> bool,
 ) -> Option<Plan> {
-    let mut state: HashMap<U256, U256> = HashMap::new();
+    let mut state: HashMap<U256, U256> = begin.clone();
     let mut clean = Vec::new();
     for step in &steps {
         let mut inputs = step.clone();

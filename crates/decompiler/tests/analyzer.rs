@@ -1723,6 +1723,7 @@ fn a_call_that_needs_earlier_storage_is_reached_through_the_call_that_writes_it(
     let marked = |p: &evmdec::path::Path| {
         p.succeeded() && p.run.storage.get(&U256::from_u64(9)) == Some(&U256::ONE)
     };
+    let none = std::collections::HashMap::new();
 
     let by_entry = dispatcher3(
         &format!("PUSH1 0x04 CALLDATALOAD {own_entry} SSTORE STOP"),
@@ -1730,7 +1731,8 @@ fn a_call_that_needs_earlier_storage_is_reached_through_the_call_that_writes_it(
         "STOP",
     );
     let explorer = Explorer::new(&by_entry);
-    let plan = seq::reach(&explorer, &entries, entries[1], &marked).expect("two calls reach it");
+    let plan =
+        seq::reach(&explorer, &entries, entries[1], &none, &marked).expect("two calls reach it");
     assert_eq!(plan.steps.len(), 1);
     assert_eq!(&plan.steps[0].calldata[..4], [0xaa; 4]);
     assert_eq!(solve::word(&plan.steps[0].calldata, 4), U256::from_u64(7));
@@ -1741,14 +1743,15 @@ fn a_call_that_needs_earlier_storage_is_reached_through_the_call_that_writes_it(
         "STOP",
     );
     let explorer = Explorer::new(&by_owner);
-    let plan = seq::reach(&explorer, &entries, entries[1], &marked).expect("claim, then call");
+    let plan =
+        seq::reach(&explorer, &entries, entries[1], &none, &marked).expect("claim, then call");
     assert_eq!(plan.steps.len(), 1);
     assert_eq!(&plan.steps[0].calldata[..4], [0xaa; 4]);
 
     let closed = dispatcher3("STOP", &format!("{OWNER_GATE} {marks}"), "STOP");
     let explorer = Explorer::new(&closed);
     assert!(
-        seq::reach(&explorer, &entries, entries[1], &marked).is_none(),
+        seq::reach(&explorer, &entries, entries[1], &none, &marked).is_none(),
         "nothing writes the owner slot"
     );
 }
@@ -2015,4 +2018,153 @@ fn a_change_made_to_a_memory_copy_of_storage_and_then_dropped_is_reported() {
 
     let returned = dispatcher(&format!("{copy_and_change} PUSH1 0x20 PUSH1 0x80 RETURN"));
     assert!(property_ids(&returned).is_empty());
+}
+
+#[test]
+fn a_confirmation_starts_from_the_storage_the_constructor_leaves() {
+    let runtime = dispatcher(
+        "PUSH1 0x00 SLOAD ISZERO PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST \
+         CALLER SELFDESTRUCT",
+    );
+    let r = analyze::analyze(&decompile::decompile(&runtime, &Options::default()));
+    let alone = finding(&r, "selfdestruct").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(
+        alone.confirmed,
+        "slot 0 is unset when only runtime code is known"
+    );
+
+    let mut creation = asm(&format!(
+        "PUSH1 0x01 PUSH1 0x00 SSTORE PUSH2 {len:#06x} DUP1 PUSH2 0x0012 PUSH1 0x00 CODECOPY \
+         PUSH1 0x00 RETURN",
+        len = runtime.len()
+    ));
+    assert_eq!(creation.len(), 0x12);
+    creation.extend(&runtime);
+    let c = decompile::decompile(&creation, &Options::default());
+    assert!(
+        c.constructor.is_some(),
+        "the fixture must be seen as creation code"
+    );
+    let r = analyze::analyze(&c);
+    assert!(
+        !r.findings.iter().any(|f| f.confirmed),
+        "the constructor sets slot 0, so the guard holds for every later caller"
+    );
+}
+
+#[test]
+fn a_signed_call_with_no_counter_in_its_digest_is_accepted_twice() {
+    let signed_payment = |extra_word: &str, digest_len: &str, after: &str| {
+        dispatcher(&format!(
+            "PUSH1 0x64 CALLDATALOAD PUSH1 0x80 MSTORE {extra_word} \
+             PUSH1 {digest_len} PUSH1 0x80 KECCAK256 PUSH1 0x80 MSTORE \
+             PUSH1 0x04 CALLDATALOAD PUSH1 0xa0 MSTORE PUSH1 0x24 CALLDATALOAD PUSH1 0xc0 MSTORE \
+             PUSH1 0x44 CALLDATALOAD PUSH1 0xe0 MSTORE \
+             PUSH1 0x20 PUSH1 0x80 PUSH1 0x80 PUSH1 0x80 PUSH1 0x01 GAS STATICCALL POP \
+             PUSH1 0x80 MLOAD PUSH1 0x00 SLOAD EQ PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT \
+             :ok JUMPDEST {after} \
+             PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x64 CALLDATALOAD CALLER GAS CALL POP STOP"
+        ))
+    };
+    let twice = |code: &[u8]| {
+        let r = analyze::analyze(&decompile::decompile(code, &Options::default()));
+        finding(&r, "signed-message-accepted-twice").cloned()
+    };
+
+    let bare = signed_payment("", "0x20", "");
+    let f = twice(&bare).expect("nothing takes the message out of use");
+    assert!(f.confirmed && f.severity == Severity::High);
+
+    let counted = signed_payment(
+        "PUSH1 0x01 SLOAD PUSH1 0xa0 MSTORE",
+        "0x40",
+        "PUSH1 0x01 SLOAD PUSH1 0x01 ADD PUSH1 0x01 SSTORE",
+    );
+    assert!(twice(&counted).is_none(), "the counter changes the digest");
+}
+
+const REVERT: &str = "PUSH1 0x00 DUP1 REVERT";
+
+fn report_of(code: &[u8]) -> analyze::Report {
+    analyze::analyze(&decompile::decompile(code, &Options::default()))
+}
+
+#[test]
+fn a_value_kept_in_block_numbers_and_compared_with_the_timestamp_is_reported() {
+    let contract = |clock: &str| {
+        dispatcher3(
+            &format!("{clock} PUSH1 0x04 CALLDATALOAD ADD PUSH1 0x05 SSTORE STOP"),
+            &format!(
+                "PUSH1 0x05 SLOAD TIMESTAMP GT PUSH2 @ok JUMPI {REVERT} :ok JUMPDEST \
+                 PUSH1 0x01 PUSH1 0x06 SSTORE STOP"
+            ),
+            "STOP",
+        )
+    };
+    assert!(finding(&report_of(&contract("NUMBER")), "clock-units-mixed").is_some());
+    assert!(finding(&report_of(&contract("TIMESTAMP")), "clock-units-mixed").is_none());
+}
+
+#[test]
+fn phases_are_recovered_and_one_that_is_never_entered_is_reported() {
+    let step = |at: u8, then: &str| {
+        format!(
+            "PUSH1 0x03 SLOAD PUSH1 {at:#04x} EQ PUSH2 @at{at} JUMPI {REVERT} \
+             :at{at} JUMPDEST {then} STOP"
+        )
+    };
+    let machine = |last: u8| {
+        dispatcher3(
+            &step(0, "PUSH1 0x01 PUSH1 0x03 SSTORE"),
+            &step(1, "PUSH1 0x02 PUSH1 0x03 SSTORE"),
+            &step(last, "PUSH1 0x01 PUSH1 0x07 SSTORE"),
+        )
+    };
+    let r = report_of(&machine(5));
+    let phases = r
+        .maps
+        .iter()
+        .find(|s| s.title == "Phases")
+        .expect("a phase map");
+    let line = &phases.lines[0];
+    assert!(
+        line.contains("from 0 to 1") && line.contains("from 1 to 2"),
+        "{line}"
+    );
+    assert!(
+        finding(&r, "phase-never-entered").is_some(),
+        "{:?}",
+        ids(&r)
+    );
+
+    assert!(finding(&report_of(&machine(2)), "phase-never-entered").is_none());
+}
+
+fn deployed(constructor: &str, runtime: &[u8]) -> Vec<u8> {
+    let tail = "DUP1 PUSH2 @code PUSH1 0x00 CODECOPY PUSH1 0x00 RETURN :code";
+    let mut code = asm(&format!(
+        "{constructor} PUSH2 {:#06x} {tail}",
+        runtime.len()
+    ));
+    code.extend(runtime);
+    code
+}
+
+#[test]
+fn a_caller_check_on_a_slot_nothing_sets_is_reported_with_the_authority_map() {
+    let runtime = dispatcher(&format!("{OWNER_GATE} CALLER SELFDESTRUCT"));
+    let marks = "PUSH1 0x01 PUSH1 0x09 SSTORE";
+
+    let r = report_of(&deployed(marks, &runtime));
+    assert!(finding(&r, "gate-never-set").is_some(), "{:?}", ids(&r));
+    let map = r
+        .maps
+        .iter()
+        .find(|s| s.title == "Authority map")
+        .expect("a map");
+    assert!(map.lines[0].contains("No function in the runtime code writes it"));
+
+    let owned = format!("{marks} CALLER PUSH1 0x00 SSTORE");
+    let r = report_of(&deployed(&owned, &runtime));
+    assert!(finding(&r, "gate-never-set").is_none());
 }

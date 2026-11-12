@@ -1,6 +1,7 @@
 use crate::abi;
 use crate::analyze::{push, Confidence, Finding, Severity};
 use crate::decompile::{Contract, Function};
+use crate::deploy;
 use crate::emit::MappingLayout;
 use crate::exec;
 use crate::function::FnKind;
@@ -139,6 +140,7 @@ struct Deposit<'a> {
 struct Pass<'a> {
     c: &'a Contract,
     explorers: HashMap<*const u8, Explorer>,
+    start: HashMap<U256, U256>,
     deadline: Instant,
 }
 
@@ -176,6 +178,7 @@ impl<'a> Pass<'a> {
             calldata: filled(&calldata, &fixed, words),
             returned: one.clone(),
             replies: vec![(SEL_TRANSFER, one.clone()), (SEL_TRANSFER_FROM, one)],
+            storage: self.start.clone(),
             ..flat
         };
         let free = Free {
@@ -250,7 +253,7 @@ impl<'a> Pass<'a> {
                 if self.pays_from_nothing(g, &q, asset, back) {
                     break;
                 }
-                report_gain(out, d, g, &q, asset, back);
+                report_gain(out, d, g, &q, asset, back, deploy::start_text(&self.start));
                 return;
             }
         }
@@ -260,7 +263,7 @@ impl<'a> Pass<'a> {
     // Other rules cover a payment nothing was put in for.
     fn pays_from_nothing(&mut self, g: &Function, q: &Path, asset: Asset, back: U256) -> bool {
         let mut alone = q.inputs.clone();
-        alone.storage = HashMap::new();
+        alone.storage = self.start.clone();
         let code = self.c.code_of(g);
         let explorer = self
             .explorers
@@ -345,6 +348,7 @@ fn report_gain(
     q: &Path,
     asset: Asset,
     back: U256,
+    from: &str,
 ) {
     let paid = sum(total(&d.taken, asset), total(&taken(q), asset));
     push(
@@ -356,7 +360,8 @@ fn report_gain(
         Some(g),
         None,
         format!(
-            "Starting from empty storage, an account holding no role calls `{}` and pays in {} of {}. Its next call, to `{}`, ends normally and sends it {} of the same asset. The same second call from empty storage sends nothing, so what comes back is decided by what the first call recorded, and it is more than was paid. The run assumes the contract holds enough to make the payment.",
+            "Starting from {}, an account holding no role calls `{}` and pays in {} of {}. Its next call, to `{}`, ends normally and sends it {} of the same asset. The same second call made first sends nothing, so what comes back is decided by what the first call recorded, and it is more than was paid. The run assumes the contract holds enough to make the payment.",
+            from,
             d.function.name,
             paid.to_hex(),
             asset_text(asset),
@@ -381,6 +386,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     let mut pass = Pass {
         c,
         explorers: HashMap::new(),
+        start: deploy::storage(c),
         deadline: Instant::now() + BUDGET,
     };
     let deposits = pass.deposits(layout);

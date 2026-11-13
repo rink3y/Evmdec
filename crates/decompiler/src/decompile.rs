@@ -1431,38 +1431,37 @@ pub(crate) fn clone_target(init: &[ExprId], len: ExprId) -> Option<String> {
     Some(U256::from_be_bytes(address).to_hex_padded(20))
 }
 
+// A block is read once however many nodes run it, with one running stack.
+// Working the stack out again before every copy was quadratic in a block full of them.
 fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
-    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut out: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut read: HashSet<usize> = HashSet::new();
     for u in std::iter::once(&rec.main).chain(rec.functions.values()) {
         for n in &u.nodes {
+            if !read.insert(n.block) {
+                continue;
+            }
             let b = &prog.blocks[n.block];
-            let insns = prog.block_insns(b);
-            for (i, ins) in insns.iter().enumerate() {
-                if ins.opcode == op::CODECOPY && i >= 3 {
-                    let st = metadata::constant_stack(&insns[..i]);
-                    let l = st.len();
-                    if l >= 3 {
-                        if let (Some(off), Some(len)) = (
-                            st[l - 2].and_then(|v| v.as_usize()),
-                            st[l - 3].and_then(|v| v.as_usize()),
-                        ) {
-                            if len >= 64
-                                && off
-                                    .checked_add(len)
-                                    .is_some_and(|end| end <= prog.code.len())
-                                && off >= b.end
-                                && !out.contains(&(off, len))
-                            {
-                                out.push((off, len));
-                            }
+            let mut st: Vec<Option<U256>> = Vec::new();
+            for (i, ins) in prog.block_insns(b).iter().enumerate() {
+                if let (op::CODECOPY, true, [.., len, off, _]) = (ins.opcode, i >= 3, &st[..]) {
+                    let region = off
+                        .and_then(|v| v.as_usize())
+                        .zip(len.and_then(|v| v.as_usize()));
+                    if let Some((off, len)) = region {
+                        let inside = off
+                            .checked_add(len)
+                            .is_some_and(|end| end <= prog.code.len());
+                        if len >= 64 && inside && off >= b.end {
+                            out.insert((off, len));
                         }
                     }
                 }
+                metadata::constant_step(&mut st, ins);
             }
         }
     }
-    out.sort();
-    out
+    out.into_iter().collect()
 }
 
 fn element_types(functions: &[Function]) -> HashMap<U256, String> {

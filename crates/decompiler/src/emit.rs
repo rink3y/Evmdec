@@ -1,4 +1,4 @@
-use crate::expr::{self, ExprId, Node};
+use crate::expr::{self, kind, ExprId, Node};
 use crate::keccak;
 use crate::lift::{Lifted, Stmt, Term, FREE_POINTER};
 use crate::opcode as op;
@@ -436,12 +436,12 @@ fn written_range(s: &Stmt) -> Option<(u64, u64)> {
     match s {
         Stmt::MStore { off, width, .. } => {
             let o = expr::as_const(*off)?.as_usize()? as u64;
-            Some((o, o + *width as u64))
+            Some((o, o.checked_add(*width as u64)?))
         }
         Stmt::Copy { dest, len, .. } => {
             let d = expr::as_const(*dest)?.as_usize()? as u64;
             let l = expr::as_const(*len)?.as_usize()? as u64;
-            Some((d, d + l))
+            Some((d, d.checked_add(l)?))
         }
         _ => None,
     }
@@ -450,17 +450,27 @@ fn written_range(s: &Stmt) -> Option<(u64, u64)> {
 fn reads_memory(s: &Stmt) -> bool {
     match s {
         Stmt::MStore { .. } | Stmt::SStore { .. } | Stmt::Assign { .. } | Stmt::Drop(_) => {
-            stmt_exprs(s)
-                .iter()
-                .any(|e| expr::contains(*e, &|n| matches!(n, Node::MLoad(..))))
+            // A word copied from call data or code is fixed by its source.
+            // Only one copied from memory depends on what memory held.
+            let from_memory = |n: &Node| matches!(n, Node::CopiedWord(op::MCOPY, ..));
+            stmt_exprs(s).iter().any(|e| {
+                expr::holds(*e, kind::MLOAD | kind::KECCAK_MEM)
+                    || (expr::holds(*e, kind::COPIED_WORD) && expr::contains(*e, &from_memory))
+            })
         }
         Stmt::Copy { kind, .. } => *kind == op::MCOPY,
         _ => true,
     }
 }
 
+// A store that is overwritten is overwritten soon after.
+// Looking further made a long run of stores quadratic.
+const DEAD_STORE_WINDOW: usize = 256;
+
 pub fn dead_memory_stores(stmts: &[Stmt]) -> HashSet<usize> {
     let mut dead = HashSet::new();
+    let reads: Vec<bool> = stmts.iter().map(reads_memory).collect();
+    let ranges: Vec<Option<(u64, u64)>> = stmts.iter().map(written_range).collect();
     for (i, s) in stmts.iter().enumerate() {
         if let Stmt::MStore {
             off,
@@ -474,17 +484,17 @@ pub fn dead_memory_stores(stmts: &[Stmt]) -> HashSet<usize> {
                 continue;
             }
         }
-        let Some((lo, hi)) = written_range(s) else {
+        let Some((lo, hi)) = ranges[i] else {
             continue;
         };
-        for later in &stmts[i + 1..] {
-            if let Some((l2, h2)) = written_range(later) {
+        for later in (i + 1..stmts.len()).take(DEAD_STORE_WINDOW) {
+            if let Some((l2, h2)) = ranges[later] {
                 if l2 <= lo && h2 >= hi {
                     dead.insert(i);
                     break;
                 }
             }
-            if reads_memory(later) {
+            if reads[later] {
                 break;
             }
         }
@@ -2362,19 +2372,7 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
 pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     let mut out = String::new();
     let reach = crate::lift::reachable(l);
-    let mut order: Vec<usize> = Vec::new();
-    let mut seen = HashSet::new();
-    fn dfs(l: &Lifted, x: usize, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
-        if !seen.insert(x) {
-            return;
-        }
-        for s in &l.nodes[x].succs {
-            dfs(l, *s, seen, order);
-        }
-        order.push(x);
-    }
-    dfs(l, l.entry, &mut seen, &mut order);
-    order.reverse();
+    let order = crate::lift::reverse_postorder(l);
     let mut needs_label: HashSet<usize> = HashSet::new();
     for (idx, &nid) in order.iter().enumerate() {
         let nd = &l.nodes[nid];

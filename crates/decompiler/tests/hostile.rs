@@ -110,3 +110,86 @@ fn a_loop_that_logs_megabytes_on_every_pass() {
         "5f3560e01c631122334414600f57005b600162ffffff536101005b62ffffff5fa06001900380601a5700",
     ));
 }
+
+#[test]
+fn many_reads_through_a_deep_pointer_after_many_writes() {
+    let mut code = repeated("5f35", "34810201", 1000, "");
+    for word in 0..256usize {
+        let at = 32 * word;
+        code.extend([0x33, 0x81, 0x61, (at >> 8) as u8, at as u8, 0x01, 0x52]);
+    }
+    code.extend(repeated("", "5f5150", 1000, "5000"));
+    survives(code);
+}
+
+#[test]
+fn hundreds_of_calls_before_hundreds_of_stores() {
+    let (calls, stores) = (300usize, 300usize);
+    let mut code = vec![0x36, 0x62, 0, 0, 0, 0x57];
+    for i in 0..calls {
+        let next = 6 + (i + 1) * 23;
+        code.push(0x5b);
+        code.extend([0x60, 0x00].repeat(5));
+        code.extend([0x33, 0x5a, 0xf1, 0x50, 0x34, 0x62]);
+        code.extend([
+            (next >> 16) as u8,
+            (next >> 8) as u8,
+            next as u8,
+            0x57,
+            0x34,
+            0x50,
+        ]);
+    }
+    code.extend([0x5b, 0x00]);
+    let branch = code.len();
+    code[2..5].copy_from_slice(&[(branch >> 16) as u8, (branch >> 8) as u8, branch as u8]);
+    code.push(0x5b);
+    code.extend([0x34, 0x34, 0x55].repeat(stores));
+    code.push(0x00);
+    survives(code);
+}
+
+#[test]
+fn thousands_of_stores_in_one_block() {
+    let mut memory = Vec::new();
+    let mut storage = Vec::new();
+    for i in 0..6000usize {
+        let at = 0x10000 + 32 * i;
+        memory.extend([
+            0x60,
+            0x01,
+            0x62,
+            (at >> 16) as u8,
+            (at >> 8) as u8,
+            at as u8,
+            0x52,
+        ]);
+        storage.extend([0x60, 0x01, 0x61, (i >> 8) as u8, i as u8, 0x55]);
+    }
+    memory.extend([0x60, 0x00, 0x60, 0x00, 0xf3]);
+    storage.push(0x00);
+    survives(memory);
+    survives(storage);
+}
+
+#[test]
+fn tens_of_thousands_of_code_copies_or_empty_blocks() {
+    survives(repeated("", "39", 30_000, ""));
+    survives(repeated("", "5b", 30_000, "00"));
+}
+
+#[test]
+fn a_dispatcher_with_thousands_of_entries() {
+    let count = 3000u32;
+    let end = 4 + count as usize * 11;
+    let mut code = vec![0x5f, 0x35, 0x60, 0xe0, 0x1c];
+    for i in 0..count {
+        code.extend([0x80, 0x63]);
+        code.extend(i.wrapping_mul(0x9e37_79b1).to_be_bytes());
+        code.extend([0x14, 0x61, (end >> 8) as u8, end as u8, 0x57]);
+    }
+    assert_eq!(code.len(), end + 1);
+    code.extend([0x00, 0x5b, 0x00]);
+    code[end + 1] = 0x5b;
+    survives(code);
+}

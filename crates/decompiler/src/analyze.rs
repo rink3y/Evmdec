@@ -284,6 +284,7 @@ struct Ctx<'a> {
     inst_seq: std::cell::Cell<usize>,
     inline_left: std::cell::Cell<usize>,
     divides: RefCell<HashMap<usize, bool>>,
+    reach: RefCell<Reach>,
     roles: HashSet<U256>,
     slot_writes: HashSet<U256>,
     field_writes: HashSet<(U256, u32, u32)>,
@@ -293,6 +294,7 @@ struct Ctx<'a> {
 }
 
 type MemWrites = Vec<(ExprId, Option<u64>)>;
+type Reach = HashMap<(usize, usize), Rc<HashSet<usize>>>;
 
 struct FnFacts {
     name: String,
@@ -2549,7 +2551,7 @@ fn ev_reaches(ctx: &Ctx, l: &Lifted, a: &Event, b: &Event) -> bool {
             ca.and_then(|pc| ctx.internals.get(&pc))
                 .and_then(|f| f.lifted.as_ref())
         };
-        return graph.is_none_or(|g| reaches(g, *na, *nb));
+        return graph.is_none_or(|g| ctx.reaches(g, *na, *nb));
     }
     true
 }
@@ -2607,19 +2609,7 @@ fn events_of_in(
     let dbg_memview = std::env::var("EVMDEC_DEBUG_MEMVIEW").ok();
     let dbg_unfresh = std::env::var("EVMDEC_DEBUG_UNFRESH").is_ok();
     let mut out = Vec::new();
-    let mut order = Vec::new();
-    let mut seen = HashSet::new();
-    fn dfs(l: &Lifted, x: usize, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
-        if !seen.insert(x) {
-            return;
-        }
-        for s in &l.nodes[x].succs {
-            dfs(l, *s, seen, order);
-        }
-        order.push(x);
-    }
-    dfs(l, l.entry, &mut seen, &mut order);
-    order.reverse();
+    let order = lift::reverse_postorder(l);
     if !loops.is_empty() {
         let w = writes_of(ctx, loops.iter().map(|n| &l.nodes[*n]), &mut HashSet::new());
         if dbg_unfresh {
@@ -2825,6 +2815,28 @@ fn events_of_in(
         });
     }
     out
+}
+
+impl Ctx<'_> {
+    // One search per start node. A rule that asks about every pair of events in a
+    // function would otherwise search the graph once per pair.
+    fn reaches(&self, l: &Lifted, a: usize, b: usize) -> bool {
+        let key = (std::ptr::from_ref(l) as usize, a);
+        let known = self.reach.borrow().get(&key).cloned();
+        let from_a = known.unwrap_or_else(|| {
+            let mut seen = HashSet::new();
+            let mut stack = vec![a];
+            while let Some(x) = stack.pop() {
+                if seen.insert(x) {
+                    stack.extend(l.nodes[x].succs.iter().copied());
+                }
+            }
+            let found = Rc::new(seen);
+            self.reach.borrow_mut().insert(key, found.clone());
+            found
+        });
+        from_a.contains(&b)
+    }
 }
 
 fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
@@ -3276,6 +3288,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         inst_seq: std::cell::Cell::new(0),
         inline_left: std::cell::Cell::new(MAX_INLINED_EVENTS),
         divides: Default::default(),
+        reach: Default::default(),
         roles: HashSet::new(),
         slot_writes: HashSet::new(),
         field_writes: HashSet::new(),

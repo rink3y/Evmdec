@@ -26,7 +26,26 @@ pub enum Node {
     Unknown(u32),
 }
 
-// bits, may and depth are worked out once, when a node is made, from its children.
+pub mod kind {
+    pub const CONST: u16 = 1 << 0;
+    pub const ENV: u16 = 1 << 1;
+    pub const OP: u16 = 1 << 2;
+    pub const MLOAD: u16 = 1 << 3;
+    pub const SLOAD: u16 = 1 << 4;
+    pub const CALLDATALOAD: u16 = 1 << 5;
+    pub const KECCAK: u16 = 1 << 6;
+    pub const KECCAK_MEM: u16 = 1 << 7;
+    pub const CALL_RESULT: u16 = 1 << 8;
+    pub const CREATE_RESULT: u16 = 1 << 9;
+    pub const VAR: u16 = 1 << 10;
+    pub const ARG: u16 = 1 << 11;
+    pub const RETURN_DATA: u16 = 1 << 12;
+    pub const COPIED_WORD: u16 = 1 << 13;
+    pub const INT_RET: u16 = 1 << 14;
+    pub const UNKNOWN: u16 = 1 << 15;
+}
+
+// bits, may, depth and kinds are worked out once, when a node is made, from its children.
 // Walking a shared expression for them again cost 2^n on n nested operators.
 #[derive(Default)]
 struct Arena {
@@ -35,6 +54,7 @@ struct Arena {
     bits: Vec<u16>,
     may: Vec<U256>,
     depth: Vec<u32>,
+    kinds: Vec<u16>,
     seq: u32,
 }
 
@@ -65,6 +85,29 @@ impl Arena {
             | Node::CopiedWord(_, a, _) => of(a),
             Node::KeccakMem(a, b, _) => of(a).max(of(b)),
             _ => 0,
+        }
+    }
+
+    fn kinds_of(&self, n: &Node) -> u16 {
+        let of = |id: &ExprId| self.kinds[id.0 as usize];
+        let all = |v: &[ExprId]| v.iter().fold(0, |seen, id| seen | of(id));
+        match n {
+            Node::Const(_) => kind::CONST,
+            Node::Env(..) => kind::ENV,
+            Node::Op(_, v) => kind::OP | all(v),
+            Node::MLoad(a, _) => kind::MLOAD | of(a),
+            Node::SLoad(a, _, _) => kind::SLOAD | of(a),
+            Node::CallDataLoad(a) => kind::CALLDATALOAD | of(a),
+            Node::Keccak(v, _) => kind::KECCAK | all(v),
+            Node::KeccakMem(a, b, _) => kind::KECCAK_MEM | of(a) | of(b),
+            Node::CallResult(_) => kind::CALL_RESULT,
+            Node::CreateResult(_) => kind::CREATE_RESULT,
+            Node::Var(_) => kind::VAR,
+            Node::Arg(_) => kind::ARG,
+            Node::ReturnData(_, a) => kind::RETURN_DATA | of(a),
+            Node::CopiedWord(_, a, _) => kind::COPIED_WORD | of(a),
+            Node::IntRet(..) => kind::INT_RET,
+            Node::Unknown(_) => kind::UNKNOWN,
         }
     }
 
@@ -153,11 +196,13 @@ pub fn intern(n: Node) -> ExprId {
         };
         let bits = a.bits_of(&n);
         let may = a.may_of(&n, bits);
+        let kinds = a.kinds_of(&n);
         let id = ExprId(a.nodes.len() as u32);
         a.nodes.push(n.clone());
         a.bits.push(bits as u16);
         a.may.push(may);
         a.depth.push(depth);
+        a.kinds.push(kinds);
         a.map.insert(n, id);
         id
     })
@@ -672,6 +717,10 @@ pub fn op3(o: u8, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
 
 pub fn value_bits(e: ExprId) -> u32 {
     ARENA.with(|a| u32::from(a.borrow().bits[e.0 as usize]))
+}
+
+pub fn holds(e: ExprId, kinds: u16) -> bool {
+    ARENA.with(|a| a.borrow().kinds[e.0 as usize] & kinds != 0)
 }
 
 pub fn depth(e: ExprId) -> u32 {

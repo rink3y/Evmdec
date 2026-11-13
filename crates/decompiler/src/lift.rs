@@ -1,5 +1,5 @@
 use crate::cfg::{AState, AVal, Edge, Program, UNode, Unit};
-use crate::expr::{self, konst, konst_u64, op1, op2, op3, ExprId, Node};
+use crate::expr::{self, kind, konst, konst_u64, op1, op2, op3, ExprId, Node};
 use crate::opcode as op;
 use crate::u256::U256;
 use std::cell::RefCell;
@@ -541,9 +541,7 @@ fn norm_offset(e: ExprId) -> (Option<ExprId>, u64) {
 }
 
 fn wild_base(b: ExprId) -> bool {
-    expr::contains(b, &|x| {
-        !matches!(x, Node::Const(_) | Node::Op(..) | Node::MLoad(..))
-    })
+    expr::holds(b, !(kind::CONST | kind::OP | kind::MLOAD))
 }
 
 // Sound only because an unknown pointer is unsigned and memory never wraps.
@@ -1885,6 +1883,7 @@ impl<'a> Lifter<'a> {
         }
 
         for ins in prog.block_insns(blk) {
+            crate::clock::check();
             let o = ins.opcode;
             macro_rules! pop {
                 () => {
@@ -3531,6 +3530,26 @@ pub fn jump_candidates(e: ExprId, jumpdests: &HashSet<usize>, code_len: usize) -
     let mut v: Vec<usize> = out.into_iter().collect();
     v.sort_unstable();
     v
+}
+
+// Kept as a loop. One call per node ran out of stack on a long chain of blocks.
+pub fn reverse_postorder(l: &Lifted) -> Vec<usize> {
+    let mut order = Vec::new();
+    let mut seen = HashSet::from([l.entry]);
+    let mut stack: Vec<(usize, usize)> = vec![(l.entry, 0)];
+    while let Some((x, next)) = stack.last().copied() {
+        let Some(s) = l.nodes[x].succs.get(next).copied() else {
+            order.push(x);
+            stack.pop();
+            continue;
+        };
+        stack.last_mut().expect("just read").1 += 1;
+        if seen.insert(s) {
+            stack.push((s, 0));
+        }
+    }
+    order.reverse();
+    order
 }
 
 pub fn reachable(l: &Lifted) -> HashSet<usize> {

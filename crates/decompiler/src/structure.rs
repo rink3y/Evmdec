@@ -1,5 +1,5 @@
 use crate::emit::{self, Names, PayloadKind};
-use crate::expr::{self, ExprId, Node};
+use crate::expr::{self, kind, ExprId, Node};
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::u256::U256;
@@ -112,7 +112,7 @@ impl Graph {
             }
         }
         let idom = dominators(n, l.entry, &succs, &preds, &rpo, &rpo_index);
-        let noreturn: Vec<bool> = (0..n).map(|x| is_noreturn_leaf(l, x)).collect();
+        let noreturn = noreturn_leaves(l);
         let mut rsuccs: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
         let mut rpreds: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
         for x in 0..n {
@@ -197,24 +197,41 @@ impl Graph {
     }
 }
 
-fn is_noreturn_leaf(l: &Lifted, mut x: usize) -> bool {
-    let mut seen = HashSet::new();
-    loop {
-        if !seen.insert(x) {
-            return false;
-        }
-        let nd = &l.nodes[x];
-        if !nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. })) {
-            return false;
-        }
-        match &nd.term {
-            Term::Revert { .. } | Term::Invalid | Term::Infeasible | Term::Unresolved(_) => {
-                return true
+// Every node on a chain of plain jumps shares the answer of the node the chain ends at.
+// Asking each node on its own walked a long chain once per node.
+fn noreturn_leaves(l: &Lifted) -> Vec<bool> {
+    let mut known: Vec<Option<bool>> = vec![None; l.nodes.len()];
+    let mut on_chain = vec![false; l.nodes.len()];
+    for start in 0..l.nodes.len() {
+        let mut chain = Vec::new();
+        let mut x = start;
+        let leaf = loop {
+            if let Some(leaf) = known[x] {
+                break leaf;
             }
-            Term::Jump(t) => x = *t,
-            _ => return false,
+            if on_chain[x] {
+                break false;
+            }
+            on_chain[x] = true;
+            chain.push(x);
+            let nd = &l.nodes[x];
+            if !nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. })) {
+                break false;
+            }
+            match &nd.term {
+                Term::Revert { .. } | Term::Invalid | Term::Infeasible | Term::Unresolved(_) => {
+                    break true
+                }
+                Term::Jump(t) => x = *t,
+                _ => break false,
+            }
+        };
+        for x in chain {
+            known[x] = Some(leaf);
+            on_chain[x] = false;
         }
     }
+    known.into_iter().map(|leaf| leaf == Some(true)).collect()
 }
 
 struct Loop {
@@ -408,7 +425,7 @@ fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) ->
     folded
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Overwritten {
     Slot(ExprId),
     Balance,
@@ -468,8 +485,8 @@ fn overwrites(st: &Stmt, names: &Names) -> Option<(Overwritten, u32)> {
     }
 }
 
-fn earliest_loads(l: &Lifted) -> HashMap<ExprId, u32> {
-    let mut earliest: HashMap<ExprId, u32> = HashMap::new();
+fn earliest_loads(l: &Lifted) -> HashMap<Overwritten, u32> {
+    let mut earliest: HashMap<Overwritten, u32> = HashMap::new();
     let mut seen: HashSet<ExprId> = HashSet::new();
     let mut pending: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
     pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
@@ -477,8 +494,14 @@ fn earliest_loads(l: &Lifted) -> HashMap<ExprId, u32> {
         if !seen.insert(e) {
             continue;
         }
-        if let Node::MLoad(addr, version) = expr::node(e) {
-            let first = earliest.entry(addr).or_insert(version);
+        let read = match expr::node(e) {
+            Node::MLoad(addr, version) => Some((Overwritten::Memory(addr), version)),
+            Node::SLoad(key, false, version) => Some((Overwritten::Slot(key), version)),
+            Node::Env(op::SELFBALANCE, version) => Some((Overwritten::Balance, version)),
+            _ => None,
+        };
+        if let Some((what, version)) = read {
+            let first = earliest.entry(what).or_insert(version);
             *first = (*first).min(version);
         }
         pending.extend(expr::children(e));
@@ -538,10 +561,10 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
             let Some((what, gen)) = overwrites(st, names) else {
                 continue;
             };
-            if let Overwritten::Memory(addr) = what {
-                if earliest.get(&addr).is_none_or(|first| *first > gen) {
-                    continue;
-                }
+            // Only a read made before the write can be stale.
+            // Without one, looking through everything after the write finds nothing.
+            if earliest.get(&what).is_none_or(|first| *first > gen) {
+                continue;
             }
             let mut after: Vec<ExprId> = Vec::new();
             for later in &nd.stmts[i + 1..] {
@@ -1099,10 +1122,11 @@ enum Pos {
     Edge,
 }
 
-fn weight(e: ExprId) -> usize {
+// The walk ends once enough are found. Counting them all made naming quadratic.
+fn has_operations(e: ExprId, wanted: usize) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
-    let mut w = 0;
+    let mut found = 0;
     while let Some(x) = stack.pop() {
         if !seen.insert(x) || seen.len() > 2000 {
             continue;
@@ -1111,32 +1135,28 @@ fn weight(e: ExprId) -> usize {
             Node::Op(op::AND, v)
                 if v.iter()
                     .any(|a| expr::as_const(*a).is_some_and(|m| m.is_low_mask())) => {}
-            Node::Op(..) => w += 1,
+            Node::Op(..) => found += 1,
             _ => {}
+        }
+        if found >= wanted {
+            return true;
         }
         stack.extend(expr::children(x));
     }
-    w
+    false
 }
 
 // Memory reads are never bound. A temporary would hide which version of memory they read.
 fn bindable(e: ExprId) -> bool {
-    if expr::is_boolean(e) || expr::is_const(e) || weight(e) < 2 {
-        return false;
-    }
-    let reads_memory = expr::contains(e, &|n| {
-        matches!(
-            n,
-            Node::MLoad(..) | Node::KeccakMem(..) | Node::CopiedWord(..) | Node::Unknown(_)
-        )
-    });
-    !reads_memory
+    let unbound = kind::MLOAD | kind::KECCAK_MEM | kind::COPIED_WORD | kind::UNKNOWN;
+    !expr::is_boolean(e) && !expr::is_const(e) && !expr::holds(e, unbound) && has_operations(e, 2)
 }
 
 // Counts are carried down the shared graph. Walking each repetition again is exponential.
 // Storage keys and hashes stay whole. A bound key would lose the slot's name.
 // The packing of an encoded word stays whole. The printer undoes it to show the arguments.
-fn bindable_subexprs(e: ExprId, encoded: bool, out: &mut Vec<(ExprId, usize)>) {
+fn bindable_subexprs(e: ExprId, encoded: bool) -> Vec<(ExprId, usize)> {
+    let mut out: Vec<(ExprId, usize)> = Vec::new();
     let packs = |x: ExprId, encoded: bool| {
         encoded
             && matches!(expr::node(x), Node::Op(o, _) if matches!(o, op::OR | op::SHL | op::SHR | op::AND | op::MUL | op::DIV))
@@ -1180,17 +1200,22 @@ fn bindable_subexprs(e: ExprId, encoded: bool, out: &mut Vec<(ExprId, usize)>) {
             *t = t.saturating_add(n);
         }
     }
+    let mut place: HashMap<ExprId, usize> = HashMap::new();
     for state in &order {
         let (x, encoded) = *state;
         if whole(x) || packs(x, encoded) || !bindable(x) {
             continue;
         }
         let n = times.get(state).copied().unwrap_or(0);
-        match out.iter_mut().find(|(y, _)| *y == x) {
-            Some((_, total)) => *total = total.saturating_add(n),
-            None => out.push((x, n)),
+        match place.get(&x) {
+            Some(at) => out[*at].1 = out[*at].1.saturating_add(n),
+            None => {
+                place.insert(x, out.len());
+                out.push((x, n));
+            }
         }
     }
+    out
 }
 
 fn term_reads(t: &Term) -> Vec<(ExprId, bool)> {
@@ -1466,9 +1491,7 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
     let mut count: HashMap<ExprId, usize> = HashMap::new();
     let mut first_seen: HashMap<ExprId, usize> = HashMap::new();
     let mut note = |(e, encoded): (ExprId, bool), at: (usize, Pos)| {
-        let mut subs = Vec::new();
-        bindable_subexprs(e, encoded, &mut subs);
-        for (x, k) in subs {
+        for (x, k) in bindable_subexprs(e, encoded) {
             let n = first_seen.len();
             first_seen.entry(x).or_insert(n);
             *count.entry(x).or_default() += k;
@@ -2051,7 +2074,7 @@ impl<'a> Printer<'a> {
                 self.stored.retain(|(_, nm, _)| *nm != name);
                 let mut fw = self.names.forwarded.borrow_mut();
                 fw.retain(|_, nm| *nm != name);
-                if !expr::is_const(*val) && weight(*val) >= 1 {
+                if !expr::is_const(*val) && has_operations(*val, 1) {
                     self.stored.push((n, name.clone(), *val));
                     fw.insert(*val, name);
                 }
@@ -2061,46 +2084,77 @@ impl<'a> Printer<'a> {
     }
 
     // Edge copies are simultaneous.
+    // A copy is printed once nothing still waiting reads the variable it writes.
+    // The readers of each variable are counted once. Searching every value again
+    // for every variable on every round was cubic in the number of copies.
     fn assign_lines(&mut self, assigns: &[(ExprId, ExprId)], depth: usize) {
         let mut rem: Vec<(ExprId, ExprId)> =
             assigns.iter().copied().filter(|(a, b)| a != b).collect();
         while !rem.is_empty() {
-            let reads = |rhs: ExprId, var: ExprId| {
-                let target = expr::node(var);
-                expr::contains(rhs, &|nd| *nd == target)
-            };
-            let pick = rem
+            let mut writers: HashMap<ExprId, Vec<usize>> = HashMap::new();
+            for (i, (var, _)) in rem.iter().enumerate() {
+                writers.entry(*var).or_default().push(i);
+            }
+            let read_by: Vec<Vec<usize>> = rem
                 .iter()
-                .position(|(var, _)| !rem.iter().any(|(v2, rhs)| v2 != var && reads(*rhs, *var)));
-            match pick {
-                Some(i) => {
-                    let (var, val) = rem.remove(i);
-                    let s = format!(
-                        "{} = {};",
-                        emit::fmt_expr(var, self.names),
-                        emit::fmt_expr(val, self.names)
-                    );
-                    self.line(depth, &s);
-                }
-                None => {
-                    let (var, _) = rem[0];
-                    let tmp = expr::intern(Node::Var(self.next_tmp));
-                    self.next_tmp += 1;
-                    let s = format!(
-                        "{} = {};",
-                        emit::fmt_expr(tmp, self.names),
-                        emit::fmt_expr(var, self.names)
-                    );
-                    self.line(depth, &s);
-                    let target = expr::node(var);
-                    for (_, rhs) in rem.iter_mut() {
-                        *rhs = expr::substitute(
-                            *rhs,
-                            &|nd| if *nd == target { Some(tmp) } else { None },
-                            &mut HashMap::new(),
-                        );
+                .map(|(var, rhs)| {
+                    let mut read = Vec::new();
+                    let mut seen = HashSet::new();
+                    let mut stack = vec![*rhs];
+                    while let Some(x) = stack.pop() {
+                        if !seen.insert(x) || seen.len() > 20_000 {
+                            continue;
+                        }
+                        if x != *var {
+                            read.extend(writers.get(&x).into_iter().flatten().copied());
+                        }
+                        stack.extend(expr::children(x));
                     }
+                    read
+                })
+                .collect();
+            let mut readers = vec![0usize; rem.len()];
+            for read in &read_by {
+                for i in read {
+                    readers[*i] += 1;
                 }
+            }
+            let mut waiting = vec![true; rem.len()];
+            while let Some(i) = (0..rem.len()).find(|i| waiting[*i] && readers[*i] == 0) {
+                waiting[i] = false;
+                for read in &read_by[i] {
+                    readers[*read] -= 1;
+                }
+                let (var, val) = rem[i];
+                let s = format!(
+                    "{} = {};",
+                    emit::fmt_expr(var, self.names),
+                    emit::fmt_expr(val, self.names)
+                );
+                self.line(depth, &s);
+            }
+            rem = (0..rem.len())
+                .filter(|i| waiting[*i])
+                .map(|i| rem[i])
+                .collect();
+            let Some((var, _)) = rem.first().copied() else {
+                break;
+            };
+            let tmp = expr::intern(Node::Var(self.next_tmp));
+            self.next_tmp += 1;
+            let s = format!(
+                "{} = {};",
+                emit::fmt_expr(tmp, self.names),
+                emit::fmt_expr(var, self.names)
+            );
+            self.line(depth, &s);
+            let target = expr::node(var);
+            for (_, rhs) in rem.iter_mut() {
+                *rhs = expr::substitute(
+                    *rhs,
+                    &|nd| if *nd == target { Some(tmp) } else { None },
+                    &mut HashMap::new(),
+                );
             }
         }
     }
@@ -2198,6 +2252,7 @@ impl<'a> Printer<'a> {
 
     fn emit_node(&mut self, mut n: usize, stop: Option<usize>, depth: usize) {
         loop {
+            crate::clock::check();
             if let Some(lp) = self.loops.get(&n) {
                 if !self.emitted.contains(&n) && !self.loop_stack.iter().any(|(h, _, _)| *h == n) {
                     let body: HashSet<usize> = lp.body.clone();

@@ -234,38 +234,42 @@ pub struct BytecodeInfo {
     pub constructor_metadata: Option<Metadata>,
 }
 
-pub fn constant_stack(insns: &[disasm::Instruction]) -> Vec<Option<U256>> {
-    let mut st: Vec<Option<U256>> = Vec::new();
-    for i in insns {
-        let op = i.opcode;
-        if opcode::is_push(op) {
-            st.push(i.imm);
-        } else if opcode::is_dup(op) {
-            let n = (op - 0x7f) as usize;
-            let v = if st.len() >= n {
-                st[st.len() - n]
-            } else {
-                None
-            };
-            st.push(v);
-        } else if opcode::is_swap(op) {
-            let n = (op - 0x8f) as usize;
-            let l = st.len();
-            if l > n {
-                st.swap(l - 1, l - 1 - n);
-            } else {
-                st.clear();
-            }
-        } else if let Some(info) = opcode::info(op) {
-            for _ in 0..info.pops {
-                st.pop();
-            }
-            for _ in 0..info.pushes {
-                st.push(None);
-            }
+pub fn constant_step(st: &mut Vec<Option<U256>>, i: &disasm::Instruction) {
+    let op = i.opcode;
+    if opcode::is_push(op) {
+        st.push(i.imm);
+    } else if opcode::is_dup(op) {
+        let n = (op - 0x7f) as usize;
+        let v = if st.len() >= n {
+            st[st.len() - n]
+        } else {
+            None
+        };
+        st.push(v);
+    } else if opcode::is_swap(op) {
+        let n = (op - 0x8f) as usize;
+        let l = st.len();
+        if l > n {
+            st.swap(l - 1, l - 1 - n);
         } else {
             st.clear();
         }
+    } else if let Some(info) = opcode::info(op) {
+        for _ in 0..info.pops {
+            st.pop();
+        }
+        for _ in 0..info.pushes {
+            st.push(None);
+        }
+    } else {
+        st.clear();
+    }
+}
+
+pub fn constant_stack(insns: &[disasm::Instruction]) -> Vec<Option<U256>> {
+    let mut st: Vec<Option<U256>> = Vec::new();
+    for i in insns {
+        constant_step(&mut st, i);
     }
     st
 }
@@ -289,67 +293,56 @@ fn detect_creation(code: &[u8]) -> Option<(usize, usize)> {
     Some((off, len))
 }
 
+// One pass keeps a running stack per block. A copy is judged when its block ends.
+// Working the stack out again for every copy was quadratic in a block full of them.
 fn creation_split(code: &[u8], insns: &[disasm::Instruction]) -> Option<(usize, usize)> {
-    let mut block_start = 0;
-    let mut i = 0;
     let mut best: Option<(usize, usize)> = None;
-    while i < insns.len() {
-        let op = insns[i].opcode;
+    let mut st: Vec<Option<U256>> = Vec::new();
+    let mut copies: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for ins in insns {
+        if best.is_some_and(|(off, _)| ins.pc >= off) {
+            break;
+        }
+        let op = ins.opcode;
+        if op == opcode::JUMPDEST {
+            st.clear();
+            copies.clear();
+        }
         if op == opcode::CODECOPY {
-            let st = constant_stack(&insns[block_start..i]);
-            let l = st.len();
-            if l >= 3 {
-                if let (Some(dest), Some(offset), Some(len)) = (st[l - 1], st[l - 2], st[l - 3]) {
-                    if let (Some(dest), Some(offset), Some(len)) =
-                        (dest.as_usize(), offset.as_usize(), len.as_usize())
-                    {
-                        if offset > insns[i].pc
-                            && len >= 1
-                            && offset.checked_add(len).is_some_and(|e| e <= code.len())
-                        {
-                            let mut j = i + 1;
-                            let mut found = false;
-                            while j < insns.len() {
-                                let o = insns[j].opcode;
-                                if o == opcode::RETURN {
-                                    let st2 = constant_stack(&insns[block_start..j]);
-                                    let l2 = st2.len();
-                                    if l2 >= 2 {
-                                        let roff = st2[l2 - 1];
-                                        let rlen = st2[l2 - 2];
-                                        if (roff.is_none()
-                                            || roff.and_then(|v| v.as_usize()) == Some(dest))
-                                            && (rlen.is_none()
-                                                || rlen.and_then(|v| v.as_usize()) == Some(len))
-                                        {
-                                            found = true;
-                                        }
-                                    } else {
-                                        found = true;
-                                    }
-                                    break;
-                                }
-                                if opcode::is_terminator(o) || o == opcode::JUMPDEST {
-                                    break;
-                                }
-                                j += 1;
-                            }
-                            if found && best.is_none_or(|(_, bl)| len > bl) {
-                                best = Some((offset, len));
-                            }
-                        }
+            if let [.., Some(len), Some(offset), Some(dest)] = st[..] {
+                if let (Some(dest), Some(offset), Some(len)) =
+                    (dest.as_usize(), offset.as_usize(), len.as_usize())
+                {
+                    let inside = offset.checked_add(len).is_some_and(|e| e <= code.len());
+                    if offset > ins.pc && len >= 1 && inside {
+                        copies.push((ins.pc, dest, offset, len));
                     }
                 }
             }
         }
-        if opcode::is_terminator(op) || (op == opcode::JUMPDEST && i > block_start) {
-            block_start = if op == opcode::JUMPDEST { i } else { i + 1 };
-        }
-        i += 1;
-        if let Some((off, _)) = best {
-            if insns[i.min(insns.len() - 1)].pc >= off {
-                break;
+        if op == opcode::RETURN {
+            let returned = match st[..] {
+                [.., len, off] => Some((off, len)),
+                _ => None,
+            };
+            for (pc, dest, offset, len) in copies.drain(..) {
+                if best.is_some_and(|(off, _)| pc >= off) {
+                    break;
+                }
+                let same = |v: Option<U256>, want: usize| {
+                    v.is_none() || v.and_then(|v| v.as_usize()) == Some(want)
+                };
+                let found = returned.is_none_or(|(off, n)| same(off, dest) && same(n, len));
+                if found && best.is_none_or(|(_, bl)| len > bl) {
+                    best = Some((offset, len));
+                }
             }
+        }
+        if opcode::is_terminator(op) {
+            st.clear();
+            copies.clear();
+        } else {
+            constant_step(&mut st, ins);
         }
     }
     best

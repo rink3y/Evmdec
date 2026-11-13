@@ -52,6 +52,9 @@ pub fn run_frame(
         visited.insert(m.pc);
         order.push(m.pc);
         steps += 1;
+        if steps % 4096 == 0 {
+            crate::clock::check();
+        }
         let at = m.pc;
         match m.step() {
             Ok(None) => {}

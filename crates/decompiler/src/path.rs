@@ -4,12 +4,14 @@ use crate::interp::{self, Host};
 use crate::lift::{Lifter, Stmt, Term};
 use crate::solve::{self, Free, Inputs, Item};
 use crate::u256::U256;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 const STEP_BUDGET: usize = 200_000;
 const MAX_BLOCKS: usize = 2_048;
 const MAX_FLIPS_PER_PATH: usize = 48;
+const MAX_LATE_RUNS: usize = 1024;
 const DEFAULT_BALANCE: U256 = U256::from_u64(1_000_000_000_000_000_000);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +57,7 @@ impl Path {
 
 pub struct Explorer {
     prog: Program,
+    late: Cell<usize>,
 }
 
 pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
@@ -79,6 +82,7 @@ impl Explorer {
     pub fn new(code: &[u8]) -> Explorer {
         Explorer {
             prog: Program::new(code.to_vec()),
+            late: Cell::new(0),
         }
     }
 
@@ -178,6 +182,15 @@ impl Explorer {
 
     // Each new path is only kept after the bytecode really ran it.
     pub fn explore(&self, start: &Inputs, free: &Free, limits: Limits) -> Vec<Path> {
+        // Past its time a caller still gets one run of each function, so a slow first
+        // function does not hide the rest. The count ends that for a contract with
+        // thousands of functions, which would otherwise run every one of them.
+        if limits.until.is_some_and(|t| Instant::now() >= t) {
+            if self.late.get() >= MAX_LATE_RUNS {
+                return Vec::new();
+            }
+            self.late.set(self.late.get() + 1);
+        }
         let first = self.run(start);
         let mut seen: HashSet<Vec<(usize, bool)>> = HashSet::new();
         seen.insert(first.signature());

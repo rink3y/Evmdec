@@ -2784,6 +2784,12 @@ fn cases() -> Vec<Case> {
             || dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP"),
         ),
         pair(
+            "weak-randomness",
+            true,
+            || dispatcher(&pays_double_when(BLOCK_MIX)),
+            || dispatcher(&refunds_outside(PLACE_IN_A_DAY)),
+        ),
+        pair(
             "short-input-accepted",
             true,
             || dispatcher(STORE_WORD),
@@ -2796,6 +2802,25 @@ fn cases() -> Vec<Case> {
         ),
     ];
     all.into_iter().flatten().collect()
+}
+
+const BLOCK_MIX: &str = "PUSH1 0x01 SLOAD NUMBER ADD PREVRANDAO ADD TIMESTAMP ADD GASLIMIT ADD \
+     PUSH1 0x25 SWAP1 MOD";
+const PLACE_IN_A_DAY: &str = "TIMESTAMP PUSH3 0x015180 SWAP1 MOD";
+const SEND_TO_CALLER: &str = "PUSH1 0x00 DUP1 DUP1 DUP1 SWAP4 CALLER GAS CALL POP";
+
+fn pays_double_when(drawn: &str) -> String {
+    format!(
+        "{drawn} PUSH1 0x04 CALLDATALOAD EQ PUSH2 @win JUMPI STOP \
+         :win JUMPDEST CALLVALUE PUSH1 0x02 MUL {SEND_TO_CALLER} STOP"
+    )
+}
+
+fn refunds_outside(place: &str) -> String {
+    format!(
+        "PUSH2 0x0e10 {place} LT PUSH2 @open JUMPI CALLVALUE {SEND_TO_CALLER} STOP \
+         :open JUMPDEST PUSH1 0x01 PUSH1 0x02 SSTORE STOP"
+    )
 }
 
 fn shown(case: &Case, code: &[u8]) -> bool {
@@ -3330,4 +3355,88 @@ fn what_is_wrong_in_a_library_function_a_contract_runs_counts_against_the_contra
     );
     let runs_another = with_linked(runs_library("cccccccc"), library());
     assert_eq!(in_library(&runs_another), None, "{:?}", ids(&runs_another));
+}
+
+#[test]
+fn a_remainder_of_block_values_that_decides_a_payout_is_shown_by_two_runs() {
+    let r = report_of(&dispatcher(&pays_double_when(BLOCK_MIX)));
+    let f = finding(&r, "weak-randomness").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    assert!(f.confirmed, "{f:?}");
+    assert!(f.description.contains("remainder"), "{}", f.description);
+    assert!(
+        f.description.contains("is paid 0x2002"),
+        "{}",
+        f.description
+    );
+}
+
+#[test]
+fn a_place_in_a_schedule_is_not_a_draw() {
+    let r = report_of(&dispatcher(&refunds_outside(PLACE_IN_A_DAY)));
+    assert!(finding(&r, "weak-randomness").is_none(), "{:?}", ids(&r));
+    let r = report_of(&dispatcher(&pays_double_when(PLACE_IN_A_DAY)));
+    assert!(finding(&r, "weak-randomness").is_none(), "{:?}", ids(&r));
+}
+
+#[test]
+fn handing_back_the_payment_of_this_call_is_not_a_withdrawal() {
+    let refund = format!("CALLVALUE {SEND_TO_CALLER} STOP");
+    let r = report_of(&dispatcher(&refund));
+    assert!(
+        finding(&r, "unprotected-ether-withdrawal").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+    let stored = format!("PUSH1 0x01 SLOAD {SEND_TO_CALLER} STOP");
+    let r = report_of(&dispatcher(&stored));
+    assert!(
+        finding(&r, "unprotected-ether-withdrawal").is_some(),
+        "{:?}",
+        ids(&r)
+    );
+}
+
+#[test]
+fn a_caller_check_joined_to_a_second_condition_is_access_control() {
+    let pay = "PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x04 CALLDATALOAD PUSH1 0x00 SLOAD GAS CALL POP";
+    let joined = |first: &str| {
+        format!(
+            "{first} DUP1 ISZERO PUSH2 @both JUMPI POP PUSH1 0x01 SLOAD PUSH1 0x04 CALLDATALOAD \
+             GT ISZERO :both JUMPDEST ISZERO PUSH2 @out JUMPI {pay} :out JUMPDEST STOP"
+        )
+    };
+    let r = report_of(&dispatcher(&joined("PUSH1 0x00 SLOAD CALLER EQ")));
+    assert_eq!(r.privileged_functions.len(), 1, "{r:?}");
+    assert!(
+        finding(&r, "unprotected-ether-withdrawal").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+    let r = report_of(&dispatcher(&joined(
+        "PUSH1 0x02 SLOAD PUSH1 0x24 CALLDATALOAD EQ",
+    )));
+    assert!(r.privileged_functions.is_empty(), "{r:?}");
+}
+
+#[test]
+fn a_caller_test_against_a_record_anyone_opens_does_not_lower_a_re_entry_finding() {
+    let record = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x05 PUSH1 0x20 MSTORE \
+                  PUSH1 0x40 PUSH1 0x00 KECCAK256";
+    let open = format!("CALLER {record} SSTORE STOP");
+    let pays_then_writes = "PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x01 SLOAD CALLER GAS CALL POP \
+                            PUSH1 0x00 PUSH1 0x01 SSTORE STOP";
+    let gated = |held: &str| {
+        format!("{held} CALLER EQ PUSH2 @in JUMPI {REVERT} :in JUMPDEST {pays_then_writes}")
+    };
+    let party = gated(&format!("{record} SLOAD"));
+    let r = report_of(&dispatcher3(&open, &party, "STOP"));
+    let f = finding(&r, "reentrancy").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    assert!(f.description.contains("names a party"), "{}", f.description);
+
+    let owner = gated("PUSH1 0x00 SLOAD");
+    let r = report_of(&dispatcher3(&open, &owner, "STOP"));
+    let f = finding(&r, "reentrancy").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium, "{f:?}");
 }

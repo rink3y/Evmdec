@@ -115,7 +115,9 @@ impl Explorer {
         }
     }
 
-    pub fn run(&self, inputs: &Inputs) -> Path {
+    // The run alone, without reading it back into expressions. Reading back costs far
+    // more than running, and a caller that only counts what moved has no use for it.
+    pub fn run_only(&self, inputs: &Inputs) -> FrameRun {
         let mut host = Host::controlled(
             inputs.address,
             inputs.caller,
@@ -131,7 +133,11 @@ impl Explorer {
         host.spends_balance = inputs.spends_balance;
         host.moving = inputs.moving.clone();
         host.selfbalance = inputs.balance;
-        let mut run = exec::run_frame(&self.prog.code, &host, inputs.storage.clone(), STEP_BUDGET);
+        exec::run_frame(&self.prog.code, &host, inputs.storage.clone(), STEP_BUDGET)
+    }
+
+    pub fn run(&self, inputs: &Inputs) -> Path {
+        let mut run = self.run_only(inputs);
         // Thousands of paths are kept at once. Each would hold one entry per step it ran.
         let order = std::mem::take(&mut run.order);
         let blocks: Vec<usize> = order

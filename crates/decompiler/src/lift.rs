@@ -2253,8 +2253,9 @@ impl<'a> Lifter<'a> {
                                     let n = (l - i).min(32) as usize;
                                     let mut buf = [0u8; 32];
                                     for (j, out) in buf.iter_mut().enumerate().take(n) {
+                                        let at = s.checked_add(i as usize + j);
                                         *out =
-                                            prog.code.get(s + i as usize + j).copied().unwrap_or(0);
+                                            at.and_then(|a| prog.code.get(a)).copied().unwrap_or(0);
                                     }
                                     if n == 32 {
                                         st.mem.store(
@@ -3383,10 +3384,25 @@ pub fn term_exprs(t: &Term) -> Vec<ExprId> {
 }
 
 pub fn jump_target_bits(e: ExprId) -> Option<U256> {
+    target_bits(e, &mut HashMap::new())
+}
+
+// An expression is shared, so without the memo a value used on both sides of
+// each of n operators would be walked 2^n times.
+fn target_bits(e: ExprId, memo: &mut HashMap<ExprId, Option<U256>>) -> Option<U256> {
+    if let Some(known) = memo.get(&e) {
+        return *known;
+    }
+    let out = target_bits_of(e, memo);
+    memo.insert(e, out);
+    out
+}
+
+fn target_bits_of(e: ExprId, memo: &mut HashMap<ExprId, Option<U256>>) -> Option<U256> {
     match expr::node(e) {
         Node::Const(c) => Some(c),
         Node::Op(op::AND, v) => {
-            let (a, b) = (jump_target_bits(v[0]), jump_target_bits(v[1]));
+            let (a, b) = (target_bits(v[0], memo), target_bits(v[1], memo));
             match (a, b) {
                 (Some(x), Some(y)) => Some(x & y),
                 (Some(x), None) | (None, Some(x)) => Some(x),
@@ -3394,8 +3410,8 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
             }
         }
         Node::Op(op::OR, v) | Node::Op(op::XOR, v) | Node::Op(op::ADD, v) => {
-            let a = jump_target_bits(v[0])?;
-            let b = jump_target_bits(v[1])?;
+            let a = target_bits(v[0], memo)?;
+            let b = target_bits(v[1], memo)?;
             if matches!(expr::node(e), Node::Op(op::ADD, _)) {
                 let bits = a.bits().max(b.bits()) + 1;
                 Some(expr::mask_bits(bits))
@@ -3408,7 +3424,7 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
             if k >= U256::from_u64(256) {
                 return Some(U256::ZERO);
             }
-            Some(jump_target_bits(v[1])? << k.low_u64() as u32)
+            Some(target_bits(v[1], memo)? << k.low_u64() as u32)
         }
         Node::Op(op::MUL, v) => {
             let (x, c) = if let Some(c) = expr::as_const(v[1]) {
@@ -3419,14 +3435,14 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
             if !c.is_power_of_two() {
                 return None;
             }
-            Some(jump_target_bits(x)? << c.trailing_zeros())
+            Some(target_bits(x, memo)? << c.trailing_zeros())
         }
         Node::Op(op::SHR, v) => {
             let k = expr::as_const(v[0])?;
             if k >= U256::from_u64(256) {
                 return Some(U256::ZERO);
             }
-            Some(jump_target_bits(v[1])? >> k.low_u64() as u32)
+            Some(target_bits(v[1], memo)? >> k.low_u64() as u32)
         }
         Node::Op(op::BYTE, _) => Some(U256::from_u64(0xff)),
         Node::Op(op::DIV, v) => {
@@ -3434,7 +3450,7 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
             if !c.is_power_of_two() {
                 return None;
             }
-            Some(jump_target_bits(v[0])? >> c.trailing_zeros())
+            Some(target_bits(v[0], memo)? >> c.trailing_zeros())
         }
         _ => {
             let b = expr::value_bits(e);

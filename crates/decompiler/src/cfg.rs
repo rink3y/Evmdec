@@ -452,7 +452,10 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                 let n = (o - 0x8f) as usize;
                 st.peek(n + 1);
                 let l = st.stack.len();
-                st.stack.swap(l - 1, l - 1 - n);
+                // peek stops filling a stack that has already taken its limit of unknowns.
+                if l > n {
+                    st.stack.swap(l - 1, l - 1 - n);
+                }
             }
             op::POP => {
                 st.pop();
@@ -796,7 +799,8 @@ const MAX_ORPHAN_NODES: usize = 60_000;
 const MAX_BLOCK_CONTEXTS: usize = 12;
 const MAX_WALK_NODES: usize = 6000;
 const MAX_STEPS: usize = 3_000_000;
-const MAX_RECURSION: usize = 3000;
+// A summary frame is large in a debug build. This depth has to fit a 2 MiB thread stack.
+const MAX_RECURSION: usize = 320;
 const MAX_PROVISIONAL_RECOMPUTES: u32 = 6;
 
 fn resolve(v: AVal, st: &mut AState) -> AVal {

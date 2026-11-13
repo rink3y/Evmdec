@@ -4,7 +4,7 @@ use crate::lift::{Lifted, Stmt, Term, FREE_POINTER};
 use crate::opcode as op;
 use crate::sigs;
 use crate::u256::U256;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -313,6 +313,40 @@ pub fn fmt_expr(e: ExprId, n: &Names) -> String {
     fmt_prec(e, 0, n)
 }
 
+thread_local! {
+    static NESTED: Cell<u32> = const { Cell::new(0) };
+}
+
+// The printer calls itself once per level of an expression. Past this many levels the
+// parts are printed first, smallest first, so every later call finds its parts done.
+const MAX_NESTED: u32 = 64;
+
+struct Level(u32);
+
+impl Drop for Level {
+    fn drop(&mut self) {
+        NESTED.with(|d| d.set(self.0));
+    }
+}
+
+fn fmt_parts_first(e: ExprId, n: &Names) {
+    let mut parts = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if seen.insert(x) {
+            parts.push(x);
+            stack.extend(expr::children(x));
+        }
+    }
+    parts.sort_by_key(|x| expr::depth(*x));
+    for part in parts {
+        if part != e {
+            fmt_prec(part, 0, n);
+        }
+    }
+}
+
 fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     if let Some(a) = n.aliases.get(&e) {
         return a.clone();
@@ -329,6 +363,13 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     if let Some((s, p)) = n.memo.borrow().get(&e) {
         return paren(s.clone(), *p, outer);
     }
+    let level = NESTED.with(Cell::get);
+    let _restore = Level(level);
+    if level >= MAX_NESTED {
+        NESTED.with(|d| d.set(0));
+        fmt_parts_first(e, n);
+    }
+    NESTED.with(|d| d.set(level + 1));
     let (s, p) = fmt_inner(e, n);
     if s.len() > TEMP_THRESHOLD && !matches!(expr::node(e), Node::Const(_)) {
         *n.temp_seq.borrow_mut() += 1;

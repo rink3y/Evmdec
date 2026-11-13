@@ -141,22 +141,27 @@ impl Bounds {
     }
 
     pub fn of(&self, e: ExprId) -> Range {
-        self.walk(e, 0)
+        self.walk(e, 0, &mut HashMap::new())
     }
 
-    fn walk(&self, e: ExprId, depth: u32) -> Range {
-        let shape = if depth > MAX_DEPTH {
-            FULL
-        } else {
-            self.shape(e, depth + 1)
-        };
-        match self.known.get(&e) {
+    // A value shared by both sides of many operations would otherwise be walked once per use.
+    fn walk(&self, e: ExprId, depth: u32, done: &mut HashMap<ExprId, Range>) -> Range {
+        if let Some(range) = done.get(&e) {
+            return *range;
+        }
+        if depth > MAX_DEPTH {
+            return self.known.get(&e).map_or(FULL, |known| FULL.meet(*known));
+        }
+        let shape = self.shape(e, depth + 1, done);
+        let range = match self.known.get(&e) {
             Some(known) => shape.meet(*known),
             None => shape,
-        }
+        };
+        done.insert(e, range);
+        range
     }
 
-    fn shape(&self, e: ExprId, depth: u32) -> Range {
+    fn shape(&self, e: ExprId, depth: u32, done: &mut HashMap<ExprId, Range>) -> Range {
         let (o, parts) = match expr::node(e) {
             Node::Const(c) => return exact(c),
             Node::Env(which, _) => {
@@ -171,7 +176,8 @@ impl Bounds {
             Node::Op(o, parts) => (o, parts),
             _ => return FULL,
         };
-        let at = |i: usize| self.walk(parts[i], depth);
+        let sides: Vec<Range> = parts.iter().map(|p| self.walk(*p, depth, done)).collect();
+        let at = |i: usize| sides[i];
         match (o, parts.len()) {
             (op::ISZERO, _) | (op::LT | op::GT | op::SLT | op::SGT | op::EQ, _) => FLAG,
             (op::AND, 2) => Range {
@@ -273,6 +279,16 @@ mod tests {
         );
         assert!(!bounds.may_wrap(expr::op2(op::ADD, word(0), word(1))));
         assert!(!bounds.may_wrap(expr::op2(op::MUL, word(0), word(1))));
+    }
+
+    #[test]
+    fn a_value_doubled_many_times_is_bounded_without_walking_every_copy() {
+        let mut value = expr::op2(op::AND, word(0), expr::konst_u64(1));
+        for _ in 0..40 {
+            let next = expr::op2(op::ADD, value, expr::konst_u64(1));
+            value = expr::op2(op::MUL, value, next);
+        }
+        assert_eq!(Bounds::default().of(value).lo, U256::ZERO);
     }
 
     #[test]

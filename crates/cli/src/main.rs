@@ -147,6 +147,13 @@ fn fetch_and_decompile(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    match evmdec::clock::on_worker(|| run(cli)) {
+        Ok(done) => done,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Info { file } => {
             let code = load(&file)?;

@@ -347,6 +347,8 @@ pub struct Machine<'a> {
     pub gas_obs: Vec<U256>,
     pub msize_obs: Vec<U256>,
     pub pc: usize,
+    pub move_limit: usize,
+    moved: usize,
 }
 
 impl<'a> Machine<'a> {
@@ -366,6 +368,8 @@ impl<'a> Machine<'a> {
             gas_obs: vec![],
             msize_obs: vec![],
             pc: 0,
+            move_limit: Self::MEM_LIMIT,
+            moved: 0,
         }
     }
 
@@ -377,6 +381,18 @@ impl<'a> Machine<'a> {
     }
 
     const MEM_LIMIT: usize = 1 << 26;
+    // A step count alone does not bound a run. One step can hash or copy megabytes.
+    // Code that runs a frame many times lowers the limit to this.
+    pub const LOOPED_MOVE_LIMIT: usize = 1 << 23;
+
+    fn moving(&mut self, bytes: usize) -> Result<(), String> {
+        self.moved = self.moved.saturating_add(bytes);
+        if self.moved > self.move_limit {
+            return Err("memory traffic budget exhausted".into());
+        }
+        Ok(())
+    }
+
     fn expand(&mut self, off: usize, len: usize) -> Result<(), String> {
         if len == 0 {
             return Ok(());
@@ -387,6 +403,7 @@ impl<'a> Machine<'a> {
         }
         let rounded = end.div_ceil(32) * 32;
         if rounded > self.memory.len() {
+            self.moving(rounded - self.memory.len())?;
             self.memory.resize(rounded, 0);
         }
         Ok(())
@@ -399,6 +416,7 @@ impl<'a> Machine<'a> {
             .as_usize()
             .filter(|o| *o < Self::MEM_LIMIT)
             .ok_or("memory offset too large")?;
+        self.moving(len)?;
         self.expand(o, len)?;
         Ok(self.memory[o..o + len].to_vec())
     }
@@ -459,6 +477,7 @@ impl<'a> Machine<'a> {
         if n == 0 {
             return Ok(());
         }
+        self.moving(n)?;
         let mut buf = vec![0u8; n];
         if let Some(s) = src.as_usize() {
             for (i, out) in buf.iter_mut().enumerate() {

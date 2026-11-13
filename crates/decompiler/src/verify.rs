@@ -55,6 +55,7 @@ struct Eval<'a> {
     host: &'a Host,
     stack0: Vec<U256>,
     mem_snapshots: Vec<Vec<u8>>,
+    kept: usize,
     stor_snapshots: Vec<HashMap<U256, U256>>,
     tstor_snapshots: Vec<HashMap<U256, U256>>,
     calls: Vec<(bool, Vec<u8>)>,
@@ -69,6 +70,18 @@ struct Eval<'a> {
 }
 
 impl<'a> Eval<'a> {
+    // Every write keeps a copy of memory. A block that writes often into a large memory
+    // would hold a copy per write, so past this total the run is given up.
+    fn keep_memory(&mut self, mem: &[u8]) {
+        const MOST: usize = 512 << 20;
+        self.kept = self.kept.saturating_add(mem.len());
+        if self.kept > MOST {
+            self.inconclusive = Some("memory copies too large".into());
+            self.mem_snapshots.push(Vec::new());
+        } else {
+            self.mem_snapshots.push(mem.to_vec());
+        }
+    }
     fn mem_at(&self, gen: u32) -> &Vec<u8> {
         let i = (gen as usize).min(self.mem_snapshots.len() - 1);
         &self.mem_snapshots[i]
@@ -528,6 +541,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                 host: &host,
                 stack0: stack0.clone(),
                 mem_snapshots: vec![mem0.clone()],
+                kept: 0,
                 stor_snapshots: vec![HashMap::new()],
                 tstor_snapshots: vec![HashMap::new()],
                 calls: Vec::new(),
@@ -566,7 +580,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         if !write_mem(&mut mem, o, data) {
                             ev.inconclusive = Some("memory offset".into());
                         }
-                        ev.mem_snapshots.push(mem.clone());
+                        ev.keep_memory(&mem);
                     }
                     Stmt::SStore {
                         key,
@@ -654,7 +668,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                             write_mem(&mut mem, oo, &buf);
                         }
                         ev.returndata = data;
-                        ev.mem_snapshots.push(mem.clone());
+                        ev.keep_memory(&mem);
                         if *kind != op::STATICCALL {
                             ev.stor_snapshots.push(storage.clone());
                         }
@@ -688,7 +702,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         ev.creates.push(host.create_result(idx));
                         ev.returndata = Vec::new();
                         ev.stor_snapshots.push(storage.clone());
-                        ev.mem_snapshots.push(mem.clone());
+                        ev.keep_memory(&mem);
                     }
                     Stmt::Copy {
                         kind,
@@ -726,7 +740,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         if !write_mem(&mut mem, d, &data) {
                             ev.inconclusive = Some("memory offset".into());
                         }
-                        ev.mem_snapshots.push(mem.clone());
+                        ev.keep_memory(&mem);
                     }
                     Stmt::Internal { .. }
                     | Stmt::Assign { .. }

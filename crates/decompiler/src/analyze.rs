@@ -4168,7 +4168,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 push(&mut findings, "ecrecover-zero", "ecrecover result may be the zero address", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                     format!("`{}` calls the ecrecover precompile; no comparison of the recovered address against zero was found. An invalid signature recovers to address(0), which may match an unset storage slot.", f.name), vec![line.clone()], "Require the recovered signer to be non-zero (or use OpenZeppelin ECDSA).");
                             }
-                            if let Some(words) = input {
+                            if let Some(words) = input.as_ref().filter(|w| !w.is_empty()) {
                                 let all: Vec<ExprId> =
                                     events.iter().flat_map(event_exprs).collect();
                                 let digest = words[0];

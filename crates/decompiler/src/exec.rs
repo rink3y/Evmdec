@@ -38,6 +38,7 @@ pub fn run_frame(
     let jumpdests: HashSet<usize> = disasm::jumpdests(code).into_iter().collect();
     let mut m = Machine::new(code, host);
     m.storage = init_storage;
+    m.move_limit = Machine::LOOPED_MOVE_LIMIT;
     let mut visited = HashSet::new();
     let mut order = Vec::new();
     let mut steps = 0;

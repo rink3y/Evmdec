@@ -96,9 +96,10 @@ impl Explorer {
         host.signed = inputs.signed.clone();
         host.failing = inputs.failing;
         host.selfbalance = inputs.balance;
-        let run = exec::run_frame(&self.prog.code, &host, inputs.storage.clone(), STEP_BUDGET);
-        let blocks: Vec<usize> = run
-            .order
+        let mut run = exec::run_frame(&self.prog.code, &host, inputs.storage.clone(), STEP_BUDGET);
+        // Thousands of paths are kept at once. Each would hold one entry per step it ran.
+        let order = std::mem::take(&mut run.order);
+        let blocks: Vec<usize> = order
             .iter()
             .filter_map(|pc| self.prog.block_at_pc.get(pc).copied())
             .take(MAX_BLOCKS)

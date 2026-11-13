@@ -14,6 +14,7 @@ pub struct Policy {
     pub max_linked: usize,
     pub max_total: usize,
     pub depth: usize,
+    pub root_time: Duration,
     pub contract_time: Duration,
     pub walk_time: Duration,
 }
@@ -25,6 +26,7 @@ impl Default for Policy {
             max_linked: 8,
             max_total: 40,
             depth: 2,
+            root_time: Duration::from_secs(120),
             contract_time: Duration::from_secs(20),
             walk_time: Duration::from_secs(120),
         }
@@ -59,7 +61,7 @@ pub fn fetch(
         seen: HashSet::new(),
         left: policy.max_total,
         decompiled: HashMap::new(),
-        time: None,
+        time: policy.root_time,
         calls: Vec::new(),
     };
     let root = fetcher.one(address)?;
@@ -91,7 +93,7 @@ struct Fetcher<'a> {
     seen: HashSet<String>,
     left: usize,
     decompiled: HashMap<[u8; 32], Contract>,
-    time: Option<Duration>,
+    time: Duration,
     calls: Vec<(String, String)>,
 }
 
@@ -120,10 +122,7 @@ impl Fetcher<'_> {
             return Some(known.clone());
         }
         let opts = self.opts;
-        let c = match self.time {
-            Some(time) => clock::run(time, || decompile::decompile(code, opts))?,
-            None => decompile::decompile(code, opts),
-        };
+        let c = clock::run(self.time, || decompile::decompile(code, opts))?;
         self.decompiled.insert(hash, c.clone());
         Some(c)
     }
@@ -155,10 +154,7 @@ impl Fetcher<'_> {
     }
 
     fn too_slow(&self) -> String {
-        format!(
-            "decompiling it took longer than {} s",
-            self.time.unwrap_or_default().as_secs()
-        )
+        format!("decompiling it took longer than {} s", self.time.as_secs())
     }
 
     fn edges(&mut self, c: &mut Contract) -> (Vec<Edge>, Vec<Unfollowed>) {
@@ -263,7 +259,7 @@ impl Fetcher<'_> {
         let mut all: Vec<Contract> = vec![root];
         let mut level: Vec<usize> = vec![0];
         let mut unfollowed: Vec<Unfollowed> = Vec::new();
-        self.time = Some(policy.contract_time);
+        self.time = policy.contract_time;
         for depth in 1..=policy.depth {
             let mut edges: Vec<Edge> = Vec::new();
             for i in level.drain(..) {

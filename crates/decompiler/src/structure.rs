@@ -272,6 +272,7 @@ struct Printer<'a> {
     out: String,
     emitted: HashSet<usize>,
     labels: HashSet<usize>,
+    nesting: usize,
     loop_stack: Vec<(usize, Option<usize>, usize)>,
     gotos: usize,
     active: HashSet<usize>,
@@ -2110,8 +2111,25 @@ impl<'a> Printer<'a> {
     }
 
     fn go(&mut self, n: usize, stop: Option<usize>, depth: usize) {
-        if Some(n) == stop {
+        let Some(n) = self.next(n, stop, depth) else {
             return;
+        };
+        // Each nested region calls back into the printer. Past this depth the rest is
+        // printed at the top level under a label, so a long chain cannot use up the stack.
+        if self.nesting >= MAX_NESTING {
+            self.labels.insert(n);
+            self.gotos += 1;
+            self.line(depth, &format!("goto L{:x};", self.node_pc(n)));
+            return;
+        }
+        self.nesting += 1;
+        self.emit_node(n, stop, depth);
+        self.nesting -= 1;
+    }
+
+    fn next(&mut self, n: usize, stop: Option<usize>, depth: usize) -> Option<usize> {
+        if Some(n) == stop {
+            return None;
         }
         for i in (0..self.loop_stack.len()).rev() {
             let (header, exit, body_depth) = self.loop_stack[i];
@@ -2129,7 +2147,7 @@ impl<'a> Printer<'a> {
                         &format!("goto L{:x}; // continue outer loop", self.node_pc(n)),
                     );
                 }
-                return;
+                return None;
             }
             if exit == Some(n) {
                 if innermost {
@@ -2142,20 +2160,20 @@ impl<'a> Printer<'a> {
                         &format!("goto L{:x}; // break outer loop", self.node_pc(n)),
                     );
                 }
-                return;
+                return None;
             }
         }
         if self.emitted.contains(&n) || self.active.contains(&n) {
             if self.is_small_terminal(n) && !self.active.contains(&n) {
                 self.emit_dup(n, depth);
-                return;
+                return None;
             }
             self.labels.insert(n);
             self.gotos += 1;
             self.line(depth, &format!("goto L{:x};", self.node_pc(n)));
-            return;
+            return None;
         }
-        self.emit_node(n, stop, depth);
+        Some(n)
     }
 
     fn emit_dup(&mut self, mut n: usize, depth: usize) {
@@ -2178,42 +2196,53 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn emit_node(&mut self, n: usize, stop: Option<usize>, depth: usize) {
-        if let Some(lp) = self.loops.get(&n) {
-            if !self.emitted.contains(&n) && !self.loop_stack.iter().any(|(h, _, _)| *h == n) {
-                let body: HashSet<usize> = lp.body.clone();
-                let exits = lp.exits.clone();
-                self.emit_loop(n, &body, &exits, stop, depth);
+    fn emit_node(&mut self, mut n: usize, stop: Option<usize>, depth: usize) {
+        loop {
+            if let Some(lp) = self.loops.get(&n) {
+                if !self.emitted.contains(&n) && !self.loop_stack.iter().any(|(h, _, _)| *h == n) {
+                    let body: HashSet<usize> = lp.body.clone();
+                    let exits = lp.exits.clone();
+                    self.emit_loop(n, &body, &exits, stop, depth);
+                    return;
+                }
+            }
+            self.emitted.insert(n);
+            if self.labels.contains(&n) {
+                self.line(depth.saturating_sub(1), &format!("L{:x}:", self.node_pc(n)));
+            }
+            if self.try_transfer_idiom(n, stop, depth) {
                 return;
             }
-        }
-        self.emitted.insert(n);
-        if self.labels.contains(&n) {
-            self.line(depth.saturating_sub(1), &format!("L{:x}:", self.node_pc(n)));
-        }
-        if self.try_transfer_idiom(n, stop, depth) {
-            return;
-        }
-        self.stmts(n, depth);
-        let term = self.l.nodes[n].term.clone();
-        match term {
-            Term::Jump(t) => self.transfer(n, t, stop, depth),
-            Term::Branch { t: Some(t), f, .. } if t == f => self.transfer(n, f, stop, depth),
-            Term::Branch { cond, t, f } => self.emit_branch(n, cond, t, f, stop, depth),
-            Term::Switch { target, cases } => {
-                let tgt = emit::fmt_expr(target, self.names);
-                self.line(depth, &format!("switch ({}) {{", tgt));
-                for (i, c) in cases.iter().enumerate() {
-                    self.line(depth + 1, &format!("case {}: {{", i));
-                    self.transfer(n, *c, stop, depth + 2);
-                    self.line(depth + 1, "}");
+            self.stmts(n, depth);
+            let to = match self.l.nodes[n].term.clone() {
+                Term::Jump(t) => t,
+                Term::Branch { t: Some(t), f, .. } if t == f => f,
+                Term::Branch { cond, t, f } => {
+                    self.emit_branch(n, cond, t, f, stop, depth);
+                    return;
                 }
-                self.line(depth, "}");
-            }
-            other => {
-                if let Some(s) = emit::fmt_term_halt(&other, self.names) {
-                    self.line(depth, &s);
+                Term::Switch { target, cases } => {
+                    let tgt = emit::fmt_expr(target, self.names);
+                    self.line(depth, &format!("switch ({}) {{", tgt));
+                    for (i, c) in cases.iter().enumerate() {
+                        self.line(depth + 1, &format!("case {}: {{", i));
+                        self.transfer(n, *c, stop, depth + 2);
+                        self.line(depth + 1, "}");
+                    }
+                    self.line(depth, "}");
+                    return;
                 }
+                other => {
+                    if let Some(s) = emit::fmt_term_halt(&other, self.names) {
+                        self.line(depth, &s);
+                    }
+                    return;
+                }
+            };
+            self.edge_assigns(n, to, depth);
+            match self.next(to, stop, depth) {
+                Some(following) => n = following,
+                None => return,
             }
         }
     }
@@ -2788,6 +2817,8 @@ pub struct Structured {
     pub gotos: usize,
 }
 
+const MAX_NESTING: usize = 400;
+
 pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     let g = Graph::new(l);
     let loops = find_loops(&g);
@@ -2806,6 +2837,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         out: String::new(),
         emitted: HashSet::new(),
         labels: HashSet::new(),
+        nesting: 0,
         loop_stack: Vec::new(),
         gotos: 0,
         active: HashSet::new(),
@@ -2829,7 +2861,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         .filter(|n| !p.emitted.contains(n))
         .collect();
     let mut rounds = 0;
-    while !pending.is_empty() && rounds < 64 {
+    while !pending.is_empty() && rounds < 64 + l.nodes.len() / MAX_NESTING {
         rounds += 1;
         pending.sort_by_key(|n| p.g.rpo_index[*n]);
         for n in pending {
@@ -2857,6 +2889,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             used: p.used.clone(),
             emitted: HashSet::new(),
             labels: p.labels.clone(),
+            nesting: 0,
             loop_stack: Vec::new(),
             gotos: 0,
             active: HashSet::new(),
@@ -2875,7 +2908,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             .filter(|n| !p2.emitted.contains(n))
             .collect();
         let mut rounds = 0;
-        while !pending.is_empty() && rounds < 64 {
+        while !pending.is_empty() && rounds < 64 + l.nodes.len() / MAX_NESTING {
             rounds += 1;
             pending.sort_by_key(|n| p2.g.rpo_index[*n]);
             for n in pending {

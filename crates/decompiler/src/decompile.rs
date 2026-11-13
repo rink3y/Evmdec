@@ -870,13 +870,9 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         acc
     };
 
-    let internals_static: &'static HashMap<usize, Lifted> = Box::leak(Box::new(
-        internals
-            .iter()
-            .map(|(pc, l)| (*pc, l.clone()))
-            .collect::<HashMap<usize, Lifted>>(),
-    ));
-    let resolve = move |pc: usize| -> Option<&'static Lifted> { internals_static.get(&pc) };
+    let internal_copies: HashMap<usize, Lifted> =
+        internals.iter().map(|(pc, l)| (*pc, l.clone())).collect();
+    let resolve = |pc: usize| internal_copies.get(&pc);
     let make = |kind: FnKind,
                 selector: Option<u32>,
                 l: Lifted,
@@ -1451,7 +1447,9 @@ fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
                             st[l - 3].and_then(|v| v.as_usize()),
                         ) {
                             if len >= 64
-                                && off + len <= prog.code.len()
+                                && off
+                                    .checked_add(len)
+                                    .is_some_and(|end| end <= prog.code.len())
                                 && off >= b.end
                                 && !out.contains(&(off, len))
                             {

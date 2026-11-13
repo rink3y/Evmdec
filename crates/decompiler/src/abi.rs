@@ -35,8 +35,16 @@ fn split_top(list: &str) -> Vec<&str> {
     parts
 }
 
+// A type text comes from a signature list anyone can add to.
+// These two bounds keep a nested type from costing more than a small layout.
+const MAX_TYPE_TEXT: usize = 512;
+const MAX_WORDS: usize = 1024;
+
 pub fn parse(ty: &str) -> Ty {
     let ty = ty.trim();
+    if ty.len() > MAX_TYPE_TEXT {
+        return Ty::Word;
+    }
     if let Some(open) = ty.rfind('[') {
         if ty.ends_with(']') && !ty[open..].contains(')') {
             let inner = Box::new(parse(&ty[..open]));
@@ -67,8 +75,10 @@ fn dynamic(ty: &Ty) -> bool {
 fn head_words(ty: &Ty) -> usize {
     match ty {
         _ if dynamic(ty) => 1,
-        Ty::Fixed(inner, n) => n * head_words(inner),
-        Ty::Tuple(parts) => parts.iter().map(head_words).sum(),
+        Ty::Fixed(inner, n) => n.saturating_mul(head_words(inner)),
+        Ty::Tuple(parts) => parts
+            .iter()
+            .fold(0usize, |sum, part| sum.saturating_add(head_words(part))),
         _ => 1,
     }
 }
@@ -82,7 +92,12 @@ struct Encoder {
 impl Encoder {
     fn sequence(&mut self, items: &[Ty]) {
         let base = self.words.len();
-        let head: usize = items.iter().map(head_words).sum();
+        let head = items
+            .iter()
+            .fold(0usize, |sum, item| sum.saturating_add(head_words(item)));
+        if base.saturating_add(head) > MAX_WORDS {
+            return;
+        }
         self.words.resize(base + head, U256::ZERO);
         let mut at = base;
         for item in items {
@@ -174,6 +189,14 @@ mod tests {
         let l = layout(Some(1), &["(address,bytes)[]".into()]);
         assert_eq!(words(&l), [0x20, 1, 0x20, 0, 0x40, 2, 0, 0]);
         assert_eq!(l.fixed, [0, 2, 4]);
+    }
+
+    #[test]
+    fn a_deeply_nested_type_gets_a_bounded_layout() {
+        let nested = format!("uint256{}", "[4]".repeat(40));
+        assert!(layout(Some(1), &[nested]).calldata.len() <= 4 + 32 * MAX_WORDS);
+        let dynamic = format!("bytes{}", "[4]".repeat(40));
+        assert!(layout(Some(1), &[dynamic]).calldata.len() < 64 * MAX_WORDS);
     }
 
     #[test]

@@ -131,6 +131,7 @@ impl World {
         host.origin = self.origin;
         host.intercept_calls = true;
         let mut m = Machine::new(code, &host);
+        m.move_limit = Machine::LOOPED_MOVE_LIMIT;
         m.storage = self
             .storage
             .get(&frame.account)

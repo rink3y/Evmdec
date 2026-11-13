@@ -129,11 +129,22 @@ fn cbor_read(data: &[u8], pos: &mut usize, depth: u32) -> Option<Cbor> {
     })
 }
 
+// Vyper appends a contract's immutable values after the trailer, 32 bytes each.
+const MAX_WORDS_AFTER_TRAILER: usize = 64;
+
 pub fn parse_metadata(code: &[u8]) -> Option<Metadata> {
-    if code.len() < 4 {
+    trailer_ending_at(code, code.len()).or_else(|| {
+        (1..=MAX_WORDS_AFTER_TRAILER)
+            .filter_map(|words| code.len().checked_sub(32 * words))
+            .filter_map(|end| trailer_ending_at(code, end))
+            .find(|md| md.compiler == "vyper")
+    })
+}
+
+fn trailer_ending_at(code: &[u8], n: usize) -> Option<Metadata> {
+    if n < 4 {
         return None;
     }
-    let n = code.len();
     let len = u16::from_be_bytes([code[n - 2], code[n - 1]]) as usize;
     if len == 0 || len + 2 > n || len > 1024 {
         return None;
@@ -405,6 +416,18 @@ fn base58(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_vyper_trailer_is_found_with_immutable_words_after_it() {
+        let mut code = vec![0x00];
+        code.extend(hex::decode("a165767970657283000309000b").expect("valid hex"));
+        assert_eq!(
+            parse_metadata(&code).and_then(|md| md.version).as_deref(),
+            Some("0.3.9")
+        );
+        code.extend([0u8; 64]);
+        let md = parse_metadata(&code).expect("found before the two words");
+        assert_eq!((md.compiler.as_str(), md.offset), ("vyper", 1));
+    }
     #[test]
     fn ipfs_cid_renders_the_multihash_as_base58() {
         let md = Metadata {

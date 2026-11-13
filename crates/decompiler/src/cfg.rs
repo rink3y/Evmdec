@@ -2,7 +2,7 @@ use crate::disasm::{self, Instruction};
 use crate::opcode as op;
 use crate::u256::U256;
 use serde::Serialize;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
@@ -135,10 +135,13 @@ struct AMem {
     words: Rc<BTreeMap<u32, AVal>>,
     bytes: Rc<Vec<Option<u8>>>,
     regions: Rc<Vec<(usize, usize, usize)>>,
+    unknown: Rc<Vec<(usize, usize)>>,
     clobbered: bool,
 }
 
 const MAX_AMEM: usize = 1 << 16;
+const MAX_UNKNOWN_RANGES: usize = 32;
+const MAX_VARIANTS: usize = 8;
 
 impl AMem {
     fn new() -> AMem {
@@ -146,8 +149,30 @@ impl AMem {
             words: Rc::new(BTreeMap::new()),
             bytes: Rc::new(Vec::new()),
             regions: Rc::new(Vec::new()),
+            unknown: Rc::new(Vec::new()),
             clobbered: false,
         }
+    }
+
+    // Memory that was never written reads as zero. A range written with bytes that are
+    // not known must not, or a jump through it is taken to go to address zero.
+    fn forget(&mut self, off: usize, len: usize) {
+        if len == 0 || self.clobbered {
+            return;
+        }
+        // Past the limit one range that covers everything stands for the rest.
+        let range = match self.unknown.len() >= MAX_UNKNOWN_RANGES {
+            true => (0, usize::MAX),
+            false => (off, off.saturating_add(len)),
+        };
+        if !self.unknown.contains(&range) {
+            Rc::make_mut(&mut self.unknown).push(range);
+        }
+    }
+
+    fn forgotten(&self, off: usize) -> bool {
+        let end = off.saturating_add(32);
+        self.unknown.iter().any(|(lo, hi)| *lo < end && off < *hi)
     }
     fn write_bytes(&mut self, off: usize, data: &[Option<u8>]) {
         if off > MAX_AMEM || data.is_empty() {
@@ -199,6 +224,7 @@ impl AMem {
         if off > MAX_AMEM || len == 0 {
             return;
         }
+        self.forget(off, len);
         let end = off.saturating_add(len).min(MAX_AMEM);
         let w = Rc::make_mut(&mut self.words);
         let lo = off.saturating_sub(31) as u32;
@@ -523,6 +549,8 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         None => {
                             if !st.mem.regions.is_empty() {
                                 AVal::Table
+                            } else if st.root && !st.mem.clobbered && st.mem.forgotten(o) {
+                                AVal::Unk
                             } else if st.root && !st.mem.clobbered {
                                 AVal::Const(U256::ZERO)
                             } else if o % 32 == 0 {
@@ -707,6 +735,12 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                                 ) =>
                             {
                                 AVal::Table
+                            }
+                            _ => AVal::Unk,
+                        },
+                        (1, op::CLZ) => match args[0] {
+                            AVal::Const(a) => {
+                                AVal::Const(U256::from_u64(u64::from(a.leading_zeros())))
                             }
                             _ => AVal::Unk,
                         },
@@ -1149,6 +1183,44 @@ impl<'a> Analysis<'a> {
         let mut work: VecDeque<usize> = VecDeque::new();
         let mut budget_exhausted = false;
         let mut per_block: HashMap<usize, Vec<usize>> = HashMap::new();
+        let rerun = Cell::new(false);
+        let variants: RefCell<HashMap<usize, Vec<AState>>> = RefCell::new(HashMap::new());
+        // A node stands for every state that reaches it. A constant the first state held
+        // and a later one does not is no longer a constant there, and the node is run
+        // again without it. Keeping it sent a computed jump only where the first path led.
+        // The states themselves are kept, so such a jump can still be followed for each.
+        let join = |id: usize, st: &AState, nodes: &mut Vec<UNode>, work: &mut VecDeque<usize>| {
+            let entry = &mut nodes[id].entry;
+            let first = entry.clone();
+            let shared = entry.stack.len().min(st.stack.len());
+            let mut changed = false;
+            for depth in 1..=shared {
+                let (mine, theirs) = (entry.stack.len() - depth, st.stack.len() - depth);
+                let AVal::Const(c) = entry.stack[mine] else {
+                    continue;
+                };
+                let target = c.as_usize().is_some_and(|pc| prog.jumpdests.contains(&pc));
+                if !target && !matches!(st.stack[theirs], AVal::Const(other) if other == c) {
+                    entry.stack[mine] = AVal::Unk;
+                    changed = true;
+                }
+            }
+            let mut variants = variants.borrow_mut();
+            if changed || variants.contains_key(&id) {
+                let kept = variants.entry(id).or_insert_with(|| vec![first]);
+                if kept.len() <= MAX_VARIANTS && !kept.iter().any(|v| v.stack == st.stack) {
+                    kept.push(st.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                rerun.set(true);
+                if !work.contains(&id) {
+                    work.push_back(id);
+                }
+            }
+            id
+        };
         let mut intern = |blk: usize,
                           st: &AState,
                           nodes: &mut Vec<UNode>,
@@ -1157,7 +1229,7 @@ impl<'a> Analysis<'a> {
          -> usize {
             let key = (blk, st.sig(prog));
             if let Some(&id) = index.get(&key) {
-                return id;
+                return join(id, st, nodes, work);
             }
             let list = per_block.entry(blk).or_default();
             let height = |a: &AState| a.stack.len() as isize - a.consumed as isize;
@@ -1165,7 +1237,7 @@ impl<'a> Analysis<'a> {
                 let existing = &nodes[**id].entry;
                 height(existing) == height(st) && existing.sig(prog).same_code_shape(&key.1)
             }) {
-                return id;
+                return join(id, st, nodes, work);
             }
             if list.len() >= MAX_BLOCK_CONTEXTS {
                 return list[0];
@@ -1203,9 +1275,58 @@ impl<'a> Analysis<'a> {
                 budget_exhausted = true;
                 break;
             }
+            for (s, _) in std::mem::take(&mut nodes[n].succs) {
+                nodes[s].preds.retain(|p| *p != n);
+            }
+            nodes[n].unresolved = false;
+            nodes[n].infeasible = false;
+            nodes[n].returns_via = None;
             let blk = nodes[n].block;
             let st = nodes[n].entry.clone();
             let mut exit = exec_block(prog, &prog.blocks[blk], &st);
+            let open = match exit.flow {
+                Flow::Return(via) => !via.is_token(),
+                Flow::BranchUnresolved { .. } => true,
+                _ => false,
+            };
+            let kept = variants.borrow().get(&n).cloned().unwrap_or_default();
+            if open && !kept.is_empty() && kept.len() <= MAX_VARIANTS {
+                let flows: Vec<Flow> = kept
+                    .iter()
+                    .map(|v| exec_block(prog, &prog.blocks[blk], v).flow)
+                    .collect();
+                let mut all: Vec<usize> = Vec::new();
+                let mut after: Option<Option<usize>> = None;
+                let mut jumps = 0;
+                let mut branches = 0;
+                for flow in &flows {
+                    match flow {
+                        Flow::Jump(targets) => {
+                            jumps += 1;
+                            all.extend(targets);
+                        }
+                        Flow::Branch {
+                            targets,
+                            fallthrough,
+                        } => {
+                            branches += 1;
+                            all.extend(targets);
+                            after = Some(*fallthrough);
+                        }
+                        _ => {}
+                    }
+                }
+                all.sort_unstable();
+                all.dedup();
+                if jumps == flows.len() {
+                    exit.flow = Flow::Jump(all);
+                } else if let (true, Some(fallthrough)) = (branches == flows.len(), after) {
+                    exit.flow = Flow::Branch {
+                        targets: all,
+                        fallthrough,
+                    };
+                }
+            }
             let mut cut = false;
             if !follow_computed && prog.computed_jumps.contains_key(&blk) {
                 match exit.flow {
@@ -1269,6 +1390,7 @@ impl<'a> Analysis<'a> {
                                     apply_exit(ex, &mut s2);
                                     for &o in &sub.mem_written {
                                         Rc::make_mut(&mut s2.mem.words).remove(&o);
+                                        s2.mem.forget(o as usize, 32);
                                     }
                                     if sub.mem_clobbered {
                                         s2.mem.clobbered = true;
@@ -1358,11 +1480,16 @@ impl<'a> Analysis<'a> {
             }
             nodes[n].succs = succs;
         }
-        Unit {
+        let unit = Unit {
             entry_block,
             nodes,
             entry,
             budget_exhausted,
+        };
+        // A node that was run again may have left nodes behind that nothing leads to now.
+        match rerun.get() {
+            true => unit.slice(entry).0,
+            false => unit,
         }
     }
 }

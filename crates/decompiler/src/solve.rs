@@ -115,7 +115,8 @@ impl Eval<'_> {
                 let given = inputs.given.iter().find(|(s, _)| *s == seq);
                 let data = given.map_or(&inputs.returned, |(_, data)| data);
                 let at = self.value(off).and_then(|o| o.as_usize());
-                at.filter(|o| o + 32 <= data.len()).map(|o| word(data, o))
+                at.filter(|o| o.checked_add(32).is_some_and(|end| end <= data.len()))
+                    .map(|o| word(data, o))
             }
             Node::Keccak(words, tail) => {
                 let mut bytes = Vec::with_capacity(32 * words.len());

@@ -130,6 +130,7 @@ impl Arena {
             },
             Node::Op(o, v) => match *o {
                 op::ISZERO | op::LT | op::GT | op::SLT | op::SGT | op::EQ => 1,
+                op::CLZ => 9,
                 op::AND => bits(v[0]).min(bits(v[1])),
                 op::OR | op::XOR => bits(v[0]).max(bits(v[1])),
                 op::SHR => match self.konst(v[0]) {
@@ -362,6 +363,7 @@ pub fn op1(o: u8, a: ExprId) -> ExprId {
         match o {
             op::ISZERO => return konst(U256::from(c.is_zero())),
             op::NOT => return konst(!c),
+            op::CLZ => return konst_u64(u64::from(c.leading_zeros())),
             _ => {}
         }
     }
@@ -403,6 +405,12 @@ pub fn is_boolean(e: ExprId) -> bool {
 
 thread_local! {
     static BOOL_VARS: RefCell<std::collections::HashSet<ExprId>> = RefCell::new(std::collections::HashSet::new());
+}
+
+// The mark belongs to the function being printed. Variable ids repeat from one function
+// to the next, so a mark left behind would change how another function is simplified.
+pub fn clear_boolean_marks() {
+    BOOL_VARS.with(|b| b.borrow_mut().clear());
 }
 
 pub fn mark_boolean(var: ExprId) {

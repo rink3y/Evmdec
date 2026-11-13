@@ -296,7 +296,8 @@ struct Printer<'a> {
     next_tmp: u32,
     used: Vec<ExprId>,
     facts: Vec<(ExprId, bool)>,
-    stale_plan: HashMap<(usize, usize), Vec<(ExprId, String)>>,
+    stale_plan: StalePlan,
+    early_reads: StalePlan,
     stored: Vec<(usize, String, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
     // Filled while the printer's &self methods run, hence the cell.
@@ -550,6 +551,133 @@ fn prev_name(what: Overwritten, names: &Names) -> String {
     format!("prev_{}", id.trim_end_matches('_'))
 }
 
+fn exprs_after(l: &Lifted, nd: &lift::LNode, i: usize, in_block_only: bool) -> Vec<ExprId> {
+    let mut after: Vec<ExprId> = Vec::new();
+    for later in &nd.stmts[i + 1..] {
+        after.extend(lift::stmt_exprs(later));
+    }
+    after.extend(lift::term_exprs(&nd.term));
+    let mut seen = HashSet::new();
+    let mut stack: Vec<usize> = match in_block_only {
+        true => Vec::new(),
+        false => nd.succs.clone(),
+    };
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        after.extend(lift::node_exprs(&l.nodes[x]));
+        stack.extend(l.nodes[x].succs.iter().copied());
+    }
+    for ((from, _), assigns) in &l.edge_assigns {
+        if *from == nd.id || seen.contains(from) {
+            after.extend(assigns.iter().map(|(_, v)| *v));
+        }
+    }
+    after
+}
+
+fn account_read(e: ExprId) -> Option<(u8, u32)> {
+    match expr::node(e) {
+        Node::Op(o @ (op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH), v) => {
+            let stamp = v.get(1).and_then(|s| expr::as_const(*s));
+            Some((o, stamp.map_or(0, |c| c.low_u64() as u32)))
+        }
+        _ => None,
+    }
+}
+
+// A call or a create can change another account's balance and code, and a store through
+// one pointer can change what another pointer reads. A read made before such a step and
+// used after it gets a name first, or the old and the new read print the same.
+fn plan_early_reads(l: &Lifted, names: &Names) -> StalePlan {
+    let mut plan = StalePlan::new();
+    let mut reads: Vec<(ExprId, u32)> = Vec::new();
+    let mut loads: Vec<(ExprId, ExprId, u32)> = Vec::new();
+    let mut seen: HashSet<ExprId> = HashSet::new();
+    let mut pending: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
+    pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
+    while let Some(e) = pending.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        if let Some((_, version)) = account_read(e) {
+            reads.push((e, version));
+        }
+        if let Node::MLoad(at, version) = expr::node(e) {
+            loads.push((e, at, version));
+        }
+        pending.extend(expr::children(e));
+    }
+    // A later read carries the store's own version only when that store may have changed it.
+    let reread = |at: ExprId, gen: u32| loads.iter().any(|(_, a, v)| *a == at && *v == gen);
+    let mut first: HashMap<ExprId, (u32, usize, usize)> = HashMap::new();
+    for nd in &l.nodes {
+        for (i, st) in nd.stmts.iter().enumerate() {
+            if let Stmt::MStore { off, gen, .. } = st {
+                let old: Vec<ExprId> = loads
+                    .iter()
+                    .filter(|(_, at, v)| at != off && v < gen && reread(*at, *gen))
+                    .map(|(e, _, _)| *e)
+                    .collect();
+                if old.is_empty() {
+                    continue;
+                }
+                let after = exprs_after(l, nd, i, true);
+                for read in old {
+                    let target = expr::node(read);
+                    if after.iter().any(|e| expr::contains(*e, &|n| *n == target)) {
+                        first.entry(read).or_insert((*gen, nd.id, i));
+                    }
+                }
+                continue;
+            }
+            let Some((Overwritten::Balance, gen)) = overwrites(st, names) else {
+                continue;
+            };
+            let old: Vec<ExprId> = reads
+                .iter()
+                .filter(|(_, version)| *version <= gen)
+                .map(|(e, _)| *e)
+                .collect();
+            if old.is_empty() {
+                continue;
+            }
+            let after = exprs_after(l, nd, i, false);
+            for read in old {
+                let target = expr::node(read);
+                if after.iter().any(|e| expr::contains(*e, &|n| *n == target)) {
+                    let at = first.entry(read).or_insert((gen, nd.id, i));
+                    if gen < at.0 {
+                        *at = (gen, nd.id, i);
+                    }
+                }
+            }
+        }
+    }
+    let mut ordered: Vec<(ExprId, (u32, usize, usize))> = first.into_iter().collect();
+    ordered.sort_by_key(|(e, at)| (*at, e.0));
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for (read, (_, node, i)) in ordered {
+        let base = match account_read(read) {
+            Some((op::BALANCE, _)) => "account_balance",
+            Some((op::EXTCODESIZE, _)) => "code_size",
+            Some(_) => "code_hash",
+            None => "mem",
+        };
+        let n = counts.entry(base).or_insert(0);
+        *n += 1;
+        let name = match *n {
+            1 => format!("prev_{base}"),
+            n => format!("prev{n}_{base}"),
+        };
+        plan.entry((node, i)).or_default().push((read, name));
+    }
+    plan
+}
+
+type StalePlan = HashMap<(usize, usize), Vec<(ExprId, String)>>;
+
 // Printing these loads as the slot name would read the new value.
 fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(ExprId, String)>> {
     let mut plan: HashMap<(usize, usize), Vec<(ExprId, String)>> = HashMap::new();
@@ -566,29 +694,8 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
             if earliest.get(&what).is_none_or(|first| *first > gen) {
                 continue;
             }
-            let mut after: Vec<ExprId> = Vec::new();
-            for later in &nd.stmts[i + 1..] {
-                after.extend(lift::stmt_exprs(later));
-            }
-            after.extend(lift::term_exprs(&nd.term));
             let in_block_only = matches!(what, Overwritten::Memory(_));
-            let mut seen = HashSet::new();
-            let mut stack: Vec<usize> = match in_block_only {
-                true => Vec::new(),
-                false => nd.succs.clone(),
-            };
-            while let Some(x) = stack.pop() {
-                if !seen.insert(x) || seen.len() > 5000 {
-                    continue;
-                }
-                after.extend(lift::node_exprs(&l.nodes[x]));
-                stack.extend(l.nodes[x].succs.iter().copied());
-            }
-            for ((from, _), assigns) in &l.edge_assigns {
-                if *from == nd.id || seen.contains(from) {
-                    after.extend(assigns.iter().map(|(_, v)| *v));
-                }
-            }
+            let after = exprs_after(l, nd, i, in_block_only);
             let forwarded = match st {
                 Stmt::SStore { val, .. } if !expr::is_const(*val) => Some(*val),
                 _ => None,
@@ -2031,6 +2138,11 @@ impl<'a> Printer<'a> {
                 self.line(depth, &def);
                 self.names.replace_stale(loads);
             }
+            for (read, name) in self.early_reads.get(&(n, i)).cloned().unwrap_or_default() {
+                let def = format!("uint256 {} = {};", name, emit::fmt_expr(read, self.names));
+                self.line(depth, &def);
+                self.names.replace_stale([(read, name)]);
+            }
             if let Stmt::Internal { results, .. } = s {
                 if !results.is_empty() && results.iter().all(|r| self.names.aliases.contains_key(r))
                 {
@@ -2900,6 +3012,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         used,
         facts: Vec::new(),
         stale_plan: plan_stale_loads(l, names),
+        early_reads: plan_early_reads(l, names),
         stored: Vec::new(),
         dead_stores: stores_dead_until_exit(l)
             .into_iter()
@@ -2950,6 +3063,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             active: HashSet::new(),
             facts: Vec::new(),
             stale_plan: std::mem::take(&mut p.stale_plan),
+            early_reads: std::mem::take(&mut p.early_reads),
             stored: Vec::new(),
             dead_stores: std::mem::take(&mut p.dead_stores),
             skipped: Default::default(),
@@ -3073,10 +3187,13 @@ fn drop_empty_once(text: &str) -> String {
 }
 
 pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
+    expr::clear_boolean_marks();
     let depth = indent.len() / 4;
     let rolled = reroll_peeled_loops(l);
     let bound = bind_shared(&rolled, n);
-    structure(&bound, n, depth).text
+    let text = structure(&bound, n, depth).text;
+    expr::clear_boolean_marks();
+    text
 }
 
 fn payload_from_stores(stores: &[(ExprId, ExprId)], ptr: ExprId) -> Option<(Vec<ExprId>, u64)> {

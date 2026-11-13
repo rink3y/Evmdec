@@ -43,6 +43,7 @@ pub const BYTE: u8 = 0x1a;
 pub const SHL: u8 = 0x1b;
 pub const SHR: u8 = 0x1c;
 pub const SAR: u8 = 0x1d;
+pub const CLZ: u8 = 0x1e;
 pub const KECCAK256: u8 = 0x20;
 pub const ADDRESS: u8 = 0x30;
 pub const BALANCE: u8 = 0x31;
@@ -135,6 +136,7 @@ pub fn info(opcode: u8) -> Option<OpInfo> {
         0x1b => op("SHL", 2, 1, 3),
         0x1c => op("SHR", 2, 1, 3),
         0x1d => op("SAR", 2, 1, 3),
+        0x1e => op("CLZ", 1, 1, 5),
         0x20 => op("KECCAK256", 2, 1, 30),
         0x30 => op("ADDRESS", 0, 1, 2),
         0x31 => op("BALANCE", 1, 1, 100),

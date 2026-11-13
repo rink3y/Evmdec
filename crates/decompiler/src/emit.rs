@@ -1405,15 +1405,16 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             }
         }
         (op::NOT, 1) => (format!("~{}", fmt_prec(v[0], P_UNARY, n)), P_UNARY),
-        (op::BALANCE, 1) => (
+        (op::CLZ, 1) => (format!("clz({})", fmt_expr(v[0], n)), P_PRIMARY),
+        (op::BALANCE, 1 | 2) => (
             format!("{}.balance", fmt_prec(v[0], P_PRIMARY, n)),
             P_PRIMARY,
         ),
-        (op::EXTCODESIZE, 1) => (
+        (op::EXTCODESIZE, 1 | 2) => (
             format!("{}.code.length", fmt_prec(v[0], P_PRIMARY, n)),
             P_PRIMARY,
         ),
-        (op::EXTCODEHASH, 1) => (
+        (op::EXTCODEHASH, 1 | 2) => (
             format!("{}.codehash", fmt_prec(v[0], P_PRIMARY, n)),
             P_PRIMARY,
         ),

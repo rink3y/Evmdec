@@ -267,21 +267,22 @@ impl<'a> Eval<'a> {
                 match (o, a.len()) {
                     (op::ISZERO, 1) => U256::from(a[0].is_zero()),
                     (op::NOT, 1) => !a[0],
-                    (op::BALANCE, 1) => {
+                    (op::CLZ, 1) => U256::from_u64(u64::from(a[0].leading_zeros())),
+                    (op::BALANCE, 1 | 2) => {
                         if a[0] == self.host.address {
                             self.host.selfbalance
                         } else {
                             self.host.balance(a[0])
                         }
                     }
-                    (op::EXTCODESIZE, 1) => {
+                    (op::EXTCODESIZE, 1 | 2) => {
                         if a[0] == self.host.address {
                             U256::from(self.code.len())
                         } else {
                             self.host.extcodesize(a[0])
                         }
                     }
-                    (op::EXTCODEHASH, 1) => self.host.extcodehash(a[0]),
+                    (op::EXTCODEHASH, 1 | 2) => self.host.extcodehash(a[0]),
                     (op::BLOCKHASH, 1) => self.host.blockhash(a[0]),
                     (op::BLOBHASH, 1) => self.host.blobhash(a[0]),
                     (op::ADD, 2) => a[0].wrapping_add(a[1]),
@@ -342,7 +343,7 @@ impl<'a> Eval<'a> {
 }
 
 fn call_index(seq: u32) -> usize {
-    (seq & 0x3ff) as usize
+    (seq & ((1 << crate::lift::SEQ_BITS) - 1)) as usize
 }
 
 fn write_mem(mem: &mut Vec<u8>, off: U256, data: &[u8]) -> bool {

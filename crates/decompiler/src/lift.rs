@@ -520,9 +520,17 @@ const BIG: u64 = 1 << 40;
 
 const MERGED_RETURN: u32 = 1 << 31;
 
+pub const SEQ_BITS: u32 = 14;
+
 // Must be stable across the rounds a node is lifted in, and never zero.
+// A node or an index too large for its bits gets the stamp of an unknown call,
+// which is never taken to be the same as another.
 fn call_stamp(node: usize, index: usize) -> u32 {
-    ((node as u32) << 10 | (index as u32 & 0x3ff)).wrapping_add(1) & !MERGED_RETURN
+    let nodes = (1usize << (31 - SEQ_BITS)) - 1;
+    if node >= nodes || index >= 1 << SEQ_BITS {
+        return MERGED_RETURN | node as u32;
+    }
+    ((node as u32) << SEQ_BITS | index as u32) + 1
 }
 
 // Past this the oldest writes are forgotten.
@@ -651,6 +659,11 @@ impl Mem {
         let mut v = self.clobber_gen;
         for w in &self.writes {
             if w.base != base {
+                // A write through another pointer may land on the same bytes.
+                // Without the new version two reads around it would count as equal.
+                if may_alias(w.base, w.off, w.len, base, d, n) {
+                    v = v.max(w.gen);
+                }
                 continue;
             }
             let hit = match w.len {
@@ -948,7 +961,15 @@ impl Mem {
         Some(words)
     }
 
-    fn intersect(&mut self, other: &Mem) -> bool {
+    fn forget_all(&mut self, stable: u32) {
+        self.writes.clear();
+        self.written.clear();
+        self.fresh = false;
+        self.gen = merged_version(self.gen, self.gen, stable);
+        self.clobber_gen = self.gen;
+    }
+
+    fn intersect(&mut self, other: &Mem, stable: u32) -> bool {
         let fresh_before = self.fresh;
         let gen_before = self.gen;
         let same = |a: &MemWrite, b: &MemWrite| {
@@ -1021,8 +1042,15 @@ impl Mem {
         let changed_writes = changed_writes || self.written.len() != written_before;
         self.fresh &= other.fresh && overflow == 0;
         if overflow > 0 || other.gen != self.gen || other.clobber_gen != self.clobber_gen {
-            self.gen = self.gen.max(other.gen) + 1;
+            self.gen = merged_version(self.gen, other.gen, stable);
             self.clobber_gen = self.gen;
+            // A write that is unknown after the merge is unknown as of the merge.
+            // Left with the version of a later round it would outrank a store made after.
+            for w in &mut self.writes {
+                if matches!(w.val, MVal::Unknown) {
+                    w.gen = w.gen.min(self.gen);
+                }
+            }
         }
         changed_writes || fresh_before != self.fresh || gen_before != self.gen
     }
@@ -1329,6 +1357,7 @@ impl Hidden {
 struct Entry {
     state: State,
     phis: Vec<bool>,
+    widened: bool,
 }
 
 impl<'a> Lifter<'a> {
@@ -1443,17 +1472,19 @@ impl<'a> Lifter<'a> {
         let mut lnodes: Vec<Option<LNode>> = vec![None; n];
         let mut exit_states: Vec<Option<State>> = vec![None; n];
         let mut runs = vec![0usize; n];
+        let mut unsettled = vec![0usize; n];
         let mut phi_ids: HashMap<(usize, usize), ExprId> = HashMap::new();
-        let mut next_var: u32 = 0;
         let mut work: VecDeque<usize> = VecDeque::new();
         let mut queued = vec![false; n];
         let mut reprocess_count = 0usize;
 
+        let stable = stable_versions(unit);
         let hidden = Hidden::default();
         let init_len = init.stack.len();
         entries[unit.entry] = Some(Entry {
             state: init,
             phis: vec![false; init_len],
+            widened: false,
         });
         work.push_back(unit.entry);
         queued[unit.entry] = true;
@@ -1463,11 +1494,29 @@ impl<'a> Lifter<'a> {
             crate::clock::check();
             queued[nid] = false;
             runs[nid] += 1;
-            if runs[nid] > 24 {
+            let widened = entries[nid].as_ref().is_some_and(|e| e.widened);
+            let allowed = match widened {
+                true => MAX_RUNS_PER_NODE + 8,
+                false => MAX_RUNS_PER_NODE,
+            };
+            if runs[nid] > allowed {
                 continue;
             }
             if runs[nid] > 1 {
                 reprocess_count += 1;
+            }
+            // Some loops need one round per word they move. Stopping at the limit kept
+            // what the earlier rounds still believed, which is not true for later passes.
+            // Giving up every belief about memory and storage first is always true.
+            // A node whose beliefs have settled and whose stack alone still changes keeps them.
+            if runs[nid] == MAX_RUNS_PER_NODE && unsettled[nid] + 2 >= runs[nid] {
+                let e = entries[nid]
+                    .as_mut()
+                    .expect("a scheduled node has an entry state");
+                e.widened = true;
+                e.state.mem.forget_all(stable[nid]);
+                e.state.storage.clear();
+                e.state.sgen = merged_version(e.state.sgen, e.state.sgen, stable[nid]);
             }
             let entry = entries[nid]
                 .clone()
@@ -1506,6 +1555,7 @@ impl<'a> Lifter<'a> {
                 let changed = match &mut entries[s] {
                     None => {
                         entries[s] = Some(Entry {
+                            widened: false,
                             phis: vec![false; exit.stack.len()],
                             state: State {
                                 stack: exit.stack.clone(),
@@ -1542,7 +1592,16 @@ impl<'a> Lifter<'a> {
                         e.phis = vec![false; e.state.stack.len()];
                         changed
                     }
-                    Some(e) => merge_into(e, &exit, s, &mut phi_ids, &mut next_var),
+                    Some(e) => {
+                        let before = (e.state.mem.gen, e.state.sgen, e.state.storage.len());
+                        let known = e.state.mem.writes.clone();
+                        let changed = merge_into(e, &exit, s, stable[s], &mut phi_ids);
+                        let after = (e.state.mem.gen, e.state.sgen, e.state.storage.len());
+                        if before != after || known != e.state.mem.writes {
+                            unsettled[s] = runs[s];
+                        }
+                        changed
+                    }
                 };
                 if changed && !queued[s] {
                     queued[s] = true;
@@ -1851,7 +1910,7 @@ impl<'a> Lifter<'a> {
         let mut stmts: Vec<Stmt> = Vec::new();
         let mut term: Option<Term> = None;
         let mut underflow = false;
-        let seq_base = (nid as u32) << 10;
+        let seq_base = (nid as u32) << SEQ_BITS;
         let mut seq_ctr = 0u32;
         let next_version = |st: &mut State| {
             st.mem.tick();
@@ -1948,13 +2007,18 @@ impl<'a> Lifter<'a> {
                     let a = pop!();
                     let own =
                         o == op::BALANCE && matches!(expr::node(a), Node::Env(op::ADDRESS, _));
+                    // A call or a create can change another account's balance and code.
+                    // The stamp keeps a read made after one apart from a read made before.
+                    let changes = matches!(o, op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH);
                     st.stack.push(if own {
                         expr::intern(Node::Env(op::SELFBALANCE, st.sgen))
+                    } else if changes && st.sgen > 0 {
+                        expr::intern(Node::Op(o, vec![a, konst_u64(u64::from(st.sgen))]))
                     } else {
                         expr::intern(Node::Op(o, vec![a]))
                     });
                 }
-                op::ISZERO | op::NOT => {
+                op::ISZERO | op::NOT | op::CLZ => {
                     let a = pop!();
                     st.stack.push(op1(o, a));
                 }
@@ -2796,12 +2860,65 @@ fn remap_term(t: &Term, map: &HashMap<usize, usize>) -> Term {
     }
 }
 
+// A version taken at a merge has to be the same every time the node is merged, or a loop
+// that writes memory or storage raises it on every round and never settles. It also has
+// to be above every version that reaches the node along a forward edge. Nodes are ranked
+// in reverse postorder and each rank owns a range, which gives both.
+const VERSIONS_PER_NODE: u32 = 1 << 14;
+const MAX_RUNS_PER_NODE: usize = 24;
+
+fn stable_versions(unit: &Unit) -> Vec<u32> {
+    let n = unit.nodes.len();
+    let mut order = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let mut stack: Vec<(usize, usize)> = vec![(unit.entry, 0)];
+    seen[unit.entry] = true;
+    while let Some((x, next)) = stack.last().copied() {
+        let Some((s, _)) = unit.nodes[x].succs.get(next).copied() else {
+            order.push(x);
+            stack.pop();
+            continue;
+        };
+        stack.last_mut().expect("just read").1 += 1;
+        if !seen[s] {
+            seen[s] = true;
+            stack.push((s, 0));
+        }
+    }
+    let mut stable = vec![u32::MAX; n];
+    for (rank, node) in order.iter().rev().enumerate() {
+        stable[*node] = (rank as u32 + 1).saturating_mul(VERSIONS_PER_NODE);
+    }
+    stable
+}
+
+// What reaches a node along a forward edge is below the node's stable version, so only a
+// back edge can bring a higher one, and that one is a later pass over the same node.
+// An entry already past its stable version came from a block with more writes than a
+// rank's range, and then the old rule of one above both is the safe one.
+fn merged_version(mine: u32, theirs: u32, stable: u32) -> u32 {
+    if mine <= stable {
+        stable
+    } else {
+        mine.max(theirs) + 1
+    }
+}
+
+// The id is made from the place the variable stands for. A running count packed into a
+// few bits came round again after enough merges and gave two places one variable.
+fn merge_var(node: usize, from_top: usize) -> ExprId {
+    match u32::try_from(from_top) {
+        Ok(depth) if depth < 1 << 10 && node < 1 << 22 => expr::var(((node as u32) << 10) | depth),
+        _ => expr::intern(Node::Unknown(expr::next_seq())),
+    }
+}
+
 fn merge_into(
     e: &mut Entry,
     exit: &State,
     node: usize,
+    stable: u32,
     phi_ids: &mut HashMap<(usize, usize), ExprId>,
-    next_var: &mut u32,
 ) -> bool {
     let mut changed = false;
     let el = e.state.stack.len();
@@ -2823,10 +2940,9 @@ fn merge_into(
                 new_phis.push(false);
             } else {
                 let from_top = xl - 1 - i;
-                let var = *phi_ids.entry((node, from_top)).or_insert_with(|| {
-                    *next_var += 1;
-                    expr::var(((node as u32) << 10) | (*next_var & 0x3ff))
-                });
+                let var = *phi_ids
+                    .entry((node, from_top))
+                    .or_insert_with(|| merge_var(node, from_top));
                 new_bottom.push(var);
                 new_phis.push(true);
             }
@@ -2854,16 +2970,15 @@ fn merge_into(
             continue;
         }
         if exit_val != Some(e.state.stack[k]) {
-            let var = *phi_ids.entry((node, from_top)).or_insert_with(|| {
-                *next_var += 1;
-                expr::var(((node as u32) << 10) | (*next_var & 0x3ff))
-            });
+            let var = *phi_ids
+                .entry((node, from_top))
+                .or_insert_with(|| merge_var(node, from_top));
             e.state.stack[k] = var;
             e.phis[k] = true;
             changed = true;
         }
     }
-    if e.state.mem.intersect(&exit.mem) {
+    if !e.widened && e.state.mem.intersect(&exit.mem, stable) {
         changed = true;
     }
     let before = e.state.storage.len();
@@ -2874,9 +2989,10 @@ fn merge_into(
     if exit.args_used > e.state.args_used {
         e.state.args_used = exit.args_used;
     }
-    if exit.sgen != e.state.sgen {
-        e.state.sgen = e.state.sgen.max(exit.sgen) + 1;
-        changed = true;
+    if exit.sgen != e.state.sgen && !e.widened {
+        let merged = merged_version(e.state.sgen, exit.sgen, stable);
+        changed |= merged != e.state.sgen;
+        e.state.sgen = merged;
     }
     let merged_return = match exit.returned == e.state.returned {
         true => exit.returned,

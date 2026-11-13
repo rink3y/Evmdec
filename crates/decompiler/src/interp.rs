@@ -569,6 +569,10 @@ impl<'a> Machine<'a> {
                 let a = self.pop()?;
                 self.push(!a)?;
             }
+            op::CLZ => {
+                let a = self.pop()?;
+                self.push(U256::from_u64(u64::from(a.leading_zeros())))?;
+            }
             op::BYTE => bin!(|a: U256, b: U256| U256::byte(a, b)),
             op::SHL => bin!(|a: U256, b: U256| if a >= U256::from_u64(256) {
                 U256::ZERO

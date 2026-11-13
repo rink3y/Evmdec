@@ -212,6 +212,9 @@ fn mentions_returndata(e: ExprId, seq: u32) -> bool {
 
 const SEL_TRANSFER: u32 = 0xa9059cbb;
 const SEL_TRANSFER_FROM: u32 = 0x23b872dd;
+// Asking an account whether it signed is the purpose of this call. Its answer is the
+// account's own word about itself, which is what the caller of it wants.
+const SEL_IS_VALID_SIGNATURE: u32 = 0x1626ba7e;
 const SEL_SYNC: u32 = 0xfff6cae9;
 const SEL_SKIM: u32 = 0xbc25cf77;
 const SEL_GET_RESERVES: u32 = 0x0902f1ac;
@@ -353,6 +356,8 @@ struct LinkedCall {
     selector: Option<u32>,
     sends_value: bool,
     approval: bool,
+    // The payload is known to be empty. No selector alone can also mean it is not known.
+    empty: bool,
     line: String,
 }
 
@@ -843,6 +848,7 @@ fn collect_facts(
             cond,
             &|n| matches!(n, Node::SLoad(k, false, _) if expr::is_const(*k)),
         ) && !is_auth_cond_in(cond, &ctx.roles)
+            && tests_only_storage(cond)
         {
             facts.init_guarded = true;
         }
@@ -850,7 +856,7 @@ fn collect_facts(
     let layout = ctx.c.compiler.layout;
     let mut mutations: Vec<&Event> = Vec::new();
     let mut call_selector: HashMap<u32, u32> = HashMap::new();
-    let mut linked_sites: Vec<(String, Option<u32>, bool, bool, Stmt)> = Vec::new();
+    let mut linked_sites: Vec<(String, Option<u32>, bool, bool, bool, Stmt)> = Vec::new();
     for ev in events {
         match &ev.stmt {
             Some(
@@ -936,7 +942,15 @@ fn collect_facts(
                         .and_then(|sp| linked_address(ctx, sp))
                         .map(|a| (a, true));
                     for (address, approval) in callee.into_iter().chain(approved) {
-                        linked_sites.push((address, selector, sends_value, approval, st.clone()));
+                        let empty = expr::as_const(*in_len) == Some(U256::ZERO);
+                        linked_sites.push((
+                            address,
+                            selector,
+                            sends_value,
+                            approval,
+                            empty,
+                            st.clone(),
+                        ));
                     }
                 }
                 if let Some(slot) = ssa::stored_address_slot(*addr) {
@@ -1008,11 +1022,12 @@ fn collect_facts(
         facts.linked_calls = linked_sites
             .into_iter()
             .map(
-                |(address, selector, sends_value, approval, st)| LinkedCall {
+                |(address, selector, sends_value, approval, empty, st)| LinkedCall {
                     address,
                     selector,
                     sends_value,
                     approval,
+                    empty,
                     line: emit::fmt_stmt(&st, &own),
                 },
             )
@@ -1258,7 +1273,7 @@ fn is_caller(e: ExprId) -> bool {
 fn walk(e: ExprId, seen: &mut HashSet<ExprId>, visit: &mut dyn FnMut(ExprId, &Node)) {
     let mut stack = vec![e];
     while let Some(x) = stack.pop() {
-        if seen.len() > 20_000 || !seen.insert(x) {
+        if !seen.insert(x) {
             continue;
         }
         let n = expr::node(x);
@@ -2518,6 +2533,39 @@ fn loop_nodes(l: &Lifted) -> HashSet<usize> {
     in_loop
 }
 
+const MAX_KEPT_EVENTS: usize = 1 << 20;
+
+#[derive(Default)]
+struct Replay {
+    events: Vec<Event>,
+    computed_returns: HashMap<u32, ExprId>,
+    carried: Vec<ExprId>,
+    made: HashMap<ExprId, String>,
+    code_copies: Vec<(ExprId, usize, usize)>,
+}
+
+impl Replay {
+    fn of(ctx: &Ctx, l: &Lifted) -> Replay {
+        let events = events_of(ctx, l, 5, false);
+        Replay {
+            events,
+            computed_returns: ctx.computed_returns.take(),
+            carried: ctx.carried.take(),
+            made: ctx.made.take(),
+            code_copies: ctx.code_copies.take(),
+        }
+    }
+
+    // The rules read these tables from the context while they walk the events.
+    fn into_events(self, ctx: &Ctx) -> Vec<Event> {
+        ctx.computed_returns.replace(self.computed_returns);
+        ctx.carried.replace(self.carried);
+        ctx.made.replace(self.made);
+        ctx.code_copies.replace(self.code_copies);
+        self.events
+    }
+}
+
 fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Event> {
     ctx.computed_returns.borrow_mut().clear();
     ctx.carried.borrow_mut().clear();
@@ -2924,6 +2972,84 @@ pub(crate) fn push(
     });
 }
 
+// The rule can only speak about a digest it can read. One that a helper returns, or
+// that starts with the 0x1901 marker and so carries a domain value fixed when the
+// contract was built, may bind the chain and the contract in a way not visible here.
+fn digest_unseen(digest: ExprId) -> bool {
+    let structured =
+        |n: &Node| matches!(n, Node::Const(c) if (*c >> 240) == U256::from_u64(0x1901));
+    mentions(digest, &|n| {
+        matches!(n, Node::IntRet(..) | Node::Var(_) | Node::Unknown(_))
+    }) || mentions(digest, &structured)
+}
+
+// The other side of an equality test that has the wanted value on one side.
+fn compared_with(cond: ExprId, wanted: &dyn Fn(&Node) -> bool) -> Option<ExprId> {
+    fn strip(e: ExprId) -> ExprId {
+        match expr::node(e) {
+            Node::Op(op::ISZERO, v) => strip(v[0]),
+            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
+                strip(v[0])
+            }
+            _ => e,
+        }
+    }
+    match expr::node(strip(cond)) {
+        Node::Op(op::AND | op::OR, v) if v.iter().all(|x| expr::is_boolean(*x)) => {
+            v.iter().find_map(|x| compared_with(*x, wanted))
+        }
+        Node::Op(op::EQ | op::SUB | op::XOR, v) => [(v[0], v[1]), (v[1], v[0])]
+            .iter()
+            .find(|(value, _)| mentions(*value, wanted))
+            .map(|(_, other)| strip(*other)),
+        _ => None,
+    }
+}
+
+// A target that is a word of the call's input or the caller, not something worked out
+// from them. An address hashed from the input is fixed by that hash.
+fn asked_directly(addr: ExprId) -> bool {
+    let inner = match expr::node(addr) {
+        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
+        _ => addr,
+    };
+    matches!(
+        expr::node(inner),
+        Node::CallDataLoad(_) | Node::Arg(_) | Node::Env(op::CALLER, _)
+    )
+}
+
+fn tests_zero(cond: ExprId, wanted: &dyn Fn(&Node) -> bool) -> bool {
+    fn strip(e: ExprId) -> ExprId {
+        match expr::node(e) {
+            Node::Op(op::ISZERO, v) => strip(v[0]),
+            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
+                strip(v[0])
+            }
+            _ => e,
+        }
+    }
+    let inner = strip(cond);
+    match expr::node(inner) {
+        Node::Op(op::AND | op::OR, v) if v.iter().all(|x| expr::is_boolean(*x)) => {
+            v.iter().any(|x| tests_zero(*x, wanted))
+        }
+        Node::Op(op::EQ, v) => [(v[0], v[1]), (v[1], v[0])].iter().any(|(value, zero)| {
+            expr::as_const(*zero) == Some(U256::ZERO) && mentions(*value, wanted)
+        }),
+        n => wanted(&n),
+    }
+}
+
+// An initializer tests what is stored, to see that nothing is there yet. A test that
+// also reads the call's input, the caller or anything else is some other check, and
+// taking it for that one let any extra requirement pass as protection.
+fn tests_only_storage(cond: ExprId) -> bool {
+    let fixed_slot = |n: &Node| matches!(n, Node::SLoad(k, false, _) if expr::is_const(*k));
+    let other = |n: &Node| !matches!(n, Node::Const(_) | Node::Op(..) | Node::SLoad(..));
+    mentions(cond, &fixed_slot) && !mentions(cond, &other)
+}
+
 fn mapping_root(key: ExprId) -> Option<U256> {
     match expr::node(key) {
         Node::Keccak(words, _) => {
@@ -2932,6 +3058,13 @@ fn mapping_root(key: ExprId) -> Option<U256> {
                     if let Some(r) = mapping_root(*w) {
                         return Some(r);
                     }
+                }
+                // An inner key made of constants was folded to one constant. A small role
+                // number and the slot can both be small, and the slot is the word hashed last.
+                let folded = expr::as_const(*w).and_then(expr::hash_parts);
+                let slot = folded.and_then(|p| p.into_iter().rev().find(|c| c.bits() <= 32));
+                if slot.is_some() {
+                    return slot;
                 }
             }
             words
@@ -3141,10 +3274,9 @@ pub fn is_auth_cond(cond: ExprId) -> bool {
                     if expr::as_const(b2).is_some_and(|c| c.byte_len() >= 15) {
                         return true;
                     }
-                    if matches!(
-                        expr::node(b2),
-                        Node::Env(op::ADDRESS, _) | Node::Env(op::ORIGIN, _)
-                    ) {
+                    // Every wallet passes a test of the caller against the origin, so that
+                    // test keeps contracts out and is no check on who may call.
+                    if matches!(expr::node(b2), Node::Env(op::ADDRESS, _)) {
                         return true;
                     }
                 }
@@ -3174,13 +3306,47 @@ fn node_conds(nd: &lift::LNode) -> Vec<ExprId> {
     v
 }
 
+// One side of a guarding branch stops without doing anything. A side that goes on to
+// write, call or log is an ordinary branch, and what follows it runs for every caller.
+fn leaves_quietly(l: &Lifted, start: usize) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) {
+            continue;
+        }
+        let nd = &l.nodes[x];
+        let acts = |s: &Stmt| {
+            matches!(
+                s,
+                Stmt::SStore { .. } | Stmt::Call { .. } | Stmt::Create { .. } | Stmt::Log { .. }
+            )
+        };
+        let ends = matches!(nd.term, Term::SelfDestruct(_));
+        if seen.len() > MAX_QUIET_NODES || ends || nd.stmts.iter().any(acts) {
+            return false;
+        }
+        stack.extend(nd.succs.iter().copied());
+    }
+    true
+}
+
+const MAX_QUIET_NODES: usize = 64;
+
 fn has_caller_check(l: &Lifted, before: Option<usize>, roles: &HashSet<U256>) -> bool {
     for nd in &l.nodes {
-        if node_conds(nd)
-            .into_iter()
-            .any(|c| is_auth_cond_in(c, roles))
-            && before.is_none_or(|b| reaches(l, nd.id, b))
-        {
+        let auth = |c: &ExprId| is_auth_cond_in(*c, roles);
+        let required = nd
+            .stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Require { cond, .. } if auth(cond)));
+        let guarded = match &nd.term {
+            Term::Branch { cond, t, f } if auth(cond) => {
+                t.is_none_or(|t| leaves_quietly(l, t)) || leaves_quietly(l, *f)
+            }
+            _ => false,
+        };
+        if (required || guarded) && before.is_none_or(|b| reaches(l, nd.id, b)) {
             return true;
         }
     }
@@ -3306,13 +3472,16 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         unguarded_extenders: HashMap::new(),
     };
     ctx.roles = role_mappings(&ctx);
-    for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
-        if any_caller_check(&ctx, f) {
+    let mut replays: HashMap<usize, Replay> = HashMap::new();
+    let mut kept = 0;
+    for (index, f) in c.functions.iter().enumerate() {
+        if f.kind != FnKind::External || any_caller_check(&ctx, f) {
             continue;
         }
         let Some(l) = &f.lifted else { continue };
         let mut grown: HashSet<U256> = HashSet::new();
-        for ev in events_of(&ctx, l, 5, false) {
+        let replay = Replay::of(&ctx, l);
+        for ev in &replay.events {
             if let Some(Stmt::SStore {
                 key,
                 val,
@@ -3336,6 +3505,10 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                 .entry(k)
                 .or_default()
                 .push(display_name(f));
+        }
+        kept += replay.events.len();
+        if kept <= MAX_KEPT_EVENTS {
+            replays.insert(index, replay);
         }
     }
     for f in &c.functions {
@@ -3438,14 +3611,16 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     let mut eip1967 = false;
     let mut delegatecall_targets_storage = false;
 
-    for f in c
-        .functions
-        .iter()
-        .filter(|f| f.kind != FnKind::Internal && f.kind != FnKind::Orphan)
-    {
+    for (index, f) in c.functions.iter().enumerate() {
+        if f.kind == FnKind::Internal || f.kind == FnKind::Orphan {
+            continue;
+        }
         let Some(l) = &f.lifted else { continue };
         let names = names_for(f);
-        let events = events_of(&ctx, l, 5, false);
+        let replay = replays.remove(&index);
+        let events = replay
+            .unwrap_or_else(|| Replay::of(&ctx, l))
+            .into_events(&ctx);
         let caller_checked = any_caller_check(&ctx, f);
         let fact = collect_facts(&ctx, f, &events, caller_checked, &names);
         summaries.extend(summarise(&ctx, &fact, &events, &auth, &names));
@@ -3496,12 +3671,22 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         if f.mutability == crate::function::Mutability::Payable {
             any_payable = true;
         }
-        let always_reverts = !l.nodes.iter().any(|nd| {
-            matches!(
-                nd.term,
-                Term::Return { .. } | Term::ReturnDyn { .. } | Term::Stop | Term::SelfDestruct(_)
-            )
-        });
+        // A helper can end the call with success as well as the function itself can.
+        let ends_well = |g: &Lifted| {
+            g.nodes.iter().any(|nd| {
+                matches!(
+                    nd.term,
+                    Term::Return { .. }
+                        | Term::ReturnDyn { .. }
+                        | Term::Stop
+                        | Term::SelfDestruct(_)
+                )
+            })
+        };
+        let always_reverts = !ends_well(l)
+            && !transitive_callees(&ctx, f)
+                .iter()
+                .any(|cf| cf.lifted.as_ref().is_some_and(ends_well));
 
         let const_sloads = |e: ExprId| -> Vec<ExprId> {
             let mut out = Vec::new();
@@ -3799,8 +3984,11 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                         }
                     }
 
-                    if *kind == op::CALL || *kind == op::CALLCODE {
-                        let later_write = events[i + 1..].iter().any(|e2| {
+                    // A read-only call can still feed a price, check a signature or return data the
+                    // code then trusts. The rules about what a call changes stay with calls that can.
+                    let plain = *kind == op::CALL || *kind == op::CALLCODE;
+                    if plain || *kind == op::STATICCALL {
+                        let later_write = plain && events[i + 1..].iter().any(|e2| {
                             let hit = matches!(&e2.stmt, Some(Stmt::SStore { .. }))
                                 && ev_reaches(&ctx, l, ev, e2);
                             if hit && std::env::var("EVMDEC_DEBUG_REENTRANCY").is_ok() {
@@ -3836,12 +4024,12 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 vec![line.clone()], "Apply the checks-effects-interactions pattern (update state before calling out) or use a reentrancy guard.");
                         }
                         let used = used_sites.contains(&lift::call_site(*seq));
-                        if !used && !precompile {
+                        if plain && !used && !precompile {
                             push(&mut findings, "unchecked-call", "Return value of external call ignored", if value_nonzero { Severity::Medium } else { Severity::Low }, Confidence::High, Some(f), Some(ev.pc),
                                 format!("`{}` ignores the success flag of a low-level call to `{}`. If the call fails (reverting callee, out of gas, non-contract address) execution continues as if it succeeded{}.", f.name, target, if value_nonzero { ", and the ether is kept by this contract while state may assume it was sent" } else { "" }),
                                 vec![line.clone()], "Check the returned boolean (`require(success)`) or use a high-level call that reverts on failure.");
                         }
-                        if input.is_some() {
+                        if plain && input.is_some() {
                             if let Some(sel) = selector {
                                 if matches!(sel, SEL_TRANSFER | SEL_TRANSFER_FROM | SEL_APPROVE) {
                                     let out_zero = expr::as_const(*out_len) == Some(U256::ZERO);
@@ -3971,7 +4159,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                             && !caller_checked
                             && !always_reverts
                             && f.kind == FnKind::External;
-                        if arbitrary {
+                        if plain && arbitrary {
                             push(&mut findings, "arbitrary-call", "Arbitrary external call with caller-controlled target and data", Severity::High, Confidence::Medium, Some(f), Some(ev.pc),
                                 format!("`{}` calls `{}` with calldata-derived payload and no access control. If this contract holds token approvals or ether, anyone can drain them through it (e.g. calling `transferFrom` on an approved token).", f.name, target),
                                 vec![line.clone()], "Restrict callable targets/selectors, or make sure the contract never holds funds or approvals.");
@@ -4006,7 +4194,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                             })
                             || (mentions(*addr, &|n| matches!(n, Node::IntRet(..)))
                                 && int_ret_fixed(*addr));
-                        if !arbitrary
+                        if plain
+                            && !arbitrary
                             && !fixed_target
                             && !selector_known
                             && !caller_checked
@@ -4026,7 +4215,9 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 format!("`{}` calls `{}` with a payload whose selector is computed rather than fixed, and the function has no access control. If the caller can influence either (through calldata, a forged proof, or a message the contract trusts), this is an arbitrary call made by this contract.", f.name, target),
                                 vec![line.clone()], "Whitelist the targets and the selectors that can be dispatched, and authenticate the source of the request.");
                         }
-                        if let (Some(words), Some(SEL_TRANSFER_FROM)) = (words_view, selector) {
+                        if let (true, Some(words), Some(SEL_TRANSFER_FROM)) =
+                            (plain, words_view, selector)
+                        {
                             if !caller_checked && f.kind == FnKind::External && !always_reverts {
                                 let from = emit::shifted_word_len(words, 0, in_len_c);
                                 let from_user = from_calldata(from)
@@ -4064,7 +4255,11 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 }
                             }
                         }
+                        // An address the contract reads from its own storage under an index
+                        // the caller gives is the contract's choice, not the caller's.
                         if user_target
+                            && (plain || asked_directly(*addr))
+                            && selector != Some(SEL_IS_VALID_SIGNATURE)
                             && !caller_checked
                             && !precompile
                             && f.kind == FnKind::External
@@ -4135,7 +4330,9 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 }
                             }
                         }
-                        if let (Some(words), Some(SEL_TRANSFER_FROM)) = (words_view, selector) {
+                        if let (true, Some(words), Some(SEL_TRANSFER_FROM)) =
+                            (plain, words_view, selector)
+                        {
                             let to = emit::shifted_word_len(words, 1, in_len_c);
                             if mentions(to, &|n| matches!(n, Node::Env(op::ADDRESS, _))) {
                                 let amount = emit::shifted_word_len(words, 2, in_len_c);
@@ -4148,7 +4345,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 }
                             }
                         }
-                        if let (Some(words), Some(sel)) = (words_view, selector) {
+                        if let (true, Some(words), Some(sel)) = (plain, words_view, selector) {
                             if let Some((given, received, how)) =
                                 reverse_quote(&ctx, l, &events, words, sel, in_len_c)
                             {
@@ -4259,7 +4456,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                     vec![line.clone()], "Bound the parameter with a require, or use checked arithmetic (SafeMath / solc >= 0.8).");
                             }
                         }
-                        if ev.in_loop && !precompile {
+                        if plain && ev.in_loop && !precompile {
                             let required = events.iter().any(|e2| match (&e2.stmt, &e2.term) {
                                 (Some(Stmt::Require { cond, .. }), _)
                                 | (_, Some(Term::Branch { cond, .. })) => mentions(
@@ -4289,7 +4486,38 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                             }
                         }
                         if expr::as_const(*addr) == Some(U256::ONE) {
-                            let zero_checked = l.nodes.iter().any(|nd| matches!(&nd.term, Term::Branch { cond, .. } if mentions(*cond, &|n| matches!(n, Node::ReturnData(s, _) if *s == *seq)) || mentions(*cond, &|n| matches!(n, Node::MLoad(..)))));
+                            // The check that matters compares what was recovered with zero. A
+                            // comparison with a stored signer is not one, since an unset signer
+                            // is zero too. It may sit in a helper, so the inlined steps are read.
+                            let recovered = |n: &Node| {
+                                matches!(n, Node::ReturnData(s, _) if *s == *seq)
+                                    || matches!(n, Node::MLoad(..))
+                            };
+                            let zero_checked = events.iter().any(|e| {
+                                let cond = match (&e.stmt, &e.term) {
+                                    (Some(Stmt::Require { cond, .. }), _) => Some(*cond),
+                                    (_, Some(Term::Branch { cond, .. })) => Some(*cond),
+                                    _ => None,
+                                };
+                                cond.is_some_and(|c| tests_zero(c, &recovered))
+                            });
+                            // Comparing it with an account already shown not to be zero does
+                            // the same job.
+                            let conds: Vec<ExprId> = events
+                                .iter()
+                                .filter_map(|e| match (&e.stmt, &e.term) {
+                                    (Some(Stmt::Require { cond, .. }), _) => Some(*cond),
+                                    (_, Some(Term::Branch { cond, .. })) => Some(*cond),
+                                    _ => None,
+                                })
+                                .collect();
+                            let zero_checked = zero_checked
+                                || conds.iter().any(|c| {
+                                    compared_with(*c, &recovered).is_some_and(|other| {
+                                        let it = expr::node(other);
+                                        conds.iter().any(|d| tests_zero(*d, &|n| *n == it))
+                                    })
+                                });
                             if !zero_checked {
                                 push(&mut findings, "ecrecover-zero", "ecrecover result may be the zero address", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                     format!("`{}` calls the ecrecover precompile; no comparison of the recovered address against zero was found. An invalid signature recovers to address(0), which may match an unset storage slot.", f.name), vec![line.clone()], "Require the recovered signer to be non-zero (or use OpenZeppelin ECDSA).");
@@ -4305,14 +4533,25 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                             Node::Env(op::CHAINID, _) | Node::Env(op::ADDRESS, _)
                                         )
                                     }) || matches!(expr::node(digest), Node::KeccakMem(..))
-                                        || from_storage(digest);
+                                        || from_storage(digest)
+                                        || digest_unseen(digest);
                                 if !domain_bound {
                                     push(&mut findings, "signature-replay-domain", "Signed digest does not bind the chain or this contract", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                         format!("`{}` verifies a signature over `{}`, which includes neither `block.chainid` nor `address(this)` (no EIP-712 domain). The same signature is valid on every chain and every deployment.", f.name, emit::fmt_expr(digest, names)),
                                         vec![line.clone()], "Sign an EIP-712 digest that includes the chain id and the verifying contract.");
                                 }
                                 let signer_keyed_write = events.iter().any(|e2| matches!(&e2.stmt, Some(Stmt::SStore { key, .. }) if mentions_returndata(*key, *seq) || contains_expr(*key, digest) || mentions(*key, &|n| matches!(n, Node::Keccak(..) | Node::KeccakMem(..)))));
-                                if !signer_keyed_write && !always_reverts {
+                                // A function that only checks a signature it is handed and changes
+                                // nothing leaves the bookkeeping to whoever calls it.
+                                let acts = events.iter().any(|e2| {
+                                    matches!(
+                                        &e2.stmt,
+                                        Some(
+                                            Stmt::SStore { .. } | Stmt::Call { value: Some(_), .. }
+                                        )
+                                    )
+                                });
+                                if !signer_keyed_write && !always_reverts && acts {
                                     push(&mut findings, "signature-replay-nonce", "No nonce or consumed-digest bookkeeping for a verified signature", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                         format!("`{}` recovers a signer but writes no storage keyed by the signer or by the digest, so the same signature can be submitted again.", f.name),
                                         vec![line.clone()], "Store and increment a per-signer nonce, or mark the digest as used.");
@@ -4336,7 +4575,11 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                     }
                     let _ = result;
                 }
-                Stmt::Create { kind, .. } => {
+                Stmt::Create { kind, value, .. } => {
+                    // Ether given to a contract as it is created has left this one.
+                    if expr::as_const(*value) != Some(U256::ZERO) {
+                        any_ether_out = true;
+                    }
                     let line = emit::fmt_stmt(stmt, names);
                     push(
                         &mut findings,
@@ -4456,7 +4699,10 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
 
         for nd in &l.nodes {
             if let Term::Branch { cond, .. } = &nd.term {
+                // A test of the origin against the caller only keeps contracts out. It
+                // gives nobody a right, so there is nothing for a relaying contract to borrow.
                 if mentions(*cond, &|n| matches!(n, Node::Env(op::ORIGIN, _)))
+                    && !from_caller(*cond)
                     && matches!(
                         expr::node(*cond),
                         Node::Op(op::EQ, _) | Node::Op(op::ISZERO, _)
@@ -4479,15 +4725,27 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                     Node::Keccak(..) | Node::KeccakMem(..) | Node::Op(op::BLOCKHASH, _)
                 )
             };
+            // A mapping keyed by the block number hashes it to find the slot. That hash
+            // picks where a value lives and is no source of chance.
+            let slots: HashSet<ExprId> = events
+                .iter()
+                .filter_map(|e| match &e.stmt {
+                    Some(Stmt::SStore { key, .. }) => Some(*key),
+                    _ => None,
+                })
+                .collect();
             let mut hashes: Vec<ExprId> = Vec::new();
             for e in events.iter().flat_map(event_exprs) {
                 let mut seen = HashSet::new();
                 let mut stack = vec![e];
                 while let Some(x) = stack.pop() {
-                    if !seen.insert(x) || seen.len() > 5000 {
+                    if !seen.insert(x) || seen.len() > 5000 || slots.contains(&x) {
                         continue;
                     }
                     let n = expr::node(x);
+                    if matches!(n, Node::SLoad(..)) {
+                        continue;
+                    }
                     if is_hash(&n) && mentions(x, &blocky) && !hashes.contains(&x) {
                         hashes.push(x);
                     }
@@ -4893,9 +5151,11 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                             && expr::is_const(*key)
                             && (from_calldata(*val) || from_caller(*val))
                         {
-                            let k = *key;
                             let init_guard = events.iter().any(|e| match (&e.term, &e.stmt) {
-                                (Some(Term::Branch { cond, .. }), _) | (_, Some(Stmt::Require { cond, .. })) => mentions(*cond, &|n| matches!(n, Node::SLoad(kk, _, _) if *kk == k)) || mentions(*cond, &|n| matches!(n, Node::SLoad(kk, _, _) if expr::is_const(*kk) && *kk != k)) && matches!(expr::node(*cond), Node::Op(op::ISZERO, _) | Node::Op(op::EQ, _)),
+                                (Some(Term::Branch { cond, .. }), _)
+                                | (_, Some(Stmt::Require { cond, .. })) => {
+                                    tests_only_storage(*cond)
+                                }
                                 _ => false,
                             });
                             if init_guard {
@@ -4984,7 +5244,19 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             );
         }
     }
-    if ctx.vyper && lock_slots.len() >= 3 {
+    // The compilers with this fault gave every function a slot of its own. Three locks that
+    // several functions share are three named locks from a compiler that works. A version
+    // the trailer names and that is not one of the three is taken at its word.
+    let faulty = ctx
+        .version
+        .is_none_or(|v| matches!(v, (0, 2, 15) | (0, 2, 16) | (0, 3, 0)));
+    // Entries a few bytes apart are one function entered with and without its default
+    // arguments, so they count as one.
+    let one_each = lock_slots.values().all(|fs| {
+        let (first, last) = (fs.iter().min(), fs.iter().max());
+        first.zip(last).is_none_or(|(a, b)| b - a <= 64)
+    });
+    if ctx.vyper && faulty && one_each && lock_slots.len() >= 3 {
         let mut fns: Vec<String> = lock_slots
             .values()
             .flatten()
@@ -4992,7 +5264,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             .collect();
         fns.sort();
         push(&mut findings, "vyper-reentrancy-lock-bug", "Each @nonreentrant function uses its own lock slot (Vyper 0.2.15 – 0.3.0 codegen bug)", Severity::High, Confidence::Medium, None, None,
-            format!("{} functions implement a reentrancy lock, and every one of them locks a different storage slot, so none of them excludes the others. Vyper 0.2.15, 0.2.16 and 0.3.0 compiled `@nonreentrant(\"key\")` this way (Curve pools, July 2023). Functions: {}.", lock_slots.len(), fns.join(", ")),
+            format!("{} functions implement a reentrancy lock, and every one of them locks a different storage slot, so none of them excludes the others. Vyper 0.2.15, 0.2.16 and 0.3.0 compiled `@nonreentrant(\"key\")` this way (Curve pools, July 2023). Functions: {}.", fns.len(), fns.join(", ")),
             vec![], "Recompile with a fixed compiler; until then treat every locked function as re-enterable from the others.");
     }
     if any_payable
@@ -5207,7 +5479,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                 c.strings
                     .iter()
                     .take(12)
-                    .map(|s| format!("\"{}\"", s))
+                    .map(|s| format!("\"{}\"", emit::escape(s)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -5217,7 +5489,31 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     }
 
     let mut seen = HashSet::new();
-    findings.retain(|f| seen.insert((f.id.clone(), f.function.clone(), f.pc, f.title.clone())));
+    let entries: HashMap<String, usize> = c
+        .functions
+        .iter()
+        .map(|f| (display_name(f), f.pc))
+        .collect();
+    // A finding about a whole function carries that function's own start. It can say
+    // different things, such as two chains that start there, so only the same words are a
+    // repeat. Any other place is one piece of code. Its words differ when a helper was
+    // read through two of its callers.
+    findings.retain(|f| {
+        let own_start = f.function.as_ref().and_then(|name| entries.get(name));
+        let whole = f.pc.is_none() || f.pc.as_ref() == own_start;
+        let words = if whole {
+            f.description.clone()
+        } else {
+            String::new()
+        };
+        seen.insert((
+            f.id.clone(),
+            f.function.clone(),
+            f.pc,
+            f.title.clone(),
+            words,
+        ))
+    });
     let positions: HashMap<String, Vec<(String, String)>> = c
         .functions
         .iter()
@@ -6501,7 +6797,7 @@ fn link_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
                     "Call a function the target implements, or point the call at the contract that does.",
                     findings,
                 ),
-                (None, _) if call.sends_value && !catch_all(true) => tell(
+                (None, _) if call.sends_value && call.empty && !catch_all(true) => tell(
                     "value-to-non-payable",
                     "Ether is sent to a contract that does not accept it",
                     Severity::Medium,
@@ -7411,12 +7707,19 @@ fn merge_findings(
                         p.evidence.push(e);
                     }
                 }
-                if f.severity < p.severity {
+                // What is shown comes from one site, the worse of the two. Mixing them gave a
+                // severity from one place with a confidence and a confirmation from another.
+                let worse = f.severity < p.severity
+                    || (f.severity == p.severity
+                        && conf_rank(f.confidence) > conf_rank(p.confidence));
+                if worse {
                     p.severity = f.severity;
                     p.description = f.description;
-                }
-                if conf_rank(f.confidence) > conf_rank(p.confidence) {
                     p.confidence = f.confidence;
+                    p.confirmed = f.confirmed;
+                    p.witness = f.witness;
+                    p.setup = f.setup;
+                    p.observed = f.observed;
                 }
                 if p.pc != f.pc {
                     p.pc = None;
@@ -7457,6 +7760,11 @@ fn merge_findings(
                 }
                 if f.severity < out[i].severity {
                     out[i].severity = f.severity;
+                    out[i].confidence = f.confidence;
+                    out[i].confirmed = f.confirmed;
+                    out[i].witness = f.witness;
+                    out[i].setup = f.setup;
+                    out[i].observed = f.observed;
                 }
             }
             None => {
@@ -7483,9 +7791,26 @@ fn merge_findings(
     out
 }
 
+fn prose(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    for c in text.chars() {
+        match c {
+            '`' => {
+                in_code = !in_code;
+                out.push(c);
+            }
+            '<' if !in_code => out.push_str("&lt;"),
+            '[' if !in_code => out.push_str("\\["),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# Security report: {}\n\n", title));
+    out.push_str(&format!("# Security report: {}\n\n", prose(title)));
     out.push_str(&format!("- Compiler: {}\n- Code size: {} bytes, {} instructions, {} external functions, {} internal functions\n- Coverage: {}/{} code blocks, {} unresolved jumps\n- Kind: {}\n- Risk score: {}/100\n\n",
         c.language, c.stats.code_bytes, c.stats.instructions, c.stats.external_functions, c.stats.internal_functions, c.stats.covered_blocks, c.stats.code_blocks, c.stats.unresolved_jumps,
         if r.contract_kind.is_empty() { "unclassified".to_string() } else { r.contract_kind.join(", ") }, r.risk_score));
@@ -7540,10 +7865,10 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
                 out.push_str(&format!("- Witness calldata: `{}`\n", w));
             }
             for line in &f.observed {
-                out.push_str(&format!("- Observed: {line}\n"));
+                out.push_str(&format!("- Observed: {}\n", prose(line)));
             }
         }
-        out.push_str(&format!("\n{}\n\n", f.description));
+        out.push_str(&format!("\n{}\n\n", prose(&f.description)));
         if !f.evidence.is_empty() {
             out.push_str("```solidity\n");
             for e in &f.evidence {
@@ -7557,7 +7882,7 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
     for section in &r.maps {
         out.push_str(&format!("## {}\n\n", section.title));
         for line in &section.lines {
-            out.push_str(&format!("- {line}\n"));
+            out.push_str(&format!("- {}\n", prose(line)));
         }
         out.push('\n');
     }

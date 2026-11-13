@@ -3347,6 +3347,7 @@ impl MemView {
 
 fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
     let mut bytes = Vec::with_capacity(words.len() * 32);
+    let mut parts = Vec::with_capacity(words.len());
     for (i, w) in words.iter().enumerate() {
         let c = expr::as_const(*w)?;
         let b = c.to_be_bytes();
@@ -3355,8 +3356,13 @@ fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
         } else {
             bytes.extend_from_slice(&b);
         }
+        parts.push(c);
     }
-    Some(U256::from_be_bytes(&crate::keccak::keccak256(&bytes)))
+    let hash = U256::from_be_bytes(&crate::keccak::keccak256(&bytes));
+    if tail == 0 {
+        expr::note_hash(hash, parts);
+    }
+    Some(hash)
 }
 
 fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {

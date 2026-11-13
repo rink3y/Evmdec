@@ -2822,3 +2822,91 @@ fn removing_the_guard_that_makes_a_fixture_sound_is_noticed() {
         }
     }
 }
+
+fn report_of_hex(code_hex: &str) -> analyze::Report {
+    let code = evmdec::hex::decode(code_hex).expect("valid hex");
+    analyze::analyze(&decompile::decompile(&code, &Options::default()))
+}
+
+fn severity_of(code_hex: &str, id: &str) -> Option<Severity> {
+    finding(&report_of_hex(code_hex), id).map(|f| f.severity)
+}
+
+const OWNER_CHECKED_DESTRUCT: &str =
+    "608060405260003560e01c63aaaaaaaa1461001957600080fd5b600054331461002757600080fd5b33ff";
+
+#[test]
+fn a_caller_comparison_that_guards_nothing_is_not_access_control() {
+    let aside =
+        "608060405260003560e01c63aaaaaaaa1461001957600080fd5b6000543314156100295760016009555b33ff";
+    assert_eq!(severity_of(aside, "selfdestruct"), Some(Severity::Critical));
+    assert_eq!(
+        severity_of(OWNER_CHECKED_DESTRUCT, "selfdestruct"),
+        Some(Severity::Medium)
+    );
+}
+
+#[test]
+fn caller_equals_origin_is_not_access_control() {
+    let code = "608060405260003560e01c63aaaaaaaa1461001957600080fd5b32331461002557600080fd5b33ff";
+    assert_eq!(severity_of(code, "selfdestruct"), Some(Severity::Critical));
+    assert!(finding(&report_of_hex(code), "tx-origin").is_none());
+}
+
+#[test]
+fn a_role_anyone_can_grant_does_not_protect() {
+    let code = "608060405260003560e01c8063aaaaaaaa146100245763bbbbbbbb1461004c57600080fd5b6001600052600560205260406000206020523360005260406000205461004957600080fd5b33ff5b6004356000526005602052604060002060205260243560005260406000206001905500";
+    assert_eq!(severity_of(code, "selfdestruct"), Some(Severity::Critical));
+}
+
+#[test]
+fn an_unrelated_check_does_not_lower_an_open_owner_write() {
+    let code = "6080604052600436106100295760003560e01c80633ccfd60b1461002e57806313af403514610048575b600080fd5b336000541461003c57600080fd5b600080808047335af150005b60043573ffffffffffffffffffffffffffffffffffffffff1680600054141561007057600080fd5b60005500";
+    assert_eq!(
+        severity_of(code, "unprotected-owner-write"),
+        Some(Severity::Critical)
+    );
+}
+
+#[test]
+fn read_only_calls_get_the_signature_and_price_rules() {
+    let recover = "60806040526004361061001e5760003560e01c8063d0e30db014610023575b600080fd5b600435600052602435602052604435604052606435606052602060006080600060015afa506000516000541461005857600080fd5b600160015500";
+    assert!(finding(&report_of_hex(recover), "ecrecover-zero").is_some());
+    let price = "60806040526004361061001e5760003560e01c8063d0e30db014610023575b600080fd5b6350d25bcd60e01b60005260206000600460006001545afa1561001e5760005160025500";
+    assert!(finding(&report_of_hex(price), "oracle-unchecked").is_some());
+}
+
+#[test]
+fn a_helper_that_can_end_the_call_keeps_its_caller_from_always_failing() {
+    let code = "608060405260003560e01c8063aaaaaaaa146100245763bbbbbbbb1461003157600080fd5b61002c61003b565b600080fd5b61003961003b565b005b60008080806004355af461004e57600080fd5b3461005857600080f35b56";
+    assert_eq!(
+        severity_of(code, "arbitrary-delegatecall"),
+        Some(Severity::Critical)
+    );
+}
+
+#[test]
+fn a_factory_that_forwards_its_ether_does_not_hold_it() {
+    assert!(finding(&report_of_hex("6000600034f05000"), "locked-ether").is_none());
+}
+
+#[test]
+fn a_per_block_counter_is_not_randomness() {
+    let code = "60806040526004361061001e5760003560e01c8063d0e30db014610023575b600080fd5b4360005260016020526040600020805460051161003f57600080fd5b8054600101905500";
+    assert!(finding(&report_of_hex(code), "weak-randomness").is_none());
+}
+
+#[test]
+fn text_from_the_bytecode_cannot_add_markup_to_the_report() {
+    let hex = "7f5b785d286a6176617363726970743a616c657274283129293c696d6720737263507f603c7363726970743e616c6572742831293c2f7363726970743e0000000000005000";
+    let code = evmdec::hex::decode(hex).expect("valid hex");
+    let contract = decompile::decompile(&code, &Options::default());
+    let report = analyze::analyze(&contract);
+    let page = analyze::render_markdown(&contract, &report, "t");
+    let line = page
+        .lines()
+        .find(|l| l.contains("string(s)"))
+        .expect("the strings are listed");
+    assert!(!line.contains('<') && !line.contains('`'), "{line}");
+    assert!(!line.contains("\"[") && line.contains("\\["), "{line}");
+}

@@ -409,6 +409,20 @@ thread_local! {
 
 // The mark belongs to the function being printed. Variable ids repeat from one function
 // to the next, so a mark left behind would change how another function is simplified.
+thread_local! {
+    static HASHED: RefCell<HashMap<U256, Vec<U256>>> = RefCell::new(HashMap::new());
+}
+
+// A hash of constants is folded to a constant, and with that the words it was made of
+// are gone. They are kept here so a folded mapping key can still be traced to its slot.
+pub fn note_hash(hash: U256, words: Vec<U256>) {
+    HASHED.with(|h| h.borrow_mut().insert(hash, words));
+}
+
+pub fn hash_parts(hash: U256) -> Option<Vec<U256>> {
+    HASHED.with(|h| h.borrow().get(&hash).cloned())
+}
+
 pub fn clear_boolean_marks() {
     BOOL_VARS.with(|b| b.borrow_mut().clear());
 }
@@ -778,10 +792,22 @@ pub fn contains(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
         if !seen.insert(x) || seen.len() > 20_000 {
             continue;
         }
-        if with_node(x, |n| pred(n)) {
+        // The node is copied out first. The test may make new expressions, and that
+        // needs the table this would otherwise still be reading.
+        let n = node(x);
+        if pred(&n) {
             return true;
         }
-        stack.extend(children(x));
+        match n {
+            Node::Op(_, v) | Node::Keccak(v, _) => stack.extend(v),
+            Node::MLoad(a, _)
+            | Node::SLoad(a, _, _)
+            | Node::CallDataLoad(a)
+            | Node::ReturnData(_, a)
+            | Node::CopiedWord(_, a, _) => stack.push(a),
+            Node::KeccakMem(a, b, _) => stack.extend([a, b]),
+            _ => {}
+        }
     }
     false
 }

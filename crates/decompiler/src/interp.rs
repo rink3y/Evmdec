@@ -674,7 +674,7 @@ impl<'a> Machine<'a> {
                 let end = s
                     .as_usize()
                     .and_then(|s| l.as_usize().map(|l| s.saturating_add(l)));
-                if end.is_none_or(|e| e > self.returndata.len()) && !l.is_zero() {
+                if end.is_none_or(|e| e > self.returndata.len()) {
                     return Err("returndata out of bounds".into());
                 }
                 let src = self.returndata.clone();

@@ -92,7 +92,9 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         };
         let entries: Vec<Entry> = c.functions.iter().filter(same_code).map(entry).collect();
         let id = finding.id.clone();
-        let goal = |p: &Path| p.run.reached(local) && p.succeeded() && shows_effect(&id, &p.run);
+        let goal = |p: &Path| {
+            p.run.reached(local) && p.succeeded() && shows_effect(&id, &p.run, &p.inputs.storage)
+        };
         let explorer = Explorer::new(code);
         if let Some(plan) = seq::reach(&explorer, &entries, entry(f), &start, &goal) {
             finding.confirm(&plan.last);
@@ -132,7 +134,7 @@ fn reach(
         let data = exec::calldata(selector, &args);
         let host = exec::caller_host(data.clone(), callvalue);
         let run = exec::run_frame(code, &host, start.clone(), STEP_BUDGET);
-        if run.reached(pc) && run.succeeded() && shows_effect(id, &run) {
+        if run.reached(pc) && run.succeeded() && shows_effect(id, &run, start) {
             let mut inputs = path::inputs_for(selector, 0);
             (inputs.callvalue, inputs.storage) = (callvalue, start.clone());
             return Some((data, evidence::observed(&inputs, &run)));
@@ -177,7 +179,11 @@ fn solved(
             let hit = explorer
                 .explore(&start, &free, Limits::default())
                 .into_iter()
-                .find(|p| p.run.reached(pc) && p.succeeded() && shows_effect(id, &p.run));
+                .find(|p| {
+                    p.run.reached(pc)
+                        && p.succeeded()
+                        && shows_effect(id, &p.run, &p.inputs.storage)
+                });
             if let Some(p) = hit {
                 let observed = evidence::observed(&p.inputs, &p.run);
                 return Some((p.inputs.calldata, observed));
@@ -187,7 +193,9 @@ fn solved(
     None
 }
 
-fn shows_effect(id: &str, run: &FrameRun) -> bool {
+// What a run stored is judged against what it started with. The run begins with what the
+// constructor stored, so its storage is never empty once a constructor has written.
+fn shows_effect(id: &str, run: &FrameRun, start: &HashMap<U256, U256>) -> bool {
     let call_of = |pred: &dyn Fn(&CallRecord) -> bool| run.calls.iter().any(pred);
     match id {
         "selfdestruct" => matches!(run.outcome, Outcome::SelfDestruct(_)),
@@ -200,10 +208,10 @@ fn shows_effect(id: &str, run: &FrameRun) -> bool {
             call_of(&|c| c.input.starts_with(&SEL_TRANSFER_FROM.to_be_bytes()))
         }
         "unprotected-owner-write" | "unprotected-initializer" | "unprotected-upgrade" => {
-            !run.storage.is_empty()
+            run.storage != *start
         }
         "silent-auth-failure" => {
-            run.storage.is_empty() && run.calls.is_empty() && run.logs.is_empty()
+            run.storage == *start && run.calls.is_empty() && run.logs.is_empty()
         }
         _ => false,
     }

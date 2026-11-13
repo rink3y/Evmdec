@@ -65,6 +65,13 @@ pub fn error(selector: u32) -> Option<Cow<'static, str>> {
         .map(Cow::Owned)
 }
 
+// A lookup service is not trusted. Its names end up in the output and the report.
+#[cfg(feature = "rpc")]
+fn answers(sig: &str, selector: u32) -> bool {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_$(),[]".contains(c);
+    sig.chars().all(plain) && crate::keccak::selector(sig) == selector.to_be_bytes()
+}
+
 #[cfg(feature = "rpc")]
 pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
     let mut out = HashMap::new();
@@ -96,7 +103,9 @@ pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
                                 .and_then(|e| e.get("name"))
                                 .and_then(|n| n.as_str()),
                         ) {
-                            out.insert(sel, first.to_string());
+                            if answers(first, sel) {
+                                out.insert(sel, first.to_string());
+                            }
                         }
                     }
                 }
@@ -114,7 +123,9 @@ pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
                     .pointer("/results/0/text_signature")
                     .and_then(|x| x.as_str())
                 {
-                    out.insert(sel, t.to_string());
+                    if answers(t, sel) {
+                        out.insert(sel, t.to_string());
+                    }
                 }
             }
         }

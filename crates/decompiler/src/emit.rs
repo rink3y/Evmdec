@@ -1912,6 +1912,9 @@ pub fn escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // The report puts expressions in code spans. A backtick from the bytecode would
+            // close one and let the rest of the string through as markup.
+            '`' => out.push_str("\\x60"),
             c if (c as u32) < 0x20 || c == '\u{fffd}' => {
                 out.push_str(&format!("\\x{:02x}", c as u32 & 0xff))
             }

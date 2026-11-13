@@ -171,6 +171,14 @@ mod tests {
     }
 
     #[test]
+    fn copying_nothing_from_past_the_returned_data_still_fails() {
+        let code = hex::decode("6000600160003e6001600055").expect("hex");
+        let run = run_frame(&code, &host(vec![]), HashMap::new(), 10_000);
+        assert!(!run.succeeded(), "{:?}", run.outcome);
+        assert_eq!(run.storage.get(&U256::ZERO), None);
+    }
+
+    #[test]
     fn an_infinite_loop_stops_at_the_budget() {
         let code = hex::decode("5b600056").expect("hex");
         let run = run_frame(&code, &host(vec![]), HashMap::new(), 500);

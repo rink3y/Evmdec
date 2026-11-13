@@ -20,6 +20,8 @@ pub struct Inputs {
     pub balance: U256,
     pub signed: Option<(Vec<u8>, U256)>,
     pub failing: Option<usize>,
+    pub spends_balance: bool,
+    pub moving: Vec<crate::interp::MovingBalance>,
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +248,17 @@ struct Search<'a> {
     eval: Eval<'a>,
     free: &'a Free,
     out: Vec<(Place, U256)>,
+    steps: usize,
+}
+
+// Forcing a value follows both sides of every operation, so one condition can cost two to
+// the power of its depth. The cap ends such a search, and its steps count as work.
+const MAX_SEARCH_STEPS: usize = 50_000;
+
+impl Drop for Search<'_> {
+    fn drop(&mut self) {
+        crate::exec::spend(self.steps as u64 * NODE_COST);
+    }
 }
 
 impl Search<'_> {
@@ -272,7 +285,8 @@ impl Search<'_> {
     }
 
     fn force(&mut self, e: ExprId, target: U256, depth: u32) {
-        if depth > 24 {
+        self.steps += 1;
+        if depth > 24 || self.steps > MAX_SEARCH_STEPS {
             return;
         }
         if let Some(place) = self.place(e) {
@@ -495,6 +509,7 @@ fn proposals(
         },
         free,
         out: Vec::new(),
+        steps: 0,
     };
     let mut seen = 0;
     for item in items {
@@ -514,7 +529,7 @@ fn proposals(
             }
         }
     }
-    search.out
+    std::mem::take(&mut search.out)
 }
 
 fn apply(inputs: &Inputs, place: Place, value: U256) -> Inputs {
@@ -602,6 +617,8 @@ mod tests {
             balance: U256::ZERO,
             signed: None,
             failing: None,
+            spends_balance: false,
+            moving: Vec::new(),
         }
     }
 

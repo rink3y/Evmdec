@@ -2253,6 +2253,62 @@ fn pay_in(credit: &str) -> String {
     format!("{credit} {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP")
 }
 
+const DIFFERENT_ASSETS: &str = "PUSH1 0x24 CALLDATALOAD PUSH1 0x04 CALLDATALOAD EQ ISZERO \
+     PUSH2 @apart JUMPI PUSH1 0x00 DUP1 REVERT :apart JUMPDEST";
+
+fn asset_records(guard: &str) -> String {
+    let held = |asset: &str| {
+        format!(
+            "PUSH4 0x70a08231 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE ADDRESS PUSH1 0x84 MSTORE \
+             PUSH1 0x20 PUSH1 0x80 PUSH1 0x24 PUSH1 0x80 {asset} GAS STATICCALL POP \
+             PUSH1 0x80 MLOAD"
+        )
+    };
+    let record = |asset: &str| {
+        format!(
+            "{asset} PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE \
+             PUSH1 0x40 PUSH1 0x00 KECCAK256"
+        )
+    };
+    let (given, taken) = ("PUSH1 0x04 CALLDATALOAD", "PUSH1 0x24 CALLDATALOAD");
+    let outside = "PUSH4 0x12345678 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE \
+                   PUSH1 0x00 DUP1 PUSH1 0x04 PUSH1 0x80 PUSH1 0x00 PUSH2 0xd0d0 GAS CALL POP";
+    format!(
+        "{guard} {} {} {outside} {} {} \
+         DUP3 SWAP1 SUB {} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP \
+         DUP3 SUB {} DUP1 SLOAD DUP3 SWAP1 SUB SWAP1 SSTORE STOP",
+        held(given),
+        held(taken),
+        held(given),
+        held(taken),
+        record(taken),
+        record(given),
+    )
+}
+
+fn counted_pay_in() -> String {
+    format!(
+        "CALLVALUE {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE \
+         PUSH1 0x01 SLOAD ADD PUSH1 0x01 SSTORE STOP"
+    )
+}
+
+fn pay_out_recorded(with_excess: bool) -> String {
+    let pays = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP STOP";
+    let excess = match with_excess {
+        true => "DUP1 SELFBALANCE SUB DUP3 ADD",
+        false => "DUP2",
+    };
+    format!(
+        "{CALLER_ENTRY} DUP1 SLOAD PUSH1 0x01 SLOAD {excess} \
+         SWAP2 SWAP1 SUB PUSH1 0x01 SSTORE SWAP1 PUSH1 0x00 SWAP1 SSTORE {pays}"
+    )
+}
+
+fn pay_out_everything() -> String {
+    String::from("SELFBALANCE PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP STOP")
+}
+
 fn pay_out_checked() -> String {
     format!(
         "PUSH1 0x04 CALLDATALOAD {CALLER_ENTRY} DUP1 SLOAD \
@@ -2710,6 +2766,24 @@ fn cases() -> Vec<Case> {
             },
         ),
         pair(
+            "ledger-credits-more-than-received",
+            true,
+            || dispatcher(&asset_records("")),
+            || dispatcher(&asset_records(DIFFERENT_ASSETS)),
+        ),
+        pair(
+            "surplus-open-to-any-account",
+            true,
+            || dispatcher3(&counted_pay_in(), &pay_out_recorded(true), "STOP"),
+            || dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP"),
+        ),
+        pair(
+            "payment-taken-by-other-account",
+            true,
+            || dispatcher3(&counted_pay_in(), &pay_out_everything(), "STOP"),
+            || dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP"),
+        ),
+        pair(
             "short-input-accepted",
             true,
             || dispatcher(STORE_WORD),
@@ -2772,7 +2846,10 @@ fn the_labelled_fixtures_score_every_rule_at_full_precision_and_recall() {
 
 // A fixture is a few instructions and leaves out what its own rule does not need.
 // These findings are true of the fixture named, so they are expected there.
-const TRUE_OF_A_SOUND_FIXTURE: [(&str, &str); 6] = [
+const TRUE_OF_A_SOUND_FIXTURE: [(&str, &str); 7] = [
+    // It credits a payment at par whatever the contract holds, so a later payer shares a
+    // surplus that stood behind the earlier one.
+    ("rounding-favours-caller", "surplus-open-to-any-account"),
     ("", "short-input-accepted"),
     ("inflow-credits-nothing", "refused-transfer-treated-as-done"),
     (
@@ -3178,4 +3255,79 @@ fn a_slot_compared_with_the_caller_and_the_argument_that_replaces_it_are_named()
     assert!(source.contains("address owner;"), "{source}");
     assert!(source.contains("(address newOwner)"), "{source}");
     assert!(source.contains("require(msg.sender == owner);"), "{source}");
+}
+
+const PAYER: &str = "0x00000000000000000000000000000000000d1570";
+
+fn with_linked(root: Vec<u8>, linked: Vec<u8>) -> analyze::Report {
+    let mut root = decompile::decompile(&root, &Options::default());
+    root.address = Some("0x0000000000000000000000000000000000007007".to_string());
+    let mut other = decompile::decompile(&linked, &Options::default());
+    other.address = Some(PAYER.to_string());
+    root.linked.push(other);
+    analyze::analyze(&root)
+}
+
+fn calls_payer(then: &str) -> Vec<u8> {
+    let callee = PAYER.trim_start_matches("0x");
+    dispatcher(&format!(
+        "PUSH4 0xbbbbbbbb PUSH1 0xe0 SHL PUSH1 0x80 MSTORE \
+         PUSH1 0x00 DUP1 PUSH1 0x04 PUSH1 0x80 PUSH1 0x00 PUSH20 0x{callee} GAS CALL POP {then} STOP"
+    ))
+}
+
+fn payer(register_gate: &str) -> Vec<u8> {
+    let register = format!("{register_gate} PUSH1 0x04 CALLDATALOAD PUSH1 0x07 SSTORE STOP");
+    let pay = "PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x01 PUSH1 0x07 SLOAD GAS CALL POP STOP";
+    dispatcher3(&register, pay, "STOP")
+}
+
+#[test]
+fn a_callee_that_pays_an_address_any_caller_set_opens_the_callers_update() {
+    let writes_after = "PUSH1 0x01 PUSH1 0x05 SSTORE";
+    let rule = "control-handed-out-mid-update";
+    let open = with_linked(calls_payer(writes_after), payer(""));
+    assert!(finding(&open, rule).is_some(), "{:?}", ids(&open));
+    let owner_set = with_linked(calls_payer(writes_after), payer(OWNER_GATE));
+    assert!(finding(&owner_set, rule).is_none(), "{:?}", ids(&owner_set));
+    let nothing_after = with_linked(calls_payer(""), payer(""));
+    assert!(
+        finding(&nothing_after, rule).is_none(),
+        "{:?}",
+        ids(&nothing_after)
+    );
+}
+
+fn runs_library(selector: &str) -> Vec<u8> {
+    let library = PAYER.trim_start_matches("0x");
+    dispatcher(&format!(
+        "PUSH4 0x{selector} PUSH1 0xe0 SHL PUSH1 0x80 MSTORE \
+         PUSH1 0x00 DUP1 PUSH1 0x04 PUSH1 0x80 PUSH20 0x{library} GAS DELEGATECALL POP STOP"
+    ))
+}
+
+#[test]
+fn what_is_wrong_in_a_library_function_a_contract_runs_counts_against_the_contract() {
+    let pays_before_clearing =
+        "CALLER SLOAD DUP1 PUSH1 0x00 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP \
+                                PUSH1 0x00 CALLER SSTORE STOP";
+    let library = || dispatcher3("STOP", pays_before_clearing, "STOP");
+    let in_library = |report: &analyze::Report| {
+        let marked = |f: &&analyze::Finding| {
+            f.id == "reentrancy"
+                && f.function
+                    .as_deref()
+                    .is_some_and(|name| name.contains(PAYER))
+        };
+        report.findings.iter().find(marked).map(|f| f.severity)
+    };
+    let runs_it = with_linked(runs_library("bbbbbbbb"), library());
+    assert_eq!(
+        in_library(&runs_it),
+        Some(Severity::High),
+        "{:?}",
+        ids(&runs_it)
+    );
+    let runs_another = with_linked(runs_library("cccccccc"), library());
+    assert_eq!(in_library(&runs_another), None, "{:?}", ids(&runs_another));
 }

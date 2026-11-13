@@ -15,8 +15,8 @@ def analyze(path):
         return None, "rc=%d %s" % (out.returncode, out.stderr.strip().splitlines()[-1:] )
     return json.loads(out.stdout), None
 
-# The one miss is a contract whose flaw is in its configuration, not in its code.
-MIN_HITS = 24
+# The misses are listed in the README: flaws no rule here reaches yet.
+MIN_HITS = 25
 
 def main():
     ap = argparse.ArgumentParser()

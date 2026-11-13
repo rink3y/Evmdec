@@ -1,4 +1,5 @@
 use crate::abi::{SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
+use crate::boundary;
 use crate::compiler;
 use crate::confirm;
 use crate::cross::World as CrossWorld;
@@ -8,6 +9,7 @@ use crate::exec;
 use crate::expr::{self, ExprId, Node};
 use crate::flow;
 use crate::function::FnKind;
+use crate::ledger;
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::origin::{self, Model};
@@ -156,6 +158,17 @@ pub struct FnSummary {
     pub stores: Vec<ParamStore>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<ParamForward>,
+    // Who else gets to run code when this function is called, if that is an address an
+    // ordinary caller can choose. A caller in the middle of its own update needs to know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hands_control: Option<String>,
+    // Set when that address is one word of this function's own call data. Whoever calls
+    // it then decides, and a caller that passes a fixed address there decides safely.
+    #[serde(skip)]
+    pub(crate) hands_word: Option<u32>,
+    // The address could not be traced to its origin. It is known only not to be fixed.
+    #[serde(skip)]
+    pub(crate) hands_untraced: bool,
     #[serde(skip)]
     pub(crate) returns: Option<ExprId>,
 }
@@ -314,6 +327,8 @@ struct FnFacts {
     ref_bounds: Vec<AvailBound>,
     moves_value: bool,
     linked_calls: Vec<LinkedCall>,
+    input_callee: Option<u32>,
+    payees: Vec<ExprId>,
     ledger_writes: Vec<LedgerWrite>,
     total_changes: Vec<(ExprId, Change)>,
     stale_moves: Vec<StaleMove>,
@@ -345,6 +360,10 @@ struct LinkedCall {
     approval: bool,
     // The payload is known to be empty. No selector alone can also mean it is not known.
     empty: bool,
+    // This function writes storage or calls out again after the call returns.
+    acts_after: bool,
+    // Payload words that carry a word of this function's own call data, with that word.
+    passed: Vec<(u32, u32)>,
     line: String,
 }
 
@@ -794,6 +813,8 @@ fn collect_facts(
         ref_bounds: Vec::new(),
         moves_value: false,
         linked_calls: Vec::new(),
+        input_callee: None,
+        payees: Vec::new(),
         ledger_writes: Vec::new(),
         total_changes: Vec::new(),
         stale_moves: Vec::new(),
@@ -845,8 +866,8 @@ fn collect_facts(
     let layout = ctx.c.compiler.layout;
     let mut mutations: Vec<&Event> = Vec::new();
     let mut call_selector: HashMap<u32, u32> = HashMap::new();
-    let mut linked_sites: Vec<(String, Option<u32>, bool, bool, bool, Stmt)> = Vec::new();
-    for ev in events {
+    let mut linked_sites: Vec<(LinkedCall, Stmt)> = Vec::new();
+    for (at, ev) in events.iter().enumerate() {
         match &ev.stmt {
             Some(
                 st @ Stmt::SStore {
@@ -888,6 +909,7 @@ fn collect_facts(
             Some(
                 st @ Stmt::Call {
                     kind,
+                    gas,
                     addr,
                     value,
                     input,
@@ -919,6 +941,17 @@ fn collect_facts(
                     call_selector.insert(*seq, sel);
                 }
                 let is_static = *kind == op::STATICCALL;
+                if !is_static && facts.input_callee.is_none() {
+                    facts.input_callee = own_word(*addr);
+                }
+                // A plain payment with more gas than the stipend lets the payee's code run.
+                let plain_payment = *kind == op::CALL
+                    && expr::as_const(*in_len) == Some(U256::ZERO)
+                    && value.is_some_and(|v| expr::as_const(v) != Some(U256::ZERO))
+                    && expr::as_const(*gas).is_none_or(|g| g > U256::from_u64(STIPEND));
+                if plain_payment {
+                    facts.payees.push(*addr);
+                }
                 if ctx.world.has_other(ctx.c) {
                     let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
                     let sends_value = value.is_some_and(|v| expr::as_const(v) != Some(U256::ZERO));
@@ -932,14 +965,36 @@ fn collect_facts(
                         .map(|a| (a, true));
                     for (address, approval) in callee.into_iter().chain(approved) {
                         let empty = expr::as_const(*in_len) == Some(U256::ZERO);
-                        linked_sites.push((
+                        let acts = |later: &Event| match &later.stmt {
+                            Some(Stmt::SStore {
+                                transient: false, ..
+                            }) => true,
+                            Some(Stmt::Call { kind, .. }) => *kind != op::STATICCALL,
+                            _ => false,
+                        };
+                        let reached = |later: &Event| {
+                            let graph = f.lifted.as_ref();
+                            graph.is_some_and(|l| ev_reaches(ctx, l, ev, later))
+                        };
+                        let acts_after = events[at + 1..].iter().any(|e| acts(e) && reached(e));
+                        let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
+                        let passed: Vec<(u32, u32)> = (0..words.len().saturating_sub(1) as u32)
+                            .filter_map(|index| {
+                                let word = emit::shifted_word_len(words, index as usize, len);
+                                Some((index, own_word(word)?))
+                            })
+                            .collect();
+                        let site = LinkedCall {
                             address,
                             selector,
                             sends_value,
                             approval,
                             empty,
-                            st.clone(),
-                        ));
+                            acts_after,
+                            passed,
+                            line: String::new(),
+                        };
+                        linked_sites.push((site, st.clone()));
                     }
                 }
                 if let Some(slot) = ssa::stored_address_slot(*addr) {
@@ -1010,16 +1065,10 @@ fn collect_facts(
         let own = names.clone();
         facts.linked_calls = linked_sites
             .into_iter()
-            .map(
-                |(address, selector, sends_value, approval, empty, st)| LinkedCall {
-                    address,
-                    selector,
-                    sends_value,
-                    approval,
-                    empty,
-                    line: emit::fmt_stmt(&st, &own),
-                },
-            )
+            .map(|(site, st)| LinkedCall {
+                line: emit::fmt_stmt(&st, &own),
+                ..site
+            })
             .collect();
     }
     facts.moves_value = !facts.ether_out.is_empty()
@@ -3676,7 +3725,12 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             || f.effects.creates;
         if caller_checked && state_changing {
             privileged.push(display_name(f));
-        } else if state_changing && f.kind == FnKind::External {
+        } else if state_changing
+            && matches!(
+                f.kind,
+                FnKind::External | FnKind::Fallback | FnKind::Receive
+            )
+        {
             unauthenticated.push(display_name(f));
         }
         if f.mutability == crate::function::Mutability::Payable {
@@ -5227,7 +5281,9 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     let slot_names = c.functions.first().map(names_for).unwrap_or_default();
     let slot_name = |slot: ExprId| emit::fmt_slot(slot, &slot_names, SlotSpace::Persistent);
     conservation_findings(&facts, &slot_name, &mut findings);
+    mark_handoffs(&ctx, &facts, &stores, &uses, &mut summaries);
     link_findings(&ctx, &facts, &mut findings);
+    library_findings(&ctx, &facts, &mut findings);
     passed_word_findings(&ctx, &facts, &summaries, &mut findings);
     origin_findings(&ctx, &facts, &stores, &uses, &mut findings);
     trust_findings(&ctx, &facts, &mut findings);
@@ -5248,6 +5304,21 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     if asked {
         report.maps.extend(crate::props::findings(c, &mut findings));
         exec::within(flow::WORK, || flow::findings(c, &mut findings));
+        exec::within(boundary::WORK, || boundary::findings(c, &mut findings));
+        exec::within(ledger::WORK, || ledger::findings(c, &mut findings));
+        // A library run by delegatecall keeps its records in this contract's storage.
+        for address in &c.library_targets {
+            let Some(library) = linked_contract(&ctx, address) else {
+                continue;
+            };
+            let mut found = Vec::new();
+            exec::within(ledger::WORK, || ledger::findings(library, &mut found));
+            for mut finding in found {
+                let name = finding.function.take().unwrap_or_default();
+                finding.function = Some(format!("{name} @ {address}"));
+                findings.push(finding);
+            }
+        }
         exec::within(signed::WORK, || signed::findings(c, &mut findings));
         report.maps.extend(exec::within(standard::WORK, || {
             standard::findings(c, &mut findings)
@@ -6728,7 +6799,257 @@ fn accounting_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     }
 }
 
+const STIPEND: u64 = 2_300;
+
+fn own_word(e: ExprId) -> Option<u32> {
+    let Node::CallDataLoad(at) = expr::node(unmask(e)) else {
+        return None;
+    };
+    let at = expr::as_const(at)?.as_usize()?;
+    (at >= 4 && (at - 4) % 32 == 0).then(|| ((at - 4) / 32) as u32)
+}
+
+fn summary_of(report: &Report, selector: Option<u32>) -> Option<&FnSummary> {
+    let wanted = format!("{:#010x}", selector?);
+    report.summaries.iter().find(|s| s.selector == wanted)
+}
+
+// A function hands control to an address an ordinary caller can choose when it calls an
+// address from its call data, an address read from storage that such a caller can fill,
+// or a function of another contract that does one of these. Followed across contracts, so
+// a caller several calls away still learns of it.
+fn mark_handoffs(
+    ctx: &Ctx,
+    facts: &[FnFacts],
+    stores: &[origin::Store],
+    uses: &[StoredUse],
+    summaries: &mut [FnSummary],
+) {
+    let model = Model::build(stores, ctx.c.compiler.layout);
+    for (index, f) in facts.iter().enumerate().filter(|(_, f)| f.external) {
+        let filled_by_callers = uses.iter().any(|u| {
+            let target = matches!(u.kind, UseKind::CallTarget { .. });
+            u.function == index && target && model.of(u.value).open()
+        });
+        let through_callee = f.linked_calls.iter().find_map(|call| handed_on(ctx, call));
+        if crate::debug::on("EVMDEC_DEBUG_HANDOFF") {
+            let calls: Vec<String> = f
+                .linked_calls
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}:{:x?}:after={}",
+                        &c.address[..8],
+                        c.selector,
+                        c.acts_after
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[handoff] {} {} open={filled_by_callers} word={:?} payees={} calls={calls:?}",
+                ctx.c.address.as_deref().unwrap_or("?"),
+                f.name,
+                f.input_callee,
+                f.payees.iter().filter(|p| worked_out(**p)).count(),
+            );
+        }
+        let handed = if filled_by_callers {
+            Handed {
+                to: String::from("an address read from storage that any caller can fill"),
+                word: None,
+                untraced: false,
+            }
+        } else if let Some(word) = f.input_callee {
+            Handed {
+                to: format!("the address in word {word} of its call data"),
+                word: Some(word),
+                untraced: false,
+            }
+        } else if f.payees.iter().any(|payee| worked_out(*payee)) {
+            Handed {
+                to: String::from(
+                    "an account it works out while it runs and pays with enough gas for that account's code to run",
+                ),
+                word: None,
+                untraced: true,
+            }
+        } else if let Some(through) = through_callee {
+            through
+        } else {
+            continue;
+        };
+        let own = summaries
+            .iter_mut()
+            .find(|s| Some(&s.selector) == f.selector.as_ref());
+        if let Some(summary) = own {
+            summary.hands_control = Some(handed.to);
+            summary.hands_word = handed.word;
+            summary.hands_untraced = handed.untraced;
+        }
+    }
+}
+
+struct Handed {
+    to: String,
+    word: Option<u32>,
+    untraced: bool,
+}
+
+// A payee that is a constant, the caller or a plain storage read is judged elsewhere.
+// What is left comes out of memory, a helper or another contract's answer: a list of
+// accounts built from data, which is how recipients that users registered are paid.
+fn worked_out(payee: ExprId) -> bool {
+    !matches!(
+        expr::node(unmask(payee)),
+        Node::Const(_) | Node::Env(..) | Node::SLoad(..) | Node::CallDataLoad(_)
+    )
+}
+
+// What the function behind a call hands control to, as seen from the caller. A callee
+// that calls a word of its own call data is harmless when the caller fixes that word, and
+// passes the choice on when the caller fills the word from its own call data.
+fn handed_on(ctx: &Ctx, call: &LinkedCall) -> Option<Handed> {
+    let report = ctx.world.report(&call.address)?;
+    let callee = summary_of(&report, call.selector)?;
+    let handed = callee.hands_control.as_ref()?;
+    match callee.hands_word {
+        None => Some(Handed {
+            to: format!(
+                "{handed}, reached through `{}` on the contract at {}",
+                callee.function, call.address
+            ),
+            word: None,
+            untraced: callee.hands_untraced,
+        }),
+        Some(word) => {
+            let own = call.passed.iter().find(|(index, _)| *index == word)?.1;
+            Some(Handed {
+                to: format!("the address in word {own} of its call data, which it passes on"),
+                word: Some(own),
+                untraced: false,
+            })
+        }
+    }
+}
+
+// These say a function is open to any caller. A library function is reached only through
+// the functions of the contract that runs it, so they hold only when one of those is open.
+const NEEDS_AN_OPEN_CALLER: [&str; 8] = [
+    "unprotected-ether-withdrawal",
+    "unprotected-owner-write",
+    "unprotected-initializer",
+    "unprotected-upgrade",
+    "arbitrary-call",
+    "arbitrary-delegatecall",
+    "arbitrary-transferfrom",
+    "dynamic-call",
+];
+
+#[derive(Default)]
+struct LibraryUse {
+    selectors: HashSet<u32>,
+    unknown_selector: bool,
+    open_caller: bool,
+}
+
+// A library called by delegatecall runs in this contract's storage and spends this
+// contract's balance. What is wrong in the library functions this contract runs is wrong
+// in this contract, and a report that leaves it to a separate page understates the risk.
+fn library_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
+    let libraries: HashSet<String> = ctx
+        .c
+        .library_targets
+        .iter()
+        .map(|a| a.to_ascii_lowercase())
+        .collect();
+    let mut used: BTreeMap<String, LibraryUse> = BTreeMap::new();
+    for f in facts {
+        for call in &f.linked_calls {
+            let address = call.address.to_ascii_lowercase();
+            if !libraries.contains(&address) {
+                continue;
+            }
+            let entry = used.entry(address).or_default();
+            entry.open_caller |= !f.caller_checked;
+            match call.selector {
+                Some(selector) => {
+                    entry.selectors.insert(selector);
+                }
+                None => entry.unknown_selector = true,
+            }
+        }
+    }
+    for (address, run) in used {
+        let Some(report) = ctx.world.report(&address) else {
+            continue;
+        };
+        // A lead the library's own report holds at low confidence stays on the library's
+        // page. Many of those together would lift the score of a sound contract.
+        let counted = |x: &&Finding| {
+            x.severity <= Severity::High
+                || (x.severity == Severity::Medium && x.confidence != Confidence::Low)
+        };
+        for found in report.findings.iter().filter(counted) {
+            let Some(name) = &found.function else {
+                continue;
+            };
+            let selector = name
+                .rsplit_once("[0x")
+                .and_then(|(_, rest)| u32::from_str_radix(rest.get(..8)?, 16).ok());
+            let reached =
+                run.unknown_selector || selector.is_some_and(|s| run.selectors.contains(&s));
+            let holds = run.open_caller || !NEEDS_AN_OPEN_CALLER.contains(&found.id.as_str());
+            if !reached || !holds {
+                continue;
+            }
+            let mut own = found.clone();
+            own.function = Some(format!("{name} @ {address}"));
+            own.description.push_str(&format!(
+                " This is library code at {address}. This contract runs it by delegatecall, so it acts on this contract's storage and balance."
+            ));
+            findings.push(own);
+        }
+    }
+}
+
+fn handoff_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
+    let mut told: HashSet<usize> = HashSet::new();
+    for f in facts.iter().filter(|f| f.external) {
+        for call in f
+            .linked_calls
+            .iter()
+            .filter(|c| c.acts_after && !c.approval)
+        {
+            let Some(handed) = handed_on(ctx, call) else {
+                continue;
+            };
+            if !told.insert(f.pc) {
+                continue;
+            }
+            let (handed, confidence) = match handed.untraced {
+                true => (handed.to, Confidence::Low),
+                false => (handed.to, Confidence::Medium),
+            };
+            push_fact(
+                findings,
+                "control-handed-out-mid-update",
+                "A contract called in the middle of an update passes control to an address a user chose",
+                Severity::High,
+                confidence,
+                f,
+                format!(
+                    "`{}` calls the contract at {} and writes storage or calls out again after that call returns. The call hands control to {handed}. Code at that address runs while this function's update is half done: what this function checked before the call can stop being true before it finishes, and anything that address calls sees the half-finished state.",
+                    f.name, call.address,
+                ),
+                vec![call.line.clone()],
+                "Finish every check-dependent update before the call, or keep the called contract from reaching addresses users choose, or hold one lock that every entry point of both contracts respects.",
+            );
+        }
+    }
+}
+
 fn link_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
+    handoff_findings(ctx, facts, findings);
     let mut told: HashSet<(usize, String, &str)> = HashSet::new();
     for f in facts.iter().filter(|f| f.external) {
         for call in &f.linked_calls {

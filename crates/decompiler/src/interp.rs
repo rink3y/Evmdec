@@ -76,6 +76,7 @@ pub struct Host {
     pub forced_return: Vec<u8>,
     pub replies: Vec<(u32, Vec<u8>)>,
     pub signed: Option<(Vec<u8>, U256)>,
+    pub failing: Option<usize>,
     pub intercept_calls: bool,
     pub unset_storage: Option<U256>,
 }
@@ -111,6 +112,7 @@ impl Host {
             forced_return: Vec::new(),
             replies: Vec::new(),
             signed: None,
+            failing: None,
             intercept_calls: false,
             unset_storage: None,
         }
@@ -140,6 +142,7 @@ impl Host {
             forced_return: Vec::new(),
             replies: Vec::new(),
             signed: None,
+            failing: None,
             intercept_calls: false,
             unset_storage: None,
         }
@@ -211,6 +214,9 @@ impl Host {
         }
     }
     pub fn call_result(&self, i: usize, addr: U256, input: &[u8]) -> (bool, Vec<u8>) {
+        if self.failing == Some(i) {
+            return (false, Vec::new());
+        }
         if let Some(b) = self.force_calls {
             let data = answer(
                 &self.signed,

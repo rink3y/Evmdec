@@ -71,6 +71,7 @@ pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
         given: Vec::new(),
         balance: DEFAULT_BALANCE,
         signed: None,
+        failing: None,
     }
 }
 
@@ -93,6 +94,7 @@ impl Explorer {
         host.forced_return = inputs.returned.clone();
         host.replies = inputs.replies.clone();
         host.signed = inputs.signed.clone();
+        host.failing = inputs.failing;
         host.selfbalance = inputs.balance;
         let run = exec::run_frame(&self.prog.code, &host, inputs.storage.clone(), STEP_BUDGET);
         let blocks: Vec<usize> = run

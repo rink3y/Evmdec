@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 const SEL_TRANSFER: u32 = 0xa905_9cbb;
 const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
+const SEL_BALANCE_OF: u32 = 0x70a0_8231;
 
 const LIMITS: Limits = Limits {
     paths: 12,
@@ -172,6 +173,7 @@ fn all_taken(p: &Path) -> U256 {
 // Small amounts, so a proportion that divides shows its rounding in every one.
 const PARTS: [(u64, u64); 4] = [(3, 3), (5, 6), (7, 9), (10, 13)];
 const MAX_AMOUNT_WORDS: usize = 4;
+const MAX_OTHER_CALLS: usize = 8;
 
 fn word_reply(value: U256) -> Vec<u8> {
     value.to_be_bytes().to_vec()
@@ -288,9 +290,13 @@ impl<'a> Pass<'a> {
     }
 
     fn after(&mut self, d: &Deposit, g: &Function) -> Vec<Path> {
-        let state = d.path.run.storage.clone();
-        let credit = d.credit;
-        let fills: [&dyn Fn(usize) -> U256; 3] = [&|_| credit, &|_| U256::ZERO, &|_| U256::MAX];
+        self.after_from(&d.path.run.storage, d.credit, g)
+    }
+
+    fn after_from(&mut self, state: &HashMap<U256, U256>, credit: U256, g: &Function) -> Vec<Path> {
+        let twice = sum(credit, credit);
+        let fills: [&dyn Fn(usize) -> U256; 4] =
+            [&|_| credit, &|_| twice, &|_| U256::ZERO, &|_| U256::MAX];
         let mut out = Vec::new();
         for (round, fill) in fills.iter().enumerate() {
             let (mut start, free) = self.base(g, fill);
@@ -324,39 +330,204 @@ impl<'a> Pass<'a> {
         true
     }
 
-    fn reenter(&mut self, d: &Deposit, g: &Function, paths: &[Path], out: &mut Vec<Finding>) {
-        let pays_caller = |q: &&Path| {
-            q.run.calls.iter().any(|c| {
-                let to_caller = c.kind == op::CALL && c.addr == q.inputs.caller;
-                to_caller && !c.value.is_zero() && c.gas > U256::from_u64(STIPEND)
-            })
-        };
-        let Some(q) = paths.iter().find(pays_caller) else {
+    fn second_account(&mut self, d: &Deposit, layout: MappingLayout, out: &mut Vec<Finding>) {
+        let mut theirs = d.path.inputs.clone();
+        theirs.caller = SECOND_CALLER;
+        theirs.storage = d.path.run.storage.clone();
+        let paid_too = self.run(d.function, &theirs);
+        if !paid_too.succeeded() || credited(&paid_too, layout).is_none() {
+            return;
+        }
+        let state = paid_too.run.storage.clone();
+        let functions: Vec<&Function> = self.externals().collect();
+        for g in functions {
+            let found = self
+                .after_from(&state, d.credit, g)
+                .into_iter()
+                .find_map(|q| {
+                    let back = sent(&q);
+                    let more = back.iter().find(|(asset, _)| {
+                        let paid = sum(total(&d.taken, *asset), total(&taken(&q), *asset));
+                        total(&back, *asset) > paid
+                    })?;
+                    Some((more.0, total(&back, more.0), q))
+                });
+            let Some((asset, back, q)) = found else {
+                continue;
+            };
+            // The two-call check already covers a payout the first payment alone allows.
+            let mut alone = q.inputs.clone();
+            alone.storage = d.path.run.storage.clone();
+            let without = self.run(g, &alone);
+            if without.succeeded() && total(&sent(&without), asset) >= back {
+                continue;
+            }
+            let paid = sum(total(&d.taken, asset), total(&taken(&q), asset));
+            push(
+                out,
+                "payout-grows-with-other-payment",
+                "An account takes out more than it paid once another account has paid in",
+                Severity::Medium,
+                Confidence::High,
+                Some(g),
+                None,
+                format!(
+                    "Starting from {}, one account pays in {} of {} through `{}`, and a second account then makes the same payment. The first account's call to `{}` now ends normally and sends it {}. Before the second payment the same call sent less, so the difference comes out of what the second account paid. The run assumes the contract holds enough to pay.",
+                    deploy::start_text(&self.start),
+                    paid.to_hex(),
+                    asset_text(asset),
+                    d.function.name,
+                    g.name,
+                    back.to_hex(),
+                ),
+                Vec::new(),
+                "Bound what an account can take out by what that account is owed, not by what the contract holds.",
+            );
+            if let Some(last) = out.last_mut() {
+                let call = hex::encode(&d.path.inputs.calldata);
+                last.setup = vec![call.clone(), call];
+                last.confirm(&q);
+            }
+            return;
+        }
+    }
+
+    // The other account neither pays in nor is paid, so the balance the contract reads
+    // would be the same in a real run and the answers used here stay true.
+    fn ordering(&mut self, d: &Deposit, g: &Function, paths: &[Path], out: &mut Vec<Finding>) {
+        let Some(q) = paths.iter().find(|q| !all_sent(q).is_zero()) else {
             return;
         };
-        let once = total(&sent(q), Asset::Ether);
-        let mut world = World::new();
-        world.place(q.inputs.address, self.c.code_of(g).to_vec());
-        for (slot, value) in &q.inputs.storage {
-            world.seed(q.inputs.address, *slot, *value);
+        let before = all_sent(q);
+        let functions: Vec<&Function> = self.externals().take(MAX_OTHER_CALLS).collect();
+        for h in functions {
+            let (mut start, free) = self.base(h, |i| U256::from_u64(0x1001 + 2 * i as u64));
+            start.storage = d.path.run.storage.clone();
+            start.caller = SECOND_CALLER;
+            let quiet = |p: &Path| {
+                let changed = p.run.storage != p.inputs.storage;
+                p.succeeded() && changed && taken(p).is_empty() && sent(p).is_empty()
+            };
+            let Some(earlier) = self
+                .explore(h, &start, &free, PROBE)
+                .into_iter()
+                .find(quiet)
+            else {
+                continue;
+            };
+            let mut later = q.inputs.clone();
+            later.storage = earlier.run.storage.clone();
+            let after = self.run(g, &later);
+            if !after.succeeded() || all_sent(&after) >= before {
+                continue;
+            }
+            if self.has_floor(g, &q.inputs, &later, before) {
+                return;
+            }
+            push(
+                out,
+                "earlier-call-lowers-payout",
+                "Another account's call just before lowers what this call pays, and nothing in the call refuses it",
+                Severity::Medium,
+                Confidence::High,
+                Some(g),
+                None,
+                format!(
+                    "After the first attached call, `{}` sends its caller {}. When a second account holding no role first calls `{}`, paying nothing in and taking nothing out, the same call to `{}` still ends normally and sends {}. No argument word set to the higher amount made the lower run fail, so the caller cannot set a floor.",
+                    g.name,
+                    before.to_hex(),
+                    h.name,
+                    g.name,
+                    all_sent(&after).to_hex(),
+                ),
+                Vec::new(),
+                "Take a minimum amount as an argument and fail when the payout is below it.",
+            );
+            if let Some(last) = out.last_mut() {
+                last.setup = vec![
+                    hex::encode(&d.path.inputs.calldata),
+                    hex::encode(&earlier.inputs.calldata),
+                ];
+                last.confirm(&after);
+            }
+            return;
         }
-        world.place(q.inputs.caller, calls_back(&q.inputs.calldata));
-        let ended = world.run(
-            q.inputs.address,
-            q.inputs.caller,
-            q.inputs.callvalue,
-            q.inputs.calldata.clone(),
-        );
+    }
+
+    fn has_floor(&mut self, g: &Function, good: &Inputs, bad: &Inputs, amount: U256) -> bool {
+        let words = (good.calldata.len().saturating_sub(4) / 32).min(MAX_AMOUNT_WORDS);
+        (0..words).any(|index| {
+            let with = |inputs: &Inputs| {
+                let mut out = inputs.clone();
+                let at = 4 + 32 * index;
+                out.calldata[at..at + 32].copy_from_slice(&amount.to_be_bytes());
+                out
+            };
+            let kept = self.run(g, &with(good));
+            let refused = self.run(g, &with(bad));
+            kept.succeeded() && all_sent(&kept) == amount && !refused.succeeded()
+        })
+    }
+
+    fn reenter(&mut self, d: &Deposit, g: &Function, paths: &[Path], out: &mut Vec<Finding>) {
+        let payment = |q: &Path| {
+            q.run.calls.iter().find_map(|c| {
+                let to_caller = c.kind == op::CALL && c.addr == q.inputs.caller;
+                if to_caller && !c.value.is_zero() && c.gas > U256::from_u64(STIPEND) {
+                    return Some(Asset::Ether);
+                }
+                let transfers = c.kind == op::CALL
+                    && selector(&c.input) == Some(SEL_TRANSFER)
+                    && c.input.len() >= 68
+                    && word(&c.input, 4) == q.inputs.caller
+                    && !word(&c.input, 36).is_zero();
+                transfers.then_some(Asset::Token(c.addr))
+            })
+        };
+        let Some((q, asset)) = paths.iter().find_map(|q| Some((q, payment(q)?))) else {
+            return;
+        };
+        let (vault, caller) = (q.inputs.address, q.inputs.caller);
+        let once = total(&sent(q), asset);
+        let mut world = World::new();
+        world.place(vault, self.c.code_of(g).to_vec());
+        for (slot, value) in &q.inputs.storage {
+            world.seed(vault, *slot, *value);
+        }
+        match asset {
+            Asset::Ether => world.place(caller, calls_back(None, &q.inputs.calldata)),
+            Asset::Token(at) => {
+                world.place(at, runs_receiver(caller));
+                world.place(caller, calls_back(Some(vault), &q.inputs.calldata));
+            }
+        }
+        let ended = world.run(vault, caller, q.inputs.callvalue, q.inputs.calldata.clone());
         let paid_out = world
             .sent()
             .iter()
-            .filter(|s| s.from == q.inputs.address && s.to == q.inputs.caller)
-            .fold(U256::ZERO, |all, s| sum(all, s.value));
+            .filter(|s| s.from == vault)
+            .filter_map(|s| match asset {
+                Asset::Ether => (s.to == caller).then_some(s.value),
+                Asset::Token(at) => {
+                    let pays = s.to == at
+                        && selector(&s.input) == Some(SEL_TRANSFER)
+                        && s.input.len() >= 68
+                        && word(&s.input, 4) == caller;
+                    pays.then(|| word(&s.input, 36))
+                }
+            })
+            .fold(U256::ZERO, sum);
         if !ended || paid_out <= once {
             return;
         }
+        let how = match asset {
+            Asset::Ether => "an account whose code makes the same call again when it is paid",
+            Asset::Token(_) => {
+                "an account whose code makes the same call again when the asset runs the receiver's code during the transfer"
+            }
+        };
         let note = format!(
-            " Confirmed by running it: after the attached earlier call, the attached call is made by an account whose code makes the same call again when it is paid. The run ends normally and the account is sent {} in all, where one call alone sends {}. The run assumes the contract holds enough to pay.",
+            " Confirmed by running it: after the attached earlier call, the attached call is made by {how}. The run ends normally and the account is sent {} in all, where one call alone sends {}. The run assumes the contract holds enough to pay.",
             paid_out.to_hex(),
             once.to_hex(),
         );
@@ -402,7 +573,7 @@ impl<'a> Pass<'a> {
         explorer.run(inputs)
     }
 
-    fn answers(&mut self, out: &mut Vec<Finding>) {
+    fn answers(&mut self, layout: MappingLayout, out: &mut Vec<Finding>) {
         let mut unanswered: Vec<String> = Vec::new();
         let mut first_unanswered = None;
         let functions: Vec<&Function> = self.externals().collect();
@@ -419,6 +590,7 @@ impl<'a> Pass<'a> {
             let Some(p) = found.iter().find(asks) else {
                 continue;
             };
+            confirm_stated_amount(out, f, p, layout);
             let with = |reply: Vec<u8>| Inputs {
                 replies: vec![(SEL_TRANSFER, reply.clone()), (SEL_TRANSFER_FROM, reply)],
                 ..p.inputs.clone()
@@ -647,30 +819,63 @@ impl<'a> Pass<'a> {
     }
 }
 
-fn calls_back(data: &[u8]) -> Vec<u8> {
-    const HEAD: u16 = 37;
-    const PUSH2: u8 = op::PUSH1 + 1;
+const PUSH2: u8 = op::PUSH1 + 1;
+const PUSH20: u8 = op::PUSH1 + 19;
+
+fn push_address(code: &mut Vec<u8>, address: U256) {
+    code.push(PUSH20);
+    code.extend_from_slice(&address.to_be_bytes()[12..]);
+}
+
+// The flag in slot 0 stops the second entry from calling a third time.
+// Without it the run would only end at the depth limit.
+fn calls_back(target: Option<U256>, data: &[u8]) -> Vec<u8> {
     let len = (data.len() as u16).to_be_bytes();
-    let off = HEAD.to_be_bytes();
-    let mut code = vec![op::PUSH1, 0x00, op::SLOAD, op::PUSH1, 35, op::JUMPI];
+    let mut code = vec![op::PUSH1, 0x00, op::SLOAD, op::PUSH1, 0, op::JUMPI];
     code.extend([op::PUSH1, 0x01, op::PUSH1, 0x00, op::SSTORE]);
-    code.extend([PUSH2, len[0], len[1], PUSH2, off[0], off[1]]);
+    code.extend([PUSH2, len[0], len[1], PUSH2, 0, 0]);
     code.extend([op::PUSH1, 0x00, op::CODECOPY]);
     code.extend([op::PUSH1, 0x00, op::PUSH1, 0x00, PUSH2, len[0], len[1]]);
-    code.extend([
-        op::PUSH1,
-        0x00,
-        op::PUSH1,
-        0x00,
-        op::CALLER,
-        op::GAS,
-        op::CALL,
-        op::POP,
-    ]);
+    code.extend([op::PUSH1, 0x00, op::PUSH1, 0x00]);
+    match target {
+        Some(address) => push_address(&mut code, address),
+        None => code.push(op::CALLER),
+    }
+    code.extend([op::GAS, op::CALL, op::POP]);
+    let end = code.len();
     code.extend([op::JUMPDEST, op::STOP]);
-    debug_assert_eq!(code.len(), usize::from(HEAD));
+    let data_at = (code.len() as u16).to_be_bytes();
+    code[4] = end as u8;
+    (code[15], code[16]) = (data_at[0], data_at[1]);
     code.extend_from_slice(data);
     code
+}
+
+fn runs_receiver(receiver: U256) -> Vec<u8> {
+    let mut code = vec![op::PUSH1, 0x00, op::PUSH1, 0x00, op::PUSH1, 0x00];
+    code.extend([op::PUSH1, 0x00, op::PUSH1, 0x00]);
+    push_address(&mut code, receiver);
+    code.extend([op::GAS, op::CALL, op::POP]);
+    code.extend([op::PUSH1, 0x01, op::PUSH1, 0x00, op::MSTORE]);
+    code.extend([op::PUSH1, 0x20, op::PUSH1, 0x00, op::RETURN]);
+    code
+}
+
+fn confirm_stated_amount(out: &mut [Finding], f: &Function, p: &Path, layout: MappingLayout) {
+    let pulled = all_taken(p);
+    let measured = |c: &CallRecord| selector(&c.input) == Some(SEL_BALANCE_OF);
+    let trusted = credited(p, layout) == Some(pulled) && !p.run.calls.iter().any(measured);
+    let name = display_name(f);
+    let known = out
+        .iter_mut()
+        .find(|x| x.id == "fee-on-transfer" && x.function.as_deref() == Some(name.as_str()));
+    if let (true, false, Some(x)) = (trusted, pulled.is_zero(), known) {
+        x.description.push_str(
+            " Confirmed by running it: the attached call asks the asset for an amount, never reads its own balance, and credits the caller exactly the amount asked for.",
+        );
+        x.confidence = Confidence::High;
+        x.confirm(p);
+    }
 }
 
 fn token_out(p: &Path) -> U256 {
@@ -776,8 +981,10 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
             gained = gained || pass.gain(d, g, &paths, out);
             pass.reenter(d, g, &paths, out);
             pass.rounding(d, g, &paths, layout, out);
+            pass.ordering(d, g, &paths, out);
         }
+        pass.second_account(d, layout, out);
     }
-    pass.answers(out);
+    pass.answers(layout, out);
     pass.moved_by_answer(out);
 }

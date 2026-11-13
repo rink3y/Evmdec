@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 const BUDGET: usize = 600_000;
 const MAX_DEPTH: usize = 12;
+const SENT_INPUT: usize = 100;
 const FIRST_MADE: u64 = 0xc0de_0000_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,11 +18,12 @@ pub struct Write {
     pub after: U256,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sent {
     pub from: U256,
     pub to: U256,
     pub value: U256,
+    pub input: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -216,11 +218,12 @@ impl World {
         if record.addr == U256::from_u64(4) {
             return (true, record.input.clone());
         }
-        let pays = record.kind == op::CALL && !record.value.is_zero();
+        let pays = record.kind == op::CALL;
         let payment = Sent {
             from: from.account,
             to: record.addr,
             value: record.value,
+            input: record.input.iter().copied().take(SENT_INPUT).collect(),
         };
         let Some(code) = self.codes.get(&record.addr).cloned() else {
             self.sent.extend(pays.then_some(payment));

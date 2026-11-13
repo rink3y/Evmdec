@@ -2365,6 +2365,79 @@ const BURN_ROUNDED_DOWN: &str = "SELFBALANCE PUSH1 0x01 SLOAD DUP3 MUL DIV SWAP1
 const BURN_ROUNDED_UP: &str = "SELFBALANCE PUSH1 0x01 DUP2 SUB PUSH1 0x01 SLOAD DUP4 MUL ADD DIV \
      SWAP1 POP";
 
+const PAY_IN_COUNTED: &str = "CALLVALUE CALLER PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE \
+     PUSH1 0x40 PUSH1 0x00 KECCAK256 DUP1 SLOAD DUP3 ADD SWAP1 SSTORE \
+     PUSH1 0x01 SLOAD ADD PUSH1 0x01 SSTORE STOP";
+
+fn pooled(limited_by_own_entry: bool) -> Vec<u8> {
+    let by_total = format!(
+        "PUSH1 0x04 CALLDATALOAD PUSH1 0x01 SLOAD \
+         DUP2 DUP2 LT ISZERO PUSH2 @cov JUMPI {REVERT} :cov JUMPDEST \
+         DUP2 SWAP1 SUB PUSH1 0x01 SSTORE \
+         PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP STOP"
+    );
+    let take = match limited_by_own_entry {
+        true => pay_out_checked(),
+        false => by_total,
+    };
+    dispatcher3(PAY_IN_COUNTED, &take, "STOP")
+}
+
+fn cut_payout(floor: bool) -> Vec<u8> {
+    let floor = match floor {
+        true => format!(
+            "DUP1 PUSH1 0x04 CALLDATALOAD GT ISZERO PUSH2 @floor JUMPI {REVERT} :floor JUMPDEST"
+        ),
+        false => String::new(),
+    };
+    let cash_out = format!(
+        "{CALLER_ENTRY} DUP1 SLOAD PUSH1 0x02 SLOAD \
+         DUP1 DUP3 LT ISZERO PUSH2 @enough JUMPI {REVERT} :enough JUMPDEST \
+         SWAP1 SUB {floor} PUSH1 0x00 DUP3 SSTORE \
+         PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 CALLER GAS CALL POP POP POP STOP"
+    );
+    dispatcher3(
+        &pay_in("CALLVALUE"),
+        "PUSH1 0x04 CALLDATALOAD PUSH1 0x02 SSTORE STOP",
+        &cash_out,
+    )
+}
+
+fn pays_two(each_required: bool) -> Vec<u8> {
+    let pay = |slot: u8, label: &str| {
+        let after = match each_required {
+            true => format!("PUSH2 @{label} JUMPI {REVERT} :{label} JUMPDEST"),
+            false => "POP".to_string(),
+        };
+        format!("PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x01 PUSH1 {slot:#04x} SLOAD GAS CALL {after}")
+    };
+    dispatcher(&format!(
+        "{} {} PUSH1 0x01 PUSH1 0x07 SSTORE STOP",
+        pay(5, "first"),
+        pay(6, "second")
+    ))
+}
+
+fn asset_vault(clear_first: bool) -> Vec<u8> {
+    let asset = "PUSH2 0xb1b1";
+    let pull = format!(
+        "PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
+         ADDRESS PUSH1 0xa4 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0xc4 MSTORE \
+         PUSH1 0x20 PUSH1 0x80 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 {asset} GAS CALL POP \
+         PUSH1 0x04 CALLDATALOAD {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP"
+    );
+    let send = format!(
+        "PUSH4 0xa9059cbb PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
+         DUP1 PUSH1 0xa4 MSTORE \
+         PUSH1 0x20 PUSH1 0x80 PUSH1 0x44 PUSH1 0x80 PUSH1 0x00 {asset} GAS CALL POP"
+    );
+    let give_back = match clear_first {
+        true => format!("{CALLER_ENTRY} DUP1 SLOAD PUSH1 0x00 DUP3 SSTORE {send} POP POP STOP"),
+        false => format!("{CALLER_ENTRY} DUP1 SLOAD {send} POP PUSH1 0x00 SWAP1 SSTORE STOP"),
+    };
+    dispatcher3(&pull, &give_back, "STOP")
+}
+
 fn clocked(clock: &str) -> Vec<u8> {
     dispatcher3(
         &format!("{clock} PUSH1 0x04 CALLDATALOAD ADD PUSH1 0x05 SSTORE STOP"),
@@ -2519,6 +2592,30 @@ fn cases() -> Vec<Case> {
             true,
             || proportional(BURN_ROUNDED_DOWN),
             || proportional(BURN_ROUNDED_UP),
+        ),
+        pair(
+            "reentrancy|reentered-call-pays-again",
+            true,
+            || asset_vault(false),
+            || asset_vault(true),
+        ),
+        pair(
+            "payout-grows-with-other-payment",
+            true,
+            || pooled(false),
+            || pooled(true),
+        ),
+        pair(
+            "earlier-call-lowers-payout",
+            true,
+            || cut_payout(false),
+            || cut_payout(true),
+        ),
+        pair(
+            "one-refusal-blocks-all|blocking-payout-loop|fixed-payee-can-block",
+            true,
+            || pays_two(true),
+            || pays_two(false),
         ),
         pair("phase-never-entered", false, || phased(5), || phased(2)),
         pair(

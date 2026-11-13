@@ -1,5 +1,5 @@
 use crate::abi;
-use crate::analyze::{push, Confidence, Finding, Section, Severity};
+use crate::analyze::{display_name, push, Confidence, Finding, Section, Severity};
 use crate::decompile::{Contract, Function};
 use crate::deploy;
 use crate::emit::MappingLayout;
@@ -979,6 +979,82 @@ fn short_input(c: &Contract, all: &[Run], out: &mut Vec<Finding>) {
     }
 }
 
+fn refusing_payee(c: &Contract, all: &[Run], out: &mut Vec<Finding>) {
+    const KNOWN: [&str; 2] = ["blocking-payout-loop", "fixed-payee-can-block"];
+    let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
+    let mut told: BTreeSet<usize> = BTreeSet::new();
+    for run in all.iter().filter(|r| !r.assumed) {
+        if told.contains(&run.function.pc) {
+            continue;
+        }
+        let inputs = &run.path.inputs;
+        let targets = run.path.effects.iter().filter_map(|st| match st {
+            Stmt::Call { addr, value, .. } => Some((*addr, *value)),
+            _ => None,
+        });
+        // An account the caller names is the caller's own risk, and an asset is not a payee.
+        // Only a payment of value to an account read from storage counts.
+        let stored = |e: ExprId| {
+            let reads = expr::contains(e, &|n| matches!(n, Node::SLoad(..)));
+            reads && !expr::contains(e, &|n| matches!(n, Node::CallDataLoad(_)))
+        };
+        let carries = |value: Option<ExprId>| {
+            value.is_some_and(|v| expr::as_const(v).is_none_or(|c| !c.is_zero()))
+        };
+        let payees: Vec<(usize, ExprId)> = targets
+            .zip(&run.path.run.calls)
+            .enumerate()
+            .filter(|(_, ((target, value), call))| {
+                let paid = call.kind == op::CALL && carries(*value) && stored(*target);
+                paid && call.addr != inputs.caller
+            })
+            .map(|(index, ((target, _), _))| (index, target))
+            .collect();
+        let distinct: BTreeSet<ExprId> = payees.iter().map(|(_, target)| *target).collect();
+        if payees.is_empty() {
+            continue;
+        }
+        let code = c.code_of(run.function);
+        let explorer = explorers
+            .entry(code.as_ptr())
+            .or_insert_with(|| Explorer::new(code));
+        let blocked = payees.iter().find_map(|(index, _)| {
+            let mut refused = inputs.clone();
+            refused.failing = Some(*index);
+            let again = explorer.run(&refused);
+            (!again.succeeded()).then_some(again)
+        });
+        let Some(again) = blocked else { continue };
+        let name = display_name(run.function);
+        let known = out.iter_mut().find(|f| {
+            KNOWN.contains(&f.id.as_str()) && f.function.as_deref() == Some(name.as_str())
+        });
+        if let Some(f) = known {
+            f.description.push_str(
+                " Confirmed by running it: with the attached input the function ends normally, and it fails when one of the accounts it pays refuses the payment.",
+            );
+            f.confidence = Confidence::High;
+            f.confirm(&again);
+            told.insert(run.function.pc);
+        } else if distinct.len() >= 2 {
+            told.insert(run.function.pc);
+            report(
+                out,
+                run,
+                "one-refusal-blocks-all",
+                "One account that refuses its payment makes the whole call fail",
+                Severity::Medium,
+                format!(
+                    "`{}` pays {} different accounts in one call and ends normally when all of them accept. When one of them refuses, the call fails and none of the others is paid, so a single account can hold up everyone else for as long as it likes.",
+                    run.function.name,
+                    distinct.len(),
+                ),
+                "Record what each account is owed and let each one collect it in its own call.",
+            );
+        }
+    }
+}
+
 const SHORT_LIST: u64 = 2;
 const LONG_LIST: u64 = 34;
 const STEPS_PER_ITEM: usize = 8;
@@ -1066,6 +1142,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Vec<Section> {
     aimed_writes(&all, out);
     short_input(c, &all, out);
     let begin = deploy::storage(c);
+    refusing_payee(c, &all, out);
     time_bounds(c, &all, &begin, layout, out);
     growth(c, &all, &begin, out);
     phases(c, &all, &begin, out).into_iter().collect()

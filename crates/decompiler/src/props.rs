@@ -13,16 +13,14 @@ use crate::solve::{self, Free, Inputs, Item, Step};
 use crate::ssa;
 use crate::u256::U256;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::time::{Duration, Instant};
 
 const LIMITS: Limits = Limits {
     paths: 24,
     runs: 96,
-    until: None,
 };
 const WORDS: usize = 12;
-const BUDGET: Duration = Duration::from_secs(3);
-const GROWTH_BUDGET: Duration = Duration::from_secs(1);
+pub const WORK: u64 = 3 * exec::WORK_PER_SECOND;
+const GROWTH_WORK: u64 = exec::WORK_PER_SECOND;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Place {
@@ -77,10 +75,6 @@ fn runs(c: &Contract) -> Vec<Run<'_>> {
     let mut out = Vec::new();
     let begin = deploy::storage(c);
     let from = deploy::start_text(&begin);
-    let limits = Limits {
-        until: Some(Instant::now() + BUDGET),
-        ..LIMITS
-    };
     let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
     for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
         let code = c.code_of(f);
@@ -113,7 +107,7 @@ fn runs(c: &Contract) -> Vec<Run<'_>> {
                     storage: begin.clone(),
                     ..flat.clone()
                 };
-                for path in explorer.explore(&start, &free, limits) {
+                for path in explorer.explore(&start, &free, LIMITS) {
                     if !path.succeeded() {
                         continue;
                     }
@@ -297,7 +291,14 @@ fn lock_left(all: &[Run], out: &mut Vec<Finding>) {
                 _ => None,
             })
             .collect();
-        Some((writes.first()?.0, writes.last()?.1, writes.len()))
+        let first = writes.first()?.0;
+        // Adding nothing twice writes a slot twice and takes no lock.
+        let moved = writes.iter().any(|(_, after)| *after != first);
+        Some((
+            first,
+            writes.last()?.1,
+            if moved { writes.len() } else { 0 },
+        ))
     };
     let mut toggled: BTreeSet<(usize, U256)> = BTreeSet::new();
     for run in all {
@@ -567,6 +568,39 @@ fn clock_mix(all: &[Run], layout: MappingLayout, out: &mut Vec<Finding>) {
     }
 }
 
+fn bits_read(cond: ExprId, slot: U256) -> U256 {
+    let amount = |e: ExprId| {
+        let by = expr::as_const(e).filter(U256::fits_u64)?.low_u64();
+        u32::try_from(by).ok().filter(|by| *by < 256)
+    };
+    let mut read = U256::ZERO;
+    let mut seen = HashSet::new();
+    let mut stack = vec![(cond, U256::MAX)];
+    while let Some((e, kept)) = stack.pop() {
+        if !seen.insert((e, kept)) || seen.len() > 4_000 {
+            continue;
+        }
+        match expr::node(e) {
+            Node::SLoad(key, false, _) if expr::as_const(key) == Some(slot) => read = read | kept,
+            Node::Op(op::AND, parts) if parts.len() == 2 => {
+                match (expr::as_const(parts[0]), expr::as_const(parts[1])) {
+                    (Some(mask), None) => stack.push((parts[1], kept & mask)),
+                    (None, Some(mask)) => stack.push((parts[0], kept & mask)),
+                    _ => stack.extend(parts.iter().map(|p| (*p, U256::MAX))),
+                }
+            }
+            Node::Op(op::SHR, parts) if amount(parts[0]).is_some() => {
+                stack.push((parts[1], kept << amount(parts[0]).unwrap_or(0)));
+            }
+            Node::Op(op::SHL, parts) if amount(parts[0]).is_some() => {
+                stack.push((parts[1], kept >> amount(parts[0]).unwrap_or(0)));
+            }
+            _ => stack.extend(expr::children(e).into_iter().map(|c| (c, U256::MAX))),
+        }
+    }
+    read
+}
+
 fn every_writer_seen(c: &Contract, all: &[Run]) -> bool {
     let finished: BTreeSet<usize> = all.iter().map(|r| r.function.pc).collect();
     c.functions
@@ -587,6 +621,7 @@ fn time_bounds(
         _ => None,
     };
     let mut timed: BTreeMap<U256, &Run> = BTreeMap::new();
+    let mut compared: BTreeMap<U256, U256> = BTreeMap::new();
     for run in all {
         for item in &run.path.items {
             let Item::Check { cond, .. } = item else {
@@ -598,10 +633,26 @@ fn time_bounds(
             for p in places_read(*cond, layout) {
                 if let Place::Fixed(slot) = p {
                     timed.entry(slot).or_insert(run);
+                    let bits = compared.entry(slot).or_insert(U256::ZERO);
+                    *bits = *bits | bits_read(*cond, slot);
                 }
             }
         }
     }
+    // A slot can pack the bound with other fields. Only a write that moves the bits the
+    // time check reads sets the bound.
+    let moves_bound = |run: &Run, slot: U256| {
+        let read = compared.get(&slot).copied().unwrap_or(U256::MAX);
+        run.steps.iter().any(|step| match step {
+            Step::Write {
+                slot: at,
+                before,
+                after,
+                ..
+            } => *at == slot && !((*before ^ *after) & read).is_zero(),
+            _ => false,
+        })
+    };
     let mut written: BTreeSet<U256> = BTreeSet::new();
     let mut set_by_call: BTreeMap<U256, &Run> = BTreeMap::new();
     for run in all {
@@ -612,7 +663,7 @@ fn time_bounds(
             let Some(slot) = fixed(*key) else { continue };
             written.insert(slot);
             let from_input = expr::contains(*val, &|n| matches!(n, Node::CallDataLoad(_)));
-            if from_input && !run.assumed {
+            if from_input && !run.assumed && moves_bound(run, slot) {
                 set_by_call.entry(slot).or_insert(run);
             }
         }
@@ -728,19 +779,34 @@ fn phases(
     // A writer with no finished run could be the one that enters the missing phase.
     let every_writer_seen = every_writer_seen(c, all);
     let small = |v: &U256| v.fits_u64() && v.low_u64() <= MAX_PHASE;
-    let mut needs: BTreeMap<Field, BTreeMap<U256, BTreeSet<&str>>> = BTreeMap::new();
-    for run in all {
+    let wanted = |run: &Run| {
+        let mut out: BTreeMap<Field, U256> = BTreeMap::new();
         for item in &run.path.items {
             let Item::Check { cond, holds, .. } = item else {
                 continue;
             };
             if let Some((field, value)) = required(*cond, *holds).filter(|(_, v)| small(v)) {
-                let by_value = needs.entry(field).or_default();
-                by_value
-                    .entry(value)
-                    .or_default()
-                    .insert(&run.function.name);
+                out.entry(field).or_insert(value);
             }
+        }
+        out
+    };
+    let wants: Vec<BTreeMap<Field, U256>> = all.iter().map(wanted).collect();
+    let fields: BTreeSet<Field> = wants.iter().flat_map(|w| w.keys().copied()).collect();
+    let mut asked: BTreeMap<(Field, &str), BTreeSet<Option<U256>>> = BTreeMap::new();
+    for (run, want) in all.iter().zip(&wants) {
+        for field in &fields {
+            let values = asked.entry((*field, &run.function.name)).or_default();
+            values.insert(want.get(field).copied());
+        }
+    }
+    // A function that also finishes at another value, or without testing the field, takes
+    // a branch on it. Only one that finishes at a single value waits for that value.
+    let mut needs: BTreeMap<Field, BTreeMap<U256, BTreeSet<&str>>> = BTreeMap::new();
+    for ((field, name), values) in asked {
+        if let [Some(value)] = values.into_iter().collect::<Vec<_>>()[..] {
+            let by_value = needs.entry(field).or_default();
+            by_value.entry(value).or_default().insert(name);
         }
     }
     let mut lines = Vec::new();
@@ -1010,7 +1076,10 @@ fn refusing_payee(c: &Contract, all: &[Run], out: &mut Vec<Finding>) {
             })
             .map(|(index, ((target, _), _))| (index, target))
             .collect();
-        let distinct: BTreeSet<ExprId> = payees.iter().map(|(_, target)| *target).collect();
+        // Two instalments to one account are one payee. The account is known by the place
+        // it is read from, since from empty storage every stored account reads as zero.
+        let read_from = |target: &ExprId| read_of_one_slot(*target).unwrap_or(*target);
+        let distinct: BTreeSet<ExprId> = payees.iter().map(|(_, t)| read_from(t)).collect();
         if payees.is_empty() {
             continue;
         }
@@ -1059,6 +1128,7 @@ const SHORT_LIST: u64 = 2;
 const LONG_LIST: u64 = 34;
 const STEPS_PER_ITEM: usize = 8;
 const MAX_COUNTERS: usize = 4;
+const LARGE_COUNT: u64 = 1 << 32;
 
 fn growth(c: &Contract, all: &[Run], begin: &HashMap<U256, U256>, out: &mut Vec<Finding>) {
     let mut counters: BTreeMap<U256, &Run> = BTreeMap::new();
@@ -1080,11 +1150,10 @@ fn growth(c: &Contract, all: &[Run], begin: &HashMap<U256, U256>, out: &mut Vec<
         }
     }
     let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
-    let deadline = Instant::now() + GROWTH_BUDGET;
     for (slot, adder) in counters.into_iter().take(MAX_COUNTERS) {
         let mut slowed: Vec<(String, usize)> = Vec::new();
         for g in c.functions.iter().filter(|f| f.kind == FnKind::External) {
-            if Instant::now() >= deadline {
+            if exec::spent() {
                 break;
             }
             let code = c.code_of(g);
@@ -1108,6 +1177,16 @@ fn growth(c: &Contract, all: &[Run], begin: &HashMap<U256, U256>, out: &mut Vec<
         let Some((_, extra)) = slowed.first() else {
             continue;
         };
+        // A cap shows as the adder refusing once the count is large.
+        let mut full = adder.path.inputs.clone();
+        full.storage.insert(slot, U256::from_u64(LARGE_COUNT));
+        let code = c.code_of(adder.function);
+        let explorer = explorers
+            .entry(code.as_ptr())
+            .or_insert_with(|| Explorer::new(code));
+        if !explorer.run(&full).succeeded() {
+            continue;
+        }
         let names: Vec<&str> = slowed.iter().map(|(n, _)| n.as_str()).collect();
         report(
             out,
@@ -1116,7 +1195,7 @@ fn growth(c: &Contract, all: &[Run], begin: &HashMap<U256, U256>, out: &mut Vec<
             "Work grows with a count that any caller can raise",
             Severity::Medium,
             format!(
-                "`{}` needs no role and raises {} by one each time it is called. {} do work for every unit of that count: with the count at {LONG_LIST} instead of {SHORT_LIST} a call runs {} more instructions. Nothing found caps the count, so enough calls put those functions beyond what one block can run.",
+                "`{}` needs no role and raises {} by one each time it is called. {} do work for every unit of that count: with the count at {LONG_LIST} instead of {SHORT_LIST} a call runs {} more instructions. The same call still ends normally with the count at {LARGE_COUNT}, so nothing caps it and enough calls put those functions beyond what one block can run.",
                 adder.function.name,
                 slot_text(slot),
                 names.join(", "),
@@ -1132,7 +1211,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Vec<Section> {
         return Vec::new();
     }
     let layout = c.compiler.layout;
-    let all = runs(c);
+    let all = exec::within(WORK, || runs(c));
     let pairs = in_step_pairs(&all, layout);
     out_of_step(&all, layout, &pairs, out);
     open_at_call(&all, layout, &pairs, out);
@@ -1144,6 +1223,6 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Vec<Section> {
     let begin = deploy::storage(c);
     refusing_payee(c, &all, out);
     time_bounds(c, &all, &begin, layout, out);
-    growth(c, &all, &begin, out);
+    exec::within(GROWTH_WORK, || growth(c, &all, &begin, out));
     phases(c, &all, &begin, out).into_iter().collect()
 }

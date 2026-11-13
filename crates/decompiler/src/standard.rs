@@ -11,7 +11,6 @@ use crate::solve::{self, Free, Inputs, Item, Step};
 use crate::ssa;
 use crate::u256::U256;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::{Duration, Instant};
 
 const SEL_TRANSFER: u32 = 0xa905_9cbb;
 const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
@@ -21,18 +20,20 @@ const SEL_TOTAL: u32 = 0x1816_0ddd;
 const LIMITS: Limits = Limits {
     paths: 24,
     runs: 96,
-    until: None,
 };
-const BUDGET: Duration = Duration::from_secs(2);
+pub const WORK: u64 = 2 * exec::WORK_PER_SECOND;
 const HOLDER: U256 = U256::from_u64(0xf00d_f00d_f00d_f00d);
 const RECEIVER: U256 = U256::from_u64(0x7070_7070_7070_7070);
 const AMOUNT: U256 = U256::from_u64(0x1001);
 
-type Entry = (U256, Vec<U256>);
+// The field offset is part of the place. A balance and a time kept in one record are
+// two values, not one.
+type Root = (U256, u64);
+type Entry = (Root, Vec<U256>);
 
 // Several mappings can be keyed by one account.
 // The one in which the payer's entry falls is the ledger.
-fn ledger(moves: &BTreeMap<Entry, (U256, U256)>, payer: U256) -> Option<U256> {
+fn ledger(moves: &BTreeMap<Entry, (U256, U256)>, payer: U256) -> Option<Root> {
     let falls = moves
         .iter()
         .filter(|((_, keys), pair)| keys[..] == [payer] && amount_sized(fell(**pair)));
@@ -45,7 +46,6 @@ struct Bench<'a> {
     layout: MappingLayout,
     begin: HashMap<U256, U256>,
     explorers: HashMap<*const u8, Explorer>,
-    deadline: Instant,
 }
 
 impl<'a> Bench<'a> {
@@ -73,11 +73,7 @@ impl<'a> Bench<'a> {
             storage: true,
             fixed: Vec::new(),
         };
-        let limits = Limits {
-            until: Some(self.deadline),
-            ..LIMITS
-        };
-        let found = self.explorer(f).explore(&start, &free, limits);
+        let found = self.explorer(f).explore(&start, &free, LIMITS);
         let moved = |p: &Path| p.succeeded() && p.run.storage != p.inputs.storage;
         found.into_iter().find(moved)
     }
@@ -102,12 +98,15 @@ impl<'a> Bench<'a> {
     fn keys(&self, key: ExprId, inputs: &Inputs) -> Option<Entry> {
         let slot = ssa::slot_path(key, self.layout)?;
         let mut out = Vec::new();
+        let mut offset = 0u64;
         for step in &slot.steps {
-            if let ssa::Step::Key(k) = step {
-                out.push(solve::value_of(*k, inputs)?);
+            match step {
+                ssa::Step::Key(k) => out.push(solve::value_of(*k, inputs)?),
+                ssa::Step::Offset(by) => offset = offset.wrapping_add(*by),
+                ssa::Step::Index(_) => {}
             }
         }
-        Some((slot.root, out))
+        Some(((slot.root, offset), out))
     }
 
     fn moves(&self, p: &Path) -> BTreeMap<Entry, (U256, U256)> {
@@ -416,7 +415,6 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Option<Section> {
         layout: c.compiler.layout,
         begin: deploy::storage(c),
         explorers: HashMap::new(),
-        deadline: Instant::now() + BUDGET,
     };
     bench.function(SEL_BALANCE_OF)?;
     let mut report = Report {

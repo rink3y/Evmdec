@@ -9,16 +9,14 @@ use crate::path::{self, Explorer, Limits, Path};
 use crate::solve::{Free, Inputs};
 use crate::u256::U256;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 const LIMITS: Limits = Limits {
     paths: 16,
     runs: 64,
-    until: None,
 };
 const WORDS: usize = 12;
 const MAX_FUNCTIONS: usize = 32;
-const BUDGET: Duration = Duration::from_secs(3);
+pub const WORK: u64 = 3 * exec::WORK_PER_SECOND;
 const RECOVER: U256 = U256::ONE;
 const SIGNER: U256 = U256::from_u64(0x5167_5167_5167_5167);
 const FIRST_ACCOUNT: u64 = 0x12;
@@ -84,22 +82,21 @@ fn start_for(f: &Function, begin: &HashMap<U256, U256>) -> (Inputs, Free) {
     (inputs, free)
 }
 
-fn repeated(
+fn explored(
     explorer: &Explorer,
     f: &Function,
     begin: &HashMap<U256, U256>,
-    deadline: Instant,
-) -> Option<Path> {
+) -> (Vec<Path>, Vec<usize>) {
     let (start, free) = start_for(f, begin);
-    let limits = Limits {
-        until: Some(deadline),
-        ..LIMITS
-    };
-    for p in explorer.explore(&start, &free, limits) {
-        let Some(digest) = digest_of(&p) else {
+    (explorer.explore(&start, &free, LIMITS), free.fixed)
+}
+
+fn repeated(explorer: &Explorer, found: &[Path]) -> Option<Path> {
+    for p in found {
+        let Some(digest) = digest_of(p) else {
             continue;
         };
-        if !p.succeeded() || !acts(&p) {
+        if !p.succeeded() || !acts(p) {
             continue;
         }
         let mut again = p.inputs.clone();
@@ -146,22 +143,6 @@ fn unsigned_words(explorer: &Explorer, first: &Path, fixed: &[usize]) -> Vec<(us
     out
 }
 
-fn signed_run(
-    explorer: &Explorer,
-    f: &Function,
-    begin: &HashMap<U256, U256>,
-    deadline: Instant,
-) -> Option<(Path, Vec<usize>)> {
-    let (start, free) = start_for(f, begin);
-    let limits = Limits {
-        until: Some(deadline),
-        ..LIMITS
-    };
-    let found = explorer.explore(&start, &free, limits);
-    let acted = |p: &Path| p.succeeded() && acts(p) && digest_of(p).is_some();
-    found.into_iter().find(acted).map(|p| (p, free.fixed))
-}
-
 fn report_unsigned(out: &mut Vec<Finding>, f: &Function, words: &[(usize, Path)]) {
     let Some((_, run)) = words.first() else {
         return;
@@ -198,11 +179,10 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         return;
     }
     let begin = deploy::storage(c);
-    let deadline = Instant::now() + BUDGET;
     let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
     let external = |f: &&Function| f.kind == FnKind::External;
     for f in c.functions.iter().filter(external).take(MAX_FUNCTIONS) {
-        if Instant::now() >= deadline {
+        if exec::spent() {
             break;
         }
         let code = c.code_of(f);
@@ -212,10 +192,12 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         let explorer = explorers
             .entry(code.as_ptr())
             .or_insert_with(|| Explorer::new(code));
-        if let Some((first, fixed)) = signed_run(explorer, f, &begin, deadline) {
-            report_unsigned(out, f, &unsigned_words(explorer, &first, &fixed));
+        let (found, fixed) = explored(explorer, f, &begin);
+        let acted = |p: &&Path| p.succeeded() && acts(p) && digest_of(p).is_some();
+        if let Some(first) = found.iter().find(acted) {
+            report_unsigned(out, f, &unsigned_words(explorer, first, &fixed));
         }
-        let Some(second) = repeated(explorer, f, &begin, deadline) else {
+        let Some(second) = repeated(explorer, &found) else {
             continue;
         };
         let severity = if moves_value(&second) {

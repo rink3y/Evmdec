@@ -177,7 +177,7 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
             }
         }
     }
-    let r = evmdec::analyze::analyze(&c);
+    let (r, linked_reports) = evmdec::analyze::analyze_all(&c);
     let md = evmdec::analyze::render_markdown(&c, &r, source.title());
     let disasm: Vec<String> = evmdec::disasm::disassemble(&c.info.runtime)
         .iter()
@@ -186,8 +186,8 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
     let linked: Vec<Value> = c
         .linked
         .iter()
-        .map(|lc| {
-            let lr = evmdec::analyze::analyze(lc);
+        .zip(linked_reports)
+        .map(|(lc, lr)| {
             let lmd = evmdec::analyze::render_markdown(
                 lc,
                 &lr,

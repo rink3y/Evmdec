@@ -29,6 +29,51 @@ impl FrameRun {
     }
 }
 
+thread_local! {
+    static WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// Setting a run up and reading its trace back costs about this many steps.
+const RUN_COST: u64 = 2_000;
+
+// Limits on the checks that run code are counted in this, not in seconds. A count gives
+// the same report on a slow machine and on a busy one.
+thread_local! {
+    static STOP: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+// About what one core does in a second, on the slowest inputs, on the machine the limits
+// were set on.
+pub const WORK_PER_SECOND: u64 = 12_000_000;
+
+pub fn work() -> u64 {
+    WORK.with(std::cell::Cell::get)
+}
+
+struct Restore(u64);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        STOP.with(|s| s.set(self.0));
+    }
+}
+
+// Runs a check with a cap on the work it may count. The path search and the solver ask
+// `spent` deep inside, so one long search cannot run many times past the cap.
+pub fn within<R>(units: u64, check: impl FnOnce() -> R) -> R {
+    let mark = work().saturating_add(units);
+    let _outer = Restore(STOP.with(|s| s.replace(s.get().min(mark))));
+    check()
+}
+
+pub fn spent() -> bool {
+    work() >= STOP.with(std::cell::Cell::get)
+}
+
+pub fn spend(units: u64) {
+    WORK.with(|w| w.set(w.get().saturating_add(units)));
+}
+
 pub fn run_frame(
     code: &[u8],
     host: &Host,
@@ -76,6 +121,7 @@ pub fn run_frame(
             Err(e) => break Outcome::Exception(e),
         }
     };
+    spend(steps as u64 + RUN_COST);
     FrameRun {
         outcome,
         visited,

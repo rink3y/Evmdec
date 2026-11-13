@@ -1,24 +1,24 @@
 use crate::cfg::Program;
 use crate::exec::{self, FrameRun};
+use crate::expr;
 use crate::interp::{self, Host};
 use crate::lift::{Lifter, Stmt, Term};
 use crate::solve::{self, Free, Inputs, Item};
 use crate::u256::U256;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Instant;
 
 const STEP_BUDGET: usize = 200_000;
 const MAX_BLOCKS: usize = 2_048;
-const MAX_FLIPS_PER_PATH: usize = 48;
 const MAX_LATE_RUNS: usize = 1024;
+// Reading one block of a trace back into expressions costs about this many steps.
+const BLOCK_COST: u64 = 40;
 const DEFAULT_BALANCE: U256 = U256::from_u64(1_000_000_000_000_000_000);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub paths: usize,
     pub runs: usize,
-    pub until: Option<Instant>,
 }
 
 impl Default for Limits {
@@ -26,7 +26,6 @@ impl Default for Limits {
         Limits {
             paths: 48,
             runs: 240,
-            until: None,
         }
     }
 }
@@ -108,6 +107,7 @@ impl Explorer {
             .filter_map(|pc| self.prog.block_at_pc.get(pc).copied())
             .take(MAX_BLOCKS)
             .collect();
+        exec::spend(blocks.len() as u64 * BLOCK_COST);
         let lifter = Lifter {
             prog: &self.prog,
             root: true,
@@ -145,9 +145,15 @@ impl Explorer {
                     _ => {}
                 }
             }
-            if let Term::CondJump { cond, .. } = &node.term {
+            if let Term::CondJump { cond, target } = &node.term {
                 let block = &self.prog.blocks[node.block];
                 let next = blocks.get(i + 1).map(|b| self.prog.blocks[*b].start);
+                // A jump to the instruction after it goes the same way whatever the test
+                // says. Recording a side would ask the solver for a run that changes nothing.
+                let to = expr::as_const(*target).and_then(|t| t.as_usize());
+                if to == Some(block.end) {
+                    continue;
+                }
                 let holds = next != Some(block.end);
                 items.push(Item::Check {
                     cond: *cond,
@@ -182,10 +188,10 @@ impl Explorer {
 
     // Each new path is only kept after the bytecode really ran it.
     pub fn explore(&self, start: &Inputs, free: &Free, limits: Limits) -> Vec<Path> {
-        // Past its time a caller still gets one run of each function, so a slow first
+        // Past its limit a caller still gets one run of each function, so a slow first
         // function does not hide the rest. The count ends that for a contract with
         // thousands of functions, which would otherwise run every one of them.
-        if limits.until.is_some_and(|t| Instant::now() >= t) {
+        if exec::spent() {
             if self.late.get() >= MAX_LATE_RUNS {
                 return Vec::new();
             }
@@ -200,12 +206,10 @@ impl Explorer {
         let mut runs = 1;
         while let Some((index, bound)) = queue.pop_front() {
             let last = paths[index].truth.len();
-            let first = bound.max(last.saturating_sub(MAX_FLIPS_PER_PATH));
             // A run that fails stops at its last check, so that is the one whose other side
             // leads further. Early checks mostly validate arguments and only add failing runs.
-            for flip in (first..last).rev() {
-                let late = limits.until.is_some_and(|t| Instant::now() >= t);
-                if late || runs >= limits.runs || paths.len() >= limits.paths {
+            for flip in (bound..last).rev() {
+                if exec::spent() || runs >= limits.runs || paths.len() >= limits.paths {
                     return paths;
                 }
                 let base = &paths[index];

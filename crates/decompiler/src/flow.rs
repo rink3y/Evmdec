@@ -14,7 +14,6 @@ use crate::solve::{self, word, Free, Inputs, Step};
 use crate::ssa;
 use crate::u256::U256;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 const SEL_TRANSFER: u32 = 0xa905_9cbb;
 const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
@@ -23,17 +22,12 @@ const SEL_BALANCE_OF: u32 = 0x70a0_8231;
 const LIMITS: Limits = Limits {
     paths: 12,
     runs: 48,
-    until: None,
 };
-const PROBE: Limits = Limits {
-    paths: 6,
-    runs: 16,
-    until: None,
-};
+const PROBE: Limits = Limits { paths: 6, runs: 16 };
 const WORDS: usize = 8;
 const MAX_FUNCTIONS: usize = 32;
 const MAX_DEPOSITS: usize = 6;
-const BUDGET: Duration = Duration::from_secs(4);
+pub const WORK: u64 = 4 * exec::WORK_PER_SECOND;
 
 const SECOND_CALLER: U256 = U256::from_u64(0xbbbb_bbbb_bbbb_bbbb);
 // About twice the amounts the second account pays in.
@@ -160,6 +154,16 @@ fn entry_moves(p: &Path, layout: MappingLayout) -> (U256, U256) {
     (rise, fall)
 }
 
+// A payout in an asset the account never paid in is a purchase, not a refund.
+fn more_back(d: &Deposit, q: &Path) -> Option<(Asset, U256)> {
+    let back = sent(q);
+    back.iter().find_map(|(asset, _)| {
+        let paid = sum(total(&d.taken, *asset), total(&taken(q), *asset));
+        let got = total(&back, *asset);
+        (!paid.is_zero() && got > paid).then_some((*asset, got))
+    })
+}
+
 fn all_sent(p: &Path) -> U256 {
     let moved = sent(p).into_iter();
     moved.fold(U256::ZERO, |all, (_, amount)| sum(all, amount))
@@ -173,6 +177,7 @@ fn all_taken(p: &Path) -> U256 {
 // Small amounts, so a proportion that divides shows its rounding in every one.
 const PARTS: [(u64, u64); 4] = [(3, 3), (5, 6), (7, 9), (10, 13)];
 const MAX_AMOUNT_WORDS: usize = 4;
+const ROUNDING_GAP: U256 = U256::from_u64(2);
 const MAX_OTHER_CALLS: usize = 8;
 
 fn word_reply(value: U256) -> Vec<u8> {
@@ -200,7 +205,6 @@ struct Pass<'a> {
     c: &'a Contract,
     explorers: HashMap<*const u8, Explorer>,
     start: HashMap<U256, U256>,
-    deadline: Instant,
 }
 
 impl<'a> Pass<'a> {
@@ -210,7 +214,7 @@ impl<'a> Pass<'a> {
     }
 
     fn explore(&mut self, f: &Function, start: &Inputs, free: &Free, limits: Limits) -> Vec<Path> {
-        if Instant::now() >= self.deadline {
+        if exec::spent() {
             return Vec::new();
         }
         let code = self.c.code_of(f);
@@ -218,10 +222,6 @@ impl<'a> Pass<'a> {
             .explorers
             .entry(code.as_ptr())
             .or_insert_with(|| Explorer::new(code));
-        let limits = Limits {
-            until: Some(self.deadline),
-            ..limits
-        };
         explorer.explore(start, free, limits)
     }
 
@@ -290,17 +290,32 @@ impl<'a> Pass<'a> {
     }
 
     fn after(&mut self, d: &Deposit, g: &Function) -> Vec<Path> {
-        self.after_from(&d.path.run.storage, d.credit, g)
+        self.after_from(&d.path.run.storage, d.credit, &d.taken, g)
     }
 
-    fn after_from(&mut self, state: &HashMap<U256, U256>, credit: U256, g: &Function) -> Vec<Path> {
+    // The contract holds what was paid in and no more. A larger balance would make a fair
+    // share of the balance look like a gain.
+    fn after_from(
+        &mut self,
+        state: &HashMap<U256, U256>,
+        credit: U256,
+        held: &[(Asset, U256)],
+        g: &Function,
+    ) -> Vec<Path> {
         let twice = sum(credit, credit);
         let fills: [&dyn Fn(usize) -> U256; 4] =
             [&|_| credit, &|_| twice, &|_| U256::ZERO, &|_| U256::MAX];
+        let ether = total(held, Asset::Ether);
+        let tokens = held.iter().filter(|(asset, _)| *asset != Asset::Ether);
+        let tokens = tokens.fold(U256::ZERO, |all, (_, amount)| sum(all, *amount));
         let mut out = Vec::new();
         for (round, fill) in fills.iter().enumerate() {
             let (mut start, free) = self.base(g, fill);
             start.storage = state.clone();
+            start.balance = ether;
+            if !tokens.is_zero() {
+                start.replies.push((SEL_BALANCE_OF, word_reply(tokens)));
+            }
             let limits = if round == 0 { PROBE } else { LIMITS };
             let found = self.explore(g, &start, &free, limits);
             if round == 0 && found.iter().all(|p| p.run.calls.is_empty()) {
@@ -312,14 +327,9 @@ impl<'a> Pass<'a> {
     }
 
     fn gain(&mut self, d: &Deposit, g: &Function, paths: &[Path], out: &mut Vec<Finding>) -> bool {
-        let better = paths.iter().find_map(|q| {
-            let back = sent(q);
-            let more = back.iter().find(|(asset, _)| {
-                let paid = sum(total(&d.taken, *asset), total(&taken(q), *asset));
-                total(&back, *asset) > paid
-            })?;
-            Some((more.0, total(&back, more.0), q))
-        });
+        let better = paths
+            .iter()
+            .find_map(|q| more_back(d, q).map(|(asset, back)| (asset, back, q)));
         let Some((asset, back, q)) = better else {
             return false;
         };
@@ -339,19 +349,13 @@ impl<'a> Pass<'a> {
             return;
         }
         let state = paid_too.run.storage.clone();
+        let held: Vec<(Asset, U256)> = d.taken.iter().chain(&d.taken).copied().collect();
         let functions: Vec<&Function> = self.externals().collect();
         for g in functions {
             let found = self
-                .after_from(&state, d.credit, g)
+                .after_from(&state, d.credit, &held, g)
                 .into_iter()
-                .find_map(|q| {
-                    let back = sent(&q);
-                    let more = back.iter().find(|(asset, _)| {
-                        let paid = sum(total(&d.taken, *asset), total(&taken(&q), *asset));
-                        total(&back, *asset) > paid
-                    })?;
-                    Some((more.0, total(&back, more.0), q))
-                });
+                .find_map(|q| more_back(d, &q).map(|(asset, back)| (asset, back, q)));
             let Some((asset, back, q)) = found else {
                 continue;
             };
@@ -501,12 +505,9 @@ impl<'a> Pass<'a> {
                 world.place(caller, calls_back(Some(vault), &q.inputs.calldata));
             }
         }
-        let ended = world.run(vault, caller, q.inputs.callvalue, q.inputs.calldata.clone());
-        let paid_out = world
-            .sent()
-            .iter()
-            .filter(|s| s.from == vault)
-            .filter_map(|s| match asset {
+        let paid = |world: &World| {
+            let from_vault = world.sent().iter().filter(|s| s.from == vault);
+            let amounts = from_vault.filter_map(|s| match asset {
                 Asset::Ether => (s.to == caller).then_some(s.value),
                 Asset::Token(at) => {
                     let pays = s.to == at
@@ -515,9 +516,28 @@ impl<'a> Pass<'a> {
                         && word(&s.input, 4) == caller;
                     pays.then(|| word(&s.input, 36))
                 }
-            })
-            .fold(U256::ZERO, sum);
-        if !ended || paid_out <= once {
+            });
+            amounts.fold(U256::ZERO, sum)
+        };
+        // A function that pays the same on every call pays twice for two calls however they
+        // are made. Only more than two calls in a row would pay is a gain.
+        let mut in_turn = World::new();
+        in_turn.place(vault, self.c.code_of(g).to_vec());
+        for (slot, value) in &q.inputs.storage {
+            in_turn.seed(vault, *slot, *value);
+        }
+        if let Asset::Token(at) = asset {
+            in_turn.place(at, runs_receiver(caller));
+        }
+        let mut two_calls = U256::ZERO;
+        for value in [q.inputs.callvalue, U256::ZERO] {
+            if in_turn.run(vault, caller, value, q.inputs.calldata.clone()) {
+                two_calls = sum(two_calls, paid(&in_turn));
+            }
+        }
+        let ended = world.run(vault, caller, q.inputs.callvalue, q.inputs.calldata.clone());
+        let paid_out = paid(&world);
+        if !ended || paid_out <= once.max(two_calls) {
             return;
         }
         let how = match asset {
@@ -702,8 +722,11 @@ impl<'a> Pass<'a> {
                 // A call the word does not steer gives the same twice and proves nothing.
                 let exact =
                     |part: U256, other: U256, all: U256| !all.is_zero() && sum(part, other) == all;
-                let more_in_parts = sum(x.0, y.0) > whole.0 && exact(x.1, y.1, whole.1);
-                let less_in_parts = sum(x.1, y.1) < whole.1 && exact(x.0, y.0, whole.0);
+                // Rounding loses less than one unit per division. A larger gap is a price
+                // that depends on the amount, which is a curve and not a rounding.
+                let near = |more: U256, less: U256| more > less && more - less <= ROUNDING_GAP;
+                let more_in_parts = near(sum(x.0, y.0), whole.0) && exact(x.1, y.1, whole.1);
+                let less_in_parts = near(whole.1, sum(x.1, y.1)) && exact(x.0, y.0, whole.0);
                 over += usize::from(more_in_parts);
                 under += usize::from(less_in_parts);
                 if more_in_parts || less_in_parts {
@@ -965,7 +988,6 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         c,
         explorers: HashMap::new(),
         start: deploy::storage(c),
-        deadline: Instant::now() + BUDGET,
     };
     let deposits = pass.deposits(layout);
     for d in &deposits {

@@ -57,7 +57,8 @@ const LOOKAHEAD: usize = 8;
 pub fn word(calldata: &[u8], offset: usize) -> U256 {
     let mut bytes = [0u8; 32];
     for (i, b) in bytes.iter_mut().enumerate() {
-        *b = calldata.get(offset + i).copied().unwrap_or(0);
+        let at = offset.checked_add(i);
+        *b = at.and_then(|at| calldata.get(at)).copied().unwrap_or(0);
     }
     U256::from_be_bytes(&bytes)
 }
@@ -74,6 +75,16 @@ struct Eval<'a> {
     inputs: &'a Inputs,
     writes: Vec<(u32, U256, U256, ExprId)>,
     memo: HashMap<ExprId, Option<U256>>,
+}
+
+// Valuing one node costs about as much as a dozen steps of a run. Counting it keeps a
+// search with long conditions inside the same limit as the runs.
+const NODE_COST: u64 = 12;
+
+impl Drop for Eval<'_> {
+    fn drop(&mut self) {
+        crate::exec::spend(self.memo.len() as u64 * NODE_COST);
+    }
 }
 
 impl Eval<'_> {
@@ -541,6 +552,9 @@ pub fn solve(items: &[Item], want: &[bool], start: &Inputs, free: &Free) -> Opti
     for _ in 0..ROUNDS {
         if reached >= want.len() {
             return Some(current);
+        }
+        if crate::exec::spent() {
+            return None;
         }
         let mut better: Option<(usize, Inputs)> = None;
         let offer = |better: &mut Option<(usize, Inputs)>, next: Inputs| {

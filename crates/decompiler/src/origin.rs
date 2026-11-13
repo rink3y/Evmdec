@@ -35,7 +35,9 @@ impl Origin {
     }
 }
 
-pub type Loc = (U256, usize);
+// Root, number of keys, and the field offset inside the record the keys lead to.
+// Two fields of one record are set by different code and are not one value.
+pub type Loc = (U256, usize, u64);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Store {
@@ -57,12 +59,14 @@ const MAX_NODES: usize = 4_000;
 
 pub fn loc_of(key: ExprId, layout: MappingLayout) -> Option<Loc> {
     let path = ssa::slot_path(key, layout)?;
-    let keyed = path
-        .steps
-        .iter()
-        .filter(|s| !matches!(s, ssa::Step::Offset(_)))
-        .count();
-    Some((path.root, keyed))
+    let (mut keyed, mut offset) = (0, 0u64);
+    for step in &path.steps {
+        match step {
+            ssa::Step::Offset(by) => offset = offset.wrapping_add(*by),
+            _ => keyed += 1,
+        }
+    }
+    Some((path.root, keyed, offset))
 }
 
 impl Model {
@@ -172,7 +176,7 @@ mod tests {
 
     fn store(n: u64, gated: bool, value: ExprId) -> Store {
         Store {
-            loc: (U256::from_u64(n), 0),
+            loc: (U256::from_u64(n), 0, 0),
             gated,
             value,
             by: 0,
@@ -184,9 +188,9 @@ mod tests {
         let argument = expr::calldataload(expr::konst_u64(4));
         let stores = [store(1, false, argument), store(2, false, slot(1))];
         let model = Model::build(&stores, MappingLayout::default());
-        assert!(model.slot((U256::from_u64(2), 0)).open());
-        assert!(model.set_directly((U256::from_u64(1), 0)));
-        assert!(!model.set_directly((U256::from_u64(2), 0)));
+        assert!(model.slot((U256::from_u64(2), 0, 0)).open());
+        assert!(model.set_directly((U256::from_u64(1), 0, 0)));
+        assert!(!model.set_directly((U256::from_u64(2), 0, 0)));
     }
 
     #[test]
@@ -194,8 +198,8 @@ mod tests {
         let argument = expr::calldataload(expr::konst_u64(4));
         let stores = [store(1, true, argument), store(2, false, slot(1))];
         let model = Model::build(&stores, MappingLayout::default());
-        let held = model.slot((U256::from_u64(2), 0));
+        let held = model.slot((U256::from_u64(2), 0, 0));
         assert!(held.has(Origin::GATED) && !held.open());
-        assert_eq!(model.slot((U256::from_u64(9), 0)), Origin::UNSET);
+        assert_eq!(model.slot((U256::from_u64(9), 0, 0)), Origin::UNSET);
     }
 }

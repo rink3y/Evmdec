@@ -1,15 +1,19 @@
 use crate::compiler;
+use crate::confirm;
 use crate::cross::World as CrossWorld;
 use crate::decompile::{self, Contract, Function};
 use crate::emit::{self, Names, SlotSpace};
 use crate::exec;
 use crate::expr::{self, ExprId, Node};
+use crate::flow;
 use crate::function::FnKind;
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::origin::{self, Model};
+use crate::signed;
 use crate::sigs;
 use crate::ssa;
+use crate::standard;
 use crate::type_rules;
 use crate::u256::U256;
 use serde::Serialize;
@@ -362,6 +366,7 @@ struct LinkedCall {
 }
 
 struct World<'a> {
+    root: &'a Contract,
     members: HashMap<String, &'a Contract>,
     // None marks a contract whose analysis is under way.
     // It stops two contracts that call each other from recursing forever.
@@ -385,6 +390,7 @@ impl<'a> World<'a> {
             work.extend(c.linked.iter());
         }
         World {
+            root,
             members,
             reports: RefCell::new(HashMap::new()),
         }
@@ -3425,6 +3431,16 @@ fn legacy_consequence(before_0_5: bool) -> &'static str {
 }
 
 pub fn analyze(c: &Contract) -> Report {
+    analyze_with_linked(c, false).0
+}
+
+// The contracts fetched with the one asked for are read while it is analysed. Their
+// reports come from that one pass. Analysing each again on its own took ten times as long.
+pub fn analyze_all(c: &Contract) -> (Report, Vec<Report>) {
+    analyze_with_linked(c, true)
+}
+
+fn analyze_with_linked(c: &Contract, linked: bool) -> (Report, Vec<Report>) {
     let world = World::of(c);
     if let Some(a) = &c.address {
         world
@@ -3432,7 +3448,17 @@ pub fn analyze(c: &Contract) -> Report {
             .borrow_mut()
             .insert(a.to_ascii_lowercase(), None);
     }
-    analyze_in(c, &world)
+    let report = analyze_in(c, &world);
+    let of_linked = |lc: &Contract| {
+        let known = lc.address.as_deref().and_then(|a| world.report(a));
+        known.map_or_else(|| analyze_in(lc, &world), |r| (*r).clone())
+    };
+    let others = if linked {
+        c.linked.iter().map(of_linked).collect()
+    } else {
+        Vec::new()
+    };
+    (report, others)
 }
 
 fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
@@ -5206,7 +5232,12 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
 
     policy_findings(&facts, &mut findings);
     chain_findings(&facts, &auth, &mut findings);
-    trace_bounds(c, &mut facts, &names_for);
+    // The checks that run code are for the contract asked for. On every contract
+    // fetched with it they multiplied the time of a report.
+    let asked = std::ptr::eq(world.root, c);
+    if asked {
+        exec::within(TRACE_WORK, || trace_bounds(c, &mut facts, &names_for));
+    }
     accounting_findings(&facts, &mut findings);
     let slot_names = c.functions.first().map(names_for).unwrap_or_default();
     let slot_name = |slot: ExprId| emit::fmt_slot(slot, &slot_names, SlotSpace::Persistent);
@@ -5218,8 +5249,10 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
 
     type_rules::findings(c, &c.types, names_for, &mut findings);
 
-    crate::confirm::confirm(c, &mut findings);
-    crate::confirm::confirm_wraps(c, &mut findings);
+    exec::within(confirm::WORK, || confirm::confirm(c, &mut findings));
+    if asked {
+        exec::within(confirm::WORK, || confirm::confirm_wraps(c, &mut findings));
+    }
 
     crate::invariant::findings(c, &c.types, &mut findings);
     let begin = crate::deploy::storage(c);
@@ -5227,12 +5260,14 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     report
         .maps
         .extend(authority(&facts, &stores, &uses, &begin, &mut findings));
-    report.maps.extend(crate::props::findings(c, &mut findings));
-    crate::flow::findings(c, &mut findings);
-    crate::signed::findings(c, &mut findings);
-    report
-        .maps
-        .extend(crate::standard::findings(c, &mut findings));
+    if asked {
+        report.maps.extend(crate::props::findings(c, &mut findings));
+        exec::within(flow::WORK, || flow::findings(c, &mut findings));
+        exec::within(signed::WORK, || signed::findings(c, &mut findings));
+        report.maps.extend(exec::within(standard::WORK, || {
+            standard::findings(c, &mut findings)
+        }));
+    }
 
     if std::env::var("EVMDEC_DEBUG_LOCKS").is_ok() {
         for (slot, fs) in &lock_slots {
@@ -6563,11 +6598,10 @@ fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<
 const TRACE_LIMITS: crate::path::Limits = crate::path::Limits {
     paths: 32,
     runs: 128,
-    until: None,
 };
 const TRACE_WORDS: usize = 32;
 const TRACE_ANSWER_BYTES: usize = 320;
-const TRACE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+const TRACE_WORK: u64 = 3 * crate::exec::WORK_PER_SECOND;
 
 // A record copied to memory and updated there hides its fields from the rule above.
 // Along one run the lifter knows what every memory word holds, so the same limits are
@@ -6578,10 +6612,7 @@ fn trace_bounds(c: &Contract, facts: &mut [FnFacts], names_for: &dyn Fn(&Functio
     }
     let layout = c.compiler.layout;
     let begin = crate::deploy::storage(c);
-    let limits = crate::path::Limits {
-        until: Some(std::time::Instant::now() + TRACE_BUDGET),
-        ..TRACE_LIMITS
-    };
+    let limits = TRACE_LIMITS;
     let mut explorers: HashMap<*const u8, crate::path::Explorer> = HashMap::new();
     for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
         let Some(fact) = facts.iter_mut().find(|x| x.external && x.pc == f.pc) else {
@@ -6974,9 +7005,10 @@ fn authority(
     let name = |i: &usize| format!("`{}`", facts[*i].name);
     let mut lines = Vec::new();
     for (loc, gated) in &gates {
-        let place = match loc.1 {
-            0 => format!("slot {}", loc.0.to_hex()),
-            _ => format!("the mapping at slot {}", loc.0.to_hex()),
+        let place = match (loc.1, loc.2) {
+            (0, _) => format!("slot {}", loc.0.to_hex()),
+            (_, 0) => format!("the mapping at slot {}", loc.0.to_hex()),
+            (_, field) => format!("field {field} of the mapping at slot {}", loc.0.to_hex()),
         };
         let setters: BTreeSet<(usize, bool)> = stores
             .iter()

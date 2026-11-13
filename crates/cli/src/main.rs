@@ -355,7 +355,7 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 print!("{}", c.source);
                 if report {
-                    let r = evmdec::analyze::analyze(&c);
+                    let (r, linked) = evmdec::analyze::analyze_all(&c);
                     println!(
                         "\n/*\n{}*/",
                         evmdec::analyze::render_markdown(&c, &r, &file.display().to_string())
@@ -373,13 +373,12 @@ fn run(cli: Cli) -> Result<()> {
                             );
                         }
                     }
-                    for lc in &c.linked {
-                        let lr = evmdec::analyze::analyze(lc);
+                    for (lc, lr) in c.linked.iter().zip(&linked) {
                         println!(
                             "\n/*\n{}*/",
                             evmdec::analyze::render_markdown(
                                 lc,
-                                &lr,
+                                lr,
                                 &format!(
                                     "linked contract {}",
                                     lc.address.as_deref().unwrap_or("?")

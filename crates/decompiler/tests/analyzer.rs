@@ -2770,6 +2770,50 @@ fn the_labelled_fixtures_score_every_rule_at_full_precision_and_recall() {
     }
 }
 
+// A fixture is a few instructions and leaves out what its own rule does not need.
+// These findings are true of the fixture named, so they are expected there.
+const TRUE_OF_A_SOUND_FIXTURE: [(&str, &str); 6] = [
+    ("", "short-input-accepted"),
+    ("inflow-credits-nothing", "refused-transfer-treated-as-done"),
+    (
+        "reentrancy|reentered-call-pays-again",
+        "refused-transfer-treated-as-done",
+    ),
+    ("clock-units-mixed", "unchecked-arithmetic"),
+    ("clock-units-mixed", "time-bound-set-by-anyone"),
+    (
+        "signed-call-leaves-word-unsigned",
+        "signed-message-accepted-twice",
+    ),
+];
+
+#[test]
+fn no_other_rule_in_the_table_is_confirmed_on_a_sound_fixture() {
+    let table = cases();
+    let rules: Vec<&str> = table.iter().flat_map(|c| c.rule.split('|')).collect();
+    for case in table.iter().filter(|c| !c.flawed) {
+        let expected = |id: &str| {
+            let listed = |(fixture, rule): &(&str, &str)| {
+                *rule == id && (fixture.is_empty() || *fixture == case.rule)
+            };
+            TRUE_OF_A_SOUND_FIXTURE.iter().any(listed)
+        };
+        let report = report_of(&(case.build)());
+        let fired: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.confirmed && rules.contains(&f.id.as_str()))
+            .map(|f| f.id.as_str())
+            .filter(|id| !expected(id))
+            .collect();
+        assert!(
+            fired.is_empty(),
+            "sound fixture for {}: {fired:?}",
+            case.rule
+        );
+    }
+}
+
 #[test]
 fn padding_the_code_changes_no_labelled_result() {
     for case in cases() {
@@ -2909,4 +2953,107 @@ fn text_from_the_bytecode_cannot_add_markup_to_the_report() {
         .expect("the strings are listed");
     assert!(!line.contains('<') && !line.contains('`'), "{line}");
     assert!(!line.contains("\"[") && line.contains("\\["), "{line}");
+}
+
+fn fired(code_hex: &str, id: &str) -> bool {
+    finding(&report_of_hex(code_hex), id).is_some()
+}
+
+#[test]
+fn a_token_bought_with_ether_is_not_a_larger_refund() {
+    let presale = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461003e57600080fd5b5034336000526000602052604060002080548201905550005b5033600052600060205260406000208054801561008a576000825563a9059cbb60e01b608052336084528060a4526020608060446080600061b1b15af11561008a576080511561008a57005b600080fd";
+    assert!(!fired(presale, "two-calls-return-more"));
+}
+
+#[test]
+fn a_fair_share_of_the_balance_is_not_a_gain() {
+    let vault = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461006057600080fd5b5034600154801561003c578147038183020461003e565b815b80156100a3578082016001553360005260006020526040600020805482019055005b5060043580156100a357336000526000602052604060002080548281106100a357829003905560015481810360015581470204600080808084335af1156100a357005b600080fd";
+    assert!(!fired(vault, "two-calls-return-more"));
+    assert!(!fired(vault, "payout-grows-with-other-payment"));
+}
+
+#[test]
+fn a_capped_claim_made_again_from_inside_pays_no_more_than_two_claims() {
+    let capped = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461003e57600080fd5b5034336000526000602052604060002080548201905550005b5033600052600060205260406000208054806108001061005e5780610062565b6108005b801561007d578082038355600080808084335af11561007d57005b600080fd";
+    assert!(!fired(capped, "reentered-call-pays-again"));
+}
+
+#[test]
+fn a_price_that_rises_with_the_amount_is_not_a_rounding() {
+    let curve = "608060405260003560e01c8063aaaaaaaa1461001a57600080fd5b506004358015610086578061ffff106100865760015480600202820182026323b872dd60e01b608052336084523060a45260c4526020608060646080600061b1b15af1156100865760805115610086578101600155336000526000602052604060002080548201905550005b600080fd";
+    assert!(!fired(curve, "rounding-favours-caller"));
+}
+
+#[test]
+fn a_total_added_to_twice_is_not_a_lock() {
+    let twice = "608060405260003560e01c8063aaaaaaaa1461001a57600080fd5b5060043561ffff166007540160075560243561ffff166007540160075500";
+    assert!(!fired(twice, "lock-left-set"));
+}
+
+#[test]
+fn a_capped_count_is_not_said_to_grow_without_limit() {
+    let capped = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461003e57600080fd5b506005548060641161003657600080fd5b600101600555005b5060005b60055481101561005757805450600101610042565b5000";
+    assert!(!fired(capped, "cost-grows-with-open-list"));
+}
+
+#[test]
+fn two_fields_of_one_record_are_not_one_value() {
+    let pool = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461004a57600080fd5b50336000541461003457600080fd5b6024356004356000526003602052604060002055005b506004356000526003602052604060002080600101805460243561ffff16019055546323b872dd60e01b608052336084523060a45260243561ffff1660c45260206080606460806000855af1156100a557608051156100a557005b600080fd";
+    assert!(!fired(pool, "stored-input-call-target"));
+}
+
+#[test]
+fn a_note_packed_beside_a_time_bound_does_not_set_the_bound() {
+    let packed = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461003f57600080fd5b5060043560401b60055467ffffffffffffffff1617600555005b5060055467ffffffffffffffff16421061005a576001600655005b600080fd";
+    assert!(!fired(packed, "time-bound-set-by-anyone"));
+}
+
+#[test]
+fn two_payments_to_one_stored_account_are_one_payee() {
+    let twice = "608060405260003560e01c8063aaaaaaaa1461001a57600080fd5b50600080808060016000545af11561003f57600080808060026000545af11561003f57005b600080fd";
+    assert!(!fired(twice, "one-refusal-blocks-all"));
+}
+
+#[test]
+fn a_branch_on_a_phase_is_not_a_wait_for_it() {
+    let branch = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461003c57600080fd5b5060005415610035576000600055005b6001600055005b5060026000541461004e576009600955005b600760095500";
+    assert!(!fired(branch, "phase-never-entered"));
+}
+
+#[test]
+fn a_counter_stepped_down_keeps_the_arithmetic_finding_open() {
+    let code = "608060405260003560e01c8063aaaaaaaa1461001a57600080fd5b5060043561ffff1660243561ffff160260005560016005540360055500";
+    let report = report_of_hex(code);
+    let wraps = finding(&report, "unchecked-arithmetic").expect("the rule fires");
+    assert!(wraps.severity < Severity::Info, "{}", wraps.description);
+    assert!(
+        !wraps.description.contains("can wrap:"),
+        "{}",
+        wraps.description
+    );
+}
+
+#[test]
+fn the_first_decision_of_a_long_run_is_still_tried() {
+    let mut body = String::from("PUSH4 0xdeadbeef PUSH1 0x04 CALLDATALOAD EQ PUSH2 @hit JUMPI ");
+    for n in 0..60 {
+        body.push_str(&format!(
+            "PUSH1 0x24 CALLDATALOAD PUSH1 0x{n:02x} LT PUSH2 @n{n} JUMPI PUSH1 0x00 POP :n{n} JUMPDEST "
+        ));
+    }
+    body.push_str("STOP :hit JUMPDEST PUSH1 0x01 PUSH1 0x09 SSTORE STOP");
+    let code = dispatcher(&body);
+    let explorer = evmdec::path::Explorer::new(&code);
+    let start = evmdec::path::inputs_for(Some(0xaaaa_aaaa), 2);
+    let free = evmdec::solve::Free {
+        words: 2,
+        ..Default::default()
+    };
+    let limits = evmdec::path::Limits {
+        paths: 200,
+        runs: 400,
+    };
+    let found = explorer.explore(&start, &free, limits);
+    let marked = |p: &evmdec::path::Path| !p.run.storage.is_empty();
+    assert!(found.iter().any(marked));
 }

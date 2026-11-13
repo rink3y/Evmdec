@@ -15,7 +15,6 @@ use crate::seq::{self, Entry};
 use crate::solve::{self, Free, Inputs, Item};
 use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
 
 const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
 
@@ -37,7 +36,7 @@ const CONFIRMABLE: &[&str] = &[
 
 const STEP_BUDGET: usize = 120_000;
 const MAX_ATTEMPTS: usize = 200;
-const BUDGET: Duration = Duration::from_secs(4);
+pub const WORK: u64 = 4 * exec::WORK_PER_SECOND;
 // Enough words for a few offsets, lengths and elements of array arguments.
 const SOLVED_WORDS: usize = 24;
 const SOME_ETHER: U256 = U256::from_u64(100_000_000_000_000_000);
@@ -55,9 +54,8 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         return;
     }
     let start = deploy::storage(c);
-    let deadline = Instant::now() + BUDGET;
     for finding in findings.iter_mut() {
-        if Instant::now() >= deadline {
+        if exec::spent() {
             break;
         }
         if finding.confirmed || !CONFIRMABLE.contains(&finding.id.as_str()) {
@@ -131,6 +129,9 @@ fn reach(
             .map(move |args| (callvalue, args))
     });
     for (callvalue, args) in shapes.take(MAX_ATTEMPTS) {
+        if exec::spent() {
+            return None;
+        }
         let data = exec::calldata(selector, &args);
         let host = exec::caller_host(data.clone(), callvalue);
         let run = exec::run_frame(code, &host, start.clone(), STEP_BUDGET);
@@ -272,8 +273,9 @@ fn stored_arithmetic(p: &Path) -> Vec<ExprId> {
             continue;
         }
         if let Node::Op(o, parts) = expr::node(e) {
-            let both_vary = parts.len() == 2 && parts.iter().all(|x| expr::as_const(*x).is_none());
-            if matches!(o, op::ADD | op::SUB | op::MUL) && both_vary {
+            // A constant on one side can wrap as well. A counter stepped down from zero does.
+            let varies = parts.len() == 2 && parts.iter().any(|x| expr::as_const(*x).is_none());
+            if matches!(o, op::ADD | op::SUB | op::MUL) && varies {
                 out.push(e);
             }
             stack.extend(parts);
@@ -348,11 +350,33 @@ fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Wra
             }
         }
     }
-    if open || results == 0 {
+    if open || results == 0 || open_with_other_storage(&explorer, f, begin) {
         Wrap::Open
     } else {
         Wrap::Bounded { paths, results }
     }
+}
+
+// A branch can need storage that another function sets. From the starting storage it is
+// never taken, and what it stores would be missing from the verdict.
+fn open_with_other_storage(explorer: &Explorer, f: &Function, begin: &HashMap<U256, U256>) -> bool {
+    let selector = exec::selector_of(f);
+    let flat = path::inputs_for(selector, f.params.len().clamp(1, 8));
+    let free = Free {
+        words: flat.calldata.len() / 32,
+        value: true,
+        storage: true,
+        fixed: Vec::new(),
+    };
+    let start = Inputs {
+        storage: begin.clone(),
+        ..flat
+    };
+    let found = explorer.explore(&start, &free, Limits::default());
+    found.iter().filter(|p| p.succeeded()).any(|p| {
+        let bounds = Bounds::from_checks(&p.items);
+        stored_arithmetic(p).iter().any(|e| bounds.may_wrap(*e))
+    })
 }
 
 pub fn confirm_wraps(c: &Contract, findings: &mut [Finding]) {
@@ -360,9 +384,8 @@ pub fn confirm_wraps(c: &Contract, findings: &mut [Finding]) {
         return;
     }
     let start = deploy::storage(c);
-    let deadline = Instant::now() + BUDGET;
     for finding in findings.iter_mut() {
-        if Instant::now() >= deadline {
+        if exec::spent() {
             break;
         }
         if finding.confirmed || !WRAP_IDS.contains(&finding.id.as_str()) {

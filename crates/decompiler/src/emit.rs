@@ -12,6 +12,12 @@ const HASHED_SLOTS: u64 = 4096;
 
 const HASH_OFFSET_RANGE: i64 = 16;
 
+// A slot below the hash is not an element of the array that starts at the hash.
+pub fn array_element(c: U256) -> Option<(U256, u64)> {
+    let (root, k) = hashed_slot(c)?;
+    u64::try_from(k).ok().map(|k| (root, k))
+}
+
 pub fn hashed_slot(c: U256) -> Option<(U256, i64)> {
     static TABLE: OnceLock<HashMap<U256, (u64, i64)>> = OnceLock::new();
     let table = TABLE.get_or_init(|| {
@@ -171,6 +177,26 @@ impl Names {
         self.memo.borrow_mut().clear();
     }
 
+    // Text long enough to be moved to a line of its own cannot stand where it is worked out
+    // again on every pass, such as a loop test. The names made for it are taken back.
+    pub fn without_temps(&self, format: impl FnOnce() -> String) -> Option<String> {
+        let made = self.temps.borrow().len();
+        let (seq, named, memo) = (
+            *self.temp_seq.borrow(),
+            self.temp_of.borrow().clone(),
+            self.memo.borrow().clone(),
+        );
+        let text = format();
+        if self.temps.borrow().len() == made {
+            return Some(text);
+        }
+        self.temps.borrow_mut().truncate(made);
+        *self.temp_seq.borrow_mut() = seq;
+        *self.temp_of.borrow_mut() = named;
+        *self.memo.borrow_mut() = memo;
+        None
+    }
+
     pub fn replace_stale(&self, loads: impl IntoIterator<Item = (ExprId, String)>) {
         let mut stale = self.stale.borrow_mut();
         let before = stale.len();
@@ -191,17 +217,29 @@ impl Names {
     }
 }
 
-const P_OR: u8 = 2;
-const P_XOR: u8 = 3;
-const P_AND: u8 = 4;
-const P_EQ: u8 = 5;
-const P_CMP: u8 = 6;
-const P_SHIFT: u8 = 7;
-const P_ADD: u8 = 8;
-const P_MUL: u8 = 9;
-const P_EXP: u8 = 10;
-const P_UNARY: u8 = 11;
-const P_PRIMARY: u8 = 12;
+// Solidity's order, not C's. In Solidity the bitwise operators bind tighter than the
+// comparisons, so `a | b <= c` there means `(a | b) <= c`.
+const P_LOR: u8 = 1;
+const P_LAND: u8 = 2;
+const P_EQ: u8 = 3;
+const P_CMP: u8 = 4;
+const P_OR: u8 = 5;
+const P_XOR: u8 = 6;
+const P_AND: u8 = 7;
+const P_SHIFT: u8 = 8;
+const P_ADD: u8 = 9;
+const P_MUL: u8 = 10;
+const P_EXP: u8 = 11;
+const P_UNARY: u8 = 12;
+const P_PRIMARY: u8 = 13;
+
+pub fn fmt_and_operand(e: ExprId, n: &Names) -> String {
+    fmt_prec(e, P_LAND, n)
+}
+
+pub fn fmt_or_operand(e: ExprId, n: &Names) -> String {
+    fmt_prec(e, P_LOR, n)
+}
 
 pub fn fmt_const(c: U256) -> String {
     if c.is_zero() {
@@ -1044,10 +1082,10 @@ pub fn element_root(key: ExprId) -> Option<U256> {
         Node::Keccak(words, 0) if words.len() == 1 => expr::as_const(words[0]),
         Node::Op(op::ADD, v) => v.iter().find_map(|a| match expr::node(*a) {
             Node::Keccak(w, 0) if w.len() == 1 => expr::as_const(w[0]),
-            Node::Const(c) => hashed_slot(c).map(|(s, _)| s),
+            Node::Const(c) => array_element(c).map(|(s, _)| s),
             _ => None,
         }),
-        Node::Const(c) => hashed_slot(c).map(|(s, _)| s),
+        Node::Const(c) => array_element(c).map(|(s, _)| s),
         _ => None,
     }
 }
@@ -1069,7 +1107,7 @@ fn base_name(e: ExprId, n: &Names, space: SlotSpace) -> String {
         SlotSpace::Transient => "tstor",
     };
     match expr::as_const(e) {
-        Some(c) if hashed_slot(c).is_none() => slot_name(c, n, prefix),
+        Some(c) if array_element(c).is_none() => slot_name(c, n, prefix),
         _ => fmt_slot(e, n, space),
     }
 }
@@ -1130,8 +1168,8 @@ fn fmt_slot_path(e: ExprId, n: &Names, space: SlotSpace) -> String {
             }
             return name.clone();
         }
-        if let Some((s, k)) = hashed_slot(c) {
-            return format!("{}[{}]", slot_name(s, n, prefix), k.max(0));
+        if let Some((s, k)) = array_element(c) {
+            return format!("{}[{}]", slot_name(s, n, prefix), k);
         }
         return if c.bits() <= 32 {
             format!("{}_{}", prefix, c.to_decimal())
@@ -1523,18 +1561,18 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
         (op::AND, 2) if is_bool(v[0], n) && is_bool(v[1], n) => (
             format!(
                 "{} && {}",
-                fmt_prec(v[0], P_AND, n),
-                fmt_prec(v[1], P_AND + 1, n)
+                fmt_prec(v[0], P_LAND, n),
+                fmt_prec(v[1], P_LAND + 1, n)
             ),
-            P_AND,
+            P_LAND,
         ),
         (op::OR, 2) if is_bool(v[0], n) && is_bool(v[1], n) => (
             format!(
                 "{} || {}",
-                fmt_prec(v[0], P_OR, n),
-                fmt_prec(v[1], P_OR + 1, n)
+                fmt_prec(v[0], P_LOR, n),
+                fmt_prec(v[1], P_LOR + 1, n)
             ),
-            P_OR,
+            P_LOR,
         ),
         (op::AND, 2) => {
             if is_selector_expr(expr::intern(Node::Op(op::AND, v.to_vec()))) {

@@ -104,3 +104,76 @@ fn a_loop_that_needs_many_rounds_does_not_keep_what_early_rounds_believed() {
     let out = decompile(&code, &Options::default()).source;
     assert!(!out.contains("return (msg.sender);"), "{out}");
 }
+
+#[test]
+fn a_store_a_hash_consumed_stays_when_a_later_plain_read_needs_it() {
+    let out = text("600435608052600160206080205560243561001957610020565b6044356080525b60206080f3");
+    assert!(out.contains("mem[0x80] = arg0;"), "{out}");
+    assert!(out.contains("return mem[128:160];"), "{out}");
+}
+
+#[test]
+fn the_tail_of_a_memory_copy_comes_from_the_matching_source_bytes() {
+    let out = text("5f3560805260203560a052603060806101005e6030610100f3");
+    assert!(
+        out.contains("return (msg.data[0:32], mem[160] >> 128);"),
+        "{out}"
+    );
+}
+
+#[test]
+fn two_overlapping_writes_in_a_different_order_per_path_are_not_trusted() {
+    let out = text(
+        "60443561001757600435609052602435608052610024565b6024356080526004356090525b60206090f3",
+    );
+    assert!(!out.contains("return (arg0);"), "{out}");
+    assert!(out.contains("return mem[144:176];"), "{out}");
+}
+
+#[test]
+fn copies_made_on_the_way_out_of_a_loop_are_printed_after_it() {
+    let out = text("600060043561001f575b5b806024351461001f5760018155600101610009565b60645500");
+    let after_loop = out
+        .split("v1 = v1 + 1;")
+        .nth(1)
+        .expect("the loop body is printed");
+    assert!(after_loop.contains("v2 = v1;"), "{out}");
+}
+
+#[test]
+fn a_slot_just_below_an_arrays_data_is_not_printed_as_its_first_element() {
+    let below = "b10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf5";
+    let first = "b10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6";
+    let out = text(&format!("6004357f{first}556024357f{below}5500"));
+    assert_eq!(out.matches("stor_1[0] = ").count(), 1, "{out}");
+}
+
+#[test]
+fn a_comparison_under_a_bitwise_operator_is_bracketed_as_solidity_reads_it() {
+    let out = text("604035602035105f35175f5500");
+    assert!(
+        out.contains("msg.data[0:32] | (calldata[32] < calldata[64]);"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_loop_test_too_long_to_print_in_place_is_worked_out_inside_the_loop() {
+    let out = text(
+        "60005b8061002435016100443501610064350161008435016100a435016100c435016100e43501610104350161012435016101443501610164350161018435016101a435016101c435016101e43501610204350161022435016102443501610264350161028435016102a435016102c435016102e43501811061007e57005b6001815560010161000256",
+    );
+    let (before, inside) = out.split_once("while (true) {").expect("a plain loop");
+    assert!(!before.contains("uint256 t1 ="), "{out}");
+    assert!(inside.contains("uint256 t1 ="), "{out}");
+}
+
+#[test]
+fn a_helper_checking_its_own_call_does_not_cover_the_callers_unchecked_call() {
+    let code = evmdec::hex::decode(
+        "608060405260003560e01c8063aaaaaaaa146100245763bbbbbbbb1461003857600080fd5b600080808080335af150610036610042565b005b610040610042565b005b6000808080806004355af161005657600080fd5b56",
+    )
+    .expect("valid hex");
+    let contract = decompile(&code, &Options::default());
+    let report = evmdec::analyze::analyze(&contract);
+    assert!(report.findings.iter().any(|f| f.id == "unchecked-call"));
+}

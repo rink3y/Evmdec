@@ -504,6 +504,16 @@ fn narrow_counters(c: &Contract, env: &TypeEnv, out: &mut Vec<Finding>) {
     }
 }
 
+fn timestamp_fate(bits: u32) -> String {
+    let seconds = 1u64 << bits.min(32);
+    match bits {
+        32 => "overflows in 2106".to_string(),
+        _ if seconds < 3600 => format!("wraps every {} minutes", seconds / 60),
+        _ if seconds < 172_800 => format!("wraps every {} hours", seconds / 3600),
+        _ => format!("wraps every {} days", seconds / 86_400),
+    }
+}
+
 fn counter_message(
     phrase: &str,
     bits: u32,
@@ -532,10 +542,11 @@ fn counter_message(
         CounterMessage {
             title: "Narrow storage timestamp",
             description: format!(
-                "{} is a `uint{}` that receives `block.timestamp` or `block.number`. A {}-bit timestamp overflows in 2106 (and a block number sooner).",
+                "{} is a `uint{}` that receives `block.timestamp` or `block.number`. A {}-bit timestamp {} (and a block number sooner).",
                 capitalise(phrase),
                 bits,
-                bits
+                bits,
+                timestamp_fate(bits)
             ),
             recommendation: "Store timestamps in at least 40 bits (`uint40` lasts until the year 36812).",
             severity: Severity::Info,

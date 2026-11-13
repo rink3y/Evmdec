@@ -2466,13 +2466,15 @@ impl<'a> Printer<'a> {
             } = &cn.term
             {
                 {
+                    let test =
+                        |e: ExprId| self.names.without_temps(|| emit::fmt_expr(e, self.names));
                     if body.contains(t) && !body.contains(f) {
-                        while_cond = Some((emit::fmt_expr(*cond, self.names), *t));
-                        exit = Some(*f);
+                        while_cond = test(*cond).map(|text| (text, *t));
                     } else if body.contains(f) && !body.contains(t) {
-                        while_cond =
-                            Some((emit::fmt_expr(expr::op1(op::ISZERO, *cond), self.names), *f));
-                        exit = Some(*t);
+                        while_cond = test(expr::op1(op::ISZERO, *cond)).map(|text| (text, *f));
+                    }
+                    if let Some((_, into)) = &while_cond {
+                        exit = Some(if into == t { *f } else { *t });
                     }
                 }
             }
@@ -2480,6 +2482,11 @@ impl<'a> Printer<'a> {
         if while_cond.is_some() && cond_node != header {
             self.emitted.insert(cond_node);
         }
+        // The loop is left from the node that holds its test, which is not always the header.
+        let left_from = match while_cond.is_some() {
+            true => cond_node,
+            false => header,
+        };
         if std::env::var("EVMDEC_DEBUG_LOOP").is_ok() {
             let tf = match &nd.term {
                 Term::Branch { t, f, .. } => format!(
@@ -2536,8 +2543,8 @@ impl<'a> Printer<'a> {
         }
         self.loop_stack.pop();
         if let Some(e) = exit {
-            if let Some(a) = self.l.edge_assigns.get(&(header, e)) {
-                if while_cond_exit_from_header(&self.l.nodes[header].term, e) {
+            if let Some(a) = self.l.edge_assigns.get(&(left_from, e)) {
+                if while_cond_exit_from_header(&self.l.nodes[left_from].term, e) {
                     let a = a.clone();
                     self.assign_lines(&a, depth);
                 }
@@ -2906,19 +2913,30 @@ impl<'a> Printer<'a> {
             self.emitted.insert(f);
         }
         let ncond = expr::op1(op::ISZERO, cond);
-        let (var_s, c_s, nc_s) = (
-            emit::fmt_expr(var, self.names),
-            emit::fmt_expr(cond, self.names),
-            emit::fmt_expr(ncond, self.names),
-        );
+        let var_s = emit::fmt_expr(var, self.names);
+        let both = |a: ExprId, b: ExprId| {
+            let (a, b) = (
+                emit::fmt_and_operand(a, self.names),
+                emit::fmt_and_operand(b, self.names),
+            );
+            format!("{var_s} = {a} && {b};")
+        };
+        let either = |a: ExprId, b: ExprId| {
+            let (a, b) = (
+                emit::fmt_or_operand(a, self.names),
+                emit::fmt_or_operand(b, self.names),
+            );
+            format!("{var_s} = {a} || {b};")
+        };
+        let c_s = emit::fmt_or_operand(cond, self.names);
         let txt = if y == cond {
-            format!("{} = {} && {};", var_s, c_s, emit::fmt_expr(x, self.names))
+            both(cond, x)
         } else if x == cond {
-            format!("{} = {} || {};", var_s, c_s, emit::fmt_expr(y, self.names))
+            either(cond, y)
         } else if x == ncond {
-            format!("{} = {} && {};", var_s, nc_s, emit::fmt_expr(y, self.names))
+            both(ncond, y)
         } else if y == ncond {
-            format!("{} = {} || {};", var_s, nc_s, emit::fmt_expr(x, self.names))
+            either(ncond, x)
         } else {
             format!(
                 "{} = {} ? {} : {};",

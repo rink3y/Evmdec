@@ -285,6 +285,7 @@ struct Ctx<'a> {
     inline_left: std::cell::Cell<usize>,
     divides: RefCell<HashMap<usize, bool>>,
     reach: RefCell<Reach>,
+    carried: RefCell<Vec<ExprId>>,
     roles: HashSet<U256>,
     slot_writes: HashSet<U256>,
     field_writes: HashSet<(U256, u32, u32)>,
@@ -2519,6 +2520,7 @@ fn loop_nodes(l: &Lifted) -> HashSet<usize> {
 
 fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Event> {
     ctx.computed_returns.borrow_mut().clear();
+    ctx.carried.borrow_mut().clear();
     ctx.made.borrow_mut().clear();
     ctx.code_copies.borrow_mut().clear();
     ctx.inline_left.set(MAX_INLINED_EVENTS);
@@ -2610,6 +2612,12 @@ fn events_of_in(
     let dbg_unfresh = std::env::var("EVMDEC_DEBUG_UNFRESH").is_ok();
     let mut out = Vec::new();
     let order = lift::reverse_postorder(l);
+    // A helper's copies between its blocks can hold the only read of a call's answer.
+    // They belong to no statement, so they are kept beside the events.
+    if inst != 0 {
+        let copies = l.edge_assigns.values().flatten().map(|(_, v)| *v);
+        ctx.carried.borrow_mut().extend(copies);
+    }
     if !loops.is_empty() {
         let w = writes_of(ctx, loops.iter().map(|n| &l.nodes[*n]), &mut HashSet::new());
         if dbg_unfresh {
@@ -3289,6 +3297,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         inline_left: std::cell::Cell::new(MAX_INLINED_EVENTS),
         divides: Default::default(),
         reach: Default::default(),
+        carried: Default::default(),
         roles: HashSet::new(),
         slot_writes: HashSet::new(),
         field_writes: HashSet::new(),
@@ -3564,36 +3573,138 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             }
             found
         };
-        let carried: Vec<ExprId> = l.edge_assigns.values().flatten().map(|(_, v)| *v).collect();
-        let checked: Vec<ExprId> = events
-            .iter()
-            .flat_map(|e| {
-                let stmt = match &e.stmt {
-                    Some(Stmt::Drop(_)) | None => Vec::new(),
-                    Some(other) => stmt_exprs(other),
-                };
-                let term = match &e.term {
-                    Some(Term::Branch { cond, .. }) => vec![*cond],
-                    Some(Term::Return { data: Some(d), .. }) => d.clone(),
-                    _ => Vec::new(),
-                };
-                stmt.into_iter().chain(term)
-            })
-            .chain(carried.iter().copied())
-            .collect();
-        let used_results = seqs_in(checked, &|n| match n {
+        let mut carried: Vec<ExprId> = l.edge_assigns.values().flatten().map(|(_, v)| *v).collect();
+        carried.extend(ctx.carried.borrow().iter().copied());
+        let checked = |e: &Event| -> Vec<ExprId> {
+            let stmt = match &e.stmt {
+                Some(Stmt::Drop(_)) | None => Vec::new(),
+                Some(other) => stmt_exprs(other),
+            };
+            let term = match &e.term {
+                Some(Term::Branch { cond, .. }) => vec![*cond],
+                Some(Term::Return { data: Some(d), .. }) => d.clone(),
+                _ => Vec::new(),
+            };
+            stmt.into_iter().chain(term).collect()
+        };
+        let mut used_results: HashSet<u32> = HashSet::new();
+        let mut read_returns: HashSet<u32> = HashSet::new();
+        let result = |n: &Node| match n {
             Node::CallResult(s) => Some(*s),
             _ => None,
-        });
-        let everything: Vec<ExprId> = events
-            .iter()
-            .flat_map(event_exprs)
-            .chain(carried.iter().copied())
-            .collect();
-        let read_returns = seqs_in(everything, &|n| match n {
+        };
+        let returned = |n: &Node| match n {
             Node::ReturnData(s, _) => Some(*s),
             _ => None,
-        });
+        };
+        for e in &events {
+            used_results.extend(seqs_in(checked(e), &result));
+            read_returns.extend(seqs_in(event_exprs(e), &returned));
+        }
+        used_results.extend(seqs_in(carried.clone(), &result));
+        read_returns.extend(seqs_in(carried.clone(), &returned));
+        // One block can be lifted in several copies. What any copy does with the answer is
+        // what the code at that place does with it.
+        let used_sites: HashSet<u32> = used_results.iter().map(|s| lift::call_site(*s)).collect();
+        // A helper can make the call and leave the answer for its caller to read. The caller
+        // then reads return data that belongs to none of the calls in its own code.
+        let call_seqs: HashSet<u32> = events
+            .iter()
+            .filter_map(|e| match &e.stmt {
+                Some(Stmt::Call { seq, .. } | Stmt::Create { seq, .. }) => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        let left_behind = |roots: Vec<ExprId>| {
+            seqs_in(roots, &returned)
+                .iter()
+                .any(|s| !call_seqs.contains(s))
+        };
+        let mut reads_left_behind: HashSet<usize> = events
+            .iter()
+            .filter(|e| left_behind(event_exprs(e)))
+            .map(|e| e.inst)
+            .collect();
+        if left_behind(l.edge_assigns.values().flatten().map(|(_, v)| *v).collect()) {
+            reads_left_behind.extend(events.first().map(|e| e.inst));
+        }
+        // Code that branches on the size of the answer has looked at the answer. A token
+        // call that asks for no output and then tests that size is handling tokens that
+        // return nothing, which is what a transfer of a single item does.
+        let sizes_tested: HashSet<usize> = events
+            .iter()
+            .filter(|e| {
+                let cond = match (&e.stmt, &e.term) {
+                    (Some(Stmt::Require { cond, .. }), _) => Some(*cond),
+                    (_, Some(Term::Branch { cond, .. })) => Some(*cond),
+                    _ => None,
+                };
+                cond.is_some_and(|c| {
+                    expr::contains(c, &|n| matches!(n, Node::Env(op::RETURNDATASIZE, _)))
+                })
+            })
+            .map(|e| e.inst)
+            .collect();
+        let read_by_caller = |ev: &Event| {
+            ev.path
+                .iter()
+                .any(|(inst, _, _)| *inst != ev.inst && reads_left_behind.contains(inst))
+        };
+        // An answer is also read by loading the memory the call wrote it to.
+        let loads_in = |roots: Vec<ExprId>| -> Vec<ExprId> {
+            let mut found = Vec::new();
+            let mut seen: HashSet<ExprId> = HashSet::new();
+            let mut pending: Vec<ExprId> = roots
+                .into_iter()
+                .filter(|e| expr::holds(*e, expr::kind::MLOAD))
+                .collect();
+            while let Some(x) = pending.pop() {
+                if !seen.insert(x) || seen.len() > 5000 {
+                    continue;
+                }
+                if let Node::MLoad(at, _) = expr::node(x) {
+                    found.push(at);
+                }
+                pending.extend(expr::children(x));
+            }
+            found
+        };
+        let within = |at: ExprId, (off, len): (ExprId, u64)| {
+            let ((base, a), (to, o)) = (expr::split_offset(at), expr::split_offset(off));
+            base == to && a >= o && a.wrapping_sub(o) < U256::from_u64(len)
+        };
+        let mut outputs: Vec<(u32, (ExprId, u64))> = Vec::new();
+        for e in &events {
+            for at in loads_in(event_exprs(e)) {
+                read_returns.extend(
+                    outputs
+                        .iter()
+                        .filter(|(_, out)| within(at, *out))
+                        .map(|o| o.0),
+                );
+            }
+            if let Some(Stmt::Call {
+                seq,
+                out_off,
+                out_len,
+                ..
+            }) = &e.stmt
+            {
+                let len = expr::as_const(*out_len)
+                    .filter(U256::fits_u64)
+                    .map(|l| l.low_u64());
+                outputs.extend(len.filter(|l| *l > 0).map(|l| (*seq, (*out_off, l))));
+            }
+        }
+        for at in loads_in(carried.clone()) {
+            read_returns.extend(
+                outputs
+                    .iter()
+                    .filter(|(_, out)| within(at, *out))
+                    .map(|o| o.0),
+            );
+        }
+        let read_sites: HashSet<u32> = read_returns.iter().map(|s| lift::call_site(*s)).collect();
         for (i, ev) in events.iter().enumerate() {
             let Some(stmt) = &ev.stmt else { continue };
             let names = &names;
@@ -3724,7 +3835,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 format!("`{}` performs an external call to `{}` and writes storage afterwards. A malicious callee can re-enter before the state update is applied (checks-effects-interactions violated).{}", f.name, target, extra),
                                 vec![line.clone()], "Apply the checks-effects-interactions pattern (update state before calling out) or use a reentrancy guard.");
                         }
-                        let used = used_results.contains(seq);
+                        let used = used_sites.contains(&lift::call_site(*seq));
                         if !used && !precompile {
                             push(&mut findings, "unchecked-call", "Return value of external call ignored", if value_nonzero { Severity::Medium } else { Severity::Low }, Confidence::High, Some(f), Some(ev.pc),
                                 format!("`{}` ignores the success flag of a low-level call to `{}`. If the call fails (reverting callee, out of gas, non-contract address) execution continues as if it succeeded{}.", f.name, target, if value_nonzero { ", and the ether is kept by this contract while state may assume it was sent" } else { "" }),
@@ -3734,7 +3845,9 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                             if let Some(sel) = selector {
                                 if matches!(sel, SEL_TRANSFER | SEL_TRANSFER_FROM | SEL_APPROVE) {
                                     let out_zero = expr::as_const(*out_len) == Some(U256::ZERO);
-                                    let decoded = read_returns.contains(seq);
+                                    let decoded = read_sites.contains(&lift::call_site(*seq))
+                                        || read_by_caller(ev)
+                                        || sizes_tested.contains(&ev.inst);
                                     let window_end = events[i + 1..]
                                         .iter()
                                         .position(|e2| matches!(e2.stmt, Some(Stmt::Call { .. })))
@@ -7224,8 +7337,27 @@ fn positional_evidence(
     f: &Finding,
     params: &HashMap<String, Vec<(String, String)>>,
 ) -> Vec<String> {
-    let Some(renames) = f.function.as_ref().and_then(|name| params.get(name)) else {
-        return f.evidence.clone();
+    let none = Vec::new();
+    let renames = f
+        .function
+        .as_ref()
+        .and_then(|name| params.get(name))
+        .unwrap_or(&none);
+    // A call's name carries a count of the calls printed before it in its function.
+    // The same line reached from two functions differs in that count and nothing else.
+    let counted = |word: &str| {
+        let numbered = ["success_", "ret_", "returndata_", "gasleft_", "created_"];
+        numbered.iter().any(|p| word.starts_with(p)).then(|| {
+            let mut plain = String::new();
+            for c in word.chars() {
+                match c.is_ascii_digit() {
+                    true if plain.ends_with('#') => {}
+                    true => plain.push('#'),
+                    false => plain.push(c),
+                }
+            }
+            plain
+        })
     };
     f.evidence
         .iter()
@@ -7249,7 +7381,7 @@ fn positional_evidence(
                 let member = out.ends_with('.');
                 match renames.iter().find(|(name, _)| *name == word) {
                     Some((_, position)) if !option && !member => out.push_str(position),
-                    _ => out.push_str(&word),
+                    _ => out.push_str(&counted(&word).unwrap_or(word)),
                 }
             }
             out
@@ -7304,11 +7436,15 @@ fn merge_findings(
     let mut out: Vec<Finding> = Vec::new();
     let mut extra: Vec<Vec<String>> = Vec::new();
     for f in by_fn {
-        let same = f.pc.and_then(|_| {
+        // A finding made at several places in a function has no single place left. It is
+        // still the same finding as another function's when the lines shown are the same.
+        let placed = f.pc.is_some() || (f.sites > 1 && !f.evidence.is_empty());
+        let same = placed.then_some(()).and_then(|()| {
             out.iter().position(|p| {
                 p.id == f.id
                     && p.title == f.title
                     && p.pc == f.pc
+                    && p.sites == f.sites
                     && positional_evidence(p, params) == positional_evidence(&f, params)
                     && p.function.is_some()
                     && f.function.is_some()

@@ -1742,7 +1742,7 @@ fn name_storage_from_getters(
         let root: Option<U256> = match (field, expr::node(word)) {
             (Some((k, _, _)), _) => Some(k),
             (None, Node::SLoad(key, false, _)) => match expr::node(key) {
-                Node::Const(k) => emit::hashed_slot(k).map(|(s, _)| s).or(Some(k)),
+                Node::Const(k) => emit::array_element(k).map(|(s, _)| s).or(Some(k)),
                 _ => emit::element_root(key).or_else(|| {
                     ssa::slot_path(key, layout)
                         .filter(|p| p.steps.iter().all(|s| matches!(s, ssa::Step::Key(_))))
@@ -2785,7 +2785,7 @@ fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
 // A key that happens to be zero or one where it is used says nothing about the key type.
 fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>, Option<String>) {
     if let Some(c) = expr::as_const(key) {
-        if let Some((s, _)) = emit::hashed_slot(c) {
+        if let Some((s, _)) = emit::array_element(c) {
             return (Some(s), Some("uint256[]".into()));
         }
         return (Some(c), None);

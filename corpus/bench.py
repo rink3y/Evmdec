@@ -171,7 +171,22 @@ def main():
     print(f"param types: {ty['par_exact']}/{ty['par_words']} = {100*ty['par_exact']/max(1,ty['par_words']):.1f}%   return types: {ty['ret_exact']}/{ty['ret_words']} = {100*ty['ret_exact']/max(1,ty['ret_words']):.1f}%")
     if a.v:
         for w in wrong: print('   ' + w)
+    floors = [
+        ('contracts measured', len(rows), 20),
+        ('selector recall %', 100*tot['match']/max(1,tot['abi']), 100),
+        ('selector precision %', 100*tot['match']/max(1,tot['found']), 100),
+        ('mutability %', 100*tot['mut_ok']/n, 98),
+        ('params %', 100*tot['par_ok']/n, 99),
+        ('returns %', 100*tot['ret_ok']/n, 99),
+        ('param types %', 100*ty['par_exact']/max(1,ty['par_words']), 95),
+        ('return types %', 100*ty['ret_exact']/max(1,ty['ret_words']), 95),
+        ('blocks covered %', 100*tot['covered']/max(1,tot['blocks']), 100),
+        ('resolved jumps', -tot['unresolved'], 0),
+    ]
+    below = [f'{what}: {value:.1f} is under {floor}' for what, value, floor in floors if value < floor]
     print(f"events: {tot['ev_found']}/{tot['ev']} = {100*tot['ev_found']/max(1,tot['ev']):.1f}%   blocks covered: {tot['covered']}/{tot['blocks']} = {100*tot['covered']/max(1,tot['blocks']):.2f}%   unresolved jumps: {tot['unresolved']}   total time {tot['time']:.2f}s")
+    for line in below: print('FAIL ' + line)
+    sys.exit(1 if below else 0)
 
 if __name__ == '__main__':
     main()

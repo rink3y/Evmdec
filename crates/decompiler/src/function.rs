@@ -194,17 +194,22 @@ pub fn discover(main: &Lifted) -> Dispatch {
 }
 
 fn is_plain_revert(l: &Lifted, n: usize) -> bool {
-    let nd = &l.nodes[n];
-    match &nd.term {
-        Term::Revert { data, len, .. } => {
-            nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. }))
-                && (data.as_ref().is_some_and(|d| d.is_empty())
-                    || expr::as_const(*len) == Some(U256::ZERO))
+    let mut at = n;
+    // Empty blocks can jump to each other in a ring. The hop count ends that walk.
+    for _ in 0..=l.nodes.len() {
+        let nd = &l.nodes[at];
+        match &nd.term {
+            Term::Revert { data, len, .. } => {
+                return nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. }))
+                    && (data.as_ref().is_some_and(|d| d.is_empty())
+                        || expr::as_const(*len) == Some(U256::ZERO));
+            }
+            Term::Invalid | Term::Infeasible => return true,
+            Term::Jump(t) if nd.stmts.is_empty() => at = *t,
+            _ => return false,
         }
-        Term::Invalid | Term::Infeasible => true,
-        Term::Jump(t) if nd.stmts.is_empty() && *t != n => is_plain_revert(l, *t),
-        _ => false,
     }
+    false
 }
 
 pub fn slice(l: &Lifted, entry: usize) -> Lifted {
@@ -418,11 +423,6 @@ pub fn exprs_with_callees_tagged<'a>(
         }
     }
     out
-}
-
-pub fn infer_params(l: &Lifted) -> Vec<Param> {
-    let roots: Vec<Root> = l.nodes.iter().flat_map(lift::roots).collect();
-    infer_params_from(&roots)
 }
 
 pub fn packing_masks(roots: &[Root]) -> HashSet<ExprId> {

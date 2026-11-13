@@ -65,6 +65,29 @@ pub fn error(selector: u32) -> Option<Cow<'static, str>> {
         .map(Cow::Owned)
 }
 
+// A lookup service is not trusted. Its names end up in the output and the report.
+#[cfg(feature = "rpc")]
+fn answers(sig: &str, selector: u32) -> bool {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_$(),[]".contains(c);
+    sig.chars().all(plain) && crate::keccak::selector(sig) == selector.to_be_bytes()
+}
+
+// A large input can have thousands of unknown selectors. Asking for each would turn one
+// request to this program into thousands to a service that owes it nothing.
+#[cfg(feature = "rpc")]
+const MAX_LOOKED_UP: usize = 200;
+#[cfg(feature = "rpc")]
+const MAX_ASKED_SINGLY: usize = 24;
+#[cfg(feature = "rpc")]
+const MAX_ANSWER: u64 = 1 << 20;
+
+#[cfg(feature = "rpc")]
+fn answer(agent: &ureq::Agent, url: &str) -> Option<serde_json::Value> {
+    use std::io::Read;
+    let body = agent.get(url).call().ok()?.into_reader().take(MAX_ANSWER);
+    serde_json::from_reader(body).ok()
+}
+
 #[cfg(feature = "rpc")]
 pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
     let mut out = HashMap::new();
@@ -72,6 +95,7 @@ pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
         .iter()
         .copied()
         .filter(|s| function(*s).is_none())
+        .take(MAX_LOOKED_UP)
         .collect();
     if unknown.is_empty() {
         return out;
@@ -85,38 +109,33 @@ pub fn lookup_online(selectors: &[u32]) -> HashMap<u32, String> {
             "https://api.openchain.xyz/signature-database/v1/lookup?function={}&filter=true",
             q.join(",")
         );
-        if let Ok(resp) = agent.get(&url).call() {
-            if let Ok(v) = resp.into_json::<serde_json::Value>() {
-                if let Some(map) = v.pointer("/result/function").and_then(|m| m.as_object()) {
-                    for (k, arr) in map {
-                        if let (Ok(sel), Some(first)) = (
-                            u32::from_str_radix(k.trim_start_matches("0x"), 16),
-                            arr.as_array()
-                                .and_then(|a| a.first())
-                                .and_then(|e| e.get("name"))
-                                .and_then(|n| n.as_str()),
-                        ) {
-                            out.insert(sel, first.to_string());
-                        }
-                    }
+        // A service that fails once is left alone for the rest of this request.
+        let Some(v) = answer(&agent, &url) else { break };
+        let Some(map) = v.pointer("/result/function").and_then(|m| m.as_object()) else {
+            continue;
+        };
+        for (k, arr) in map {
+            let first = arr.as_array().and_then(|a| a.first());
+            let name = first.and_then(|e| e.get("name")).and_then(|n| n.as_str());
+            let selector = u32::from_str_radix(k.trim_start_matches("0x"), 16);
+            if let (Ok(sel), Some(name)) = (selector, name) {
+                if answers(name, sel) {
+                    out.insert(sel, name.to_string());
                 }
             }
         }
     }
-    for sel in unknown {
-        if out.contains_key(&sel) {
-            continue;
-        }
+    let missing: Vec<u32> = unknown
+        .into_iter()
+        .filter(|sel| !out.contains_key(sel))
+        .take(MAX_ASKED_SINGLY)
+        .collect();
+    for sel in missing {
         let url = format!("https://www.4byte.directory/api/v1/signatures/?hex_signature={:#010x}&ordering=created_at", sel);
-        if let Ok(resp) = agent.get(&url).call() {
-            if let Ok(v) = resp.into_json::<serde_json::Value>() {
-                if let Some(t) = v
-                    .pointer("/results/0/text_signature")
-                    .and_then(|x| x.as_str())
-                {
-                    out.insert(sel, t.to_string());
-                }
-            }
+        let Some(v) = answer(&agent, &url) else { break };
+        let text = v.pointer("/results/0/text_signature");
+        if let Some(t) = text.and_then(|x| x.as_str()).filter(|t| answers(t, sel)) {
+            out.insert(sel, t.to_string());
         }
     }
     out

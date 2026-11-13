@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 pub struct FrameRun {
     pub outcome: Outcome,
     pub visited: HashSet<usize>,
+    pub order: Vec<usize>,
     pub steps: usize,
     pub storage: HashMap<U256, U256>,
     pub logs: Vec<LogRecord>,
@@ -28,6 +29,51 @@ impl FrameRun {
     }
 }
 
+thread_local! {
+    static WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// Setting a run up and reading its trace back costs about this many steps.
+const RUN_COST: u64 = 2_000;
+
+// Limits on the checks that run code are counted in this, not in seconds. A count gives
+// the same report on a slow machine and on a busy one.
+thread_local! {
+    static STOP: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+// About what one core does in a second, on the slowest inputs, on the machine the limits
+// were set on.
+pub const WORK_PER_SECOND: u64 = 12_000_000;
+
+pub fn work() -> u64 {
+    WORK.with(std::cell::Cell::get)
+}
+
+struct Restore(u64);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        STOP.with(|s| s.set(self.0));
+    }
+}
+
+// Runs a check with a cap on the work it may count. The path search and the solver ask
+// `spent` deep inside, so one long search cannot run many times past the cap.
+pub fn within<R>(units: u64, check: impl FnOnce() -> R) -> R {
+    let mark = work().saturating_add(units);
+    let _outer = Restore(STOP.with(|s| s.replace(s.get().min(mark))));
+    check()
+}
+
+pub fn spent() -> bool {
+    work() >= STOP.with(std::cell::Cell::get)
+}
+
+pub fn spend(units: u64) {
+    WORK.with(|w| w.set(w.get().saturating_add(units)));
+}
+
 pub fn run_frame(
     code: &[u8],
     host: &Host,
@@ -37,7 +83,9 @@ pub fn run_frame(
     let jumpdests: HashSet<usize> = disasm::jumpdests(code).into_iter().collect();
     let mut m = Machine::new(code, host);
     m.storage = init_storage;
+    m.move_limit = Machine::LOOPED_MOVE_LIMIT;
     let mut visited = HashSet::new();
+    let mut order = Vec::new();
     let mut steps = 0;
     let outcome = loop {
         if steps >= budget {
@@ -47,7 +95,11 @@ pub fn run_frame(
             break Outcome::Stop;
         }
         visited.insert(m.pc);
+        order.push(m.pc);
         steps += 1;
+        if steps % 4096 == 0 {
+            crate::clock::check();
+        }
         let at = m.pc;
         match m.step() {
             Ok(None) => {}
@@ -69,9 +121,11 @@ pub fn run_frame(
             Err(e) => break Outcome::Exception(e),
         }
     };
+    spend(steps as u64 + RUN_COST);
     FrameRun {
         outcome,
         visited,
+        order,
         steps,
         storage: m.storage,
         logs: m.logs,
@@ -160,6 +214,14 @@ mod tests {
         let code = hex::decode("600156").expect("hex");
         let run = run_frame(&code, &host(vec![]), HashMap::new(), 10_000);
         assert!(matches!(run.outcome, Outcome::Invalid));
+    }
+
+    #[test]
+    fn copying_nothing_from_past_the_returned_data_still_fails() {
+        let code = hex::decode("6000600160003e6001600055").expect("hex");
+        let run = run_frame(&code, &host(vec![]), HashMap::new(), 10_000);
+        assert!(!run.succeeded(), "{:?}", run.outcome);
+        assert_eq!(run.storage.get(&U256::ZERO), None);
     }
 
     #[test]

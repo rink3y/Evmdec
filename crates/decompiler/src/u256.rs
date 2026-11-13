@@ -82,9 +82,9 @@ impl U256 {
         256 - self.bits()
     }
     pub fn trailing_zeros(&self) -> u32 {
-        for i in 0..4 {
-            if self.0[i] != 0 {
-                return 64 * i as u32 + self.0[i].trailing_zeros();
+        for (i, limb) in self.0.iter().enumerate() {
+            if *limb != 0 {
+                return 64 * i as u32 + limb.trailing_zeros();
             }
         }
         256
@@ -97,6 +97,11 @@ impl U256 {
     }
     pub fn is_low_mask(&self) -> bool {
         !self.is_zero() && (*self + U256::ONE).is_power_of_two() || *self == U256::MAX
+    }
+
+    pub fn checked_add(self, rhs: U256) -> Option<U256> {
+        let (out, carried) = self.overflowing_add(rhs);
+        (!carried).then_some(out)
     }
 
     pub fn overflowing_add(self, rhs: U256) -> (U256, bool) {

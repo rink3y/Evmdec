@@ -74,7 +74,10 @@ impl SigDb {
                 .expect("header[16..24] is 8 bytes"),
         );
         let len = file.metadata()?.len();
-        if pool != HEADER_LEN + entries * ENTRY_LEN || len < pool {
+        let expected = entries
+            .checked_mul(ENTRY_LEN)
+            .and_then(|table| table.checked_add(HEADER_LEN));
+        if expected != Some(pool) || len < pool {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "signature index header does not match its size",
@@ -170,6 +173,9 @@ impl SigDb {
         let mut v = self
             .candidates((selector as u64) << 32, Match::Selector, MAX_FANOUT)
             .unwrap_or_default();
+        // The file is not trusted to pair a name with the right number. A name is kept
+        // only when its own hash gives the selector that was asked for.
+        v.retain(|name| keccak::keccak256(name.as_bytes())[..4] == selector.to_be_bytes());
         v.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         v.dedup();
         v
@@ -285,6 +291,10 @@ mod tests {
                     "transfer_with_a_longer_colliding_name(address,uint256)".to_string(),
                 ),
                 (
+                    h("many_msg_babbage(bytes1)"),
+                    "many_msg_babbage(bytes1)".to_string(),
+                ),
+                (
                     h("Transfer(address,address,uint256)"),
                     "Transfer(address,address,uint256)".to_string(),
                 ),
@@ -297,13 +307,14 @@ mod tests {
         )
         .unwrap();
         let db = SigDb::open(&path).unwrap();
-        assert_eq!(db.len(), 5, "duplicates are stored once");
+        assert_eq!(db.len(), 6, "duplicates are stored once");
         assert_eq!(
             db.selector(0xa9059cbb),
             vec![
+                "many_msg_babbage(bytes1)".to_string(),
                 "transfer(address,uint256)".to_string(),
-                "transfer_with_a_longer_colliding_name(address,uint256)".to_string()
-            ]
+            ],
+            "a real collision is kept and a name filed under the wrong number is not"
         );
         assert_eq!(
             db.selector(0x70a08231),
@@ -315,6 +326,17 @@ mod tests {
             Some("Transfer(address,address,uint256)")
         );
         assert_eq!(db.topic(&h("Nothing()")), None);
+    }
+
+    #[test]
+    fn open_rejects_a_header_whose_count_overflows() {
+        let dir = TempDir::new("sigdb-count");
+        let path = dir.0.join("sigs.idx");
+        write(&path, vec![(h("a()"), "a()".to_string())]).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(SigDb::open(&path).is_err());
     }
 
     #[test]

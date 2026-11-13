@@ -116,8 +116,19 @@ mod tests {
             hex(&keccak256(b"Transfer(address,address,uint256)")),
             "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
         );
-        let long = vec![0x61u8; 300];
-        assert_eq!(hex(&keccak256(&long)).len(), 64);
+        let of_a = |count: usize| hex(&keccak256(&vec![0x61u8; count]));
+        assert_eq!(
+            of_a(300),
+            "5b7e0e47a96f32a88b4f14ca177982790807c40e1a105742ba0fc1babe1ef826"
+        );
+        assert_eq!(
+            of_a(135),
+            "34367dc248bbd832f4e3e69dfaac2f92638bd0bbd18f2912ba4ef454919cf446"
+        );
+        assert_eq!(
+            of_a(136),
+            "a6c4d403279fe3e0af03729caada8374b5ca54d8065329a3ebcaeb4b60aa386e"
+        );
         assert_eq!(
             hex(&keccak256(b"eip1967.proxy.implementation")),
             "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbd"

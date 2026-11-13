@@ -102,14 +102,52 @@ enum Cmd {
 
 fn load(file: &PathBuf) -> Result<Vec<u8>> {
     let raw = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
-    if raw.iter().all(|b| b.is_ascii()) {
-        let s = String::from_utf8_lossy(&raw);
-        let t = s.trim();
-        if t.starts_with("0x") || t.chars().all(|c| c.is_ascii_hexdigit()) {
-            return evmdec::hex::decode(t).map_err(|e| anyhow::anyhow!(e));
-        }
+    // Hex is often folded into lines. Read as raw bytes, the line ends and digits would
+    // decompile into a report about code that is not there.
+    let text: Option<String> = raw.is_ascii().then(|| {
+        let text = String::from_utf8_lossy(&raw);
+        text.split_ascii_whitespace().collect()
+    });
+    let hex = text.filter(|t| t.starts_with("0x") || t.chars().all(|c| c.is_ascii_hexdigit()));
+    let code = match hex {
+        Some(hex) => evmdec::hex::decode(&hex).map_err(|e| anyhow::anyhow!(e))?,
+        None => raw,
+    };
+    if code.is_empty() {
+        anyhow::bail!("{} holds no code", file.display());
     }
-    Ok(raw)
+    Ok(code)
+}
+
+fn unknown_selectors(c: &Contract) -> Vec<u32> {
+    let unnamed = c.functions.iter().filter(|f| f.signature.is_none());
+    let selectors = unnamed.filter_map(|f| f.selector.as_ref());
+    selectors
+        .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
+fn look_up(c: &Contract) -> std::collections::HashMap<u32, String> {
+    let selectors = unknown_selectors(c);
+    let found = evmdec::sigs::lookup_online(&selectors);
+    eprintln!(
+        "resolved {} of {} unknown selectors online",
+        found.len(),
+        selectors.len()
+    );
+    found
+}
+
+// Output piped into a command that stops reading, such as head, is not a failure.
+fn quiet_on_closed_pipe() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let text = info.payload().downcast_ref::<String>();
+        if text.is_some_and(|t| t.starts_with("failed printing to stdout")) {
+            std::process::exit(0);
+        }
+        default(info);
+    }));
 }
 
 fn load_input(input: &str) -> Result<Vec<u8>> {
@@ -119,7 +157,11 @@ fn load_input(input: &str) -> Result<Vec<u8>> {
     }
     let t = input.trim();
     if t.starts_with("0x") || (t.len() > 8 && t.chars().all(|c| c.is_ascii_hexdigit())) {
-        return evmdec::hex::decode(t).map_err(|e| anyhow::anyhow!(e));
+        let code = evmdec::hex::decode(t).map_err(|e| anyhow::anyhow!(e))?;
+        if code.is_empty() {
+            anyhow::bail!("'{input}' holds no code");
+        }
+        return Ok(code);
     }
     anyhow::bail!("'{}' is neither a file, a hex string nor an address", input)
 }
@@ -129,24 +171,39 @@ fn fetch_and_decompile(
     rpc: Option<&str>,
     chain: &str,
     policy: Policy,
-    opts: &Options,
+    opts: &mut Options,
+    lookup: bool,
 ) -> Result<Contract> {
     let client = Client::new(rpc, chain).map_err(|e| anyhow::anyhow!(e))?;
     let mut cache = CodeCache::new();
-    evmdec::fetch::fetch(
-        &client,
-        address,
-        chain,
-        opts,
-        policy,
-        &mut cache,
-        &mut |line| eprintln!("{}", line),
-    )
-    .map_err(|e| anyhow::anyhow!(e))
+    let mut fetch = |opts: &Options| {
+        let mut log = |line: &str| eprintln!("{line}");
+        evmdec::fetch::fetch(&client, address, chain, opts, policy, &mut cache, &mut log)
+            .map_err(|e| anyhow::anyhow!(e))
+    };
+    let c = fetch(opts)?;
+    if !lookup {
+        return Ok(c);
+    }
+    // The names can only be asked for once the code is here. The second pass reads the
+    // code from the cache and uses them.
+    opts.extra_sigs = look_up(&c);
+    if opts.extra_sigs.is_empty() {
+        return Ok(c);
+    }
+    fetch(opts)
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    quiet_on_closed_pipe();
+    match evmdec::clock::on_worker(|| run(cli)) {
+        Ok(done) => done,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Info { file } => {
             let code = load(&file)?;
@@ -290,25 +347,8 @@ fn main() -> Result<()> {
             } else {
                 Some(load_input(&input)?)
             };
-            if lookup {
-                let probe = code
-                    .as_ref()
-                    .map(|c| evmdec::decompile::decompile(c, &opts));
-                if let Some(pc) = probe {
-                    let sels: Vec<u32> = pc
-                        .functions
-                        .iter()
-                        .filter(|f| f.signature.is_none())
-                        .filter_map(|f| f.selector.as_ref())
-                        .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                        .collect();
-                    opts.extra_sigs = evmdec::sigs::lookup_online(&sels);
-                    eprintln!(
-                        "resolved {} of {} unknown selectors online",
-                        opts.extra_sigs.len(),
-                        sels.len()
-                    );
-                }
+            if let (true, Some(code)) = (lookup, &code) {
+                opts.extra_sigs = look_up(&evmdec::decompile::decompile(code, &opts));
             }
             let c = match code {
                 None => fetch_and_decompile(
@@ -320,7 +360,8 @@ fn main() -> Result<()> {
                         depth: depth.min(3),
                         ..Policy::default()
                     },
-                    &opts,
+                    &mut opts,
+                    lookup,
                 )?,
                 Some(code) => {
                     let opts2 = opts.clone();
@@ -335,7 +376,7 @@ fn main() -> Result<()> {
                             for i in evmdec::disasm::disassemble(&info.runtime) {
                                 println!("{}", evmdec::disasm::format_instruction(&i));
                             }
-                            return Ok(());
+                            anyhow::bail!("the decompiler failed on this input");
                         }
                     }
                 }
@@ -348,7 +389,7 @@ fn main() -> Result<()> {
             } else {
                 print!("{}", c.source);
                 if report {
-                    let r = evmdec::analyze::analyze(&c);
+                    let (r, linked) = evmdec::analyze::analyze_all(&c);
                     println!(
                         "\n/*\n{}*/",
                         evmdec::analyze::render_markdown(&c, &r, &file.display().to_string())
@@ -366,13 +407,12 @@ fn main() -> Result<()> {
                             );
                         }
                     }
-                    for lc in &c.linked {
-                        let lr = evmdec::analyze::analyze(lc);
+                    for (lc, lr) in c.linked.iter().zip(&linked) {
                         println!(
                             "\n/*\n{}*/",
                             evmdec::analyze::render_markdown(
                                 lc,
-                                &lr,
+                                lr,
                                 &format!(
                                     "linked contract {}",
                                     lc.address.as_deref().unwrap_or("?")

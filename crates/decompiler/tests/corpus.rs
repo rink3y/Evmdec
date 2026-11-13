@@ -26,15 +26,13 @@ fn every_contract_decompiles_with_full_jump_resolution() {
             c.stats.external_functions + c.stats.internal_functions > 0 || code.len() < 100,
             "{name}: no functions"
         );
-        if name != "univ3_factory" {
-            assert_eq!(c.stats.unresolved_jumps, 0, "{name}: unresolved jumps");
-            assert!(
-                c.stats.covered_blocks * 100 >= c.stats.code_blocks * 90,
-                "{name}: coverage {}/{}",
-                c.stats.covered_blocks,
-                c.stats.code_blocks
-            );
-        }
+        assert_eq!(c.stats.unresolved_jumps, 0, "{name}: unresolved jumps");
+        assert!(
+            c.stats.covered_blocks * 100 >= c.stats.code_blocks * 90,
+            "{name}: coverage {}/{}",
+            c.stats.covered_blocks,
+            c.stats.code_blocks
+        );
         let _ = evmdec::analyze::analyze(&c);
     }
 }

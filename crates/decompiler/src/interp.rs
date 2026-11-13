@@ -73,6 +73,10 @@ pub struct Host {
     pub seed: u64,
     pub zero_storage: bool,
     pub force_calls: Option<bool>,
+    pub forced_return: Vec<u8>,
+    pub replies: Vec<(u32, Vec<u8>)>,
+    pub signed: Option<(Vec<u8>, U256)>,
+    pub failing: Option<usize>,
     pub intercept_calls: bool,
     pub unset_storage: Option<U256>,
 }
@@ -105,6 +109,10 @@ impl Host {
             seed: rng.next_u64(),
             zero_storage: false,
             force_calls: None,
+            forced_return: Vec::new(),
+            replies: Vec::new(),
+            signed: None,
+            failing: None,
             intercept_calls: false,
             unset_storage: None,
         }
@@ -131,6 +139,10 @@ impl Host {
             seed: 0x5eed,
             zero_storage: true,
             force_calls: Some(true),
+            forced_return: Vec::new(),
+            replies: Vec::new(),
+            signed: None,
+            failing: None,
             intercept_calls: false,
             unset_storage: None,
         }
@@ -201,9 +213,19 @@ impl Host {
             r
         }
     }
-    pub fn call_result(&self, i: usize) -> (bool, Vec<u8>) {
+    pub fn call_result(&self, i: usize, addr: U256, input: &[u8]) -> (bool, Vec<u8>) {
+        if self.failing == Some(i) {
+            return (false, Vec::new());
+        }
         if let Some(b) = self.force_calls {
-            return (b, Vec::new());
+            let data = answer(
+                &self.signed,
+                &self.replies,
+                &self.forced_return,
+                addr,
+                input,
+            );
+            return (b, data);
         }
         let r = keccak::keccak256(
             &[
@@ -240,6 +262,33 @@ impl Host {
     pub fn initial_gas(&self) -> u64 {
         1_000_000 + (self.seed % 1_000_000)
     }
+}
+
+const RECOVER: U256 = U256::ONE;
+const SOMEONE_ELSE: U256 = U256::from_u64(0x0e15_e0e1_5e0e_15e0);
+
+// Signature recovery answers the signer for the one digest it was given.
+// Any other digest recovers someone else, as a changed message would.
+pub fn answer(
+    signed: &Option<(Vec<u8>, U256)>,
+    replies: &[(u32, Vec<u8>)],
+    default: &[u8],
+    addr: U256,
+    input: &[u8],
+) -> Vec<u8> {
+    if let (true, Some((digest, signer))) = (addr == RECOVER, signed) {
+        let who = if input.starts_with(digest) {
+            *signer
+        } else {
+            SOMEONE_ELSE
+        };
+        return who.to_be_bytes().to_vec();
+    }
+    let selector = input
+        .get(..4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let chosen = replies.iter().find(|(s, _)| Some(*s) == selector);
+    chosen.map_or(default, |(_, data)| data).to_vec()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,6 +347,8 @@ pub struct Machine<'a> {
     pub gas_obs: Vec<U256>,
     pub msize_obs: Vec<U256>,
     pub pc: usize,
+    pub move_limit: usize,
+    moved: usize,
 }
 
 impl<'a> Machine<'a> {
@@ -317,6 +368,8 @@ impl<'a> Machine<'a> {
             gas_obs: vec![],
             msize_obs: vec![],
             pc: 0,
+            move_limit: Self::MEM_LIMIT,
+            moved: 0,
         }
     }
 
@@ -328,6 +381,18 @@ impl<'a> Machine<'a> {
     }
 
     const MEM_LIMIT: usize = 1 << 26;
+    // A step count alone does not bound a run. One step can hash or copy megabytes.
+    // Code that runs a frame many times lowers the limit to this.
+    pub const LOOPED_MOVE_LIMIT: usize = 1 << 23;
+
+    fn moving(&mut self, bytes: usize) -> Result<(), String> {
+        self.moved = self.moved.saturating_add(bytes);
+        if self.moved > self.move_limit {
+            return Err("memory traffic budget exhausted".into());
+        }
+        Ok(())
+    }
+
     fn expand(&mut self, off: usize, len: usize) -> Result<(), String> {
         if len == 0 {
             return Ok(());
@@ -338,6 +403,7 @@ impl<'a> Machine<'a> {
         }
         let rounded = end.div_ceil(32) * 32;
         if rounded > self.memory.len() {
+            self.moving(rounded - self.memory.len())?;
             self.memory.resize(rounded, 0);
         }
         Ok(())
@@ -350,6 +416,7 @@ impl<'a> Machine<'a> {
             .as_usize()
             .filter(|o| *o < Self::MEM_LIMIT)
             .ok_or("memory offset too large")?;
+        self.moving(len)?;
         self.expand(o, len)?;
         Ok(self.memory[o..o + len].to_vec())
     }
@@ -410,6 +477,7 @@ impl<'a> Machine<'a> {
         if n == 0 {
             return Ok(());
         }
+        self.moving(n)?;
         let mut buf = vec![0u8; n];
         if let Some(s) = src.as_usize() {
             for (i, out) in buf.iter_mut().enumerate() {
@@ -500,6 +568,10 @@ impl<'a> Machine<'a> {
             op::NOT => {
                 let a = self.pop()?;
                 self.push(!a)?;
+            }
+            op::CLZ => {
+                let a = self.pop()?;
+                self.push(U256::from_u64(u64::from(a.leading_zeros())))?;
             }
             op::BYTE => bin!(|a: U256, b: U256| U256::byte(a, b)),
             op::SHL => bin!(|a: U256, b: U256| if a >= U256::from_u64(256) {
@@ -602,7 +674,7 @@ impl<'a> Machine<'a> {
                 let end = s
                     .as_usize()
                     .and_then(|s| l.as_usize().map(|l| s.saturating_add(l)));
-                if end.is_none_or(|e| e > self.returndata.len()) && !l.is_zero() {
+                if end.is_none_or(|e| e > self.returndata.len()) {
                     return Err("returndata out of bounds".into());
                 }
                 let src = self.returndata.clone();
@@ -800,7 +872,7 @@ impl<'a> Machine<'a> {
                 let (success, data) = if addr == U256::from_u64(4) {
                     (true, input)
                 } else {
-                    self.host.call_result(idx)
+                    self.host.call_result(idx, addr, &input)
                 };
                 self.deliver_call(out_off, out_len, success, data)?;
             }

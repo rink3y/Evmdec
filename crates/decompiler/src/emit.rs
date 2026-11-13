@@ -1,16 +1,22 @@
-use crate::expr::{self, ExprId, Node};
+use crate::expr::{self, kind, ExprId, Node};
 use crate::keccak;
 use crate::lift::{Lifted, Stmt, Term, FREE_POINTER};
 use crate::opcode as op;
 use crate::sigs;
 use crate::u256::U256;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 const HASHED_SLOTS: u64 = 4096;
 
 const HASH_OFFSET_RANGE: i64 = 16;
+
+// A slot below the hash is not an element of the array that starts at the hash.
+pub fn array_element(c: U256) -> Option<(U256, u64)> {
+    let (root, k) = hashed_slot(c)?;
+    u64::try_from(k).ok().map(|k| (root, k))
+}
 
 pub fn hashed_slot(c: U256) -> Option<(U256, i64)> {
     static TABLE: OnceLock<HashMap<U256, (u64, i64)>> = OnceLock::new();
@@ -171,6 +177,26 @@ impl Names {
         self.memo.borrow_mut().clear();
     }
 
+    // Text long enough to be moved to a line of its own cannot stand where it is worked out
+    // again on every pass, such as a loop test. The names made for it are taken back.
+    pub fn without_temps(&self, format: impl FnOnce() -> String) -> Option<String> {
+        let made = self.temps.borrow().len();
+        let (seq, named, memo) = (
+            *self.temp_seq.borrow(),
+            self.temp_of.borrow().clone(),
+            self.memo.borrow().clone(),
+        );
+        let text = format();
+        if self.temps.borrow().len() == made {
+            return Some(text);
+        }
+        self.temps.borrow_mut().truncate(made);
+        *self.temp_seq.borrow_mut() = seq;
+        *self.temp_of.borrow_mut() = named;
+        *self.memo.borrow_mut() = memo;
+        None
+    }
+
     pub fn replace_stale(&self, loads: impl IntoIterator<Item = (ExprId, String)>) {
         let mut stale = self.stale.borrow_mut();
         let before = stale.len();
@@ -191,17 +217,29 @@ impl Names {
     }
 }
 
-const P_OR: u8 = 2;
-const P_XOR: u8 = 3;
-const P_AND: u8 = 4;
-const P_EQ: u8 = 5;
-const P_CMP: u8 = 6;
-const P_SHIFT: u8 = 7;
-const P_ADD: u8 = 8;
-const P_MUL: u8 = 9;
-const P_EXP: u8 = 10;
-const P_UNARY: u8 = 11;
-const P_PRIMARY: u8 = 12;
+// Solidity's order, not C's. In Solidity the bitwise operators bind tighter than the
+// comparisons, so `a | b <= c` there means `(a | b) <= c`.
+const P_LOR: u8 = 1;
+const P_LAND: u8 = 2;
+const P_EQ: u8 = 3;
+const P_CMP: u8 = 4;
+const P_OR: u8 = 5;
+const P_XOR: u8 = 6;
+const P_AND: u8 = 7;
+const P_SHIFT: u8 = 8;
+const P_ADD: u8 = 9;
+const P_MUL: u8 = 10;
+const P_EXP: u8 = 11;
+const P_UNARY: u8 = 12;
+const P_PRIMARY: u8 = 13;
+
+pub fn fmt_and_operand(e: ExprId, n: &Names) -> String {
+    fmt_prec(e, P_LAND, n)
+}
+
+pub fn fmt_or_operand(e: ExprId, n: &Names) -> String {
+    fmt_prec(e, P_LOR, n)
+}
 
 pub fn fmt_const(c: U256) -> String {
     if c.is_zero() {
@@ -313,6 +351,40 @@ pub fn fmt_expr(e: ExprId, n: &Names) -> String {
     fmt_prec(e, 0, n)
 }
 
+thread_local! {
+    static NESTED: Cell<u32> = const { Cell::new(0) };
+}
+
+// The printer calls itself once per level of an expression. Past this many levels the
+// parts are printed first, smallest first, so every later call finds its parts done.
+const MAX_NESTED: u32 = 64;
+
+struct Level(u32);
+
+impl Drop for Level {
+    fn drop(&mut self) {
+        NESTED.with(|d| d.set(self.0));
+    }
+}
+
+fn fmt_parts_first(e: ExprId, n: &Names) {
+    let mut parts = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if seen.insert(x) {
+            parts.push(x);
+            stack.extend(expr::children(x));
+        }
+    }
+    parts.sort_by_key(|x| expr::depth(*x));
+    for part in parts {
+        if part != e {
+            fmt_prec(part, 0, n);
+        }
+    }
+}
+
 fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     if let Some(a) = n.aliases.get(&e) {
         return a.clone();
@@ -329,6 +401,13 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     if let Some((s, p)) = n.memo.borrow().get(&e) {
         return paren(s.clone(), *p, outer);
     }
+    let level = NESTED.with(Cell::get);
+    let _restore = Level(level);
+    if level >= MAX_NESTED {
+        NESTED.with(|d| d.set(0));
+        fmt_parts_first(e, n);
+    }
+    NESTED.with(|d| d.set(level + 1));
     let (s, p) = fmt_inner(e, n);
     if s.len() > TEMP_THRESHOLD && !matches!(expr::node(e), Node::Const(_)) {
         *n.temp_seq.borrow_mut() += 1;
@@ -395,12 +474,12 @@ fn written_range(s: &Stmt) -> Option<(u64, u64)> {
     match s {
         Stmt::MStore { off, width, .. } => {
             let o = expr::as_const(*off)?.as_usize()? as u64;
-            Some((o, o + *width as u64))
+            Some((o, o.checked_add(*width as u64)?))
         }
         Stmt::Copy { dest, len, .. } => {
             let d = expr::as_const(*dest)?.as_usize()? as u64;
             let l = expr::as_const(*len)?.as_usize()? as u64;
-            Some((d, d + l))
+            Some((d, d.checked_add(l)?))
         }
         _ => None,
     }
@@ -409,17 +488,27 @@ fn written_range(s: &Stmt) -> Option<(u64, u64)> {
 fn reads_memory(s: &Stmt) -> bool {
     match s {
         Stmt::MStore { .. } | Stmt::SStore { .. } | Stmt::Assign { .. } | Stmt::Drop(_) => {
-            stmt_exprs(s)
-                .iter()
-                .any(|e| expr::contains(*e, &|n| matches!(n, Node::MLoad(..))))
+            // A word copied from call data or code is fixed by its source.
+            // Only one copied from memory depends on what memory held.
+            let from_memory = |n: &Node| matches!(n, Node::CopiedWord(op::MCOPY, ..));
+            stmt_exprs(s).iter().any(|e| {
+                expr::holds(*e, kind::MLOAD | kind::KECCAK_MEM)
+                    || (expr::holds(*e, kind::COPIED_WORD) && expr::contains(*e, &from_memory))
+            })
         }
         Stmt::Copy { kind, .. } => *kind == op::MCOPY,
         _ => true,
     }
 }
 
+// A store that is overwritten is overwritten soon after.
+// Looking further made a long run of stores quadratic.
+const DEAD_STORE_WINDOW: usize = 256;
+
 pub fn dead_memory_stores(stmts: &[Stmt]) -> HashSet<usize> {
     let mut dead = HashSet::new();
+    let reads: Vec<bool> = stmts.iter().map(reads_memory).collect();
+    let ranges: Vec<Option<(u64, u64)>> = stmts.iter().map(written_range).collect();
     for (i, s) in stmts.iter().enumerate() {
         if let Stmt::MStore {
             off,
@@ -433,17 +522,17 @@ pub fn dead_memory_stores(stmts: &[Stmt]) -> HashSet<usize> {
                 continue;
             }
         }
-        let Some((lo, hi)) = written_range(s) else {
+        let Some((lo, hi)) = ranges[i] else {
             continue;
         };
-        for later in &stmts[i + 1..] {
-            if let Some((l2, h2)) = written_range(later) {
+        for later in (i + 1..stmts.len()).take(DEAD_STORE_WINDOW) {
+            if let Some((l2, h2)) = ranges[later] {
                 if l2 <= lo && h2 >= hi {
                     dead.insert(i);
                     break;
                 }
             }
-            if reads_memory(later) {
+            if reads[later] {
                 break;
             }
         }
@@ -993,10 +1082,10 @@ pub fn element_root(key: ExprId) -> Option<U256> {
         Node::Keccak(words, 0) if words.len() == 1 => expr::as_const(words[0]),
         Node::Op(op::ADD, v) => v.iter().find_map(|a| match expr::node(*a) {
             Node::Keccak(w, 0) if w.len() == 1 => expr::as_const(w[0]),
-            Node::Const(c) => hashed_slot(c).map(|(s, _)| s),
+            Node::Const(c) => array_element(c).map(|(s, _)| s),
             _ => None,
         }),
-        Node::Const(c) => hashed_slot(c).map(|(s, _)| s),
+        Node::Const(c) => array_element(c).map(|(s, _)| s),
         _ => None,
     }
 }
@@ -1018,7 +1107,7 @@ fn base_name(e: ExprId, n: &Names, space: SlotSpace) -> String {
         SlotSpace::Transient => "tstor",
     };
     match expr::as_const(e) {
-        Some(c) if hashed_slot(c).is_none() => slot_name(c, n, prefix),
+        Some(c) if array_element(c).is_none() => slot_name(c, n, prefix),
         _ => fmt_slot(e, n, space),
     }
 }
@@ -1079,8 +1168,8 @@ fn fmt_slot_path(e: ExprId, n: &Names, space: SlotSpace) -> String {
             }
             return name.clone();
         }
-        if let Some((s, k)) = hashed_slot(c) {
-            return format!("{}[{}]", slot_name(s, n, prefix), k.max(0));
+        if let Some((s, k)) = array_element(c) {
+            return format!("{}[{}]", slot_name(s, n, prefix), k);
         }
         return if c.bits() <= 32 {
             format!("{}_{}", prefix, c.to_decimal())
@@ -1354,15 +1443,16 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             }
         }
         (op::NOT, 1) => (format!("~{}", fmt_prec(v[0], P_UNARY, n)), P_UNARY),
-        (op::BALANCE, 1) => (
+        (op::CLZ, 1) => (format!("clz({})", fmt_expr(v[0], n)), P_PRIMARY),
+        (op::BALANCE, 1 | 2) => (
             format!("{}.balance", fmt_prec(v[0], P_PRIMARY, n)),
             P_PRIMARY,
         ),
-        (op::EXTCODESIZE, 1) => (
+        (op::EXTCODESIZE, 1 | 2) => (
             format!("{}.code.length", fmt_prec(v[0], P_PRIMARY, n)),
             P_PRIMARY,
         ),
-        (op::EXTCODEHASH, 1) => (
+        (op::EXTCODEHASH, 1 | 2) => (
             format!("{}.codehash", fmt_prec(v[0], P_PRIMARY, n)),
             P_PRIMARY,
         ),
@@ -1471,18 +1561,18 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
         (op::AND, 2) if is_bool(v[0], n) && is_bool(v[1], n) => (
             format!(
                 "{} && {}",
-                fmt_prec(v[0], P_AND, n),
-                fmt_prec(v[1], P_AND + 1, n)
+                fmt_prec(v[0], P_LAND, n),
+                fmt_prec(v[1], P_LAND + 1, n)
             ),
-            P_AND,
+            P_LAND,
         ),
         (op::OR, 2) if is_bool(v[0], n) && is_bool(v[1], n) => (
             format!(
                 "{} || {}",
-                fmt_prec(v[0], P_OR, n),
-                fmt_prec(v[1], P_OR + 1, n)
+                fmt_prec(v[0], P_LOR, n),
+                fmt_prec(v[1], P_LOR + 1, n)
             ),
-            P_OR,
+            P_LOR,
         ),
         (op::AND, 2) => {
             if is_selector_expr(expr::intern(Node::Op(op::AND, v.to_vec()))) {
@@ -1822,6 +1912,9 @@ pub fn escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // The report puts expressions in code spans. A backtick from the bytecode would
+            // close one and let the rest of the string through as markup.
+            '`' => out.push_str("\\x60"),
             c if (c as u32) < 0x20 || c == '\u{fffd}' => {
                 out.push_str(&format!("\\x{:02x}", c as u32 & 0xff))
             }
@@ -2321,19 +2414,7 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
 pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     let mut out = String::new();
     let reach = crate::lift::reachable(l);
-    let mut order: Vec<usize> = Vec::new();
-    let mut seen = HashSet::new();
-    fn dfs(l: &Lifted, x: usize, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
-        if !seen.insert(x) {
-            return;
-        }
-        for s in &l.nodes[x].succs {
-            dfs(l, *s, seen, order);
-        }
-        order.push(x);
-    }
-    dfs(l, l.entry, &mut seen, &mut order);
-    order.reverse();
+    let order = crate::lift::reverse_postorder(l);
     let mut needs_label: HashSet<usize> = HashSet::new();
     for (idx, &nid) in order.iter().enumerate() {
         let nd = &l.nodes[nid];

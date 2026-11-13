@@ -43,6 +43,7 @@ pub const BYTE: u8 = 0x1a;
 pub const SHL: u8 = 0x1b;
 pub const SHR: u8 = 0x1c;
 pub const SAR: u8 = 0x1d;
+pub const CLZ: u8 = 0x1e;
 pub const KECCAK256: u8 = 0x20;
 pub const ADDRESS: u8 = 0x30;
 pub const BALANCE: u8 = 0x31;
@@ -135,6 +136,7 @@ pub fn info(opcode: u8) -> Option<OpInfo> {
         0x1b => op("SHL", 2, 1, 3),
         0x1c => op("SHR", 2, 1, 3),
         0x1d => op("SAR", 2, 1, 3),
+        0x1e => op("CLZ", 1, 1, 5),
         0x20 => op("KECCAK256", 2, 1, 30),
         0x30 => op("ADDRESS", 0, 1, 2),
         0x31 => op("BALANCE", 1, 1, 100),
@@ -246,9 +248,6 @@ pub fn is_dup(op: u8) -> bool {
 pub fn is_swap(op: u8) -> bool {
     (0x90..=0x9f).contains(&op)
 }
-pub fn is_log(op: u8) -> bool {
-    (0xa0..=0xa4).contains(&op)
-}
 pub fn is_terminator(op: u8) -> bool {
     matches!(
         op,
@@ -262,5 +261,38 @@ pub fn name(op: u8) -> String {
     match info(op) {
         Some(i) => i.name.to_string(),
         None => format!("UNKNOWN_{:02x}", op),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shape(opcode: u8) -> Option<(u8, u8, u8)> {
+        info(opcode).map(|i| (i.pops, i.pushes, i.imm))
+    }
+
+    #[test]
+    fn the_table_knows_the_newer_opcodes() {
+        assert_eq!(shape(CLZ), Some((1, 1, 0)));
+        assert_eq!(shape(0x5f), Some((0, 1, 0)));
+        assert_eq!(shape(0x5c), Some((1, 1, 0)));
+        assert_eq!(shape(0x5d), Some((2, 0, 0)));
+        assert_eq!(shape(0x5e), Some((3, 0, 0)));
+    }
+
+    #[test]
+    fn a_push_carries_its_width_and_a_swap_reads_one_past_its_number() {
+        assert_eq!(shape(0x60), Some((0, 1, 1)));
+        assert_eq!(shape(0x7f), Some((0, 1, 32)));
+        assert!(is_push(0x7f) && !is_push(0x80));
+        assert!(is_dup(0x80) && is_swap(0x90));
+    }
+
+    #[test]
+    fn a_code_with_no_entry_ends_the_block() {
+        assert!(info(0x0c).is_none());
+        assert!(is_terminator(0x0c));
+        assert!(is_terminator(JUMPI) && !is_terminator(0x01));
     }
 }

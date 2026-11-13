@@ -1,0 +1,259 @@
+use crate::cfg::Program;
+use crate::exec::{self, FrameRun};
+use crate::expr;
+use crate::interp::{self, Host};
+use crate::lift::{Lifter, Stmt, Term};
+use crate::solve::{self, Free, Inputs, Item};
+use crate::u256::U256;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
+
+const STEP_BUDGET: usize = 200_000;
+const MAX_BLOCKS: usize = 2_048;
+const MAX_LATE_RUNS: usize = 1024;
+// Reading one block of a trace back into expressions costs about this many steps.
+const BLOCK_COST: u64 = 40;
+const DEFAULT_BALANCE: U256 = U256::from_u64(1_000_000_000_000_000_000);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub paths: usize,
+    pub runs: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            paths: 48,
+            runs: 240,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Path {
+    pub inputs: Inputs,
+    pub items: Vec<Item>,
+    pub truth: Vec<bool>,
+    pub effects: Vec<Stmt>,
+    pub end: Option<Term>,
+    pub run: FrameRun,
+}
+
+impl Path {
+    pub fn signature(&self) -> Vec<(usize, bool)> {
+        let checks = self.items.iter().filter_map(|i| match i {
+            Item::Check { pc, holds, .. } => Some((*pc, *holds)),
+            Item::Store { .. } => None,
+        });
+        checks.collect()
+    }
+
+    pub fn succeeded(&self) -> bool {
+        self.run.succeeded()
+    }
+}
+
+pub struct Explorer {
+    prog: Program,
+    late: Cell<usize>,
+}
+
+// One explorer per piece of code. A contract made of several parts has several.
+#[derive(Default)]
+pub struct Explorers {
+    by_code: HashMap<*const u8, Explorer>,
+}
+
+impl Explorers {
+    pub fn of(&mut self, code: &[u8]) -> &Explorer {
+        let made = || Explorer::new(code);
+        self.by_code.entry(code.as_ptr()).or_insert_with(made)
+    }
+}
+
+// Branches alone never ask for a non-zero amount, and a zero amount moves nothing.
+// Every word differs, so two arguments are never equal by chance.
+pub fn varied_word(index: usize) -> U256 {
+    U256::from_u64(0x1001 + 2 * index as u64)
+}
+
+pub fn fill_words(calldata: &[u8], fixed: &[usize], value: impl Fn(usize) -> U256) -> Vec<u8> {
+    let mut out = calldata.to_vec();
+    for index in (0..calldata.len().saturating_sub(4) / 32).filter(|i| !fixed.contains(i)) {
+        let at = 4 + 32 * index;
+        out[at..at + 32].copy_from_slice(&value(index).to_be_bytes());
+    }
+    out
+}
+
+pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
+    Inputs {
+        calldata: exec::calldata(selector, &vec![U256::ZERO; words]),
+        caller: exec::CALLER,
+        address: exec::SELF,
+        callvalue: U256::ZERO,
+        timestamp: U256::from_u64(1_700_000_000),
+        number: U256::from_u64(18_000_000),
+        storage: HashMap::new(),
+        returned: Vec::new(),
+        replies: Vec::new(),
+        given: Vec::new(),
+        balance: DEFAULT_BALANCE,
+        signed: None,
+        failing: None,
+    }
+}
+
+impl Explorer {
+    pub fn new(code: &[u8]) -> Explorer {
+        Explorer {
+            prog: Program::new(code.to_vec()),
+            late: Cell::new(0),
+        }
+    }
+
+    pub fn run(&self, inputs: &Inputs) -> Path {
+        let mut host = Host::controlled(
+            inputs.address,
+            inputs.caller,
+            inputs.calldata.clone(),
+            inputs.callvalue,
+        );
+        host.timestamp = inputs.timestamp;
+        host.number = inputs.number;
+        host.forced_return = inputs.returned.clone();
+        host.replies = inputs.replies.clone();
+        host.signed = inputs.signed.clone();
+        host.failing = inputs.failing;
+        host.selfbalance = inputs.balance;
+        let mut run = exec::run_frame(&self.prog.code, &host, inputs.storage.clone(), STEP_BUDGET);
+        // Thousands of paths are kept at once. Each would hold one entry per step it ran.
+        let order = std::mem::take(&mut run.order);
+        let blocks: Vec<usize> = order
+            .iter()
+            .filter_map(|pc| self.prog.block_at_pc.get(pc).copied())
+            .take(MAX_BLOCKS)
+            .collect();
+        exec::spend(blocks.len() as u64 * BLOCK_COST);
+        let lifter = Lifter {
+            prog: &self.prog,
+            root: true,
+            summaries: HashMap::new(),
+            footprints: HashMap::new(),
+            oracle: true,
+            copy_loops: Default::default(),
+        };
+        let nodes = lifter.lift_trace(&blocks);
+        let mut items = Vec::new();
+        let mut truth = Vec::new();
+        let mut effects = Vec::new();
+        for (i, node) in nodes.iter().enumerate() {
+            for st in &node.stmts {
+                match st {
+                    Stmt::SStore {
+                        key,
+                        val,
+                        transient: false,
+                        gen,
+                    } => {
+                        items.push(Item::Store {
+                            key: *key,
+                            val: *val,
+                            gen: *gen,
+                        });
+                        effects.push(st.clone());
+                    }
+                    Stmt::Call { .. }
+                    | Stmt::Create { .. }
+                    | Stmt::Log { .. }
+                    | Stmt::MStore { .. } => {
+                        effects.push(st.clone());
+                    }
+                    _ => {}
+                }
+            }
+            if let Term::CondJump { cond, target } = &node.term {
+                let block = &self.prog.blocks[node.block];
+                let next = blocks.get(i + 1).map(|b| self.prog.blocks[*b].start);
+                // A jump to the instruction after it goes the same way whatever the test
+                // says. Recording a side would ask the solver for a run that changes nothing.
+                let to = expr::as_const(*target).and_then(|t| t.as_usize());
+                if to == Some(block.end) {
+                    continue;
+                }
+                let holds = next != Some(block.end);
+                items.push(Item::Check {
+                    cond: *cond,
+                    holds,
+                    pc: self.prog.insns[block.last].pc,
+                });
+                truth.push(holds);
+            }
+        }
+        let mut inputs = inputs.clone();
+        let made = effects.iter().filter_map(|st| match st {
+            Stmt::Call { seq, .. } => Some(*seq),
+            _ => None,
+        });
+        inputs.given = made
+            .zip(&run.calls)
+            .map(|(seq, call)| {
+                let (replies, default) = (&inputs.replies, &inputs.returned);
+                let data = interp::answer(&inputs.signed, replies, default, call.addr, &call.input);
+                (seq, data)
+            })
+            .collect();
+        Path {
+            inputs,
+            items,
+            truth,
+            effects,
+            end: nodes.last().map(|n| n.term.clone()),
+            run,
+        }
+    }
+
+    // Each new path is only kept after the bytecode really ran it.
+    pub fn explore(&self, start: &Inputs, free: &Free, limits: Limits) -> Vec<Path> {
+        // Past its limit a caller still gets one run of each function, so a slow first
+        // function does not hide the rest. The count ends that for a contract with
+        // thousands of functions, which would otherwise run every one of them.
+        if exec::spent() {
+            if self.late.get() >= MAX_LATE_RUNS {
+                return Vec::new();
+            }
+            self.late.set(self.late.get() + 1);
+        }
+        let first = self.run(start);
+        let mut seen: HashSet<Vec<(usize, bool)>> = HashSet::new();
+        seen.insert(first.signature());
+        let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+        let mut paths = vec![first];
+        queue.push_back((0, 0));
+        let mut runs = 1;
+        while let Some((index, bound)) = queue.pop_front() {
+            let last = paths[index].truth.len();
+            // A run that fails stops at its last check, so that is the one whose other side
+            // leads further. Early checks mostly validate arguments and only add failing runs.
+            for flip in (bound..last).rev() {
+                if exec::spent() || runs >= limits.runs || paths.len() >= limits.paths {
+                    return paths;
+                }
+                let base = &paths[index];
+                let mut want = base.truth[..=flip].to_vec();
+                want[flip] = !want[flip];
+                let Some(inputs) = solve::solve(&base.items, &want, &base.inputs, free) else {
+                    continue;
+                };
+                runs += 1;
+                let path = self.run(&inputs);
+                if seen.insert(path.signature()) {
+                    queue.push_back((paths.len(), flip + 1));
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    }
+}

@@ -1,5 +1,5 @@
 use crate::emit::{self, Names, PayloadKind};
-use crate::expr::{self, ExprId, Node};
+use crate::expr::{self, kind, ExprId, Node};
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::u256::U256;
@@ -112,7 +112,7 @@ impl Graph {
             }
         }
         let idom = dominators(n, l.entry, &succs, &preds, &rpo, &rpo_index);
-        let noreturn: Vec<bool> = (0..n).map(|x| is_noreturn_leaf(l, x)).collect();
+        let noreturn = noreturn_leaves(l);
         let mut rsuccs: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
         let mut rpreds: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
         for x in 0..n {
@@ -197,24 +197,41 @@ impl Graph {
     }
 }
 
-fn is_noreturn_leaf(l: &Lifted, mut x: usize) -> bool {
-    let mut seen = HashSet::new();
-    loop {
-        if !seen.insert(x) {
-            return false;
-        }
-        let nd = &l.nodes[x];
-        if !nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. })) {
-            return false;
-        }
-        match &nd.term {
-            Term::Revert { .. } | Term::Invalid | Term::Infeasible | Term::Unresolved(_) => {
-                return true
+// Every node on a chain of plain jumps shares the answer of the node the chain ends at.
+// Asking each node on its own walked a long chain once per node.
+fn noreturn_leaves(l: &Lifted) -> Vec<bool> {
+    let mut known: Vec<Option<bool>> = vec![None; l.nodes.len()];
+    let mut on_chain = vec![false; l.nodes.len()];
+    for start in 0..l.nodes.len() {
+        let mut chain = Vec::new();
+        let mut x = start;
+        let leaf = loop {
+            if let Some(leaf) = known[x] {
+                break leaf;
             }
-            Term::Jump(t) => x = *t,
-            _ => return false,
+            if on_chain[x] {
+                break false;
+            }
+            on_chain[x] = true;
+            chain.push(x);
+            let nd = &l.nodes[x];
+            if !nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. })) {
+                break false;
+            }
+            match &nd.term {
+                Term::Revert { .. } | Term::Invalid | Term::Infeasible | Term::Unresolved(_) => {
+                    break true
+                }
+                Term::Jump(t) => x = *t,
+                _ => break false,
+            }
+        };
+        for x in chain {
+            known[x] = Some(leaf);
+            on_chain[x] = false;
         }
     }
+    known.into_iter().map(|leaf| leaf == Some(true)).collect()
 }
 
 struct Loop {
@@ -272,13 +289,15 @@ struct Printer<'a> {
     out: String,
     emitted: HashSet<usize>,
     labels: HashSet<usize>,
+    nesting: usize,
     loop_stack: Vec<(usize, Option<usize>, usize)>,
     gotos: usize,
     active: HashSet<usize>,
     next_tmp: u32,
     used: Vec<ExprId>,
     facts: Vec<(ExprId, bool)>,
-    stale_plan: HashMap<(usize, usize), Vec<(ExprId, String)>>,
+    stale_plan: StalePlan,
+    early_reads: StalePlan,
     stored: Vec<(usize, String, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
     // Filled while the printer's &self methods run, hence the cell.
@@ -407,7 +426,7 @@ fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) ->
     folded
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Overwritten {
     Slot(ExprId),
     Balance,
@@ -467,8 +486,8 @@ fn overwrites(st: &Stmt, names: &Names) -> Option<(Overwritten, u32)> {
     }
 }
 
-fn earliest_loads(l: &Lifted) -> HashMap<ExprId, u32> {
-    let mut earliest: HashMap<ExprId, u32> = HashMap::new();
+fn earliest_loads(l: &Lifted) -> HashMap<Overwritten, u32> {
+    let mut earliest: HashMap<Overwritten, u32> = HashMap::new();
     let mut seen: HashSet<ExprId> = HashSet::new();
     let mut pending: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
     pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
@@ -476,8 +495,14 @@ fn earliest_loads(l: &Lifted) -> HashMap<ExprId, u32> {
         if !seen.insert(e) {
             continue;
         }
-        if let Node::MLoad(addr, version) = expr::node(e) {
-            let first = earliest.entry(addr).or_insert(version);
+        let read = match expr::node(e) {
+            Node::MLoad(addr, version) => Some((Overwritten::Memory(addr), version)),
+            Node::SLoad(key, false, version) => Some((Overwritten::Slot(key), version)),
+            Node::Env(op::SELFBALANCE, version) => Some((Overwritten::Balance, version)),
+            _ => None,
+        };
+        if let Some((what, version)) = read {
+            let first = earliest.entry(what).or_insert(version);
             *first = (*first).min(version);
         }
         pending.extend(expr::children(e));
@@ -526,6 +551,133 @@ fn prev_name(what: Overwritten, names: &Names) -> String {
     format!("prev_{}", id.trim_end_matches('_'))
 }
 
+fn exprs_after(l: &Lifted, nd: &lift::LNode, i: usize, in_block_only: bool) -> Vec<ExprId> {
+    let mut after: Vec<ExprId> = Vec::new();
+    for later in &nd.stmts[i + 1..] {
+        after.extend(lift::stmt_exprs(later));
+    }
+    after.extend(lift::term_exprs(&nd.term));
+    let mut seen = HashSet::new();
+    let mut stack: Vec<usize> = match in_block_only {
+        true => Vec::new(),
+        false => nd.succs.clone(),
+    };
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        after.extend(lift::node_exprs(&l.nodes[x]));
+        stack.extend(l.nodes[x].succs.iter().copied());
+    }
+    for ((from, _), assigns) in &l.edge_assigns {
+        if *from == nd.id || seen.contains(from) {
+            after.extend(assigns.iter().map(|(_, v)| *v));
+        }
+    }
+    after
+}
+
+fn account_read(e: ExprId) -> Option<(u8, u32)> {
+    match expr::node(e) {
+        Node::Op(o @ (op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH), v) => {
+            let stamp = v.get(1).and_then(|s| expr::as_const(*s));
+            Some((o, stamp.map_or(0, |c| c.low_u64() as u32)))
+        }
+        _ => None,
+    }
+}
+
+// A call or a create can change another account's balance and code, and a store through
+// one pointer can change what another pointer reads. A read made before such a step and
+// used after it gets a name first, or the old and the new read print the same.
+fn plan_early_reads(l: &Lifted, names: &Names) -> StalePlan {
+    let mut plan = StalePlan::new();
+    let mut reads: Vec<(ExprId, u32)> = Vec::new();
+    let mut loads: Vec<(ExprId, ExprId, u32)> = Vec::new();
+    let mut seen: HashSet<ExprId> = HashSet::new();
+    let mut pending: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
+    pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
+    while let Some(e) = pending.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        if let Some((_, version)) = account_read(e) {
+            reads.push((e, version));
+        }
+        if let Node::MLoad(at, version) = expr::node(e) {
+            loads.push((e, at, version));
+        }
+        pending.extend(expr::children(e));
+    }
+    // A later read carries the store's own version only when that store may have changed it.
+    let reread = |at: ExprId, gen: u32| loads.iter().any(|(_, a, v)| *a == at && *v == gen);
+    let mut first: HashMap<ExprId, (u32, usize, usize)> = HashMap::new();
+    for nd in &l.nodes {
+        for (i, st) in nd.stmts.iter().enumerate() {
+            if let Stmt::MStore { off, gen, .. } = st {
+                let old: Vec<ExprId> = loads
+                    .iter()
+                    .filter(|(_, at, v)| at != off && v < gen && reread(*at, *gen))
+                    .map(|(e, _, _)| *e)
+                    .collect();
+                if old.is_empty() {
+                    continue;
+                }
+                let after = exprs_after(l, nd, i, true);
+                for read in old {
+                    let target = expr::node(read);
+                    if after.iter().any(|e| expr::contains(*e, &|n| *n == target)) {
+                        first.entry(read).or_insert((*gen, nd.id, i));
+                    }
+                }
+                continue;
+            }
+            let Some((Overwritten::Balance, gen)) = overwrites(st, names) else {
+                continue;
+            };
+            let old: Vec<ExprId> = reads
+                .iter()
+                .filter(|(_, version)| *version <= gen)
+                .map(|(e, _)| *e)
+                .collect();
+            if old.is_empty() {
+                continue;
+            }
+            let after = exprs_after(l, nd, i, false);
+            for read in old {
+                let target = expr::node(read);
+                if after.iter().any(|e| expr::contains(*e, &|n| *n == target)) {
+                    let at = first.entry(read).or_insert((gen, nd.id, i));
+                    if gen < at.0 {
+                        *at = (gen, nd.id, i);
+                    }
+                }
+            }
+        }
+    }
+    let mut ordered: Vec<(ExprId, (u32, usize, usize))> = first.into_iter().collect();
+    ordered.sort_by_key(|(e, at)| (*at, e.0));
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for (read, (_, node, i)) in ordered {
+        let base = match account_read(read) {
+            Some((op::BALANCE, _)) => "account_balance",
+            Some((op::EXTCODESIZE, _)) => "code_size",
+            Some(_) => "code_hash",
+            None => "mem",
+        };
+        let n = counts.entry(base).or_insert(0);
+        *n += 1;
+        let name = match *n {
+            1 => format!("prev_{base}"),
+            n => format!("prev{n}_{base}"),
+        };
+        plan.entry((node, i)).or_default().push((read, name));
+    }
+    plan
+}
+
+type StalePlan = HashMap<(usize, usize), Vec<(ExprId, String)>>;
+
 // Printing these loads as the slot name would read the new value.
 fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(ExprId, String)>> {
     let mut plan: HashMap<(usize, usize), Vec<(ExprId, String)>> = HashMap::new();
@@ -537,34 +689,13 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
             let Some((what, gen)) = overwrites(st, names) else {
                 continue;
             };
-            if let Overwritten::Memory(addr) = what {
-                if earliest.get(&addr).is_none_or(|first| *first > gen) {
-                    continue;
-                }
+            // Only a read made before the write can be stale.
+            // Without one, looking through everything after the write finds nothing.
+            if earliest.get(&what).is_none_or(|first| *first > gen) {
+                continue;
             }
-            let mut after: Vec<ExprId> = Vec::new();
-            for later in &nd.stmts[i + 1..] {
-                after.extend(lift::stmt_exprs(later));
-            }
-            after.extend(lift::term_exprs(&nd.term));
             let in_block_only = matches!(what, Overwritten::Memory(_));
-            let mut seen = HashSet::new();
-            let mut stack: Vec<usize> = match in_block_only {
-                true => Vec::new(),
-                false => nd.succs.clone(),
-            };
-            while let Some(x) = stack.pop() {
-                if !seen.insert(x) || seen.len() > 5000 {
-                    continue;
-                }
-                after.extend(lift::node_exprs(&l.nodes[x]));
-                stack.extend(l.nodes[x].succs.iter().copied());
-            }
-            for ((from, _), assigns) in &l.edge_assigns {
-                if *from == nd.id || seen.contains(from) {
-                    after.extend(assigns.iter().map(|(_, v)| *v));
-                }
-            }
+            let after = exprs_after(l, nd, i, in_block_only);
             let forwarded = match st {
                 Stmt::SStore { val, .. } if !expr::is_const(*val) => Some(*val),
                 _ => None,
@@ -628,7 +759,7 @@ fn with_init(e: ExprId, init: &HashMap<ExprId, ExprId>) -> ExprId {
 fn reroll_peeled_loops(l: &Lifted) -> Lifted {
     let g = Graph::new(l);
     let loops = find_loops(&g);
-    let debug = std::env::var("EVMDEC_DEBUG_PEEL").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_PEEL");
     if debug && !loops.is_empty() {
         for nd in &l.nodes {
             eprintln!(
@@ -725,7 +856,7 @@ fn reroll_peeled_loops(l: &Lifted) -> Lifted {
 }
 
 fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
-    let debug = std::env::var("EVMDEC_DEBUG_PEEL").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_PEEL");
     let fail = |why: &str| {
         if debug {
             eprintln!("[peel]     copy {} of {}: {}", hp, q0, why);
@@ -954,7 +1085,7 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
         }
     }
     let mut dead = HashSet::new();
-    let debug = std::env::var("EVMDEC_DEBUG_DEAD").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_DEAD");
     for nd in &l.nodes {
         if debug && nd.stmts.iter().any(|s| matches!(s, Stmt::Copy { .. })) {
             eprintln!(
@@ -1098,10 +1229,11 @@ enum Pos {
     Edge,
 }
 
-fn weight(e: ExprId) -> usize {
+// The walk ends once enough are found. Counting them all made naming quadratic.
+fn has_operations(e: ExprId, wanted: usize) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![e];
-    let mut w = 0;
+    let mut found = 0;
     while let Some(x) = stack.pop() {
         if !seen.insert(x) || seen.len() > 2000 {
             continue;
@@ -1110,32 +1242,28 @@ fn weight(e: ExprId) -> usize {
             Node::Op(op::AND, v)
                 if v.iter()
                     .any(|a| expr::as_const(*a).is_some_and(|m| m.is_low_mask())) => {}
-            Node::Op(..) => w += 1,
+            Node::Op(..) => found += 1,
             _ => {}
+        }
+        if found >= wanted {
+            return true;
         }
         stack.extend(expr::children(x));
     }
-    w
+    false
 }
 
 // Memory reads are never bound. A temporary would hide which version of memory they read.
 fn bindable(e: ExprId) -> bool {
-    if expr::is_boolean(e) || expr::is_const(e) || weight(e) < 2 {
-        return false;
-    }
-    let reads_memory = expr::contains(e, &|n| {
-        matches!(
-            n,
-            Node::MLoad(..) | Node::KeccakMem(..) | Node::CopiedWord(..) | Node::Unknown(_)
-        )
-    });
-    !reads_memory
+    let unbound = kind::MLOAD | kind::KECCAK_MEM | kind::COPIED_WORD | kind::UNKNOWN;
+    !expr::is_boolean(e) && !expr::is_const(e) && !expr::holds(e, unbound) && has_operations(e, 2)
 }
 
 // Counts are carried down the shared graph. Walking each repetition again is exponential.
 // Storage keys and hashes stay whole. A bound key would lose the slot's name.
 // The packing of an encoded word stays whole. The printer undoes it to show the arguments.
-fn bindable_subexprs(e: ExprId, encoded: bool, out: &mut Vec<(ExprId, usize)>) {
+fn bindable_subexprs(e: ExprId, encoded: bool) -> Vec<(ExprId, usize)> {
+    let mut out: Vec<(ExprId, usize)> = Vec::new();
     let packs = |x: ExprId, encoded: bool| {
         encoded
             && matches!(expr::node(x), Node::Op(o, _) if matches!(o, op::OR | op::SHL | op::SHR | op::AND | op::MUL | op::DIV))
@@ -1179,17 +1307,22 @@ fn bindable_subexprs(e: ExprId, encoded: bool, out: &mut Vec<(ExprId, usize)>) {
             *t = t.saturating_add(n);
         }
     }
+    let mut place: HashMap<ExprId, usize> = HashMap::new();
     for state in &order {
         let (x, encoded) = *state;
         if whole(x) || packs(x, encoded) || !bindable(x) {
             continue;
         }
         let n = times.get(state).copied().unwrap_or(0);
-        match out.iter_mut().find(|(y, _)| *y == x) {
-            Some((_, total)) => *total = total.saturating_add(n),
-            None => out.push((x, n)),
+        match place.get(&x) {
+            Some(at) => out[*at].1 = out[*at].1.saturating_add(n),
+            None => {
+                place.insert(x, out.len());
+                out.push((x, n));
+            }
         }
     }
+    out
 }
 
 fn term_reads(t: &Term) -> Vec<(ExprId, bool)> {
@@ -1412,7 +1545,7 @@ fn available_at(
             _ => l.nodes[x].stmts.len(),
         };
         if let Some(bad) = l.nodes[x].stmts[..limit].iter().find(|s| !clean_stmt(s)) {
-            if std::env::var("EVMDEC_DEBUG_BIND").is_ok() {
+            if crate::debug::on("EVMDEC_DEBUG_BIND") {
                 eprintln!(
                     "[bind]   node {} blocks hoisting: {}",
                     x,
@@ -1460,14 +1593,12 @@ fn reaches_within(l: &Lifted, a: usize, b: usize, within: &HashSet<usize>) -> bo
 
 fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
     let g = Graph::new(l);
-    let debug = std::env::var("EVMDEC_DEBUG_BIND").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_BIND");
     let mut uses: HashMap<ExprId, Vec<(usize, Pos)>> = HashMap::new();
     let mut count: HashMap<ExprId, usize> = HashMap::new();
     let mut first_seen: HashMap<ExprId, usize> = HashMap::new();
     let mut note = |(e, encoded): (ExprId, bool), at: (usize, Pos)| {
-        let mut subs = Vec::new();
-        bindable_subexprs(e, encoded, &mut subs);
-        for (x, k) in subs {
+        for (x, k) in bindable_subexprs(e, encoded) {
             let n = first_seen.len();
             first_seen.entry(x).or_insert(n);
             *count.entry(x).or_default() += k;
@@ -2007,6 +2138,11 @@ impl<'a> Printer<'a> {
                 self.line(depth, &def);
                 self.names.replace_stale(loads);
             }
+            for (read, name) in self.early_reads.get(&(n, i)).cloned().unwrap_or_default() {
+                let def = format!("uint256 {} = {};", name, emit::fmt_expr(read, self.names));
+                self.line(depth, &def);
+                self.names.replace_stale([(read, name)]);
+            }
             if let Stmt::Internal { results, .. } = s {
                 if !results.is_empty() && results.iter().all(|r| self.names.aliases.contains_key(r))
                 {
@@ -2050,7 +2186,7 @@ impl<'a> Printer<'a> {
                 self.stored.retain(|(_, nm, _)| *nm != name);
                 let mut fw = self.names.forwarded.borrow_mut();
                 fw.retain(|_, nm| *nm != name);
-                if !expr::is_const(*val) && weight(*val) >= 1 {
+                if !expr::is_const(*val) && has_operations(*val, 1) {
                     self.stored.push((n, name.clone(), *val));
                     fw.insert(*val, name);
                 }
@@ -2060,46 +2196,77 @@ impl<'a> Printer<'a> {
     }
 
     // Edge copies are simultaneous.
+    // A copy is printed once nothing still waiting reads the variable it writes.
+    // The readers of each variable are counted once. Searching every value again
+    // for every variable on every round was cubic in the number of copies.
     fn assign_lines(&mut self, assigns: &[(ExprId, ExprId)], depth: usize) {
         let mut rem: Vec<(ExprId, ExprId)> =
             assigns.iter().copied().filter(|(a, b)| a != b).collect();
         while !rem.is_empty() {
-            let reads = |rhs: ExprId, var: ExprId| {
-                let target = expr::node(var);
-                expr::contains(rhs, &|nd| *nd == target)
-            };
-            let pick = rem
+            let mut writers: HashMap<ExprId, Vec<usize>> = HashMap::new();
+            for (i, (var, _)) in rem.iter().enumerate() {
+                writers.entry(*var).or_default().push(i);
+            }
+            let read_by: Vec<Vec<usize>> = rem
                 .iter()
-                .position(|(var, _)| !rem.iter().any(|(v2, rhs)| v2 != var && reads(*rhs, *var)));
-            match pick {
-                Some(i) => {
-                    let (var, val) = rem.remove(i);
-                    let s = format!(
-                        "{} = {};",
-                        emit::fmt_expr(var, self.names),
-                        emit::fmt_expr(val, self.names)
-                    );
-                    self.line(depth, &s);
-                }
-                None => {
-                    let (var, _) = rem[0];
-                    let tmp = expr::intern(Node::Var(self.next_tmp));
-                    self.next_tmp += 1;
-                    let s = format!(
-                        "{} = {};",
-                        emit::fmt_expr(tmp, self.names),
-                        emit::fmt_expr(var, self.names)
-                    );
-                    self.line(depth, &s);
-                    let target = expr::node(var);
-                    for (_, rhs) in rem.iter_mut() {
-                        *rhs = expr::substitute(
-                            *rhs,
-                            &|nd| if *nd == target { Some(tmp) } else { None },
-                            &mut HashMap::new(),
-                        );
+                .map(|(var, rhs)| {
+                    let mut read = Vec::new();
+                    let mut seen = HashSet::new();
+                    let mut stack = vec![*rhs];
+                    while let Some(x) = stack.pop() {
+                        if !seen.insert(x) || seen.len() > 20_000 {
+                            continue;
+                        }
+                        if x != *var {
+                            read.extend(writers.get(&x).into_iter().flatten().copied());
+                        }
+                        stack.extend(expr::children(x));
                     }
+                    read
+                })
+                .collect();
+            let mut readers = vec![0usize; rem.len()];
+            for read in &read_by {
+                for i in read {
+                    readers[*i] += 1;
                 }
+            }
+            let mut waiting = vec![true; rem.len()];
+            while let Some(i) = (0..rem.len()).find(|i| waiting[*i] && readers[*i] == 0) {
+                waiting[i] = false;
+                for read in &read_by[i] {
+                    readers[*read] -= 1;
+                }
+                let (var, val) = rem[i];
+                let s = format!(
+                    "{} = {};",
+                    emit::fmt_expr(var, self.names),
+                    emit::fmt_expr(val, self.names)
+                );
+                self.line(depth, &s);
+            }
+            rem = (0..rem.len())
+                .filter(|i| waiting[*i])
+                .map(|i| rem[i])
+                .collect();
+            let Some((var, _)) = rem.first().copied() else {
+                break;
+            };
+            let tmp = expr::intern(Node::Var(self.next_tmp));
+            self.next_tmp += 1;
+            let s = format!(
+                "{} = {};",
+                emit::fmt_expr(tmp, self.names),
+                emit::fmt_expr(var, self.names)
+            );
+            self.line(depth, &s);
+            let target = expr::node(var);
+            for (_, rhs) in rem.iter_mut() {
+                *rhs = expr::substitute(
+                    *rhs,
+                    &|nd| if *nd == target { Some(tmp) } else { None },
+                    &mut HashMap::new(),
+                );
             }
         }
     }
@@ -2110,8 +2277,25 @@ impl<'a> Printer<'a> {
     }
 
     fn go(&mut self, n: usize, stop: Option<usize>, depth: usize) {
-        if Some(n) == stop {
+        let Some(n) = self.next(n, stop, depth) else {
             return;
+        };
+        // Each nested region calls back into the printer. Past this depth the rest is
+        // printed at the top level under a label, so a long chain cannot use up the stack.
+        if self.nesting >= MAX_NESTING {
+            self.labels.insert(n);
+            self.gotos += 1;
+            self.line(depth, &format!("goto L{:x};", self.node_pc(n)));
+            return;
+        }
+        self.nesting += 1;
+        self.emit_node(n, stop, depth);
+        self.nesting -= 1;
+    }
+
+    fn next(&mut self, n: usize, stop: Option<usize>, depth: usize) -> Option<usize> {
+        if Some(n) == stop {
+            return None;
         }
         for i in (0..self.loop_stack.len()).rev() {
             let (header, exit, body_depth) = self.loop_stack[i];
@@ -2129,7 +2313,7 @@ impl<'a> Printer<'a> {
                         &format!("goto L{:x}; // continue outer loop", self.node_pc(n)),
                     );
                 }
-                return;
+                return None;
             }
             if exit == Some(n) {
                 if innermost {
@@ -2142,20 +2326,20 @@ impl<'a> Printer<'a> {
                         &format!("goto L{:x}; // break outer loop", self.node_pc(n)),
                     );
                 }
-                return;
+                return None;
             }
         }
         if self.emitted.contains(&n) || self.active.contains(&n) {
             if self.is_small_terminal(n) && !self.active.contains(&n) {
                 self.emit_dup(n, depth);
-                return;
+                return None;
             }
             self.labels.insert(n);
             self.gotos += 1;
             self.line(depth, &format!("goto L{:x};", self.node_pc(n)));
-            return;
+            return None;
         }
-        self.emit_node(n, stop, depth);
+        Some(n)
     }
 
     fn emit_dup(&mut self, mut n: usize, depth: usize) {
@@ -2178,42 +2362,54 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn emit_node(&mut self, n: usize, stop: Option<usize>, depth: usize) {
-        if let Some(lp) = self.loops.get(&n) {
-            if !self.emitted.contains(&n) && !self.loop_stack.iter().any(|(h, _, _)| *h == n) {
-                let body: HashSet<usize> = lp.body.clone();
-                let exits = lp.exits.clone();
-                self.emit_loop(n, &body, &exits, stop, depth);
+    fn emit_node(&mut self, mut n: usize, stop: Option<usize>, depth: usize) {
+        loop {
+            crate::clock::check();
+            if let Some(lp) = self.loops.get(&n) {
+                if !self.emitted.contains(&n) && !self.loop_stack.iter().any(|(h, _, _)| *h == n) {
+                    let body: HashSet<usize> = lp.body.clone();
+                    let exits = lp.exits.clone();
+                    self.emit_loop(n, &body, &exits, stop, depth);
+                    return;
+                }
+            }
+            self.emitted.insert(n);
+            if self.labels.contains(&n) {
+                self.line(depth.saturating_sub(1), &format!("L{:x}:", self.node_pc(n)));
+            }
+            if self.try_transfer_idiom(n, stop, depth) {
                 return;
             }
-        }
-        self.emitted.insert(n);
-        if self.labels.contains(&n) {
-            self.line(depth.saturating_sub(1), &format!("L{:x}:", self.node_pc(n)));
-        }
-        if self.try_transfer_idiom(n, stop, depth) {
-            return;
-        }
-        self.stmts(n, depth);
-        let term = self.l.nodes[n].term.clone();
-        match term {
-            Term::Jump(t) => self.transfer(n, t, stop, depth),
-            Term::Branch { t: Some(t), f, .. } if t == f => self.transfer(n, f, stop, depth),
-            Term::Branch { cond, t, f } => self.emit_branch(n, cond, t, f, stop, depth),
-            Term::Switch { target, cases } => {
-                let tgt = emit::fmt_expr(target, self.names);
-                self.line(depth, &format!("switch ({}) {{", tgt));
-                for (i, c) in cases.iter().enumerate() {
-                    self.line(depth + 1, &format!("case {}: {{", i));
-                    self.transfer(n, *c, stop, depth + 2);
-                    self.line(depth + 1, "}");
+            self.stmts(n, depth);
+            let to = match self.l.nodes[n].term.clone() {
+                Term::Jump(t) => t,
+                Term::Branch { t: Some(t), f, .. } if t == f => f,
+                Term::Branch { cond, t, f } => {
+                    self.emit_branch(n, cond, t, f, stop, depth);
+                    return;
                 }
-                self.line(depth, "}");
-            }
-            other => {
-                if let Some(s) = emit::fmt_term_halt(&other, self.names) {
-                    self.line(depth, &s);
+                Term::Switch { target, cases } => {
+                    let tgt = emit::fmt_expr(target, self.names);
+                    self.line(depth, &format!("switch ({}) {{", tgt));
+                    for (i, c) in cases.iter().enumerate() {
+                        self.line(depth + 1, &format!("case {}: {{", i));
+                        self.transfer(n, *c, stop, depth + 2);
+                        self.line(depth + 1, "}");
+                    }
+                    self.line(depth, "}");
+                    return;
                 }
+                other => {
+                    if let Some(s) = emit::fmt_term_halt(&other, self.names) {
+                        self.line(depth, &s);
+                    }
+                    return;
+                }
+            };
+            self.edge_assigns(n, to, depth);
+            match self.next(to, stop, depth) {
+                Some(following) => n = following,
+                None => return,
             }
         }
     }
@@ -2270,13 +2466,15 @@ impl<'a> Printer<'a> {
             } = &cn.term
             {
                 {
+                    let test =
+                        |e: ExprId| self.names.without_temps(|| emit::fmt_expr(e, self.names));
                     if body.contains(t) && !body.contains(f) {
-                        while_cond = Some((emit::fmt_expr(*cond, self.names), *t));
-                        exit = Some(*f);
+                        while_cond = test(*cond).map(|text| (text, *t));
                     } else if body.contains(f) && !body.contains(t) {
-                        while_cond =
-                            Some((emit::fmt_expr(expr::op1(op::ISZERO, *cond), self.names), *f));
-                        exit = Some(*t);
+                        while_cond = test(expr::op1(op::ISZERO, *cond)).map(|text| (text, *f));
+                    }
+                    if let Some((_, into)) = &while_cond {
+                        exit = Some(if into == t { *f } else { *t });
                     }
                 }
             }
@@ -2284,7 +2482,12 @@ impl<'a> Printer<'a> {
         if while_cond.is_some() && cond_node != header {
             self.emitted.insert(cond_node);
         }
-        if std::env::var("EVMDEC_DEBUG_LOOP").is_ok() {
+        // The loop is left from the node that holds its test, which is not always the header.
+        let left_from = match while_cond.is_some() {
+            true => cond_node,
+            false => header,
+        };
+        if crate::debug::on("EVMDEC_DEBUG_LOOP") {
             let tf = match &nd.term {
                 Term::Branch { t, f, .. } => format!(
                     "branch t={:?} (in body {:?}) f={} (in body {})",
@@ -2340,8 +2543,8 @@ impl<'a> Printer<'a> {
         }
         self.loop_stack.pop();
         if let Some(e) = exit {
-            if let Some(a) = self.l.edge_assigns.get(&(header, e)) {
-                if while_cond_exit_from_header(&self.l.nodes[header].term, e) {
+            if let Some(a) = self.l.edge_assigns.get(&(left_from, e)) {
+                if while_cond_exit_from_header(&self.l.nodes[left_from].term, e) {
                     let a = a.clone();
                     self.assign_lines(&a, depth);
                 }
@@ -2600,7 +2803,7 @@ impl<'a> Printer<'a> {
         if self.names.bool_returns.as_slice() != [true] {
             return None;
         }
-        if std::env::var("EVMDEC_DEBUG_FOLD").is_ok() {
+        if crate::debug::on("EVMDEC_DEBUG_FOLD") {
             eprintln!(
                 "[fold] bool return sides {} {:?} {:?} / {} {:?} {:?}",
                 t,
@@ -2710,19 +2913,30 @@ impl<'a> Printer<'a> {
             self.emitted.insert(f);
         }
         let ncond = expr::op1(op::ISZERO, cond);
-        let (var_s, c_s, nc_s) = (
-            emit::fmt_expr(var, self.names),
-            emit::fmt_expr(cond, self.names),
-            emit::fmt_expr(ncond, self.names),
-        );
+        let var_s = emit::fmt_expr(var, self.names);
+        let both = |a: ExprId, b: ExprId| {
+            let (a, b) = (
+                emit::fmt_and_operand(a, self.names),
+                emit::fmt_and_operand(b, self.names),
+            );
+            format!("{var_s} = {a} && {b};")
+        };
+        let either = |a: ExprId, b: ExprId| {
+            let (a, b) = (
+                emit::fmt_or_operand(a, self.names),
+                emit::fmt_or_operand(b, self.names),
+            );
+            format!("{var_s} = {a} || {b};")
+        };
+        let c_s = emit::fmt_or_operand(cond, self.names);
         let txt = if y == cond {
-            format!("{} = {} && {};", var_s, c_s, emit::fmt_expr(x, self.names))
+            both(cond, x)
         } else if x == cond {
-            format!("{} = {} || {};", var_s, c_s, emit::fmt_expr(y, self.names))
+            either(cond, y)
         } else if x == ncond {
-            format!("{} = {} && {};", var_s, nc_s, emit::fmt_expr(y, self.names))
+            both(ncond, y)
         } else if y == ncond {
-            format!("{} = {} || {};", var_s, nc_s, emit::fmt_expr(x, self.names))
+            either(ncond, x)
         } else {
             format!(
                 "{} = {} ? {} : {};",
@@ -2788,6 +3002,8 @@ pub struct Structured {
     pub gotos: usize,
 }
 
+const MAX_NESTING: usize = 400;
+
 pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
     let g = Graph::new(l);
     let loops = find_loops(&g);
@@ -2806,6 +3022,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         out: String::new(),
         emitted: HashSet::new(),
         labels: HashSet::new(),
+        nesting: 0,
         loop_stack: Vec::new(),
         gotos: 0,
         active: HashSet::new(),
@@ -2813,6 +3030,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         used,
         facts: Vec::new(),
         stale_plan: plan_stale_loads(l, names),
+        early_reads: plan_early_reads(l, names),
         stored: Vec::new(),
         dead_stores: stores_dead_until_exit(l)
             .into_iter()
@@ -2829,7 +3047,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         .filter(|n| !p.emitted.contains(n))
         .collect();
     let mut rounds = 0;
-    while !pending.is_empty() && rounds < 64 {
+    while !pending.is_empty() && rounds < 64 + l.nodes.len() / MAX_NESTING {
         rounds += 1;
         pending.sort_by_key(|n| p.g.rpo_index[*n]);
         for n in pending {
@@ -2857,11 +3075,13 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             used: p.used.clone(),
             emitted: HashSet::new(),
             labels: p.labels.clone(),
+            nesting: 0,
             loop_stack: Vec::new(),
             gotos: 0,
             active: HashSet::new(),
             facts: Vec::new(),
             stale_plan: std::mem::take(&mut p.stale_plan),
+            early_reads: std::mem::take(&mut p.early_reads),
             stored: Vec::new(),
             dead_stores: std::mem::take(&mut p.dead_stores),
             skipped: Default::default(),
@@ -2875,7 +3095,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             .filter(|n| !p2.emitted.contains(n))
             .collect();
         let mut rounds = 0;
-        while !pending.is_empty() && rounds < 64 {
+        while !pending.is_empty() && rounds < 64 + l.nodes.len() / MAX_NESTING {
             rounds += 1;
             pending.sort_by_key(|n| p2.g.rpo_index[*n]);
             for n in pending {
@@ -2985,10 +3205,13 @@ fn drop_empty_once(text: &str) -> String {
 }
 
 pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
+    expr::clear_boolean_marks();
     let depth = indent.len() / 4;
     let rolled = reroll_peeled_loops(l);
     let bound = bind_shared(&rolled, n);
-    structure(&bound, n, depth).text
+    let text = structure(&bound, n, depth).text;
+    expr::clear_boolean_marks();
+    text
 }
 
 fn payload_from_stores(stores: &[(ExprId, ExprId)], ptr: ExprId) -> Option<(Vec<ExprId>, u64)> {

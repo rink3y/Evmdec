@@ -26,14 +26,159 @@ pub enum Node {
     Unknown(u32),
 }
 
+pub mod kind {
+    pub const CONST: u16 = 1 << 0;
+    pub const ENV: u16 = 1 << 1;
+    pub const OP: u16 = 1 << 2;
+    pub const MLOAD: u16 = 1 << 3;
+    pub const SLOAD: u16 = 1 << 4;
+    pub const CALLDATALOAD: u16 = 1 << 5;
+    pub const KECCAK: u16 = 1 << 6;
+    pub const KECCAK_MEM: u16 = 1 << 7;
+    pub const CALL_RESULT: u16 = 1 << 8;
+    pub const CREATE_RESULT: u16 = 1 << 9;
+    pub const VAR: u16 = 1 << 10;
+    pub const ARG: u16 = 1 << 11;
+    pub const RETURN_DATA: u16 = 1 << 12;
+    pub const COPIED_WORD: u16 = 1 << 13;
+    pub const INT_RET: u16 = 1 << 14;
+    pub const UNKNOWN: u16 = 1 << 15;
+}
+
+// bits, may, depth and kinds are worked out once, when a node is made, from its children.
+// Walking a shared expression for them again cost 2^n on n nested operators.
+#[derive(Default)]
 struct Arena {
     nodes: Vec<Node>,
     map: HashMap<Node, ExprId>,
+    bits: Vec<u16>,
+    may: Vec<U256>,
+    depth: Vec<u32>,
+    kinds: Vec<u16>,
     seq: u32,
 }
 
 thread_local! {
-    static ARENA: RefCell<Arena> = RefCell::new(Arena { nodes: Vec::new(), map: HashMap::new(), seq: 0 });
+    static ARENA: RefCell<Arena> = RefCell::new(Arena::default());
+}
+
+// Deeper than this, code that walks an expression by calling itself can run out of stack.
+// No compiler output comes near it. A deeper value is kept as an unknown.
+const MAX_DEPTH: u32 = 1_024;
+
+impl Arena {
+    fn konst(&self, id: ExprId) -> Option<U256> {
+        match &self.nodes[id.0 as usize] {
+            Node::Const(c) => Some(*c),
+            _ => None,
+        }
+    }
+
+    fn depth_below(&self, n: &Node) -> u32 {
+        let of = |id: &ExprId| self.depth[id.0 as usize];
+        match n {
+            Node::Op(_, v) | Node::Keccak(v, _) => v.iter().map(of).max().unwrap_or(0),
+            Node::MLoad(a, _)
+            | Node::SLoad(a, _, _)
+            | Node::CallDataLoad(a)
+            | Node::ReturnData(_, a)
+            | Node::CopiedWord(_, a, _) => of(a),
+            Node::KeccakMem(a, b, _) => of(a).max(of(b)),
+            _ => 0,
+        }
+    }
+
+    fn kinds_of(&self, n: &Node) -> u16 {
+        let of = |id: &ExprId| self.kinds[id.0 as usize];
+        let all = |v: &[ExprId]| v.iter().fold(0, |seen, id| seen | of(id));
+        match n {
+            Node::Const(_) => kind::CONST,
+            Node::Env(..) => kind::ENV,
+            Node::Op(_, v) => kind::OP | all(v),
+            Node::MLoad(a, _) => kind::MLOAD | of(a),
+            Node::SLoad(a, _, _) => kind::SLOAD | of(a),
+            Node::CallDataLoad(a) => kind::CALLDATALOAD | of(a),
+            Node::Keccak(v, _) => kind::KECCAK | all(v),
+            Node::KeccakMem(a, b, _) => kind::KECCAK_MEM | of(a) | of(b),
+            Node::CallResult(_) => kind::CALL_RESULT,
+            Node::CreateResult(_) => kind::CREATE_RESULT,
+            Node::Var(_) => kind::VAR,
+            Node::Arg(_) => kind::ARG,
+            Node::ReturnData(_, a) => kind::RETURN_DATA | of(a),
+            Node::CopiedWord(_, a, _) => kind::COPIED_WORD | of(a),
+            Node::IntRet(..) => kind::INT_RET,
+            Node::Unknown(_) => kind::UNKNOWN,
+        }
+    }
+
+    fn bits_of(&self, n: &Node) -> u32 {
+        let bits = |id: ExprId| u32::from(self.bits[id.0 as usize]);
+        match n {
+            Node::Const(c) => c.bits(),
+            Node::Env(o, _) => match *o {
+                op::CALLER | op::ADDRESS | op::ORIGIN | op::COINBASE => 160,
+                op::TIMESTAMP
+                | op::NUMBER
+                | op::GASLIMIT
+                | op::GAS
+                | op::CALLDATASIZE
+                | op::RETURNDATASIZE
+                | op::CODESIZE
+                | op::MSIZE
+                | op::PC => 64,
+                _ => 256,
+            },
+            Node::Op(o, v) => match *o {
+                op::ISZERO | op::LT | op::GT | op::SLT | op::SGT | op::EQ => 1,
+                op::CLZ => 9,
+                op::AND => bits(v[0]).min(bits(v[1])),
+                op::OR | op::XOR => bits(v[0]).max(bits(v[1])),
+                op::SHR => match self.konst(v[0]) {
+                    Some(s) => bits(v[1]).saturating_sub(s.low_u64().min(256) as u32),
+                    None => 256,
+                },
+                op::SHL => match self.konst(v[0]) {
+                    Some(s) => (bits(v[1]) + s.low_u64().min(256) as u32).min(256),
+                    None => 256,
+                },
+                op::DIV => match self.konst(v[1]) {
+                    Some(c) if c.is_zero() => 0,
+                    Some(c) => bits(v[0]).saturating_sub(c.bits() - 1),
+                    None => bits(v[0]),
+                },
+                op::MOD => self.konst(v[1]).map_or(256, |c| c.bits()),
+                op::BYTE => 8,
+                _ => 256,
+            },
+            Node::CallResult(_) => 1,
+            Node::CreateResult(_) => 160,
+            _ => 256,
+        }
+    }
+
+    fn may_of(&self, n: &Node, bits: u32) -> U256 {
+        let may = |id: ExprId| self.may[id.0 as usize];
+        let shift = |v: &[ExprId], left: bool| match self.konst(v[0]) {
+            Some(s) if s.fits_u64() && s.low_u64() < 256 => {
+                let by = s.low_u64() as u32;
+                if left {
+                    may(v[1]) << by
+                } else {
+                    may(v[1]) >> by
+                }
+            }
+            Some(_) => U256::ZERO,
+            None => U256::MAX,
+        };
+        match n {
+            Node::Const(c) => *c,
+            Node::Op(op::AND, v) => may(v[0]) & may(v[1]),
+            Node::Op(op::OR | op::XOR, v) => may(v[0]) | may(v[1]),
+            Node::Op(op::SHL, v) => shift(v, true),
+            Node::Op(op::SHR, v) => shift(v, false),
+            _ => mask_bits(bits),
+        }
+    }
 }
 
 pub fn intern(n: Node) -> ExprId {
@@ -42,8 +187,23 @@ pub fn intern(n: Node) -> ExprId {
         if let Some(id) = a.map.get(&n) {
             return *id;
         }
+        let mut depth = a.depth_below(&n) + 1;
+        let n = if depth > MAX_DEPTH {
+            a.seq += 1;
+            depth = 1;
+            Node::Unknown(a.seq)
+        } else {
+            n
+        };
+        let bits = a.bits_of(&n);
+        let may = a.may_of(&n, bits);
+        let kinds = a.kinds_of(&n);
         let id = ExprId(a.nodes.len() as u32);
         a.nodes.push(n.clone());
+        a.bits.push(bits as u16);
+        a.may.push(may);
+        a.depth.push(depth);
+        a.kinds.push(kinds);
         a.map.insert(n, id);
         id
     })
@@ -203,6 +363,7 @@ pub fn op1(o: u8, a: ExprId) -> ExprId {
         match o {
             op::ISZERO => return konst(U256::from(c.is_zero())),
             op::NOT => return konst(!c),
+            op::CLZ => return konst_u64(u64::from(c.leading_zeros())),
             _ => {}
         }
     }
@@ -246,6 +407,26 @@ thread_local! {
     static BOOL_VARS: RefCell<std::collections::HashSet<ExprId>> = RefCell::new(std::collections::HashSet::new());
 }
 
+// The mark belongs to the function being printed. Variable ids repeat from one function
+// to the next, so a mark left behind would change how another function is simplified.
+thread_local! {
+    static HASHED: RefCell<HashMap<U256, Vec<U256>>> = RefCell::new(HashMap::new());
+}
+
+// A hash of constants is folded to a constant, and with that the words it was made of
+// are gone. They are kept here so a folded mapping key can still be traced to its slot.
+pub fn note_hash(hash: U256, words: Vec<U256>) {
+    HASHED.with(|h| h.borrow_mut().insert(hash, words));
+}
+
+pub fn hash_parts(hash: U256) -> Option<Vec<U256>> {
+    HASHED.with(|h| h.borrow().get(&hash).cloned())
+}
+
+pub fn clear_boolean_marks() {
+    BOOL_VARS.with(|b| b.borrow_mut().clear());
+}
+
 pub fn mark_boolean(var: ExprId) {
     if matches!(node(var), Node::Var(_)) {
         BOOL_VARS.with(|b| b.borrow_mut().insert(var));
@@ -253,32 +434,7 @@ pub fn mark_boolean(var: ExprId) {
 }
 
 pub fn may_bits(e: ExprId) -> U256 {
-    fn go(e: ExprId, depth: u32) -> U256 {
-        if depth > 12 {
-            return mask_bits(value_bits(e));
-        }
-        match node(e) {
-            Node::Const(c) => c,
-            Node::Op(op::AND, v) => go(v[0], depth + 1) & go(v[1], depth + 1),
-            Node::Op(op::OR, v) | Node::Op(op::XOR, v) => go(v[0], depth + 1) | go(v[1], depth + 1),
-            Node::Op(op::SHL, v) => match as_const(v[0]) {
-                Some(s) if s.fits_u64() && s.low_u64() < 256 => {
-                    go(v[1], depth + 1) << s.low_u64() as u32
-                }
-                Some(_) => U256::ZERO,
-                None => U256::MAX,
-            },
-            Node::Op(op::SHR, v) => match as_const(v[0]) {
-                Some(s) if s.fits_u64() && s.low_u64() < 256 => {
-                    go(v[1], depth + 1) >> s.low_u64() as u32
-                }
-                Some(_) => U256::ZERO,
-                None => U256::MAX,
-            },
-            _ => mask_bits(value_bits(e)),
-        }
-    }
-    go(e, 0)
+    ARENA.with(|a| a.borrow().may[e.0 as usize])
 }
 
 pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
@@ -481,14 +637,15 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                         return op2(op::SHL, konst(s.wrapping_add(j)), v[1]);
                     }
                 }
-                if let Node::Op(op::OR, v) = node(b) {
-                    let l = op2(op::SHL, a, v[0]);
-                    let r = op2(op::SHL, a, v[1]);
-                    if as_const(l) == Some(U256::ZERO) {
-                        return r;
+                // Only the side that survives the shift is rebuilt.
+                // Rebuilding both to see which is zero doubled the work per level.
+                if let (Node::Op(op::OR, v), true) = (node(b), s.fits_u64()) {
+                    let gone = |x: ExprId| (may_bits(x) << s.low_u64() as u32).is_zero();
+                    if gone(v[0]) {
+                        return op2(op::SHL, a, v[1]);
                     }
-                    if as_const(r) == Some(U256::ZERO) {
-                        return l;
+                    if gone(v[1]) {
+                        return op2(op::SHL, a, v[0]);
                     }
                 }
                 if let Node::Op(op::SHR, v) = node(b) {
@@ -511,14 +668,13 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
                         return op2(op::SHR, konst(s.wrapping_add(j)), v[1]);
                     }
                 }
-                if let Node::Op(op::OR, v) = node(b) {
-                    let l = op2(op::SHR, a, v[0]);
-                    let r = op2(op::SHR, a, v[1]);
-                    if as_const(l) == Some(U256::ZERO) {
-                        return r;
+                if let (Node::Op(op::OR, v), true) = (node(b), s.fits_u64()) {
+                    let gone = |x: ExprId| (may_bits(x) >> s.low_u64() as u32).is_zero();
+                    if gone(v[0]) {
+                        return op2(op::SHR, a, v[1]);
                     }
-                    if as_const(r) == Some(U256::ZERO) {
-                        return l;
+                    if gone(v[1]) {
+                        return op2(op::SHR, a, v[0]);
                     }
                 }
                 if let Node::Op(op::SHL, v) = node(b) {
@@ -582,70 +738,15 @@ pub fn op3(o: u8, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
 }
 
 pub fn value_bits(e: ExprId) -> u32 {
-    match node(e) {
-        Node::Const(c) => c.bits(),
-        Node::Env(o, _) => match o {
-            op::CALLER | op::ADDRESS | op::ORIGIN | op::COINBASE => 160,
-            op::TIMESTAMP
-            | op::NUMBER
-            | op::GASLIMIT
-            | op::GAS
-            | op::CALLDATASIZE
-            | op::RETURNDATASIZE
-            | op::CODESIZE
-            | op::MSIZE
-            | op::PC => 64,
-            _ => 256,
-        },
-        Node::Op(o, v) => match o {
-            op::ISZERO | op::LT | op::GT | op::SLT | op::SGT | op::EQ => 1,
-            op::AND => {
-                let a = value_bits(v[0]);
-                let b = value_bits(v[1]);
-                a.min(b)
-            }
-            op::OR | op::XOR => value_bits(v[0]).max(value_bits(v[1])),
-            op::SHR => {
-                if let Some(s) = as_const(v[0]) {
-                    let s = s.low_u64().min(256) as u32;
-                    value_bits(v[1]).saturating_sub(s)
-                } else {
-                    256
-                }
-            }
-            op::SHL => {
-                if let Some(s) = as_const(v[0]) {
-                    (value_bits(v[1]) + s.low_u64().min(256) as u32).min(256)
-                } else {
-                    256
-                }
-            }
-            op::DIV => {
-                if let Some(c) = as_const(v[1]) {
-                    if c.is_zero() {
-                        0
-                    } else {
-                        value_bits(v[0]).saturating_sub(c.bits() - 1)
-                    }
-                } else {
-                    value_bits(v[0])
-                }
-            }
-            op::MOD => {
-                if let Some(c) = as_const(v[1]) {
-                    c.bits()
-                } else {
-                    256
-                }
-            }
-            op::BYTE => 8,
-            op::EXTCODESIZE | op::BALANCE => 256,
-            _ => 256,
-        },
-        Node::CallResult(_) => 1,
-        Node::CreateResult(_) => 160,
-        _ => 256,
-    }
+    ARENA.with(|a| u32::from(a.borrow().bits[e.0 as usize]))
+}
+
+pub fn holds(e: ExprId, kinds: u16) -> bool {
+    ARENA.with(|a| a.borrow().kinds[e.0 as usize] & kinds != 0)
+}
+
+pub fn depth(e: ExprId) -> u32 {
+    ARENA.with(|a| a.borrow().depth[e.0 as usize])
 }
 
 pub fn size(e: ExprId) -> usize {
@@ -684,6 +785,22 @@ pub fn children(e: ExprId) -> Vec<ExprId> {
     }
 }
 
+const MAX_PARTS_SEARCHED: usize = 5_000;
+
+pub fn has_part(e: ExprId, target: ExprId) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if x == target {
+            return true;
+        }
+        if seen.insert(x) && seen.len() <= MAX_PARTS_SEARCHED {
+            stack.extend(children(x));
+        }
+    }
+    false
+}
+
 pub fn contains(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![e];
@@ -691,10 +808,22 @@ pub fn contains(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
         if !seen.insert(x) || seen.len() > 20_000 {
             continue;
         }
-        if with_node(x, |n| pred(n)) {
+        // The node is copied out first. The test may make new expressions, and that
+        // needs the table this would otherwise still be reading.
+        let n = node(x);
+        if pred(&n) {
             return true;
         }
-        stack.extend(children(x));
+        match n {
+            Node::Op(_, v) | Node::Keccak(v, _) => stack.extend(v),
+            Node::MLoad(a, _)
+            | Node::SLoad(a, _, _)
+            | Node::CallDataLoad(a)
+            | Node::ReturnData(_, a)
+            | Node::CopiedWord(_, a, _) => stack.push(a),
+            Node::KeccakMem(a, b, _) => stack.extend([a, b]),
+            _ => {}
+        }
     }
     false
 }

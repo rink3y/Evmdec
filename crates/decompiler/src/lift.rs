@@ -1,5 +1,5 @@
-use crate::cfg::{AVal, Edge, Program, Unit};
-use crate::expr::{self, konst, konst_u64, op1, op2, op3, ExprId, Node};
+use crate::cfg::{AState, AVal, Edge, Program, UNode, Unit};
+use crate::expr::{self, kind, konst, konst_u64, op1, op2, op3, ExprId, Node};
 use crate::opcode as op;
 use crate::u256::U256;
 use std::cell::RefCell;
@@ -513,15 +513,24 @@ struct Mem {
     written: BTreeSet<(u64, u64)>,
     entry_loads: Rc<RefCell<MemoryReads>>,
     touched: Rc<RefCell<MemoryWrites>>,
+    single_run: bool,
 }
 
 const BIG: u64 = 1 << 40;
 
 const MERGED_RETURN: u32 = 1 << 31;
 
+pub const SEQ_BITS: u32 = 14;
+
 // Must be stable across the rounds a node is lifted in, and never zero.
+// A node or an index too large for its bits gets the stamp of an unknown call,
+// which is never taken to be the same as another.
 fn call_stamp(node: usize, index: usize) -> u32 {
-    ((node as u32) << 10 | (index as u32 & 0x3ff)).wrapping_add(1) & !MERGED_RETURN
+    let nodes = (1usize << (31 - SEQ_BITS)) - 1;
+    if node >= nodes || index >= 1 << SEQ_BITS {
+        return MERGED_RETURN | node as u32;
+    }
+    ((node as u32) << SEQ_BITS | index as u32) + 1
 }
 
 // Past this the oldest writes are forgotten.
@@ -540,9 +549,7 @@ fn norm_offset(e: ExprId) -> (Option<ExprId>, u64) {
 }
 
 fn wild_base(b: ExprId) -> bool {
-    expr::contains(b, &|x| {
-        !matches!(x, Node::Const(_) | Node::Op(..) | Node::MLoad(..))
-    })
+    expr::holds(b, !(kind::CONST | kind::OP | kind::MLOAD))
 }
 
 // Sound only because an unknown pointer is unsigned and memory never wraps.
@@ -629,6 +636,7 @@ impl Mem {
             written: BTreeSet::new(),
             entry_loads: Rc::default(),
             touched: Rc::default(),
+            single_run: false,
         }
     }
 
@@ -651,6 +659,11 @@ impl Mem {
         let mut v = self.clobber_gen;
         for w in &self.writes {
             if w.base != base {
+                // A write through another pointer may land on the same bytes.
+                // Without the new version two reads around it would count as equal.
+                if may_alias(w.base, w.off, w.len, base, d, n) {
+                    v = v.max(w.gen);
+                }
                 continue;
             }
             let hit = match w.len {
@@ -741,16 +754,27 @@ impl Mem {
                 break;
             }
             if w.base != base {
-                if may_alias(w.base, w.off, w.len, base, d, n) {
+                // One run cannot tell where an input-sized offset lands.
+                // It is taken to miss a fixed address and the re-run catches a wrong guess.
+                let guessed = self.single_run && base.is_none() && w.base.is_some();
+                if !guessed && may_alias(w.base, w.off, w.len, base, d, n) {
                     return None;
                 }
                 continue;
             }
             let Some(wl) = w.len else {
-                if d + n > w.off {
-                    return None;
+                if d + n <= w.off {
+                    continue;
                 }
-                continue;
+                // A read past the copied length is a wrong guess here.
+                // Every answer built on it is run again on the bytecode.
+                if let (true, 0, MVal::Copy(k, src, addr)) = (self.single_run, covered, &w.val) {
+                    if d >= w.off {
+                        copy_hit = Some((*k, *src, *addr, d - w.off, w.gen));
+                        break;
+                    }
+                }
+                return None;
             };
             let lo = w.off.max(d);
             let hi = (w.off + wl).min(d + n);
@@ -937,7 +961,15 @@ impl Mem {
         Some(words)
     }
 
-    fn intersect(&mut self, other: &Mem) -> bool {
+    fn forget_all(&mut self, stable: u32) {
+        self.writes.clear();
+        self.written.clear();
+        self.fresh = false;
+        self.gen = merged_version(self.gen, self.gen, stable);
+        self.clobber_gen = self.gen;
+    }
+
+    fn intersect(&mut self, other: &Mem, stable: u32) -> bool {
         let fresh_before = self.fresh;
         let gen_before = self.gen;
         let same = |a: &MemWrite, b: &MemWrite| {
@@ -973,9 +1005,13 @@ impl Mem {
             (agrees, latest)
         };
         let mut merged: Vec<MemWrite> = Vec::new();
+        let mut kept: Vec<(usize, usize)> = Vec::new();
         for w in &self.writes {
             let (agrees, latest) = at(&theirs, &other.writes, w);
             if agrees {
+                let there = theirs.get(&place(w)).map(Vec::as_slice).unwrap_or(&[]);
+                let same = there.iter().rev().find(|i| other.writes[**i].val == w.val);
+                kept.extend(same.map(|i| (merged.len(), *i)));
                 merged.push(w.clone());
             } else {
                 merged.push(MemWrite {
@@ -984,6 +1020,26 @@ impl Mem {
                     gen: w.gen.max(latest.unwrap_or(0)),
                     ..w.clone()
                 });
+            }
+        }
+        // Two writes that overlap leave the bytes of whichever came last. Both sides made
+        // the same two writes, but in a different order, so the shared bytes differ.
+        if kept.windows(2).any(|pair| pair[0].1 > pair[1].1) {
+            let overlap = |a: &MemWrite, b: &MemWrite| {
+                let end = |w: &MemWrite| w.len.map_or(u64::MAX, |l| w.off.saturating_add(l));
+                a.base == b.base && a.off < end(b) && b.off < end(a)
+            };
+            let mut unsure: HashSet<usize> = HashSet::new();
+            for (i, (first, theirs_first)) in kept.iter().enumerate() {
+                for (second, theirs_second) in &kept[i + 1..] {
+                    if theirs_first > theirs_second && overlap(&merged[*first], &merged[*second]) {
+                        unsure.extend([*first, *second]);
+                    }
+                }
+            }
+            for i in unsure {
+                merged[i].val = MVal::Unknown;
+                merged[i].origin = None;
             }
         }
         let mut placed: HashSet<Place> = mine.keys().copied().collect();
@@ -1010,8 +1066,15 @@ impl Mem {
         let changed_writes = changed_writes || self.written.len() != written_before;
         self.fresh &= other.fresh && overflow == 0;
         if overflow > 0 || other.gen != self.gen || other.clobber_gen != self.clobber_gen {
-            self.gen = self.gen.max(other.gen) + 1;
+            self.gen = merged_version(self.gen, other.gen, stable);
             self.clobber_gen = self.gen;
+            // A write that is unknown after the merge is unknown as of the merge.
+            // Left with the version of a later round it would outrank a store made after.
+            for w in &mut self.writes {
+                if matches!(w.val, MVal::Unknown) {
+                    w.gen = w.gen.min(self.gen);
+                }
+            }
         }
         changed_writes || fresh_before != self.fresh || gen_before != self.gen
     }
@@ -1030,24 +1093,18 @@ pub struct State {
 }
 
 impl State {
-    fn pop(&mut self, root: bool, underflow: &mut bool) -> ExprId {
+    fn pop(&mut self) -> ExprId {
         match self.stack.pop() {
             Some(v) => v,
             None => {
-                if root {
-                    *underflow = true;
-                }
                 let v = expr::arg(self.args_used as u32);
                 self.args_used += 1;
                 v
             }
         }
     }
-    fn peek(&mut self, n: usize, root: bool, underflow: &mut bool) -> ExprId {
+    fn peek(&mut self, n: usize) -> ExprId {
         while self.stack.len() < n {
-            if root {
-                *underflow = true;
-            }
             let v = expr::arg(self.args_used as u32);
             self.args_used += 1;
             self.stack.insert(0, v);
@@ -1093,7 +1150,7 @@ pub struct CalleeSummary {
 }
 
 fn fail_summary(code: u32) -> Option<CalleeSummary> {
-    if std::env::var("EVMDEC_DEBUG_SUMMARY").is_ok() {
+    if crate::debug::on("EVMDEC_DEBUG_SUMMARY") {
         eprintln!("[summary] not summarisable (reason {})", code);
     }
     None
@@ -1296,6 +1353,34 @@ struct Hidden {
     // Cleared each time the node is re-run.
     // A decode that only succeeded on an early run must not hide stores for good.
     by_node: RefCell<HashMap<usize, HashSet<(usize, usize)>>>,
+    // For each node, how many earlier nodes of the unit run the same block.
+    copies: Vec<u32>,
+}
+
+const COPY_BITS: u32 = 6;
+
+// A call is numbered by where it stands in the code, so the number means the same call
+// in a helper and in every function that helper is folded into. Numbering by node made
+// the first call of a function and the first call of its helper the same call.
+fn site_seq(pc: usize, copy: u32) -> u32 {
+    (pc as u32) << COPY_BITS | copy.min((1 << COPY_BITS) - 1)
+}
+
+// The same call seen in two copies of its block is still one place in the code.
+pub fn call_site(seq: u32) -> u32 {
+    seq >> COPY_BITS
+}
+
+fn copy_ordinals(unit: &Unit) -> Vec<u32> {
+    let mut seen: HashMap<usize, u32> = HashMap::new();
+    unit.nodes
+        .iter()
+        .map(|n| {
+            let count = seen.entry(n.block).or_insert(0);
+            *count += 1;
+            *count - 1
+        })
+        .collect()
 }
 
 impl Hidden {
@@ -1318,6 +1403,7 @@ impl Hidden {
 struct Entry {
     state: State,
     phis: Vec<bool>,
+    widened: bool,
 }
 
 impl<'a> Lifter<'a> {
@@ -1339,7 +1425,7 @@ impl<'a> Lifter<'a> {
     pub fn lift_summarizing(&self, unit: &Unit, initial: Option<(Vec<ExprId>, bool)>) -> Lifted {
         let l = self.lift(unit, initial.clone());
         let loops = crate::idiom::copy_loops(&l);
-        if std::env::var("EVMDEC_DEBUG_LOOPS").is_ok() {
+        if crate::debug::on("EVMDEC_DEBUG_LOOPS") {
             eprintln!(
                 "[loops] unit entry block {} ({:#x}): {} copy loop(s) {:?}",
                 unit.entry_block,
@@ -1376,6 +1462,49 @@ impl<'a> Lifter<'a> {
         self.lift_from(unit, init)
     }
 
+    pub fn lift_trace(&self, blocks: &[usize]) -> Vec<LNode> {
+        let unit = Unit {
+            entry_block: blocks.first().copied().unwrap_or(0),
+            nodes: blocks
+                .iter()
+                .enumerate()
+                .map(|(id, block)| UNode {
+                    id,
+                    block: *block,
+                    entry: AState::new(),
+                    succs: vec![],
+                    preds: vec![],
+                    call: None,
+                    returns_via: None,
+                    unresolved: true,
+                    infeasible: false,
+                    computed_cut: false,
+                })
+                .collect(),
+            entry: 0,
+            budget_exhausted: false,
+        };
+        let mut state = State {
+            stack: Vec::new(),
+            args_used: 0,
+            mem: Mem::new(true),
+            storage: Vec::new(),
+            version: 0,
+            sgen: 0,
+            called: false,
+            returned: 0,
+        };
+        state.mem.single_run = true;
+        let hidden = Hidden::default();
+        let mut out = Vec::with_capacity(blocks.len());
+        for id in 0..blocks.len() {
+            let (node, next) = self.run_node(&unit, id, &state, &hidden);
+            state = next;
+            out.push(node);
+        }
+        out
+    }
+
     pub fn entry_state_of(l: &Lifted, unit_node: usize) -> Option<State> {
         l.entry_states.get(unit_node).cloned().flatten()
     }
@@ -1389,17 +1518,22 @@ impl<'a> Lifter<'a> {
         let mut lnodes: Vec<Option<LNode>> = vec![None; n];
         let mut exit_states: Vec<Option<State>> = vec![None; n];
         let mut runs = vec![0usize; n];
+        let mut unsettled = vec![0usize; n];
         let mut phi_ids: HashMap<(usize, usize), ExprId> = HashMap::new();
-        let mut next_var: u32 = 0;
         let mut work: VecDeque<usize> = VecDeque::new();
         let mut queued = vec![false; n];
         let mut reprocess_count = 0usize;
 
-        let hidden = Hidden::default();
+        let stable = stable_versions(unit);
+        let hidden = Hidden {
+            copies: copy_ordinals(unit),
+            ..Hidden::default()
+        };
         let init_len = init.stack.len();
         entries[unit.entry] = Some(Entry {
             state: init,
             phis: vec![false; init_len],
+            widened: false,
         });
         work.push_back(unit.entry);
         queued[unit.entry] = true;
@@ -1409,11 +1543,29 @@ impl<'a> Lifter<'a> {
             crate::clock::check();
             queued[nid] = false;
             runs[nid] += 1;
-            if runs[nid] > 24 {
+            let widened = entries[nid].as_ref().is_some_and(|e| e.widened);
+            let allowed = match widened {
+                true => MAX_RUNS_PER_NODE + 8,
+                false => MAX_RUNS_PER_NODE,
+            };
+            if runs[nid] > allowed {
                 continue;
             }
             if runs[nid] > 1 {
                 reprocess_count += 1;
+            }
+            // Some loops need one round per word they move. Stopping at the limit kept
+            // what the earlier rounds still believed, which is not true for later passes.
+            // Giving up every belief about memory and storage first is always true.
+            // A node whose beliefs have settled and whose stack alone still changes keeps them.
+            if runs[nid] == MAX_RUNS_PER_NODE && unsettled[nid] + 2 >= runs[nid] {
+                let e = entries[nid]
+                    .as_mut()
+                    .expect("a scheduled node has an entry state");
+                e.widened = true;
+                e.state.mem.forget_all(stable[nid]);
+                e.state.storage.clear();
+                e.state.sgen = merged_version(e.state.sgen, e.state.sgen, stable[nid]);
             }
             let entry = entries[nid]
                 .clone()
@@ -1452,6 +1604,7 @@ impl<'a> Lifter<'a> {
                 let changed = match &mut entries[s] {
                     None => {
                         entries[s] = Some(Entry {
+                            widened: false,
                             phis: vec![false; exit.stack.len()],
                             state: State {
                                 stack: exit.stack.clone(),
@@ -1488,7 +1641,16 @@ impl<'a> Lifter<'a> {
                         e.phis = vec![false; e.state.stack.len()];
                         changed
                     }
-                    Some(e) => merge_into(e, &exit, s, &mut phi_ids, &mut next_var),
+                    Some(e) => {
+                        let before = (e.state.mem.gen, e.state.sgen, e.state.storage.len());
+                        let known = e.state.mem.writes.clone();
+                        let changed = merge_into(e, &exit, s, stable[s], &mut phi_ids);
+                        let after = (e.state.mem.gen, e.state.sgen, e.state.storage.len());
+                        if before != after || known != e.state.mem.writes {
+                            unsettled[s] = runs[s];
+                        }
+                        changed
+                    }
                 };
                 if changed && !queued[s] {
                     queued[s] = true;
@@ -1497,7 +1659,7 @@ impl<'a> Lifter<'a> {
             }
         }
 
-        let hidden_set = hidden.all();
+        let hidden_set = without_still_read(&lnodes, hidden.all());
         let mut nodes: Vec<LNode> = Vec::new();
         let mut map: HashMap<usize, usize> = HashMap::new();
         for (i, ln) in lnodes.iter().enumerate() {
@@ -1796,9 +1958,14 @@ impl<'a> Lifter<'a> {
         st.version = st.mem.gen;
         let mut stmts: Vec<Stmt> = Vec::new();
         let mut term: Option<Term> = None;
-        let mut underflow = false;
-        let seq_base = (nid as u32) << 10;
+        let seq_base = (nid as u32) << SEQ_BITS;
         let mut seq_ctr = 0u32;
+        // A trace and the oracle lift one node per step, so there the step is the number.
+        let copy = hidden.copies.get(nid).copied().filter(|_| !self.oracle);
+        let seq_at = |pc: usize, count: u32| match copy {
+            Some(copy) => site_seq(pc, copy),
+            None => seq_base + count,
+        };
         let next_version = |st: &mut State| {
             st.mem.tick();
             st.version = st.mem.gen;
@@ -1829,22 +1996,23 @@ impl<'a> Lifter<'a> {
         }
 
         for ins in prog.block_insns(blk) {
+            crate::clock::check();
             let o = ins.opcode;
             macro_rules! pop {
                 () => {
-                    st.pop(false, &mut underflow)
+                    st.pop()
                 };
             }
             match o {
                 _ if op::is_push(o) => st.stack.push(konst(ins.imm.unwrap_or(U256::ZERO))),
                 _ if op::is_dup(o) => {
                     let n = (o - 0x7f) as usize;
-                    let v = st.peek(n, false, &mut underflow);
+                    let v = st.peek(n);
                     st.stack.push(v);
                 }
                 _ if op::is_swap(o) => {
                     let n = (o - 0x8f) as usize;
-                    st.peek(n + 1, false, &mut underflow);
+                    st.peek(n + 1);
                     let l = st.stack.len();
                     st.stack.swap(l - 1, l - 1 - n);
                 }
@@ -1893,13 +2061,18 @@ impl<'a> Lifter<'a> {
                     let a = pop!();
                     let own =
                         o == op::BALANCE && matches!(expr::node(a), Node::Env(op::ADDRESS, _));
+                    // A call or a create can change another account's balance and code.
+                    // The stamp keeps a read made after one apart from a read made before.
+                    let changes = matches!(o, op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH);
                     st.stack.push(if own {
                         expr::intern(Node::Env(op::SELFBALANCE, st.sgen))
+                    } else if changes && st.sgen > 0 {
+                        expr::intern(Node::Op(o, vec![a, konst_u64(u64::from(st.sgen))]))
                     } else {
                         expr::intern(Node::Op(o, vec![a]))
                     });
                 }
-                op::ISZERO | op::NOT => {
+                op::ISZERO | op::NOT | op::CLZ => {
                     let a = pop!();
                     st.stack.push(op1(o, a));
                 }
@@ -1970,7 +2143,9 @@ impl<'a> Lifter<'a> {
                 op::MLOAD => {
                     let off = pop!();
                     let v = st.mem.load_word(off, st.version);
-                    if std::env::var("EVMDEC_DEBUG_LOAD").is_ok_and(|w| w == ins.pc.to_string()) {
+                    if crate::debug::on("EVMDEC_DEBUG_LOAD")
+                        && std::env::var("EVMDEC_DEBUG_LOAD").is_ok_and(|w| w == ins.pc.to_string())
+                    {
                         eprintln!(
                             "MLOAD pc={} off={:?} norm={:?} -> {:?}",
                             ins.pc,
@@ -2083,8 +2258,7 @@ impl<'a> Lifter<'a> {
                             call,
                             &mut st,
                             &mut stmts,
-                            seq_base + seq_ctr,
-                            &mut underflow,
+                            seq_at(ins.pc, seq_ctr),
                         ));
                     } else if let Some(via) = un.returns_via {
                         let ret_arg = match via {
@@ -2162,33 +2336,7 @@ impl<'a> Lifter<'a> {
                         .and_then(|v| v.as_usize())
                         .map(|v| v as u64);
                     if o == op::MCOPY {
-                        if let Some(l) = l {
-                            if let Some((words, tail)) = st.mem.read_region(src, l, st.version) {
-                                let mut i = 0u64;
-                                for (k, w) in words.iter().enumerate() {
-                                    let is_tail = tail > 0 && k == words.len() - 1;
-                                    if !is_tail {
-                                        st.mem.store(
-                                            expr::add_const(dest, U256::from(i)),
-                                            Some(32),
-                                            MVal::Word(*w),
-                                        );
-                                        i += 32;
-                                    }
-                                }
-                                if tail > 0 {
-                                    st.mem.store(
-                                        expr::add_const(dest, U256::from(i)),
-                                        Some(tail as u64),
-                                        MVal::Copy(o, src, None),
-                                    );
-                                }
-                            } else {
-                                st.mem.store(dest, Some(l), MVal::Copy(o, src, None));
-                            }
-                        } else {
-                            st.mem.store(dest, None, MVal::Copy(o, src, None));
-                        }
+                        apply_mcopy(&mut st, dest, src, len);
                     } else if o == op::CODECOPY {
                         match (expr::as_const(src).and_then(|v| v.as_usize()), l) {
                             (Some(s), Some(l)) if l <= 4096 => {
@@ -2197,8 +2345,9 @@ impl<'a> Lifter<'a> {
                                     let n = (l - i).min(32) as usize;
                                     let mut buf = [0u8; 32];
                                     for (j, out) in buf.iter_mut().enumerate().take(n) {
+                                        let at = s.checked_add(i as usize + j);
                                         *out =
-                                            prog.code.get(s + i as usize + j).copied().unwrap_or(0);
+                                            at.and_then(|a| prog.code.get(a)).copied().unwrap_or(0);
                                     }
                                     if n == 32 {
                                         st.mem.store(
@@ -2284,7 +2433,7 @@ impl<'a> Lifter<'a> {
                     let in_len = pop!();
                     let out_off = pop!();
                     let out_len = pop!();
-                    let seq = seq_base + seq_ctr;
+                    let seq = seq_at(ins.pc, seq_ctr);
                     seq_ctr += 1;
                     let input = expr::as_const(in_len)
                         .and_then(|l| l.as_usize())
@@ -2294,7 +2443,10 @@ impl<'a> Lifter<'a> {
                         hidden.add(nid, st.mem.consumers(in_off, l.low_u64()));
                     }
                     let result = expr::intern(Node::CallResult(seq));
-                    if let Ok(want) = std::env::var("EVMDEC_DEBUG_HEAD") {
+                    let wanted = crate::debug::on("EVMDEC_DEBUG_HEAD")
+                        .then(|| std::env::var("EVMDEC_DEBUG_HEAD").ok())
+                        .flatten();
+                    if let Some(want) = wanted {
                         if want == "all" || want == ins.pc.to_string() {
                             eprintln!(
                                 "CALL pc={} in_off={:?} norm={:?} version={} gen={} clobber={}",
@@ -2378,7 +2530,7 @@ impl<'a> Lifter<'a> {
                     let off = pop!();
                     let len = pop!();
                     let salt = if o == op::CREATE2 { Some(pop!()) } else { None };
-                    let seq = seq_base + seq_ctr;
+                    let seq = seq_at(ins.pc, seq_ctr);
                     seq_ctr += 1;
                     let init = expr::as_const(len)
                         .and_then(|l| l.as_usize())
@@ -2478,11 +2630,10 @@ impl<'a> Lifter<'a> {
         st: &mut State,
         stmts: &mut Vec<Stmt>,
         seq: u32,
-        underflow: &mut bool,
     ) -> Term {
         let consumed = call.consumed as usize;
         if consumed > 0 {
-            st.peek(consumed, false, underflow);
+            st.peek(consumed);
         }
         let l = st.stack.len();
         let pre: Vec<ExprId> = st.stack.clone();
@@ -2740,12 +2891,294 @@ fn remap_term(t: &Term, map: &HashMap<usize, usize>) -> Term {
     }
 }
 
+type Span = (Option<ExprId>, u64, u64);
+type Whole = (ExprId, ExprId);
+type RawRead = (ExprId, Option<ExprId>, Option<u32>);
+
+fn span(off: ExprId, len: Option<u64>) -> Option<Span> {
+    let (base, at) = expr::split_offset(off);
+    let at = at.fits_u64().then(|| at.low_u64())?;
+    Some((base, at, len.map_or(u64::MAX, |l| at.saturating_add(l))))
+}
+
+fn const_len(len: ExprId) -> Option<u64> {
+    expr::as_const(len)
+        .filter(U256::fits_u64)
+        .map(|l| l.low_u64())
+}
+
+fn raw_reads(stmts: &[Stmt], term: &Term) -> Vec<RawRead> {
+    let mut reads = Vec::new();
+    let word = Some(konst_u64(32));
+    let loads = |e: ExprId, reads: &mut Vec<RawRead>| {
+        if !expr::holds(e, kind::MLOAD | kind::KECCAK_MEM) {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut stack = vec![e];
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) || seen.len() > 2000 {
+                continue;
+            }
+            match expr::node(x) {
+                Node::MLoad(at, version) => reads.push((at, word, Some(version))),
+                Node::KeccakMem(at, len, version) => reads.push((at, Some(len), Some(version))),
+                _ => {}
+            }
+            stack.extend(expr::children(x));
+        }
+    };
+    for s in stmts {
+        match s {
+            Stmt::Log {
+                off,
+                len,
+                data: None,
+                ..
+            } => reads.push((*off, Some(*len), None)),
+            // The words in the head were decoded. Only what follows them is read raw.
+            Stmt::Call {
+                in_off,
+                input: None,
+                input_head,
+                ..
+            } if !input_head.is_empty() => {
+                let decoded = U256::from(32 * input_head.len());
+                reads.push((expr::add_const(*in_off, decoded), None, None));
+            }
+            Stmt::Call {
+                in_off,
+                in_len,
+                input: None,
+                ..
+            } => reads.push((*in_off, Some(*in_len), None)),
+            Stmt::Create {
+                off,
+                len,
+                init: None,
+                ..
+            } => reads.push((*off, Some(*len), None)),
+            Stmt::Copy {
+                kind: op::MCOPY,
+                src,
+                len,
+                ..
+            } => reads.push((*src, Some(*len), None)),
+            _ => {}
+        }
+        for e in stmt_exprs(s) {
+            loads(e, &mut reads);
+        }
+    }
+    match term {
+        Term::Return {
+            off,
+            len,
+            data: None,
+        }
+        | Term::Revert {
+            off,
+            len,
+            data: None,
+        } => {
+            reads.push((*off, Some(*len), None));
+        }
+        _ => {}
+    }
+    for e in term_exprs(term) {
+        loads(e, &mut reads);
+    }
+    reads
+}
+
+// A store is hidden when something decoded it, such as a hash that printed its input.
+// A later read of the same bytes that was not decoded still needs to see the store,
+// unless a write on the way to that read has already replaced the bytes it reads.
+fn without_still_read(
+    lnodes: &[Option<LNode>],
+    hidden: HashSet<(usize, usize)>,
+) -> HashSet<(usize, usize)> {
+    if hidden.is_empty() {
+        return hidden;
+    }
+    let reads_any = |ln: &LNode| !raw_reads(&ln.stmts, &ln.term).is_empty();
+    if !lnodes.iter().flatten().any(reads_any) {
+        return hidden;
+    }
+    let written = |s: &Stmt| -> Option<Span> {
+        match s {
+            Stmt::MStore { off, width, .. } => span(*off, Some(u64::from(*width))),
+            Stmt::Call {
+                out_off, out_len, ..
+            } => span(*out_off, Some(const_len(*out_len)?)),
+            Stmt::Copy { dest, len, .. } => span(*dest, Some(const_len(*len)?)),
+            _ => None,
+        }
+    };
+    // Several writes side by side cover a range together.
+    let inside = |(base, lo, hi): Span, over: &[Span]| {
+        let mut parts: Vec<(u64, u64)> = over
+            .iter()
+            .filter(|(b, l, h)| *b == base && *l < hi && lo < *h)
+            .map(|(_, l, h)| (*l, *h))
+            .collect();
+        parts.sort_unstable();
+        let mut reached = lo;
+        for (l, h) in parts {
+            if l > reached {
+                break;
+            }
+            reached = reached.max(h);
+        }
+        reached >= hi
+    };
+    // The first value says a read of the store's bytes was met. The second says the walk
+    // goes on past these statements.
+    let scan = |stmts: &[Stmt],
+                term: &Term,
+                (store, made): (Span, u32),
+                over: &mut Vec<Span>|
+     -> (bool, bool) {
+        let seen = |reads: Vec<RawRead>, over: &[Span], same: &[Whole]| {
+            reads.into_iter().any(|(off, len, version)| {
+                // A read stamped before the store was made does not see it.
+                if version.is_some_and(|v| v < made) {
+                    return false;
+                }
+                // A read of exactly what a copy just wrote sees the copy and nothing older.
+                if len.is_some_and(|len| same.contains(&(off, len))) {
+                    return false;
+                }
+                let Some((base, lo, hi)) = span(off, len.map_or(Some(u64::MAX), const_len)) else {
+                    return false;
+                };
+                let part = (base, lo.max(store.1), hi.min(store.2));
+                base == store.0 && part.1 < part.2 && !inside(part, over)
+            })
+        };
+        let mut same: Vec<Whole> = Vec::new();
+        for (i, s) in stmts.iter().enumerate() {
+            if seen(raw_reads(&stmts[i..=i], &Term::Stop), over, &same) {
+                return (true, false);
+            }
+            over.extend(written(s));
+            match s {
+                Stmt::Copy { dest, len, .. } => same.push((*dest, *len)),
+                Stmt::Call {
+                    out_off, out_len, ..
+                } => same.push((*out_off, *out_len)),
+                _ => {}
+            }
+            if inside(store, over) {
+                return (false, false);
+            }
+        }
+        (seen(raw_reads(&[], term), over, &same), true)
+    };
+    hidden
+        .into_iter()
+        .filter(|(node, index)| {
+            let Some(ln) = &lnodes[*node] else {
+                return true;
+            };
+            let Some(Stmt::MStore {
+                off, width, gen, ..
+            }) = ln.stmts.get(*index)
+            else {
+                return true;
+            };
+            let Some(store) = span(*off, Some(u64::from(*width))).map(|s| (s, *gen)) else {
+                return true;
+            };
+            let mut over = Vec::new();
+            let (read, on) = scan(&ln.stmts[index + 1..], &ln.term, store, &mut over);
+            if read || !on {
+                return !read;
+            }
+            let mut seen = HashSet::new();
+            let mut stack: Vec<(usize, Vec<Span>)> =
+                ln.succs.iter().map(|s| (*s, over.clone())).collect();
+            while let Some((x, mut over)) = stack.pop() {
+                if !seen.insert(x) || seen.len() > MAX_NODES_AFTER_STORE {
+                    continue;
+                }
+                let Some(next) = &lnodes[x] else {
+                    continue;
+                };
+                let (read, on) = scan(&next.stmts, &next.term, store, &mut over);
+                if read {
+                    return false;
+                }
+                if on {
+                    stack.extend(next.succs.iter().map(|s| (*s, over.clone())));
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+const MAX_NODES_AFTER_STORE: usize = 512;
+
+// A version taken at a merge has to be the same every time the node is merged, or a loop
+// that writes memory or storage raises it on every round and never settles. It also has
+// to be above every version that reaches the node along a forward edge. Nodes are ranked
+// in reverse postorder and each rank owns a range, which gives both.
+const VERSIONS_PER_NODE: u32 = 1 << 14;
+const MAX_RUNS_PER_NODE: usize = 24;
+
+fn stable_versions(unit: &Unit) -> Vec<u32> {
+    let n = unit.nodes.len();
+    let mut order = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let mut stack: Vec<(usize, usize)> = vec![(unit.entry, 0)];
+    seen[unit.entry] = true;
+    while let Some((x, next)) = stack.last().copied() {
+        let Some((s, _)) = unit.nodes[x].succs.get(next).copied() else {
+            order.push(x);
+            stack.pop();
+            continue;
+        };
+        stack.last_mut().expect("just read").1 += 1;
+        if !seen[s] {
+            seen[s] = true;
+            stack.push((s, 0));
+        }
+    }
+    let mut stable = vec![u32::MAX; n];
+    for (rank, node) in order.iter().rev().enumerate() {
+        stable[*node] = (rank as u32 + 1).saturating_mul(VERSIONS_PER_NODE);
+    }
+    stable
+}
+
+// What reaches a node along a forward edge is below the node's stable version, so only a
+// back edge can bring a higher one, and that one is a later pass over the same node.
+// An entry already past its stable version came from a block with more writes than a
+// rank's range, and then the old rule of one above both is the safe one.
+fn merged_version(mine: u32, theirs: u32, stable: u32) -> u32 {
+    if mine <= stable {
+        stable
+    } else {
+        mine.max(theirs) + 1
+    }
+}
+
+// The id is made from the place the variable stands for. A running count packed into a
+// few bits came round again after enough merges and gave two places one variable.
+fn merge_var(node: usize, from_top: usize) -> ExprId {
+    match u32::try_from(from_top) {
+        Ok(depth) if depth < 1 << 10 && node < 1 << 22 => expr::var(((node as u32) << 10) | depth),
+        _ => expr::intern(Node::Unknown(expr::next_seq())),
+    }
+}
+
 fn merge_into(
     e: &mut Entry,
     exit: &State,
     node: usize,
+    stable: u32,
     phi_ids: &mut HashMap<(usize, usize), ExprId>,
-    next_var: &mut u32,
 ) -> bool {
     let mut changed = false;
     let el = e.state.stack.len();
@@ -2767,10 +3200,9 @@ fn merge_into(
                 new_phis.push(false);
             } else {
                 let from_top = xl - 1 - i;
-                let var = *phi_ids.entry((node, from_top)).or_insert_with(|| {
-                    *next_var += 1;
-                    expr::var(((node as u32) << 10) | (*next_var & 0x3ff))
-                });
+                let var = *phi_ids
+                    .entry((node, from_top))
+                    .or_insert_with(|| merge_var(node, from_top));
                 new_bottom.push(var);
                 new_phis.push(true);
             }
@@ -2798,16 +3230,15 @@ fn merge_into(
             continue;
         }
         if exit_val != Some(e.state.stack[k]) {
-            let var = *phi_ids.entry((node, from_top)).or_insert_with(|| {
-                *next_var += 1;
-                expr::var(((node as u32) << 10) | (*next_var & 0x3ff))
-            });
+            let var = *phi_ids
+                .entry((node, from_top))
+                .or_insert_with(|| merge_var(node, from_top));
             e.state.stack[k] = var;
             e.phis[k] = true;
             changed = true;
         }
     }
-    if e.state.mem.intersect(&exit.mem) {
+    if !e.widened && e.state.mem.intersect(&exit.mem, stable) {
         changed = true;
     }
     let before = e.state.storage.len();
@@ -2818,9 +3249,10 @@ fn merge_into(
     if exit.args_used > e.state.args_used {
         e.state.args_used = exit.args_used;
     }
-    if exit.sgen != e.state.sgen {
-        e.state.sgen = e.state.sgen.max(exit.sgen) + 1;
-        changed = true;
+    if exit.sgen != e.state.sgen && !e.widened {
+        let merged = merged_version(e.state.sgen, exit.sgen, stable);
+        changed |= merged != e.state.sgen;
+        e.state.sgen = merged;
     }
     let merged_return = match exit.returned == e.state.returned {
         true => exit.returned,
@@ -2911,6 +3343,7 @@ impl MemView {
 
 fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
     let mut bytes = Vec::with_capacity(words.len() * 32);
+    let mut parts = Vec::with_capacity(words.len());
     for (i, w) in words.iter().enumerate() {
         let c = expr::as_const(*w)?;
         let b = c.to_be_bytes();
@@ -2919,8 +3352,13 @@ fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
         } else {
             bytes.extend_from_slice(&b);
         }
+        parts.push(c);
     }
-    Some(U256::from_be_bytes(&crate::keccak::keccak256(&bytes)))
+    let hash = U256::from_be_bytes(&crate::keccak::keccak256(&bytes));
+    if tail == 0 {
+        expr::note_hash(hash, parts);
+    }
+    Some(hash)
 }
 
 fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
@@ -2945,7 +3383,7 @@ fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
                 st.mem.store(
                     expr::add_const(dest, U256::from(i)),
                     Some(tail as u64),
-                    MVal::Copy(op::MCOPY, src, None),
+                    MVal::Copy(op::MCOPY, expr::add_const(src, U256::from(i)), None),
                 );
             }
         } else {
@@ -3327,10 +3765,25 @@ pub fn term_exprs(t: &Term) -> Vec<ExprId> {
 }
 
 pub fn jump_target_bits(e: ExprId) -> Option<U256> {
+    target_bits(e, &mut HashMap::new())
+}
+
+// An expression is shared, so without the memo a value used on both sides of
+// each of n operators would be walked 2^n times.
+fn target_bits(e: ExprId, memo: &mut HashMap<ExprId, Option<U256>>) -> Option<U256> {
+    if let Some(known) = memo.get(&e) {
+        return *known;
+    }
+    let out = target_bits_of(e, memo);
+    memo.insert(e, out);
+    out
+}
+
+fn target_bits_of(e: ExprId, memo: &mut HashMap<ExprId, Option<U256>>) -> Option<U256> {
     match expr::node(e) {
         Node::Const(c) => Some(c),
         Node::Op(op::AND, v) => {
-            let (a, b) = (jump_target_bits(v[0]), jump_target_bits(v[1]));
+            let (a, b) = (target_bits(v[0], memo), target_bits(v[1], memo));
             match (a, b) {
                 (Some(x), Some(y)) => Some(x & y),
                 (Some(x), None) | (None, Some(x)) => Some(x),
@@ -3338,8 +3791,8 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
             }
         }
         Node::Op(op::OR, v) | Node::Op(op::XOR, v) | Node::Op(op::ADD, v) => {
-            let a = jump_target_bits(v[0])?;
-            let b = jump_target_bits(v[1])?;
+            let a = target_bits(v[0], memo)?;
+            let b = target_bits(v[1], memo)?;
             if matches!(expr::node(e), Node::Op(op::ADD, _)) {
                 let bits = a.bits().max(b.bits()) + 1;
                 Some(expr::mask_bits(bits))
@@ -3352,7 +3805,7 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
             if k >= U256::from_u64(256) {
                 return Some(U256::ZERO);
             }
-            Some(jump_target_bits(v[1])? << k.low_u64() as u32)
+            Some(target_bits(v[1], memo)? << k.low_u64() as u32)
         }
         Node::Op(op::MUL, v) => {
             let (x, c) = if let Some(c) = expr::as_const(v[1]) {
@@ -3363,14 +3816,14 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
             if !c.is_power_of_two() {
                 return None;
             }
-            Some(jump_target_bits(x)? << c.trailing_zeros())
+            Some(target_bits(x, memo)? << c.trailing_zeros())
         }
         Node::Op(op::SHR, v) => {
             let k = expr::as_const(v[0])?;
             if k >= U256::from_u64(256) {
                 return Some(U256::ZERO);
             }
-            Some(jump_target_bits(v[1])? >> k.low_u64() as u32)
+            Some(target_bits(v[1], memo)? >> k.low_u64() as u32)
         }
         Node::Op(op::BYTE, _) => Some(U256::from_u64(0xff)),
         Node::Op(op::DIV, v) => {
@@ -3378,7 +3831,7 @@ pub fn jump_target_bits(e: ExprId) -> Option<U256> {
             if !c.is_power_of_two() {
                 return None;
             }
-            Some(jump_target_bits(v[0])? >> c.trailing_zeros())
+            Some(target_bits(v[0], memo)? >> c.trailing_zeros())
         }
         _ => {
             let b = expr::value_bits(e);
@@ -3461,6 +3914,26 @@ pub fn jump_candidates(e: ExprId, jumpdests: &HashSet<usize>, code_len: usize) -
     v
 }
 
+// Kept as a loop. One call per node ran out of stack on a long chain of blocks.
+pub fn reverse_postorder(l: &Lifted) -> Vec<usize> {
+    let mut order = Vec::new();
+    let mut seen = HashSet::from([l.entry]);
+    let mut stack: Vec<(usize, usize)> = vec![(l.entry, 0)];
+    while let Some((x, next)) = stack.last().copied() {
+        let Some(s) = l.nodes[x].succs.get(next).copied() else {
+            order.push(x);
+            stack.pop();
+            continue;
+        };
+        stack.last_mut().expect("just read").1 += 1;
+        if seen.insert(s) {
+            stack.push((s, 0));
+        }
+    }
+    order.reverse();
+    order
+}
+
 pub fn reachable(l: &Lifted) -> HashSet<usize> {
     let mut seen = HashSet::new();
     let mut stack = vec![l.entry];
@@ -3473,4 +3946,65 @@ pub fn reachable(l: &Lifted) -> HashSet<usize> {
         }
     }
     seen
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decompile::{decompile, Options};
+
+    fn statements(code_hex: &str) -> Vec<Stmt> {
+        let code = crate::hex::decode(code_hex).expect("hex");
+        let c = decompile(&code, &Options::default());
+        let lifted = c.functions.iter().find_map(|f| f.lifted.as_ref());
+        let nodes = &lifted.expect("the code is lifted").nodes;
+        nodes.iter().flat_map(|n| n.stmts.clone()).collect()
+    }
+
+    fn stored(stmts: &[Stmt]) -> Vec<ExprId> {
+        let values = stmts.iter().filter_map(|s| match s {
+            Stmt::SStore { val, .. } => Some(*val),
+            _ => None,
+        });
+        values.collect()
+    }
+
+    #[test]
+    fn a_memory_copy_is_lifted_as_a_copy_of_its_kind() {
+        let stmts = statements("6020600060405e00");
+        let copy = stmts.iter().find_map(|s| match s {
+            Stmt::Copy { kind, len, .. } => Some((*kind, expr::as_const(*len))),
+            _ => None,
+        });
+        assert_eq!(copy, Some((op::MCOPY, Some(U256::from_u64(0x20)))));
+    }
+
+    #[test]
+    fn a_balance_read_after_a_call_is_not_the_one_read_before_it() {
+        let stmts = statements("3031600055600080808080335af1503031600155");
+        let values = stored(&stmts);
+        assert_eq!(values.len(), 2);
+        assert_ne!(values[0], values[1]);
+    }
+
+    #[test]
+    fn a_balance_read_twice_with_nothing_between_is_one_value() {
+        let values = stored(&statements("30313031600055600155"));
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], values[1]);
+    }
+
+    #[test]
+    fn two_calls_at_two_places_have_two_numbers() {
+        let stmts = statements("600080808080335af150600080808080335af15000");
+        let sites: Vec<u32> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Call { seq, .. } => Some(call_site(*seq)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sites.len(), 2);
+        assert_ne!(sites[0], sites[1]);
+    }
 }

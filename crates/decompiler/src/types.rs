@@ -248,7 +248,7 @@ pub fn solve(
     let mut env = TypeEnv {
         layout,
         vyper: layout == MappingLayout::Vyper,
-        debug: std::env::var("EVMDEC_DEBUG_TYPES").is_ok(),
+        debug: crate::debug::on("EVMDEC_DEBUG_TYPES"),
         ids: HashMap::new(),
         classes: Vec::new(),
         callee_of: HashMap::new(),
@@ -300,8 +300,13 @@ impl TypeEnv {
             return *i;
         }
         let i = self.classes.len();
+        // A packed field is as wide as its mask. Without this start a narrow number
+        // had no type until some other use gave it one, and often none did.
         let hints = match &loc {
             Loc::Field { bits: 160, .. } => Ty::Address,
+            Loc::Field { bits, .. } if (16..=128).contains(bits) && bits % 8 == 0 => {
+                Ty::Uint(*bits)
+            }
             _ => Ty::Unknown,
         };
         self.classes.push(Class {
@@ -742,7 +747,12 @@ impl TypeEnv {
                 }
             }
             op::SDIV | op::SMOD | op::SAR => {
-                for x in v {
+                // The first operand of a shift is the count, which is not signed.
+                let signed = match o {
+                    op::SAR => &v[1..],
+                    _ => v,
+                };
+                for x in signed {
                     if konst(*x).is_none() {
                         let loc = self.location(*x, scope);
                         self.hint(loc.clone(), Ty::Int(256));
@@ -800,6 +810,11 @@ impl TypeEnv {
                 }
                 self.hint(loc, Ty::of_mask(m.bits()));
             } else if let Some(bytes) = high_mask_bytes(m) {
+                // Under an OR this mask keeps the rest of a packed word while one field is
+                // written. It says nothing about the type of what it is applied to.
+                if parent == Some(op::OR) {
+                    continue;
+                }
                 let loc = self.location(x, scope);
                 self.hint(loc, Ty::Bytes(bytes));
             }
@@ -1137,8 +1152,32 @@ impl TypeEnv {
             }
             self.classes.push(c);
         }
+        // Two parts of one contract can use the same storage. What the later part learned
+        // about a shared place is added to the class the first part made for it, or a
+        // rule that needs both sides would only ever see the first.
+        let mut shared = false;
         for (loc, id) in other.ids {
-            self.ids.entry(loc).or_insert(id + offset);
+            let theirs = id + offset;
+            match self.ids.get(&loc).copied() {
+                None => {
+                    self.ids.insert(loc, theirs);
+                }
+                Some(mine) => {
+                    let from = self.classes[theirs].clone();
+                    let into = &mut self.classes[mine];
+                    into.hints = into.hints.join(from.hints);
+                    into.weak = into.weak.join(from.weak);
+                    into.from_defs = into.from_defs.join(from.from_defs);
+                    into.resolved = into.resolved.join(from.resolved);
+                    into.flags.absorb(from.flags);
+                    into.defs.extend(from.defs);
+                    into.sources.extend(from.sources);
+                    shared = true;
+                }
+            }
+        }
+        if shared {
+            self.propagate();
         }
         self.callee_of.extend(other.callee_of);
         self.results_len.extend(other.results_len);

@@ -216,12 +216,13 @@ fn self_credit(c: &Contract, ledgers: &[Ledger], out: &mut Vec<Finding>) {
         .iter()
         .map(|l| (*l, entry_key(l.root, caller, c.compiler.layout)))
         .collect();
+    let start = crate::deploy::storage(c);
     for f in c.functions.iter().filter(|f| creditable(f)) {
         if let Some(Credit {
             witness,
             root,
             wrapped,
-        }) = search_credit(c.code_of(f), f, &keys)
+        }) = search_credit(c.code_of(f), f, &keys, &start)
         {
             let how = if wrapped {
                 "A subtraction on that path wraps below zero, so the balance becomes a near-2^256 number: the debit is missing the check that other paths apply to this mapping."
@@ -258,7 +259,14 @@ struct Credit {
     wrapped: bool,
 }
 
-fn search_credit(code: &[u8], f: &Function, keys: &[(Ledger, U256)]) -> Option<Credit> {
+// The run starts from what the constructor stored. From empty storage a function that
+// always fails on the deployed contract could look as if it worked.
+fn search_credit(
+    code: &[u8],
+    f: &Function,
+    keys: &[(Ledger, U256)],
+    start: &HashMap<U256, U256>,
+) -> Option<Credit> {
     let selector = exec::selector_of(f);
     let mut attempts = 0;
     for nargs in 0..=5usize {
@@ -269,12 +277,13 @@ fn search_credit(code: &[u8], f: &Function, keys: &[(Ledger, U256)]) -> Option<C
             attempts += 1;
             let data = exec::calldata(selector, &args);
             let host = exec::caller_host(data.clone(), U256::ZERO);
-            let run = exec::run_frame(code, &host, HashMap::new(), STEP_BUDGET);
+            let run = exec::run_frame(code, &host, start.clone(), STEP_BUDGET);
             if !run.succeeded() {
                 continue;
             }
             for (ledger, key) in keys {
-                let Some(v) = run.storage.get(key).filter(|v| !v.is_zero()) else {
+                let raised = |v: &&U256| !v.is_zero() && start.get(key) != Some(*v);
+                let Some(v) = run.storage.get(key).filter(raised) else {
                     continue;
                 };
                 let wrapped = v.is_negative();

@@ -87,10 +87,6 @@ impl Profile {
         }
     }
 
-    pub fn effective_version(&self) -> Option<Version> {
-        self.version.or(self.at_least)
-    }
-
     pub fn bounds(&self) -> Option<String> {
         if self.version.is_some() {
             return None;

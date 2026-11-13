@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 const BUDGET: usize = 600_000;
 const MAX_DEPTH: usize = 12;
+const SENT_INPUT: usize = 100;
 const FIRST_MADE: u64 = 0xc0de_0000_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,6 +16,14 @@ pub struct Write {
     pub slot: U256,
     pub before: U256,
     pub after: U256,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sent {
+    pub from: U256,
+    pub to: U256,
+    pub value: U256,
+    pub input: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +38,7 @@ struct Saved {
     storage: HashMap<U256, HashMap<U256, U256>>,
     codes: HashMap<U256, Rc<Vec<u8>>>,
     writes: usize,
+    sent: usize,
 }
 
 #[derive(Default)]
@@ -36,6 +46,7 @@ pub struct World {
     codes: HashMap<U256, Rc<Vec<u8>>>,
     storage: HashMap<U256, HashMap<U256, U256>>,
     writes: Vec<Write>,
+    sent: Vec<Sent>,
     origin: U256,
     budget: usize,
     made: u64,
@@ -66,6 +77,10 @@ impl World {
         &self.writes
     }
 
+    pub fn sent(&self) -> &[Sent] {
+        &self.sent
+    }
+
     pub fn was_made(&self, address: U256) -> bool {
         address.fits_u64() && (FIRST_MADE + 1..=FIRST_MADE + self.made).contains(&address.low_u64())
     }
@@ -73,6 +88,7 @@ impl World {
     pub fn run(&mut self, address: U256, caller: U256, value: U256, data: Vec<u8>) -> bool {
         self.budget = BUDGET;
         self.writes.clear();
+        self.sent.clear();
         self.made = 0;
         self.origin = caller;
         let Some(code) = self.codes.get(&address).cloned() else {
@@ -97,6 +113,7 @@ impl World {
             storage: self.storage.clone(),
             codes: self.codes.clone(),
             writes: self.writes.len(),
+            sent: self.sent.len(),
         }
     }
 
@@ -104,6 +121,7 @@ impl World {
         self.storage = saved.storage;
         self.codes = saved.codes;
         self.writes.truncate(saved.writes);
+        self.sent.truncate(saved.sent);
     }
 
     fn frame(&mut self, code: &[u8], frame: &Frame, depth: usize) -> (bool, Vec<u8>) {
@@ -113,6 +131,7 @@ impl World {
         host.origin = self.origin;
         host.intercept_calls = true;
         let mut m = Machine::new(code, &host);
+        m.move_limit = Machine::LOOPED_MOVE_LIMIT;
         m.storage = self
             .storage
             .get(&frame.account)
@@ -200,7 +219,15 @@ impl World {
         if record.addr == U256::from_u64(4) {
             return (true, record.input.clone());
         }
+        let pays = record.kind == op::CALL;
+        let payment = Sent {
+            from: from.account,
+            to: record.addr,
+            value: record.value,
+            input: record.input.iter().copied().take(SENT_INPUT).collect(),
+        };
         let Some(code) = self.codes.get(&record.addr).cloned() else {
+            self.sent.extend(pays.then_some(payment));
             return (true, Vec::new());
         };
         if depth >= MAX_DEPTH {
@@ -228,6 +255,8 @@ impl World {
             },
         };
         let saved = self.save();
+        // Pushed after the save so a callee that fails takes the payment back with it.
+        self.sent.extend(pays.then_some(payment));
         let (success, output) = self.frame(&code, &inner, depth + 1);
         if !success || record.kind == op::STATICCALL {
             self.restore(saved);

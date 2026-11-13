@@ -1,14 +1,20 @@
+use crate::abi::{SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::compiler;
+use crate::confirm;
 use crate::cross::World as CrossWorld;
 use crate::decompile::{self, Contract, Function};
 use crate::emit::{self, Names, SlotSpace};
 use crate::exec;
 use crate::expr::{self, ExprId, Node};
+use crate::flow;
 use crate::function::FnKind;
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
+use crate::origin::{self, Model};
+use crate::signed;
 use crate::sigs;
 use crate::ssa;
+use crate::standard;
 use crate::type_rules;
 use crate::u256::U256;
 use serde::Serialize;
@@ -54,6 +60,18 @@ pub struct Finding {
     pub confirmed: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub witness: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub setup: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub observed: Vec<String>,
+}
+
+impl Finding {
+    pub fn confirm(&mut self, path: &crate::path::Path) {
+        self.confirmed = true;
+        self.witness = Some(crate::hex::encode(&path.inputs.calldata));
+        self.observed = crate::evidence::observed(&path.inputs, &path.run);
+    }
 }
 
 fn is_one(n: &usize) -> bool {
@@ -70,7 +88,15 @@ pub struct Report {
     pub summary: BTreeMap<String, usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub summaries: Vec<FnSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub maps: Vec<Section>,
     pub risk_score: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct Section {
+    pub title: String,
+    pub lines: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -170,27 +196,13 @@ fn event_exprs(e: &Event) -> Vec<ExprId> {
     v
 }
 
-fn contains_expr(e: ExprId, target: ExprId) -> bool {
-    let mut seen = HashSet::new();
-    let mut stack = vec![e];
-    while let Some(x) = stack.pop() {
-        if x == target {
-            return true;
-        }
-        if !seen.insert(x) || seen.len() > 5000 {
-            continue;
-        }
-        stack.extend(expr::children(x));
-    }
-    false
-}
-
 fn mentions_returndata(e: ExprId, seq: u32) -> bool {
     mentions(e, &|n| matches!(n, Node::ReturnData(s, _) if *s == seq))
 }
 
-const SEL_TRANSFER: u32 = 0xa9059cbb;
-const SEL_TRANSFER_FROM: u32 = 0x23b872dd;
+// Asking an account whether it signed is the purpose of this call. Its answer is the
+// account's own word about itself, which is what the caller of it wants.
+const SEL_IS_VALID_SIGNATURE: u32 = 0x1626ba7e;
 const SEL_SYNC: u32 = 0xfff6cae9;
 const SEL_SKIM: u32 = 0xbc25cf77;
 const SEL_GET_RESERVES: u32 = 0x0902f1ac;
@@ -225,7 +237,6 @@ const POOL_SELECTORS: &[u32] = &[
     0xf6c00927,
 ];
 const SEL_APPROVE: u32 = 0x095ea7b3;
-const SEL_BALANCE_OF: u32 = 0x70a08231;
 const SEL_LATEST_ROUND_DATA: u32 = 0xfeaf968c;
 const SEL_LATEST_ANSWER: u32 = 0x50d25bcd;
 const CALLBACK_SELECTORS: &[u32] = &[
@@ -263,6 +274,8 @@ struct Ctx<'a> {
     inst_seq: std::cell::Cell<usize>,
     inline_left: std::cell::Cell<usize>,
     divides: RefCell<HashMap<usize, bool>>,
+    reach: RefCell<Reach>,
+    carried: RefCell<Vec<ExprId>>,
     roles: HashSet<U256>,
     slot_writes: HashSet<U256>,
     field_writes: HashSet<(U256, u32, u32)>,
@@ -272,6 +285,7 @@ struct Ctx<'a> {
 }
 
 type MemWrites = Vec<(ExprId, Option<u64>)>;
+type Reach = HashMap<(usize, usize), Rc<HashSet<usize>>>;
 
 struct FnFacts {
     name: String,
@@ -329,10 +343,13 @@ struct LinkedCall {
     selector: Option<u32>,
     sends_value: bool,
     approval: bool,
+    // The payload is known to be empty. No selector alone can also mean it is not known.
+    empty: bool,
     line: String,
 }
 
 struct World<'a> {
+    root: &'a Contract,
     members: HashMap<String, &'a Contract>,
     // None marks a contract whose analysis is under way.
     // It stops two contracts that call each other from recursing forever.
@@ -356,6 +373,7 @@ impl<'a> World<'a> {
             work.extend(c.linked.iter());
         }
         World {
+            root,
             members,
             reports: RefCell::new(HashMap::new()),
         }
@@ -819,6 +837,7 @@ fn collect_facts(
             cond,
             &|n| matches!(n, Node::SLoad(k, false, _) if expr::is_const(*k)),
         ) && !is_auth_cond_in(cond, &ctx.roles)
+            && tests_only_storage(cond)
         {
             facts.init_guarded = true;
         }
@@ -826,7 +845,7 @@ fn collect_facts(
     let layout = ctx.c.compiler.layout;
     let mut mutations: Vec<&Event> = Vec::new();
     let mut call_selector: HashMap<u32, u32> = HashMap::new();
-    let mut linked_sites: Vec<(String, Option<u32>, bool, bool, Stmt)> = Vec::new();
+    let mut linked_sites: Vec<(String, Option<u32>, bool, bool, bool, Stmt)> = Vec::new();
     for ev in events {
         match &ev.stmt {
             Some(
@@ -912,7 +931,15 @@ fn collect_facts(
                         .and_then(|sp| linked_address(ctx, sp))
                         .map(|a| (a, true));
                     for (address, approval) in callee.into_iter().chain(approved) {
-                        linked_sites.push((address, selector, sends_value, approval, st.clone()));
+                        let empty = expr::as_const(*in_len) == Some(U256::ZERO);
+                        linked_sites.push((
+                            address,
+                            selector,
+                            sends_value,
+                            approval,
+                            empty,
+                            st.clone(),
+                        ));
                     }
                 }
                 if let Some(slot) = ssa::stored_address_slot(*addr) {
@@ -984,11 +1011,12 @@ fn collect_facts(
         facts.linked_calls = linked_sites
             .into_iter()
             .map(
-                |(address, selector, sends_value, approval, st)| LinkedCall {
+                |(address, selector, sends_value, approval, empty, st)| LinkedCall {
                     address,
                     selector,
                     sends_value,
                     approval,
+                    empty,
                     line: emit::fmt_stmt(&st, &own),
                 },
             )
@@ -1038,7 +1066,7 @@ fn collect_facts(
             limits_in(e, layout, names, &mut seen, &mut candidates);
         }
     }
-    if std::env::var("EVMDEC_DEBUG_LIMITS").is_ok() && !candidates.is_empty() {
+    if crate::debug::on("EVMDEC_DEBUG_LIMITS") && !candidates.is_empty() {
         eprintln!(
             "[outflow] {} moves={} outflows={:?} others={:?}",
             facts.name,
@@ -1053,7 +1081,7 @@ fn collect_facts(
                 .collect::<Vec<_>>()
         );
     }
-    if std::env::var("EVMDEC_DEBUG_UNPLACED").is_ok() {
+    if crate::debug::on("EVMDEC_DEBUG_UNPLACED") {
         debug_unplaced(&facts.name, events, layout, names);
     }
     facts.ref_bounds = candidates.iter().map(|(b, _)| b.clone()).collect();
@@ -1074,7 +1102,7 @@ fn collect_facts(
         .filter(|(_, other)| limits_outflow(*other, &outflows))
         .map(|(b, _)| b)
         .collect();
-    if std::env::var("EVMDEC_DEBUG_LIMITS").is_ok() {
+    if crate::debug::on("EVMDEC_DEBUG_LIMITS") {
         for b in &facts.avail_bounds {
             let show = |set: &BTreeSet<Field>| {
                 set.iter()
@@ -1091,7 +1119,7 @@ fn collect_facts(
             );
         }
     }
-    if std::env::var("EVMDEC_DEBUG_FACTS").is_ok() {
+    if crate::debug::on("EVMDEC_DEBUG_FACTS") {
         eprintln!(
             "[facts] {} checked={} init={} time={} auth={:?} writes={} ether={} sd={} dc={} guards={:?}",
             facts.name,
@@ -1234,7 +1262,7 @@ fn is_caller(e: ExprId) -> bool {
 fn walk(e: ExprId, seen: &mut HashSet<ExprId>, visit: &mut dyn FnMut(ExprId, &Node)) {
     let mut stack = vec![e];
     while let Some(x) = stack.pop() {
-        if seen.len() > 20_000 || !seen.insert(x) {
+        if !seen.insert(x) {
             continue;
         }
         let n = expr::node(x);
@@ -1954,6 +1982,71 @@ fn linear_bound(e: ExprId, layout: emit::MappingLayout, names: &Names) -> Option
     })
 }
 
+fn amount_term(e: ExprId, layout: emit::MappingLayout, budget: &mut u32) -> Option<ExprId> {
+    if *budget == 0 || pooled_field(e, layout).is_some() {
+        return None;
+    }
+    *budget -= 1;
+    match expr::node(e) {
+        Node::Op(op::ADD | op::SUB, v) => v.iter().find_map(|x| amount_term(*x, layout, budget)),
+        Node::Op(op::AND, v) if v.len() == 2 => {
+            let masked = v.iter().find(|x| !expr::is_const(**x))?;
+            amount_term(*masked, layout, budget)
+        }
+        Node::SLoad(..) | Node::Const(_) => None,
+        _ => expr::contains(e, &|n| matches!(n, Node::CallDataLoad(_))).then_some(e),
+    }
+}
+
+// `amount + owed < held` says the same as `amount < held - owed`.
+// Fields that stand with the amount are owed, and fields on the other side are held.
+fn two_sided_bound(
+    with_amount: ExprId,
+    opposite: ExprId,
+    layout: emit::MappingLayout,
+    names: &Names,
+) -> Option<(AvailBound, ExprId)> {
+    let amount = amount_term(with_amount, layout, &mut 64)?;
+    if amount_term(opposite, layout, &mut 64).is_some() {
+        return None;
+    }
+    let mut labels = HashMap::new();
+    let mut fields = |e: ExprId| {
+        let mut coef = BTreeMap::new();
+        linear_fields(e, 1, layout, names, &mut coef, &mut labels, &mut 256);
+        coef
+    };
+    let (near, far) = (fields(with_amount), fields(opposite));
+    let pick = |from: &BTreeMap<Field, i32>, positive: bool| -> BTreeSet<Field> {
+        let wanted = from
+            .iter()
+            .filter(|(_, c)| (**c > 0) == positive && **c != 0);
+        wanted.map(|(f, _)| f.clone()).collect()
+    };
+    let added: BTreeSet<Field> = pick(&far, true)
+        .union(&pick(&near, false))
+        .cloned()
+        .collect();
+    let subbed: BTreeSet<Field> = pick(&near, true)
+        .union(&pick(&far, false))
+        .cloned()
+        .collect();
+    let line = format!(
+        "{} vs {}",
+        emit::fmt_expr(with_amount, names),
+        emit::fmt_expr(opposite, names)
+    );
+    (!added.is_empty() && !subbed.is_empty() && !near.is_empty()).then_some((
+        AvailBound {
+            added,
+            subbed,
+            names: labels,
+            line,
+        },
+        amount,
+    ))
+}
+
 fn limits_outflow(other: ExprId, outflows: &[ExprId]) -> bool {
     let calldata = |e: ExprId| {
         let mut words = HashSet::new();
@@ -1973,8 +2066,8 @@ fn limits_outflow(other: ExprId, outflows: &[ExprId]) -> bool {
     let mine = calldata(other);
     outflows.iter().any(|a| {
         *a == other
-            || contains_expr(*a, other)
-            || contains_expr(other, *a)
+            || expr::has_part(*a, other)
+            || expr::has_part(other, *a)
             || !mine.is_disjoint(&calldata(*a))
     })
 }
@@ -1992,13 +2085,15 @@ fn limits_in(
             continue;
         }
         if let Node::Op(op::LT | op::GT | op::SLT | op::SGT, v) = expr::node(x) {
+            let mut found: Vec<(AvailBound, ExprId)> = Vec::new();
             for (side, other) in [(v[0], v[1]), (v[1], v[0])] {
                 if expr::is_const(other) {
                     continue;
                 }
-                let Some(b) = linear_bound(side, layout, names) else {
-                    continue;
-                };
+                found.extend(linear_bound(side, layout, names).map(|b| (b, other)));
+                found.extend(two_sided_bound(other, side, layout, names));
+            }
+            for (b, other) in found {
                 if !out
                     .iter()
                     .any(|(o, w)| *w == other && o.added == b.added && o.subbed == b.subbed)
@@ -2427,8 +2522,42 @@ fn loop_nodes(l: &Lifted) -> HashSet<usize> {
     in_loop
 }
 
+const MAX_KEPT_EVENTS: usize = 1 << 20;
+
+#[derive(Default)]
+struct Replay {
+    events: Vec<Event>,
+    computed_returns: HashMap<u32, ExprId>,
+    carried: Vec<ExprId>,
+    made: HashMap<ExprId, String>,
+    code_copies: Vec<(ExprId, usize, usize)>,
+}
+
+impl Replay {
+    fn of(ctx: &Ctx, l: &Lifted) -> Replay {
+        let events = events_of(ctx, l, 5, false);
+        Replay {
+            events,
+            computed_returns: ctx.computed_returns.take(),
+            carried: ctx.carried.take(),
+            made: ctx.made.take(),
+            code_copies: ctx.code_copies.take(),
+        }
+    }
+
+    // The rules read these tables from the context while they walk the events.
+    fn into_events(self, ctx: &Ctx) -> Vec<Event> {
+        ctx.computed_returns.replace(self.computed_returns);
+        ctx.carried.replace(self.carried);
+        ctx.made.replace(self.made);
+        ctx.code_copies.replace(self.code_copies);
+        self.events
+    }
+}
+
 fn events_of(ctx: &Ctx, l: &Lifted, depth: usize, in_loop_outer: bool) -> Vec<Event> {
     ctx.computed_returns.borrow_mut().clear();
+    ctx.carried.borrow_mut().clear();
     ctx.made.borrow_mut().clear();
     ctx.code_copies.borrow_mut().clear();
     ctx.inline_left.set(MAX_INLINED_EVENTS);
@@ -2461,7 +2590,7 @@ fn ev_reaches(ctx: &Ctx, l: &Lifted, a: &Event, b: &Event) -> bool {
             ca.and_then(|pc| ctx.internals.get(&pc))
                 .and_then(|f| f.lifted.as_ref())
         };
-        return graph.is_none_or(|g| reaches(g, *na, *nb));
+        return graph.is_none_or(|g| ctx.reaches(g, *na, *nb));
     }
     true
 }
@@ -2516,22 +2645,18 @@ fn events_of_in(
         )
     };
     let loops = loop_nodes(l);
-    let dbg_memview = std::env::var("EVMDEC_DEBUG_MEMVIEW").ok();
-    let dbg_unfresh = std::env::var("EVMDEC_DEBUG_UNFRESH").is_ok();
+    let dbg_memview = crate::debug::on("EVMDEC_DEBUG_MEMVIEW")
+        .then(|| std::env::var("EVMDEC_DEBUG_MEMVIEW").ok())
+        .flatten();
+    let dbg_unfresh = crate::debug::on("EVMDEC_DEBUG_UNFRESH");
     let mut out = Vec::new();
-    let mut order = Vec::new();
-    let mut seen = HashSet::new();
-    fn dfs(l: &Lifted, x: usize, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
-        if !seen.insert(x) {
-            return;
-        }
-        for s in &l.nodes[x].succs {
-            dfs(l, *s, seen, order);
-        }
-        order.push(x);
+    let order = lift::reverse_postorder(l);
+    // A helper's copies between its blocks can hold the only read of a call's answer.
+    // They belong to no statement, so they are kept beside the events.
+    if inst != 0 {
+        let copies = l.edge_assigns.values().flatten().map(|(_, v)| *v);
+        ctx.carried.borrow_mut().extend(copies);
     }
-    dfs(l, l.entry, &mut seen, &mut order);
-    order.reverse();
     if !loops.is_empty() {
         let w = writes_of(ctx, loops.iter().map(|n| &l.nodes[*n]), &mut HashSet::new());
         if dbg_unfresh {
@@ -2739,6 +2864,28 @@ fn events_of_in(
     out
 }
 
+impl Ctx<'_> {
+    // One search per start node. A rule that asks about every pair of events in a
+    // function would otherwise search the graph once per pair.
+    fn reaches(&self, l: &Lifted, a: usize, b: usize) -> bool {
+        let key = (std::ptr::from_ref(l) as usize, a);
+        let known = self.reach.borrow().get(&key).cloned();
+        let from_a = known.unwrap_or_else(|| {
+            let mut seen = HashSet::new();
+            let mut stack = vec![a];
+            while let Some(x) = stack.pop() {
+                if seen.insert(x) {
+                    stack.extend(l.nodes[x].succs.iter().copied());
+                }
+            }
+            let found = Rc::new(seen);
+            self.reach.borrow_mut().insert(key, found.clone());
+            found
+        });
+        from_a.contains(&b)
+    }
+}
+
 fn reaches(l: &Lifted, a: usize, b: usize) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![a];
@@ -2811,7 +2958,87 @@ pub(crate) fn push(
         recommendation: rec.into(),
         confirmed: false,
         witness: None,
+        setup: Vec::new(),
+        observed: Vec::new(),
     });
+}
+
+// The rule can only speak about a digest it can read. One that a helper returns, or
+// that starts with the 0x1901 marker and so carries a domain value fixed when the
+// contract was built, may bind the chain and the contract in a way not visible here.
+fn digest_unseen(digest: ExprId) -> bool {
+    let structured =
+        |n: &Node| matches!(n, Node::Const(c) if (*c >> 240) == U256::from_u64(0x1901));
+    mentions(digest, &|n| {
+        matches!(n, Node::IntRet(..) | Node::Var(_) | Node::Unknown(_))
+    }) || mentions(digest, &structured)
+}
+
+// The other side of an equality test that has the wanted value on one side.
+fn compared_with(cond: ExprId, wanted: &dyn Fn(&Node) -> bool) -> Option<ExprId> {
+    fn strip(e: ExprId) -> ExprId {
+        match expr::node(e) {
+            Node::Op(op::ISZERO, v) => strip(v[0]),
+            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
+                strip(v[0])
+            }
+            _ => e,
+        }
+    }
+    match expr::node(strip(cond)) {
+        Node::Op(op::AND | op::OR, v) if v.iter().all(|x| expr::is_boolean(*x)) => {
+            v.iter().find_map(|x| compared_with(*x, wanted))
+        }
+        Node::Op(op::EQ | op::SUB | op::XOR, v) => [(v[0], v[1]), (v[1], v[0])]
+            .iter()
+            .find(|(value, _)| mentions(*value, wanted))
+            .map(|(_, other)| strip(*other)),
+        _ => None,
+    }
+}
+
+// A target that is a word of the call's input or the caller, not something worked out
+// from them. An address hashed from the input is fixed by that hash.
+fn asked_directly(addr: ExprId) -> bool {
+    let inner = match expr::node(addr) {
+        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
+        _ => addr,
+    };
+    matches!(
+        expr::node(inner),
+        Node::CallDataLoad(_) | Node::Arg(_) | Node::Env(op::CALLER, _)
+    )
+}
+
+fn tests_zero(cond: ExprId, wanted: &dyn Fn(&Node) -> bool) -> bool {
+    fn strip(e: ExprId) -> ExprId {
+        match expr::node(e) {
+            Node::Op(op::ISZERO, v) => strip(v[0]),
+            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
+                strip(v[0])
+            }
+            _ => e,
+        }
+    }
+    let inner = strip(cond);
+    match expr::node(inner) {
+        Node::Op(op::AND | op::OR, v) if v.iter().all(|x| expr::is_boolean(*x)) => {
+            v.iter().any(|x| tests_zero(*x, wanted))
+        }
+        Node::Op(op::EQ, v) => [(v[0], v[1]), (v[1], v[0])].iter().any(|(value, zero)| {
+            expr::as_const(*zero) == Some(U256::ZERO) && mentions(*value, wanted)
+        }),
+        n => wanted(&n),
+    }
+}
+
+// An initializer tests what is stored, to see that nothing is there yet. A test that
+// also reads the call's input, the caller or anything else is some other check, and
+// taking it for that one let any extra requirement pass as protection.
+fn tests_only_storage(cond: ExprId) -> bool {
+    let fixed_slot = |n: &Node| matches!(n, Node::SLoad(k, false, _) if expr::is_const(*k));
+    let other = |n: &Node| !matches!(n, Node::Const(_) | Node::Op(..) | Node::SLoad(..));
+    mentions(cond, &fixed_slot) && !mentions(cond, &other)
 }
 
 fn mapping_root(key: ExprId) -> Option<U256> {
@@ -2822,6 +3049,13 @@ fn mapping_root(key: ExprId) -> Option<U256> {
                     if let Some(r) = mapping_root(*w) {
                         return Some(r);
                     }
+                }
+                // An inner key made of constants was folded to one constant. A small role
+                // number and the slot can both be small, and the slot is the word hashed last.
+                let folded = expr::as_const(*w).and_then(expr::hash_parts);
+                let slot = folded.and_then(|p| p.into_iter().rev().find(|c| c.bits() <= 32));
+                if slot.is_some() {
+                    return slot;
                 }
             }
             words
@@ -3031,10 +3265,9 @@ pub fn is_auth_cond(cond: ExprId) -> bool {
                     if expr::as_const(b2).is_some_and(|c| c.byte_len() >= 15) {
                         return true;
                     }
-                    if matches!(
-                        expr::node(b2),
-                        Node::Env(op::ADDRESS, _) | Node::Env(op::ORIGIN, _)
-                    ) {
+                    // Every wallet passes a test of the caller against the origin, so that
+                    // test keeps contracts out and is no check on who may call.
+                    if matches!(expr::node(b2), Node::Env(op::ADDRESS, _)) {
                         return true;
                     }
                 }
@@ -3064,13 +3297,47 @@ fn node_conds(nd: &lift::LNode) -> Vec<ExprId> {
     v
 }
 
+// One side of a guarding branch stops without doing anything. A side that goes on to
+// write, call or log is an ordinary branch, and what follows it runs for every caller.
+fn leaves_quietly(l: &Lifted, start: usize) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) {
+            continue;
+        }
+        let nd = &l.nodes[x];
+        let acts = |s: &Stmt| {
+            matches!(
+                s,
+                Stmt::SStore { .. } | Stmt::Call { .. } | Stmt::Create { .. } | Stmt::Log { .. }
+            )
+        };
+        let ends = matches!(nd.term, Term::SelfDestruct(_));
+        if seen.len() > MAX_QUIET_NODES || ends || nd.stmts.iter().any(acts) {
+            return false;
+        }
+        stack.extend(nd.succs.iter().copied());
+    }
+    true
+}
+
+const MAX_QUIET_NODES: usize = 64;
+
 fn has_caller_check(l: &Lifted, before: Option<usize>, roles: &HashSet<U256>) -> bool {
     for nd in &l.nodes {
-        if node_conds(nd)
-            .into_iter()
-            .any(|c| is_auth_cond_in(c, roles))
-            && before.is_none_or(|b| reaches(l, nd.id, b))
-        {
+        let auth = |c: &ExprId| is_auth_cond_in(*c, roles);
+        let required = nd
+            .stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Require { cond, .. } if auth(cond)));
+        let guarded = match &nd.term {
+            Term::Branch { cond, t, f } if auth(cond) => {
+                t.is_none_or(|t| leaves_quietly(l, t)) || leaves_quietly(l, *f)
+            }
+            _ => false,
+        };
+        if (required || guarded) && before.is_none_or(|b| reaches(l, nd.id, b)) {
             return true;
         }
     }
@@ -3149,6 +3416,16 @@ fn legacy_consequence(before_0_5: bool) -> &'static str {
 }
 
 pub fn analyze(c: &Contract) -> Report {
+    analyze_with_linked(c, false).0
+}
+
+// The contracts fetched with the one asked for are read while it is analysed. Their
+// reports come from that one pass. Analysing each again on its own took ten times as long.
+pub fn analyze_all(c: &Contract) -> (Report, Vec<Report>) {
+    analyze_with_linked(c, true)
+}
+
+fn analyze_with_linked(c: &Contract, linked: bool) -> (Report, Vec<Report>) {
     let world = World::of(c);
     if let Some(a) = &c.address {
         world
@@ -3156,7 +3433,17 @@ pub fn analyze(c: &Contract) -> Report {
             .borrow_mut()
             .insert(a.to_ascii_lowercase(), None);
     }
-    analyze_in(c, &world)
+    let report = analyze_in(c, &world);
+    let of_linked = |lc: &Contract| {
+        let known = lc.address.as_deref().and_then(|a| world.report(a));
+        known.map_or_else(|| analyze_in(lc, &world), |r| (*r).clone())
+    };
+    let others = if linked {
+        c.linked.iter().map(of_linked).collect()
+    } else {
+        Vec::new()
+    };
+    (report, others)
 }
 
 fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
@@ -3186,6 +3473,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         inst_seq: std::cell::Cell::new(0),
         inline_left: std::cell::Cell::new(MAX_INLINED_EVENTS),
         divides: Default::default(),
+        reach: Default::default(),
+        carried: Default::default(),
         roles: HashSet::new(),
         slot_writes: HashSet::new(),
         field_writes: HashSet::new(),
@@ -3194,13 +3483,16 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         unguarded_extenders: HashMap::new(),
     };
     ctx.roles = role_mappings(&ctx);
-    for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
-        if any_caller_check(&ctx, f) {
+    let mut replays: HashMap<usize, Replay> = HashMap::new();
+    let mut kept = 0;
+    for (index, f) in c.functions.iter().enumerate() {
+        if f.kind != FnKind::External || any_caller_check(&ctx, f) {
             continue;
         }
         let Some(l) = &f.lifted else { continue };
         let mut grown: HashSet<U256> = HashSet::new();
-        for ev in events_of(&ctx, l, 5, false) {
+        let replay = Replay::of(&ctx, l);
+        for ev in &replay.events {
             if let Some(Stmt::SStore {
                 key,
                 val,
@@ -3224,6 +3516,10 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                 .entry(k)
                 .or_default()
                 .push(display_name(f));
+        }
+        kept += replay.events.len();
+        if kept <= MAX_KEPT_EVENTS {
+            replays.insert(index, replay);
         }
     }
     for f in &c.functions {
@@ -3316,6 +3612,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     let mut unauthenticated: Vec<String> = Vec::new();
     let mut facts: Vec<FnFacts> = Vec::new();
     let mut summaries: Vec<FnSummary> = Vec::new();
+    let mut stores: Vec<origin::Store> = Vec::new();
+    let mut uses: Vec<StoredUse> = Vec::new();
     let mut lock_slots: HashMap<ExprId, HashSet<usize>> = HashMap::new();
     let mut any_payable = false;
     let mut any_ether_out = false;
@@ -3324,17 +3622,28 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     let mut eip1967 = false;
     let mut delegatecall_targets_storage = false;
 
-    for f in c
-        .functions
-        .iter()
-        .filter(|f| f.kind != FnKind::Internal && f.kind != FnKind::Orphan)
-    {
+    for (index, f) in c.functions.iter().enumerate() {
+        if f.kind == FnKind::Internal || f.kind == FnKind::Orphan {
+            continue;
+        }
         let Some(l) = &f.lifted else { continue };
         let names = names_for(f);
-        let events = events_of(&ctx, l, 5, false);
+        let replay = replays.remove(&index);
+        let events = replay
+            .unwrap_or_else(|| Replay::of(&ctx, l))
+            .into_events(&ctx);
         let caller_checked = any_caller_check(&ctx, f);
         let fact = collect_facts(&ctx, f, &events, caller_checked, &names);
         summaries.extend(summarise(&ctx, &fact, &events, &auth, &names));
+        stored_uses(
+            &ctx,
+            &fact,
+            facts.len(),
+            &events,
+            &names,
+            &mut stores,
+            &mut uses,
+        );
         facts.push(fact);
         let loop_cap: Option<u64> = {
             let mut keys: Vec<U256> = Vec::new();
@@ -3373,12 +3682,22 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         if f.mutability == crate::function::Mutability::Payable {
             any_payable = true;
         }
-        let always_reverts = !l.nodes.iter().any(|nd| {
-            matches!(
-                nd.term,
-                Term::Return { .. } | Term::ReturnDyn { .. } | Term::Stop | Term::SelfDestruct(_)
-            )
-        });
+        // A helper can end the call with success as well as the function itself can.
+        let ends_well = |g: &Lifted| {
+            g.nodes.iter().any(|nd| {
+                matches!(
+                    nd.term,
+                    Term::Return { .. }
+                        | Term::ReturnDyn { .. }
+                        | Term::Stop
+                        | Term::SelfDestruct(_)
+                )
+            })
+        };
+        let always_reverts = !ends_well(l)
+            && !transitive_callees(&ctx, f)
+                .iter()
+                .any(|cf| cf.lifted.as_ref().is_some_and(ends_well));
 
         let const_sloads = |e: ExprId| -> Vec<ExprId> {
             let mut out = Vec::new();
@@ -3450,36 +3769,138 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             }
             found
         };
-        let carried: Vec<ExprId> = l.edge_assigns.values().flatten().map(|(_, v)| *v).collect();
-        let checked: Vec<ExprId> = events
-            .iter()
-            .flat_map(|e| {
-                let stmt = match &e.stmt {
-                    Some(Stmt::Drop(_)) | None => Vec::new(),
-                    Some(other) => stmt_exprs(other),
-                };
-                let term = match &e.term {
-                    Some(Term::Branch { cond, .. }) => vec![*cond],
-                    Some(Term::Return { data: Some(d), .. }) => d.clone(),
-                    _ => Vec::new(),
-                };
-                stmt.into_iter().chain(term)
-            })
-            .chain(carried.iter().copied())
-            .collect();
-        let used_results = seqs_in(checked, &|n| match n {
+        let mut carried: Vec<ExprId> = l.edge_assigns.values().flatten().map(|(_, v)| *v).collect();
+        carried.extend(ctx.carried.borrow().iter().copied());
+        let checked = |e: &Event| -> Vec<ExprId> {
+            let stmt = match &e.stmt {
+                Some(Stmt::Drop(_)) | None => Vec::new(),
+                Some(other) => stmt_exprs(other),
+            };
+            let term = match &e.term {
+                Some(Term::Branch { cond, .. }) => vec![*cond],
+                Some(Term::Return { data: Some(d), .. }) => d.clone(),
+                _ => Vec::new(),
+            };
+            stmt.into_iter().chain(term).collect()
+        };
+        let mut used_results: HashSet<u32> = HashSet::new();
+        let mut read_returns: HashSet<u32> = HashSet::new();
+        let result = |n: &Node| match n {
             Node::CallResult(s) => Some(*s),
             _ => None,
-        });
-        let everything: Vec<ExprId> = events
-            .iter()
-            .flat_map(event_exprs)
-            .chain(carried.iter().copied())
-            .collect();
-        let read_returns = seqs_in(everything, &|n| match n {
+        };
+        let returned = |n: &Node| match n {
             Node::ReturnData(s, _) => Some(*s),
             _ => None,
-        });
+        };
+        for e in &events {
+            used_results.extend(seqs_in(checked(e), &result));
+            read_returns.extend(seqs_in(event_exprs(e), &returned));
+        }
+        used_results.extend(seqs_in(carried.clone(), &result));
+        read_returns.extend(seqs_in(carried.clone(), &returned));
+        // One block can be lifted in several copies. What any copy does with the answer is
+        // what the code at that place does with it.
+        let used_sites: HashSet<u32> = used_results.iter().map(|s| lift::call_site(*s)).collect();
+        // A helper can make the call and leave the answer for its caller to read. The caller
+        // then reads return data that belongs to none of the calls in its own code.
+        let call_seqs: HashSet<u32> = events
+            .iter()
+            .filter_map(|e| match &e.stmt {
+                Some(Stmt::Call { seq, .. } | Stmt::Create { seq, .. }) => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        let left_behind = |roots: Vec<ExprId>| {
+            seqs_in(roots, &returned)
+                .iter()
+                .any(|s| !call_seqs.contains(s))
+        };
+        let mut reads_left_behind: HashSet<usize> = events
+            .iter()
+            .filter(|e| left_behind(event_exprs(e)))
+            .map(|e| e.inst)
+            .collect();
+        if left_behind(l.edge_assigns.values().flatten().map(|(_, v)| *v).collect()) {
+            reads_left_behind.extend(events.first().map(|e| e.inst));
+        }
+        // Code that branches on the size of the answer has looked at the answer. A token
+        // call that asks for no output and then tests that size is handling tokens that
+        // return nothing, which is what a transfer of a single item does.
+        let sizes_tested: HashSet<usize> = events
+            .iter()
+            .filter(|e| {
+                let cond = match (&e.stmt, &e.term) {
+                    (Some(Stmt::Require { cond, .. }), _) => Some(*cond),
+                    (_, Some(Term::Branch { cond, .. })) => Some(*cond),
+                    _ => None,
+                };
+                cond.is_some_and(|c| {
+                    expr::contains(c, &|n| matches!(n, Node::Env(op::RETURNDATASIZE, _)))
+                })
+            })
+            .map(|e| e.inst)
+            .collect();
+        let read_by_caller = |ev: &Event| {
+            ev.path
+                .iter()
+                .any(|(inst, _, _)| *inst != ev.inst && reads_left_behind.contains(inst))
+        };
+        // An answer is also read by loading the memory the call wrote it to.
+        let loads_in = |roots: Vec<ExprId>| -> Vec<ExprId> {
+            let mut found = Vec::new();
+            let mut seen: HashSet<ExprId> = HashSet::new();
+            let mut pending: Vec<ExprId> = roots
+                .into_iter()
+                .filter(|e| expr::holds(*e, expr::kind::MLOAD))
+                .collect();
+            while let Some(x) = pending.pop() {
+                if !seen.insert(x) || seen.len() > 5000 {
+                    continue;
+                }
+                if let Node::MLoad(at, _) = expr::node(x) {
+                    found.push(at);
+                }
+                pending.extend(expr::children(x));
+            }
+            found
+        };
+        let within = |at: ExprId, (off, len): (ExprId, u64)| {
+            let ((base, a), (to, o)) = (expr::split_offset(at), expr::split_offset(off));
+            base == to && a >= o && a.wrapping_sub(o) < U256::from_u64(len)
+        };
+        let mut outputs: Vec<(u32, (ExprId, u64))> = Vec::new();
+        for e in &events {
+            for at in loads_in(event_exprs(e)) {
+                read_returns.extend(
+                    outputs
+                        .iter()
+                        .filter(|(_, out)| within(at, *out))
+                        .map(|o| o.0),
+                );
+            }
+            if let Some(Stmt::Call {
+                seq,
+                out_off,
+                out_len,
+                ..
+            }) = &e.stmt
+            {
+                let len = expr::as_const(*out_len)
+                    .filter(U256::fits_u64)
+                    .map(|l| l.low_u64());
+                outputs.extend(len.filter(|l| *l > 0).map(|l| (*seq, (*out_off, l))));
+            }
+        }
+        for at in loads_in(carried.clone()) {
+            read_returns.extend(
+                outputs
+                    .iter()
+                    .filter(|(_, out)| within(at, *out))
+                    .map(|o| o.0),
+            );
+        }
+        let read_sites: HashSet<u32> = read_returns.iter().map(|s| lift::call_site(*s)).collect();
         for (i, ev) in events.iter().enumerate() {
             let Some(stmt) = &ev.stmt else { continue };
             let names = &names;
@@ -3513,7 +3934,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                         .and_then(|w0| emit::leading_selector(w0, in_len_c));
                     let selector_known =
                         selector.is_some() || expr::as_const(*in_len) == Some(U256::ZERO);
-                    if std::env::var("EVMDEC_DEBUG_CALLS").is_ok() {
+                    if crate::debug::on("EVMDEC_DEBUG_CALLS") {
                         eprintln!(
                             "call pc={} fn={} sel={:?} head=[{}] in_len={}",
                             ev.pc,
@@ -3574,11 +3995,14 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                         }
                     }
 
-                    if *kind == op::CALL || *kind == op::CALLCODE {
-                        let later_write = events[i + 1..].iter().any(|e2| {
+                    // A read-only call can still feed a price, check a signature or return data the
+                    // code then trusts. The rules about what a call changes stay with calls that can.
+                    let plain = *kind == op::CALL || *kind == op::CALLCODE;
+                    if plain || *kind == op::STATICCALL {
+                        let later_write = plain && events[i + 1..].iter().any(|e2| {
                             let hit = matches!(&e2.stmt, Some(Stmt::SStore { .. }))
                                 && ev_reaches(&ctx, l, ev, e2);
-                            if hit && std::env::var("EVMDEC_DEBUG_REENTRANCY").is_ok() {
+                            if hit && crate::debug::on("EVMDEC_DEBUG_REENTRANCY") {
                                 eprintln!(
                                     "[reentrancy] {} call pc={} inst={} inner={} node={} callee={:?} -> store pc={} inst={} inner={} node={} callee={:?}: {}",
                                     f.name, ev.pc, ev.inst, ev.inner, ev.node, ev.callee, e2.pc, e2.inst, e2.inner, e2.node, e2.callee,
@@ -3610,17 +4034,19 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 format!("`{}` performs an external call to `{}` and writes storage afterwards. A malicious callee can re-enter before the state update is applied (checks-effects-interactions violated).{}", f.name, target, extra),
                                 vec![line.clone()], "Apply the checks-effects-interactions pattern (update state before calling out) or use a reentrancy guard.");
                         }
-                        let used = used_results.contains(seq);
-                        if !used && !precompile {
+                        let used = used_sites.contains(&lift::call_site(*seq));
+                        if plain && !used && !precompile {
                             push(&mut findings, "unchecked-call", "Return value of external call ignored", if value_nonzero { Severity::Medium } else { Severity::Low }, Confidence::High, Some(f), Some(ev.pc),
                                 format!("`{}` ignores the success flag of a low-level call to `{}`. If the call fails (reverting callee, out of gas, non-contract address) execution continues as if it succeeded{}.", f.name, target, if value_nonzero { ", and the ether is kept by this contract while state may assume it was sent" } else { "" }),
                                 vec![line.clone()], "Check the returned boolean (`require(success)`) or use a high-level call that reverts on failure.");
                         }
-                        if input.is_some() {
+                        if plain && input.is_some() {
                             if let Some(sel) = selector {
                                 if matches!(sel, SEL_TRANSFER | SEL_TRANSFER_FROM | SEL_APPROVE) {
                                     let out_zero = expr::as_const(*out_len) == Some(U256::ZERO);
-                                    let decoded = read_returns.contains(seq);
+                                    let decoded = read_sites.contains(&lift::call_site(*seq))
+                                        || read_by_caller(ev)
+                                        || sizes_tested.contains(&ev.inst);
                                     let window_end = events[i + 1..]
                                         .iter()
                                         .position(|e2| matches!(e2.stmt, Some(Stmt::Call { .. })))
@@ -3744,7 +4170,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                             && !caller_checked
                             && !always_reverts
                             && f.kind == FnKind::External;
-                        if arbitrary {
+                        if plain && arbitrary {
                             push(&mut findings, "arbitrary-call", "Arbitrary external call with caller-controlled target and data", Severity::High, Confidence::Medium, Some(f), Some(ev.pc),
                                 format!("`{}` calls `{}` with calldata-derived payload and no access control. If this contract holds token approvals or ether, anyone can drain them through it (e.g. calling `transferFrom` on an approved token).", f.name, target),
                                 vec![line.clone()], "Restrict callable targets/selectors, or make sure the contract never holds funds or approvals.");
@@ -3779,7 +4205,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                             })
                             || (mentions(*addr, &|n| matches!(n, Node::IntRet(..)))
                                 && int_ret_fixed(*addr));
-                        if !arbitrary
+                        if plain
+                            && !arbitrary
                             && !fixed_target
                             && !selector_known
                             && !caller_checked
@@ -3799,13 +4226,15 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 format!("`{}` calls `{}` with a payload whose selector is computed rather than fixed, and the function has no access control. If the caller can influence either (through calldata, a forged proof, or a message the contract trusts), this is an arbitrary call made by this contract.", f.name, target),
                                 vec![line.clone()], "Whitelist the targets and the selectors that can be dispatched, and authenticate the source of the request.");
                         }
-                        if let (Some(words), Some(SEL_TRANSFER_FROM)) = (words_view, selector) {
+                        if let (true, Some(words), Some(SEL_TRANSFER_FROM)) =
+                            (plain, words_view, selector)
+                        {
                             if !caller_checked && f.kind == FnKind::External && !always_reverts {
                                 let from = emit::shifted_word_len(words, 0, in_len_c);
                                 let from_user = from_calldata(from)
                                     && !from_caller(from)
                                     && !mentions(from, &|n| matches!(n, Node::Env(op::ADDRESS, _)));
-                                let allowance = events.iter().flat_map(event_exprs).any(|e| mentions(e, &|n| matches!(n, Node::SLoad(k, _, _) if from_caller(*k) && contains_expr(*k, from))));
+                                let allowance = events.iter().flat_map(event_exprs).any(|e| mentions(e, &|n| matches!(n, Node::SLoad(k, _, _) if from_caller(*k) && expr::has_part(*k, from))));
                                 let signed = events.iter().any(|e| match &e.stmt {
                                     Some(Stmt::Call {
                                         addr,
@@ -3837,7 +4266,11 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 }
                             }
                         }
+                        // An address the contract reads from its own storage under an index
+                        // the caller gives is the contract's choice, not the caller's.
                         if user_target
+                            && (plain || asked_directly(*addr))
+                            && selector != Some(SEL_IS_VALID_SIGNATURE)
                             && !caller_checked
                             && !precompile
                             && f.kind == FnKind::External
@@ -3864,7 +4297,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                     _ => vec![],
                                 };
                                 conds.into_iter().any(|c| {
-                                    mentions(c, &|n| matches!(n, Node::SLoad(k, _, _) if contains_expr(*k, *addr)))
+                                    mentions(c, &|n| matches!(n, Node::SLoad(k, _, _) if expr::has_part(*k, *addr)))
                                 })
                             });
                             let erc20_result_only = matches!(
@@ -3908,11 +4341,13 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 }
                             }
                         }
-                        if let (Some(words), Some(SEL_TRANSFER_FROM)) = (words_view, selector) {
+                        if let (true, Some(words), Some(SEL_TRANSFER_FROM)) =
+                            (plain, words_view, selector)
+                        {
                             let to = emit::shifted_word_len(words, 1, in_len_c);
                             if mentions(to, &|n| matches!(n, Node::Env(op::ADDRESS, _))) {
                                 let amount = emit::shifted_word_len(words, 2, in_len_c);
-                                let credited = events[i + 1..].iter().any(|e2| matches!(&e2.stmt, Some(Stmt::SStore { val, .. }) if contains_expr(*val, amount)));
+                                let credited = events[i + 1..].iter().any(|e2| matches!(&e2.stmt, Some(Stmt::SStore { val, .. }) if expr::has_part(*val, amount)));
                                 let measured = events[i + 1..].iter().any(|e2| matches!(&e2.stmt, Some(Stmt::Call { input: Some(w), in_len, .. }) if w.first().and_then(|w0| emit::leading_selector(*w0, expr::as_const(*in_len).and_then(|l| l.as_usize()))) == Some(SEL_BALANCE_OF)));
                                 if credited && !measured && !expr::is_const(amount) {
                                     push(&mut findings, "fee-on-transfer", "Token amount credited without measuring the balance received", Severity::Low, Confidence::Low, Some(f), Some(ev.pc),
@@ -3921,7 +4356,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 }
                             }
                         }
-                        if let (Some(words), Some(sel)) = (words_view, selector) {
+                        if let (true, Some(words), Some(sel)) = (plain, words_view, selector) {
                             if let Some((given, received, how)) =
                                 reverse_quote(&ctx, l, &events, words, sel, in_len_c)
                             {
@@ -4032,7 +4467,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                     vec![line.clone()], "Bound the parameter with a require, or use checked arithmetic (SafeMath / solc >= 0.8).");
                             }
                         }
-                        if ev.in_loop && !precompile {
+                        if plain && ev.in_loop && !precompile {
                             let required = events.iter().any(|e2| match (&e2.stmt, &e2.term) {
                                 (Some(Stmt::Require { cond, .. }), _)
                                 | (_, Some(Term::Branch { cond, .. })) => mentions(
@@ -4062,12 +4497,43 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                             }
                         }
                         if expr::as_const(*addr) == Some(U256::ONE) {
-                            let zero_checked = l.nodes.iter().any(|nd| matches!(&nd.term, Term::Branch { cond, .. } if mentions(*cond, &|n| matches!(n, Node::ReturnData(s, _) if *s == *seq)) || mentions(*cond, &|n| matches!(n, Node::MLoad(..)))));
+                            // The check that matters compares what was recovered with zero. A
+                            // comparison with a stored signer is not one, since an unset signer
+                            // is zero too. It may sit in a helper, so the inlined steps are read.
+                            let recovered = |n: &Node| {
+                                matches!(n, Node::ReturnData(s, _) if *s == *seq)
+                                    || matches!(n, Node::MLoad(..))
+                            };
+                            let zero_checked = events.iter().any(|e| {
+                                let cond = match (&e.stmt, &e.term) {
+                                    (Some(Stmt::Require { cond, .. }), _) => Some(*cond),
+                                    (_, Some(Term::Branch { cond, .. })) => Some(*cond),
+                                    _ => None,
+                                };
+                                cond.is_some_and(|c| tests_zero(c, &recovered))
+                            });
+                            // Comparing it with an account already shown not to be zero does
+                            // the same job.
+                            let conds: Vec<ExprId> = events
+                                .iter()
+                                .filter_map(|e| match (&e.stmt, &e.term) {
+                                    (Some(Stmt::Require { cond, .. }), _) => Some(*cond),
+                                    (_, Some(Term::Branch { cond, .. })) => Some(*cond),
+                                    _ => None,
+                                })
+                                .collect();
+                            let zero_checked = zero_checked
+                                || conds.iter().any(|c| {
+                                    compared_with(*c, &recovered).is_some_and(|other| {
+                                        let it = expr::node(other);
+                                        conds.iter().any(|d| tests_zero(*d, &|n| *n == it))
+                                    })
+                                });
                             if !zero_checked {
                                 push(&mut findings, "ecrecover-zero", "ecrecover result may be the zero address", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                     format!("`{}` calls the ecrecover precompile; no comparison of the recovered address against zero was found. An invalid signature recovers to address(0), which may match an unset storage slot.", f.name), vec![line.clone()], "Require the recovered signer to be non-zero (or use OpenZeppelin ECDSA).");
                             }
-                            if let Some(words) = input {
+                            if let Some(words) = input.as_ref().filter(|w| !w.is_empty()) {
                                 let all: Vec<ExprId> =
                                     events.iter().flat_map(event_exprs).collect();
                                 let digest = words[0];
@@ -4078,14 +4544,25 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                             Node::Env(op::CHAINID, _) | Node::Env(op::ADDRESS, _)
                                         )
                                     }) || matches!(expr::node(digest), Node::KeccakMem(..))
-                                        || from_storage(digest);
+                                        || from_storage(digest)
+                                        || digest_unseen(digest);
                                 if !domain_bound {
                                     push(&mut findings, "signature-replay-domain", "Signed digest does not bind the chain or this contract", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                         format!("`{}` verifies a signature over `{}`, which includes neither `block.chainid` nor `address(this)` (no EIP-712 domain). The same signature is valid on every chain and every deployment.", f.name, emit::fmt_expr(digest, names)),
                                         vec![line.clone()], "Sign an EIP-712 digest that includes the chain id and the verifying contract.");
                                 }
-                                let signer_keyed_write = events.iter().any(|e2| matches!(&e2.stmt, Some(Stmt::SStore { key, .. }) if mentions_returndata(*key, *seq) || contains_expr(*key, digest) || mentions(*key, &|n| matches!(n, Node::Keccak(..) | Node::KeccakMem(..)))));
-                                if !signer_keyed_write && !always_reverts {
+                                let signer_keyed_write = events.iter().any(|e2| matches!(&e2.stmt, Some(Stmt::SStore { key, .. }) if mentions_returndata(*key, *seq) || expr::has_part(*key, digest) || mentions(*key, &|n| matches!(n, Node::Keccak(..) | Node::KeccakMem(..)))));
+                                // A function that only checks a signature it is handed and changes
+                                // nothing leaves the bookkeeping to whoever calls it.
+                                let acts = events.iter().any(|e2| {
+                                    matches!(
+                                        &e2.stmt,
+                                        Some(
+                                            Stmt::SStore { .. } | Stmt::Call { value: Some(_), .. }
+                                        )
+                                    )
+                                });
+                                if !signer_keyed_write && !always_reverts && acts {
                                     push(&mut findings, "signature-replay-nonce", "No nonce or consumed-digest bookkeeping for a verified signature", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                         format!("`{}` recovers a signer but writes no storage keyed by the signer or by the digest, so the same signature can be submitted again.", f.name),
                                         vec![line.clone()], "Store and increment a per-signer nonce, or mark the digest as used.");
@@ -4109,7 +4586,11 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                     }
                     let _ = result;
                 }
-                Stmt::Create { kind, .. } => {
+                Stmt::Create { kind, value, .. } => {
+                    // Ether given to a contract as it is created has left this one.
+                    if expr::as_const(*value) != Some(U256::ZERO) {
+                        any_ether_out = true;
+                    }
                     let line = emit::fmt_stmt(stmt, names);
                     push(
                         &mut findings,
@@ -4229,7 +4710,10 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
 
         for nd in &l.nodes {
             if let Term::Branch { cond, .. } = &nd.term {
+                // A test of the origin against the caller only keeps contracts out. It
+                // gives nobody a right, so there is nothing for a relaying contract to borrow.
                 if mentions(*cond, &|n| matches!(n, Node::Env(op::ORIGIN, _)))
+                    && !from_caller(*cond)
                     && matches!(
                         expr::node(*cond),
                         Node::Op(op::EQ, _) | Node::Op(op::ISZERO, _)
@@ -4252,15 +4736,27 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                     Node::Keccak(..) | Node::KeccakMem(..) | Node::Op(op::BLOCKHASH, _)
                 )
             };
+            // A mapping keyed by the block number hashes it to find the slot. That hash
+            // picks where a value lives and is no source of chance.
+            let slots: HashSet<ExprId> = events
+                .iter()
+                .filter_map(|e| match &e.stmt {
+                    Some(Stmt::SStore { key, .. }) => Some(*key),
+                    _ => None,
+                })
+                .collect();
             let mut hashes: Vec<ExprId> = Vec::new();
             for e in events.iter().flat_map(event_exprs) {
                 let mut seen = HashSet::new();
                 let mut stack = vec![e];
                 while let Some(x) = stack.pop() {
-                    if !seen.insert(x) || seen.len() > 5000 {
+                    if !seen.insert(x) || seen.len() > 5000 || slots.contains(&x) {
                         continue;
                     }
                     let n = expr::node(x);
+                    if matches!(n, Node::SLoad(..)) {
+                        continue;
+                    }
                     if is_hash(&n) && mentions(x, &blocky) && !hashes.contains(&x) {
                         hashes.push(x);
                     }
@@ -4268,7 +4764,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                 }
             }
             if !hashes.is_empty() {
-                let uses_hash = |e: ExprId| hashes.iter().any(|h| contains_expr(e, *h));
+                let uses_hash = |e: ExprId| hashes.iter().any(|h| expr::has_part(e, *h));
                 let mut reduced: Option<ExprId> = None;
                 let mut decided: Option<ExprId> = None;
                 let mut pc = l.nodes[l.entry].pc;
@@ -4499,7 +4995,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                 parts.insert(*amount);
                 let bounded = guards
                     .iter()
-                    .any(|c| from_calldata(*c) && parts.iter().any(|p| contains_expr(*c, *p)));
+                    .any(|c| from_calldata(*c) && parts.iter().any(|p| expr::has_part(*c, *p)));
                 if !bounded {
                     push(&mut findings, "no-slippage-bound", "Computed payout has no caller-supplied minimum", Severity::Low, Confidence::Low, Some(f), Some(*pc),
                         format!("`{}` pays `{}` to msg.sender: an amount computed from balances or storage and the caller's input, with no check against a value the caller passes in. Whoever transacts first can move the price, so the caller may receive far less than expected (front-running, sandwiching).", f.name, emit::fmt_expr(*amount, &names)),
@@ -4666,9 +5162,11 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                             && expr::is_const(*key)
                             && (from_calldata(*val) || from_caller(*val))
                         {
-                            let k = *key;
                             let init_guard = events.iter().any(|e| match (&e.term, &e.stmt) {
-                                (Some(Term::Branch { cond, .. }), _) | (_, Some(Stmt::Require { cond, .. })) => mentions(*cond, &|n| matches!(n, Node::SLoad(kk, _, _) if *kk == k)) || mentions(*cond, &|n| matches!(n, Node::SLoad(kk, _, _) if expr::is_const(*kk) && *kk != k)) && matches!(expr::node(*cond), Node::Op(op::ISZERO, _) | Node::Op(op::EQ, _)),
+                                (Some(Term::Branch { cond, .. }), _)
+                                | (_, Some(Stmt::Require { cond, .. })) => {
+                                    tests_only_storage(*cond)
+                                }
                                 _ => false,
                             });
                             if init_guard {
@@ -4719,21 +5217,44 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
 
     policy_findings(&facts, &mut findings);
     chain_findings(&facts, &auth, &mut findings);
+    // The checks that run code are for the contract asked for. On every contract
+    // fetched with it they multiplied the time of a report.
+    let asked = std::ptr::eq(world.root, c);
+    if asked {
+        exec::within(TRACE_WORK, || trace_bounds(c, &mut facts, &names_for));
+    }
     accounting_findings(&facts, &mut findings);
     let slot_names = c.functions.first().map(names_for).unwrap_or_default();
     let slot_name = |slot: ExprId| emit::fmt_slot(slot, &slot_names, SlotSpace::Persistent);
     conservation_findings(&facts, &slot_name, &mut findings);
     link_findings(&ctx, &facts, &mut findings);
     passed_word_findings(&ctx, &facts, &summaries, &mut findings);
+    origin_findings(&ctx, &facts, &stores, &uses, &mut findings);
     trust_findings(&ctx, &facts, &mut findings);
 
     type_rules::findings(c, &c.types, names_for, &mut findings);
 
-    crate::confirm::confirm(c, &mut findings);
+    exec::within(confirm::WORK, || confirm::confirm(c, &mut findings));
+    if asked {
+        exec::within(confirm::WORK, || confirm::confirm_wraps(c, &mut findings));
+    }
 
     crate::invariant::findings(c, &c.types, &mut findings);
+    let begin = crate::deploy::storage(c);
+    report.maps.extend(crate::deploy::section(c));
+    report
+        .maps
+        .extend(authority(&facts, &stores, &uses, &begin, &mut findings));
+    if asked {
+        report.maps.extend(crate::props::findings(c, &mut findings));
+        exec::within(flow::WORK, || flow::findings(c, &mut findings));
+        exec::within(signed::WORK, || signed::findings(c, &mut findings));
+        report.maps.extend(exec::within(standard::WORK, || {
+            standard::findings(c, &mut findings)
+        }));
+    }
 
-    if std::env::var("EVMDEC_DEBUG_LOCKS").is_ok() {
+    if crate::debug::on("EVMDEC_DEBUG_LOCKS") {
         for (slot, fs) in &lock_slots {
             eprintln!(
                 "[locks] slot {:?} used by {} function(s): {:?}",
@@ -4743,7 +5264,19 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             );
         }
     }
-    if ctx.vyper && lock_slots.len() >= 3 {
+    // The compilers with this fault gave every function a slot of its own. Three locks that
+    // several functions share are three named locks from a compiler that works. A version
+    // the trailer names and that is not one of the three is taken at its word.
+    let faulty = ctx
+        .version
+        .is_none_or(|v| matches!(v, (0, 2, 15) | (0, 2, 16) | (0, 3, 0)));
+    // Entries a few bytes apart are one function entered with and without its default
+    // arguments, so they count as one.
+    let one_each = lock_slots.values().all(|fs| {
+        let (first, last) = (fs.iter().min(), fs.iter().max());
+        first.zip(last).is_none_or(|(a, b)| b - a <= 64)
+    });
+    if ctx.vyper && faulty && one_each && lock_slots.len() >= 3 {
         let mut fns: Vec<String> = lock_slots
             .values()
             .flatten()
@@ -4751,7 +5284,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             .collect();
         fns.sort();
         push(&mut findings, "vyper-reentrancy-lock-bug", "Each @nonreentrant function uses its own lock slot (Vyper 0.2.15 – 0.3.0 codegen bug)", Severity::High, Confidence::Medium, None, None,
-            format!("{} functions implement a reentrancy lock, and every one of them locks a different storage slot, so none of them excludes the others. Vyper 0.2.15, 0.2.16 and 0.3.0 compiled `@nonreentrant(\"key\")` this way (Curve pools, July 2023). Functions: {}.", lock_slots.len(), fns.join(", ")),
+            format!("{} functions implement a reentrancy lock, and every one of them locks a different storage slot, so none of them excludes the others. Vyper 0.2.15, 0.2.16 and 0.3.0 compiled `@nonreentrant(\"key\")` this way (Curve pools, July 2023). Functions: {}.", fns.len(), fns.join(", ")),
             vec![], "Recompile with a fixed compiler; until then treat every locked function as re-enterable from the others.");
     }
     if any_payable
@@ -4820,10 +5353,10 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     } else if fallback_delegatecall {
         let kind = if eip1967 {
             "EIP-1967 upgradeable proxy"
-        } else if c.info.runtime.len() < 100 {
-            "EIP-1167 minimal proxy (clone)"
         } else if delegatecall_targets_storage {
             "Proxy (implementation address in storage)"
+        } else if c.info.runtime.len() < 100 {
+            "EIP-1167 minimal proxy (clone)"
         } else {
             "Proxy"
         };
@@ -4966,7 +5499,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                 c.strings
                     .iter()
                     .take(12)
-                    .map(|s| format!("\"{}\"", s))
+                    .map(|s| format!("\"{}\"", emit::escape(s)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -4975,8 +5508,61 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         );
     }
 
+    let findings = settle(c, findings);
+
+    let mut summary = BTreeMap::new();
+    for f in &findings {
+        *summary
+            .entry(format!("{:?}", f.severity).to_lowercase())
+            .or_insert(0) += 1;
+    }
+    report.risk_score = risk_score(&findings);
+    report.contract_kind = kinds;
+    report.findings = findings;
+    report.privileged_functions = privileged;
+    report.unauthenticated_state_changers = unauthenticated;
+    report.external_calls = external_calls.into_iter().collect();
+    let gate_slots: HashSet<String> = summaries
+        .iter()
+        .flat_map(|g| g.gate_slots.iter().cloned())
+        .collect();
+    for held in summaries.iter_mut().flat_map(|g| g.stores.iter_mut()) {
+        held.gates |= held.base.is_none() && gate_slots.contains(&held.slot);
+    }
+    report.summary = summary;
+    report.summaries = summaries;
+    report
+}
+
+// What every rule found, made into what the report shows: repeats dropped, sites of one
+// finding in one function joined, findings behind a lock grouped, the worst first.
+fn settle(c: &Contract, mut findings: Vec<Finding>) -> Vec<Finding> {
     let mut seen = HashSet::new();
-    findings.retain(|f| seen.insert((f.id.clone(), f.function.clone(), f.pc, f.title.clone())));
+    let entries: HashMap<String, usize> = c
+        .functions
+        .iter()
+        .map(|f| (display_name(f), f.pc))
+        .collect();
+    // A finding about a whole function carries that function's own start. It can say
+    // different things, such as two chains that start there, so only the same words are a
+    // repeat. Any other place is one piece of code. Its words differ when a helper was
+    // read through two of its callers.
+    findings.retain(|f| {
+        let own_start = f.function.as_ref().and_then(|name| entries.get(name));
+        let whole = f.pc.is_none() || f.pc.as_ref() == own_start;
+        let words = if whole {
+            f.description.clone()
+        } else {
+            String::new()
+        };
+        seen.insert((
+            f.id.clone(),
+            f.function.clone(),
+            f.pc,
+            f.title.clone(),
+            words,
+        ))
+    });
     let positions: HashMap<String, Vec<(String, String)>> = c
         .functions
         .iter()
@@ -5026,6 +5612,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             sites: locked.len(),
             confirmed: false,
             witness: None,
+            setup: Vec::new(),
+            observed: Vec::new(),
         });
     }
     findings.sort_by(|a, b| {
@@ -5034,29 +5622,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             .then(a.confidence.cmp(&b.confidence))
             .then(a.function.cmp(&b.function))
     });
-
-    let mut summary = BTreeMap::new();
-    for f in &findings {
-        *summary
-            .entry(format!("{:?}", f.severity).to_lowercase())
-            .or_insert(0) += 1;
-    }
-    report.risk_score = risk_score(&findings);
-    report.contract_kind = kinds;
-    report.findings = findings;
-    report.privileged_functions = privileged;
-    report.unauthenticated_state_changers = unauthenticated;
-    report.external_calls = external_calls.into_iter().collect();
-    let gate_slots: HashSet<String> = summaries
-        .iter()
-        .flat_map(|g| g.gate_slots.iter().cloned())
-        .collect();
-    for held in summaries.iter_mut().flat_map(|g| g.stores.iter_mut()) {
-        held.gates |= held.base.is_none() && gate_slots.contains(&held.slot);
-    }
-    report.summary = summary;
-    report.summaries = summaries;
-    report
+    findings
 }
 
 fn callee_divides(ctx: &Ctx, pc: usize, seen: &mut HashSet<usize>) -> bool {
@@ -5172,7 +5738,7 @@ fn capped_slots(c: &Contract) -> HashMap<U256, u64> {
             }
         }
     }
-    if std::env::var("EVMDEC_DEBUG_CAPS").is_ok() {
+    if crate::debug::on("EVMDEC_DEBUG_CAPS") {
         for (k, ws) in &writes {
             eprintln!(
                 "[caps] slot {} writes: {:?} bounds: {:?}",
@@ -5250,7 +5816,7 @@ fn require_conds(ctx: &Ctx, l: &Lifted, events: &[Event]) -> Vec<(ExprId, bool)>
 fn only_nonzero_bound(ctx: &Ctx, l: &Lifted, events: &[Event], amt: ExprId) -> Option<bool> {
     let mut zero_test = false;
     for (c0, holds) in require_conds(ctx, l, events) {
-        if !contains_expr(c0, amt) {
+        if !expr::has_part(c0, amt) {
             continue;
         }
         let mut c = c0;
@@ -5304,7 +5870,7 @@ fn reverse_quote(
         SEL_TRANSFER_FROM => {
             let to = emit::shifted_word_len(words, 1, in_len);
             let amt = emit::shifted_word_len(words, 2, in_len);
-            if std::env::var("EVMDEC_DEBUG_RQ").is_ok() {
+            if crate::debug::on("EVMDEC_DEBUG_RQ") {
                 eprintln!(
                     "[rq] transferFrom to={} amt={} to_this={} div={} bound={:?} words={}",
                     emit::fmt_expr(to, &names),
@@ -5499,6 +6065,8 @@ fn push_fact(
         sites: 1,
         confirmed: false,
         witness: None,
+        setup: Vec::new(),
+        observed: Vec::new(),
     });
 }
 
@@ -5628,7 +6196,7 @@ fn trust_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
             if gate_target || (target_slot.is_none() && !from_calldata(unmask(d.key))) {
                 continue;
             }
-            if std::env::var("EVMDEC_DEBUG_TRUST").is_ok() {
+            if crate::debug::on("EVMDEC_DEBUG_TRUST") {
                 eprintln!(
                     "[trust] {} debit {} key={:?} allowances={:?}",
                     x.name,
@@ -6019,6 +6587,94 @@ fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<
     }
 }
 
+const TRACE_LIMITS: crate::path::Limits = crate::path::Limits {
+    paths: 32,
+    runs: 128,
+};
+const TRACE_WORDS: usize = 32;
+const TRACE_ANSWER_BYTES: usize = 320;
+const TRACE_WORK: u64 = 3 * crate::exec::WORK_PER_SECOND;
+
+// A record copied to memory and updated there hides its fields from the rule above.
+// Along one run the lifter knows what every memory word holds, so the same limits are
+// read again from the checks of each run and added to what the function is known to cap.
+fn trace_bounds(c: &Contract, facts: &mut [FnFacts], names_for: &dyn Fn(&Function) -> Names) {
+    if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
+        return;
+    }
+    let layout = c.compiler.layout;
+    let begin = crate::deploy::storage(c);
+    let limits = TRACE_LIMITS;
+    let mut explorers = crate::path::Explorers::default();
+    for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
+        let Some(fact) = facts.iter_mut().find(|x| x.external && x.pc == f.pc) else {
+            continue;
+        };
+        let names = names_for(f);
+        let code = c.code_of(f);
+        let explorer = explorers.of(code);
+        // Zero words pass every type check on a decoded argument at once.
+        // Other values would spend the path limit on one check per field.
+        let mut start = crate::path::inputs_for(crate::exec::selector_of(f), TRACE_WORDS);
+        start.storage = begin.clone();
+        // A true word first, then room for a callee that answers with a record.
+        start.returned = U256::ONE.to_be_bytes().to_vec();
+        start.returned.resize(TRACE_ANSWER_BYTES, 0);
+        let free = crate::solve::Free {
+            words: TRACE_WORDS,
+            value: true,
+            storage: true,
+            fixed: Vec::new(),
+        };
+        let explored = explorer.explore(&start, &free, limits);
+        for p in explored {
+            let mut outflows: Vec<ExprId> = Vec::new();
+            for st in &p.effects {
+                match st {
+                    Stmt::Call {
+                        value,
+                        input,
+                        input_head,
+                        in_len,
+                        ..
+                    } => {
+                        outflows.extend(value.filter(|v| !expr::is_const(*v)));
+                        let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
+                        let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
+                        let selector = words
+                            .first()
+                            .and_then(|w0| emit::leading_selector(*w0, len));
+                        if selector == Some(SEL_TRANSFER) && words.len() >= 2 {
+                            outflows.push(emit::shifted_word_len(words, 1, len));
+                        }
+                    }
+                    Stmt::SStore { key, val, .. } => outflows.extend(subtracts_from(*val, *key)),
+                    _ => {}
+                }
+            }
+            let mut candidates: Vec<(AvailBound, ExprId)> = Vec::new();
+            let mut seen = HashSet::new();
+            for item in &p.items {
+                let e = match item {
+                    crate::solve::Item::Check { cond, .. } => *cond,
+                    crate::solve::Item::Store { val, .. } => *val,
+                };
+                limits_in(e, layout, &names, &mut seen, &mut candidates);
+            }
+            for (bound, other) in candidates {
+                let same = |b: &AvailBound| b.added == bound.added && b.subbed == bound.subbed;
+                if limits_outflow(other, &outflows) && !fact.avail_bounds.iter().any(same) {
+                    fact.avail_bounds.push(bound.clone());
+                    fact.moves_value = true;
+                }
+                if !fact.ref_bounds.iter().any(same) {
+                    fact.ref_bounds.push(bound);
+                }
+            }
+        }
+    }
+}
+
 fn accounting_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let mut flagged: HashSet<usize> = HashSet::new();
     for (i, f) in facts.iter().enumerate() {
@@ -6162,7 +6818,7 @@ fn link_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
                     "Call a function the target implements, or point the call at the contract that does.",
                     findings,
                 ),
-                (None, _) if call.sends_value && !catch_all(true) => tell(
+                (None, _) if call.sends_value && call.empty && !catch_all(true) => tell(
                     "value-to-non-payable",
                     "Ether is sent to a contract that does not accept it",
                     Severity::Medium,
@@ -6226,6 +6882,229 @@ fn link_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 "Review the linked contract's finding before relying on this call, and check what this contract does when the call misbehaves.",
                 findings,
             );
+        }
+    }
+}
+
+enum UseKind {
+    CallTarget { delegated: bool },
+    Gate,
+}
+
+struct StoredUse {
+    function: usize,
+    kind: UseKind,
+    value: ExprId,
+    loc: origin::Loc,
+    own_entry: bool,
+    line: String,
+}
+
+fn stored_uses(
+    ctx: &Ctx,
+    fact: &FnFacts,
+    function: usize,
+    events: &[Event],
+    names: &Names,
+    stores: &mut Vec<origin::Store>,
+    uses: &mut Vec<StoredUse>,
+) {
+    let layout = ctx.c.compiler.layout;
+    let gated = fact.caller_checked || fact.init_guarded;
+    let own = names.clone();
+    let read_from = |e: ExprId| -> Option<(origin::Loc, bool)> {
+        let mut found = None;
+        walk(e, &mut HashSet::new(), &mut |_, n| {
+            if let (Node::SLoad(k, false, _), None) = (n, &found) {
+                found = origin::loc_of(*k, layout).map(|loc| (loc, key_parties(*k).1));
+            }
+        });
+        found
+    };
+    for ev in events {
+        match &ev.stmt {
+            Some(Stmt::SStore {
+                key,
+                val,
+                transient: false,
+                ..
+            }) => {
+                if let Some(loc) = origin::loc_of(*key, layout) {
+                    stores.push(origin::Store {
+                        loc,
+                        gated,
+                        value: *val,
+                        by: function,
+                    });
+                }
+            }
+            Some(st @ Stmt::Call { kind, addr, .. }) if *kind != op::STATICCALL => {
+                if let Some((loc, own_entry)) = read_from(*addr) {
+                    uses.push(StoredUse {
+                        function,
+                        kind: UseKind::CallTarget {
+                            delegated: *kind == op::DELEGATECALL,
+                        },
+                        value: *addr,
+                        loc,
+                        own_entry,
+                        line: emit::fmt_stmt(st, &own),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    for cond in guard_conds(events) {
+        walk(cond, &mut HashSet::new(), &mut |_, n| {
+            let Node::Op(op::EQ | op::SUB | op::XOR, v) = n else {
+                return;
+            };
+            for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
+                let Node::SLoad(k, false, _) = expr::node(unmask(b)) else {
+                    continue;
+                };
+                if let (true, Some(loc)) = (is_caller(a), origin::loc_of(k, layout)) {
+                    uses.push(StoredUse {
+                        function,
+                        kind: UseKind::Gate,
+                        value: b,
+                        loc,
+                        own_entry: key_parties(k).1,
+                        line: emit::fmt_cond(cond, &own),
+                    });
+                }
+            }
+        });
+    }
+}
+
+// A fixed slot that an ungated function fills straight from its input is the older rules' ground.
+// These two report what they cannot see: values that arrive through other slots or sit in mappings.
+fn authority(
+    facts: &[FnFacts],
+    stores: &[origin::Store],
+    uses: &[StoredUse],
+    begin: &HashMap<U256, U256>,
+    findings: &mut Vec<Finding>,
+) -> Option<Section> {
+    let mut gates: BTreeMap<origin::Loc, BTreeSet<usize>> = BTreeMap::new();
+    for u in uses.iter().filter(|u| matches!(u.kind, UseKind::Gate)) {
+        gates.entry(u.loc).or_default().insert(u.function);
+    }
+    let name = |i: &usize| format!("`{}`", facts[*i].name);
+    let mut lines = Vec::new();
+    for (loc, gated) in &gates {
+        let place = match (loc.1, loc.2) {
+            (0, _) => format!("slot {}", loc.0.to_hex()),
+            (_, 0) => format!("the mapping at slot {}", loc.0.to_hex()),
+            (_, field) => format!("field {field} of the mapping at slot {}", loc.0.to_hex()),
+        };
+        let setters: BTreeSet<(usize, bool)> = stores
+            .iter()
+            .filter(|s| s.loc == *loc)
+            .map(|s| (s.by, s.gated))
+            .collect();
+        let set_by = match setters.is_empty() {
+            true => "No function in the runtime code writes it.".to_string(),
+            false => {
+                let each = setters.iter().map(|(by, checked)| {
+                    let how = if *checked {
+                        "behind a caller check"
+                    } else {
+                        "with no caller check"
+                    };
+                    format!("{} ({how})", name(by))
+                });
+                format!("It is written by {}.", each.collect::<Vec<_>>().join(", "))
+            }
+        };
+        lines.push(format!(
+            "{place} decides who may call {}. {set_by}",
+            gated.iter().map(name).collect::<Vec<_>>().join(", "),
+        ));
+        let unset = !begin.is_empty() && begin.get(&loc.0).is_none_or(|v| v.is_zero());
+        if let (true, true, 0, Some(first)) = (setters.is_empty(), unset, loc.1, gated.first()) {
+            push_fact(
+                findings,
+                "gate-never-set",
+                "A caller check reads a slot that nothing ever sets",
+                Severity::Low,
+                Confidence::Medium,
+                &facts[*first],
+                format!(
+                    "{} function(s) compare the caller with slot {}. The constructor leaves that slot at zero and no function in the runtime code writes it, so no account can pass the check and what it protects cannot be called.",
+                    gated.len(),
+                    loc.0.to_hex(),
+                ),
+                Vec::new(),
+                "Set the slot during construction, or add an authorised function that sets it, or remove the dead functions.",
+            );
+        }
+    }
+    (!lines.is_empty()).then_some(Section {
+        title: "Authority map".to_string(),
+        lines,
+    })
+}
+
+fn origin_findings(
+    ctx: &Ctx,
+    facts: &[FnFacts],
+    stores: &[origin::Store],
+    uses: &[StoredUse],
+    findings: &mut Vec<Finding>,
+) {
+    let model = Model::build(stores, ctx.c.compiler.layout);
+    let mut told: HashSet<(usize, origin::Loc, bool)> = HashSet::new();
+    for u in uses {
+        let f = &facts[u.function];
+        let fixed = u.loc.1 == 0;
+        if !f.external || !model.of(u.value).open() || (fixed && model.set_directly(u.loc)) {
+            continue;
+        }
+        match u.kind {
+            UseKind::CallTarget { delegated } => {
+                if f.caller_checked || (u.own_entry && !delegated) {
+                    continue;
+                }
+                if told.insert((u.function, u.loc, false)) {
+                    push_fact(
+                        findings,
+                        "stored-input-call-target",
+                        "A call target is read from storage any caller can fill",
+                        if delegated { Severity::High } else { Severity::Medium },
+                        Confidence::Medium,
+                        f,
+                        format!(
+                            "`{}` needs no role and {} an address it reads from storage. Following every store into that location back through the slots it is copied from, the value can be an argument or the caller of a function that needs no role either, so whoever calls first decides where this call goes.",
+                            f.name,
+                            if delegated { "runs the code at" } else { "calls" },
+                        ),
+                        vec![u.line.clone()],
+                        "Let only an authorised caller fill the location, or check the address against a fixed set before using it.",
+                    );
+                }
+            }
+            UseKind::Gate => {
+                if !fixed || !told.insert((usize::MAX, u.loc, true)) {
+                    continue;
+                }
+                push_fact(
+                    findings,
+                    "gate-on-open-slot",
+                    "An access check compares the caller with a value any caller can put there",
+                    Severity::High,
+                    Confidence::Medium,
+                    f,
+                    format!(
+                        "`{}` compares `msg.sender` with a slot. No function stores an argument there directly, but following the stores back through the slots the value is copied from, it can be an argument or the caller of a function that needs no role. The check then passes for whoever made those calls.",
+                        f.name,
+                    ),
+                    vec![u.line.clone()],
+                    "Gate every function on the path that fills the slot.",
+                );
+            }
         }
     }
 }
@@ -6776,8 +7655,27 @@ fn positional_evidence(
     f: &Finding,
     params: &HashMap<String, Vec<(String, String)>>,
 ) -> Vec<String> {
-    let Some(renames) = f.function.as_ref().and_then(|name| params.get(name)) else {
-        return f.evidence.clone();
+    let none = Vec::new();
+    let renames = f
+        .function
+        .as_ref()
+        .and_then(|name| params.get(name))
+        .unwrap_or(&none);
+    // A call's name carries a count of the calls printed before it in its function.
+    // The same line reached from two functions differs in that count and nothing else.
+    let counted = |word: &str| {
+        let numbered = ["success_", "ret_", "returndata_", "gasleft_", "created_"];
+        numbered.iter().any(|p| word.starts_with(p)).then(|| {
+            let mut plain = String::new();
+            for c in word.chars() {
+                match c.is_ascii_digit() {
+                    true if plain.ends_with('#') => {}
+                    true => plain.push('#'),
+                    false => plain.push(c),
+                }
+            }
+            plain
+        })
     };
     f.evidence
         .iter()
@@ -6801,7 +7699,7 @@ fn positional_evidence(
                 let member = out.ends_with('.');
                 match renames.iter().find(|(name, _)| *name == word) {
                     Some((_, position)) if !option && !member => out.push_str(position),
-                    _ => out.push_str(&word),
+                    _ => out.push_str(&counted(&word).unwrap_or(word)),
                 }
             }
             out
@@ -6831,12 +7729,19 @@ fn merge_findings(
                         p.evidence.push(e);
                     }
                 }
-                if f.severity < p.severity {
+                // What is shown comes from one site, the worse of the two. Mixing them gave a
+                // severity from one place with a confidence and a confirmation from another.
+                let worse = f.severity < p.severity
+                    || (f.severity == p.severity
+                        && conf_rank(f.confidence) > conf_rank(p.confidence));
+                if worse {
                     p.severity = f.severity;
                     p.description = f.description;
-                }
-                if conf_rank(f.confidence) > conf_rank(p.confidence) {
                     p.confidence = f.confidence;
+                    p.confirmed = f.confirmed;
+                    p.witness = f.witness;
+                    p.setup = f.setup;
+                    p.observed = f.observed;
                 }
                 if p.pc != f.pc {
                     p.pc = None;
@@ -6856,11 +7761,15 @@ fn merge_findings(
     let mut out: Vec<Finding> = Vec::new();
     let mut extra: Vec<Vec<String>> = Vec::new();
     for f in by_fn {
-        let same = f.pc.and_then(|_| {
+        // A finding made at several places in a function has no single place left. It is
+        // still the same finding as another function's when the lines shown are the same.
+        let placed = f.pc.is_some() || (f.sites > 1 && !f.evidence.is_empty());
+        let same = placed.then_some(()).and_then(|()| {
             out.iter().position(|p| {
                 p.id == f.id
                     && p.title == f.title
                     && p.pc == f.pc
+                    && p.sites == f.sites
                     && positional_evidence(p, params) == positional_evidence(&f, params)
                     && p.function.is_some()
                     && f.function.is_some()
@@ -6873,6 +7782,11 @@ fn merge_findings(
                 }
                 if f.severity < out[i].severity {
                     out[i].severity = f.severity;
+                    out[i].confidence = f.confidence;
+                    out[i].confirmed = f.confirmed;
+                    out[i].witness = f.witness;
+                    out[i].setup = f.setup;
+                    out[i].observed = f.observed;
                 }
             }
             None => {
@@ -6899,9 +7813,26 @@ fn merge_findings(
     out
 }
 
+fn prose(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    for c in text.chars() {
+        match c {
+            '`' => {
+                in_code = !in_code;
+                out.push(c);
+            }
+            '<' if !in_code => out.push_str("&lt;"),
+            '[' if !in_code => out.push_str("\\["),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# Security report: {}\n\n", title));
+    out.push_str(&format!("# Security report: {}\n\n", prose(title)));
     out.push_str(&format!("- Compiler: {}\n- Code size: {} bytes, {} instructions, {} external functions, {} internal functions\n- Coverage: {}/{} code blocks, {} unresolved jumps\n- Kind: {}\n- Risk score: {}/100\n\n",
         c.language, c.stats.code_bytes, c.stats.instructions, c.stats.external_functions, c.stats.internal_functions, c.stats.covered_blocks, c.stats.code_blocks, c.stats.unresolved_jumps,
         if r.contract_kind.is_empty() { "unclassified".to_string() } else { r.contract_kind.join(", ") }, r.risk_score));
@@ -6948,12 +7879,18 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
         }
         out.push_str(&format!("- Confidence: {:?}\n", f.confidence));
         if f.confirmed {
-            out.push_str("- Confirmed: reached from a fresh state by an arbitrary caller\n");
+            out.push_str("- Confirmed by running it\n");
+            for (i, call) in f.setup.iter().enumerate() {
+                out.push_str(&format!("- Earlier call {}: `{}`\n", i + 1, call));
+            }
             if let Some(w) = &f.witness {
                 out.push_str(&format!("- Witness calldata: `{}`\n", w));
             }
+            for line in &f.observed {
+                out.push_str(&format!("- Observed: {}\n", prose(line)));
+            }
         }
-        out.push_str(&format!("\n{}\n\n", f.description));
+        out.push_str(&format!("\n{}\n\n", prose(&f.description)));
         if !f.evidence.is_empty() {
             out.push_str("```solidity\n");
             for e in &f.evidence {
@@ -6963,6 +7900,13 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
             out.push_str("```\n\n");
         }
         out.push_str(&format!("Recommendation: {}\n\n", f.recommendation));
+    }
+    for section in &r.maps {
+        out.push_str(&format!("## {}\n\n", section.title));
+        for line in &section.lines {
+            out.push_str(&format!("- {}\n", prose(line)));
+        }
+        out.push('\n');
     }
     if !r.privileged_functions.is_empty() {
         out.push_str("## Privileged functions (gated by msg.sender checks)\n\n");
@@ -7161,4 +8105,118 @@ pub fn render_markdown(c: &Contract, r: &Report, title: &str) -> String {
     }
     let _ = sigs::get();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn found(severity: Severity, confidence: Confidence) -> Finding {
+        let mut out = Vec::new();
+        let text = String::from("words");
+        push(
+            &mut out,
+            "rule",
+            "title",
+            severity,
+            confidence,
+            None,
+            None,
+            text,
+            Vec::new(),
+            "",
+        );
+        out.remove(0)
+    }
+
+    #[test]
+    fn the_score_is_zero_for_nothing_and_never_passes_a_hundred() {
+        assert_eq!(risk_score(&[]), 0);
+        assert_eq!(risk_score(&[found(Severity::Info, Confidence::High)]), 0);
+        let many = vec![found(Severity::Critical, Confidence::High); 400];
+        assert_eq!(risk_score(&many), 100);
+    }
+
+    #[test]
+    fn one_more_finding_never_lowers_the_score() {
+        let ranks = [
+            Severity::Info,
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ];
+        let mut all = Vec::new();
+        let mut last = 0;
+        for round in 0..6 {
+            for severity in ranks {
+                let confidence = match round % 3 {
+                    0 => Confidence::Low,
+                    1 => Confidence::Medium,
+                    _ => Confidence::High,
+                };
+                all.push(found(severity, confidence));
+                let now = risk_score(&all);
+                assert!(now >= last, "{last} fell to {now}");
+                last = now;
+            }
+        }
+    }
+
+    fn two_function_contract() -> Contract {
+        let code = crate::hex::decode(
+            "60003560e01c8063aaaaaaaa1461001f5763bbbbbbbb1461002557600080fd5b60016000555b00",
+        )
+        .expect("hex");
+        decompile::decompile(&code, &decompile::Options::default())
+    }
+
+    #[test]
+    fn a_repeat_at_one_instruction_is_dropped_and_other_sites_are_counted() {
+        let c = two_function_contract();
+        let f = c
+            .functions
+            .iter()
+            .find(|f| f.kind == FnKind::External)
+            .expect("an external function");
+        let at = |pc: Option<usize>, words: &str| {
+            let mut out = Vec::new();
+            let text = words.to_string();
+            let (sev, conf) = (Severity::Medium, Confidence::Medium);
+            push(
+                &mut out,
+                "rule",
+                "title",
+                sev,
+                conf,
+                Some(f),
+                pc,
+                text,
+                vec![],
+                "",
+            );
+            out.remove(0)
+        };
+        let inside = Some(f.pc + 3);
+        let same_place = settle(
+            &c,
+            vec![at(inside, "seen one way"), at(inside, "seen another")],
+        );
+        assert_eq!((same_place.len(), same_place[0].sites), (1, 1));
+        let two_places = settle(&c, vec![at(inside, "one"), at(Some(f.pc + 9), "two")]);
+        assert_eq!((two_places.len(), two_places[0].sites), (1, 2));
+        let whole = settle(&c, vec![at(None, "one chain"), at(None, "another chain")]);
+        assert_eq!((whole.len(), whole[0].sites), (1, 2));
+        let repeat = settle(&c, vec![at(None, "one chain"), at(None, "one chain")]);
+        assert_eq!((repeat.len(), repeat[0].sites), (1, 1));
+    }
+
+    #[test]
+    fn the_worst_finding_comes_first() {
+        let c = two_function_contract();
+        let mut low = found(Severity::Low, Confidence::High);
+        low.id = "other".into();
+        let sorted = settle(&c, vec![low, found(Severity::Critical, Confidence::Medium)]);
+        assert_eq!(sorted[0].severity, Severity::Critical);
+    }
 }

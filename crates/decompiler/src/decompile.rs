@@ -599,7 +599,7 @@ pub fn decompile(code: &[u8], opts: &Options) -> Contract {
         };
         let mut ctor = decompile_runtime(&info.constructor, &cinfo, opts);
         for f in ctor.functions.iter_mut() {
-            if f.kind == FnKind::Fallback || (f.kind == FnKind::External && false) {
+            if f.kind == FnKind::Fallback {
                 f.kind = FnKind::Constructor;
                 f.name = "constructor".into();
             }
@@ -765,7 +765,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             by_block.push((*b, l));
         }
         let mut sums = HashMap::new();
-        let debug_sum = std::env::var("EVMDEC_DEBUG_SUMMARY").is_ok();
+        let debug_sum = crate::debug::on("EVMDEC_DEBUG_SUMMARY");
         for (b, l) in &by_block {
             if debug_sum {
                 eprintln!(
@@ -870,13 +870,9 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         acc
     };
 
-    let internals_static: &'static HashMap<usize, Lifted> = Box::leak(Box::new(
-        internals
-            .iter()
-            .map(|(pc, l)| (*pc, l.clone()))
-            .collect::<HashMap<usize, Lifted>>(),
-    ));
-    let resolve = move |pc: usize| -> Option<&'static Lifted> { internals_static.get(&pc) };
+    let internal_copies: HashMap<usize, Lifted> =
+        internals.iter().map(|(pc, l)| (*pc, l.clone())).collect();
+    let resolve = |pc: usize| internal_copies.get(&pc);
     let make = |kind: FnKind,
                 selector: Option<u32>,
                 l: Lifted,
@@ -1435,36 +1431,37 @@ pub(crate) fn clone_target(init: &[ExprId], len: ExprId) -> Option<String> {
     Some(U256::from_be_bytes(address).to_hex_padded(20))
 }
 
+// A block is read once however many nodes run it, with one running stack.
+// Working the stack out again before every copy was quadratic in a block full of them.
 fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
-    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut out: BTreeSet<(usize, usize)> = BTreeSet::new();
+    let mut read: HashSet<usize> = HashSet::new();
     for u in std::iter::once(&rec.main).chain(rec.functions.values()) {
         for n in &u.nodes {
+            if !read.insert(n.block) {
+                continue;
+            }
             let b = &prog.blocks[n.block];
-            let insns = prog.block_insns(b);
-            for (i, ins) in insns.iter().enumerate() {
-                if ins.opcode == op::CODECOPY && i >= 3 {
-                    let st = metadata::constant_stack(&insns[..i]);
-                    let l = st.len();
-                    if l >= 3 {
-                        if let (Some(off), Some(len)) = (
-                            st[l - 2].and_then(|v| v.as_usize()),
-                            st[l - 3].and_then(|v| v.as_usize()),
-                        ) {
-                            if len >= 64
-                                && off + len <= prog.code.len()
-                                && off >= b.end
-                                && !out.contains(&(off, len))
-                            {
-                                out.push((off, len));
-                            }
+            let mut st: Vec<Option<U256>> = Vec::new();
+            for (i, ins) in prog.block_insns(b).iter().enumerate() {
+                if let (op::CODECOPY, true, [.., len, off, _]) = (ins.opcode, i >= 3, &st[..]) {
+                    let region = off
+                        .and_then(|v| v.as_usize())
+                        .zip(len.and_then(|v| v.as_usize()));
+                    if let Some((off, len)) = region {
+                        let inside = off
+                            .checked_add(len)
+                            .is_some_and(|end| end <= prog.code.len());
+                        if len >= 64 && inside && off >= b.end {
+                            out.insert((off, len));
                         }
                     }
                 }
+                metadata::constant_step(&mut st, ins);
             }
         }
     }
-    out.sort();
-    out
+    out.into_iter().collect()
 }
 
 fn element_types(functions: &[Function]) -> HashMap<U256, String> {
@@ -1745,7 +1742,7 @@ fn name_storage_from_getters(
         let root: Option<U256> = match (field, expr::node(word)) {
             (Some((k, _, _)), _) => Some(k),
             (None, Node::SLoad(key, false, _)) => match expr::node(key) {
-                Node::Const(k) => emit::hashed_slot(k).map(|(s, _)| s).or(Some(k)),
+                Node::Const(k) => emit::array_element(k).map(|(s, _)| s).or(Some(k)),
                 _ => emit::element_root(key).or_else(|| {
                     ssa::slot_path(key, layout)
                         .filter(|p| p.steps.iter().all(|s| matches!(s, ssa::Step::Key(_))))
@@ -1977,7 +1974,7 @@ pub fn make_names(
 }
 
 fn refine_types(functions: &mut [Function], env: &TypeEnv) {
-    let debug = std::env::var("EVMDEC_DEBUG_TYPES").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_TYPES");
     for f in functions.iter_mut() {
         let Some(l) = &f.lifted else { continue };
         match f.kind {
@@ -2788,7 +2785,7 @@ fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
 // A key that happens to be zero or one where it is used says nothing about the key type.
 fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>, Option<String>) {
     if let Some(c) = expr::as_const(key) {
-        if let Some((s, _)) = emit::hashed_slot(c) {
+        if let Some((s, _)) = emit::array_element(c) {
             return (Some(s), Some("uint256[]".into()));
         }
         return (Some(c), None);

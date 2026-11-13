@@ -15,6 +15,9 @@ def analyze(path):
         return None, "rc=%d %s" % (out.returncode, out.stderr.strip().splitlines()[-1:] )
     return json.loads(out.stdout), None
 
+# The one miss is a contract whose flaw is in its configuration, not in its code.
+MIN_HITS = 24
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", action="store_true")
@@ -23,6 +26,7 @@ def main():
     print(f"{'contract':<20}{'year':>5} {'result':<8} {'score':>5}  expected -> found")
     hits = total = 0
     undetectable = []
+    labelled, caught, alerts = {}, {}, {}
     for name, m in manifest.items():
         path = os.path.join(ROOT, "testdata", "vuln", name + ".hex")
         if not os.path.exists(path):
@@ -44,6 +48,9 @@ def main():
             total += 1
             hits += hit
             res = "HIT" if hit else "MISS"
+            for e in m["expected"]:
+                labelled[e] = labelled.get(e, 0) + 1
+                caught[e] = caught.get(e, 0) + (found.get(e, -1) >= need)
         got = " ".join(f"{k}:{'ilmhc'[v]}" for k, v in sorted(found.items()) if k not in NOISE)
         print(f"{name:<20}{m['year']:>5} {res:<8} {rep['risk_score']:>5}  {','.join(m['expected']) or '-'} -> {got}")
         if a.v:
@@ -60,8 +67,19 @@ def main():
             print(f"{f[:-4]:<22} ERROR {err}"); continue
         hc = [x for x in rep["findings"] if SEV[x["severity"]] >= 3]
         hc_total += len(hc)
+        for x in rep["findings"]:
+            if SEV[x["severity"]] >= 2 and x["id"] not in NOISE:
+                alerts[x["id"]] = alerts.get(x["id"], 0) + 1
         print(f"{f[:-4]:<22}{rep['risk_score']:>5}  {len(hc):>2}  {' '.join(sorted(set(x['id'] for x in hc)))}")
     print(f"\nhigh/critical findings on the audited corpus: {hc_total} across {len(good)} contracts")
+    print(f"\n{'rule':<34}{'labelled':>9}{'caught':>7}{'recall':>8}  medium or higher on audited code")
+    for rule in sorted(set(labelled) | set(alerts)):
+        n, c = labelled.get(rule, 0), caught.get(rule, 0)
+        recall = f"{c / n:.2f}" if n else "-"
+        print(f"{rule:<34}{n:>9}{c:>7}{recall:>8}  {alerts.get(rule, 0)}")
+    if hits < MIN_HITS or not good:
+        print(f"FAIL recall {hits}/{total} is under {MIN_HITS}, or the audited corpus is missing")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

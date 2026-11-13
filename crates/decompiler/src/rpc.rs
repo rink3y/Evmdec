@@ -3,6 +3,9 @@ use crate::hex;
 use crate::u256::U256;
 use crate::{expr, keccak};
 use serde_json::{json, Value};
+use std::cell::{Cell, RefCell};
+use std::io::Read;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct Chain {
@@ -110,11 +113,6 @@ pub const CHAINS: &[Chain] = &[
         endpoints: &["https://blast-rpc.publicnode.com", "https://rpc.blast.io"],
     },
     Chain {
-        name: "zksync",
-        id: 324,
-        endpoints: &["https://mainnet.era.zksync.io"],
-    },
-    Chain {
         name: "classic",
         id: 61,
         endpoints: &[
@@ -137,42 +135,76 @@ pub fn chain_by_name(name: &str) -> Option<&'static Chain> {
         .find(|c| c.name.eq_ignore_ascii_case(name) || c.id.to_string() == name)
 }
 
+const CALL_TIME: Duration = Duration::from_secs(20);
+// One request to this program may make this many calls to remote nodes, in this much
+// time. A contract of many parts could otherwise ask for a quarter of a million.
+const MAX_CALLS: usize = 4_000;
+const TOTAL_TIME: Duration = Duration::from_secs(240);
+// An answer is read through this limit. Without it a node that streams without end
+// fills the memory. Code is two hex digits a byte, so this leaves room for the largest.
+const MAX_ANSWER: u64 = 4 << 20;
+pub const MAX_CODE: usize = 1 << 20;
+
 #[derive(Clone, Debug)]
 pub struct Client {
     pub endpoints: Vec<String>,
-    pub timeout_secs: u64,
+    agent: ureq::Agent,
+    started: Instant,
+    calls: Cell<usize>,
+    // An endpoint that did not answer is not asked again. Each try costs the full wait.
+    dead: RefCell<Vec<bool>>,
+}
+
+fn listed(urls: &str) -> Vec<String> {
+    let trimmed = urls.split(',').map(|s| s.trim().to_string());
+    trimmed.filter(|s| !s.is_empty()).collect()
 }
 
 impl Client {
     pub fn new(rpc: Option<&str>, chain: &str) -> Result<Client, String> {
-        let mut endpoints: Vec<String> = Vec::new();
-        if let Some(r) = rpc {
-            endpoints.extend(
-                r.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            );
-        } else if let Ok(env) = std::env::var("EVMDEC_RPC_URL") {
-            endpoints.extend(
-                env.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            );
-        }
-        if endpoints.is_empty() {
-            let c = chain_by_name(chain).ok_or_else(|| {
+        let known = || {
+            chain_by_name(chain).ok_or_else(|| {
                 format!(
                     "unknown chain '{}' (known: {})",
                     chain,
                     CHAINS.iter().map(|c| c.name).collect::<Vec<_>>().join(", ")
                 )
-            })?;
-            endpoints.extend(c.endpoints.iter().map(|s| s.to_string()));
-        }
-        Ok(Client {
+            })
+        };
+        let named = rpc.map(listed).filter(|urls| !urls.is_empty());
+        let set = std::env::var("EVMDEC_RPC_URL")
+            .ok()
+            .map(|urls| listed(&urls));
+        let set = set.filter(|urls| !urls.is_empty());
+        let (endpoints, expected) = match (named, set) {
+            // Whoever names a node on the command line knows which chain it serves.
+            (Some(urls), _) => (urls, None),
+            // A node set for the whole program serves one chain. The chain asked for has
+            // to be that one, or the answer would be another chain's contract under the
+            // name of the chain asked for.
+            (None, Some(urls)) => (urls, Some(known()?)),
+            (None, None) => {
+                let urls = known()?.endpoints.iter().map(|s| s.to_string());
+                (urls.collect(), None)
+            }
+        };
+        let client = Client {
+            dead: RefCell::new(vec![false; endpoints.len()]),
             endpoints,
-            timeout_secs: 20,
-        })
+            agent: ureq::AgentBuilder::new().timeout(CALL_TIME).build(),
+            started: Instant::now(),
+            calls: Cell::new(0),
+        };
+        if let Some(chain) = expected {
+            let served = client.chain_id()?;
+            if served != chain.id {
+                return Err(format!(
+                    "the node this program is set to use serves chain {served}, not {} ({})",
+                    chain.name, chain.id
+                ));
+            }
+        }
+        Ok(client)
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -187,19 +219,39 @@ impl Client {
         params: Value,
         conclusive: impl Fn(&Value) -> bool,
     ) -> Result<Value, String> {
+        if self.calls.get() >= MAX_CALLS {
+            return Err(format!(
+                "the limit of {MAX_CALLS} calls to remote nodes for one request was reached"
+            ));
+        }
+        let Some(left) = TOTAL_TIME.checked_sub(self.started.elapsed()) else {
+            return Err(format!(
+                "calls to remote nodes had taken {} s",
+                TOTAL_TIME.as_secs()
+            ));
+        };
+        self.calls.set(self.calls.get() + 1);
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let mut last_err = String::new();
+        let mut last_err = String::from("no endpoint answers");
         let mut inconclusive: Option<Value> = None;
-        for ep in &self.endpoints {
-            let agent = ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(self.timeout_secs))
-                .build();
-            let resp = agent
+        for (index, ep) in self.endpoints.iter().enumerate() {
+            if self.dead.borrow()[index] {
+                continue;
+            }
+            let resp = self
+                .agent
                 .post(ep)
+                .timeout(left.min(CALL_TIME))
                 .set("content-type", "application/json")
                 .send_json(body.clone());
+            if matches!(resp, Err(ureq::Error::Transport(_))) {
+                self.dead.borrow_mut()[index] = true;
+            }
+            let read = |r: ureq::Response| {
+                serde_json::from_reader::<_, Value>(r.into_reader().take(MAX_ANSWER))
+            };
             match resp {
-                Ok(r) => match r.into_json::<Value>() {
+                Ok(r) => match read(r) {
                     Ok(v) => {
                         if let Some(err) = v.get("error") {
                             last_err = format!("{}: {}", ep, err);
@@ -234,7 +286,14 @@ impl Client {
         };
         let v = self.call_where("eth_getCode", json!([address, "latest"]), has_code)?;
         let s = v.as_str().ok_or("eth_getCode: result is not a string")?;
-        hex::decode(s)
+        let code = hex::decode(s)?;
+        if code.len() > MAX_CODE {
+            return Err(format!(
+                "the code at {address} is {} bytes, over the limit of {MAX_CODE}",
+                code.len()
+            ));
+        }
+        Ok(code)
     }
 
     pub fn get_storage(&self, address: &str, slot: &str) -> Result<U256, String> {

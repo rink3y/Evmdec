@@ -21,6 +21,21 @@ pub fn run<R>(time: Duration, work: impl FnOnce() -> R) -> Option<R> {
     }
 }
 
+const WORKER_STACK: usize = 64 << 20;
+
+// The depth limits in this crate are sized for a 2 MiB stack. The larger stack here is a
+// second line of defence. The thread also takes its expression table with it when it ends,
+// so a long-lived caller does not keep the table of every input it has seen.
+pub fn on_worker<R: Send>(work: impl FnOnce() -> R + Send) -> std::thread::Result<R> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(WORKER_STACK)
+            .spawn_scoped(scope, work)
+            .expect("a worker thread could not be started")
+            .join()
+    })
+}
+
 // Unwinds up to run. A half-built result must never be returned.
 pub fn check() {
     if DEADLINE
@@ -34,6 +49,12 @@ pub fn check() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worker_returns_its_result_and_reports_a_panic() {
+        assert_eq!(on_worker(|| 7).ok(), Some(7));
+        assert!(on_worker(|| panic!("expected in this test")).is_err());
+    }
 
     #[test]
     fn work_is_abandoned_once_its_time_has_passed() {

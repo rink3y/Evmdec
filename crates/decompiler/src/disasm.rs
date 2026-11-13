@@ -18,9 +18,6 @@ impl Instruction {
     pub fn is_push(&self) -> bool {
         opcode::is_push(self.opcode)
     }
-    pub fn push_value(&self) -> Option<U256> {
-        self.imm
-    }
 }
 
 impl Serialize for U256 {
@@ -95,5 +92,23 @@ pub fn format_instruction(i: &Instruction) -> String {
             v.to_hex_padded((i.opcode - 0x5f) as usize)
         ),
         _ => format!("{:06x}: {}", i.pc, i.name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_push_cut_off_by_the_end_of_the_code_is_marked() {
+        let insns = disassemble(&[0x60, 0x01, 0x61, 0xff]);
+        assert_eq!(insns.len(), 2);
+        assert!(!insns[0].truncated && insns[1].truncated);
+        assert_eq!(insns[1].pc, 2);
+    }
+
+    #[test]
+    fn a_jump_destination_inside_push_data_is_not_one() {
+        assert_eq!(jumpdests(&[0x60, 0x5b, 0x5b, 0x00]), vec![2]);
     }
 }

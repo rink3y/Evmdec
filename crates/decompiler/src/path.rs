@@ -59,6 +59,34 @@ pub struct Explorer {
     late: Cell<usize>,
 }
 
+// One explorer per piece of code. A contract made of several parts has several.
+#[derive(Default)]
+pub struct Explorers {
+    by_code: HashMap<*const u8, Explorer>,
+}
+
+impl Explorers {
+    pub fn of(&mut self, code: &[u8]) -> &Explorer {
+        let made = || Explorer::new(code);
+        self.by_code.entry(code.as_ptr()).or_insert_with(made)
+    }
+}
+
+// Branches alone never ask for a non-zero amount, and a zero amount moves nothing.
+// Every word differs, so two arguments are never equal by chance.
+pub fn varied_word(index: usize) -> U256 {
+    U256::from_u64(0x1001 + 2 * index as u64)
+}
+
+pub fn fill_words(calldata: &[u8], fixed: &[usize], value: impl Fn(usize) -> U256) -> Vec<u8> {
+    let mut out = calldata.to_vec();
+    for index in (0..calldata.len().saturating_sub(4) / 32).filter(|i| !fixed.contains(i)) {
+        let at = 4 + 32 * index;
+        out[at..at + 32].copy_from_slice(&value(index).to_be_bytes());
+    }
+    out
+}
+
 pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
     Inputs {
         calldata: exec::calldata(selector, &vec![U256::ZERO; words]),

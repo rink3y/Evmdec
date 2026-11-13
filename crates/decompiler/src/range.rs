@@ -46,8 +46,7 @@ fn product(a: U256, b: U256) -> Option<U256> {
 }
 
 fn sum(a: U256, b: U256) -> Option<U256> {
-    let (out, carried) = a.overflowing_add(b);
-    (!carried).then_some(out)
+    a.checked_add(b)
 }
 
 impl Range {

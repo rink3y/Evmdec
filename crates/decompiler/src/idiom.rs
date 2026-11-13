@@ -483,7 +483,7 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
     for (u, ln) in &l.node_map {
         inv.insert(*ln, *u);
     }
-    let debug = std::env::var("EVMDEC_DEBUG_LOOPS").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_LOOPS");
     let mut out = Vec::new();
     let step32 = |assigns: &Vec<(ExprId, ExprId)>, var: ExprId| -> bool {
         assigns.iter().any(|(v, val)| {
@@ -687,4 +687,22 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sum_is_split_into_its_terms_and_one_constant() {
+        let word = |at: u64| expr::calldataload(expr::konst_u64(at));
+        let (a, b) = (word(4), word(36));
+        let left = expr::op2(op::ADD, a, expr::konst_u64(3));
+        let right = expr::op2(op::ADD, expr::konst_u64(4), b);
+        let (terms, constant) = addends(expr::op2(op::ADD, left, right));
+        let mut wanted = vec![a, b];
+        wanted.sort();
+        assert_eq!(terms, wanted);
+        assert_eq!(constant, U256::from_u64(7));
+    }
 }

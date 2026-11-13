@@ -272,10 +272,10 @@ storage, logs, calls and the control decision are compared.
 | | |
 |---|---|
 | blocks | 13,656 |
-| runs | 109,011 |
+| runs | 109,003 |
 | mismatches | 0 |
-| inconclusive runs | 1,582 |
-| instructions in verified blocks | 158,380 / 159,940 |
+| inconclusive runs | 1,586 |
+| instructions in verified blocks | 158,341 / 159,940 |
 
 A mismatch is a decompiler bug by definition. An inconclusive run is one the reference cannot
 execute from the drawn state, or one that makes two differently based memory accesses alias.
@@ -291,7 +291,7 @@ whose exploits are public, from The DAO to Balancer V1, with the rules that must
 | known bugs found | 24 / 25 |
 | missed | the Fence tranche pool on Avalanche. Its limits are computed from an in-memory copy of the record. Reading limits from runs now recovers one of the two, which was invisible before; the other is not in a form the rule recognises, so the pool is still missed |
 | not counted | Nomad, an upgrade-time state error outside bytecode patterns |
-| high or critical findings on the 22 audited contracts | 28, nearly all on contracts whose purpose is to execute caller-supplied calls |
+| high or critical findings on the 22 audited contracts | 27, nearly all on contracts whose purpose is to execute caller-supplied calls |
 
 The audited corpus is the running false-positive budget for every rule change. The TENDRIL
 token on BSC, whose pool was drained through a hook contract the token trusted, is the case the
@@ -309,6 +309,7 @@ fixture for each of 25 rules that work by running the code, with the expected re
 | rules at precision 1.00 and recall 1.00 | 25 / 25 |
 | results that change when the code is padded after every jump destination | 0 |
 | rules whose sound fixture depends on a guard, and notice when it is removed | 6 / 6 |
+| sound fixtures on which another rule of the table is confirmed without cause | 0 |
 
 These fixtures are the nearest sound pattern to each flaw, not real contracts. On the 48 real
 contracts 38 findings are confirmed by a run, and the checks added here raise only
@@ -369,8 +370,11 @@ solc --bin MyContract.sol | tail -1 > my.hex
 PORT=8080 ./target/release/evmdec-server
 ```
 
+The compiler release is pinned in `rust-toolchain.toml`; rustup installs it on the first build.
+
 Chains: mainnet, sepolia, arbitrum, optimism, base, polygon, bsc, avalanche, gnosis, fantom,
-linea, scroll, blast, classic. Public endpoints are tried in order; an endpoint that
+linea, scroll, blast, classic. zkSync Era is not listed: its nodes return code for a different
+machine, which would be decompiled as if it were EVM bytecode. Public endpoints are tried in order; an endpoint that
 returns empty code or zero storage falls through to the next.
 
 Docker: `docker build -t evmdec . && docker run -p 8080:8080 evmdec`. The image builds the full
@@ -421,13 +425,14 @@ when the lookup was made); the contract asked for lists what was not fetched (`u
 and the contracts it creates (`embedded`). A report carries `summaries`: per external function,
 what it does with each word of its call data and what gates it. `depth` is the number of call
 edges to follow (default 2, at most 3, 0 for none). Requests are bounded: four decompilations
-in flight, five minutes each.
+in flight, four minutes each, sixteen more waiting. One request makes at most 4,000 calls to
+remote nodes in at most 240 seconds, and code over 1 MiB is refused.
 
 ### Configuration
 
 | variable | effect |
 |---|---|
-| `EVMDEC_RPC_URL` | comma-separated JSON-RPC endpoints, tried before the public list |
+| `EVMDEC_RPC_URL` | comma-separated JSON-RPC endpoints, used in place of the public list. The chain asked for has to be the chain they serve; a request for another chain is refused |
 | `EVMDEC_SIGS` | path of the signature index; empty disables it. Default search: `./sigs.idx`, next to the binary, `/var/lib/evmdec/sigs.idx`, `~/.evmdec/sigs.idx` |
 | `EVMDEC_NO_CONFIRM` | skip the confirmation and invariant passes |
 | `EVMDEC_TIMING` | print the time spent in each stage |
@@ -471,15 +476,18 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   needs more prior storage than that stays unconfirmed, not refuted.
 - The solver finds inputs, it does not prove their absence. A branch it cannot invert, a hash
   it would have to reverse, or a path past its limits is simply not explored, so a check that
-  reports nothing has not shown the property holds. Each dynamic pass also has a time limit
-  per contract.
+  reports nothing has not shown the property holds. Each check that runs code has a limit on
+  the work it may do, counted in steps run and solver work and not in seconds, so the same
+  input gives the same report on a slow or busy machine.
+- Those checks run on the contract asked for. A contract fetched with it gets the rules that
+  read the code, the reachability confirmation and the storage invariants, from the same pass.
 - The checks with a second account assume the balance the contract reads does not move unless
   a call in the run moves it, and the ordering check only places calls that pay nothing in and
   take nothing out, so that assumption holds.
 - The value-flow and re-entry checks need a function that takes a payment and credits the
   payer in one call from the starting storage. Contracts that need a longer setup are not
   reached: none of the reentrancy findings on the 26 exploited contracts is confirmed this
-  way. Payments are assumed to be backed by the contract's balance.
+  way. After a payment the contract is taken to hold what was paid in and no more.
 - The signed-message and standard-interface checks choose storage so that the call can end
   normally, and say so in the finding. They show what the code does in that state, not that
   the state is reachable.

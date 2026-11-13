@@ -759,7 +759,7 @@ fn with_init(e: ExprId, init: &HashMap<ExprId, ExprId>) -> ExprId {
 fn reroll_peeled_loops(l: &Lifted) -> Lifted {
     let g = Graph::new(l);
     let loops = find_loops(&g);
-    let debug = std::env::var("EVMDEC_DEBUG_PEEL").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_PEEL");
     if debug && !loops.is_empty() {
         for nd in &l.nodes {
             eprintln!(
@@ -856,7 +856,7 @@ fn reroll_peeled_loops(l: &Lifted) -> Lifted {
 }
 
 fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
-    let debug = std::env::var("EVMDEC_DEBUG_PEEL").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_PEEL");
     let fail = |why: &str| {
         if debug {
             eprintln!("[peel]     copy {} of {}: {}", hp, q0, why);
@@ -1085,7 +1085,7 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
         }
     }
     let mut dead = HashSet::new();
-    let debug = std::env::var("EVMDEC_DEBUG_DEAD").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_DEAD");
     for nd in &l.nodes {
         if debug && nd.stmts.iter().any(|s| matches!(s, Stmt::Copy { .. })) {
             eprintln!(
@@ -1545,7 +1545,7 @@ fn available_at(
             _ => l.nodes[x].stmts.len(),
         };
         if let Some(bad) = l.nodes[x].stmts[..limit].iter().find(|s| !clean_stmt(s)) {
-            if std::env::var("EVMDEC_DEBUG_BIND").is_ok() {
+            if crate::debug::on("EVMDEC_DEBUG_BIND") {
                 eprintln!(
                     "[bind]   node {} blocks hoisting: {}",
                     x,
@@ -1593,7 +1593,7 @@ fn reaches_within(l: &Lifted, a: usize, b: usize, within: &HashSet<usize>) -> bo
 
 fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
     let g = Graph::new(l);
-    let debug = std::env::var("EVMDEC_DEBUG_BIND").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_BIND");
     let mut uses: HashMap<ExprId, Vec<(usize, Pos)>> = HashMap::new();
     let mut count: HashMap<ExprId, usize> = HashMap::new();
     let mut first_seen: HashMap<ExprId, usize> = HashMap::new();
@@ -2487,7 +2487,7 @@ impl<'a> Printer<'a> {
             true => cond_node,
             false => header,
         };
-        if std::env::var("EVMDEC_DEBUG_LOOP").is_ok() {
+        if crate::debug::on("EVMDEC_DEBUG_LOOP") {
             let tf = match &nd.term {
                 Term::Branch { t, f, .. } => format!(
                     "branch t={:?} (in body {:?}) f={} (in body {})",
@@ -2803,7 +2803,7 @@ impl<'a> Printer<'a> {
         if self.names.bool_returns.as_slice() != [true] {
             return None;
         }
-        if std::env::var("EVMDEC_DEBUG_FOLD").is_ok() {
+        if crate::debug::on("EVMDEC_DEBUG_FOLD") {
             eprintln!(
                 "[fold] bool return sides {} {:?} {:?} / {} {:?} {:?}",
                 t,

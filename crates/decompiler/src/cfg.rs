@@ -98,14 +98,6 @@ impl Program {
             None
         }
     }
-
-    pub fn block_containing(&self, pc: usize) -> Option<usize> {
-        self.block_at_pc
-            .range(..=pc)
-            .next_back()
-            .map(|(_, b)| *b)
-            .filter(|b| self.blocks[*b].end > pc)
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1242,7 +1234,7 @@ impl<'a> Analysis<'a> {
             if list.len() >= MAX_BLOCK_CONTEXTS {
                 return list[0];
             }
-            if std::env::var("EVMDEC_DEBUG_CTX").is_ok() && !list.is_empty() {
+            if crate::debug::on("EVMDEC_DEBUG_CTX") && !list.is_empty() {
                 eprintln!(
                     "[ctx] block {:#x}: new context {:?} vs existing {:?}",
                     prog.blocks[blk].start,
@@ -1639,5 +1631,20 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
         orphans,
         unresolved_jumps: unresolved,
         budget_exhausted: budget,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_end_at_a_branch_and_start_at_a_destination() {
+        let code = crate::hex::decode("6001600757005b6002005b00").expect("hex");
+        let prog = Program::new(code);
+        let starts: Vec<usize> = prog.blocks.iter().map(|b| b.start).collect();
+        assert_eq!(starts, vec![0, 5, 6, 10]);
+        assert!(prog.blocks[2].is_jumpdest && !prog.blocks[1].is_jumpdest);
+        assert_eq!(prog.block_at_pc.get(&6), Some(&2));
     }
 }

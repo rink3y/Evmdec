@@ -1,4 +1,4 @@
-use crate::abi;
+use crate::abi::{self, SEL_TRANSFER_FROM};
 use crate::analyze::{display_name, Confidence, Finding, Severity};
 use crate::decompile::{Contract, Function};
 use crate::deploy;
@@ -15,8 +15,6 @@ use crate::seq::{self, Entry};
 use crate::solve::{self, Free, Inputs, Item};
 use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
-
-const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
 
 // Only rules whose whole claim is reachability from a fresh state.
 // Reentrancy needs a seeded balance and arithmetic is about values.

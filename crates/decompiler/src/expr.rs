@@ -785,6 +785,22 @@ pub fn children(e: ExprId) -> Vec<ExprId> {
     }
 }
 
+const MAX_PARTS_SEARCHED: usize = 5_000;
+
+pub fn has_part(e: ExprId, target: ExprId) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if x == target {
+            return true;
+        }
+        if seen.insert(x) && seen.len() <= MAX_PARTS_SEARCHED {
+            stack.extend(children(x));
+        }
+    }
+    false
+}
+
 pub fn contains(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![e];

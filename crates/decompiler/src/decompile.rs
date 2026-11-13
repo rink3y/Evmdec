@@ -599,7 +599,7 @@ pub fn decompile(code: &[u8], opts: &Options) -> Contract {
         };
         let mut ctor = decompile_runtime(&info.constructor, &cinfo, opts);
         for f in ctor.functions.iter_mut() {
-            if f.kind == FnKind::Fallback || (f.kind == FnKind::External && false) {
+            if f.kind == FnKind::Fallback {
                 f.kind = FnKind::Constructor;
                 f.name = "constructor".into();
             }
@@ -765,7 +765,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             by_block.push((*b, l));
         }
         let mut sums = HashMap::new();
-        let debug_sum = std::env::var("EVMDEC_DEBUG_SUMMARY").is_ok();
+        let debug_sum = crate::debug::on("EVMDEC_DEBUG_SUMMARY");
         for (b, l) in &by_block {
             if debug_sum {
                 eprintln!(
@@ -1974,7 +1974,7 @@ pub fn make_names(
 }
 
 fn refine_types(functions: &mut [Function], env: &TypeEnv) {
-    let debug = std::env::var("EVMDEC_DEBUG_TYPES").is_ok();
+    let debug = crate::debug::on("EVMDEC_DEBUG_TYPES");
     for f in functions.iter_mut() {
         let Some(l) = &f.lifted else { continue };
         match f.kind {

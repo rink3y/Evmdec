@@ -1,4 +1,4 @@
-use crate::abi;
+use crate::abi::{self, SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::analyze::{display_name, push, Confidence, Finding, Severity};
 use crate::cross::World;
 use crate::decompile::{Contract, Function};
@@ -9,15 +9,11 @@ use crate::function::FnKind;
 use crate::hex;
 use crate::interp::CallRecord;
 use crate::opcode as op;
-use crate::path::{self, Explorer, Limits, Path};
+use crate::path::{self, Explorers, Limits, Path};
 use crate::solve::{self, word, Free, Inputs, Step};
 use crate::ssa;
 use crate::u256::U256;
 use std::collections::HashMap;
-
-const SEL_TRANSFER: u32 = 0xa905_9cbb;
-const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
-const SEL_BALANCE_OF: u32 = 0x70a0_8231;
 
 const LIMITS: Limits = Limits {
     paths: 12,
@@ -84,12 +80,7 @@ fn sent(p: &Path) -> Vec<(Asset, U256)> {
 }
 
 fn sum(a: U256, b: U256) -> U256 {
-    let out = a.wrapping_add(b);
-    if out < a {
-        U256::MAX
-    } else {
-        out
-    }
+    a.checked_add(b).unwrap_or(U256::MAX)
 }
 
 fn total(moves: &[(Asset, U256)], asset: Asset) -> U256 {
@@ -184,15 +175,6 @@ fn word_reply(value: U256) -> Vec<u8> {
     value.to_be_bytes().to_vec()
 }
 
-fn filled(calldata: &[u8], fixed: &[usize], value: impl Fn(usize) -> U256) -> Vec<u8> {
-    let mut out = calldata.to_vec();
-    for index in (0..calldata.len().saturating_sub(4) / 32).filter(|i| !fixed.contains(i)) {
-        let at = 4 + 32 * index;
-        out[at..at + 32].copy_from_slice(&value(index).to_be_bytes());
-    }
-    out
-}
-
 struct Deposit<'a> {
     function: &'a Function,
     path: Path,
@@ -203,7 +185,7 @@ struct Deposit<'a> {
 
 struct Pass<'a> {
     c: &'a Contract,
-    explorers: HashMap<*const u8, Explorer>,
+    explorers: Explorers,
     start: HashMap<U256, U256>,
 }
 
@@ -218,10 +200,7 @@ impl<'a> Pass<'a> {
             return Vec::new();
         }
         let code = self.c.code_of(f);
-        let explorer = self
-            .explorers
-            .entry(code.as_ptr())
-            .or_insert_with(|| Explorer::new(code));
+        let explorer = self.explorers.of(code);
         explorer.explore(start, free, limits)
     }
 
@@ -238,7 +217,7 @@ impl<'a> Pass<'a> {
         };
         let one = word_reply(U256::ONE);
         let inputs = Inputs {
-            calldata: filled(&calldata, &fixed, words),
+            calldata: path::fill_words(&calldata, &fixed, words),
             returned: one.clone(),
             replies: vec![(SEL_TRANSFER, one.clone()), (SEL_TRANSFER_FROM, one)],
             storage: self.start.clone(),
@@ -257,10 +236,7 @@ impl<'a> Pass<'a> {
         let mut out: Vec<Deposit<'a>> = Vec::new();
         for f in self.externals() {
             // One check needs a single unit paid in. The others need room to pay out in parts.
-            let sizes: [(u64, Fill); 2] = [
-                (1, |_| U256::ONE),
-                (0x1001, |i| U256::from_u64(0x1001 + 2 * i as u64)),
-            ];
+            let sizes: [(u64, Fill); 2] = [(1, |_| U256::ONE), (0x1001, path::varied_word)];
             for (value, words) in sizes {
                 let (mut start, free) = self.base(f, words);
                 start.callvalue = U256::from_u64(value);
@@ -405,7 +381,7 @@ impl<'a> Pass<'a> {
         let before = all_sent(q);
         let functions: Vec<&Function> = self.externals().take(MAX_OTHER_CALLS).collect();
         for h in functions {
-            let (mut start, free) = self.base(h, |i| U256::from_u64(0x1001 + 2 * i as u64));
+            let (mut start, free) = self.base(h, path::varied_word);
             start.storage = d.path.run.storage.clone();
             start.caller = SECOND_CALLER;
             let quiet = |p: &Path| {
@@ -586,10 +562,7 @@ impl<'a> Pass<'a> {
 
     fn run(&mut self, f: &Function, inputs: &Inputs) -> Path {
         let code = self.c.code_of(f);
-        let explorer = self
-            .explorers
-            .entry(code.as_ptr())
-            .or_insert_with(|| Explorer::new(code));
+        let explorer = self.explorers.of(code);
         explorer.run(inputs)
     }
 
@@ -598,7 +571,7 @@ impl<'a> Pass<'a> {
         let mut first_unanswered = None;
         let functions: Vec<&Function> = self.externals().collect();
         for f in functions {
-            let (start, free) = self.base(f, |i| U256::from_u64(0x1001 + 2 * i as u64));
+            let (start, free) = self.base(f, path::varied_word);
             let found = self.explore(f, &start, &free, LIMITS);
             let asks = |p: &&Path| {
                 let transfer = |c: &CallRecord| {
@@ -661,7 +634,7 @@ impl<'a> Pass<'a> {
             let Some(f) = functions.iter().find(named) else {
                 continue;
             };
-            let (mut start, free) = self.base(f, |i| U256::from_u64(0x1001 + 2 * i as u64));
+            let (mut start, free) = self.base(f, path::varied_word);
             let read = U256::from_u64(0x10_0000);
             (start.returned, start.balance) = (word_reply(read), read);
             let found = self.explore(f, &start, &free, LIMITS);
@@ -774,10 +747,7 @@ impl<'a> Pass<'a> {
         let mut alone = q.inputs.clone();
         alone.storage = self.start.clone();
         let code = self.c.code_of(g);
-        let explorer = self
-            .explorers
-            .entry(code.as_ptr())
-            .or_insert_with(|| Explorer::new(code));
+        let explorer = self.explorers.of(code);
         let again = explorer.run(&alone);
         again.succeeded() && total(&sent(&again), asset) >= back
     }
@@ -788,7 +758,7 @@ impl<'a> Pass<'a> {
             return;
         }
         let f = d.function;
-        let (mut start, free) = self.base(f, |i| U256::from_u64(0x1001 + 2 * i as u64));
+        let (mut start, free) = self.base(f, path::varied_word);
         start.storage = d.path.run.storage.clone();
         start.caller = SECOND_CALLER;
         start.callvalue = match d.taken[0].0 {
@@ -811,10 +781,7 @@ impl<'a> Pass<'a> {
         honest.returned = word_reply(U256::ONE);
         honest.balance = U256::ONE;
         let code = self.c.code_of(f);
-        let explorer = self
-            .explorers
-            .entry(code.as_ptr())
-            .or_insert_with(|| Explorer::new(code));
+        let explorer = self.explorers.of(code);
         let plain = explorer.run(&honest);
         if !plain.succeeded() || credited(&plain, layout).is_none() {
             return;
@@ -986,7 +953,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     let layout = c.compiler.layout;
     let mut pass = Pass {
         c,
-        explorers: HashMap::new(),
+        explorers: Explorers::default(),
         start: deploy::storage(c),
     };
     let deposits = pass.deposits(layout);

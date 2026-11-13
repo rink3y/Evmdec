@@ -425,11 +425,6 @@ pub fn exprs_with_callees_tagged<'a>(
     out
 }
 
-pub fn infer_params(l: &Lifted) -> Vec<Param> {
-    let roots: Vec<Root> = l.nodes.iter().flat_map(lift::roots).collect();
-    infer_params_from(&roots)
-}
-
 pub fn packing_masks(roots: &[Root]) -> HashSet<ExprId> {
     let mut out = HashSet::new();
     let mut seen = HashSet::new();

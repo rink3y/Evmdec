@@ -1,5 +1,9 @@
 use crate::u256::U256;
 
+pub const SEL_TRANSFER: u32 = 0xa905_9cbb;
+pub const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
+pub const SEL_BALANCE_OF: u32 = 0x70a0_8231;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ty {
     Word,

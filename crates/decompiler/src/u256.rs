@@ -99,6 +99,11 @@ impl U256 {
         !self.is_zero() && (*self + U256::ONE).is_power_of_two() || *self == U256::MAX
     }
 
+    pub fn checked_add(self, rhs: U256) -> Option<U256> {
+        let (out, carried) = self.overflowing_add(rhs);
+        (!carried).then_some(out)
+    }
+
     pub fn overflowing_add(self, rhs: U256) -> (U256, bool) {
         let mut r = [0u64; 4];
         let mut carry = 0u64;

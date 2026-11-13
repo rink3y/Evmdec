@@ -8,7 +8,7 @@ use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
 use crate::lift::{Stmt, Term};
 use crate::opcode as op;
-use crate::path::{self, Explorer, Limits, Path};
+use crate::path::{self, Explorers, Limits, Path};
 use crate::solve::{self, Free, Inputs, Item, Step};
 use crate::ssa;
 use crate::u256::U256;
@@ -60,27 +60,18 @@ fn deltas(steps: &[Step], layout: MappingLayout) -> BTreeMap<Place, U256> {
     net
 }
 
-// Branches alone never ask for a non-zero amount, and a zero amount moves nothing.
 fn varied(calldata: &[u8], fixed: &[usize]) -> Vec<u8> {
-    let mut out = calldata.to_vec();
-    for index in (0..calldata.len().saturating_sub(4) / 32).filter(|i| !fixed.contains(i)) {
-        let at = 4 + 32 * index;
-        let value = U256::from_u64(0x1001 + 2 * index as u64);
-        out[at..at + 32].copy_from_slice(&value.to_be_bytes());
-    }
-    out
+    path::fill_words(calldata, fixed, path::varied_word)
 }
 
 fn runs(c: &Contract) -> Vec<Run<'_>> {
     let mut out = Vec::new();
     let begin = deploy::storage(c);
     let from = deploy::start_text(&begin);
-    let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
+    let mut explorers = Explorers::default();
     for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
         let code = c.code_of(f);
-        let explorer = explorers
-            .entry(code.as_ptr())
-            .or_insert_with(|| Explorer::new(code));
+        let explorer = explorers.of(code);
         let selector = exec::selector_of(f);
         let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
         let shaped = abi::layout(selector, &types);
@@ -165,7 +156,7 @@ fn report(
 }
 
 // Two flags that both flip, or two counters that both step by one, move together by chance.
-fn amount_sized(delta: U256) -> bool {
+pub(crate) fn amount_sized(delta: U256) -> bool {
     let small = U256::from_u64(0xff);
     delta > small && U256::ZERO.wrapping_sub(delta) > small
 }
@@ -344,20 +335,6 @@ fn lock_left(all: &[Run], out: &mut Vec<Finding>) {
     }
 }
 
-fn mentions(e: ExprId, target: ExprId) -> bool {
-    let mut seen = HashSet::new();
-    let mut stack = vec![e];
-    while let Some(x) = stack.pop() {
-        if x == target {
-            return true;
-        }
-        if seen.insert(x) && seen.len() < 4_000 {
-            stack.extend(expr::children(x));
-        }
-    }
-    false
-}
-
 fn read_of_one_slot(e: ExprId) -> Option<ExprId> {
     match expr::node(e) {
         Node::SLoad(key, false, _) => Some(key),
@@ -411,33 +388,33 @@ fn dropped_change(run: &Run) -> Option<(ExprId, ExprId)> {
     let end_uses = |val: ExprId| match &run.path.end {
         Some(Term::Return { data, .. }) => data
             .as_ref()
-            .is_none_or(|words| words.iter().any(|w| mentions(*w, val))),
+            .is_none_or(|words| words.iter().any(|w| expr::has_part(*w, val))),
         Some(Term::Stop) => false,
         _ => true,
     };
     let checked = |val: ExprId| {
         run.path.items.iter().any(|item| match item {
-            Item::Check { cond, .. } => mentions(*cond, val),
+            Item::Check { cond, .. } => expr::has_part(*cond, val),
             Item::Store { .. } => false,
         })
     };
     changed.into_iter().find_map(|(at, key, val)| {
         let used_later = effects[at + 1..].iter().any(|st| match st {
-            Stmt::SStore { key: k, val: v, .. } => *k == key || mentions(*v, val),
+            Stmt::SStore { key: k, val: v, .. } => *k == key || expr::has_part(*v, val),
             Stmt::Call { input, value, .. } => {
-                let sent = value.is_some_and(|v| mentions(v, val));
+                let sent = value.is_some_and(|v| expr::has_part(v, val));
                 sent || input
                     .as_ref()
-                    .is_none_or(|words| words.iter().any(|w| mentions(*w, val)))
+                    .is_none_or(|words| words.iter().any(|w| expr::has_part(*w, val)))
             }
             Stmt::Log { data, topics, .. } => {
-                topics.iter().any(|t| mentions(*t, val))
+                topics.iter().any(|t| expr::has_part(*t, val))
                     || data
                         .as_ref()
-                        .is_none_or(|words| words.iter().any(|w| mentions(*w, val)))
+                        .is_none_or(|words| words.iter().any(|w| expr::has_part(*w, val)))
             }
             Stmt::Create { .. } => true,
-            Stmt::MStore { val: v, .. } => *v != val && mentions(*v, val),
+            Stmt::MStore { val: v, .. } => *v != val && expr::has_part(*v, val),
             _ => false,
         });
         (!used_later && !end_uses(val) && !checked(val)).then_some((key, val))
@@ -927,7 +904,7 @@ fn raw_words(e: ExprId) -> Vec<ExprId> {
 fn unbounded_word(run: &Run, place: ExprId) -> Option<ExprId> {
     let tested = |word: ExprId| {
         run.path.items.iter().any(|item| match item {
-            Item::Check { cond, .. } => mentions(*cond, word),
+            Item::Check { cond, .. } => expr::has_part(*cond, word),
             Item::Store { .. } => false,
         })
     };
@@ -988,7 +965,7 @@ fn aimed_writes(all: &[Run], out: &mut Vec<Finding>) {
 }
 
 fn short_input(c: &Contract, all: &[Run], out: &mut Vec<Finding>) {
-    let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
+    let mut explorers = Explorers::default();
     let mut accepted: Vec<&Run> = Vec::new();
     let mut seen: BTreeSet<usize> = BTreeSet::new();
     for run in all.iter().filter(|r| !r.assumed) {
@@ -1009,9 +986,7 @@ fn short_input(c: &Contract, all: &[Run], out: &mut Vec<Finding>) {
             continue;
         }
         let code = c.code_of(run.function);
-        let explorer = explorers
-            .entry(code.as_ptr())
-            .or_insert_with(|| Explorer::new(code));
+        let explorer = explorers.of(code);
         let mut cut = inputs.clone();
         cut.calldata
             .truncate(4 + 32 * run.function.params.len() - 1);
@@ -1047,7 +1022,7 @@ fn short_input(c: &Contract, all: &[Run], out: &mut Vec<Finding>) {
 
 fn refusing_payee(c: &Contract, all: &[Run], out: &mut Vec<Finding>) {
     const KNOWN: [&str; 2] = ["blocking-payout-loop", "fixed-payee-can-block"];
-    let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
+    let mut explorers = Explorers::default();
     let mut told: BTreeSet<usize> = BTreeSet::new();
     for run in all.iter().filter(|r| !r.assumed) {
         if told.contains(&run.function.pc) {
@@ -1084,9 +1059,7 @@ fn refusing_payee(c: &Contract, all: &[Run], out: &mut Vec<Finding>) {
             continue;
         }
         let code = c.code_of(run.function);
-        let explorer = explorers
-            .entry(code.as_ptr())
-            .or_insert_with(|| Explorer::new(code));
+        let explorer = explorers.of(code);
         let blocked = payees.iter().find_map(|(index, _)| {
             let mut refused = inputs.clone();
             refused.failing = Some(*index);
@@ -1149,7 +1122,7 @@ fn growth(c: &Contract, all: &[Run], begin: &HashMap<U256, U256>, out: &mut Vec<
             }
         }
     }
-    let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
+    let mut explorers = Explorers::default();
     for (slot, adder) in counters.into_iter().take(MAX_COUNTERS) {
         let mut slowed: Vec<(String, usize)> = Vec::new();
         for g in c.functions.iter().filter(|f| f.kind == FnKind::External) {
@@ -1157,9 +1130,7 @@ fn growth(c: &Contract, all: &[Run], begin: &HashMap<U256, U256>, out: &mut Vec<
                 break;
             }
             let code = c.code_of(g);
-            let explorer = explorers
-                .entry(code.as_ptr())
-                .or_insert_with(|| Explorer::new(code));
+            let explorer = explorers.of(code);
             let steps_at = |length: u64| {
                 let mut inputs = path::inputs_for(exec::selector_of(g), WORDS);
                 inputs.storage = begin.clone();
@@ -1181,9 +1152,7 @@ fn growth(c: &Contract, all: &[Run], begin: &HashMap<U256, U256>, out: &mut Vec<
         let mut full = adder.path.inputs.clone();
         full.storage.insert(slot, U256::from_u64(LARGE_COUNT));
         let code = c.code_of(adder.function);
-        let explorer = explorers
-            .entry(code.as_ptr())
-            .or_insert_with(|| Explorer::new(code));
+        let explorer = explorers.of(code);
         if !explorer.run(&full).succeeded() {
             continue;
         }

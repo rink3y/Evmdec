@@ -5,7 +5,7 @@ use crate::deploy;
 use crate::exec;
 use crate::function::FnKind;
 use crate::opcode as op;
-use crate::path::{self, Explorer, Limits, Path};
+use crate::path::{self, Explorer, Explorers, Limits, Path};
 use crate::solve::{Free, Inputs};
 use crate::u256::U256;
 use std::collections::HashMap;
@@ -59,12 +59,7 @@ fn start_for(f: &Function, begin: &HashMap<U256, U256>) -> (Inputs, Free) {
         (shaped.calldata, shaped.fixed)
     };
     // An amount left at zero would hide that the repeated call pays again.
-    let mut calldata = calldata;
-    for index in (0..calldata.len().saturating_sub(4) / 32).filter(|i| !fixed.contains(i)) {
-        let at = 4 + 32 * index;
-        let value = U256::from_u64(0x1001 + 2 * index as u64);
-        calldata[at..at + 32].copy_from_slice(&value.to_be_bytes());
-    }
+    let calldata = path::fill_words(&calldata, &fixed, path::varied_word);
     let inputs = Inputs {
         calldata,
         returned: SIGNER.to_be_bytes().to_vec(),
@@ -179,7 +174,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         return;
     }
     let begin = deploy::storage(c);
-    let mut explorers: HashMap<*const u8, Explorer> = HashMap::new();
+    let mut explorers = Explorers::default();
     let external = |f: &&Function| f.kind == FnKind::External;
     for f in c.functions.iter().filter(external).take(MAX_FUNCTIONS) {
         if exec::spent() {
@@ -189,9 +184,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         if !code.contains(&op::STATICCALL) && !code.contains(&op::CALL) {
             continue;
         }
-        let explorer = explorers
-            .entry(code.as_ptr())
-            .or_insert_with(|| Explorer::new(code));
+        let explorer = explorers.of(code);
         let (found, fixed) = explored(explorer, f, &begin);
         let acted = |p: &&Path| p.succeeded() && acts(p) && digest_of(p).is_some();
         if let Some(first) = found.iter().find(acted) {

@@ -1093,24 +1093,18 @@ pub struct State {
 }
 
 impl State {
-    fn pop(&mut self, root: bool, underflow: &mut bool) -> ExprId {
+    fn pop(&mut self) -> ExprId {
         match self.stack.pop() {
             Some(v) => v,
             None => {
-                if root {
-                    *underflow = true;
-                }
                 let v = expr::arg(self.args_used as u32);
                 self.args_used += 1;
                 v
             }
         }
     }
-    fn peek(&mut self, n: usize, root: bool, underflow: &mut bool) -> ExprId {
+    fn peek(&mut self, n: usize) -> ExprId {
         while self.stack.len() < n {
-            if root {
-                *underflow = true;
-            }
             let v = expr::arg(self.args_used as u32);
             self.args_used += 1;
             self.stack.insert(0, v);
@@ -1156,7 +1150,7 @@ pub struct CalleeSummary {
 }
 
 fn fail_summary(code: u32) -> Option<CalleeSummary> {
-    if std::env::var("EVMDEC_DEBUG_SUMMARY").is_ok() {
+    if crate::debug::on("EVMDEC_DEBUG_SUMMARY") {
         eprintln!("[summary] not summarisable (reason {})", code);
     }
     None
@@ -1431,7 +1425,7 @@ impl<'a> Lifter<'a> {
     pub fn lift_summarizing(&self, unit: &Unit, initial: Option<(Vec<ExprId>, bool)>) -> Lifted {
         let l = self.lift(unit, initial.clone());
         let loops = crate::idiom::copy_loops(&l);
-        if std::env::var("EVMDEC_DEBUG_LOOPS").is_ok() {
+        if crate::debug::on("EVMDEC_DEBUG_LOOPS") {
             eprintln!(
                 "[loops] unit entry block {} ({:#x}): {} copy loop(s) {:?}",
                 unit.entry_block,
@@ -1964,7 +1958,6 @@ impl<'a> Lifter<'a> {
         st.version = st.mem.gen;
         let mut stmts: Vec<Stmt> = Vec::new();
         let mut term: Option<Term> = None;
-        let mut underflow = false;
         let seq_base = (nid as u32) << SEQ_BITS;
         let mut seq_ctr = 0u32;
         // A trace and the oracle lift one node per step, so there the step is the number.
@@ -2007,19 +2000,19 @@ impl<'a> Lifter<'a> {
             let o = ins.opcode;
             macro_rules! pop {
                 () => {
-                    st.pop(false, &mut underflow)
+                    st.pop()
                 };
             }
             match o {
                 _ if op::is_push(o) => st.stack.push(konst(ins.imm.unwrap_or(U256::ZERO))),
                 _ if op::is_dup(o) => {
                     let n = (o - 0x7f) as usize;
-                    let v = st.peek(n, false, &mut underflow);
+                    let v = st.peek(n);
                     st.stack.push(v);
                 }
                 _ if op::is_swap(o) => {
                     let n = (o - 0x8f) as usize;
-                    st.peek(n + 1, false, &mut underflow);
+                    st.peek(n + 1);
                     let l = st.stack.len();
                     st.stack.swap(l - 1, l - 1 - n);
                 }
@@ -2150,7 +2143,9 @@ impl<'a> Lifter<'a> {
                 op::MLOAD => {
                     let off = pop!();
                     let v = st.mem.load_word(off, st.version);
-                    if std::env::var("EVMDEC_DEBUG_LOAD").is_ok_and(|w| w == ins.pc.to_string()) {
+                    if crate::debug::on("EVMDEC_DEBUG_LOAD")
+                        && std::env::var("EVMDEC_DEBUG_LOAD").is_ok_and(|w| w == ins.pc.to_string())
+                    {
                         eprintln!(
                             "MLOAD pc={} off={:?} norm={:?} -> {:?}",
                             ins.pc,
@@ -2264,7 +2259,6 @@ impl<'a> Lifter<'a> {
                             &mut st,
                             &mut stmts,
                             seq_at(ins.pc, seq_ctr),
-                            &mut underflow,
                         ));
                     } else if let Some(via) = un.returns_via {
                         let ret_arg = match via {
@@ -2449,7 +2443,10 @@ impl<'a> Lifter<'a> {
                         hidden.add(nid, st.mem.consumers(in_off, l.low_u64()));
                     }
                     let result = expr::intern(Node::CallResult(seq));
-                    if let Ok(want) = std::env::var("EVMDEC_DEBUG_HEAD") {
+                    let wanted = crate::debug::on("EVMDEC_DEBUG_HEAD")
+                        .then(|| std::env::var("EVMDEC_DEBUG_HEAD").ok())
+                        .flatten();
+                    if let Some(want) = wanted {
                         if want == "all" || want == ins.pc.to_string() {
                             eprintln!(
                                 "CALL pc={} in_off={:?} norm={:?} version={} gen={} clobber={}",
@@ -2633,11 +2630,10 @@ impl<'a> Lifter<'a> {
         st: &mut State,
         stmts: &mut Vec<Stmt>,
         seq: u32,
-        underflow: &mut bool,
     ) -> Term {
         let consumed = call.consumed as usize;
         if consumed > 0 {
-            st.peek(consumed, false, underflow);
+            st.peek(consumed);
         }
         let l = st.stack.len();
         let pre: Vec<ExprId> = st.stack.clone();
@@ -3950,4 +3946,65 @@ pub fn reachable(l: &Lifted) -> HashSet<usize> {
         }
     }
     seen
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decompile::{decompile, Options};
+
+    fn statements(code_hex: &str) -> Vec<Stmt> {
+        let code = crate::hex::decode(code_hex).expect("hex");
+        let c = decompile(&code, &Options::default());
+        let lifted = c.functions.iter().find_map(|f| f.lifted.as_ref());
+        let nodes = &lifted.expect("the code is lifted").nodes;
+        nodes.iter().flat_map(|n| n.stmts.clone()).collect()
+    }
+
+    fn stored(stmts: &[Stmt]) -> Vec<ExprId> {
+        let values = stmts.iter().filter_map(|s| match s {
+            Stmt::SStore { val, .. } => Some(*val),
+            _ => None,
+        });
+        values.collect()
+    }
+
+    #[test]
+    fn a_memory_copy_is_lifted_as_a_copy_of_its_kind() {
+        let stmts = statements("6020600060405e00");
+        let copy = stmts.iter().find_map(|s| match s {
+            Stmt::Copy { kind, len, .. } => Some((*kind, expr::as_const(*len))),
+            _ => None,
+        });
+        assert_eq!(copy, Some((op::MCOPY, Some(U256::from_u64(0x20)))));
+    }
+
+    #[test]
+    fn a_balance_read_after_a_call_is_not_the_one_read_before_it() {
+        let stmts = statements("3031600055600080808080335af1503031600155");
+        let values = stored(&stmts);
+        assert_eq!(values.len(), 2);
+        assert_ne!(values[0], values[1]);
+    }
+
+    #[test]
+    fn a_balance_read_twice_with_nothing_between_is_one_value() {
+        let values = stored(&statements("30313031600055600155"));
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], values[1]);
+    }
+
+    #[test]
+    fn two_calls_at_two_places_have_two_numbers() {
+        let stmts = statements("600080808080335af150600080808080335af15000");
+        let sites: Vec<u32> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Call { seq, .. } => Some(call_site(*seq)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sites.len(), 2);
+        assert_ne!(sites[0], sites[1]);
+    }
 }

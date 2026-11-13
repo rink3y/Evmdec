@@ -1,3 +1,4 @@
+use crate::abi::{SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::analyze::{push, Confidence, Finding, Section, Severity};
 use crate::decompile::{Contract, Function};
 use crate::deploy;
@@ -6,15 +7,13 @@ use crate::exec;
 use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
 use crate::interp::Outcome;
-use crate::path::{self, Explorer, Limits, Path};
+use crate::path::{self, Explorer, Explorers, Limits, Path};
+use crate::props::amount_sized;
 use crate::solve::{self, Free, Inputs, Item, Step};
 use crate::ssa;
 use crate::u256::U256;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-const SEL_TRANSFER: u32 = 0xa905_9cbb;
-const SEL_TRANSFER_FROM: u32 = 0x23b8_72dd;
-const SEL_BALANCE_OF: u32 = 0x70a0_8231;
 const SEL_TOTAL: u32 = 0x1816_0ddd;
 
 const LIMITS: Limits = Limits {
@@ -45,7 +44,7 @@ struct Bench<'a> {
     c: &'a Contract,
     layout: MappingLayout,
     begin: HashMap<U256, U256>,
-    explorers: HashMap<*const u8, Explorer>,
+    explorers: Explorers,
 }
 
 impl<'a> Bench<'a> {
@@ -57,9 +56,7 @@ impl<'a> Bench<'a> {
 
     fn explorer(&mut self, f: &Function) -> &Explorer {
         let code = self.c.code_of(f);
-        self.explorers
-            .entry(code.as_ptr())
-            .or_insert_with(|| Explorer::new(code))
+        self.explorers.of(code)
     }
 
     // The arguments stay as given. Storage is left free so the run can be given a balance.
@@ -154,11 +151,6 @@ fn fell(pair: (U256, U256)) -> U256 {
 
 fn rose(pair: (U256, U256)) -> U256 {
     pair.1.wrapping_sub(pair.0)
-}
-
-fn amount_sized(delta: U256) -> bool {
-    let small = U256::from_u64(0xff);
-    delta > small && U256::ZERO.wrapping_sub(delta) > small
 }
 
 struct Report<'o> {
@@ -414,7 +406,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Option<Section> {
         c,
         layout: c.compiler.layout,
         begin: deploy::storage(c),
-        explorers: HashMap::new(),
+        explorers: Explorers::default(),
     };
     bench.function(SEL_BALANCE_OF)?;
     let mut report = Report {

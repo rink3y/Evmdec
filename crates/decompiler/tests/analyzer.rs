@@ -3057,3 +3057,125 @@ fn the_first_decision_of_a_long_run_is_still_tried() {
     let marked = |p: &evmdec::path::Path| !p.run.storage.is_empty();
     assert!(found.iter().any(marked));
 }
+
+const SIGNED_STORE: &str = "60806040526004361061001e5760003560e01c8063d0e30db014610023575b600080fd5b600435600052602435602052604435604052606435606052602060006080600060015afa506000516000541461005857600080fd5b600160015500";
+
+#[test]
+fn a_recovered_signer_with_no_domain_counter_or_range_check_is_reported() {
+    let report = report_of_hex(SIGNED_STORE);
+    for rule in [
+        "ecrecover-zero",
+        "signature-replay-domain",
+        "signature-replay-nonce",
+        "signature-malleability",
+    ] {
+        assert!(
+            finding(&report, rule).is_some(),
+            "{rule}: {:?}",
+            ids(&report)
+        );
+    }
+}
+
+#[test]
+fn a_payout_priced_from_the_live_balance_is_reported() {
+    let vault = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461006057600080fd5b5034600154801561003c578147038183020461003e565b815b80156100a3578082016001553360005260006020526040600020805482019055005b5060043580156100a357336000526000602052604060002080548281106100a357829003905560015481810360015581470204600080808084335af1156100a357005b600080fd";
+    let report = report_of_hex(vault);
+    assert!(finding(&report, "spot-balance-price").is_some());
+    assert!(finding(&report, "no-slippage-bound").is_some());
+}
+
+#[test]
+fn an_initializer_anyone_can_call_first_is_reported() {
+    let guarded = format!("{OWNER_GATE} PUSH1 0x01 PUSH1 0x05 SSTORE STOP");
+    let setup = |fresh_check: &str| {
+        format!(
+            "{fresh_check} PUSH1 0x01 PUSH1 0x01 SSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0x00 SSTORE STOP"
+        )
+    };
+    let once = "PUSH1 0x01 SLOAD ISZERO PUSH2 @fresh JUMPI PUSH1 0x00 DUP1 REVERT :fresh JUMPDEST";
+    let open = report_of(&dispatcher3(&guarded, &setup(once), "STOP"));
+    assert!(
+        finding(&open, "unprotected-initializer").is_some(),
+        "{:?}",
+        ids(&open)
+    );
+    let owned = "PUSH1 0x00 SLOAD CALLER EQ PUSH2 @own JUMPI PUSH1 0x00 DUP1 REVERT :own JUMPDEST";
+    let closed = report_of(&dispatcher3(&guarded, &setup(owned), "STOP"));
+    assert!(finding(&closed, "unprotected-initializer").is_none());
+}
+
+fn upgrade(gate: &str) -> Vec<u8> {
+    asm(&format!(
+        "PUSH1 0x80 PUSH1 0x40 MSTORE PUSH1 0x00 CALLDATALOAD PUSH1 0xe0 SHR PUSH4 0x3659cfe6 EQ PUSH2 @f JUMPI PUSH1 0x00 DUP1 REVERT :f JUMPDEST {gate} PUSH1 0x04 CALLDATALOAD PUSH1 0x07 SSTORE STOP"
+    ))
+}
+
+#[test]
+fn an_upgrade_function_without_a_caller_check_is_reported() {
+    let open = report_of(&upgrade(""));
+    let found = finding(&open, "unprotected-upgrade").expect("the open upgrade is reported");
+    assert_eq!(found.severity, Severity::Critical);
+    let closed = report_of(&upgrade(OWNER_GATE));
+    assert!(finding(&closed, "unprotected-upgrade").is_none());
+}
+
+#[test]
+fn the_last_decision_of_a_run_is_flipped_before_an_earlier_one() {
+    let check = |word: u8, value: u8, slot: u8, label: &str| {
+        format!(
+            "PUSH1 0x{value:02x} PUSH1 0x{word:02x} CALLDATALOAD EQ ISZERO PUSH2 @{label} JUMPI \
+             PUSH1 0x01 PUSH1 0x{slot:02x} SSTORE :{label} JUMPDEST"
+        )
+    };
+    let body = format!(
+        "{} {} STOP",
+        check(0x04, 5, 1, "first"),
+        check(0x24, 7, 2, "second")
+    );
+    let code = dispatcher(&body);
+    let explorer = evmdec::path::Explorer::new(&code);
+    let start = evmdec::path::inputs_for(Some(0xaaaa_aaaa), 2);
+    let free = evmdec::solve::Free {
+        words: 2,
+        ..Default::default()
+    };
+    let two_runs = evmdec::path::Limits { paths: 8, runs: 2 };
+    let found = explorer.explore(&start, &free, two_runs);
+    assert_eq!(found.len(), 2);
+    let slots: Vec<u64> = found[1].run.storage.keys().map(|k| k.low_u64()).collect();
+    assert_eq!(slots, vec![2]);
+}
+
+fn owned_store() -> decompile::Contract {
+    let setter = format!("{OWNER_GATE} PUSH1 0x04 CALLDATALOAD PUSH1 0x01 SSTORE STOP");
+    let getter = "PUSH1 0x01 SLOAD PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN";
+    let handover = "PUSH1 0x00 SLOAD CALLER EQ PUSH2 @mine JUMPI PUSH1 0x00 DUP1 REVERT \
+                    :mine JUMPDEST PUSH1 0x04 CALLDATALOAD PUSH1 0x00 SSTORE STOP";
+    let code = dispatcher3(&setter, getter, handover);
+    decompile::decompile(&code, &Options::default())
+}
+
+#[test]
+fn arguments_results_and_effects_are_recovered_per_function() {
+    let c = owned_store();
+    let shape = |selector: &str| {
+        let f = c
+            .functions
+            .iter()
+            .find(|f| f.selector.as_deref() == Some(selector))
+            .expect("the function is found");
+        (f.params.len(), f.returns.clone(), f.effects.writes_storage)
+    };
+    assert_eq!(shape("0xaaaaaaaa"), (1, Vec::new(), true));
+    assert_eq!(shape("0xbbbbbbbb"), (0, vec!["uint256".to_string()], false));
+    assert_eq!(shape("0xcccccccc"), (1, Vec::new(), true));
+}
+
+#[test]
+fn a_slot_compared_with_the_caller_and_the_argument_that_replaces_it_are_named() {
+    let source = owned_store().source;
+    assert!(source.contains("address owner;"), "{source}");
+    assert!(source.contains("(address newOwner)"), "{source}");
+    assert!(source.contains("require(msg.sender == owner);"), "{source}");
+}

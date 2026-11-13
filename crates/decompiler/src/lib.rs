@@ -19,6 +19,7 @@ pub mod clock;
 pub mod compiler;
 pub mod confirm;
 pub mod cross;
+pub mod debug;
 pub mod decompile;
 pub mod deploy;
 pub mod emit;

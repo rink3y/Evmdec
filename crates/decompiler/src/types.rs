@@ -248,7 +248,7 @@ pub fn solve(
     let mut env = TypeEnv {
         layout,
         vyper: layout == MappingLayout::Vyper,
-        debug: std::env::var("EVMDEC_DEBUG_TYPES").is_ok(),
+        debug: crate::debug::on("EVMDEC_DEBUG_TYPES"),
         ids: HashMap::new(),
         classes: Vec::new(),
         callee_of: HashMap::new(),

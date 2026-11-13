@@ -3,7 +3,11 @@ use evmdec::decompile::{self, Options};
 
 thread_local! {
     static PADDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GUARDS_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GUARD_TO_DROP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
+
+const DISPATCH_LABELS: [&str; 5] = ["@f", "@a", "@b", "@c", "@t"];
 
 fn asm(src: &str) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
@@ -12,7 +16,17 @@ fn asm(src: &str) -> Vec<u8> {
     let opcodes: std::collections::HashMap<&str, u8> = (0u8..=255)
         .filter_map(|o| evmdec::opcode::info(o).map(|i| (i.name, o)))
         .collect();
+    let mut previous = "";
     for tok in src.split_whitespace() {
+        let guard = tok == "JUMPI" && !DISPATCH_LABELS.contains(&previous);
+        previous = tok;
+        if guard {
+            let index = GUARDS_SEEN.with(|g| g.replace(g.get() + 1));
+            if GUARD_TO_DROP.with(std::cell::Cell::get) == Some(index) {
+                out.extend_from_slice(&[0x90, 0x50, 0x56]);
+                continue;
+            }
+        }
         if let Some(l) = tok.strip_prefix(':') {
             labels.insert(l.to_string(), out.len());
             continue;
@@ -2438,6 +2452,24 @@ fn asset_vault(clear_first: bool) -> Vec<u8> {
     dispatcher3(&pull, &give_back, "STOP")
 }
 
+fn limits_with_a_copied_record(draw_subtracts_both: bool) -> Vec<u8> {
+    let draw = match draw_subtracts_both {
+        true => format!("{} {} ADD {} SUB", mread(2), mread(1), mread(0)),
+        false => format!("{} {} SUB", mread(1), mread(0)),
+    };
+    let copied = "PUSH1 0x00 :cp JUMPDEST DUP1 PUSH1 0x03 GT ISZERO PUSH2 @cpd JUMPI \
+         PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE DUP1 PUSH1 0x20 MSTORE \
+         PUSH1 0x40 PUSH1 0x00 KECCAK256 SLOAD \
+         DUP2 PUSH1 0x20 MUL PUSH1 0x80 ADD MSTORE PUSH1 0x01 ADD PUSH2 @cp JUMP \
+         :cpd JUMPDEST POP \
+         PUSH1 0xc0 MLOAD PUSH1 0xa0 MLOAD ADD PUSH1 0x80 MLOAD SUB";
+    dispatcher3(
+        &bounded_payout(&draw, "bad_draw"),
+        &bounded_payout(copied, "bad_exit"),
+        "STOP",
+    )
+}
+
 fn clocked(clock: &str) -> Vec<u8> {
     dispatcher3(
         &format!("{clock} PUSH1 0x04 CALLDATALOAD ADD PUSH1 0x05 SSTORE STOP"),
@@ -2617,6 +2649,12 @@ fn cases() -> Vec<Case> {
             || pays_two(true),
             || pays_two(false),
         ),
+        pair(
+            "inconsistent-liability-accounting",
+            false,
+            || limits_with_a_copied_record(false),
+            || limits_with_a_copied_record(true),
+        ),
         pair("phase-never-entered", false, || phased(5), || phased(2)),
         pair(
             "gate-never-set",
@@ -2746,5 +2784,41 @@ fn padding_the_code_changes_no_labelled_result() {
             case.rule,
             if case.flawed { "flawed" } else { "sound" },
         );
+    }
+}
+
+const SOUND_BY_A_GUARD: [&str; 6] = [
+    "inflow-credits-nothing",
+    "refused-transfer-treated-as-done|erc20-return-ignored|unchecked-token-pull",
+    "input-picks-storage-slot",
+    "short-input-accepted",
+    "earlier-call-lowers-payout",
+    "time-bound-set-by-anyone",
+];
+
+fn without_guard(case: &Case, index: Option<usize>) -> (Vec<u8>, usize) {
+    GUARDS_SEEN.with(|g| g.set(0));
+    GUARD_TO_DROP.with(|d| d.set(index));
+    let code = (case.build)();
+    GUARD_TO_DROP.with(|d| d.set(None));
+    (code, GUARDS_SEEN.with(std::cell::Cell::get))
+}
+
+#[test]
+fn removing_the_guard_that_makes_a_fixture_sound_is_noticed() {
+    println!("{:<72} guards noticed", "rule");
+    for case in cases().iter().filter(|c| !c.flawed) {
+        let (_, guards) = without_guard(case, None);
+        let noticed = (0..guards)
+            .filter(|n| shown(case, &without_guard(case, Some(*n)).0))
+            .count();
+        println!("{:<72} {guards:>6} {noticed:>7}", case.rule);
+        if SOUND_BY_A_GUARD.contains(&case.rule) {
+            assert!(
+                noticed >= 1,
+                "{}: no removed guard makes the rule fire",
+                case.rule
+            );
+        }
     }
 }

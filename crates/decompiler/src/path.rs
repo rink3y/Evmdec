@@ -185,8 +185,11 @@ impl Explorer {
         queue.push_back((0, 0));
         let mut runs = 1;
         while let Some((index, bound)) = queue.pop_front() {
-            let last = paths[index].truth.len().min(bound + MAX_FLIPS_PER_PATH);
-            for flip in bound..last {
+            let last = paths[index].truth.len();
+            let first = bound.max(last.saturating_sub(MAX_FLIPS_PER_PATH));
+            // A run that fails stops at its last check, so that is the one whose other side
+            // leads further. Early checks mostly validate arguments and only add failing runs.
+            for flip in (first..last).rev() {
                 let late = limits.until.is_some_and(|t| Instant::now() >= t);
                 if late || runs >= limits.runs || paths.len() >= limits.paths {
                     return paths;

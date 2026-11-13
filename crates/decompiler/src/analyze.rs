@@ -1975,6 +1975,71 @@ fn linear_bound(e: ExprId, layout: emit::MappingLayout, names: &Names) -> Option
     })
 }
 
+fn amount_term(e: ExprId, layout: emit::MappingLayout, budget: &mut u32) -> Option<ExprId> {
+    if *budget == 0 || pooled_field(e, layout).is_some() {
+        return None;
+    }
+    *budget -= 1;
+    match expr::node(e) {
+        Node::Op(op::ADD | op::SUB, v) => v.iter().find_map(|x| amount_term(*x, layout, budget)),
+        Node::Op(op::AND, v) if v.len() == 2 => {
+            let masked = v.iter().find(|x| !expr::is_const(**x))?;
+            amount_term(*masked, layout, budget)
+        }
+        Node::SLoad(..) | Node::Const(_) => None,
+        _ => expr::contains(e, &|n| matches!(n, Node::CallDataLoad(_))).then_some(e),
+    }
+}
+
+// `amount + owed < held` says the same as `amount < held - owed`.
+// Fields that stand with the amount are owed, and fields on the other side are held.
+fn two_sided_bound(
+    with_amount: ExprId,
+    opposite: ExprId,
+    layout: emit::MappingLayout,
+    names: &Names,
+) -> Option<(AvailBound, ExprId)> {
+    let amount = amount_term(with_amount, layout, &mut 64)?;
+    if amount_term(opposite, layout, &mut 64).is_some() {
+        return None;
+    }
+    let mut labels = HashMap::new();
+    let mut fields = |e: ExprId| {
+        let mut coef = BTreeMap::new();
+        linear_fields(e, 1, layout, names, &mut coef, &mut labels, &mut 256);
+        coef
+    };
+    let (near, far) = (fields(with_amount), fields(opposite));
+    let pick = |from: &BTreeMap<Field, i32>, positive: bool| -> BTreeSet<Field> {
+        let wanted = from
+            .iter()
+            .filter(|(_, c)| (**c > 0) == positive && **c != 0);
+        wanted.map(|(f, _)| f.clone()).collect()
+    };
+    let added: BTreeSet<Field> = pick(&far, true)
+        .union(&pick(&near, false))
+        .cloned()
+        .collect();
+    let subbed: BTreeSet<Field> = pick(&near, true)
+        .union(&pick(&far, false))
+        .cloned()
+        .collect();
+    let line = format!(
+        "{} vs {}",
+        emit::fmt_expr(with_amount, names),
+        emit::fmt_expr(opposite, names)
+    );
+    (!added.is_empty() && !subbed.is_empty() && !near.is_empty()).then_some((
+        AvailBound {
+            added,
+            subbed,
+            names: labels,
+            line,
+        },
+        amount,
+    ))
+}
+
 fn limits_outflow(other: ExprId, outflows: &[ExprId]) -> bool {
     let calldata = |e: ExprId| {
         let mut words = HashSet::new();
@@ -2013,13 +2078,15 @@ fn limits_in(
             continue;
         }
         if let Node::Op(op::LT | op::GT | op::SLT | op::SGT, v) = expr::node(x) {
+            let mut found: Vec<(AvailBound, ExprId)> = Vec::new();
             for (side, other) in [(v[0], v[1]), (v[1], v[0])] {
                 if expr::is_const(other) {
                     continue;
                 }
-                let Some(b) = linear_bound(side, layout, names) else {
-                    continue;
-                };
+                found.extend(linear_bound(side, layout, names).map(|b| (b, other)));
+                found.extend(two_sided_bound(other, side, layout, names));
+            }
+            for (b, other) in found {
                 if !out
                     .iter()
                     .any(|(o, w)| *w == other && o.added == b.added && o.subbed == b.subbed)
@@ -4753,6 +4820,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
 
     policy_findings(&facts, &mut findings);
     chain_findings(&facts, &auth, &mut findings);
+    trace_bounds(c, &mut facts, &names_for);
     accounting_findings(&facts, &mut findings);
     let slot_names = c.functions.first().map(names_for).unwrap_or_default();
     let slot_name = |slot: ExprId| emit::fmt_slot(slot, &slot_names, SlotSpace::Persistent);
@@ -6065,6 +6133,100 @@ fn chain_findings(facts: &[FnFacts], auth: &HashSet<ExprId>, findings: &mut Vec<
                 push_fact(findings, "attack-chain", "Attack chain: set a trusted slot, then trigger the function that trusts it", chain_sev, Confidence::Medium, x,
                     format!("Step 1: `{}` lets anyone write `{}` from its arguments. Step 2: `{}`, also callable by anyone, {}.{}", x.name, slot_name, g.name, what, init_note),
                     vec![wline.clone(), gline], "Protect the write in step 1 or validate the slot's value where it is used.");
+            }
+        }
+    }
+}
+
+const TRACE_LIMITS: crate::path::Limits = crate::path::Limits {
+    paths: 32,
+    runs: 128,
+    until: None,
+};
+const TRACE_WORDS: usize = 32;
+const TRACE_ANSWER_BYTES: usize = 320;
+const TRACE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+// A record copied to memory and updated there hides its fields from the rule above.
+// Along one run the lifter knows what every memory word holds, so the same limits are
+// read again from the checks of each run and added to what the function is known to cap.
+fn trace_bounds(c: &Contract, facts: &mut [FnFacts], names_for: &dyn Fn(&Function) -> Names) {
+    if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
+        return;
+    }
+    let layout = c.compiler.layout;
+    let begin = crate::deploy::storage(c);
+    let limits = crate::path::Limits {
+        until: Some(std::time::Instant::now() + TRACE_BUDGET),
+        ..TRACE_LIMITS
+    };
+    let mut explorers: HashMap<*const u8, crate::path::Explorer> = HashMap::new();
+    for f in c.functions.iter().filter(|f| f.kind == FnKind::External) {
+        let Some(fact) = facts.iter_mut().find(|x| x.external && x.pc == f.pc) else {
+            continue;
+        };
+        let names = names_for(f);
+        let code = c.code_of(f);
+        let explorer = explorers
+            .entry(code.as_ptr())
+            .or_insert_with(|| crate::path::Explorer::new(code));
+        // Zero words pass every type check on a decoded argument at once.
+        // Other values would spend the path limit on one check per field.
+        let mut start = crate::path::inputs_for(crate::exec::selector_of(f), TRACE_WORDS);
+        start.storage = begin.clone();
+        // A true word first, then room for a callee that answers with a record.
+        start.returned = U256::ONE.to_be_bytes().to_vec();
+        start.returned.resize(TRACE_ANSWER_BYTES, 0);
+        let free = crate::solve::Free {
+            words: TRACE_WORDS,
+            value: true,
+            storage: true,
+            fixed: Vec::new(),
+        };
+        let explored = explorer.explore(&start, &free, limits);
+        for p in explored {
+            let mut outflows: Vec<ExprId> = Vec::new();
+            for st in &p.effects {
+                match st {
+                    Stmt::Call {
+                        value,
+                        input,
+                        input_head,
+                        in_len,
+                        ..
+                    } => {
+                        outflows.extend(value.filter(|v| !expr::is_const(*v)));
+                        let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
+                        let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
+                        let selector = words
+                            .first()
+                            .and_then(|w0| emit::leading_selector(*w0, len));
+                        if selector == Some(SEL_TRANSFER) && words.len() >= 2 {
+                            outflows.push(emit::shifted_word_len(words, 1, len));
+                        }
+                    }
+                    Stmt::SStore { key, val, .. } => outflows.extend(subtracts_from(*val, *key)),
+                    _ => {}
+                }
+            }
+            let mut candidates: Vec<(AvailBound, ExprId)> = Vec::new();
+            let mut seen = HashSet::new();
+            for item in &p.items {
+                let e = match item {
+                    crate::solve::Item::Check { cond, .. } => *cond,
+                    crate::solve::Item::Store { val, .. } => *val,
+                };
+                limits_in(e, layout, &names, &mut seen, &mut candidates);
+            }
+            for (bound, other) in candidates {
+                let same = |b: &AvailBound| b.added == bound.added && b.subbed == bound.subbed;
+                if limits_outflow(other, &outflows) && !fact.avail_bounds.iter().any(same) {
+                    fact.avail_bounds.push(bound.clone());
+                    fact.moves_value = true;
+                }
+                if !fact.ref_bounds.iter().any(same) {
+                    fact.ref_bounds.push(bound);
+                }
             }
         }
     }

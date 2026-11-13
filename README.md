@@ -49,7 +49,7 @@ Every stage is in `crates/decompiler`:
 | `compiler` | compiler version and feature fingerprints when the metadata is missing |
 | `analyze`, `confirm`, `invariant`, `exec`, `cross` | security rules, concrete confirmation of reachable findings, invariant search, whole-frame and cross-contract executors |
 | `path`, `solve`, `seq`, `abi`, `deploy` | the path engine: one concrete run lifted into its branch conditions and writes, a solver that inverts a condition back to an input word, a search over short call sequences, ABI-shaped starting inputs, and the storage a constructor leaves |
-| `props`, `flow`, `signed`, `standard`, `origin`, `evidence` | checks made by running the code: properties inferred from behaviour, what calls take and return, repeated signed messages, the standard ledger interface as measured, where stored values come from, and what a confirming run was seen to do |
+| `props`, `flow`, `signed`, `standard`, `origin`, `range`, `evidence` | checks made by running the code: properties inferred from behaviour, what calls take and return, signed messages, the standard ledger interface as measured, where stored values come from, value ranges along a path, and what a confirming run was seen to do |
 | `interp`, `verify` | reference EVM interpreter and the block oracle |
 | `rpc`, `fetch`, `decompile`, `slots`, `clock` | chain access, proxy and diamond resolution, the walk over call targets, composition, well-known storage slots, the time limit one dependency is given |
 
@@ -207,27 +207,29 @@ other way to get an input that takes the other branch. The solver is a generator
 decision procedure: it inverts arithmetic back to a word of the call, the value sent or, when
 asked, a storage slot, and every answer it gives is run again on the bytecode before anything
 is built on it. On the 22 audited contracts the lifted conditions agree with the interpreter
-on all 53,349 branches taken. When creation code is given, the constructor is run first and
+on all 70,261 branches taken. When creation code is given, the constructor is run first and
 every check starts from the storage it leaves; with runtime code only, they start from empty
 storage and say so.
 
 | check | what is run and what is reported |
 |---|---|
 | reachability | a sink no single input reaches is tried through up to three earlier calls that write the storage it needs; the earlier calls are attached to the finding |
-| arithmetic | an input that takes a path ending normally and makes a stored sum, difference or product wrap; open when no such run exists from the starting storage |
-| properties from behaviour | a mapping and a total that at least two functions move in step, then a path that moves them apart (`entries-total-out-of-step`) or calls out between the two updates (`total-open-at-call`); a slot toggled like a lock and left set on one path (`lock-left-set`); a memory copy of storage changed and dropped (`changed-copy-dropped`); a value written from one block clock and compared with the other (`clock-units-mixed`); a storage slot or memory offset picked by an untested word of the call (`input-picks-storage-slot`, `input-picks-memory-offset`); input one byte short still accepted (`short-input-accepted`); work that grows with a count any caller can raise (`cost-grows-with-open-list`) |
-| value flow | an account pays in, then every other function is run from that state: a second call that returns more than was paid (`two-calls-return-more`); the same payment by a second account with the balance the contract reads raised from outside, credited nothing (`inflow-credits-nothing`); a payment run again with the receiver being code that repeats the call, paid twice (confirms `reentrancy`, or `reentered-call-pays-again`) |
-| callee answers | each call the contract makes can be answered separately: a transfer that answers false and is treated as done (confirms `erc20-return-ignored`, or `refused-transfer-treated-as-done`); a transfer that returns nothing and makes the function fail (`transfer-without-answer-refused`); a payout that changes when a value read from outside is halved (confirms `no-slippage-bound` and `spot-balance-price`) |
-| signed messages | a signed call is run, then run again unchanged from the state it left, with recovery answering the signer for the first digest only; accepted again means nothing takes the message out of use (`signed-message-accepted-twice`) |
+| arithmetic | an input that takes a path ending normally and makes a stored sum, difference or product wrap; open when no such run exists from the starting storage. A small interval analysis reads the masks, the checks on each path and the orderings they prove; when every stored result on every finished path stays in range, the finding is kept at the lowest severity and says so |
+| properties from behaviour | a mapping and a total that at least two functions move in step, then a path that moves them apart (`entries-total-out-of-step`) or calls out between the two updates (`total-open-at-call`); a slot toggled like a lock and left set on one path (`lock-left-set`); a memory copy of storage changed and dropped (`changed-copy-dropped`); a value written from one block clock and compared with the other (`clock-units-mixed`); a storage slot or memory offset picked by an untested word of the call (`input-picks-storage-slot`, `input-picks-memory-offset`); input one byte short still accepted (`short-input-accepted`); work that grows with a count any caller can raise (`cost-grows-with-open-list`); a bound compared with the block clock that any caller can store (`time-bound-set-by-anyone`) and a time check on a slot nothing sets (`time-window-never-opens`); a payment of value to accounts read from storage that fails as a whole when one of them refuses (`one-refusal-blocks-all`, or confirms `blocking-payout-loop` and `fixed-payee-can-block`) |
+| value flow | an account pays in, then every other function is run from that state: a second call that returns more than was paid (`two-calls-return-more`); the same payment by a second account with the balance the contract reads raised from outside, credited nothing (`inflow-credits-nothing`); a payment run again with the receiver being code that repeats the call, paid twice, also when the payment goes through an asset that runs the receiver's code during the transfer (confirms `reentrancy`, or `reentered-call-pays-again`); a second account repeating the first payment, after which the first account takes out more than it paid (`payout-grows-with-other-payment`); another account's call that pays nothing in and takes nothing out, placed before a payout, lowering it while no argument can refuse the lower amount (`earlier-call-lowers-payout`); what a call hands out and takes compared for two amounts and for their sum at one state, showing a division that rounds toward the caller (`rounding-favours-caller`) |
+| callee answers | each call the contract makes can be answered separately: a transfer that answers false and is treated as done (confirms `erc20-return-ignored`, or `refused-transfer-treated-as-done`); a transfer that returns nothing and makes the function fail (`transfer-without-answer-refused`); a payout that changes when a value read from outside is halved (confirms `no-slippage-bound` and `spot-balance-price`); a function that credits exactly the amount it asked an asset for without reading its own balance (confirms `fee-on-transfer`) |
+| signed messages | a signed call is run, then run again unchanged from the state it left, with recovery answering the signer for the first digest only; accepted again means nothing takes the message out of use (`signed-message-accepted-twice`). Each argument word is then changed in turn: a word that changes what the call does while the digest stays the same is not signed (`signed-call-leaves-word-unsigned`) |
 | the standard interface | a contract that shows `transfer`, `transferFrom` and `balanceOf` is not taken at its word: each is run and the entries it changes are measured against the amount asked (`transfer-creates-value`, `transfer-delivers-less`, `transfer-touches-third-entry`, `reported-balance-differs`, `transfer-changes-supply`, `transferfrom-ignores-allowance`, `allowance-not-spent`) |
 | where values come from | every store into a slot is followed back through the slots it is copied from; a call target or a caller check that reads a slot any caller can fill (`stored-input-call-target`, `gate-on-open-slot`); a caller check on a slot nothing sets (`gate-never-set`) |
+| payout limits | the limits the accounting rule compares are read again from the checks of each run, where a record copied to memory and updated there resolves to the fields it came from, and a limit written as a sum compared with a sum is read too (feeds `inconsistent-liability-accounting`) |
 
 A confirmed finding carries the input, any earlier calls, and what the run was seen to do: who
 sent it, the slots that changed and their values before and after, the calls made, and how it
-ended. The report also has three maps that are not findings: the authority map (each slot a
-caller check reads, the functions it protects and the functions that write it), the phases
-(small fields that functions test for equality, and the moves between their values), and the
-standard interface as measured.
+ended. The report also has four sections that are not findings: what the constructor sets
+(each slot, and whether it holds the deployer, a constructor argument or a constant), the
+authority map (each slot a caller check reads, the functions it protects and the functions
+that write it), the phases (small fields that functions test for equality, and the moves
+between their values), and the standard interface as measured.
 
 ## Accuracy
 
@@ -287,7 +289,7 @@ whose exploits are public, from The DAO to Balancer V1, with the rules that must
 | | |
 |---|---|
 | known bugs found | 24 / 25 |
-| missed | the Fence tranche pool on Avalanche: one of its two limits is computed from an in-memory copy of the record, which the accounting rule does not read. The `changed-copy-dropped` check covers a copy whose change is lost, which is a different shape |
+| missed | the Fence tranche pool on Avalanche. Its limits are computed from an in-memory copy of the record. Reading limits from runs now recovers one of the two, which was invisible before; the other is not in a form the rule recognises, so the pool is still missed |
 | not counted | Nomad, an upgrade-time state error outside bytecode patterns |
 | high or critical findings on the 22 audited contracts | 28, nearly all on contracts whose purpose is to execute caller-supplied calls |
 
@@ -298,17 +300,18 @@ trust rules were built on and tested against.
 ### Labelled fixtures per rule
 
 `python3 corpus/rule_bench.py`. `testdata/rules` holds a flawed and a sound hand-assembled
-fixture for each of 16 rules that work by running the code, with the expected result in
+fixture for each of 25 rules that work by running the code, with the expected result in
 `manifest.json`.
 
 | | |
 |---|---|
-| fixtures | 32 |
-| rules at precision 1.00 and recall 1.00 | 16 / 16 |
+| fixtures | 52 |
+| rules at precision 1.00 and recall 1.00 | 25 / 25 |
 | results that change when the code is padded after every jump destination | 0 |
+| rules whose sound fixture depends on a guard, and notice when it is removed | 6 / 6 |
 
 These fixtures are the nearest sound pattern to each flaw, not real contracts. On the 48 real
-contracts 34 findings are confirmed by a run, and the checks added here raise only
+contracts 38 findings are confirmed by a run, and the checks added here raise only
 low-severity findings of their own. `vuln_bench.py` prints the per-rule table for the real
 corpora: labels, how many were caught, and how often each rule fires at medium or higher on
 audited code.
@@ -468,6 +471,9 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   it would have to reverse, or a path past its limits is simply not explored, so a check that
   reports nothing has not shown the property holds. Each dynamic pass also has a time limit
   per contract.
+- The checks with a second account assume the balance the contract reads does not move unless
+  a call in the run moves it, and the ordering check only places calls that pay nothing in and
+  take nothing out, so that assumption holds.
 - The value-flow and re-entry checks need a function that takes a payment and credits the
   payer in one call from the starting storage. Contracts that need a longer setup are not
   reached: none of the reentrancy findings on the 26 exploited contracts is confirmed this
@@ -484,12 +490,10 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   contract's storage; only calls made to the created contract after it exists are.
 - `pair-sync-after-state-change` looks for the Uniswap V2 `sync()` call; V3 and later pools
   have no equivalent, and the third-party debit rule covers them.
-- `inconsistent-liability-accounting` compares limits built from storage reads. Memory is
-  resolved where the analyzer can replay it safely; a copy of the record that a helper updates
-  and returns is not mapped back to storage, because its values no longer equal the stored
-  fields. In the Fence pool those copies measure how far a time-based update moved each field,
-  and the defect is that reclassification over time, which a comparison of limits does not
-  model; the pool is listed as missed. Two limits that differ on purpose, because they cap
+- `inconsistent-liability-accounting` compares limits built from storage reads, and from the
+  checks of single runs where memory copies resolve. A limit that is neither a difference of
+  fields compared with an amount nor a sum compared with a sum is not read. In the Fence pool
+  one limit is recovered this way and the other is not, and the pool is listed as missed. Two limits that differ on purpose, because they cap
   different things, can read as an omission.
 - Findings are heuristic and should be read as leads with a confidence level.
 

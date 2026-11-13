@@ -27,11 +27,15 @@ Every rule carries a test on hand-assembled bytecode in `crates/decompiler/tests
 with a positive case and the nearest legitimate pattern as a negative case.
 
 A rule that works by running the code also gets a row in `cases()` in the same file: a flawed
-fixture and the sound one closest to it. Two tests read that table. One scores it per rule and
+fixture and the sound one closest to it. Three tests read that table. One scores it per rule and
 fails on any miss or false alarm. The other rebuilds every fixture with a push and a pop after
 each jump destination and fails if a result changes, so a rule cannot depend on where the code
 happens to sit. `EVMDEC_WRITE_FIXTURES=testdata/rules cargo test the_labelled` rewrites the
 fixtures on disk that `corpus/rule_bench.py` scores.
+
+When the sound fixture differs from the flawed one by a guard, add the rule to
+`SOUND_BY_A_GUARD`. A third test drops one guard at a time from every sound fixture and, for
+those rules, requires at least one removal to make the rule fire.
 
 A check that runs code reports only what a run showed. An input the solver produced is run
 again on the bytecode before a finding is built on it, and a finding that chose storage to get

@@ -3418,3 +3418,25 @@ fn a_caller_check_joined_to_a_second_condition_is_access_control() {
     )));
     assert!(r.privileged_functions.is_empty(), "{r:?}");
 }
+
+#[test]
+fn a_caller_test_against_a_record_anyone_opens_does_not_lower_a_re_entry_finding() {
+    let record = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x05 PUSH1 0x20 MSTORE \
+                  PUSH1 0x40 PUSH1 0x00 KECCAK256";
+    let open = format!("CALLER {record} SSTORE STOP");
+    let pays_then_writes = "PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x01 SLOAD CALLER GAS CALL POP \
+                            PUSH1 0x00 PUSH1 0x01 SSTORE STOP";
+    let gated = |held: &str| {
+        format!("{held} CALLER EQ PUSH2 @in JUMPI {REVERT} :in JUMPDEST {pays_then_writes}")
+    };
+    let party = gated(&format!("{record} SLOAD"));
+    let r = report_of(&dispatcher3(&open, &party, "STOP"));
+    let f = finding(&r, "reentrancy").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    assert!(f.description.contains("names a party"), "{}", f.description);
+
+    let owner = gated("PUSH1 0x00 SLOAD");
+    let r = report_of(&dispatcher3(&open, &owner, "STOP"));
+    let f = finding(&r, "reentrancy").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium, "{f:?}");
+}

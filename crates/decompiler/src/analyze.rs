@@ -4175,7 +4175,12 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                             } else if hook {
                                 ("reentrancy", Severity::High, Confidence::High, " The call is a token transfer with a receiver hook (ERC721/ERC1155/ERC777 `on…Received`/`tokensReceived`), so the recipient is called with the state not yet updated.")
                             } else if (value_nonzero || user_target) && caller_checked {
-                                ("reentrancy", Severity::Medium, Confidence::Medium, " The function is behind a msg.sender check, so the re-entering callee must be, or be controlled by, an authorised account (an owner-chosen payee that is itself an owner, for instance).")
+                                (
+                                    "reentrancy",
+                                    Severity::Medium,
+                                    Confidence::Medium,
+                                    BEHIND_A_CALLER_CHECK,
+                                )
                             } else if value_nonzero || user_target {
                                 ("reentrancy", Severity::High, Confidence::Medium, "")
                             } else {
@@ -7490,6 +7495,37 @@ fn authority(
     })
 }
 
+const BEHIND_A_CALLER_CHECK: &str = " The function is behind a msg.sender check, so the re-entering callee must be, or be controlled by, an authorised account (an owner-chosen payee that is itself an owner, for instance).";
+const BEHIND_A_PARTY_CHECK: &str = " The function compares msg.sender with a field of a record that any caller can fill with its own address. The check names a party to that record, not an authority, so it does not limit who is called back.";
+
+// A lower rating for a gated function rests on the gate naming someone trusted. A record
+// field that an open function fills from its caller or its input names whoever opened
+// the record.
+fn party_checks_limit_nothing(
+    facts: &[FnFacts],
+    uses: &[StoredUse],
+    model: &Model,
+    findings: &mut [Finding],
+) {
+    let mut party_only: BTreeMap<usize, bool> = BTreeMap::new();
+    for u in uses.iter().filter(|u| matches!(u.kind, UseKind::Gate)) {
+        let party = u.loc.1 > 0 && model.of(u.value).open();
+        *party_only.entry(u.function).or_insert(true) &= party;
+    }
+    for (function, _) in party_only.iter().filter(|(_, party)| **party) {
+        let name = &facts[*function].name;
+        let here = |f: &&mut Finding| f.id == "reentrancy" && f.function.as_ref() == Some(name);
+        for f in findings.iter_mut().filter(here) {
+            let Some(at) = f.description.find(BEHIND_A_CALLER_CHECK) else {
+                continue;
+            };
+            let end = at + BEHIND_A_CALLER_CHECK.len();
+            f.description.replace_range(at..end, BEHIND_A_PARTY_CHECK);
+            (f.severity, f.confidence) = (Severity::High, Confidence::Medium);
+        }
+    }
+}
+
 fn origin_findings(
     ctx: &Ctx,
     facts: &[FnFacts],
@@ -7498,6 +7534,7 @@ fn origin_findings(
     findings: &mut Vec<Finding>,
 ) {
     let model = Model::build(stores, ctx.c.compiler.layout);
+    party_checks_limit_nothing(facts, uses, &model, findings);
     let mut told: HashSet<(usize, origin::Loc, bool)> = HashSet::new();
     for u in uses {
         let f = &facts[u.function];

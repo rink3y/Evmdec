@@ -102,6 +102,8 @@ pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
         balance: DEFAULT_BALANCE,
         signed: None,
         failing: None,
+        spends_balance: false,
+        moving: Vec::new(),
     }
 }
 
@@ -126,6 +128,8 @@ impl Explorer {
         host.replies = inputs.replies.clone();
         host.signed = inputs.signed.clone();
         host.failing = inputs.failing;
+        host.spends_balance = inputs.spends_balance;
+        host.moving = inputs.moving.clone();
         host.selfbalance = inputs.balance;
         let mut run = exec::run_frame(&self.prog.code, &host, inputs.storage.clone(), STEP_BUDGET);
         // Thousands of paths are kept at once. Each would hold one entry per step it ran.
@@ -196,11 +200,17 @@ impl Explorer {
             Stmt::Call { seq, .. } => Some(*seq),
             _ => None,
         });
+        let mut outside = 0;
         inputs.given = made
             .zip(&run.calls)
             .map(|(seq, call)| {
                 let (replies, default) = (&inputs.replies, &inputs.returned);
-                let data = interp::answer(&inputs.signed, replies, default, call.addr, &call.input);
+                let moved = interp::moving_answer(&inputs.moving, outside, call.addr, &call.input);
+                let went_out = interp::goes_outside(&inputs.moving, call.addr, &call.input);
+                outside += usize::from(call.kind == crate::opcode::CALL && went_out);
+                let data = moved.unwrap_or_else(|| {
+                    interp::answer(&inputs.signed, replies, default, call.addr, &call.input)
+                });
                 (seq, data)
             })
             .collect();

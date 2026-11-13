@@ -77,6 +77,8 @@ pub struct Host {
     pub replies: Vec<(u32, Vec<u8>)>,
     pub signed: Option<(Vec<u8>, U256)>,
     pub failing: Option<usize>,
+    pub spends_balance: bool,
+    pub moving: Vec<MovingBalance>,
     pub intercept_calls: bool,
     pub unset_storage: Option<U256>,
 }
@@ -113,6 +115,8 @@ impl Host {
             replies: Vec::new(),
             signed: None,
             failing: None,
+            spends_balance: false,
+            moving: Vec::new(),
             intercept_calls: false,
             unset_storage: None,
         }
@@ -143,6 +147,8 @@ impl Host {
             replies: Vec::new(),
             signed: None,
             failing: None,
+            spends_balance: false,
+            moving: Vec::new(),
             intercept_calls: false,
             unset_storage: None,
         }
@@ -291,6 +297,46 @@ pub fn answer(
     chosen.map_or(default, |(_, data)| data).to_vec()
 }
 
+// The balance an asset reports for this contract, before and after the contract first
+// calls anything that is not an asset. That call is where a swap or a pool would move it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MovingBalance {
+    pub asset: U256,
+    pub before: U256,
+    pub after: U256,
+}
+
+const ASSET_SELECTORS: [u32; 4] = [0x70a0_8231, 0xa905_9cbb, 0x23b8_72dd, 0x095e_a7b3];
+
+fn selector_of(input: &[u8]) -> Option<u32> {
+    let b = input.get(..4)?;
+    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+pub fn goes_outside(moving: &[MovingBalance], addr: U256, input: &[u8]) -> bool {
+    let asset = moving.iter().any(|m| m.asset == addr);
+    let plain = selector_of(input).is_some_and(|s| ASSET_SELECTORS.contains(&s));
+    !moving.is_empty() && !asset && !plain && input.len() >= 4
+}
+
+pub fn moving_answer(
+    moving: &[MovingBalance],
+    outside_calls: usize,
+    addr: U256,
+    input: &[u8],
+) -> Option<Vec<u8>> {
+    let balance = moving.iter().find(|m| m.asset == addr)?;
+    if selector_of(input) != Some(ASSET_SELECTORS[0]) {
+        return None;
+    }
+    let now = if outside_calls == 0 {
+        balance.before
+    } else {
+        balance.after
+    };
+    Some(now.to_be_bytes().to_vec())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallRecord {
     pub kind: u8,
@@ -349,9 +395,21 @@ pub struct Machine<'a> {
     pub pc: usize,
     pub move_limit: usize,
     moved: usize,
+    paid_out: U256,
+    outside_calls: usize,
 }
 
 impl<'a> Machine<'a> {
+    // With a host that spends its balance, what the code reads falls as it pays out.
+    // A loop that pays while the balance lasts would otherwise never end.
+    fn own_balance(&self) -> U256 {
+        match self.host.spends_balance {
+            true if self.paid_out <= self.host.selfbalance => self.host.selfbalance - self.paid_out,
+            true => U256::ZERO,
+            false => self.host.selfbalance,
+        }
+    }
+
     pub fn new(code: &'a [u8], host: &'a Host) -> Machine<'a> {
         Machine {
             code,
@@ -370,6 +428,8 @@ impl<'a> Machine<'a> {
             pc: 0,
             move_limit: Self::MEM_LIMIT,
             moved: 0,
+            paid_out: U256::ZERO,
+            outside_calls: 0,
         }
     }
 
@@ -607,7 +667,7 @@ impl<'a> Machine<'a> {
             op::BALANCE => {
                 let a = self.pop()?;
                 let v = if a == self.host.address {
-                    self.host.selfbalance
+                    self.own_balance()
                 } else {
                     self.host.balance(a)
                 };
@@ -694,7 +754,7 @@ impl<'a> Machine<'a> {
             op::PREVRANDAO => self.push(self.host.prevrandao)?,
             op::GASLIMIT => self.push(self.host.gaslimit)?,
             op::CHAINID => self.push(self.host.chainid)?,
-            op::SELFBALANCE => self.push(self.host.selfbalance)?,
+            op::SELFBALANCE => self.push(self.own_balance())?,
             op::BASEFEE => self.push(self.host.basefee)?,
             op::BLOBHASH => {
                 let i = self.pop()?;
@@ -856,6 +916,15 @@ impl<'a> Machine<'a> {
                     .filter(|l| *l < (1 << 24))
                     .ok_or("call input too large")?;
                 let input = self.mread(in_off, il)?;
+                if self.host.spends_balance && o == op::CALL {
+                    // A payment the balance does not cover fails, and nothing moves.
+                    if value > self.own_balance() {
+                        self.deliver_call(out_off, out_len, false, Vec::new())?;
+                        self.pc = next;
+                        return Ok(None);
+                    }
+                    self.paid_out = self.paid_out.wrapping_add(value);
+                }
                 let idx = self.calls.len();
                 self.calls.push(CallRecord {
                     kind: o,
@@ -869,8 +938,14 @@ impl<'a> Machine<'a> {
                 if self.host.intercept_calls {
                     return Ok(Some(Outcome::Call(idx)));
                 }
+                let seen = moving_answer(&self.host.moving, self.outside_calls, addr, &input);
+                if o == op::CALL && goes_outside(&self.host.moving, addr, &input) {
+                    self.outside_calls += 1;
+                }
                 let (success, data) = if addr == U256::from_u64(4) {
                     (true, input)
+                } else if let Some(balance) = seen {
+                    (true, balance)
                 } else {
                     self.host.call_result(idx, addr, &input)
                 };

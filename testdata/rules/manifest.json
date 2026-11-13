@@ -49,6 +49,12 @@
   {"file": "47-sound.hex", "rule": "transferfrom-ignores-allowance", "flawed": false, "confirmed": true},
   {"file": "48-flawed.hex", "rule": "input-picks-storage-slot", "flawed": true, "confirmed": true},
   {"file": "49-sound.hex", "rule": "input-picks-storage-slot", "flawed": false, "confirmed": true},
-  {"file": "50-flawed.hex", "rule": "short-input-accepted", "flawed": true, "confirmed": true},
-  {"file": "51-sound.hex", "rule": "short-input-accepted", "flawed": false, "confirmed": true}
+  {"file": "50-flawed.hex", "rule": "ledger-credits-more-than-received", "flawed": true, "confirmed": true},
+  {"file": "51-sound.hex", "rule": "ledger-credits-more-than-received", "flawed": false, "confirmed": true},
+  {"file": "52-flawed.hex", "rule": "surplus-open-to-any-account", "flawed": true, "confirmed": true},
+  {"file": "53-sound.hex", "rule": "surplus-open-to-any-account", "flawed": false, "confirmed": true},
+  {"file": "54-flawed.hex", "rule": "payment-taken-by-other-account", "flawed": true, "confirmed": true},
+  {"file": "55-sound.hex", "rule": "payment-taken-by-other-account", "flawed": false, "confirmed": true},
+  {"file": "56-flawed.hex", "rule": "short-input-accepted", "flawed": true, "confirmed": true},
+  {"file": "57-sound.hex", "rule": "short-input-accepted", "flawed": false, "confirmed": true}
 ]

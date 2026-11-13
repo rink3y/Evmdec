@@ -1152,8 +1152,32 @@ impl TypeEnv {
             }
             self.classes.push(c);
         }
+        // Two parts of one contract can use the same storage. What the later part learned
+        // about a shared place is added to the class the first part made for it, or a
+        // rule that needs both sides would only ever see the first.
+        let mut shared = false;
         for (loc, id) in other.ids {
-            self.ids.entry(loc).or_insert(id + offset);
+            let theirs = id + offset;
+            match self.ids.get(&loc).copied() {
+                None => {
+                    self.ids.insert(loc, theirs);
+                }
+                Some(mine) => {
+                    let from = self.classes[theirs].clone();
+                    let into = &mut self.classes[mine];
+                    into.hints = into.hints.join(from.hints);
+                    into.weak = into.weak.join(from.weak);
+                    into.from_defs = into.from_defs.join(from.from_defs);
+                    into.resolved = into.resolved.join(from.resolved);
+                    into.flags.absorb(from.flags);
+                    into.defs.extend(from.defs);
+                    into.sources.extend(from.sources);
+                    shared = true;
+                }
+            }
+        }
+        if shared {
+            self.propagate();
         }
         self.callee_of.extend(other.callee_of);
         self.results_len.extend(other.results_len);

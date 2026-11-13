@@ -177,3 +177,40 @@ fn a_helper_checking_its_own_call_does_not_cover_the_callers_unchecked_call() {
     let report = evmdec::analyze::analyze(&contract);
     assert!(report.findings.iter().any(|f| f.id == "unchecked-call"));
 }
+
+fn finding_text(code_hex: &str, id: &str) -> Option<String> {
+    let code = evmdec::hex::decode(code_hex).expect("valid hex");
+    let contract = decompile(&code, &Options::default());
+    let report = evmdec::analyze::analyze(&contract);
+    report
+        .findings
+        .into_iter()
+        .find(|f| f.id == id)
+        .map(|f| f.description)
+}
+
+#[test]
+fn only_the_shifted_value_of_an_arithmetic_shift_is_signed() {
+    let out = text("60003560e01c8063aaaaaaaa1461001557600080fd5b6004356024351d60005500");
+    assert!(out.contains("(int256 arg0, uint256 arg1)"), "{out}");
+}
+
+#[test]
+fn a_packed_counter_is_seen_as_narrow() {
+    let found = finding_text(
+        "60003560e01c8063aaaaaaaa14610020578063bbbbbbbb1461004157600080fd5b6000548063ffffffff1660010163ffffffff169063ffffffff191617600055005b60005463ffffffff1660005260206000f3",
+        "narrow-counter",
+    );
+    assert!(found.is_some_and(|text| text.contains("uint32")));
+}
+
+#[test]
+fn a_sixteen_bit_timestamp_is_said_to_wrap_in_hours_not_in_2106() {
+    let found = finding_text(
+        "60003560e01c8063aaaaaaaa1461001557600080fd5b4261ffff1660005500",
+        "narrow-counter",
+    )
+    .expect("the narrow timestamp is reported");
+    assert!(found.contains("wraps every 18 hours"), "{found}");
+    assert!(!found.contains("2106"), "{found}");
+}

@@ -106,6 +106,13 @@ impl Fetcher<'_> {
         true
     }
 
+    // Two proxies can share one implementation and two diamonds one facet. The code of an
+    // address already fetched is cached, so using it again costs nothing. Refusing it
+    // left the second proxy an empty shell that looked clean.
+    fn take_part(&mut self, address: &str) -> bool {
+        self.seen.contains(&address.to_ascii_lowercase()) || self.take(address)
+    }
+
     fn code(&mut self, address: &str) -> Result<Vec<u8>, String> {
         let key = address.to_ascii_lowercase();
         if let Some(code) = self.cache.get(&key) {
@@ -465,7 +472,7 @@ impl Fetcher<'_> {
         ));
         let mut parts = Vec::new();
         for facet in d.facets {
-            if !self.take(&facet.address) {
+            if !self.take_part(&facet.address) {
                 (self.log)(&format!("facet {} skipped (budget)", facet.address));
                 continue;
             }
@@ -504,7 +511,7 @@ impl Fetcher<'_> {
             admin: p.admin.clone(),
             contract: None,
         });
-        if !self.take(&p.implementation) {
+        if !self.take_part(&p.implementation) {
             return c;
         }
         let impl_code = match self.code(&p.implementation) {

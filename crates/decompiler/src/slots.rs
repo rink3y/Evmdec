@@ -105,11 +105,21 @@ const KNOWN: &[(&str, Scheme, &str)] = &[
     (
         "openzeppelin.storage.EIP712",
         Scheme::Erc7201(0),
-        "oz_eip712_name",
+        "oz_eip712_hashed_name",
     ),
     (
         "openzeppelin.storage.EIP712",
         Scheme::Erc7201(1),
+        "oz_eip712_hashed_version",
+    ),
+    (
+        "openzeppelin.storage.EIP712",
+        Scheme::Erc7201(2),
+        "oz_eip712_name",
+    ),
+    (
+        "openzeppelin.storage.EIP712",
+        Scheme::Erc7201(3),
         "oz_eip712_version",
     ),
 ];

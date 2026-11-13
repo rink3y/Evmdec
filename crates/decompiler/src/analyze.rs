@@ -5061,10 +5061,10 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     } else if fallback_delegatecall {
         let kind = if eip1967 {
             "EIP-1967 upgradeable proxy"
-        } else if c.info.runtime.len() < 100 {
-            "EIP-1167 minimal proxy (clone)"
         } else if delegatecall_targets_storage {
             "Proxy (implementation address in storage)"
+        } else if c.info.runtime.len() < 100 {
+            "EIP-1167 minimal proxy (clone)"
         } else {
             "Proxy"
         };

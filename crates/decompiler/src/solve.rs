@@ -115,7 +115,7 @@ impl Eval<'_> {
                 op::NUMBER => Some(self.inputs.number),
                 op::RETURNDATASIZE => Some(U256::from(self.inputs.returned.len())),
                 op::SELFBALANCE => Some(self.inputs.balance),
-                _ => None,
+                _ => crate::interp::fixed_in_a_run(o),
             },
             Node::CallDataLoad(off) | Node::CopiedWord(op::CALLDATACOPY, off, _) => self
                 .value(off)

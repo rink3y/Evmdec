@@ -2508,6 +2508,11 @@ fn inventories(
                 collect_fields(root, &mut fields);
             }
         }
+        // The right side of an `||` is carried on the edge into the join and read
+        // nowhere else.
+        for (_, value) in l.edge_assigns.values().flatten() {
+            collect_sloads(*value, &mut slots, vyper, &bases);
+        }
     }
     let _ = names;
     let elem_types = element_types(functions);

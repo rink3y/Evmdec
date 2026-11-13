@@ -297,6 +297,16 @@
         "control-handed-out-mid-update"
       ],
       "min_severity": "high"
+    },
+    "block_value_wheel": {
+      "address": "0x5fe5b7546d1628f7348b023a0393de1fc825a4fd",
+      "chain": "mainnet",
+      "year": 2026,
+      "bug": "a wheel whose number is the remainder of a sum of block values and a stored counter: every input is known inside the block the bet is placed in",
+      "expected": [
+        "weak-randomness"
+      ],
+      "min_severity": "high"
     }
   }
 }

@@ -3373,6 +3373,101 @@ fn leaves_quietly(l: &Lifted, start: usize) -> bool {
 
 const MAX_QUIET_NODES: usize = 64;
 
+// A remainder taken from block values is a draw, with or without a hash. A time on its
+// own is left out: `timestamp % period` places a moment in a schedule. A field that says
+// nothing about time, or two fields added together, has no such reading.
+fn mixed_remainder(n: &Node) -> bool {
+    let Node::Op(op::MOD, parts) = n else {
+        return false;
+    };
+    let Some(drawn) = parts.first() else {
+        return false;
+    };
+    let has = |which: u8| mentions(*drawn, &|n| matches!(n, Node::Env(o, _) if *o == which));
+    let timeless = [op::PREVRANDAO, op::COINBASE, op::GASLIMIT]
+        .iter()
+        .any(|o| has(*o))
+        || mentions(*drawn, &|n| matches!(n, Node::Op(op::BLOCKHASH, _)));
+    timeless || (has(op::TIMESTAMP) && has(op::NUMBER))
+}
+
+// A test that holds also settles what it negates, as deep as the negations go.
+fn hold(known: &mut HashMap<ExprId, bool>, cond: ExprId, truth: bool) {
+    let (mut cond, mut truth) = (cond, truth);
+    loop {
+        known.insert(cond, truth);
+        let Node::Op(op::ISZERO, inner) = expr::node(cond) else {
+            return;
+        };
+        (cond, truth) = (inner[0], !truth);
+    }
+}
+
+fn settled(cond: ExprId, known: &HashMap<ExprId, bool>) -> Option<bool> {
+    if let Some(truth) = known.get(&cond) {
+        return Some(*truth);
+    }
+    match expr::node(cond) {
+        Node::Const(c) => Some(!c.is_zero()),
+        Node::Op(op::ISZERO, inner) => settled(inner[0], known).map(|truth| !truth),
+        _ => None,
+    }
+}
+
+// The same question as `leaves_quietly`, asked of one side of a branch. A compound test
+// such as `caller == owner && amount <= held` is compiled as two branches that meet in
+// a variable. The failing side carries the failed test into it, and the branch on it then
+// goes one way only. Following what each side is known to hold keeps the failing side
+// from looking like it reaches the body.
+fn leaves_quietly_from(l: &Lifted, branch: usize, start: usize) -> bool {
+    let Term::Branch { cond, t, .. } = &l.nodes[branch].term else {
+        return leaves_quietly(l, start);
+    };
+    let mut first = HashMap::new();
+    hold(&mut first, *cond, *t == Some(start));
+    let mut seen = HashSet::new();
+    let mut stack = vec![(branch, start, first)];
+    while let Some((from, x, mut known)) = stack.pop() {
+        if !seen.insert((from, x)) {
+            continue;
+        }
+        for (var, value) in l.edge_assigns.get(&(from, x)).into_iter().flatten() {
+            match settled(*value, &known) {
+                Some(truth) => hold(&mut known, *var, truth),
+                None => {
+                    known.remove(var);
+                }
+            }
+        }
+        let nd = &l.nodes[x];
+        let acts = |s: &Stmt| {
+            matches!(
+                s,
+                Stmt::SStore { .. } | Stmt::Call { .. } | Stmt::Create { .. } | Stmt::Log { .. }
+            )
+        };
+        let ends = matches!(nd.term, Term::SelfDestruct(_));
+        if seen.len() > MAX_QUIET_NODES || ends || nd.stmts.iter().any(acts) {
+            return false;
+        }
+        let Term::Branch { cond, t, f } = &nd.term else {
+            stack.extend(nd.succs.iter().map(|next| (x, *next, known.clone())));
+            continue;
+        };
+        let sides = [(*t, true), (Some(*f), false)];
+        for (side, truth) in sides {
+            let Some(next) = side else { continue };
+            if settled(*cond, &known).is_some_and(|k| k != truth) {
+                continue;
+            }
+            let mut holds = known.clone();
+            hold(&mut holds, *cond, truth);
+            stack.push((x, next, holds));
+        }
+    }
+    true
+}
+
 fn has_caller_check(l: &Lifted, before: Option<usize>, roles: &HashSet<U256>) -> bool {
     for nd in &l.nodes {
         let auth = |c: &ExprId| is_auth_cond_in(*c, roles);
@@ -3382,7 +3477,8 @@ fn has_caller_check(l: &Lifted, before: Option<usize>, roles: &HashSet<U256>) ->
             .any(|s| matches!(s, Stmt::Require { cond, .. } if auth(cond)));
         let guarded = match &nd.term {
             Term::Branch { cond, t, f } if auth(cond) => {
-                t.is_none_or(|t| leaves_quietly(l, t)) || leaves_quietly(l, *f)
+                t.is_none_or(|t| leaves_quietly_from(l, nd.id, t))
+                    || leaves_quietly_from(l, nd.id, *f)
             }
             _ => false,
         };
@@ -3693,6 +3789,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
             &mut stores,
             &mut uses,
         );
+        let sends_ether = !fact.ether_out.is_empty();
         facts.push(fact);
         let loop_cap: Option<u64> = {
             let mut keys: Vec<U256> = Vec::new();
@@ -4475,7 +4572,11 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 }
                                 _ => false,
                             });
-                            if !from_caller(v) && !accounted {
+                            // Sending back what this same call brought takes nothing from
+                            // the contract.
+                            let refund =
+                                matches!(expr::node(unmask(v)), Node::Env(op::CALLVALUE, _));
+                            if !from_caller(v) && !accounted && !refund {
                                 push(&mut findings, "unprotected-ether-withdrawal", "Ether sent to msg.sender without per-caller accounting", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                     format!("`{}` sends `{}` wei to msg.sender; the amount is not derived from a msg.sender-keyed balance and the function has no access control.", f.name, emit::fmt_expr(v, names)),
                                     vec![line.clone()], "Verify the amount is bounded by what the caller is owed.");
@@ -4800,6 +4901,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                 })
                 .collect();
             let mut hashes: Vec<ExprId> = Vec::new();
+            let mut plain = false;
             for e in events.iter().flat_map(event_exprs) {
                 let mut seen = HashSet::new();
                 let mut stack = vec![e];
@@ -4811,8 +4913,10 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                     if matches!(n, Node::SLoad(..)) {
                         continue;
                     }
-                    if is_hash(&n) && mentions(x, &blocky) && !hashes.contains(&x) {
+                    let hashed = is_hash(&n) && mentions(x, &blocky);
+                    if (hashed || mixed_remainder(&n)) && !hashes.contains(&x) {
                         hashes.push(x);
+                        plain |= !hashed;
                     }
                     stack.extend(expr::children(x));
                 }
@@ -4872,8 +4976,24 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                         emit::fmt_expr(hashes[0], &names),
                     ),
                 };
+                // A result that decides a branch in a function that pays out is worth
+                // whatever the function can pay. A caller's own contract reads the same
+                // block values first and calls only when the result suits it.
+                let pays = decided.is_some() && sends_ether;
+                let (sev, conf) = match pays {
+                    true => (Severity::High, Confidence::Medium),
+                    false => (sev, conf),
+                };
+                let how = match plain {
+                    true => "takes the remainder of a mix of block values (`block.timestamp`, `block.number`, `prevrandao`, `gaslimit`, `coinbase`, `blockhash`)",
+                    false => "hashes `block.timestamp`/`block.number`/`prevrandao`/`coinbase`/`blockhash`",
+                };
+                let stakes = match pays {
+                    true => " The result decides a branch in a function that pays ether out, so whoever can predict it collects.",
+                    false => "",
+                };
                 push(&mut findings, "weak-randomness", "Block attributes used as a randomness source", sev, conf, Some(f), Some(pc),
-                    format!("`{}` hashes `block.timestamp`/`block.number`/`prevrandao`/`coinbase`/`blockhash`{}. Validators and front-running contracts can predict or influence every one of these inputs.", f.name, match (reduced, decided) { (Some(_), _) => " and reduces the result to a range", (None, Some(_)) => " and branches on the result", _ => "" }),
+                    format!("`{}` {how}{}. Every one of these values is the same for every call in a block, so a contract can compute the result first and call only when it wins, and a validator can choose them.{stakes}", f.name, if reduced.is_some() { " and reduces or compares the result" } else { "" }),
                     vec![what], "Use a verifiable randomness source (VRF, commit-reveal) and never decide payouts on block attributes.");
             }
         }
@@ -5293,6 +5413,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     exec::within(confirm::WORK, || confirm::confirm(c, &mut findings));
     if asked {
         exec::within(confirm::WORK, || confirm::confirm_wraps(c, &mut findings));
+        exec::within(confirm::WORK, || confirm::confirm_chance(c, &mut findings));
     }
 
     crate::invariant::findings(c, &c.types, &mut findings);

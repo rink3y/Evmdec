@@ -89,7 +89,10 @@ pub fn confirm(c: &Contract, findings: &mut [Finding]) {
         let entries: Vec<Entry> = c.functions.iter().filter(same_code).map(entry).collect();
         let id = finding.id.clone();
         let goal = |p: &Path| {
-            p.run.reached(local) && p.succeeded() && shows_effect(&id, &p.run, &p.inputs.storage)
+            let brought = p.inputs.callvalue;
+            p.run.reached(local)
+                && p.succeeded()
+                && shows_effect(&id, &p.run, &p.inputs.storage, brought)
         };
         let explorer = Explorer::new(code);
         if let Some(plan) = seq::reach(&explorer, &entries, entry(f), &start, &goal) {
@@ -133,7 +136,7 @@ fn reach(
         let data = exec::calldata(selector, &args);
         let host = exec::caller_host(data.clone(), callvalue);
         let run = exec::run_frame(code, &host, start.clone(), STEP_BUDGET);
-        if run.reached(pc) && run.succeeded() && shows_effect(id, &run, start) {
+        if run.reached(pc) && run.succeeded() && shows_effect(id, &run, start, callvalue) {
             let mut inputs = path::inputs_for(selector, 0);
             (inputs.callvalue, inputs.storage) = (callvalue, start.clone());
             return Some((data, evidence::observed(&inputs, &run)));
@@ -181,7 +184,7 @@ fn solved(
                 .find(|p| {
                     p.run.reached(pc)
                         && p.succeeded()
-                        && shows_effect(id, &p.run, &p.inputs.storage)
+                        && shows_effect(id, &p.run, &p.inputs.storage, p.inputs.callvalue)
                 });
             if let Some(p) = hit {
                 let observed = evidence::observed(&p.inputs, &p.run);
@@ -194,11 +197,18 @@ fn solved(
 
 // What a run stored is judged against what it started with. The run begins with what the
 // constructor stored, so its storage is never empty once a constructor has written.
-fn shows_effect(id: &str, run: &FrameRun, start: &HashMap<U256, U256>) -> bool {
+fn shows_effect(id: &str, run: &FrameRun, start: &HashMap<U256, U256>, brought: U256) -> bool {
     let call_of = |pred: &dyn Fn(&CallRecord) -> bool| run.calls.iter().any(pred);
     match id {
         "selfdestruct" => matches!(run.outcome, Outcome::SelfDestruct(_)),
-        "unprotected-ether-withdrawal" => call_of(&|c| c.kind == op::CALL && !c.value.is_zero()),
+        // Ether that came in with this call and goes back out is a refund.
+        "unprotected-ether-withdrawal" => {
+            let sent = run.calls.iter().filter(|c| c.kind == op::CALL);
+            let out = sent.fold(U256::ZERO, |all, c| {
+                all.checked_add(c.value).unwrap_or(U256::MAX)
+            });
+            out > brought
+        }
         "arbitrary-call" => call_of(&|c| matches!(c.kind, op::CALL | op::CALLCODE)),
         "arbitrary-delegatecall" | "delegatecall-user-target" | "delegatecall-dynamic-target" => {
             call_of(&|c| c.kind == op::DELEGATECALL)
@@ -415,5 +425,116 @@ pub fn confirm_wraps(c: &Contract, findings: &mut [Finding]) {
             }
             Wrap::Open => {}
         }
+    }
+}
+
+const CHANCE_ID: &str = "weak-randomness";
+const LATER: [u64; 3] = [1, 2, 3];
+const BLOCK_SECONDS: u64 = 12;
+const STAKE: u64 = 0x1001;
+
+fn paid_to_caller(p: &Path) -> U256 {
+    let sent = p
+        .run
+        .calls
+        .iter()
+        .filter(|c| c.kind == op::CALL && c.addr == p.inputs.caller);
+    sent.fold(U256::ZERO, |all, c| {
+        all.checked_add(c.value).unwrap_or(U256::MAX)
+    })
+}
+
+struct Chance {
+    won: Path,
+    blocks: u64,
+    then: U256,
+}
+
+// A draw from block values is shown by its effect: a call that is paid more than it
+// brought, and the same call a block or two later that is not. Nothing but the block
+// differs between the two, and a contract reads the block before it decides to call.
+fn chance_shown(explorer: &Explorer, f: &Function, begin: &HashMap<U256, U256>) -> Option<Chance> {
+    let selector = exec::selector_of(f);
+    let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
+    let shaped = abi::layout(selector, &types);
+    let flat = path::inputs_for(selector, f.params.len().clamp(1, 8));
+    let starts = [
+        (flat.calldata.clone(), Vec::new()),
+        (shaped.calldata, shaped.fixed),
+    ];
+    for (calldata, fixed) in starts {
+        let free = Free {
+            words: calldata.len() / 32,
+            value: true,
+            // The limits such a function checks are set by an owner or a constructor.
+            // They are chosen here so that the call is accepted.
+            storage: true,
+            fixed,
+        };
+        // No branch asks for a payment above zero, so the search would settle for none.
+        let start = Inputs {
+            calldata,
+            callvalue: U256::from_u64(STAKE),
+            storage: begin.clone(),
+            ..flat.clone()
+        };
+        for p in explorer.explore(&start, &free, Limits::default()) {
+            let paid = paid_to_caller(&p);
+            if !p.succeeded() || paid <= p.inputs.callvalue {
+                continue;
+            }
+            for blocks in LATER {
+                let mut later = p.inputs.clone();
+                later.number = later.number.wrapping_add(U256::from_u64(blocks));
+                let seconds = U256::from_u64(blocks * BLOCK_SECONDS);
+                later.timestamp = later.timestamp.wrapping_add(seconds);
+                let again = explorer.run(&later);
+                let then = paid_to_caller(&again);
+                if again.succeeded() && then < paid {
+                    return Some(Chance {
+                        won: p,
+                        blocks,
+                        then,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn confirm_chance(c: &Contract, findings: &mut [Finding]) {
+    if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
+        return;
+    }
+    let start = deploy::storage(c);
+    for finding in findings.iter_mut() {
+        if exec::spent() {
+            break;
+        }
+        if finding.confirmed || finding.id != CHANCE_ID {
+            continue;
+        }
+        let Some(name) = finding.function.as_deref() else {
+            continue;
+        };
+        let function = c
+            .functions
+            .iter()
+            .find(|f| f.kind == FnKind::External && display_name(f) == name);
+        let Some(f) = function else { continue };
+        let explorer = Explorer::new(c.code_of(f));
+        let Some(Chance { won, blocks, then }) = chance_shown(&explorer, f, &start) else {
+            continue;
+        };
+        finding.description.push_str(&format!(
+            " Confirmed by running it, with storage chosen so that the call is accepted: the attached call brings {} and is paid {}. The same call with the block number {blocks} higher is paid {}. Nothing but the block number and its time differs between the two runs.",
+            won.inputs.callvalue.to_hex(),
+            paid_to_caller(&won).to_hex(),
+            then.to_hex(),
+        ));
+        finding.severity = Severity::High;
+        finding.confidence = Confidence::High;
+        finding.confirm(&won);
     }
 }

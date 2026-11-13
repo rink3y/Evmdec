@@ -53,6 +53,30 @@ fn h(data: &[u8]) -> U256 {
     U256::from_be_bytes(&keccak::keccak256(data))
 }
 
+const GASPRICE: u64 = 1_000_000_000;
+const COINBASE: u64 = 0xc0;
+const PREVRANDAO: u64 = 0x1234_5678_9abc_def0;
+const GASLIMIT: u64 = 30_000_000;
+const CHAINID: u64 = 1;
+const BASEFEE: u64 = 1_000_000_000;
+const BLOBBASEFEE: u64 = 1;
+
+// The solver works out a branch from these. A value it does not know here is a branch
+// it cannot turn, however simple the comparison.
+pub fn fixed_in_a_run(o: u8) -> Option<U256> {
+    let value = match o {
+        op::GASPRICE => GASPRICE,
+        op::COINBASE => COINBASE,
+        op::PREVRANDAO => PREVRANDAO,
+        op::GASLIMIT => GASLIMIT,
+        op::CHAINID => CHAINID,
+        op::BASEFEE => BASEFEE,
+        op::BLOBBASEFEE => BLOBBASEFEE,
+        _ => return None,
+    };
+    Some(U256::from_u64(value))
+}
+
 #[derive(Clone, Debug)]
 pub struct Host {
     pub address: U256,
@@ -130,16 +154,16 @@ impl Host {
             origin: caller,
             callvalue,
             calldata,
-            gasprice: U256::from_u64(1_000_000_000),
-            coinbase: U256::from_u64(0xc0),
+            gasprice: U256::from_u64(GASPRICE),
+            coinbase: U256::from_u64(COINBASE),
             timestamp: U256::from_u64(1_700_000_000),
             number: U256::from_u64(18_000_000),
-            prevrandao: U256::from_u64(0x1234_5678_9abc_def0),
-            gaslimit: U256::from_u64(30_000_000),
-            chainid: U256::ONE,
+            prevrandao: U256::from_u64(PREVRANDAO),
+            gaslimit: U256::from_u64(GASLIMIT),
+            chainid: U256::from_u64(CHAINID),
             selfbalance: U256::from_u64(1_000_000_000_000_000_000),
-            basefee: U256::from_u64(1_000_000_000),
-            blobbasefee: U256::ONE,
+            basefee: U256::from_u64(BASEFEE),
+            blobbasefee: U256::from_u64(BLOBBASEFEE),
             seed: 0x5eed,
             zero_storage: true,
             force_calls: Some(true),

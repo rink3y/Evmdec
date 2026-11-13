@@ -2,7 +2,7 @@ use crate::abi::{self, SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::analyze::{push, Confidence, Finding, Severity};
 use crate::decompile::{Contract, Function};
 use crate::deploy;
-use crate::exec;
+use crate::exec::{self, FrameRun};
 use crate::function::FnKind;
 use crate::hex;
 use crate::interp::Outcome;
@@ -95,11 +95,16 @@ struct Call<'a> {
     value: U256,
 }
 
-type Gain<'a> = (Vec<Call<'a>>, Path, Moved);
+type Gain<'a> = (Vec<Call<'a>>, Ran, Moved);
+
+struct Ran {
+    inputs: Inputs,
+    run: FrameRun,
+}
 
 struct Found<'a> {
     calls: Vec<Call<'a>>,
-    last: Path,
+    last: Ran,
     net: Moved,
     first_paid: U256,
     surplus: U256,
@@ -111,7 +116,7 @@ fn selector(input: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-fn token_moves(p: &Path) -> impl Iterator<Item = (U256, U256, U256)> + '_ {
+fn token_moves(p: &Ran) -> impl Iterator<Item = (U256, U256, U256)> + '_ {
     let this = p.inputs.address;
     p.run.calls.iter().filter_map(move |c| {
         if c.kind != op::CALL {
@@ -129,7 +134,7 @@ fn token_moves(p: &Path) -> impl Iterator<Item = (U256, U256, U256)> + '_ {
     })
 }
 
-fn moved(p: &Path) -> Moved {
+fn moved(p: &Ran) -> Moved {
     let (who, this) = (p.inputs.caller, p.inputs.address);
     let paid = p
         .run
@@ -154,7 +159,7 @@ fn moved(p: &Path) -> Moved {
 
 // The run engine answers every call with success. A payment the contract could not
 // have covered would have failed on chain, so such a run is not counted.
-fn settle(p: &Path, held: &Held) -> Option<Held> {
+fn settle(p: &Ran, held: &Held) -> Option<Held> {
     if !matches!(p.run.outcome, Outcome::Stop | Outcome::Return(_)) {
         return None;
     }
@@ -245,10 +250,11 @@ impl<'a> Pass<'a> {
         }
     }
 
-    fn step(&mut self, call: &Call, held: &Held) -> Option<(Path, Held)> {
+    fn step(&mut self, call: &Call, held: &Held) -> Option<(Ran, Held)> {
         let inputs = self.inputs(call, held);
         let code = self.c.code_of(call.function);
-        let p = self.explorers.of(code).run(&inputs);
+        let run = self.explorers.of(code).run_only(&inputs);
+        let p = Ran { inputs, run };
         let next = settle(&p, held)?;
         Some((p, next))
     }
@@ -358,6 +364,9 @@ impl<'a> Pass<'a> {
             .filter(|i| self.entries[*i].function.effects.calls)
             .collect();
         for round in 0..MAX_REPEATS {
+            if exec::spent() {
+                return None;
+            }
             let (p, next) = self.step(&again, &held)?;
             net = net.plus(moved(&p));
             held = next;
@@ -512,7 +521,9 @@ fn report(out: &mut Vec<Finding>, found: &Found, from: &str, needs_surplus: bool
             )
         };
         finding.setup = earlier.iter().map(shown).collect();
-        finding.confirm(&found.last);
+        finding.confirmed = true;
+        finding.witness = Some(hex::encode(&found.last.inputs.calldata));
+        finding.observed = crate::evidence::observed(&found.last.inputs, &found.last.run);
     }
 }
 

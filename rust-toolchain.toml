@@ -1,0 +1,9 @@
+# ---------------------------------------------------------------
+# Toolchain: the compiler every build and check uses
+#
+#   channel      the exact release, so a new one cannot fail code already merged
+#   components   the formatter and the linter the checks run
+# ---------------------------------------------------------------
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]

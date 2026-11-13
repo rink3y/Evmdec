@@ -15,3 +15,7 @@ for f in "$DIR"/*.hex; do
 done
 pct=$(python3 -c "print(f'{100*$tiv/max(1,$tit):.3f}')")
 printf "%-22s %7s %7s %6s %6s %6s %9s %9s %8s\n" TOTAL "$tb" "$tr" "$ta" "$tm" "$ti" "$tbv/$tb" "$tiv/$tit" "$pct"
+if [ "$tb" -eq 0 ] || [ "$tm" -ne 0 ] || [ $((tiv * 1000)) -lt $((tit * ${MIN_PERMILLE:-985})) ]; then
+  echo "FAIL no blocks checked, a mismatch, or under ${MIN_PERMILLE:-985} per mille of instructions verified"
+  exit 1
+fi

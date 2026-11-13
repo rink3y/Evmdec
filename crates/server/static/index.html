@@ -343,18 +343,19 @@ document.querySelectorAll('#support,.sup-foot').forEach(b=>b.addEventListener('c
 $('#dl').addEventListener('click',()=>{if(!DATA)return;const blob=new Blob([DATA.contract.source],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(DATA.contract.address||'contract')+'.sol';a.click();say('Downloaded '+a.download)});
 function fromUrl(){const p=new URLSearchParams(location.search);const a=p.get('address');if(a&&/^0x[0-9a-fA-F]{40}$/.test(a)){$('#q').value=a;const sel=$('#chain'),c=p.get('chain');if(c&&[...sel.options].some(o=>o.value===c))sel.value=c;go()}}
 
-async function go(){const q=$('#q').value.trim();if(!q)return;const btn=$('#go');btn.disabled=true;btn.textContent='Decompiling…';say('Decompiling');document.body.setAttribute('aria-busy','true');
+let REQ=0;
+async function go(){const q=$('#q').value.trim();if(!q)return;const mine=++REQ;const chain=$('#chain').value;const btn=$('#go');btn.disabled=true;btn.textContent='Decompiling…';say('Decompiling');document.body.setAttribute('aria-busy','true');
  try{
-  const isAddr=/^0x[0-9a-fA-F]{40}$/.test(q);const body=isAddr?{address:q,chain:$('#chain').value}:{bytecode:q};
+  const isAddr=/^0x[0-9a-fA-F]{40}$/.test(q);const body=isAddr?{address:q,chain}:{bytecode:q};
   const r=await fetch('/api/decompile',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-  const j=await r.json();if(!r.ok)throw new Error(j.error||r.statusText);
+  const j=await r.json();if(mine!==REQ)return;if(!r.ok)throw new Error(j.error||r.statusText);
   DATA=j;CUR=null;document.body.dataset.state='loaded';$('#landing-err').innerHTML='';
-  if(isAddr){history.replaceState(null,'','?chain='+encodeURIComponent($('#chain').value)+'&address='+q)}
+  if(isAddr){history.replaceState(null,'','?chain='+encodeURIComponent(chain)+'&address='+q)}
   ROOT=j;ENTRIES=buildEntries(j);show(0);
-  document.title=(isAddr?q.slice(0,10)+'…'+q.slice(-4)+' on '+$('#chain').value:'pasted bytecode')+' · evmdec: risk '+j.report.risk_score+'/100';
+  document.title=(isAddr?q.slice(0,10)+'…'+q.slice(-4)+' on '+chain:'pasted bytecode')+' · evmdec: risk '+j.report.risk_score+'/100';
   say('Decompiled: '+j.contract.stats.external_functions+' external functions, '+FINDINGS.length+' findings, risk '+j.report.risk_score+' of 100');
- }catch(e){const msg='<div class="err" role="alert"><b>Could not decompile.</b> '+esc(e.message||e)+' Check the address and chain, or paste the bytecode directly.</div>';if(DATA)$('#panel-code').innerHTML=msg;else $('#landing-err').innerHTML=msg;say('Failed: '+(e.message||e))}
- finally{btn.disabled=false;btn.textContent='Decompile';document.body.removeAttribute('aria-busy')}}
+ }catch(e){if(mine!==REQ)return;const msg='<div class="err" role="alert"><b>Could not decompile.</b> '+esc(e.message||e)+' Check the address and chain, or paste the bytecode directly.</div>';if(DATA){$('#panel-code').innerHTML=msg;selectTab($('#tab-code'))}else $('#landing-err').innerHTML=msg;say('Failed: '+(e.message||e))}
+ finally{if(mine===REQ){btn.disabled=false;btn.textContent='Decompile';document.body.removeAttribute('aria-busy')}}}
 
 function riskWord(s){return s>=80?'Critical':s>=40?'High':s>=20?'Medium':s>=8?'Low':'Minimal'}
 function summaryText(sum){return ['critical','high','medium','low','info'].filter(k=>sum[k]).map(k=>sum[k]+' '+SEVL[k].toLowerCase()).join(', ')||'no findings'}
@@ -373,6 +374,7 @@ function buildEntries(root){const c=root.contract;const out=[{label:c.composite?
 function show(i){CURRENT=i;DATA=ENTRIES[i].data;CUR=null;rerender()}
 function shortA(a){a=a||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
 function riskClass(r){return r>=50?'hi':r>=20?'md':''}
+function kinds(rep){const k=rep&&rep.contract_kind;return (Array.isArray(k)?k:(typeof k==='string'?[k]:[])).map(x=>String(x).trim()).filter(x=>x&&x!=='unclassified')}
 function kindOf(entry){const k=entry.report&&entry.report.contract_kind;const s=Array.isArray(k)?k[0]:(typeof k==='string'?k:'');return s&&s!=='unclassified'?s:'contract'}
 function loopWithIn(root,addr){const a=(addr||'').toLowerCase();return (root.report.findings||[]).some(f=>f.id==='trusted-callee-loop'&&f.severity==='critical'&&(f.description||'').toLowerCase().includes(a))}
 function howLinked(c,addr,lc){const a=(addr||'').toLowerCase();const lk=lc&&lc.link;if(lk){const far=lk.depth>1?' · called by '+shortA(lk.from)+' · '+lk.depth+' calls away':'';const ok=(lc.admits||[]).some(x=>x.toLowerCase()===(lk.from||'').toLowerCase());return lk.how+far+(ok?' · its storage approves that caller':'')}const st=(c.stored_targets||[]).find(([,x])=>x.toLowerCase()===a);if(st)return 'held in storage slot '+(st[0].replace(/^0x0*/,'0x')||'0x0');if((c.call_targets||[]).some(x=>x.toLowerCase()===a))return 'hard-coded in the code';if((c.library_targets||[]).some(x=>x.toLowerCase()===a))return 'library, run in this contract\'s storage';return 'linked'}
@@ -466,7 +468,7 @@ function storagePanel(c){const comp=!!(c.parts&&c.parts.length);const pcol=s=>co
  const table=rows?scrollTable('Storage layout','<table class="stack" role="table"><thead role="rowgroup"><tr role="row"><th role="columnheader" scope="col">Slot</th><th role="columnheader" scope="col">Name</th><th role="columnheader" scope="col">Type</th><th role="columnheader" scope="col">Reads</th><th role="columnheader" scope="col">Writes</th>'+(comp?'<th role="columnheader" scope="col">Parts</th>':'')+'</tr></thead><tbody role="rowgroup">'+rows+'</tbody></table>'):'<p>No storage accessed.</p>';
  return '<div class="report">'+partsTable(c)+'<h2>Storage layout</h2>'+table+'<h2>Events</h2>'+list(c.events,'No events emitted.')+'<h2>Custom errors</h2>'+list(c.errors,'None.')+'<h2>Strings</h2>'+(c.strings.length?'<ul>'+c.strings.map(e=>'<li>'+esc(e)+'</li>').join('')+'</ul>':'<p>None.</p>')+'<h2>Selectors called on other contracts</h2>'+list(c.selectors_called,'None.')+'</div>'}
 function reportPanel(rep,c){const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
- return '<div class="report"><h2>Summary</h2><p>Risk score <b class="'+(rep.risk_score>=8?'sev-high':'')+'">'+rep.risk_score+'/100</b> ('+riskWord(rep.risk_score).toLowerCase()+'). '+summaryText(rep.summary)+((typeof rep.contract_kind==='string'&&rep.contract_kind.trim()&&rep.contract_kind.trim()!=='unclassified')?'. Kind: '+esc(rep.contract_kind.trim()):'')+'. Findings are leads with a confidence level; coverage and unresolved jumps are in the title block.</p><h2>Privileged functions</h2>'+list(rep.privileged_functions)+'<h2>State-changing functions callable by anyone</h2>'+list(rep.unauthenticated_state_changers)+'<h2>External calls</h2>'+list(rep.external_calls)+(rep.maps||[]).map(m=>'<h2>'+esc(m.title)+'</h2><ul>'+m.lines.map(l=>'<li>'+esc(l)+'</li>').join('')+'</ul>').join('')+'<h2>All findings</h2><ol class="findings">'+FINDINGS.map((f,i)=>findingItem(i+1,f,true).replace(' id="F'+(i+1)+'"',' id="R'+(i+1)+'"').replace('id="FB'+(i+1)+'"','id="RB'+(i+1)+'"').replace('aria-controls="FB'+(i+1)+'"','aria-controls="RB'+(i+1)+'"')).join('')+'</ol></div>'}
+ return '<div class="report"><h2>Summary</h2><p>Risk score <b class="'+(rep.risk_score>=8?'sev-high':'')+'">'+rep.risk_score+'/100</b> ('+riskWord(rep.risk_score).toLowerCase()+'). '+summaryText(rep.summary)+(kinds(rep).length?'. Kind: '+esc(kinds(rep).join(', ')):'')+'. Findings are leads with a confidence level; coverage and unresolved jumps are in the title block.</p><h2>Privileged functions</h2>'+list(rep.privileged_functions)+'<h2>State-changing functions callable by anyone</h2>'+list(rep.unauthenticated_state_changers)+'<h2>External calls</h2>'+list(rep.external_calls)+(rep.maps||[]).map(m=>'<h2>'+esc(m.title)+'</h2><ul>'+m.lines.map(l=>'<li>'+esc(l)+'</li>').join('')+'</ul>').join('')+'<h2>All findings</h2><ol class="findings">'+FINDINGS.map((f,i)=>findingItem(i+1,f,true).replace(' id="F'+(i+1)+'"',' id="R'+(i+1)+'"').replace('id="FB'+(i+1)+'"','id="RB'+(i+1)+'"').replace('aria-controls="FB'+(i+1)+'"','aria-controls="RB'+(i+1)+'"')).join('')+'</ol></div>'}
 function partsTable(c){const parts=c.parts||[];if(!parts.length)return '';const comp=c.composite||{};
  const role=p=>p.role==='shell'?'shell (routes calls)':p.role==='implementation'?'implementation':'facet';
  const sels=p=>p.role==='shell'?'router':(p.selectors.length?p.selectors.length+' selectors':'all unrouted');

@@ -321,8 +321,10 @@ audited code.
 `corpus/harvest.py` collects the `to` address of every transaction in random recent mainnet
 blocks and `corpus/run_sample.sh` decompiles and verifies each one. The last run over 120
 contracts (`corpus/sample_ids.txt`) decompiled all of them with no unresolved jumps and no
-oracle mismatch in 589,349 instructions. The sample itself is not in the repository; the two
-scripts regenerate it, with the code each address holds on the day it is fetched.
+oracle mismatch in 589,349 instructions. The sample itself is not in the repository.
+`corpus/harvest.py --ids corpus/sample_ids.txt --out sample` fetches the same addresses again,
+with the code each one holds on the day it is fetched, and takes the multichain list the same
+way.
 
 A larger run takes 579 distinct contracts from mainnet, Base, BNB Chain, Arbitrum and Polygon
 (`corpus/sample_ids_multichain.txt`, chain and address per line). 578 are decompiled, analysed
@@ -368,7 +370,7 @@ PORT=8080 ./target/release/evmdec-server
 ```
 
 Chains: mainnet, sepolia, arbitrum, optimism, base, polygon, bsc, avalanche, gnosis, fantom,
-linea, scroll, blast, zksync, classic. Public endpoints are tried in order; an endpoint that
+linea, scroll, blast, classic. Public endpoints are tried in order; an endpoint that
 returns empty code or zero storage falls through to the next.
 
 Docker: `docker build -t evmdec . && docker run -p 8080:8080 evmdec`. The image builds the full

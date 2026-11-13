@@ -10,13 +10,44 @@ def rpc(url, method, params):
     if "error" in j: raise RuntimeError(j["error"])
     return j["result"]
 
+CHAINS = {
+    "mainnet": "https://ethereum-rpc.publicnode.com",
+    "base": "https://base-rpc.publicnode.com",
+    "bsc": "https://bsc-rpc.publicnode.com",
+    "arbitrum": "https://arbitrum-one-rpc.publicnode.com",
+    "polygon": "https://polygon-bor-rpc.publicnode.com",
+}
+
+def fetch_listed(ids, out, default_rpc):
+    got = 0
+    for line in open(ids):
+        words = line.split()
+        if not words: continue
+        chain, address = (words[0], words[1]) if len(words) > 1 else ("mainnet", words[0])
+        url = CHAINS.get(chain, default_rpc) if len(words) > 1 else default_rpc
+        name = address.lower() if len(words) == 1 else f"{chain}_{address.lower()}"
+        path = os.path.join(out, name + ".hex")
+        if os.path.exists(path): continue
+        try:
+            code = rpc(url, "eth_getCode", [address, "latest"])
+        except Exception as e:
+            print("code", chain, address, "failed:", e, file=sys.stderr); continue
+        if len(code) <= 2:
+            print("no code now at", chain, address, file=sys.stderr); continue
+        open(path, "w").write(code)
+        got += 1
+    print(f"fetched {got} listed contracts", file=sys.stderr)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True); ap.add_argument("--blocks", type=int, default=20)
+    ap.add_argument("--ids", help="fetch the addresses in this file (one per line, or 'chain address') instead of sampling blocks")
     ap.add_argument("--rpc", default=os.environ.get("EVMDEC_RPC_URL", "https://ethereum-rpc.publicnode.com").split(",")[0])
     ap.add_argument("--max", type=int, default=150); ap.add_argument("--seed", type=int, default=1)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
+    if a.ids:
+        return fetch_listed(a.ids, a.out, a.rpc)
     random.seed(a.seed)
     latest = int(rpc(a.rpc, "eth_blockNumber", []), 16)
     seen = set(x[:-4].lower() for x in os.listdir(a.out) if x.endswith(".hex"))

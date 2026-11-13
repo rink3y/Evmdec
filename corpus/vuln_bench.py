@@ -15,6 +15,9 @@ def analyze(path):
         return None, "rc=%d %s" % (out.returncode, out.stderr.strip().splitlines()[-1:] )
     return json.loads(out.stdout), None
 
+# The one miss is a contract whose flaw is in its configuration, not in its code.
+MIN_HITS = 24
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", action="store_true")
@@ -74,6 +77,9 @@ def main():
         n, c = labelled.get(rule, 0), caught.get(rule, 0)
         recall = f"{c / n:.2f}" if n else "-"
         print(f"{rule:<34}{n:>9}{c:>7}{recall:>8}  {alerts.get(rule, 0)}")
+    if hits < MIN_HITS or not good:
+        print(f"FAIL recall {hits}/{total} is under {MIN_HITS}, or the audited corpus is missing")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

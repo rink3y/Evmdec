@@ -1,0 +1,10 @@
+target
+.git
+.github
+.claude
+sample
+cache
+testdata
+sigs.idx
+.sigs-cache
+**/__pycache__

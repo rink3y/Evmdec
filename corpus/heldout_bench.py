@@ -33,9 +33,8 @@ FAMILIES = {
         "reported-balance-moved-by-another-account", "one-call-reading-leaves-a-gain",
     ],
     "accounting": [
-        "two-calls-return-more", "inflow-credits-nothing", "payout-grows-with-other-payment",
-        "earlier-call-lowers-payout", "rounding-favours-caller", "surplus-open-to-any-account",
-        "payment-taken-by-other-account", "ledger-credits-more-than-received",
+        "inflow-credits-nothing", "earlier-call-lowers-payout", "rounding-favours-caller",
+        "ledger-credits-more-than-received",
         "ledger-total-mismatch", "entries-total-out-of-step", "inconsistent-liability-accounting",
         "unbalanced-ledger-move", "stale-ledger-write", "changed-copy-dropped",
         "division-before-multiplication", "fee-on-transfer", "transfer-creates-value",

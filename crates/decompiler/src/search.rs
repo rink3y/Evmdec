@@ -9,7 +9,7 @@ use crate::interp::Rng;
 use crate::path::{self, Explorers, Limits, Path};
 use crate::solve::{Free, Inputs};
 use crate::u256::U256;
-use crate::world::{Call, Holdings, World, PURSE};
+use crate::world::{Call, Done, Holdings, World, PURSE};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 
@@ -26,7 +26,7 @@ const MAX_DEPTH: usize = 6;
 const MAX_KEPT: usize = 240;
 const MAX_ROUNDS: usize = 60_000;
 // Rounds that reach no new code before the search is taken to have learnt what it can.
-const STALE_ROUNDS: usize = 3_000;
+const STALE_ROUNDS: usize = 10_000;
 // A contract whose calls are long gets through few rounds. It is stale by work done.
 const STALE_WORK: u64 = WORK / 8;
 const SEEDS_PER_ENTRY: usize = 4;
@@ -35,6 +35,7 @@ const MAX_POSITIONS: usize = 96;
 const MAX_SET_SLOTS: usize = 64;
 const SEED_LIMITS: Limits = Limits { paths: 6, runs: 18 };
 const FIRST_VALUE: u64 = 0x1001;
+const SIZES: [u32; 4] = [0, 1, 2, 4];
 const WAITS: [u64; 4] = [3_600, 86_400, 30 * 86_400, 365 * 86_400];
 const UNUSED_SELECTOR: u32 = 0xffff_ffff;
 
@@ -50,9 +51,23 @@ struct Entry<'a> {
 }
 
 #[derive(Clone)]
-struct Step {
-    entry: usize,
-    call: Call,
+enum Step {
+    Call(usize, Call),
+    // Value sent straight to the contract, outside any of its functions.
+    Gift(U256, Option<U256>, U256),
+}
+
+impl Step {
+    fn waited_by_actor(&self) -> bool {
+        matches!(self, Step::Call(_, call) if call.who == ACTOR && call.seconds_later > 0)
+    }
+
+    fn by_actor(&self) -> bool {
+        match self {
+            Step::Call(_, call) => call.who == ACTOR,
+            Step::Gift(who, ..) => *who == ACTOR,
+        }
+    }
 }
 
 // A sequence of calls that ended, with the world it left behind.
@@ -93,8 +108,9 @@ struct Less {
     waited: bool,
 }
 
-// Which way each holding of the two accounts went, and which slots are set.
-type Place = (Vec<(U256, Ordering)>, BTreeSet<U256>);
+// Which way each holding of the two accounts went, which slots are set, and whether
+// value the contract has no record of was sent to it.
+type Place = (Vec<(U256, Ordering)>, BTreeSet<U256>, bool);
 
 struct Search<'a> {
     c: &'a Contract,
@@ -302,6 +318,22 @@ impl<'a> Search<'a> {
         inputs.take(SEEDS_PER_ENTRY).collect()
     }
 
+    // An amount to send: nothing, a little, or a few times what this sequence has
+    // already seen sent. What a contract pays out is often sized by what was paid in.
+    fn size(&mut self, from: usize) -> U256 {
+        let seen = &self.kept[from].amounts;
+        let mut sizes = match seen.is_empty() {
+            true => vec![U256::ZERO, U256::ONE, U256::from_u64(FIRST_VALUE)],
+            false => vec![U256::ZERO],
+        };
+        sizes.extend(seen.iter().copied());
+        let chosen = sizes[self.pick(sizes.len())];
+        match chosen < PURSE {
+            true => chosen << SIZES[self.pick(SIZES.len())],
+            false => chosen,
+        }
+    }
+
     fn input(&mut self, index: usize, who: U256, from: usize) -> Call {
         let seeds = self.entries[index].seeds.len();
         let (mut data, mut value) = match seeds {
@@ -322,7 +354,9 @@ impl<'a> Search<'a> {
             U256::MAX,
             who,
         ];
-        pool.extend(self.kept[from].amounts.iter().copied());
+        // What was paid, and twice that: a credit is often a multiple of the payment.
+        let seen = self.kept[from].amounts.iter().filter(|a| **a < PURSE);
+        pool.extend(seen.flat_map(|a| [*a, *a << 1]));
         if who == ACTOR {
             pool.push(OTHER);
         }
@@ -353,8 +387,14 @@ impl<'a> Search<'a> {
                 data[4 + 32 * at..36 + 32 * at].copy_from_slice(&with.to_be_bytes());
             }
         }
-        if self.pick(4) == 0 {
-            value = pool[self.pick(3)];
+        // A function that was solved with a payment is one whose payment matters, and
+        // what it pays back is often sized by what was paid.
+        let resized = match value.is_zero() {
+            true => self.pick(8) == 0,
+            false => self.pick(2) == 0,
+        };
+        if resized {
+            value = self.size(from);
         }
         let seconds_later = match self.pick(8) {
             0 => WAITS[self.pick(WAITS.len())],
@@ -403,11 +443,51 @@ impl<'a> Search<'a> {
             (false, 0) => OTHER,
             _ => ACTOR,
         };
+        // Value sent to a contract nobody has a stake in is nobody's to lose. The other
+        // account sends it only while the contract holds a payment it recorded.
+        let parent = &self.kept[from];
+        let stake = who == ACTOR || (parent.recorded && parent.world.holds_value(exec::SELF));
+        if stake && self.pick(16) == 0 {
+            self.gift(false, from, who);
+            return;
+        }
         let call = self.input(index, who, from);
         self.attempt(from, index, call);
     }
 
+    fn gift(&mut self, keep: bool, from: usize, who: U256) -> Option<usize> {
+        let mut world = self.kept[from].world.clone();
+        let assets: Vec<U256> = world.assets().into_iter().collect();
+        let asset = match self.pick(assets.len() + 1) {
+            0 => None,
+            n => Some(assets[n - 1]),
+        };
+        // Several times the largest payment seen, so that it is not lost in what the
+        // contract holds.
+        let seen = self.kept[from].amounts.iter().max().copied();
+        let amount = seen.unwrap_or(U256::from_u64(FIRST_VALUE));
+        let amount = match amount < PURSE {
+            true => amount << 2,
+            false => amount,
+        };
+        if !world.give(asset, who, exec::SELF, amount) {
+            return None;
+        }
+        let done = Done {
+            ended: true,
+            moved: true,
+            ..Done::default()
+        };
+        self.settle(keep, from, world, Step::Gift(who, asset, amount), &done)
+    }
+
     fn attempt(&mut self, from: usize, index: usize, call: Call) -> bool {
+        self.attempt_and(false, from, index, call).is_some()
+    }
+
+    // The state a call leaves when it ends and that state is kept. With `keep` it is
+    // kept whether or not it is somewhere new.
+    fn attempt_and(&mut self, keep: bool, from: usize, index: usize, call: Call) -> Option<usize> {
         let at = self.entries[index].at;
         let mut world = self.kept[from].world.clone();
         let mut call = call;
@@ -423,7 +503,7 @@ impl<'a> Search<'a> {
             known.extend(done.read.iter().copied());
         }
         if !done.ended {
-            return false;
+            return None;
         }
         // The starting state stands for a contract in use. A call that sets a slot it
         // found empty and cannot be made again is the contract's set-up. The other
@@ -436,14 +516,29 @@ impl<'a> Search<'a> {
             && done.written.iter().any(arms)
             && !world.clone().call(at, &call).ended
         {
-            return false;
+            return None;
         }
-        let mut novel = false;
+        let kept = self.settle(keep, from, world, Step::Call(index, call), &done);
+        Some(kept.unwrap_or(from))
+    }
+
+    // What a step that ended leaves: the properties are checked on it, and it is kept
+    // to continue from when it is somewhere new.
+    fn settle(
+        &mut self,
+        keep: bool,
+        from: usize,
+        world: World,
+        step: Step,
+        done: &Done,
+    ) -> Option<usize> {
+        let mut novel = keep;
         for branch in &done.branches {
             novel |= self.covered.insert(*branch);
         }
         let parent = &self.kept[from];
-        let base = match (call.who == ACTOR, &parent.base) {
+        let by_actor = step.by_actor();
+        let base = match (by_actor, &parent.base) {
             (true, None) => Some(parent.world.holdings(ACTOR)),
             (_, base) => base.clone(),
         };
@@ -453,22 +548,23 @@ impl<'a> Search<'a> {
         if written.len() < MAX_READS {
             written.extend(done.written.iter().copied());
         }
-        if !call.value.is_zero() && !amounts.contains(&call.value) {
-            amounts.push(call.value);
+        let sent = match &step {
+            Step::Call(_, call) => call.value,
+            Step::Gift(_, _, amount) => *amount,
+        };
+        if !sent.is_zero() && !amounts.contains(&sent) {
+            amounts.push(sent);
         }
-        let brought = call.who == OTHER && done.crossed && !done.written.is_empty();
+        let brought = !by_actor && done.crossed && !done.written.is_empty();
         let recorded = parent.recorded || brought;
-        let by_actor = call.who == ACTOR;
         let reentered = parent.reentered || done.called_back;
-        steps.push(Step { entry: index, call });
+        steps.push(step);
         let changed = !done.written.is_empty() || done.moved;
         let other = match changed {
             true => world.holdings(OTHER),
             false => parent.other.clone(),
         };
-        let waited = steps
-            .iter()
-            .any(|s| s.call.who == ACTOR && s.call.seconds_later > 0);
+        let waited = steps.iter().any(Step::waited_by_actor);
         let fell = by_actor && gained(&other, &parent.other);
         let taken = parent.taken || (fell && other.assets != parent.other.assets);
         if fell {
@@ -482,15 +578,24 @@ impl<'a> Search<'a> {
                 self.less = Some(found);
             }
         }
-        if let (Some(base), true) = (&base, changed) {
-            let now = world.holdings(ACTOR);
-            let mut place = position(base, &now);
+        let now = match (&base, changed) {
+            (Some(_), true) => Some(world.holdings(ACTOR)),
+            _ => None,
+        };
+        if changed {
+            let mut place = match (&base, &now) {
+                (Some(base), Some(now)) => position(base, now),
+                _ => Vec::new(),
+            };
             place.extend(position(&self.kept[0].other, &other));
             // Which slots are set tells apart states the holdings alone do not. A
             // contract that sets a new slot on every call would never stop being new.
             let set = world.set_slots(exec::SELF);
             let room = self.positions.len() < MAX_POSITIONS && set.len() <= MAX_SET_SLOTS;
-            novel |= room && self.positions.insert((place, set));
+            let unrecorded = steps.iter().any(|s| matches!(s, Step::Gift(..)));
+            novel |= room && self.positions.insert((place, set, unrecorded));
+        }
+        if let (Some(base), Some(now)) = (&base, now) {
             if gained(base, &now) {
                 let mut found = Broken {
                     steps: steps.clone(),
@@ -502,14 +607,17 @@ impl<'a> Search<'a> {
                     reentered,
                 };
                 // A gain the call leaves on its own is not owed to calling in again.
-                if let (true, Some(last)) = (done.called_back, found.steps.last_mut()) {
+                if let (true, Some(Step::Call(index, call))) = (done.called_back, steps.last()) {
                     let mut plain = parent.world.clone();
-                    last.call.back = None;
-                    let alone = plain.call(at, &last.call).ended;
-                    let same = alone && gained(base, &plain.holdings(ACTOR));
-                    match same {
-                        true => found.reentered = parent.reentered,
-                        false => last.call.back = steps.last().and_then(|s| s.call.back.clone()),
+                    let alone = Call {
+                        back: None,
+                        ..call.clone()
+                    };
+                    let ended = plain.call(self.entries[*index].at, &alone).ended;
+                    if ended && gained(base, &plain.holdings(ACTOR)) {
+                        found.reentered = parent.reentered;
+                        found.steps.pop();
+                        found.steps.push(Step::Call(*index, alone));
                     }
                 }
                 if self.best.as_ref().is_none_or(|b| found.better_than(b)) {
@@ -529,8 +637,9 @@ impl<'a> Search<'a> {
                 reentered,
                 other,
             });
+            return Some(self.kept.len() - 1);
         }
-        true
+        None
     }
 
     fn help(&mut self, from: usize, index: usize, who: U256) {
@@ -557,12 +666,55 @@ impl<'a> Search<'a> {
         }
     }
 
+    // What a contract pays back is often sized by what was paid, and random sizes
+    // seldom meet the pair that matters. For each function that needs a payment: the
+    // other account pays, value the contract has no record of arrives, and the actor
+    // pays twice at each pair of a few sizes. Every state reached is kept, so that the
+    // rounds after it try every way out from there.
+    fn opening(&mut self, index: usize) {
+        // A function that also ends without a payment does not size anything by it.
+        let seeds = &self.entries[index].seeds;
+        if seeds.iter().any(|(_, value)| value.is_zero()) {
+            return;
+        }
+        let Some((data, value)) = seeds.iter().find(|(_, v)| *v < PURSE).cloned() else {
+            return;
+        };
+        let pays = |who: U256, value: U256| Call {
+            who,
+            data: data.clone(),
+            value,
+            ..Call::default()
+        };
+        let Some(paid_in) = self.attempt_and(true, 0, index, pays(OTHER, value)) else {
+            return;
+        };
+        let Some(given) = self.gift(true, paid_in, OTHER) else {
+            return;
+        };
+        for first in SIZES {
+            let call = pays(ACTOR, value << first);
+            let Some(once) = self.attempt_and(true, given, index, call) else {
+                continue;
+            };
+            for second in SIZES {
+                self.attempt_and(true, once, index, pays(ACTOR, value << second));
+            }
+        }
+    }
+
     fn run(&mut self) {
         for index in 0..self.entries.len() {
             if exec::spent() {
                 return;
             }
             self.help(0, index, OTHER);
+        }
+        for index in 0..self.entries.len() {
+            if exec::spent() {
+                return;
+            }
+            self.opening(index);
         }
         let mut rounds = 0;
         let learnt = self.covered.len() + self.positions.len();
@@ -610,26 +762,39 @@ impl<'a> Search<'a> {
 }
 
 fn shown(steps: &[Step]) -> Vec<String> {
-    let line = |s: &Step| {
-        let waited = match s.call.seconds_later {
-            0 => String::new(),
-            seconds => format!(", {seconds} seconds after the call before it"),
-        };
-        format!(
-            "{} with value {} from {}{waited}",
-            hex::encode(&s.call.data),
-            s.call.value.to_hex(),
-            s.call.who.to_hex()
-        )
+    let line = |s: &Step| match s {
+        Step::Call(_, call) => {
+            let waited = match call.seconds_later {
+                0 => String::new(),
+                seconds => format!(", {seconds} seconds after the call before it"),
+            };
+            format!(
+                "{} with value {} from {}{waited}",
+                hex::encode(&call.data),
+                call.value.to_hex(),
+                call.who.to_hex()
+            )
+        }
+        Step::Gift(who, asset, amount) => {
+            let what = match asset {
+                Some(asset) => format!("the asset at {}", asset.to_hex()),
+                None => "ether".to_string(),
+            };
+            format!(
+                "{} of {what} sent straight to the contract by {}, outside its functions",
+                amount.to_hex(),
+                who.to_hex()
+            )
+        }
     };
     steps.iter().map(line).collect()
 }
 
 fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>) {
-    let Some((last, earlier)) = broken.steps.split_last() else {
+    let Some((Step::Call(entry, last), earlier)) = broken.steps.split_last() else {
         return;
     };
-    let function = search.entries[last.entry].function;
+    let function = search.entries[*entry].function;
     let (base, now) = (&broken.base, &broken.now);
     let mut rose = Vec::new();
     if now.ether > base.ether {
@@ -700,12 +865,12 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
             f.confidence = Confidence::High;
             f.setup = shown(earlier);
             f.confirmed = true;
-            f.witness = Some(hex::encode(&last.call.data));
-            f.observed = vec![format!("sent by {}", last.call.who.to_hex())];
+            f.witness = Some(hex::encode(&last.data));
+            f.observed = vec![format!("sent by {}", last.who.to_hex())];
         }
         return;
     }
-    let own_calls = broken.steps.iter().filter(|s| s.call.who == ACTOR).count();
+    let own_calls = broken.steps.iter().filter(|s| s.by_actor()).count();
     push(
         out,
         "calls-leave-account-with-gain",
@@ -728,9 +893,9 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
     if let Some(finding) = out.last_mut() {
         finding.setup = shown(earlier);
         finding.confirmed = true;
-        finding.witness = Some(hex::encode(&last.call.data));
+        finding.witness = Some(hex::encode(&last.data));
         finding.observed = vec![
-            format!("sent by {}", last.call.who.to_hex()),
+            format!("sent by {}", last.who.to_hex()),
             format!(
                 "ether held by that account: {} becomes {}",
                 base.ether.to_hex(),
@@ -741,10 +906,10 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
 }
 
 fn report_less(c: &Contract, search: &Search, less: &Less, out: &mut Vec<Finding>) {
-    let Some((last, earlier)) = less.steps.split_last() else {
+    let Some((Step::Call(entry, last), earlier)) = less.steps.split_last() else {
         return;
     };
-    let function = search.entries[last.entry].function;
+    let function = search.entries[*entry].function;
     let (before, now) = (&less.before, &less.now);
     let mut fell = Vec::new();
     for (asset, held) in &now.assets {
@@ -790,8 +955,8 @@ fn report_less(c: &Contract, search: &Search, less: &Less, out: &mut Vec<Finding
     if let Some(finding) = out.last_mut() {
         finding.setup = shown(earlier);
         finding.confirmed = true;
-        finding.witness = Some(hex::encode(&last.call.data));
-        finding.observed = vec![format!("sent by {}", last.call.who.to_hex())];
+        finding.witness = Some(hex::encode(&last.data));
+        finding.observed = vec![format!("sent by {}", last.who.to_hex())];
     }
 }
 

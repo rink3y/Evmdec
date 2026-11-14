@@ -244,6 +244,20 @@ impl World {
         true
     }
 
+    // Value sent straight to an account, outside any function of a contract. Ether can
+    // be forced on a contract and an asset is moved in the asset's own books, so no
+    // contract can refuse either.
+    pub fn give(&mut self, asset: Option<U256>, from: U256, to: U256, amount: U256) -> bool {
+        match asset {
+            Some(asset) => self.moves(asset, from, to, amount),
+            None => self.pays(from, to, amount),
+        }
+    }
+
+    pub fn assets(&self) -> BTreeSet<U256> {
+        self.assets.keys().map(|(asset, _)| *asset).collect()
+    }
+
     pub fn holdings(&self, who: U256) -> Holdings {
         let touched = self.assets.keys().filter(|(_, holder)| *holder == who);
         Holdings {

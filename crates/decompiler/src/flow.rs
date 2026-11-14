@@ -143,16 +143,6 @@ fn entry_moves(p: &Path, layout: MappingLayout) -> (U256, U256) {
     (rise, fall)
 }
 
-// A payout in an asset the account never paid in is a purchase, not a refund.
-fn more_back(d: &Deposit, q: &Path) -> Option<(Asset, U256)> {
-    let back = sent(q);
-    back.iter().find_map(|(asset, _)| {
-        let paid = sum(total(&d.taken, *asset), total(&taken(q), *asset));
-        let got = total(&back, *asset);
-        (!paid.is_zero() && got > paid).then_some((*asset, got))
-    })
-}
-
 fn all_sent(p: &Path) -> U256 {
     let moved = sent(p).into_iter();
     moved.fold(U256::ZERO, |all, (_, amount)| sum(all, amount))
@@ -302,78 +292,6 @@ impl<'a> Pass<'a> {
         out
     }
 
-    fn gain(&mut self, d: &Deposit, g: &Function, paths: &[Path], out: &mut Vec<Finding>) -> bool {
-        let better = paths
-            .iter()
-            .find_map(|q| more_back(d, q).map(|(asset, back)| (asset, back, q)));
-        let Some((asset, back, q)) = better else {
-            return false;
-        };
-        if self.pays_from_nothing(g, q, asset, back) {
-            return false;
-        }
-        report_gain(out, d, g, q, asset, back, deploy::started_from(self.c));
-        true
-    }
-
-    fn second_account(&mut self, d: &Deposit, layout: MappingLayout, out: &mut Vec<Finding>) {
-        let mut theirs = d.path.inputs.clone();
-        theirs.caller = SECOND_CALLER;
-        theirs.storage = d.path.run.storage.clone();
-        let paid_too = self.run(d.function, &theirs);
-        if !paid_too.succeeded() || credited(&paid_too, layout).is_none() {
-            return;
-        }
-        let state = paid_too.run.storage.clone();
-        let held: Vec<(Asset, U256)> = d.taken.iter().chain(&d.taken).copied().collect();
-        let functions: Vec<&Function> = self.externals().collect();
-        for g in functions {
-            let found = self
-                .after_from(&state, d.credit, &held, g)
-                .into_iter()
-                .find_map(|q| more_back(d, &q).map(|(asset, back)| (asset, back, q)));
-            let Some((asset, back, q)) = found else {
-                continue;
-            };
-            // The two-call check already covers a payout the first payment alone allows.
-            let mut alone = q.inputs.clone();
-            alone.storage = d.path.run.storage.clone();
-            let without = self.run(g, &alone);
-            if without.succeeded() && total(&sent(&without), asset) >= back {
-                continue;
-            }
-            let paid = sum(total(&d.taken, asset), total(&taken(&q), asset));
-            push(
-                out,
-                "payout-grows-with-other-payment",
-                "An account takes out more than it paid once another account has paid in",
-                Severity::Medium,
-                Confidence::High,
-                Some(g),
-                None,
-                format!(
-                    "Starting from {}, one account pays in {} of {} through `{}`, and a second account then makes the same payment. The first account's call to `{}` now ends normally and sends it {}. Before the second payment the same call sent less, so the difference comes out of what the second account paid. The run assumes the contract holds enough to pay.",
-                    deploy::started_from(self.c),
-                    paid.to_hex(),
-                    asset_text(asset),
-                    d.function.name,
-                    g.name,
-                    back.to_hex(),
-                ),
-                Vec::new(),
-                "Bound what an account can take out by what that account is owed, not by what the contract holds.",
-            );
-            if let Some(last) = out.last_mut() {
-                let call = hex::encode(&d.path.inputs.calldata);
-                last.setup = vec![call.clone(), call];
-                last.confirm(&q);
-            }
-            return;
-        }
-    }
-
-    // The other account neither pays in nor is paid, so the balance the contract reads
-    // would be the same in a real run and the answers used here stay true.
     fn ordering(&mut self, d: &Deposit, g: &Function, paths: &[Path], out: &mut Vec<Finding>) {
         let Some(q) = paths.iter().find(|q| !all_sent(q).is_zero()) else {
             return;
@@ -637,17 +555,6 @@ impl<'a> Pass<'a> {
         }
     }
 
-    // A function that pays the same from empty storage is not a round trip.
-    // Other rules cover a payment nothing was put in for.
-    fn pays_from_nothing(&mut self, g: &Function, q: &Path, asset: Asset, back: U256) -> bool {
-        let mut alone = q.inputs.clone();
-        alone.storage = self.start.clone();
-        let code = self.c.code_of(g);
-        let explorer = self.explorers.of(code);
-        let again = explorer.run(&alone);
-        again.succeeded() && total(&sent(&again), asset) >= back
-    }
-
     fn uncredited(&mut self, d: &Deposit, layout: MappingLayout, out: &mut Vec<Finding>) {
         let one_unit = d.taken.iter().all(|(_, amount)| *amount == U256::ONE);
         if !one_unit {
@@ -757,49 +664,6 @@ fn report_refused(out: &mut Vec<Finding>, f: &Function, run: &Path) {
     }
 }
 
-fn asset_text(asset: Asset) -> String {
-    match asset {
-        Asset::Ether => "ether".to_string(),
-        Asset::Token(at) => format!("the asset at {}", at.to_hex()),
-    }
-}
-
-fn report_gain(
-    out: &mut Vec<Finding>,
-    d: &Deposit,
-    g: &Function,
-    q: &Path,
-    asset: Asset,
-    back: U256,
-    from: &str,
-) {
-    let paid = sum(total(&d.taken, asset), total(&taken(q), asset));
-    push(
-        out,
-        "two-calls-return-more",
-        "Two calls by one account return more than they took",
-        Severity::High,
-        Confidence::High,
-        Some(g),
-        None,
-        format!(
-            "Starting from {}, an account holding no role calls `{}` and pays in {} of {}. Its next call, to `{}`, ends normally and sends it {} of the same asset. The same second call made first sends nothing, so what comes back is decided by what the first call recorded, and it is more than was paid. The run assumes the contract holds enough to make the payment.",
-            from,
-            d.function.name,
-            paid.to_hex(),
-            asset_text(asset),
-            g.name,
-            back.to_hex(),
-        ),
-        Vec::new(),
-        "Make what a call pays out no larger than what the same account paid in, after rounding in the contract's favour.",
-    );
-    if let Some(last) = out.last_mut() {
-        last.setup = vec![hex::encode(&d.path.inputs.calldata)];
-        last.confirm(q);
-    }
-}
-
 pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return;
@@ -818,14 +682,11 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
             continue;
         }
         let functions: Vec<&Function> = pass.externals().collect();
-        let mut gained = false;
         for g in functions {
             let paths = pass.after(d, g);
-            gained = gained || pass.gain(d, g, &paths, out);
             pass.rounding(d, g, &paths, layout, out);
             pass.ordering(d, g, &paths, out);
         }
-        pass.second_account(d, layout, out);
     }
     pass.answers(layout, out);
     pass.moved_by_answer(out);

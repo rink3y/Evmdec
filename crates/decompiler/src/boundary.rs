@@ -8,10 +8,9 @@ use crate::hex;
 use crate::interp::{self, CallRecord, Outcome};
 use crate::opcode as op;
 use crate::path::{self, Explorers, Limits, Path};
-use crate::solve::{word, Free, Inputs, Settable};
+use crate::solve::{word, Free, Inputs};
 use crate::u256::U256;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 pub const WORK: u64 = 2 * exec::WORK_PER_SECOND;
 
@@ -22,21 +21,10 @@ const LIMITS: Limits = Limits {
 const WORDS: usize = 6;
 const MAX_ENTRIES: usize = 24;
 const MAX_PAY_INS: usize = 3;
-// A queue that pays its head from each new payment needs several payments before the
-// payer's own entries reach the head.
-const MAX_REPEATS: usize = 8;
-// Enough beyond what the first account paid that a rule which hands the surplus to
-// whoever comes next shows a gain within the repeats above.
-const SURPLUS_FACTOR: u64 = 4;
 const HOLDER: U256 = U256::from_u64(0xbbbb_bbbb_bbbb_bbbb);
 const OUTSIDER: U256 = exec::CALLER;
 const UNUSED_SELECTOR: u32 = 0xffff_ffff;
 const FIRST_VALUE: u64 = 0x1001;
-const SIZES: u32 = 6;
-// Another function is tried after these many repeats. After every repeat would spend
-// the whole limit on the first pay-in of a large contract.
-const CLOSING_AFTER: [usize; 4] = [0, 1, 3, 7];
-const MAX_SIZED_CALLS: usize = 3;
 // A reading is tried a thousand times higher and a thousand times lower. A price pushed
 // for the length of one transaction moves by such factors, not by a few percent.
 const SWING: u64 = 1_000;
@@ -47,7 +35,6 @@ const MAX_READINGS: usize = 12;
 const MAX_READ_WORDS: usize = 4;
 const MAX_TAKES: usize = 4;
 const LAST_BUILT_IN: u64 = 0x0a;
-const PROFILE_HOLDS: u64 = 1_000_000_000;
 
 // Only what crosses the contract's edge is counted. How the contract records what it
 // owes is never read, so a queue, a mapping and a packed record are all judged alike.
@@ -107,20 +94,9 @@ struct Call<'a> {
     value: U256,
 }
 
-type Gain<'a> = (Vec<Call<'a>>, Ran, Moved);
-
 struct Ran {
     inputs: Inputs,
     run: FrameRun,
-}
-
-struct Found<'a> {
-    calls: Vec<Call<'a>>,
-    last: Ran,
-    net: Moved,
-    first_paid: U256,
-    surplus: U256,
-    in_ether: bool,
 }
 
 fn selector(input: &[u8]) -> Option<u32> {
@@ -343,48 +319,6 @@ impl<'a> Pass<'a> {
         )
     }
 
-    fn pays_back(&mut self, after: &Held, settable: &Rc<Settable>) -> usize {
-        let mut count = 0;
-        for index in 0..self.entries.len() {
-            if exec::spent() {
-                break;
-            }
-            let entry = &self.entries[index];
-            let function = entry.function;
-            if !function.effects.calls {
-                continue;
-            }
-            let call = Call {
-                function,
-                who: OUTSIDER,
-                calldata: path::fill_words(&entry.calldata, &entry.fixed, path::varied_word),
-                value: U256::ZERO,
-            };
-            let free = Free {
-                words: call.calldata.len() / 32,
-                value: false,
-                storage: false,
-                answers: true,
-                settings: Some(settable.clone()),
-                fixed: entry.fixed.clone(),
-            };
-            let mut inputs = self.inputs(&call, after);
-            inputs.spends_balance = false;
-            let code = self.c.code_of(function);
-            let found = self.explorers.of(code).explore(&inputs, &free, LIMITS);
-            let sends = found.into_iter().filter(Path::succeeded).any(|p| {
-                let ran = Ran {
-                    inputs: p.inputs,
-                    run: p.run,
-                };
-                let net = moved(&ran);
-                !net.ether_out.is_zero() || !net.tokens_out.is_zero()
-            });
-            count += usize::from(sends);
-        }
-        count
-    }
-
     // What the contract learns from outside during a run. A transfer answers whether it
     // went through, which is not a quantity. A question that names this contract is about
     // what it holds itself, and that is counted here, not answered freely.
@@ -593,148 +527,6 @@ impl<'a> Pass<'a> {
         }
         out
     }
-
-    fn search(&mut self, pay_in: &Call<'a>, start: &Held, factor: u64) -> Option<Found<'a>> {
-        let (first, mut held) = self.step(pay_in, start)?;
-        let paid = moved(&first);
-        let in_ether = !paid.ether_in.is_zero();
-        let first_paid = if in_ether {
-            paid.ether_in
-        } else {
-            paid.tokens_in
-        };
-        let surplus = first_paid.wrapping_mul(U256::from_u64(factor));
-        match in_ether {
-            true => held.ether = sum(held.ether, surplus),
-            false => held.tokens = sum(held.tokens, surplus),
-        }
-        let found = |(calls, last, net): Gain<'a>| Found {
-            calls,
-            last,
-            net,
-            first_paid,
-            surplus,
-            in_ether,
-        };
-        let opening = vec![pay_in.clone()];
-        let repeated = self.repeats(pay_in, &held, opening.clone());
-        let sized = || match in_ether {
-            true => self.sizes(pay_in, &held, Moved::default(), opening, MAX_SIZED_CALLS),
-            false => None,
-        };
-        repeated.or_else(sized).map(found)
-    }
-
-    // The same payment again and again, with one other call tried after each.
-    fn repeats(
-        &mut self,
-        pay_in: &Call<'a>,
-        from: &Held,
-        mut calls: Vec<Call<'a>>,
-    ) -> Option<Gain<'a>> {
-        let mut held = from.clone();
-        let mut net = Moved::default();
-        let again = Call {
-            who: OUTSIDER,
-            ..pay_in.clone()
-        };
-        let senders: Vec<usize> = (0..self.entries.len())
-            .filter(|i| self.entries[*i].function.effects.calls)
-            .collect();
-        for round in 0..MAX_REPEATS {
-            if exec::spent() {
-                return None;
-            }
-            let (p, next) = self.step(&again, &held)?;
-            net = net.plus(moved(&p));
-            held = next;
-            calls.push(again.clone());
-            if net.gains() {
-                return Some((calls, p, net));
-            }
-            if !CLOSING_AFTER.contains(&round) {
-                continue;
-            }
-            // An amount is asked for in the sizes that crossed the edge so far. What the
-            // contract records is not read.
-            let paid = sum(net.ether_in, net.tokens_in);
-            let holds = sum(held.ether, held.tokens);
-            let amounts = [U256::ZERO, paid, sum(paid, paid), holds];
-            for index in &senders {
-                let varied =
-                    self.explore(*index, OUTSIDER, Some(U256::ZERO), &held, path::varied_word);
-                let sized = amounts.iter().flat_map(|amount| {
-                    self.explore(*index, OUTSIDER, Some(U256::ZERO), &held, |_| *amount)
-                });
-                let tried: Vec<Call<'a>> = sized.chain(varied).collect();
-                for call in tried {
-                    let Some((p, _)) = self.step(&call, &held) else {
-                        continue;
-                    };
-                    let total = net.plus(moved(&p));
-                    if total.gains() {
-                        calls.push(call);
-                        return Some((calls, p, total));
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    // A rule can accept a payment only at some sizes, or pay out only when a later
-    // payment is smaller than an earlier one. So a few payments of different sizes are
-    // tried, each a multiple of the smallest one the function accepts.
-    fn sizes(
-        &mut self,
-        pay_in: &Call<'a>,
-        held: &Held,
-        net: Moved,
-        calls: Vec<Call<'a>>,
-        left: usize,
-    ) -> Option<Gain<'a>> {
-        for doublings in 0..SIZES {
-            if exec::spent() {
-                return None;
-            }
-            let call = Call {
-                who: OUTSIDER,
-                value: pay_in.value.wrapping_mul(U256::ONE << doublings),
-                ..pay_in.clone()
-            };
-            let Some((p, next)) = self.step(&call, held) else {
-                continue;
-            };
-            let total = net.plus(moved(&p));
-            let mut made = calls.clone();
-            made.push(call);
-            if total.gains() {
-                return Some((made, p, total));
-            }
-            if left > 1 {
-                let deeper = self.sizes(pay_in, &next, total, made, left - 1);
-                if deeper.is_some() {
-                    return deeper;
-                }
-            }
-        }
-        None
-    }
-
-    fn gains_without_surplus(&mut self, calls: &[Call<'a>], start: &Held) -> bool {
-        let mut held = start.clone();
-        let mut net = Moved::default();
-        for call in calls {
-            let Some((p, next)) = self.step(call, &held) else {
-                return false;
-            };
-            if call.who == OUTSIDER {
-                net = net.plus(moved(&p));
-            }
-            held = next;
-        }
-        net.gains()
-    }
 }
 
 // A pay-in made while a reading is moved can credit more than the same pay-in did before.
@@ -825,79 +617,6 @@ fn report_swing(out: &mut Vec<Finding>, found: &Swung, from: &str) {
     }
 }
 
-// What crosses the edge when each function is run by an account with no role, from the
-// starting state. This is what a chain of calls is built from: a function that brings
-// value in, and one that sends value to its caller.
-#[derive(Clone, Copy, Default)]
-pub struct Crossing {
-    pub ends: bool,
-    pub brings_in: bool,
-    pub sends_out: bool,
-    // A function that sends value to the account once that account has paid in.
-    pub pays_back: usize,
-}
-
-pub fn crossings(c: &Contract, settable: &Rc<Settable>) -> Vec<(String, Crossing)> {
-    let start = Held {
-        storage: deploy::start(c),
-        ether: U256::ZERO,
-        tokens: U256::from_u64(PROFILE_HOLDS),
-    };
-    let mut pass = Pass::new_with(c, usize::MAX);
-    let mut out = Vec::new();
-    let mut measured = false;
-    for index in 0..pass.entries.len() {
-        if exec::spent() {
-            break;
-        }
-        let entry = &pass.entries[index];
-        let function = entry.function;
-        let call = Call {
-            function,
-            who: OUTSIDER,
-            calldata: path::fill_words(&entry.calldata, &entry.fixed, path::varied_word),
-            value: U256::from_u64(FIRST_VALUE),
-        };
-        let free = Free {
-            words: call.calldata.len() / 32,
-            value: true,
-            storage: false,
-            answers: true,
-            settings: Some(settable.clone()),
-            fixed: entry.fixed.clone(),
-        };
-        let mut inputs = pass.inputs(&call, &start);
-        inputs.spends_balance = false;
-        let code = c.code_of(function);
-        let found = pass.explorers.of(code).explore(&inputs, &free, LIMITS);
-        let mut crossing = Crossing::default();
-        let mut paid: Option<Held> = None;
-        for p in found.into_iter().filter(Path::succeeded) {
-            let ran = Ran {
-                inputs: p.inputs,
-                run: p.run,
-            };
-            let net = moved(&ran);
-            crossing.ends = true;
-            crossing.brings_in |= !net.ether_in.is_zero() || !net.tokens_in.is_zero();
-            crossing.sends_out |= !net.ether_out.is_zero() || !net.tokens_out.is_zero();
-            if net.pays_in_only() && paid.is_none() && ran.run.storage != ran.inputs.storage {
-                paid = Some(Held {
-                    storage: ran.run.storage.clone(),
-                    ether: sum(start.ether, net.ether_in),
-                    tokens: sum(start.tokens, net.tokens_in),
-                });
-            }
-        }
-        if let Some(after) = paid.filter(|_| !measured) {
-            measured = true;
-            crossing.pays_back = pass.pays_back(&after, settable);
-        }
-        out.push((function.name.clone(), crossing));
-    }
-    out
-}
-
 pub fn swing_findings(c: &Contract, out: &mut Vec<Finding>) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return;
@@ -924,107 +643,5 @@ pub fn swing_findings(c: &Contract, out: &mut Vec<Finding>) {
                 return;
             }
         }
-    }
-}
-
-fn report(out: &mut Vec<Finding>, found: &Found, from: &str, needs_surplus: bool) {
-    let Some((last, earlier)) = found.calls.split_last() else {
-        return;
-    };
-    let asset = if found.in_ether { "ether" } else { "a token" };
-    let (paid, got) = match found.in_ether {
-        true => (found.net.ether_in, found.net.ether_out),
-        false => (found.net.tokens_in, found.net.tokens_out),
-    };
-    let own_calls = found.calls.iter().filter(|c| c.who == OUTSIDER).count();
-    let opening = format!(
-        "Starting from {from}, a first account pays in {} of {asset} through `{}`.",
-        found.first_paid.to_hex(),
-        earlier[0].function.name,
-    );
-    let outcome = format!(
-        "A second account, with no role and nothing paid in before, then makes {own_calls} call(s), the last to `{}`. Every call ends normally and no payment is larger than what the contract holds. In all it pays in {} and is paid {}.",
-        last.function.name,
-        paid.to_hex(),
-        got.to_hex(),
-    );
-    let (id, title, cause, advice) = match needs_surplus {
-        true => (
-            "surplus-open-to-any-account",
-            "An account with no stake collects what the contract holds beyond its records",
-            format!(
-                " The contract is given {} more than its accounts paid in. The same calls without that surplus leave the second account with no gain, so what it gains is the surplus. Nothing ties that balance to the account that collects it.",
-                found.surplus.to_hex(),
-            ),
-            "Pay an account only what is recorded for it, and decide who may collect a balance the records do not cover.",
-        ),
-        false => (
-            "payment-taken-by-other-account",
-            "An account takes out more than it paid in, from what another account paid",
-            String::from(
-                " The contract holds only what the two accounts paid in, so the gain comes out of the first account's payment.",
-            ),
-            "Bound what an account can take out by what is recorded for that account.",
-        ),
-    };
-    push(
-        out,
-        id,
-        title,
-        Severity::High,
-        Confidence::High,
-        Some(last.function),
-        None,
-        format!("{opening} {outcome}{cause}"),
-        Vec::new(),
-        advice,
-    );
-    if let Some(finding) = out.last_mut() {
-        let shown = |c: &Call| {
-            let data = hex::encode(&c.calldata);
-            format!(
-                "{data} with value {} from {}",
-                c.value.to_hex(),
-                c.who.to_hex()
-            )
-        };
-        finding.setup = earlier.iter().map(shown).collect();
-        finding.confirmed = true;
-        finding.witness = Some(hex::encode(&found.last.inputs.calldata));
-        finding.observed = crate::evidence::observed(&found.last.inputs, &found.last.run);
-    }
-}
-
-pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
-    if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
-        return;
-    }
-    let start = Held {
-        storage: deploy::start(c),
-        ether: U256::ZERO,
-        tokens: U256::ZERO,
-    };
-    let from = deploy::started_from(c);
-    let mut pass = Pass::new(c);
-    let trace = crate::debug::on("EVMDEC_DEBUG_BOUNDARY");
-    if trace {
-        let names: Vec<&str> = pass
-            .entries
-            .iter()
-            .map(|e| e.function.name.as_str())
-            .collect();
-        eprintln!("[boundary] entries {names:?}");
-    }
-    for pay_in in pass.pay_ins(&start) {
-        if trace {
-            let (name, value) = (&pay_in.function.name, pay_in.value.to_hex());
-            eprintln!("[boundary] pay-in {name} value {value}");
-        }
-        let Some(found) = pass.search(&pay_in, &start, SURPLUS_FACTOR) else {
-            continue;
-        };
-        let needs_surplus = !pass.gains_without_surplus(&found.calls, &start);
-        report(out, &found, from, needs_surplus);
-        return;
     }
 }

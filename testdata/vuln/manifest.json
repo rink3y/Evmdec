@@ -274,7 +274,7 @@
       "year": 2026,
       "bug": "queue that pays each entry 125% from the shared balance: ether held beyond the queue goes to whoever fills the queue",
       "expected": [
-        "surplus-open-to-any-account"
+        "calls-leave-account-with-gain"
       ],
       "min_severity": "high"
     },

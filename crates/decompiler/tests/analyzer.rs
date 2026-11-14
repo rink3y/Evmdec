@@ -1970,13 +1970,13 @@ const CALLER_ENTRY: &str =
     "CALLER PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
 
 fn flow_ids(code: &[u8]) -> Vec<String> {
-    let ours = ["two-calls-return-more", "inflow-credits-nothing"];
+    let ours = ["calls-leave-account-with-gain", "inflow-credits-nothing"];
     analyze::analyze(&decompile::decompile(code, &Options::default()))
         .findings
         .iter()
         .filter(|f| ours.contains(&f.id.as_str()))
         .map(|f| {
-            assert!(f.confirmed && f.witness.is_some() && f.setup.len() == 1);
+            assert!(f.confirmed && f.witness.is_some() && !f.setup.is_empty());
             f.id.clone()
         })
         .collect()
@@ -1986,7 +1986,7 @@ fn flow_ids(code: &[u8]) -> Vec<String> {
 fn a_pair_of_calls_that_returns_more_than_it_took_is_reported() {
     let pay_out = pay_out_checked();
     let doubled = dispatcher3(&pay_in("CALLVALUE PUSH1 0x02 MUL"), &pay_out, "STOP");
-    assert_eq!(flow_ids(&doubled), ["two-calls-return-more"]);
+    assert_eq!(flow_ids(&doubled), ["calls-leave-account-with-gain"]);
 
     let exact = dispatcher3(&pay_in("CALLVALUE"), &pay_out, "STOP");
     assert!(flow_ids(&exact).is_empty(), "{:?}", flow_ids(&exact));
@@ -2606,7 +2606,7 @@ fn cases() -> Vec<Case> {
     };
     let all = [
         pair(
-            "two-calls-return-more",
+            "calls-leave-account-with-gain",
             true,
             || {
                 dispatcher3(
@@ -2688,7 +2688,7 @@ fn cases() -> Vec<Case> {
             || asset_vault(true),
         ),
         pair(
-            "payout-grows-with-other-payment",
+            "calls-leave-account-with-gain",
             true,
             || pooled(false),
             || pooled(true),
@@ -2772,13 +2772,13 @@ fn cases() -> Vec<Case> {
             || dispatcher(&asset_records(DIFFERENT_ASSETS)),
         ),
         pair(
-            "surplus-open-to-any-account",
+            "calls-leave-account-with-gain",
             true,
             || dispatcher3(&counted_pay_in(), &pay_out_recorded(true), "STOP"),
             || dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP"),
         ),
         pair(
-            "payment-taken-by-other-account",
+            "calls-leave-account-with-gain",
             true,
             || dispatcher3(&counted_pay_in(), &pay_out_everything(), "STOP"),
             || dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP"),
@@ -2909,7 +2909,7 @@ fn the_labelled_fixtures_score_every_rule_at_full_precision_and_recall() {
 const TRUE_OF_A_SOUND_FIXTURE: [(&str, &str); 7] = [
     // It credits a payment at par whatever the contract holds, so a later payer shares a
     // surplus that stood behind the earlier one.
-    ("rounding-favours-caller", "surplus-open-to-any-account"),
+    ("rounding-favours-caller", "calls-leave-account-with-gain"),
     ("", "short-input-accepted"),
     ("inflow-credits-nothing", "refused-transfer-treated-as-done"),
     (
@@ -3099,14 +3099,13 @@ fn fired(code_hex: &str, id: &str) -> bool {
 #[test]
 fn a_token_bought_with_ether_is_not_a_larger_refund() {
     let presale = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461003e57600080fd5b5034336000526000602052604060002080548201905550005b5033600052600060205260406000208054801561008a576000825563a9059cbb60e01b608052336084528060a4526020608060446080600061b1b15af11561008a576080511561008a57005b600080fd";
-    assert!(!fired(presale, "two-calls-return-more"));
+    assert!(!fired(presale, "calls-leave-account-with-gain"));
 }
 
 #[test]
 fn a_fair_share_of_the_balance_is_not_a_gain() {
     let vault = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461006057600080fd5b5034600154801561003c578147038183020461003e565b815b80156100a3578082016001553360005260006020526040600020805482019055005b5060043580156100a357336000526000602052604060002080548281106100a357829003905560015481810360015581470204600080808084335af1156100a357005b600080fd";
-    assert!(!fired(vault, "two-calls-return-more"));
-    assert!(!fired(vault, "payout-grows-with-other-payment"));
+    assert!(!fired(vault, "calls-leave-account-with-gain"));
 }
 
 #[test]
@@ -3521,7 +3520,7 @@ fn a_flag_only_its_owner_sets_is_assumed_and_the_check_behind_it_is_reached() {
     let r = report_of(&code);
     assert_eq!(assumed(&r).len(), 1, "{:?}", assumed(&r));
     assert!(assumed(&r)[0].contains("slot 0x9"), "{:?}", assumed(&r));
-    let f = finding(&r, "surplus-open-to-any-account").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    let f = finding(&r, "calls-leave-account-with-gain").unwrap_or_else(|| panic!("{:?}", ids(&r)));
     assert!(
         f.description.contains("assumed settings"),
         "{}",

@@ -389,7 +389,7 @@ recall above is measured on contracts the rules were developed on.
 The label is the kind of flaw, not the function it is in, so the first row is an upper
 bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.48
 for missing checks on who may call, 0.39 for accounting, 0.34 for prices read from outside
-and 0.36 for arithmetic. On the contracts with no known flaw, 9 of the 22 that get a high
+and 0.36 for arithmetic. On the contracts with no known flaw, 8 of the 22 that get a high
 finding get it from `dynamic-call`.
 
 The set was first scored at 96, 121 and 78 on the first, third and fourth rows. The assumed

@@ -594,6 +594,14 @@ impl<'a> Machine<'a> {
         self.deliver_call(out_off, out_len, success, data)
     }
 
+    // A call made from this frame may have moved ether in or out of the account.
+    pub fn balance_is(&mut self, now: U256) {
+        self.paid_out = match now <= self.host.selfbalance {
+            true => self.host.selfbalance - now,
+            false => U256::ZERO,
+        };
+    }
+
     pub fn resume_after_create(&mut self, address: U256) -> Result<(), String> {
         self.returndata = Vec::new();
         self.push(address)

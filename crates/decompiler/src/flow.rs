@@ -1,6 +1,5 @@
 use crate::abi::{self, SEL_BALANCE_OF, SEL_OWNER_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::analyze::{display_name, push, Confidence, Finding, Severity};
-use crate::cross::World;
 use crate::decompile::{Contract, Function};
 use crate::deploy;
 use crate::emit::MappingLayout;
@@ -30,7 +29,6 @@ const SECOND_CALLER: U256 = U256::from_u64(0xbbbb_bbbb_bbbb_bbbb);
 // Raising the balance by that much costs about as much as the payment it is tested against.
 const RAISED_BALANCE: u64 = 0x4000;
 // A payment that passes on no more gas than this cannot make a call from the receiver.
-const STIPEND: u64 = 2_300;
 
 type Fill = fn(usize) -> U256;
 
@@ -451,117 +449,6 @@ impl<'a> Pass<'a> {
         })
     }
 
-    fn reenter(&mut self, d: &Deposit, g: &Function, paths: &[Path], out: &mut Vec<Finding>) {
-        let payment = |q: &Path| {
-            q.run.calls.iter().find_map(|c| {
-                let to_caller = c.kind == op::CALL && c.addr == q.inputs.caller;
-                if to_caller && !c.value.is_zero() && c.gas > U256::from_u64(STIPEND) {
-                    return Some(Asset::Ether);
-                }
-                let transfers = c.kind == op::CALL
-                    && selector(&c.input) == Some(SEL_TRANSFER)
-                    && c.input.len() >= 68
-                    && word(&c.input, 4) == q.inputs.caller
-                    && !word(&c.input, 36).is_zero();
-                transfers.then_some(Asset::Token(c.addr))
-            })
-        };
-        let Some((q, asset)) = paths.iter().find_map(|q| Some((q, payment(q)?))) else {
-            return;
-        };
-        let (vault, caller) = (q.inputs.address, q.inputs.caller);
-        let once = total(&sent(q), asset);
-        let mut world = World::new();
-        world.place(vault, self.c.code_of(g).to_vec());
-        for (slot, value) in &q.inputs.storage {
-            world.seed(vault, *slot, *value);
-        }
-        match asset {
-            Asset::Ether => world.place(caller, calls_back(None, &q.inputs.calldata)),
-            Asset::Token(at) => {
-                world.place(at, runs_receiver(caller));
-                world.place(caller, calls_back(Some(vault), &q.inputs.calldata));
-            }
-        }
-        let paid = |world: &World| {
-            let from_vault = world.sent().iter().filter(|s| s.from == vault);
-            let amounts = from_vault.filter_map(|s| match asset {
-                Asset::Ether => (s.to == caller).then_some(s.value),
-                Asset::Token(at) => {
-                    let pays = s.to == at
-                        && selector(&s.input) == Some(SEL_TRANSFER)
-                        && s.input.len() >= 68
-                        && word(&s.input, 4) == caller;
-                    pays.then(|| word(&s.input, 36))
-                }
-            });
-            amounts.fold(U256::ZERO, sum)
-        };
-        // A function that pays the same on every call pays twice for two calls however they
-        // are made. Only more than two calls in a row would pay is a gain.
-        let mut in_turn = World::new();
-        in_turn.place(vault, self.c.code_of(g).to_vec());
-        for (slot, value) in &q.inputs.storage {
-            in_turn.seed(vault, *slot, *value);
-        }
-        if let Asset::Token(at) = asset {
-            in_turn.place(at, runs_receiver(caller));
-        }
-        let mut two_calls = U256::ZERO;
-        for value in [q.inputs.callvalue, U256::ZERO] {
-            if in_turn.run(vault, caller, value, q.inputs.calldata.clone()) {
-                two_calls = sum(two_calls, paid(&in_turn));
-            }
-        }
-        let ended = world.run(vault, caller, q.inputs.callvalue, q.inputs.calldata.clone());
-        let paid_out = paid(&world);
-        if !ended || paid_out <= once.max(two_calls) {
-            return;
-        }
-        let how = match asset {
-            Asset::Ether => "an account whose code makes the same call again when it is paid",
-            Asset::Token(_) => {
-                "an account whose code makes the same call again when the asset runs the receiver's code during the transfer"
-            }
-        };
-        let note = format!(
-            " Confirmed by running it: after the attached earlier call, the attached call is made by {how}. The run ends normally and the account is sent {} in all, where one call alone sends {}. The run assumes the contract holds enough to pay.",
-            paid_out.to_hex(),
-            once.to_hex(),
-        );
-        let setup = vec![hex::encode(&d.path.inputs.calldata)];
-        let known = out.iter_mut().find(|f| {
-            f.id.starts_with("reentrancy")
-                && f.function.as_deref() == Some(display_name(g).as_str())
-        });
-        if let Some(f) = known {
-            f.description.push_str(&note);
-            f.confidence = Confidence::High;
-            f.setup = setup;
-            f.confirm(q);
-            return;
-        }
-        push(
-            out,
-            "reentered-call-pays-again",
-            "A call made again from inside its own payment is paid twice",
-            Severity::High,
-            Confidence::High,
-            Some(g),
-            None,
-            format!(
-                "`{}` pays its caller before it has finished recording the payment.{note}",
-                g.name
-            ),
-            Vec::new(),
-            "Finish every storage update before the payment, or hold a lock across it.",
-        );
-        if let Some(f) = out.last_mut() {
-            f.setup = setup;
-            f.confirm(q);
-        }
-    }
-
     fn run(&mut self, f: &Function, inputs: &Inputs) -> Path {
         let code = self.c.code_of(f);
         let explorer = self.explorers.of(code);
@@ -818,48 +705,6 @@ impl<'a> Pass<'a> {
     }
 }
 
-const PUSH2: u8 = op::PUSH1 + 1;
-const PUSH20: u8 = op::PUSH1 + 19;
-
-fn push_address(code: &mut Vec<u8>, address: U256) {
-    code.push(PUSH20);
-    code.extend_from_slice(&address.to_be_bytes()[12..]);
-}
-
-// The flag in slot 0 stops the second entry from calling a third time.
-// Without it the run would only end at the depth limit.
-fn calls_back(target: Option<U256>, data: &[u8]) -> Vec<u8> {
-    let len = (data.len() as u16).to_be_bytes();
-    let mut code = vec![op::PUSH1, 0x00, op::SLOAD, op::PUSH1, 0, op::JUMPI];
-    code.extend([op::PUSH1, 0x01, op::PUSH1, 0x00, op::SSTORE]);
-    code.extend([PUSH2, len[0], len[1], PUSH2, 0, 0]);
-    code.extend([op::PUSH1, 0x00, op::CODECOPY]);
-    code.extend([op::PUSH1, 0x00, op::PUSH1, 0x00, PUSH2, len[0], len[1]]);
-    code.extend([op::PUSH1, 0x00, op::PUSH1, 0x00]);
-    match target {
-        Some(address) => push_address(&mut code, address),
-        None => code.push(op::CALLER),
-    }
-    code.extend([op::GAS, op::CALL, op::POP]);
-    let end = code.len();
-    code.extend([op::JUMPDEST, op::STOP]);
-    let data_at = (code.len() as u16).to_be_bytes();
-    code[4] = end as u8;
-    (code[15], code[16]) = (data_at[0], data_at[1]);
-    code.extend_from_slice(data);
-    code
-}
-
-fn runs_receiver(receiver: U256) -> Vec<u8> {
-    let mut code = vec![op::PUSH1, 0x00, op::PUSH1, 0x00, op::PUSH1, 0x00];
-    code.extend([op::PUSH1, 0x00, op::PUSH1, 0x00]);
-    push_address(&mut code, receiver);
-    code.extend([op::GAS, op::CALL, op::POP]);
-    code.extend([op::PUSH1, 0x01, op::PUSH1, 0x00, op::MSTORE]);
-    code.extend([op::PUSH1, 0x20, op::PUSH1, 0x00, op::RETURN]);
-    code
-}
-
 fn confirm_stated_amount(out: &mut [Finding], f: &Function, p: &Path, layout: MappingLayout) {
     let pulled = all_taken(p);
     let measured = |c: &CallRecord| selector(&c.input) == Some(SEL_BALANCE_OF);
@@ -977,7 +822,6 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         for g in functions {
             let paths = pass.after(d, g);
             gained = gained || pass.gain(d, g, &paths, out);
-            pass.reenter(d, g, &paths, out);
             pass.rounding(d, g, &paths, layout, out);
             pass.ordering(d, g, &paths, out);
         }

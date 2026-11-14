@@ -1,5 +1,5 @@
 use crate::abi::{self, SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
-use crate::analyze::{push, Confidence, Finding, Severity};
+use crate::analyze::{display_name, push, Confidence, Finding, Severity};
 use crate::decompile::{Contract, Function};
 use crate::deploy;
 use crate::exec;
@@ -10,6 +10,7 @@ use crate::path::{self, Explorers, Limits, Path};
 use crate::solve::{Free, Inputs};
 use crate::u256::U256;
 use crate::world::{Call, Holdings, World, PURSE};
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 
 pub const WORK: u64 = 4 * exec::WORK_PER_SECOND;
@@ -30,6 +31,8 @@ const STALE_ROUNDS: usize = 3_000;
 const STALE_WORK: u64 = WORK / 8;
 const SEEDS_PER_ENTRY: usize = 4;
 const MAX_READS: usize = 1_024;
+const MAX_POSITIONS: usize = 96;
+const MAX_SET_SLOTS: usize = 64;
 const SEED_LIMITS: Limits = Limits { paths: 6, runs: 18 };
 const FIRST_VALUE: u64 = 0x1001;
 const WAITS: [u64; 4] = [3_600, 86_400, 30 * 86_400, 365 * 86_400];
@@ -37,6 +40,7 @@ const UNUSED_SELECTOR: u32 = 0xffff_ffff;
 
 struct Entry<'a> {
     function: &'a Function,
+    at: usize,
     shape: Vec<u8>,
     fixed: Vec<usize>,
     addresses: Vec<usize>,
@@ -53,8 +57,8 @@ struct Step {
 
 // A sequence of calls that ended, with the world it left behind.
 #[derive(Clone)]
-struct Kept<'a> {
-    world: World<'a>,
+struct Kept {
+    world: World,
     steps: Vec<Step>,
     written: BTreeSet<U256>,
     amounts: Vec<U256>,
@@ -66,6 +70,7 @@ struct Kept<'a> {
     recorded: bool,
     // Whether a call by the actor moved an asset out of the other account.
     taken: bool,
+    reentered: bool,
     other: Holdings,
 }
 
@@ -76,6 +81,8 @@ struct Broken {
     waited: bool,
     recorded: bool,
     taken: bool,
+    // Whether the gain needs the account to call in again while it is being paid.
+    reentered: bool,
 }
 
 // One call by the actor after which the other account has less.
@@ -86,11 +93,15 @@ struct Less {
     waited: bool,
 }
 
+// Which way each holding of the two accounts went, and which slots are set.
+type Place = (Vec<(U256, Ordering)>, BTreeSet<U256>);
+
 struct Search<'a> {
     c: &'a Contract,
     entries: Vec<Entry<'a>>,
-    kept: Vec<Kept<'a>>,
+    kept: Vec<Kept>,
     covered: HashSet<(usize, usize, bool)>,
+    positions: HashSet<Place>,
     explorers: Explorers,
     rng: Rng,
     helps_left: usize,
@@ -137,6 +148,20 @@ fn gained(base: &Holdings, now: &Holdings) -> bool {
     pairs.iter().all(|(a, b)| b >= a) && pairs.iter().any(|(a, b)| b > a)
 }
 
+// Which way each of an account's holdings went. A state where the two accounts'
+// holdings went a way not seen before is a new place to continue from, whatever code
+// ran to reach it.
+fn position(base: &Holdings, now: &Holdings) -> Vec<(U256, Ordering)> {
+    let of = |h: &Holdings, asset: &U256| h.assets.get(asset).copied().unwrap_or(PURSE);
+    let assets = now
+        .assets
+        .keys()
+        .map(|a| (*a, of(now, a).cmp(&of(base, a))));
+    let own = (U256::MAX, now.reported.cmp(&base.reported));
+    let ether = (U256::ZERO, now.ether.cmp(&base.ether));
+    [ether, own].into_iter().chain(assets).collect()
+}
+
 impl Broken {
     fn outside(&self) -> bool {
         let rose = |(asset, held): (&U256, &U256)| {
@@ -158,7 +183,7 @@ impl Broken {
 
     fn better_than(&self, other: &Broken) -> bool {
         // The most severe level sorts first.
-        let rank = |b: &Broken| (b.severity(), b.steps.len());
+        let rank = |b: &Broken| (b.severity(), b.reentered, b.steps.len());
         rank(self) < rank(other)
     }
 }
@@ -192,12 +217,14 @@ impl<'a> Search<'a> {
                 FnKind::External | FnKind::Fallback | FnKind::Receive
             )
         };
-        let entries = c.functions.iter().filter(reached).take(MAX_ENTRIES);
+        let entries = c.functions.iter().enumerate();
+        let entries = entries.filter(|(_, f)| reached(f)).take(MAX_ENTRIES);
         let entries: Vec<Entry<'a>> = entries
-            .map(|function| {
+            .map(|(at, function)| {
                 let (shape, fixed) = shape(function);
                 Entry {
                     function,
+                    at,
                     shape,
                     fixed,
                     addresses: address_words(function),
@@ -207,7 +234,7 @@ impl<'a> Search<'a> {
                 }
             })
             .collect();
-        let world = World::new(c, &[ACTOR, OTHER]);
+        let world = World::of(c, &[ACTOR, OTHER]);
         let start = Kept {
             other: world.holdings(OTHER),
             world,
@@ -217,6 +244,7 @@ impl<'a> Search<'a> {
             base: None,
             recorded: false,
             taken: false,
+            reentered: false,
         };
         Search {
             c,
@@ -224,6 +252,7 @@ impl<'a> Search<'a> {
             entries,
             kept: vec![start],
             covered: HashSet::new(),
+            positions: HashSet::new(),
             explorers: Explorers::default(),
             rng: Rng::new(SEED),
             best: None,
@@ -246,7 +275,7 @@ impl<'a> Search<'a> {
             calldata: path::fill_words(&entry.shape, &entry.fixed, path::varied_word),
             caller: who,
             callvalue: U256::from_u64(FIRST_VALUE),
-            storage: world.storage().clone(),
+            storage: world.slots(exec::SELF),
             timestamp,
             number,
             returned: one.clone(),
@@ -311,12 +340,13 @@ impl<'a> Search<'a> {
             let with = pool[self.pick(pool.len())];
             data[4 + 32 * at..36 + 32 * at].copy_from_slice(&with.to_be_bytes());
         }
-        // An address a call names is one of three that mean something here.
-        let other = match who == ACTOR {
-            true => OTHER,
-            false => ACTOR,
+        // An address a call names is one of the few that mean something here. The
+        // other account never names the actor: an account it names has been given
+        // something, and is no longer one with no role.
+        let parties: &[U256] = match who == ACTOR {
+            true => &[ACTOR, OTHER, exec::SELF],
+            false => &[OTHER, exec::SELF],
         };
-        let parties = [who, other, exec::SELF];
         for at in self.entries[index].addresses.clone() {
             if at < words && self.pick(2) == 0 {
                 let with = parties[self.pick(parties.len())];
@@ -330,11 +360,17 @@ impl<'a> Search<'a> {
             0 => WAITS[self.pick(WAITS.len())],
             _ => 0,
         };
+        // An account that is code can make a call of its own when it is paid.
+        let back = match who == ACTOR && self.pick(6) == 0 {
+            true => Some((data.clone(), U256::ZERO)),
+            false => None,
+        };
         Call {
             who,
             data,
             value,
             seconds_later,
+            back,
         }
     }
 
@@ -372,9 +408,16 @@ impl<'a> Search<'a> {
     }
 
     fn attempt(&mut self, from: usize, index: usize, call: Call) -> bool {
-        let function = self.entries[index].function;
+        let at = self.entries[index].at;
         let mut world = self.kept[from].world.clone();
-        let done = world.call(function, &call);
+        let mut call = call;
+        let mut done = world.call(at, &call);
+        // The same call with nothing made from inside it is the plainer account of
+        // whatever it shows.
+        if done.ended && !done.called_back && call.back.take().is_some() {
+            world = self.kept[from].world.clone();
+            done = world.call(at, &call);
+        }
         let known = &mut self.entries[index].reads;
         if known.len() < MAX_READS {
             known.extend(done.read.iter().copied());
@@ -386,19 +429,18 @@ impl<'a> Search<'a> {
         // found empty and cannot be made again is the contract's set-up. The other
         // account may make it, which is how the state a later call needs comes to be.
         // The account whose gain is looked for may not: its gain would be the set-up's.
-        let zero = |world: &World, key: &U256| world.storage().get(key).is_none_or(|v| v.is_zero());
+        let zero = |world: &World, key: &U256| world.stored(exec::SELF, *key).is_zero();
         let before = &self.kept[from].world;
         let arms = |key: &U256| done.read.contains(key) && zero(before, key) && !zero(&world, key);
         if call.who == ACTOR
             && done.written.iter().any(arms)
-            && !world.clone().call(function, &call).ended
+            && !world.clone().call(at, &call).ended
         {
             return false;
         }
-        let code = self.c.code_of(function).as_ptr() as usize;
         let mut novel = false;
-        for (pc, taken) in &done.branches {
-            novel |= self.covered.insert((code, *pc, *taken));
+        for branch in &done.branches {
+            novel |= self.covered.insert(*branch);
         }
         let parent = &self.kept[from];
         let base = match (call.who == ACTOR, &parent.base) {
@@ -417,8 +459,9 @@ impl<'a> Search<'a> {
         let brought = call.who == OTHER && done.crossed && !done.written.is_empty();
         let recorded = parent.recorded || brought;
         let by_actor = call.who == ACTOR;
+        let reentered = parent.reentered || done.called_back;
         steps.push(Step { entry: index, call });
-        let changed = !done.written.is_empty() || done.crossed;
+        let changed = !done.written.is_empty() || done.moved;
         let other = match changed {
             true => world.holdings(OTHER),
             false => parent.other.clone(),
@@ -441,15 +484,34 @@ impl<'a> Search<'a> {
         }
         if let (Some(base), true) = (&base, changed) {
             let now = world.holdings(ACTOR);
+            let mut place = position(base, &now);
+            place.extend(position(&self.kept[0].other, &other));
+            // Which slots are set tells apart states the holdings alone do not. A
+            // contract that sets a new slot on every call would never stop being new.
+            let set = world.set_slots(exec::SELF);
+            let room = self.positions.len() < MAX_POSITIONS && set.len() <= MAX_SET_SLOTS;
+            novel |= room && self.positions.insert((place, set));
             if gained(base, &now) {
-                let found = Broken {
+                let mut found = Broken {
                     steps: steps.clone(),
                     base: base.clone(),
                     now,
                     waited,
                     recorded,
                     taken,
+                    reentered,
                 };
+                // A gain the call leaves on its own is not owed to calling in again.
+                if let (true, Some(last)) = (done.called_back, found.steps.last_mut()) {
+                    let mut plain = parent.world.clone();
+                    last.call.back = None;
+                    let alone = plain.call(at, &last.call).ended;
+                    let same = alone && gained(base, &plain.holdings(ACTOR));
+                    match same {
+                        true => found.reentered = parent.reentered,
+                        false => last.call.back = steps.last().and_then(|s| s.call.back.clone()),
+                    }
+                }
                 if self.best.as_ref().is_none_or(|b| found.better_than(b)) {
                     self.best = Some(found);
                 }
@@ -464,6 +526,7 @@ impl<'a> Search<'a> {
                 base,
                 recorded,
                 taken,
+                reentered,
                 other,
             });
         }
@@ -475,13 +538,18 @@ impl<'a> Search<'a> {
             return;
         }
         self.helps_left -= 1;
-        let found = self.solved(index, who, from);
+        let mut found = self.solved(index, who, from);
+        // The solver sends a payment in case the function wants one. A function that
+        // ends without it is also called without it.
+        let unpaid = found.iter().filter(|(_, value)| !value.is_zero());
+        let unpaid: Vec<_> = unpaid.map(|(data, _)| (data.clone(), U256::ZERO)).collect();
+        found.extend(unpaid);
         for (data, value) in found {
             let call = Call {
                 who,
                 data: data.clone(),
                 value,
-                seconds_later: 0,
+                ..Call::default()
             };
             if self.attempt(from, index, call) && self.entries[index].seeds.len() < 16 {
                 self.entries[index].seeds.push((data, value));
@@ -497,15 +565,17 @@ impl<'a> Search<'a> {
             self.help(0, index, OTHER);
         }
         let mut rounds = 0;
-        let (mut reached, mut fresh, mut fresh_at) = (self.covered.len(), 0, exec::work());
+        let learnt = self.covered.len() + self.positions.len();
+        let (mut reached, mut fresh, mut fresh_at) = (learnt, 0, exec::work());
         let stale = |rounds: usize, fresh: usize, fresh_at: u64| {
             rounds - fresh >= STALE_ROUNDS || exec::work() - fresh_at >= STALE_WORK
         };
         while !exec::spent() && rounds < MAX_ROUNDS && !stale(rounds, fresh, fresh_at) {
             rounds += 1;
             self.round();
-            if self.covered.len() > reached {
-                (reached, fresh, fresh_at) = (self.covered.len(), rounds, exec::work());
+            let learnt = self.covered.len() + self.positions.len();
+            if learnt > reached {
+                (reached, fresh, fresh_at) = (learnt, rounds, exec::work());
             }
             // A state the search just reached may be the one a stuck function was
             // waiting for. Its own checks are solved again from there.
@@ -522,7 +592,11 @@ impl<'a> Search<'a> {
         }
         if crate::debug::on("EVMDEC_DEBUG_SEARCH") {
             let seeded = self.entries.iter().filter(|e| !e.seeds.is_empty()).count();
-            let holding = self.kept.iter().filter(|k| k.world.holds_value()).count();
+            let holding = self
+                .kept
+                .iter()
+                .filter(|k| k.world.holds_value(exec::SELF))
+                .count();
             eprintln!(
                 "[search] work={} entries={} seeded={seeded} rounds={rounds} kept={} holding={holding} covered={} broken={}",
                 exec::work(),
@@ -595,6 +669,42 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
             " The gain needs time to pass between the calls, as a reward that accrues would. Whether that reward is meant to be open to an account that paid nothing is for a reader to judge."
         }
     };
+    if broken.reentered {
+        let note = format!(
+            " Confirmed by running it: after the attached earlier call(s), the attached call is made by an account whose code makes the same call again when it is paid. Every call ends normally and the account ends with {} and with no less of anything else. The same call with nothing made from inside it leaves no gain.",
+            rose.join(" and "),
+        );
+        let name = display_name(function);
+        let known = |f: &&mut Finding| {
+            f.id.starts_with("reentrancy") && f.function.as_deref() == Some(name.as_str())
+        };
+        if out.iter_mut().find(known).is_none() {
+            push(
+                out,
+                "reentered-call-pays-again",
+                "A call made again from inside its own payment is paid twice",
+                Severity::High,
+                Confidence::High,
+                Some(function),
+                None,
+                format!(
+                    "`{}` pays its caller before it has finished recording the payment.",
+                    function.name
+                ),
+                Vec::new(),
+                "Finish every storage update before the payment, or hold a lock across it.",
+            );
+        }
+        if let Some(f) = out.iter_mut().find(known) {
+            f.description.push_str(&note);
+            f.confidence = Confidence::High;
+            f.setup = shown(earlier);
+            f.confirmed = true;
+            f.witness = Some(hex::encode(&last.call.data));
+            f.observed = vec![format!("sent by {}", last.call.who.to_hex())];
+        }
+        return;
+    }
     let own_calls = broken.steps.iter().filter(|s| s.call.who == ACTOR).count();
     push(
         out,

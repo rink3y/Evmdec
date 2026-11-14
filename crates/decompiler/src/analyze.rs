@@ -2,7 +2,6 @@ use crate::abi::{SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::boundary;
 use crate::compiler;
 use crate::confirm;
-use crate::cross::World as CrossWorld;
 use crate::decompile::{self, Contract, Function};
 use crate::emit::{self, Names, SlotSpace};
 use crate::exec;
@@ -19,6 +18,7 @@ use crate::ssa;
 use crate::standard;
 use crate::type_rules;
 use crate::u256::U256;
+use crate::world::{Call, World as CrossWorld};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -7735,14 +7735,15 @@ fn place_contract(world: &mut CrossWorld, c: &Contract) -> Option<U256> {
     if c.info.runtime.is_empty() {
         return None;
     }
-    world.place(address, c.info.runtime.clone());
+    world.place(address, &c.info.runtime);
+    world.fund(address);
     let units: Vec<U256> = c
         .parts
         .iter()
         .skip(1)
         .filter_map(|part| {
             let at = U256::from_hex_str(&part.address)?;
-            world.place(at, part.runtime.clone());
+            world.place(at, &part.runtime);
             Some(at)
         })
         .collect();
@@ -7807,17 +7808,21 @@ fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec
         args[word as usize] = account;
         let data = exec::calldata(selector, &args);
         let mut world = build(held)?;
-        world
-            .run(root, exec::CALLER, U256::ZERO, data.clone())
-            .then_some((data, world))
+        let call = Call {
+            who: exec::CALLER,
+            data: data.clone(),
+            ..Call::default()
+        };
+        let done = world.run(root, &call);
+        done.ended.then_some((data, world, done.writes))
     };
     let far = |world: &CrossWorld, at: U256| match fixed_target {
         Some(target) => at == target,
         None => world.was_made(at),
     };
     let written = |account: U256| -> Option<HashSet<(U256, U256)>> {
-        let (_, world) = run(account, &vec![U256::ZERO; nargs], &[])?;
-        let slots = world.writes().iter().filter(|w| far(&world, w.address));
+        let (_, world, writes) = run(account, &vec![U256::ZERO; nargs], &[])?;
+        let slots = writes.iter().filter(|w| far(&world, w.address));
         Some(slots.map(|w| (w.address, w.slot)).collect())
     };
     let (first, second) = (written(NAMED[0])?, written(NAMED[1])?);
@@ -7838,7 +7843,7 @@ fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec
         }
     }
     let lowered = |account: usize, shape: &[U256]| -> Option<Vec<u8>> {
-        let (data, world) = run(NAMED[account], shape, &own[account])?;
+        let (data, world, _) = run(NAMED[account], shape, &own[account])?;
         own[account]
             .iter()
             .any(|(address, slot)| world.stored(*address, *slot) < balance)

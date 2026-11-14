@@ -323,6 +323,27 @@ low-severity findings of their own. `vuln_bench.py` prints the per-rule table fo
 corpora: labels, how many were caught, and how often each rule fires at medium or higher on
 audited code.
 
+### Held-out set
+
+`python3 corpus/heldout_bench.py`. `testdata/heldout` holds 234 contracts from public incidents
+and 101 contracts in steady use for over three years with no known flaw. None of them was
+used to build or tune a rule, and none may be: the rule of use and the way the set was
+chosen are in `testdata/heldout/README.md`. This is the number to judge the analyzer by. The
+recall above is measured on contracts the rules were developed on.
+
+| | |
+|---|---|
+| flawed contracts with the right kind of finding at high or above | 96 / 234 = 41% |
+| the same at medium or above | 134 / 234 = 57% |
+| flawed contracts with any finding at high or above | 121 / 234 = 52% |
+| contracts with no known flaw and nothing at high or above | 78 / 101 = 77% |
+
+The label is the kind of flaw, not the function it is in, so the first row is an upper
+bound. By kind, recall is 0.69 for calls that hand control out before state is settled, 0.48
+for missing checks on who may call, 0.37 for accounting, 0.34 for prices read from outside
+and 0.21 for arithmetic. On the contracts with no known flaw, 15 of the 23 that get a high
+finding get it from `dynamic-call`.
+
 ### Random sample
 
 `corpus/harvest.py` collects the `to` address of every transaction in random recent mainnet

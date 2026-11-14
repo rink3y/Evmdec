@@ -37,6 +37,7 @@ pub mod invariant;
 pub mod lift;
 #[cfg(feature = "rpc")]
 pub mod rpc;
+pub mod search;
 pub mod seq;
 pub mod settings;
 pub mod sigdb;
@@ -50,3 +51,4 @@ pub mod structure;
 pub mod type_rules;
 pub mod types;
 pub mod verify;
+pub mod world;

@@ -3645,3 +3645,18 @@ fn a_reading_that_differs_for_one_call_must_leave_no_gain() {
     let r = report_of(&vault(credited_plainly(ASKED_OF_ONE)));
     assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
 }
+
+#[test]
+fn the_search_finds_an_account_that_ends_with_more_than_it_started_with() {
+    let rule = "calls-leave-account-with-gain";
+    let takes_all = dispatcher3(&counted_pay_in(), &pay_out_everything(), "STOP");
+    let r = report_of(&takes_all);
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    assert!(f.confirmed, "{f:?}");
+    assert!(!f.setup.is_empty(), "{f:?}");
+
+    let pays_what_is_recorded = dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP");
+    let r = report_of(&pays_what_is_recorded);
+    assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
+}

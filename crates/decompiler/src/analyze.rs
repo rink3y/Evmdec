@@ -5460,6 +5460,9 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                 );
             }
         }
+        exec::within(crate::search::WORK, || {
+            crate::search::findings(c, &mut findings)
+        });
         exec::within(ledger::WORK, || ledger::findings(c, &mut findings));
         if !crate::deploy::assumed(c).is_empty() {
             for finding in &mut findings[measured..] {

@@ -20,7 +20,7 @@ FAMILIES = {
         "unbound-address-made-privileged", "unbound-account-passed-on",
         "approval-to-open-spender", "third-party-balance-debit", "unprivileged-balance-credit",
         "trusted-callee-loop", "silent-auth-failure", "storage-collision",
-        "call-lowers-another-accounts-balance",
+        "call-lowers-another-accounts-balance", "calls-leave-account-with-gain",
     ],
     "reentry": [
         "reentrancy", "reentered-call-pays-again", "control-handed-out-mid-update",
@@ -43,7 +43,7 @@ FAMILIES = {
         "unbounded-payout-parameter", "unchecked-token-pull", "erc20-return-ignored",
         "refused-transfer-treated-as-done", "msg-value-in-loop", "msg-value-multicall",
         "call-lowers-another-accounts-balance", "reported-balance-moved-by-another-account",
-        "one-call-reading-leaves-a-gain",
+        "one-call-reading-leaves-a-gain", "calls-leave-account-with-gain",
     ],
     "arithmetic": [
         "unchecked-arithmetic", "unchecked-block-arithmetic", "unchecked-downcast",

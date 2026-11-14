@@ -43,9 +43,55 @@ pub fn storage(c: &Contract) -> HashMap<U256, U256> {
 }
 
 type Stored = ([u8; 32], HashMap<U256, U256>);
+type Assumed = ([u8; 32], Vec<(U256, U256)>);
 
 thread_local! {
     static LAST: RefCell<Option<Stored>> = const { RefCell::new(None) };
+    static ASSUMED: RefCell<Option<Assumed>> = const { RefCell::new(None) };
+}
+
+pub fn assume(c: &Contract, settings: Vec<(U256, U256)>) {
+    let key = keccak::keccak256(&c.info.runtime);
+    ASSUMED.with(|held| *held.borrow_mut() = Some((key, settings)));
+}
+
+pub fn assumed(c: &Contract) -> Vec<(U256, U256)> {
+    let key = keccak::keccak256(&c.info.runtime);
+    ASSUMED.with(|held| {
+        let held = held.borrow();
+        let ours = held.as_ref().filter(|(k, _)| *k == key);
+        ours.map_or(Vec::new(), |(_, settings)| settings.clone())
+    })
+}
+
+// What the constructor left, with the settings taken for this contract on top. The
+// checks that measure what calls do start here. The rules about what the constructor
+// did or did not set keep reading `storage`.
+pub fn start(c: &Contract) -> HashMap<U256, U256> {
+    let mut held = storage(c);
+    held.extend(assumed(c));
+    held
+}
+
+pub fn started_from(c: &Contract) -> &'static str {
+    match (storage(c).is_empty(), assumed(c).is_empty()) {
+        (true, true) => "empty storage",
+        (true, false) => "the settings assumed for it",
+        (false, true) => "the storage its constructor leaves",
+        (false, false) => "the storage its constructor leaves and the settings assumed for it",
+    }
+}
+
+pub fn settings_section(c: &Contract) -> Option<Section> {
+    let lines: Vec<String> = assumed(c)
+        .iter()
+        .take(MAX_LINES)
+        .map(|(slot, value)| format!("slot {} is taken to hold {}", slot.to_hex(), value.to_hex()))
+        .collect();
+    (!lines.is_empty()).then_some(Section {
+        title: "Assumed settings".to_string(),
+        lines,
+    })
 }
 
 const MAX_LINES: usize = 16;

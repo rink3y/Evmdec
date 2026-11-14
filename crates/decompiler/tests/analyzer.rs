@@ -3440,3 +3440,89 @@ fn a_caller_test_against_a_record_anyone_opens_does_not_lower_a_re_entry_finding
     let f = finding(&r, "reentrancy").unwrap_or_else(|| panic!("{:?}", ids(&r)));
     assert_eq!(f.severity, Severity::Medium, "{f:?}");
 }
+
+const NEEDS_TWO_WORDS: &str = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP1 PUSH1 0x11 GAS CALL POP \
+     PUSH1 0x40 RETURNDATASIZE LT ISZERO PUSH2 @long JUMPI PUSH1 0x00 DUP1 REVERT \
+     :long JUMPDEST PUSH1 0x20 PUSH1 0x20 PUSH1 0x80 RETURNDATACOPY PUSH1 0x80 MLOAD \
+     PUSH2 @set JUMPI PUSH1 0x00 DUP1 REVERT :set JUMPDEST PUSH1 0x01 PUSH1 0x01 SSTORE STOP";
+
+#[test]
+fn a_search_lengthens_and_fills_the_answer_a_caller_decodes() {
+    let code = dispatcher(NEEDS_TWO_WORDS);
+    let explorer = evmdec::path::Explorer::new(&code);
+    let start = evmdec::path::inputs_for(Some(0xaaaa_aaaa), 1);
+    let finishes = |answers: bool| {
+        let free = evmdec::solve::Free {
+            words: 1,
+            answers,
+            ..Default::default()
+        };
+        let found = explorer.explore(&start, &free, evmdec::path::Limits::default());
+        found.iter().any(evmdec::path::Path::succeeded)
+    };
+    assert!(finishes(true));
+    assert!(!finishes(false));
+}
+
+fn assumed(r: &analyze::Report) -> Vec<String> {
+    let section = r.maps.iter().find(|s| s.title == "Assumed settings");
+    section.map_or(Vec::new(), |s| s.lines.clone())
+}
+
+const SET_BY_OWNER: &str = "PUSH1 0x01 PUSH1 0x09 SSTORE STOP";
+
+fn behind_flag(label: &str, body: &str) -> String {
+    format!("PUSH1 0x09 SLOAD PUSH2 @{label} JUMPI PUSH1 0x00 DUP1 REVERT :{label} JUMPDEST {body}")
+}
+
+#[test]
+fn a_flag_only_its_owner_sets_is_assumed_and_the_check_behind_it_is_reached() {
+    let owner_sets = format!("{OWNER_GATE} {SET_BY_OWNER}");
+    let code = dispatcher3(
+        &behind_flag("in", &counted_pay_in()),
+        &behind_flag("out", &pay_out_recorded(true)),
+        &owner_sets,
+    );
+    let r = report_of(&code);
+    assert_eq!(assumed(&r).len(), 1, "{:?}", assumed(&r));
+    assert!(assumed(&r)[0].contains("slot 0x9"), "{:?}", assumed(&r));
+    let f = finding(&r, "surplus-open-to-any-account").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(
+        f.description.contains("assumed settings"),
+        "{}",
+        f.description
+    );
+}
+
+#[test]
+fn a_flag_any_caller_sets_is_a_record_and_is_not_assumed() {
+    let code = dispatcher3(
+        &behind_flag("in", &counted_pay_in()),
+        &behind_flag("out", &pay_out_recorded(true)),
+        SET_BY_OWNER,
+    );
+    assert!(assumed(&report_of(&code)).is_empty());
+}
+
+#[test]
+fn no_setting_is_chosen_to_make_the_caller_the_owner() {
+    let owner_only = format!("{OWNER_GATE} PUSH1 0x01 PUSH1 0x01 SSTORE STOP");
+    let r = report_of(&dispatcher(&owner_only));
+    assert!(assumed(&r).is_empty(), "{:?}", assumed(&r));
+    assert_eq!(r.privileged_functions.len(), 1, "{r:?}");
+}
+
+fn calls_with(head: &str, target: &str) -> String {
+    format!(
+        "{head} PUSH1 0x80 MSTORE PUSH1 0x00 DUP1 PUSH1 0x24 PUSH1 0x80 PUSH1 0x00 \
+         {target} GAS CALL POP STOP"
+    )
+}
+
+#[test]
+fn a_selector_that_never_follows_the_call_data_is_not_a_dynamic_call() {
+    let named = "PUSH1 0x04 CALLDATALOAD";
+    let from_storage = dispatcher(&calls_with("PUSH1 0x07 SLOAD", named));
+    let r = report_of(&from_storage);
+    assert!(finding(&r, "dynamic-call").is_none(), "{:?}", ids(&r));
+}

@@ -68,6 +68,8 @@ impl<'a> Bench<'a> {
             words: 0,
             value: false,
             storage: true,
+            answers: false,
+            settings: None,
             fixed: Vec::new(),
         };
         let found = self.explorer(f).explore(&start, &free, LIMITS);

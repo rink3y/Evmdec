@@ -169,6 +169,8 @@ fn solved(
             words: SOLVED_WORDS.max(calldata.len() / 32),
             value: true,
             storage: false,
+            answers: false,
+            settings: None,
             fixed,
         };
         for returned in [Vec::new(), answer.clone()] {
@@ -310,6 +312,8 @@ fn wrapping_input(code: &[u8], f: &Function, begin: &HashMap<U256, U256>) -> Wra
             words: calldata.len() / 32,
             value: true,
             storage: false,
+            answers: false,
+            settings: None,
             fixed,
         };
         let start = Inputs {
@@ -374,6 +378,8 @@ fn open_with_other_storage(explorer: &Explorer, f: &Function, begin: &HashMap<U2
         words: flat.calldata.len() / 32,
         value: true,
         storage: true,
+        answers: false,
+        settings: None,
         fixed: Vec::new(),
     };
     let start = Inputs {
@@ -469,6 +475,8 @@ fn chance_shown(explorer: &Explorer, f: &Function, begin: &HashMap<U256, U256>) 
             // The limits such a function checks are set by an owner or a constructor.
             // They are chosen here so that the call is accepted.
             storage: true,
+            answers: false,
+            settings: None,
             fixed,
         };
         // No branch asks for a payment above zero, so the search would settle for none.
@@ -536,5 +544,135 @@ pub fn confirm_chance(c: &Contract, findings: &mut [Finding]) {
         finding.severity = Severity::High;
         finding.confidence = Confidence::High;
         finding.confirm(&won);
+    }
+}
+
+const SELECTOR_ID: &str = "dynamic-call";
+const SELECTOR_LIMITS: Limits = Limits {
+    paths: 16,
+    runs: 60,
+};
+const MAX_CHUNKS: usize = 256;
+const MIN_TRIALS: usize = 4;
+const FLIP: [u8; 4] = [0xa5; 4];
+
+enum Selector {
+    Chosen {
+        run: Box<Path>,
+        at: usize,
+        then: [u8; 4],
+    },
+    Fixed,
+    Unknown,
+}
+
+fn selector_at(run: &FrameRun, site: &std::ops::Range<usize>) -> Option<[u8; 4]> {
+    let made = run.sites.iter().position(|pc| site.contains(pc))?;
+    let call = run.calls.get(made)?;
+    call.input.get(..4)?.try_into().ok()
+}
+
+// Whether a caller picks the function that is called is a question about bytes: do the
+// first four of the payload follow the call data. Changing the call data four bytes at a
+// time answers it for a selector passed whole, cut from a longer argument, or hashed
+// from one. A selector that never moves is fixed by the code or by storage.
+fn selector_under_change(explorer: &Explorer, f: &Function, pc: usize) -> Selector {
+    let site = explorer.rest_of_block(pc);
+    let selector = exec::selector_of(f);
+    let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
+    let shaped = abi::layout_with(selector, &types, 2);
+    let flat = path::inputs_for(selector, SOLVED_WORDS);
+    let starts = [
+        (shaped.calldata, shaped.fixed),
+        (flat.calldata.clone(), Vec::new()),
+    ];
+    for (calldata, fixed) in starts {
+        let free = Free {
+            words: calldata.len() / 32,
+            value: true,
+            storage: true,
+            answers: true,
+            settings: None,
+            fixed,
+        };
+        let start = Inputs {
+            calldata,
+            returned: U256::ONE.to_be_bytes().to_vec(),
+            ..flat.clone()
+        };
+        let found = explorer.explore(&start, &free, SELECTOR_LIMITS);
+        let reaching = found
+            .into_iter()
+            .find_map(|p| selector_at(&p.run, &site).map(|first| (p, first)));
+        let Some((run, first)) = reaching else {
+            continue;
+        };
+        let chunks = (run.inputs.calldata.len().saturating_sub(4) / 4).min(MAX_CHUNKS);
+        let mut trials = 0;
+        for chunk in 0..chunks {
+            let at = 4 + 4 * chunk;
+            let mut changed = run.inputs.clone();
+            for (byte, flip) in changed.calldata[at..at + 4].iter_mut().zip(FLIP) {
+                *byte ^= flip;
+            }
+            let Some(then) = selector_at(&explorer.run_only(&changed), &site) else {
+                continue;
+            };
+            trials += 1;
+            if then != first {
+                return Selector::Chosen {
+                    run: Box::new(run),
+                    at,
+                    then,
+                };
+            }
+        }
+        if trials >= MIN_TRIALS {
+            return Selector::Fixed;
+        }
+    }
+    Selector::Unknown
+}
+
+pub fn settle_selectors(c: &Contract, findings: &mut Vec<Finding>) {
+    if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
+        return;
+    }
+    let mut fixed = Vec::new();
+    for (index, finding) in findings.iter_mut().enumerate() {
+        if exec::spent() {
+            break;
+        }
+        if finding.id != SELECTOR_ID {
+            continue;
+        }
+        let (Some(pc), Some(name)) = (finding.pc, finding.function.as_deref()) else {
+            continue;
+        };
+        let function = c
+            .functions
+            .iter()
+            .find(|f| f.kind == FnKind::External && display_name(f) == name);
+        let Some(f) = function else { continue };
+        let explorer = Explorer::new(c.code_of(f));
+        match selector_under_change(&explorer, f, c.local_pc(f, pc)) {
+            Selector::Fixed => fixed.push(index),
+            Selector::Unknown => {}
+            Selector::Chosen { run, at, then } => {
+                let site = explorer.rest_of_block(c.local_pc(f, pc));
+                let first = selector_at(&run.run, &site).unwrap_or_default();
+                finding.description.push_str(&format!(
+                    " Confirmed by running it, with storage chosen so that the call is reached: the payload begins with 0x{}, and with bytes {at} to {} of the call data changed it begins with 0x{}. The caller decides which function is called.",
+                    hex::encode(&first),
+                    at + 3,
+                    hex::encode(&then),
+                ));
+                finding.confidence = Confidence::Medium;
+                finding.confirm(&run);
+            }
+        }
+    }
+    for index in fixed.into_iter().rev() {
+        findings.remove(index);
     }
 }

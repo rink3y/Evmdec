@@ -72,6 +72,8 @@ fn start_for(f: &Function, begin: &HashMap<U256, U256>) -> (Inputs, Free) {
         words: inputs.calldata.len() / 32,
         value: false,
         storage: true,
+        answers: false,
+        settings: None,
         fixed,
     };
     (inputs, free)

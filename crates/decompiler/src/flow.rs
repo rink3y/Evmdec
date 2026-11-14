@@ -227,6 +227,8 @@ impl<'a> Pass<'a> {
             words: inputs.calldata.len() / 32,
             value: false,
             storage: false,
+            answers: true,
+            settings: None,
             fixed,
         };
         (inputs, free)
@@ -312,7 +314,7 @@ impl<'a> Pass<'a> {
         if self.pays_from_nothing(g, q, asset, back) {
             return false;
         }
-        report_gain(out, d, g, q, asset, back, deploy::start_text(&self.start));
+        report_gain(out, d, g, q, asset, back, deploy::started_from(self.c));
         true
     }
 
@@ -353,7 +355,7 @@ impl<'a> Pass<'a> {
                 None,
                 format!(
                     "Starting from {}, one account pays in {} of {} through `{}`, and a second account then makes the same payment. The first account's call to `{}` now ends normally and sends it {}. Before the second payment the same call sent less, so the difference comes out of what the second account paid. The run assumes the contract holds enough to pay.",
-                    deploy::start_text(&self.start),
+                    deploy::started_from(self.c),
                     paid.to_hex(),
                     asset_text(asset),
                     d.function.name,
@@ -954,7 +956,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     let mut pass = Pass {
         c,
         explorers: Explorers::default(),
-        start: deploy::storage(c),
+        start: deploy::start(c),
     };
     let deposits = pass.deposits(layout);
     for d in &deposits {

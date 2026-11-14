@@ -99,6 +99,7 @@ pub struct Host {
     pub force_calls: Option<bool>,
     pub forced_return: Vec<u8>,
     pub replies: Vec<(u32, Vec<u8>)>,
+    pub answers: Vec<(usize, Vec<u8>)>,
     pub signed: Option<(Vec<u8>, U256)>,
     pub failing: Option<usize>,
     pub spends_balance: bool,
@@ -137,6 +138,7 @@ impl Host {
             force_calls: None,
             forced_return: Vec::new(),
             replies: Vec::new(),
+            answers: Vec::new(),
             signed: None,
             failing: None,
             spends_balance: false,
@@ -164,11 +166,12 @@ impl Host {
             selfbalance: U256::from_u64(1_000_000_000_000_000_000),
             basefee: U256::from_u64(BASEFEE),
             blobbasefee: U256::from_u64(BLOBBASEFEE),
-            seed: 0x5eed,
+            seed: CONTROLLED_SEED,
             zero_storage: true,
             force_calls: Some(true),
             forced_return: Vec::new(),
             replies: Vec::new(),
+            answers: Vec::new(),
             signed: None,
             failing: None,
             spends_balance: false,
@@ -181,14 +184,8 @@ impl Host {
         h(&[&self.seed.to_be_bytes()[..], b"bal", &a.to_be_bytes()].concat())
             & U256::from_u64(u64::MAX)
     }
-    // The zero address never holds code. An unset slot read as an address must have none.
     pub fn extcodesize(&self, a: U256) -> U256 {
-        if a.is_zero() {
-            return U256::ZERO;
-        }
-        U256::from_u64(
-            h(&[&self.seed.to_be_bytes()[..], b"size", &a.to_be_bytes()].concat()).low_u64() % 300,
-        )
+        code_size(self.seed, a)
     }
     pub fn extcodehash(&self, a: U256) -> U256 {
         if a.is_zero() {
@@ -248,13 +245,8 @@ impl Host {
             return (false, Vec::new());
         }
         if let Some(b) = self.force_calls {
-            let data = answer(
-                &self.signed,
-                &self.replies,
-                &self.forced_return,
-                addr,
-                input,
-            );
+            let default = own_answer(&self.answers, i).unwrap_or(&self.forced_return);
+            let data = answer(&self.signed, &self.replies, default, addr, input);
             return (b, data);
         }
         let r = keccak::keccak256(
@@ -296,6 +288,48 @@ impl Host {
 
 const RECOVER: U256 = U256::ONE;
 const SOMEONE_ELSE: U256 = U256::from_u64(0x0e15_e0e1_5e0e_15e0);
+
+const CONTROLLED_SEED: u64 = 0x5eed;
+
+// The zero address and the built-in contracts hold no code on chain. An unset slot read
+// as an address must have none, and neither may a stored address that a search set to a
+// small number to make a flag read as true.
+fn code_size(seed: u64, a: U256) -> U256 {
+    if a.fits_u64() && a.low_u64() <= LAST_PRECOMPILE {
+        return U256::ZERO;
+    }
+    let drawn = h(&[&seed.to_be_bytes()[..], b"size", &a.to_be_bytes()].concat());
+    U256::from_u64(drawn.low_u64() % 300)
+}
+
+pub fn code_size_in_a_run(a: U256) -> U256 {
+    code_size(CONTROLLED_SEED, a)
+}
+
+pub fn own_answer(answers: &[(usize, Vec<u8>)], call: usize) -> Option<&Vec<u8>> {
+    answers
+        .iter()
+        .find(|(at, _)| *at == call)
+        .map(|(_, data)| data)
+}
+
+const LAST_PRECOMPILE: u64 = 0x0a;
+
+// An answer a check set on purpose is part of what that check measures. Only the answer
+// nothing chose is left for a search to shape.
+pub fn answered_by_default(
+    signed: &Option<(Vec<u8>, U256)>,
+    replies: &[(u32, Vec<u8>)],
+    addr: U256,
+    input: &[u8],
+) -> bool {
+    let selector = input
+        .get(..4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let built_in = addr.fits_u64() && (1..=LAST_PRECOMPILE).contains(&addr.low_u64());
+    let recovered = addr == RECOVER && signed.is_some();
+    !built_in && !recovered && !replies.iter().any(|(s, _)| Some(*s) == selector)
+}
 
 // Signature recovery answers the signer for the one digest it was given.
 // Any other digest recovers someone else, as a changed message would.
@@ -413,6 +447,7 @@ pub struct Machine<'a> {
     pub gas: u64,
     pub logs: Vec<LogRecord>,
     pub calls: Vec<CallRecord>,
+    pub call_sites: Vec<usize>,
     pub creates: Vec<CreateRecord>,
     pub gas_obs: Vec<U256>,
     pub msize_obs: Vec<U256>,
@@ -446,6 +481,7 @@ impl<'a> Machine<'a> {
             gas: host.initial_gas(),
             logs: vec![],
             calls: vec![],
+            call_sites: Vec::new(),
             creates: vec![],
             gas_obs: vec![],
             msize_obs: vec![],
@@ -950,6 +986,7 @@ impl<'a> Machine<'a> {
                     self.paid_out = self.paid_out.wrapping_add(value);
                 }
                 let idx = self.calls.len();
+                self.call_sites.push(self.pc);
                 self.calls.push(CallRecord {
                     kind: o,
                     gas,

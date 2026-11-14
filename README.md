@@ -213,8 +213,24 @@ on all 70,261 branches taken. When creation code is given, the constructor is ru
 every check starts from the storage it leaves; with runtime code only, they start from empty
 storage and say so.
 
+Runtime code does not say how its contract was set up, and a function that tests a flag, a
+limit or the code behind a stored address stops there when that storage is empty. Before the
+checks that measure what calls do, one set of values is taken for the contract: each function
+any account may call is explored, and the storage it needs in order to run is chosen, among
+the places no function open to every caller writes. Those places hold what a constructor or
+an authorised account sets. A place is never given the caller's address or a value a call
+answered, so no setting makes the caller an owner or makes a recovered signer match. The
+value-flow, edge and records checks start from these settings, the report lists them under
+"Assumed settings", and every finding measured from them says so.
+
+A call the contract makes is answered with one word unless a check sets the answer on
+purpose. When the code then tests the length of the answer or a word of it, the search may
+lengthen the answer and fill the word, the way it sets a word of the call data. This is not
+done in the pass that confirms what other rules found.
+
 | check | what is run and what is reported |
 |---|---|
+| which function is called | a call whose target and selector are both worked out at run time is run, and the call data is then changed four bytes at a time. A payload whose first four bytes never follow the call data has its selector fixed by the code or by storage, and the finding is withdrawn. One whose first four bytes change is confirmed with the run attached (`dynamic-call`) |
 | reachability | a sink no single input reaches is tried through up to three earlier calls that write the storage it needs; the earlier calls are attached to the finding |
 | arithmetic | an input that takes a path ending normally and makes a stored sum, difference or product wrap; open when no such run exists from the starting storage. A small interval analysis reads the masks, the checks on each path and the orderings they prove; when every stored result on every finished path stays in range, the finding is kept at the lowest severity and says so |
 | properties from behaviour | a mapping and a total that at least two functions move in step, then a path that moves them apart (`entries-total-out-of-step`) or calls out between the two updates (`total-open-at-call`); a slot toggled like a lock and left set on one path (`lock-left-set`); a memory copy of storage changed and dropped (`changed-copy-dropped`); a value written from one block clock and compared with the other (`clock-units-mixed`); a storage slot or memory offset picked by an untested word of the call (`input-picks-storage-slot`, `input-picks-memory-offset`); input one byte short still accepted (`short-input-accepted`); work that grows with a count any caller can raise (`cost-grows-with-open-list`); a bound compared with the block clock that any caller can store (`time-bound-set-by-anyone`) and a time check on a slot nothing sets (`time-window-never-opens`); a payment of value to accounts read from storage that fails as a whole when one of them refuses (`one-refusal-blocks-all`, or confirms `blocking-payout-loop` and `fixed-payee-can-block`) |
@@ -526,9 +542,12 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   that do it. It cannot know whether the deployed contract holds a surplus, or how large a
   loss was. It tries one payment repeated up to eight times and three payments of up to six
   sizes each, so a gain that needs a longer or finer sequence is not found.
-- The records-against-assets check needs the function to finish in a run where every outside
-  call is answered with one word. Code that decodes a longer answer from its outside call
-  stops there and is not judged.
+- The assumed settings are one configuration under which the open functions run, not the one
+  a deployment has. A slot written by any function without a caller check is never assumed,
+  so what an open initialiser sets stays empty, and a contract whose state lives behind a
+  storage pointer passed as an argument gets no settings at all. A finding measured from
+  assumed settings holds for that configuration and says which it is.
+- An answer the search chose is one the code accepts, not one a real callee is known to give.
 - Whether a called contract passes control on is read from the code that contract has today.
   A payee taken from memory, a helper or another contract's answer is reported as worked out
   at run time, at low confidence, because its origin is not traced.

@@ -283,6 +283,8 @@ impl<'a> Pass<'a> {
             // The amount a function accepts is whatever its own checks ask for.
             value: value.is_none(),
             storage: false,
+            answers: true,
+            settings: None,
             fixed: entry.fixed.clone(),
         };
         let inputs = self.inputs(&start, held);
@@ -532,11 +534,11 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         return;
     }
     let start = Held {
-        storage: deploy::storage(c),
+        storage: deploy::start(c),
         ether: U256::ZERO,
         tokens: U256::ZERO,
     };
-    let from = deploy::start_text(&start.storage);
+    let from = deploy::started_from(c);
     let mut pass = Pass::new(c);
     let trace = crate::debug::on("EVMDEC_DEBUG_BOUNDARY");
     if trace {

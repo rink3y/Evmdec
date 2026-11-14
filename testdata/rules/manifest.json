@@ -55,8 +55,10 @@
   {"file": "53-sound.hex", "rule": "surplus-open-to-any-account", "flawed": false, "confirmed": true},
   {"file": "54-flawed.hex", "rule": "payment-taken-by-other-account", "flawed": true, "confirmed": true},
   {"file": "55-sound.hex", "rule": "payment-taken-by-other-account", "flawed": false, "confirmed": true},
-  {"file": "56-flawed.hex", "rule": "weak-randomness", "flawed": true, "confirmed": true},
-  {"file": "57-sound.hex", "rule": "weak-randomness", "flawed": false, "confirmed": true},
-  {"file": "58-flawed.hex", "rule": "short-input-accepted", "flawed": true, "confirmed": true},
-  {"file": "59-sound.hex", "rule": "short-input-accepted", "flawed": false, "confirmed": true}
+  {"file": "56-flawed.hex", "rule": "one-call-reading-leaves-a-gain", "flawed": true, "confirmed": true},
+  {"file": "57-sound.hex", "rule": "one-call-reading-leaves-a-gain", "flawed": false, "confirmed": true},
+  {"file": "58-flawed.hex", "rule": "weak-randomness", "flawed": true, "confirmed": true},
+  {"file": "59-sound.hex", "rule": "weak-randomness", "flawed": false, "confirmed": true},
+  {"file": "60-flawed.hex", "rule": "short-input-accepted", "flawed": true, "confirmed": true},
+  {"file": "61-sound.hex", "rule": "short-input-accepted", "flawed": false, "confirmed": true}
 ]

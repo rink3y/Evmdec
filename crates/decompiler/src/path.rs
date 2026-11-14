@@ -255,16 +255,15 @@ impl Explorer {
             .map(|(index, ((seq, size), call))| {
                 let (signed, replies) = (&inputs.signed, &inputs.replies);
                 let chosen = interp::own_answer(&inputs.answers, index);
-                let default = chosen.unwrap_or(&inputs.returned);
                 let moved = interp::moving_answer(&inputs.moving, outside, call.addr, &call.input);
                 let went_out = interp::goes_outside(&inputs.moving, call.addr, &call.input);
                 outside += usize::from(call.kind == crate::opcode::CALL && went_out);
                 let by_default =
                     interp::answered_by_default(signed, replies, call.addr, &call.input);
                 let open = moved.is_none() && by_default;
-                let data = moved.unwrap_or_else(|| {
-                    interp::answer(signed, replies, default, call.addr, &call.input)
-                });
+                let usual =
+                    || interp::answer(signed, replies, &inputs.returned, call.addr, &call.input);
+                let data = moved.unwrap_or_else(|| chosen.cloned().unwrap_or_else(usual));
                 Given {
                     seq: *seq,
                     size: *size,

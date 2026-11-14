@@ -29,7 +29,7 @@ FAMILIES = {
     "price": [
         "spot-balance-price", "oracle-unchecked", "no-slippage-bound",
         "pair-sync-after-state-change", "untrusted-return-data", "reverse-quote-rounding",
-        "reported-balance-moved-by-another-account",
+        "reported-balance-moved-by-another-account", "one-call-reading-leaves-a-gain",
     ],
     "accounting": [
         "two-calls-return-more", "inflow-credits-nothing", "payout-grows-with-other-payment",
@@ -43,6 +43,7 @@ FAMILIES = {
         "unbounded-payout-parameter", "unchecked-token-pull", "erc20-return-ignored",
         "refused-transfer-treated-as-done", "msg-value-in-loop", "msg-value-multicall",
         "call-lowers-another-accounts-balance", "reported-balance-moved-by-another-account",
+        "one-call-reading-leaves-a-gain",
     ],
     "arithmetic": [
         "unchecked-arithmetic", "unchecked-block-arithmetic", "unchecked-downcast",

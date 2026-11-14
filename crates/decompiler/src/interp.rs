@@ -245,8 +245,18 @@ impl Host {
             return (false, Vec::new());
         }
         if let Some(b) = self.force_calls {
-            let default = own_answer(&self.answers, i).unwrap_or(&self.forced_return);
-            let data = answer(&self.signed, &self.replies, default, addr, input);
+            // An answer set for this one call stands before the answer set for every call
+            // of its kind. A search only sets one where nothing else chose.
+            let data = match own_answer(&self.answers, i) {
+                Some(own) => own.clone(),
+                None => answer(
+                    &self.signed,
+                    &self.replies,
+                    &self.forced_return,
+                    addr,
+                    input,
+                ),
+            };
             return (b, data);
         }
         let r = keccak::keccak256(

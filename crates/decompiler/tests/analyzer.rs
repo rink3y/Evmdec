@@ -2784,6 +2784,24 @@ fn cases() -> Vec<Case> {
             || dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP"),
         ),
         pair(
+            "one-call-reading-leaves-a-gain",
+            true,
+            || {
+                dispatcher3(
+                    &pay_in(&credited_at(ASKED_OF_ONE)),
+                    &pay_out_checked(),
+                    "STOP",
+                )
+            },
+            || {
+                dispatcher3(
+                    &pay_in(&credited_plainly(ASKED_OF_ONE)),
+                    &pay_out_checked(),
+                    "STOP",
+                )
+            },
+        ),
+        pair(
             "weak-randomness",
             true,
             || dispatcher(&pays_double_when(BLOCK_MIX)),
@@ -2821,6 +2839,23 @@ fn refunds_outside(place: &str) -> String {
         "PUSH2 0x0e10 {place} LT PUSH2 @open JUMPI CALLVALUE {SEND_TO_CALLER} STOP \
          :open JUMPDEST PUSH1 0x01 PUSH1 0x02 SSTORE STOP"
     )
+}
+
+const ASKED_OF_ONE: &str = "PUSH2 0xfeed";
+const ASKED_OF_NAMED: &str = "PUSH1 0x04 CALLDATALOAD";
+
+fn reading_from(callee: &str) -> String {
+    format!(
+        "PUSH1 0x20 PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 {callee} GAS STATICCALL POP PUSH1 0x00 MLOAD"
+    )
+}
+
+fn credited_at(callee: &str) -> String {
+    format!("{} CALLVALUE MUL", reading_from(callee))
+}
+
+fn credited_plainly(callee: &str) -> String {
+    format!("{} POP CALLVALUE", reading_from(callee))
 }
 
 fn shown(case: &Case, code: &[u8]) -> bool {
@@ -3585,5 +3620,28 @@ fn a_call_that_lowers_the_balance_of_an_account_that_took_no_part_is_reported() 
 
     let burns_own = lowers("CALLER", "PUSH1 0x04 CALLDATALOAD");
     let r = report_of(&token_with(&burns_own));
+    assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
+}
+
+#[test]
+fn a_reading_that_differs_for_one_call_must_leave_no_gain() {
+    let rule = "one-call-reading-leaves-a-gain";
+    let vault = |credit: String| dispatcher3(&pay_in(&credit), &pay_out_checked(), "STOP");
+
+    let r = report_of(&vault(credited_at(ASKED_OF_ONE)));
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium, "{f:?}");
+    assert!(f.confirmed, "{f:?}");
+    assert!(
+        f.description.contains("for that one call"),
+        "{}",
+        f.description
+    );
+
+    let r = report_of(&vault(credited_at(ASKED_OF_NAMED)));
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+
+    let r = report_of(&vault(credited_plainly(ASKED_OF_ONE)));
     assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
 }

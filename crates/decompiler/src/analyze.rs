@@ -5443,6 +5443,9 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         let measured = findings.len();
         exec::within(flow::WORK, || flow::findings(c, &mut findings));
         exec::within(boundary::WORK, || boundary::findings(c, &mut findings));
+        exec::within(boundary::WORK, || {
+            boundary::swing_findings(c, &mut findings)
+        });
         exec::within(ledger::WORK, || ledger::findings(c, &mut findings));
         if !crate::deploy::assumed(c).is_empty() {
             for finding in &mut findings[measured..] {

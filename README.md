@@ -236,6 +236,7 @@ done in the pass that confirms what other rules found.
 | properties from behaviour | a mapping and a total that at least two functions move in step, then a path that moves them apart (`entries-total-out-of-step`) or calls out between the two updates (`total-open-at-call`); a slot toggled like a lock and left set on one path (`lock-left-set`); a memory copy of storage changed and dropped (`changed-copy-dropped`); a value written from one block clock and compared with the other (`clock-units-mixed`); a storage slot or memory offset picked by an untested word of the call (`input-picks-storage-slot`, `input-picks-memory-offset`); input one byte short still accepted (`short-input-accepted`); work that grows with a count any caller can raise (`cost-grows-with-open-list`); a bound compared with the block clock that any caller can store (`time-bound-set-by-anyone`) and a time check on a slot nothing sets (`time-window-never-opens`); a payment of value to accounts read from storage that fails as a whole when one of them refuses (`one-refusal-blocks-all`, or confirms `blocking-payout-loop` and `fixed-payee-can-block`) |
 | value flow | an account pays in, then every other function is run from that state: a second call that returns more than was paid (`two-calls-return-more`); the same payment by a second account with the balance the contract reads raised from outside, credited nothing (`inflow-credits-nothing`); a payment run again with the receiver being code that repeats the call, paid twice, also when the payment goes through an asset that runs the receiver's code during the transfer (confirms `reentrancy`, or `reentered-call-pays-again`); a second account repeating the first payment, after which the first account takes out more than it paid (`payout-grows-with-other-payment`); another account's call that pays nothing in and takes nothing out, placed before a payout, lowering it while no argument can refuse the lower amount (`earlier-call-lowers-payout`); what a call hands out and takes compared for two amounts and for their sum at one state, showing a division that rounds toward the caller (`rounding-favours-caller`) |
 | value at the edge | only what crosses the contract's edge is counted, never how the contract records it, so a queue, a mapping and a packed record are judged alike. Every entry point is used, the fallback and receive paths included, and the amount paid is whatever the function's own checks accept. One account pays in, the contract is given a surplus, and a second account with no stake pays in again at several sizes and tries every function that can pay out: taking out more than it paid is `surplus-open-to-any-account`, or `payment-taken-by-other-account` when no surplus was needed. In these runs the balance falls as ether is sent, as it does on chain |
+| a reading that lasts one call | an account pays in and takes out, after a first account has paid in. With every outside answer as first given it gets back no more than it paid. One word of one answer is then a thousand times higher or lower for the length of one of its two calls, and as first given for the other. If the account now ends with more than it paid, and the contract held enough to pay it, a change that lasted one call left a gain that stays (`one-call-reading-leaves-a-gain`). A transfer's answer and a question that names the contract itself are not moved. The finding is high when the caller can move the answer, because it is what an asset reports another account holds or comes from a contract the call data names, and medium otherwise. A contract that reads an answer and does not credit or pay from it is not reported |
 | records against assets | a function that asks two assets named in its call data what the contract holds is run with a balance that moves during its outside call. With two different assets the entries kept under each must change by exactly what that asset reported; only then are they known to be its record. With both words naming one asset, a record that rises by more than the asset did is `ledger-credits-more-than-received`. Also run on libraries the contract calls by delegatecall |
 | draws from the block | a function that takes a hash or a remainder of block values and can pay ether is run with a payment, with storage chosen so that its own checks accept the call, until a run pays the caller more than it brought. The same call is then run one to three blocks later with nothing else changed: a payment that is no longer made shows the block decides who is paid (confirms `weak-randomness`). A remainder of the time alone, which places a moment in a schedule, is not taken for a draw |
 | callee answers | each call the contract makes can be answered separately: a transfer that answers false and is treated as done (confirms `erc20-return-ignored`, or `refused-transfer-treated-as-done`); a transfer that returns nothing and makes the function fail (`transfer-without-answer-refused`); a payout that changes when a value read from outside is halved (confirms `no-slippage-bound` and `spot-balance-price`); a function that credits exactly the amount it asked an asset for without reading its own balance (confirms `fee-on-transfer`) |
@@ -323,13 +324,13 @@ trust rules were built on and tested against.
 ### Labelled fixtures per rule
 
 `python3 corpus/rule_bench.py`. `testdata/rules` holds a flawed and a sound hand-assembled
-fixture for each of 29 rules that work by running the code, with the expected result in
+fixture for each of 30 rules that work by running the code, with the expected result in
 `manifest.json`.
 
 | | |
 |---|---|
-| fixtures | 60 |
-| rules at precision 1.00 and recall 1.00 | 29 / 29 |
+| fixtures | 62 |
+| rules at precision 1.00 and recall 1.00 | 30 / 30 |
 | results that change when the code is padded after every jump destination | 0 |
 | rules whose sound fixture depends on a guard, and notice when it is removed | 6 / 6 |
 | sound fixtures on which another rule of the table is confirmed without cause | 0 |
@@ -350,6 +351,12 @@ groups among the misses are a token whose code changes a pool's balance outside 
 an amount priced from a reading that one transaction can move, a swap of the contract's own
 holdings that anyone can trigger with no minimum, and reward accounting that pays the same
 claim twice. No one rule covers a group: each incident meets its conditions in its own way.
+
+The checks that pay in and take out reach few of these contracts. On the 231, a call by
+which an account pays in and nothing comes back is found on 24, a second call that takes
+something out on 2, and the check on a reading that lasts one call fires on none. Most of
+the flawed contracts are tokens, routers, or pools an owner sets up first, not places an
+account pays into and takes out of in two calls from an empty state.
 
 ### Held-out set
 
@@ -574,6 +581,10 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   storage pointer passed as an argument gets no settings at all. A finding measured from
   assumed settings holds for that configuration and says which it is.
 - An answer the search chose is one the code accepts, not one a real callee is known to give.
+- The check on a reading that lasts one call moves one word at a time across one pay-in and
+  one take-out, and counts only ether and standard transfers. A gain that needs a longer
+  sequence, or is paid by minting, is not found. It cannot know what moving an answer costs,
+  only that the contract's own code turns a one-call change into a lasting gain.
 - Whether a called contract passes control on is read from the code that contract has today.
   A payee taken from memory, a helper or another contract's answer is reported as worked out
   at run time, at low confidence, because its origin is not traced.

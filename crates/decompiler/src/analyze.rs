@@ -5435,7 +5435,9 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         // writes is a record of the calls made, not a setting.
         let anyone = |s: &&origin::Store| !facts[s.by].caller_checked;
         let open: HashSet<origin::Loc> = stores.iter().filter(anyone).map(|s| s.loc).collect();
-        exec::within(crate::settings::WORK, || crate::settings::assume(c, open));
+        exec::within(crate::settings::WORK, || {
+            crate::settings::assume(c, open.clone())
+        });
         report.maps.extend(crate::deploy::settings_section(c));
         report.maps.extend(crate::props::findings(c, &mut findings));
         let measured = findings.len();
@@ -5462,7 +5464,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         }
         exec::within(signed::WORK, || signed::findings(c, &mut findings));
         report.maps.extend(exec::within(standard::WORK, || {
-            standard::findings(c, &mut findings)
+            standard::findings(c, &open, &mut findings)
         }));
     }
 

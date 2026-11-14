@@ -241,6 +241,7 @@ done in the pass that confirms what other rules found.
 | callee answers | each call the contract makes can be answered separately: a transfer that answers false and is treated as done (confirms `erc20-return-ignored`, or `refused-transfer-treated-as-done`); a transfer that returns nothing and makes the function fail (`transfer-without-answer-refused`); a payout that changes when a value read from outside is halved (confirms `no-slippage-bound` and `spot-balance-price`); a function that credits exactly the amount it asked an asset for without reading its own balance (confirms `fee-on-transfer`) |
 | signed messages | a signed call is run, then run again unchanged from the state it left, with recovery answering the signer for the first digest only; accepted again means nothing takes the message out of use (`signed-message-accepted-twice`). Each argument word is then changed in turn: a word that changes what the call does while the digest stays the same is not signed (`signed-call-leaves-word-unsigned`) |
 | the standard interface | a contract that shows `transfer`, `transferFrom` and `balanceOf` is not taken at its word: each is run and the entries it changes are measured against the amount asked (`transfer-creates-value`, `transfer-delivers-less`, `transfer-touches-third-entry`, `reported-balance-differs`, `transfer-changes-supply`, `transferfrom-ignores-allowance`, `allowance-not-spent`) |
+| what a token holds for others | from a state in which a second account holds tokens, reached by a real transfer, every function any account may call is run by a third account. A balance entry that belongs to neither the caller nor the contract and falls is `call-lowers-another-accounts-balance`. A balance reported for the second account that moves while its entry was not written is `reported-balance-moved-by-another-account`. A call that cannot be made a second time is taken for set-up and left out |
 | where values come from | every store into a slot is followed back through the slots it is copied from; a call target or a caller check that reads a slot any caller can fill (`stored-input-call-target`, `gate-on-open-slot`); a caller check on a slot nothing sets (`gate-never-set`); a caller check against a record field that any caller fills with its own address names a party and does not lower a reentrancy finding |
 | payout limits | the limits the accounting rule compares are read again from the checks of each run, where a record copied to memory and updated there resolves to the fields it came from, and a limit written as a sum compared with a sum is read too (feeds `inconsistent-liability-accounting`) |
 
@@ -338,6 +339,17 @@ contracts 38 findings are confirmed by a run, and the checks added here raise on
 low-severity findings of their own. `vuln_bench.py` prints the per-rule table for the real
 corpora: labels, how many were caught, and how often each rule fires at medium or higher on
 audited code.
+
+### Development incidents
+
+`python3 corpus/heldout_bench.py --set incidents`. `testdata/incidents` holds 231 contracts
+from public incidents and 55 with no known flaw, collected like the held-out set below from
+a different third of the same index. This is where misses are read and rules are shaped: 78
+of the 231 get the right kind of finding at high or above. Read by root cause, the largest
+groups among the misses are a token whose code changes a pool's balance outside a transfer,
+an amount priced from a reading that one transaction can move, a swap of the contract's own
+holdings that anyone can trigger with no minimum, and reward accounting that pays the same
+claim twice. No one rule covers a group: each incident meets its conditions in its own way.
 
 ### Held-out set
 

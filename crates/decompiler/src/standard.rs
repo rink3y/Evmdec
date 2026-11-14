@@ -1,4 +1,4 @@
-use crate::abi::{SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
+use crate::abi::{self, SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::analyze::{push, Confidence, Finding, Section, Severity};
 use crate::decompile::{Contract, Function};
 use crate::deploy;
@@ -7,12 +7,15 @@ use crate::exec;
 use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
 use crate::interp::Outcome;
+use crate::lift::Term;
+use crate::origin::Loc;
 use crate::path::{self, Explorer, Explorers, Limits, Path};
 use crate::props::amount_sized;
-use crate::solve::{self, Free, Inputs, Item, Step};
+use crate::solve::{self, Free, Inputs, Item, Settable, Step};
 use crate::ssa;
 use crate::u256::U256;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 const SEL_TOTAL: u32 = 0x1816_0ddd;
 
@@ -24,6 +27,11 @@ pub const WORK: u64 = 2 * exec::WORK_PER_SECOND;
 const HOLDER: U256 = U256::from_u64(0xf00d_f00d_f00d_f00d);
 const RECEIVER: U256 = U256::from_u64(0x7070_7070_7070_7070);
 const AMOUNT: U256 = U256::from_u64(0x1001);
+const ACTOR: U256 = U256::from_u64(0xac70_ac70_ac70_ac70);
+const RECOVER: U256 = U256::ONE;
+const OTHER_LIMITS: Limits = Limits { paths: 8, runs: 24 };
+const OTHER_WORDS: usize = 6;
+const MAX_OTHERS: usize = 40;
 
 // The field offset is part of the place. A balance and a time kept in one record are
 // two values, not one.
@@ -77,6 +85,78 @@ impl<'a> Bench<'a> {
         found.into_iter().find(moved)
     }
 
+    // A state in which the contract reports a balance for the holder. A token that
+    // divides by its own supply reports nothing for anyone until the supply is set, and
+    // only its constructor did that. The solver is asked for storage under which the
+    // answer is not zero, whatever the formula is.
+    fn holding(&mut self) -> Option<HashMap<U256, U256>> {
+        let f = self.function(SEL_BALANCE_OF)?;
+        let mut start = path::inputs_for(Some(SEL_BALANCE_OF), 1);
+        start.calldata = exec::calldata(Some(SEL_BALANCE_OF), &[HOLDER]);
+        start.storage = self.begin.clone();
+        let free = Free {
+            storage: true,
+            ..Free::default()
+        };
+        let mut found = self.explorer(f).explore(&start, &free, LIMITS);
+        // The longest way through the function is the one that works the balance out.
+        // A shorter one returns a field kept for accounts set apart from the rest.
+        found.sort_by_key(|p| std::cmp::Reverse(p.truth.len()));
+        for asked in found {
+            let Some(Term::Return {
+                data: Some(words), ..
+            }) = &asked.end
+            else {
+                continue;
+            };
+            let Some(word) = words.first() else { continue };
+            // Enough for the holder to pass half on and keep half.
+            let enough = AMOUNT.wrapping_add(AMOUNT);
+            let mut items = asked.items.clone();
+            items.push(Item::Check {
+                cond: expr::op2(crate::opcode::LT, *word, expr::konst(enough)),
+                holds: true,
+                pc: usize::MAX,
+            });
+            let mut want = asked.truth.clone();
+            want.push(false);
+            let reports = |bench: &mut Bench, storage: &HashMap<U256, U256>| {
+                let reported = bench.answer(SEL_BALANCE_OF, &[HOLDER], storage);
+                reported.is_some_and(|v| v >= enough)
+            };
+            if reports(self, &asked.inputs.storage) {
+                return Some(asked.inputs.storage);
+            }
+            let chosen = solve::solve(&items, &want, &asked.inputs, &free).map(|i| i.storage);
+            if let Some(chosen) = chosen.filter(|chosen| reports(self, chosen)) {
+                return Some(chosen);
+            }
+        }
+        None
+    }
+
+    // The holder passes part of what it holds to the account that will make the calls.
+    // The entries that run changes show where the ledger is, and it leaves both accounts
+    // holding tokens by a real transfer, whatever units the ledger is kept in.
+    fn sent(&mut self, f: &Function, held: &HashMap<U256, U256>) -> Option<Path> {
+        let args = [ACTOR, AMOUNT];
+        let mut start = path::inputs_for(exec::selector_of(f), args.len());
+        start.calldata = exec::calldata(exec::selector_of(f), &args);
+        start.caller = HOLDER;
+        start.storage = held.clone();
+        let free = Free {
+            storage: true,
+            ..Free::default()
+        };
+        let found = self.explorer(f).explore(&start, &free, LIMITS);
+        let moved = |p: &Path| p.succeeded() && p.run.storage != p.inputs.storage;
+        let holds = |p: &Path, bench: &mut Bench| {
+            let now = bench.answer(SEL_BALANCE_OF, &[HOLDER], &p.run.storage);
+            now.is_some_and(|v| !v.is_zero())
+        };
+        found.into_iter().find(|p| moved(p) && holds(p, self))
+    }
+
     fn answer(
         &mut self,
         selector: u32,
@@ -124,6 +204,24 @@ impl<'a> Bench<'a> {
         out
     }
 
+    fn before(&self, p: &Path, root: Root) -> Vec<(U256, U256)> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for step in solve::steps(&p.effects, &p.inputs) {
+            let Step::Write {
+                key, slot, before, ..
+            } = step
+            else {
+                continue;
+            };
+            let ledger = self.keys(key, &p.inputs).is_some_and(|(r, _)| r == root);
+            if ledger && seen.insert(slot) {
+                out.push((slot, before));
+            }
+        }
+        out
+    }
+
     fn reads(&self, p: &Path) -> Vec<Entry> {
         let mut seen = HashSet::new();
         let mut stack: Vec<ExprId> = Vec::new();
@@ -161,6 +259,35 @@ struct Report<'o> {
 }
 
 impl Report<'_> {
+    fn differs_at(
+        &mut self,
+        id: &str,
+        title: &str,
+        severity: Severity,
+        f: &Function,
+        run: &Path,
+        text: String,
+    ) {
+        self.lines.push(text.clone());
+        push(
+            self.out,
+            id,
+            title,
+            severity,
+            Confidence::High,
+            Some(f),
+            None,
+            format!(
+                "{text} This is what it did when it was run with the attached input, from a state in which a second account holds tokens, with the settings the call needs chosen among the storage no function open to every caller writes.",
+            ),
+            Vec::new(),
+            "Let a function change only the balance of its caller, of an account that approved the caller, or of the contract itself, and move what it reports for others only through a transfer.",
+        );
+        if let Some(last) = self.out.last_mut() {
+            last.confirm(run);
+        }
+    }
+
     fn differs(
         &mut self,
         id: &str,
@@ -400,7 +527,194 @@ fn transfer_from(bench: &mut Bench, report: &mut Report) {
     }
 }
 
-pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Option<Section> {
+// A token that keeps balances in scaled units lowers the sender's entry by the amount
+// times a rate, which is no longer the size of an amount.
+fn scaled_ledger(moves: &BTreeMap<Entry, (U256, U256)>, payer: U256) -> Option<Root> {
+    let falls =
+        |((_, keys), pair): &(&Entry, &(U256, U256))| keys[..] == [payer] && pair.1 < pair.0;
+    ledger(moves, payer).or_else(|| moves.iter().find(falls).map(|((root, _), _)| *root))
+}
+
+fn names(calldata: &[u8], who: U256) -> bool {
+    let bytes = who.to_be_bytes();
+    let short = bytes.iter().position(|b| *b != 0).unwrap_or(31);
+    calldata.windows(32 - short).any(|w| w == &bytes[short..])
+}
+
+// What a token holds for an account is that account's. Two things are measured for every
+// function any account may call, from a state in which a second account holds tokens and
+// the caller is a third. An entry of the ledger that belongs to neither the caller nor
+// the contract must not fall. And what the contract reports for the second account must
+// not move while that account's entry stays as it was. A pool that holds the token is
+// such an account, and its reserves follow its balance.
+fn others(bench: &mut Bench, report: &mut Report, open: &HashSet<Loc>) {
+    let Some(transfer) = bench.function(SEL_TRANSFER) else {
+        return;
+    };
+    let trace = crate::debug::on("EVMDEC_DEBUG_OTHERS");
+    let said = |what: &str| {
+        if trace {
+            eprintln!("[others] {what}");
+        }
+    };
+    let Some(held) = bench.holding() else {
+        return said("no state in which the holder is reported to hold tokens");
+    };
+    let Some(given) = bench.sent(transfer, &held) else {
+        return said("the holder could not pass tokens on");
+    };
+    let Some(root) = scaled_ledger(&bench.moves(&given), HOLDER) else {
+        return said("no ledger entry fell when the holder passed tokens on");
+    };
+    // Any account may hold tokens, so an entry of the ledger is left for the search to
+    // fill. Without that a function that takes from an account stops for lack of a balance
+    // and is never seen to take.
+    let settable = Rc::new(Settable {
+        layout: bench.layout,
+        open: open.clone(),
+        held: HashSet::from([(root.0, 1, root.1)]),
+    });
+    let state = given.run.storage.clone();
+    let writes = |f: &&Function| f.kind == FnKind::External && f.effects.writes_storage;
+    let functions: Vec<&Function> = bench.c.functions.iter().filter(writes).collect();
+    for f in functions.into_iter().take(MAX_OTHERS) {
+        if exec::spent() {
+            break;
+        }
+        let selector = exec::selector_of(f);
+        let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
+        let shaped = abi::layout(selector, &types);
+        let flat = path::inputs_for(selector, OTHER_WORDS);
+        let free = Free {
+            words: OTHER_WORDS.max(shaped.calldata.len() / 32),
+            value: true,
+            storage: false,
+            answers: false,
+            settings: Some(settable.clone()),
+            fixed: shaped.fixed.clone(),
+        };
+        let start = Inputs {
+            calldata: path::fill_words(&shaped.calldata, &shaped.fixed, path::varied_word),
+            caller: ACTOR,
+            storage: state.clone(),
+            returned: U256::ONE.to_be_bytes().to_vec(),
+            ..flat
+        };
+        let found = bench.explorer(f).explore(&start, &free, OTHER_LIMITS);
+        let acted = |q: &&Path| q.succeeded() && q.run.storage != q.inputs.storage;
+        said(&format!(
+            "{}: {} runs changed storage",
+            f.name,
+            found.iter().filter(acted).count()
+        ));
+        for q in found {
+            // A signed message is the holder's own permission, and no run here signs one.
+            let signed = q.run.calls.iter().any(|c| c.addr == RECOVER);
+            if !q.succeeded() || signed || q.run.storage == q.inputs.storage {
+                continue;
+            }
+            // The state here stands for a contract in use. A call that works once and
+            // never again is its set-up, which a contract in use has behind it. The
+            // balances go back to what they were first, so that a call which spent one
+            // is not taken for set-up.
+            let mut again = q.inputs.clone();
+            again.storage = q.run.storage.clone();
+            again.storage.extend(bench.before(&q, root));
+            if !bench.explorer(f).run_only(&again).succeeded() {
+                continue;
+            }
+            if other_entry_falls(bench, report, f, &q, root)
+                || report_moves(bench, report, f, &q, root)
+            {
+                break;
+            }
+        }
+    }
+}
+
+fn other_entry_falls(
+    bench: &Bench,
+    report: &mut Report,
+    f: &Function,
+    q: &Path,
+    root: Root,
+) -> bool {
+    let moves = bench.moves(q);
+    let theirs = |keys: &[U256]| {
+        let who = keys[0];
+        keys.len() == 1 && who != q.inputs.caller && who != q.inputs.address
+    };
+    let fallen = moves
+        .iter()
+        .find(|((r, keys), pair)| *r == root && theirs(keys) && pair.1 < pair.0);
+    let Some(((_, keys), pair)) = fallen else {
+        return false;
+    };
+    let named = match names(&q.inputs.calldata, keys[0]) {
+        true => "names that account, which gave the caller no allowance",
+        false => "does not name that account",
+    };
+    report.differs_at(
+        "call-lowers-another-accounts-balance",
+        "A call lowers the balance of an account that took no part in it",
+        Severity::High,
+        f,
+        q,
+        format!(
+            "`{}` was called by an account holding no role and lowered the balance entry of {} from {} to {}. The call data {named}.",
+            f.name,
+            keys[0].to_hex(),
+            pair.0.to_hex(),
+            pair.1.to_hex(),
+        ),
+    );
+    true
+}
+
+fn report_moves(
+    bench: &mut Bench,
+    report: &mut Report,
+    f: &Function,
+    q: &Path,
+    root: Root,
+) -> bool {
+    let entry = (root, vec![HOLDER]);
+    let touched = bench
+        .moves(q)
+        .get(&entry)
+        .is_some_and(|pair| pair.0 != pair.1);
+    if touched || names(&q.inputs.calldata, HOLDER) {
+        return false;
+    }
+    let before = bench.answer(SEL_BALANCE_OF, &[HOLDER], &q.inputs.storage);
+    let after = bench.answer(SEL_BALANCE_OF, &[HOLDER], &q.run.storage);
+    let (Some(before), Some(after)) = (before, after) else {
+        return false;
+    };
+    if before == after || before.is_zero() {
+        return false;
+    }
+    let (severity, way) = match after < before {
+        true => (Severity::High, "fell"),
+        false => (Severity::Medium, "rose"),
+    };
+    report.differs_at(
+        "reported-balance-moved-by-another-account",
+        "A call changes what the contract reports another account holds",
+        severity,
+        f,
+        q,
+        format!(
+            "`{}` was called by an account holding no role. An account it does not name, whose balance entry it did not write, was reported to hold {} before the call and {} after it, so its balance {way} without a transfer. A pool that holds this token keeps reserves that no longer match what it holds, and whoever settles the difference takes it.",
+            f.name,
+            before.to_hex(),
+            after.to_hex(),
+        ),
+    );
+    true
+}
+
+pub fn findings(c: &Contract, open: &HashSet<Loc>, out: &mut Vec<Finding>) -> Option<Section> {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return None;
     }
@@ -417,6 +731,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Option<Section> {
     };
     transfer(&mut bench, &mut report);
     transfer_from(&mut bench, &mut report);
+    others(&mut bench, &mut report, open);
     (!report.lines.is_empty()).then_some(Section {
         title: "Standard interface, as measured".to_string(),
         lines: report.lines,

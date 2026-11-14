@@ -1,0 +1,2405 @@
+{
+  "flawed": {
+    "2020-06-balancer_20200628": {
+      "address": "0x0e511aa1a137aad267dfe3a6bfca0b856c1a3682",
+      "chain": "mainnet",
+      "year": 2020,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/defi/slippage",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2020-12-cover": {
+      "address": "0xe0b94a7bb45dd905c79bb1992c9879f40f1caed5",
+      "chain": "mainnet",
+      "year": 2020,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/oracle/stale-price"
+      ]
+    },
+    "2021-05-bearn": {
+      "address": "0x406cfaae2c8e30a70b90baa52e753b6c17c1df9c",
+      "chain": "bsc",
+      "year": 2021,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2021-05-pancakebunny": {
+      "address": "0xc9849e6fdb743d08faee3e34dd2d1bc69ea11a51",
+      "chain": "bsc",
+      "year": 2021,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2021-05-valuedefi": {
+      "address": "0xd4bbf439d3eab5155ca7c0537e583088fb4cfce8",
+      "chain": "bsc",
+      "year": 2021,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/governance/flash-loan-attack",
+        "vuln/arithmetic/rounding"
+      ]
+    },
+    "2021-06-pancakehunny": {
+      "address": "0x109ea28dbdea5e6ec126fbc8c33845dfe812a300",
+      "chain": "bsc",
+      "year": 2021,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/oracle/spot-price"
+      ]
+    },
+    "2021-08-waultfinance": {
+      "address": "0xa79fe386b88fbee6e492eeb76ec48517d1ec759a",
+      "chain": "bsc",
+      "year": 2021,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2021-09-zabu": {
+      "address": "0xf61b4f980a1f34b55bbf3b2ef28213efcc6248c4",
+      "chain": "avalanche",
+      "year": 2021,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2021-11-mono": {
+      "address": "0x2920f7d6134f4669343e70122ca9b8f19ef8fa5d",
+      "chain": "mainnet",
+      "year": 2021,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/logic/price-calculation"
+      ]
+    },
+    "2021-12-nervebridge": {
+      "address": "0xf642f2a626a8b732619606c493abfc2433dd2d35",
+      "chain": "bsc",
+      "year": 2021,
+      "classes": [
+        "vuln/oracle/stale-price",
+        "vuln/logic/state-update"
+      ]
+    },
+    "2022-02-sandbox": {
+      "address": "0x50f5474724e0ee42d9a4e711ccfb275809fd6d4a",
+      "chain": "mainnet",
+      "year": 2022,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/broken-logic"
+      ]
+    },
+    "2022-03-auctus": {
+      "address": "0xe7597f774fd0a15a617894dc39d45a28b97afa4f",
+      "chain": "mainnet",
+      "year": 2022,
+      "classes": [
+        "vuln/logic/missing-validation",
+        "vuln/dependency/unsafe-external-call",
+        "vuln/access-control/untrusted-input"
+      ]
+    },
+    "2022-04-cftoken": {
+      "address": "0x8b7218cf6ac641382d7c723de8aa173e98a80196",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2022-04-gym_1": {
+      "address": "0x1befe6f3f0e8edd2d4d15cae97baee01e51ea4a4",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2022-04-saddle": {
+      "address": "0x824dcd7b044d60df2e89b1bb888e66d8bcf41491",
+      "chain": "mainnet",
+      "year": 2022,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/arithmetic/rounding"
+      ]
+    },
+    "2022-05-bayc_apecoin": {
+      "address": "0x025c6da5bd0e6a5dd1350fda9e3b6a614b205a1f",
+      "chain": "mainnet",
+      "year": 2022,
+      "classes": [
+        "vuln/governance/flash-loan-attack",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2022-05-novo": {
+      "address": "0xa0787daad6062349f63b7c228cbfd5d8a3db08f1",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/logic/missing-check",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2022-06-snood": {
+      "address": "0xeac2a259f3ebb8fd1097aeccaa62e73b6e43d5bf",
+      "chain": "mainnet",
+      "year": 2022,
+      "classes": [
+        "vuln/logic/missing-check",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2022-07-flippazone": {
+      "address": "0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944",
+      "chain": "mainnet",
+      "year": 2022,
+      "classes": [
+        "vuln/access-control/missing-modifier",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2022-08-egd_finance": {
+      "address": "0x93c175439726797dcee24d08e4ac9164e88e7aee",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2022-08-xst": {
+      "address": "0xb276647e70cb3b81a1ca302cf8de280ff0ce5799",
+      "chain": "mainnet",
+      "year": 2022,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2022-09-bnb48mevbot": {
+      "address": "0x64dd59d6c7f09dc05b472ce5cb961b6e10106e1d",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/missing-modifier"
+      ]
+    },
+    "2022-09-radt": {
+      "address": "0xdc8cb92aa6fc7277e3ec32e3f00ad7b8437ae883",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2022-10-atk": {
+      "address": "0x9cb928bf50ed220ac8f703bce35be5ce7f56c99c",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2022-10-carrot": {
+      "address": "0xcff086ead392ccb39c49ecda8c974ad5238452ac",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-allowance",
+        "vuln/dependency/unsafe-external-call"
+      ]
+    },
+    "2022-10-hpay": {
+      "address": "0xe9bc03ef08e991a99f1bd095a8590499931dcc30",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/access-control/missing-modifier",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2022-10-olympusdao": {
+      "address": "0x007fe7c498a2cf30971ad8f2cbc36bd14ac51156",
+      "chain": "mainnet",
+      "year": 2022,
+      "classes": [
+        "vuln/access-control/missing-validation",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2022-10-res": {
+      "address": "0xeccd8b08ac3b587b7175d40fb9c60a20990f8d21",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/oracle/spot-price",
+        "vuln/logic/incorrect-order-of-operations"
+      ]
+    },
+    "2022-10-teamfinance": {
+      "address": "0x48d118c9185e4dbafe7f3813f8f29ec8a6248359",
+      "chain": "mainnet",
+      "year": 2022,
+      "classes": [
+        "vuln/logic/missing-validation",
+        "vuln/access-control/missing-check"
+      ]
+    },
+    "2022-10-uerii": {
+      "address": "0x418c24191ae947a78c99fdc0e45a1f96afb254be",
+      "chain": "mainnet",
+      "year": 2022,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/arithmetic/overflow"
+      ]
+    },
+    "2022-11-aur": {
+      "address": "0x70678291bddfd95498d1214be368e19e882f7614",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/reward-calculation"
+      ]
+    },
+    "2022-11-sheepfarm": {
+      "address": "0x4726010da871f4b57b5031e3ea48bde961f122aa",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/access-control/missing-check"
+      ]
+    },
+    "2022-12-aes": {
+      "address": "0xddc0cff76bcc0ee14c3e73af630c029fe020f907",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2022-12-bgld": {
+      "address": "0x67d7249d581169516e49a88eec11370234100fb7",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/arithmetic/decimal-mismatch",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2022-12-elasticswap": {
+      "address": "0x4ae1da57f2d6b2e9a23d07e264aa2b3bbcaed19a",
+      "chain": "avalanche",
+      "year": 2022,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2022-12-lodestar": {
+      "address": "0x5326e71ff593ecc2cf7acae5fe57582d6e74cff1",
+      "chain": "arbitrum",
+      "year": 2022,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/arithmetic/rounding"
+      ]
+    },
+    "2022-12-rfb": {
+      "address": "0x26f1457f067bf26881f311833391b52ca871a4b5",
+      "chain": "bsc",
+      "year": 2022,
+      "classes": [
+        "vuln/logic/missing-validation",
+        "vuln/input-validation/missing"
+      ]
+    },
+    "2023-01-bevo": {
+      "address": "0xc6cb12df4520b7bf83f64c79c585b8462e18b6aa",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2023-01-roefinance": {
+      "address": "0x574ff39184dee9e46f6c3229b95e0e0938e398d0",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2023-01-tinu": {
+      "address": "0x2d0e64b6bf13660a4c0de42a0b88144a7c10991f",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2023-02-bonqdao": {
+      "address": "0x8f55d884cad66b79e1a131f6bcb0e66f4fd84d5b",
+      "chain": "polygon",
+      "year": 2023,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/oracle/single-source"
+      ]
+    },
+    "2023-02-dforce": {
+      "address": "0x15962427a9795005c640a6bf7f99c2ba1531ad6d",
+      "chain": "arbitrum",
+      "year": 2023,
+      "classes": [
+        "vuln/reentrancy/read-only",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2023-02-fdp": {
+      "address": "0x1954b6bd198c29c3ecf2d6f6bc70a4d41ea1cc07",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2023-02-platypus": {
+      "address": "0xbcd6796177ab8071f6a9ba2c3e2e0301ee91bef5",
+      "chain": "avalanche",
+      "year": 2023,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/logic/price-calculation"
+      ]
+    },
+    "2023-02-starlink": {
+      "address": "0x518281f34dbf5b76e6cdd3908a6972e8ec49e345",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2023-03-bigfi": {
+      "address": "0xd3d4b46db01c006fb165879f343fc13174a1ceeb",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2023-03-phoenix": {
+      "address": "0x65baf1dc6fa0c7e459a36e2e310836b396d1b1de",
+      "chain": "polygon",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/dependency/unsafe-external-call"
+      ]
+    },
+    "2023-04-sentiment": {
+      "address": "0x16f3ae9c1727ee38c98417ca08ba785bb7641b5b",
+      "chain": "arbitrum",
+      "year": 2023,
+      "classes": [
+        "vuln/reentrancy/read-only",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2023-05-bitpaidio": {
+      "address": "0x9d6d817ea5d4a69ff4c4509bea8f9b2534cec108",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/logic/incorrect-state-transition",
+        "vuln/logic/wrong-condition"
+      ]
+    },
+    "2023-05-erc20tokenbank": {
+      "address": "0x765b8d7cd8ff304f796f4b6fb1bcf78698333f6d",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/defi/sandwich-attack",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2023-05-hodlcapital": {
+      "address": "0xeda47e13fd1192e32226753dc2261c4a14908fb7",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/logic/state-update",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2023-05-level": {
+      "address": "0x0e6d6c8d7604a7ef4948bbf421c4a031d9eeddb2",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/logic/missing-check",
+        "vuln/input-validation/missing"
+      ]
+    },
+    "2023-05-multichaincapital": {
+      "address": "0x1a7981d87e3b6a95c1516eb820e223fe979896b3",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/logic/state-update",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2023-05-sellc": {
+      "address": "0x274b3e185c9c8f4ddef79cb9a8dc0d94f73a7675",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2023-05-snk": {
+      "address": "0xa3f5ea945c4970f48e322f1e70f4cc08e70039ee",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/logic/state-update"
+      ]
+    },
+    "2023-06-biswap": {
+      "address": "0x839b0afd0a0528ea184448e890cbaaffd99c1dbf",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-allowance",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2023-06-cfc": {
+      "address": "0xdd9b223aec6ea56567a62f21ff89585ff125632c",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/logic/state-update",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2023-06-pawnfi": {
+      "address": "0x85018cf6f53c8bbd03c3137e71f4fca226cda92c",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/missing-modifier",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2023-06-themis": {
+      "address": "0x2132d49157d6148dee8753f059fad1c1b09c477c",
+      "chain": "arbitrum",
+      "year": 2023,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/oracle/spot-price",
+        "vuln/oracle/missing-circuit-breaker",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2023-06-vinu": {
+      "address": "0xf7ef0d57277ad6c2babf87ab64ba61abdd2590d2",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/state-update",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2023-07-azukidao": {
+      "address": "0x8189afbe7b0e81dae735ef027cd31371b3974feb",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/auth/signature-replay",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2023-07-bno": {
+      "address": "0xdca503449899d5649d32175a255a8835a03e4006",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/logic/reward-calculation"
+      ]
+    },
+    "2023-07-civnft": {
+      "address": "0x78bd317a87d2eab65b666e9402182a949ab4eeb9",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/dependency/unsafe-external-call"
+      ]
+    },
+    "2023-07-ffist": {
+      "address": "0x80121da952a74c06adc1d7f85a237089b57af347",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/oracle/spot-price",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2023-07-lusd": {
+      "address": "0xdec12a1dcbc1f741ccd02dfd862ab226f6383003",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2023-07-sut": {
+      "address": "0xf075c5c7ba59208c0b9c41afccd1f60da9ec9c37",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/oracle/stale-price",
+        "vuln/arithmetic/precision-loss"
+      ]
+    },
+    "2023-07-wgpt": {
+      "address": "0x1f415255f7e2a8546559a553e962de7bc60d7942",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/oracle/spot-price",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2023-08-ehive": {
+      "address": "0x4ae2cd1f5b8806a973953b76f9ce6d5fab9cdcfd",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/logic/reward-calculation"
+      ]
+    },
+    "2023-08-leetswap": {
+      "address": "0x94dac4a3ce998143aa119c05460731da80ad90cf",
+      "chain": "base",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/broken-logic",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2023-08-uwerx": {
+      "address": "0x4306b12f8e824ce1fa9604bbd88f2ad4f0fe3c54",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/logic/state-update"
+      ]
+    },
+    "2023-09-apig": {
+      "address": "0xdc630fb4f95faaee087e0ce45d5b9c4fc9888888",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/arithmetic/overflow",
+        "vuln/logic/state-update"
+      ]
+    },
+    "2023-09-floordao": {
+      "address": "0x759c6de5bca9ade8a1a2719a31553c4b7de02539",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/arithmetic/precision-loss"
+      ]
+    },
+    "2023-09-uniclynft": {
+      "address": "0xd3c41c85be295607e8ea5c58487ec5894300ee67",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/reentrancy/cross-function",
+        "vuln/logic/reward-calculation"
+      ]
+    },
+    "2023-10-belugadex": {
+      "address": "0xa403ed95cf10efeffa8128b47b6da8d5e6a27261",
+      "chain": "arbitrum",
+      "year": 2023,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/defi/slippage",
+        "vuln/logic/price-calculation"
+      ]
+    },
+    "2023-10-hopelend": {
+      "address": "0xf1cd4193bbc1ad4a23e833170f49d60f3d35a621",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/arithmetic/rounding",
+        "vuln/logic/price-calculation",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2023-10-platypus03": {
+      "address": "0xe5c84c7630a505b6adf69b5594d0ff7fedd5f447",
+      "chain": "avalanche",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/oracle/price-manipulation",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2023-10-unibot": {
+      "address": "0x126c9fbab3a2fca24edfd17322e71a5e36e91865",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/dependency/unsafe-external-call",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2023-11-3913": {
+      "address": "0xd74f28c6e0e2c09881ef2d9445f158833c174775",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2023-11-brand": {
+      "address": "0x831d6f9aa6af85cead4ccec9b859c64421eeefd4",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/defi/sandwich-attack"
+      ]
+    },
+    "2023-11-eee": {
+      "address": "0x297f3996ce5c2dcd033c77098ca9e1acc3c3c3ee",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2023-11-grok": {
+      "address": "0x8390a1da07e376ef7add4be859ba74fb83aa02d5",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/reentrancy/cross-function",
+        "vuln/defi/fee-manipulation"
+      ]
+    },
+    "2023-11-linkdao": {
+      "address": "0x6524a5fd3fec179db3b3c1d21f700da7abe6b0de",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/arithmetic/decimal-mismatch",
+        "vuln/logic/incorrect-order-of-operations"
+      ]
+    },
+    "2023-11-mev_0x8c2d": {
+      "address": "0x19a23ddaa47396335894229e0439d3d187d89ec9",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/missing-modifier"
+      ]
+    },
+    "2023-11-onyxprotocol": {
+      "address": "0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/arithmetic/rounding",
+        "vuln/logic/price-calculation"
+      ]
+    },
+    "2023-11-thestandard_io": {
+      "address": "0x7c1acd1a7ba8c5f9f511bc0274b71a12c4be543d",
+      "chain": "arbitrum",
+      "year": 2023,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2023-11-weco": {
+      "address": "0xd672b766d66662f5c6fd798a999e1193a7945451",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/arithmetic/decimal-mismatch",
+        "vuln/logic/reward-calculation"
+      ]
+    },
+    "2023-12-bearndao": {
+      "address": "0x21125d94cfe886e7179c8d2fe8c1ea8d57c73e0e",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2023-12-goodcompound": {
+      "address": "0x4a37a8d7cdb43d89b4dbd7ecfaeaf9bd39e24929",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/oracle/spot-price"
+      ]
+    },
+    "2023-12-hypr": {
+      "address": "0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/uninitialized-proxy",
+        "vuln/bridge/message-spoofing"
+      ]
+    },
+    "2023-12-nfttrader": {
+      "address": "0xc310e760778ecbca4c65b6c559874757a4c4ece0",
+      "chain": "mainnet",
+      "year": 2023,
+      "classes": [
+        "vuln/reentrancy/cross-function"
+      ]
+    },
+    "2023-12-telcoin": {
+      "address": "0x10d0e9755c67ab37089acb4f51e8b4ee407fe853",
+      "chain": "polygon",
+      "year": 2023,
+      "classes": [
+        "vuln/access-control/uninitialized-proxy",
+        "vuln/access-control/uninitialized-owner"
+      ]
+    },
+    "2023-12-unverifiedcontr_0x431abb": {
+      "address": "0x431abb27dab05f4e7cdeaa18390fe39364197500",
+      "chain": "bsc",
+      "year": 2023,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/oracle/spot-price"
+      ]
+    },
+    "2024-01-citadelfinance": {
+      "address": "0x34b666992fcce34669940ab6b017fe11e5750799",
+      "chain": "arbitrum",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2024-01-mimspell2": {
+      "address": "0xd96f48665a1410c0cd669a88898eca36b9fc2cce",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/arithmetic/rounding",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2024-01-peapodsfinance": {
+      "address": "0xdbb20a979a92cccce15229e41c9b082d5b5d7e31",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/reentrancy/cross-function",
+        "vuln/logic/incorrect-order-of-operations"
+      ]
+    },
+    "2024-01-xsij": {
+      "address": "0x31bfa137c76561ef848c2af9ca301b60451caac0",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2024-02-babyloogn": {
+      "address": "0x971d08bba900230298add23e61e04b04226b5073",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/missing-check",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2024-02-compounduni": {
+      "address": "0x50ce56a3239671ab62f185704caedf626352741e",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/stale-price"
+      ]
+    },
+    "2024-02-dualpools": {
+      "address": "0x8fbcc81e5983d8347495468122c65e2dc274eed9",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/arithmetic/rounding",
+        "vuln/arithmetic/precision-loss"
+      ]
+    },
+    "2024-02-game": {
+      "address": "0x52d69c67536f55efefe02941868e5e762538dbd6",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/reentrancy/single-function",
+        "vuln/logic/incorrect-order-of-operations"
+      ]
+    },
+    "2024-02-pandora": {
+      "address": "0xddadf1bf44363d07e750c20219c2347ed7d826b9",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/arithmetic/underflow",
+        "vuln/access-control/missing-check"
+      ]
+    },
+    "2024-02-seneca": {
+      "address": "0x45e15d1e4f92f28a916f4f2971ad9adc278e148b",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/dependency/unsafe-external-call"
+      ]
+    },
+    "2024-02-zoomer": {
+      "address": "0x9700204d77a67a18ea8f1b47275897b21e5efa97",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2024-03-ethfin": {
+      "address": "0x17bd2e09fa4585c15749f40bb32a6e3db58522ba",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2024-03-juice": {
+      "address": "0x8584ddbd1e28bca4bc6fb96bafe39f850301940e",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/input-validation/missing"
+      ]
+    },
+    "2024-03-paraswap": {
+      "address": "0x00000000fdac7708d0d360bddc1bc7d097f47439",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2024-03-tgbs": {
+      "address": "0xedecfa18cae067b2489a2287784a543069f950f4",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/state-update"
+      ]
+    },
+    "2024-03-woofi": {
+      "address": "0xeff23b4be1091b53205e35f3afcd9c7182bf3062",
+      "chain": "arbitrum",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/oracle/missing-circuit-breaker"
+      ]
+    },
+    "2024-04-bigbangswap": {
+      "address": "0x6ef66fd568903c072a9654e2c8db9520686932cf",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/logic/price-calculation"
+      ]
+    },
+    "2024-04-fil314": {
+      "address": "0xe8a290c6fc6fa6c0b79c9cfae1878d195aeb59af",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2024-04-hackathon": {
+      "address": "0x11cee747faaf0c0801075253ac28ab503c888888",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2024-04-squid": {
+      "address": "0xd309f0fd5c3b90ecfb7024ede7d329d9582492c5",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2024-04-ups": {
+      "address": "0x3da4828640ad831f3301a4597821cc3461b06678",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2024-04-yiedl": {
+      "address": "0x4edda16ab4f4cc46b160abc42763ba63885862a4",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/missing-validation",
+        "vuln/dependency/unsafe-external-call"
+      ]
+    },
+    "2024-05-burner": {
+      "address": "0x4d4d05e1205e3a412ae1469c99e0d954113aa76f",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2024-05-gpu": {
+      "address": "0xf51cbf9f8e089ca48e454eb79731037a405972ce",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/arithmetic/overflow"
+      ]
+    },
+    "2024-05-mixedswaprouter": {
+      "address": "0x58637aaac44e2a2f190d9e1976e236d86d691542",
+      "chain": "arbitrum",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-validation",
+        "vuln/dependency/unsafe-external-call"
+      ]
+    },
+    "2024-05-predyfinance": {
+      "address": "0x7b8b944ab2f24c829504a7a6d70fce5298f2147c",
+      "chain": "arbitrum",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2024-05-tgc": {
+      "address": "0x32f9188d6d86bf88dbac3ceee5958adf1aa609df",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/arithmetic/precision-loss"
+      ]
+    },
+    "2024-06-apemaga": {
+      "address": "0x56ff4afd909aa66a1530fe69bf94c74e6d44500c",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2024-06-dyson_money": {
+      "address": "0xaff18b43dfb44d9b56c2b88e8569b3b0880c2a56",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/defi/sandwich-attack",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2024-06-uwulend_first": {
+      "address": "0xd252953818bdf8507643c237877020398fa4b2e8",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/governance/flash-loan-attack",
+        "vuln/oracle/spot-price"
+      ]
+    },
+    "2024-06-wifcoin_eth": {
+      "address": "0xa1ce40702e15d0417a6c74d0bab96772f36f4e99",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2024-07-defiplaza": {
+      "address": "0xe68c1d72340aeefe5be76eda63ae2f4bc7514110",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/arithmetic/division-before-multiply"
+      ]
+    },
+    "2024-07-spectra_finance": {
+      "address": "0x51bdbfcd7656e2c25ad1bc8037f70572b7142ecc",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/dependency/unsafe-external-call"
+      ]
+    },
+    "2024-08-novaxm2e": {
+      "address": "0x55c9eebd368873494c7d06a4900e8f5674b11bd2",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2024-08-vow": {
+      "address": "0x184497031808f2b6a2126886c712cc41f146e5dc",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/single-source",
+        "vuln/logic/price-calculation"
+      ]
+    },
+    "2024-09-airbtc": {
+      "address": "0x12050e4355a392162698c6cf30eb8c9e0777300d",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2024-09-caterpillar_coin_cut": {
+      "address": "0x7057f3b0f4d0649b428f0d8378a8a0e7d21d36a7",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/arithmetic/rounding"
+      ]
+    },
+    "2024-09-inumi": {
+      "address": "0xdb27d4ff4be1cd04c34a7cb6f47402c37cb73459",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/missing-owner-check"
+      ]
+    },
+    "2024-09-otseastaking": {
+      "address": "0xf2c8e860ca12cde3f3195423ecf54427a4f30916",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/reentrancy/single-function"
+      ]
+    },
+    "2024-09-pln": {
+      "address": "0xe0c218e1633a5c76d57ff4f11149f07bfff16aea",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/wrong-condition",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2024-09-unverified_03f9": {
+      "address": "0x03f911aedc25c770e701b8f563e8102cfacd62c0",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2024-10-aizpttoken": {
+      "address": "0xbe779d420b7d573c08eee226b9958737b6218888",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/logic/fee-calculation",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2024-10-erc20transfer": {
+      "address": "0x43dc865e916914fd93540461fde124484fbf8faa",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2024-10-sashatoken": {
+      "address": "0xd1456d1b9ceb59abd4423a49d40942a9485ceef6",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2024-11-chisale": {
+      "address": "0x050163597d9905ba66400f7b3ca8f2ef23df702d",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/logic/fee-calculation",
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/access-control/broken-logic"
+      ]
+    },
+    "2024-11-mainnetsettler": {
+      "address": "0x70bf6634ee8cb27d04478f184b9b8bb13e5f4710",
+      "chain": "mainnet",
+      "year": 2024,
+      "classes": [
+        "vuln/dependency/unsafe-external-call",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2024-11-nftg": {
+      "address": "0x5fbbb391d54f4fb1d1cf18310c93d400bc80042e",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/wrong-feed",
+        "vuln/arithmetic/decimal-mismatch"
+      ]
+    },
+    "2024-11-rpp": {
+      "address": "0x7d1a69302d2a94620d5185f2d80e065454a35751",
+      "chain": "bsc",
+      "year": 2024,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2024-12-cloberdex": {
+      "address": "0x6a0b87d6b74f7d5c92722f6a11714dbeda9f3895",
+      "chain": "base",
+      "year": 2024,
+      "classes": [
+        "vuln/reentrancy/single-function",
+        "vuln/logic/incorrect-order-of-operations"
+      ]
+    },
+    "2025-01-aixbtforcedswap": {
+      "address": "0x32cd8541ccd275a70dda33a9fd490d948a78e1ff",
+      "chain": "base",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/secret-exposure",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2025-01-lauratoken": {
+      "address": "0xb292678438245ec863f9fea64affcea887144240",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2025-01-mosca": {
+      "address": "0x1962b3356122d6a56f978e112d14f5e23a25037d",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2025-01-paribus": {
+      "address": "0xa185a8c0929d473f2d0d2a132c4464fc01380bce",
+      "chain": "arbitrum",
+      "year": 2025,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2025-01-unilend": {
+      "address": "0xc86d2555f8c360d3c5e8e4364f42c1f2d169330e",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/liquidation-logic",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2025-02-fourmeme": {
+      "address": "0xb28723a16d3347cdc0ce035eb1c1eb0b7406682f",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/defi/sandwich-attack",
+        "vuln/logic/incorrect-order-of-operations"
+      ]
+    },
+    "2025-02-limitorderprotocol": {
+      "address": "0xce8d7cd4ddb3fd50baae0cc59dbfd786a7f0e44e",
+      "chain": "base",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-modifier",
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2025-02-stepheronfts": {
+      "address": "0x9823e10a0bf6f64f59964be1a7f83090bf5728ab",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/reentrancy/single-function",
+        "vuln/logic/incorrect-order-of-operations"
+      ]
+    },
+    "2025-03-dcftoken": {
+      "address": "0xa7e92345ddf541aa5cf60fee2a0e721c50ca1adb",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2025-03-leveragesir": {
+      "address": "0xb91ae2c8365fd45030aba84a4666c4db074e53e7",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/reentrancy/single-function"
+      ]
+    },
+    "2025-03-pump": {
+      "address": "0x09762e00ce0de8211f7002f70759447b1f2b1892",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2025-03-stackmarket": {
+      "address": "0x555555555a4161c1c0ba310fc1c993086d3de042",
+      "chain": "base",
+      "year": 2025,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2025-03-unverified_de7c": {
+      "address": "0xde7ca40ae3c3430723a2d1e3ae0e6e27152744b0",
+      "chain": "base",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-owner-check",
+        "vuln/defi/sandwich-attack",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2025-03-zeroexsettler": {
+      "address": "0x0d0e364aa7852291883c162b22d6d81f6355428f",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/business-logic/arbitrary-call",
+        "vuln/business-logic/confused-deputy"
+      ]
+    },
+    "2025-04-aventarewardclaim": {
+      "address": "0x33b860fc7787e9e4813181b227eaffa0cada4c73",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/oracle/spot-price",
+        "vuln/access-control/broken-logic"
+      ]
+    },
+    "2025-04-flylong": {
+      "address": "0x9ca66a67dc3d77beb59dc11caf96677843797c08",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/broken-logic",
+        "vuln/logic/state-update",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2025-04-lifeprotocol": {
+      "address": "0x42e2773508e2ae8ff9434bea599812e28449e2cd",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/price-calculation",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2025-04-tcdp": {
+      "address": "0xda4c9ee8373fd1095379a3dd457a0c78968aaf03",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/access-control/broken-logic"
+      ]
+    },
+    "2025-05-betapresale": {
+      "address": "0x760c2aaa22220f24b9343b2a91a62dd664953853",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/defi/fee-manipulation"
+      ]
+    },
+    "2025-05-crosswise": {
+      "address": "0x70873211cb64c1d4ec027ea63a399a7d07c4085b",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/broken-logic",
+        "vuln/access-control/centralization"
+      ]
+    },
+    "2025-05-irysai": {
+      "address": "0x746727fc8212ed49510a2cb81ab0486ee6954444",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/centralization",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2025-05-nalakuvara_lotteryticket50": {
+      "address": "0x172119155a48de766b126de95c2cb331d3a5c7c2",
+      "chain": "base",
+      "year": 2025,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2025-05-unverified_91a1": {
+      "address": "0x91a1dd68dc0ba6526d560ba9e9a3715e0634193d",
+      "chain": "base",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/broken-logic",
+        "vuln/logic/missing-check",
+        "vuln/dos/griefing"
+      ]
+    },
+    "2025-05-ydttoken": {
+      "address": "0x3612e4cb34617bcac849add27366d8d85c102efd",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/fake-account-substitution"
+      ]
+    },
+    "2025-06-bankrollstack": {
+      "address": "0x16d0a151297a0393915239373897bcc955882110",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/governance/flash-loan-attack",
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2025-06-initcodefactoryfees": {
+      "address": "0x930f9fa91e1e46d8e44abc3517e2965c6f9c4763",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/broken-logic",
+        "vuln/input-validation/missing",
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/dependency/unchecked-return-value"
+      ]
+    },
+    "2025-06-pegaball": {
+      "address": "0x29003dd6b9970ad658314fffb61e42f352c41630",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/access-control/broken-logic",
+        "vuln/dependency/unchecked-return-value"
+      ]
+    },
+    "2025-06-sinstakezombie": {
+      "address": "0x7314729d691fd074dbba03ca3c6ef3be61b31d34",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/defi/fee-manipulation",
+        "vuln/oracle/spot-price"
+      ]
+    },
+    "2025-07-activepoolurgentredemption": {
+      "address": "0x9dc845b500853f17e238c36ba120400dbea1d02a",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/access-control/missing-auth",
+        "vuln/defi/slippage",
+        "vuln/oracle/price-calculation"
+      ]
+    },
+    "2025-07-avaxbifknpair": {
+      "address": "0x5b5913eec2031c9d8383e3afcfd269217e481ce1",
+      "chain": "avalanche",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/oracle/price-manipulation",
+        "vuln/logic/state-update",
+        "vuln/reentrancy/cross-function"
+      ]
+    },
+    "2025-07-fpc": {
+      "address": "0xb192d4a737430aa61cea4ce9bfb6432f7d42592f",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2025-07-ranttoken": {
+      "address": "0xc321ac21a07b3d593b269acdace69c3762ca2dd0",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/defi/slippage",
+        "vuln/logic/state-update"
+      ]
+    },
+    "2025-07-superrare": {
+      "address": "0xffb512b9176d527c5d32189c3e310ed4ab2bb9ec",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/broken-logic",
+        "vuln/logic/wrong-condition"
+      ]
+    },
+    "2025-07-unverified6883": {
+      "address": "0x6883fe4d2ee50941b80b41b8f7f9bf2561d844cc",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/missing-validation",
+        "vuln/access-control/missing-auth",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2025-07-upengburnsync": {
+      "address": "0x4303cddbef06b5820f10dbc00206f8bde6749e2f",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/defi/slippage"
+      ]
+    },
+    "2025-07-whereismydragontreasure": {
+      "address": "0x32c87193c2cc9961f2283fca3ca11a483d8e426b",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/logic/price-calculation",
+        "vuln/logic/wrong-condition",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2025-08-abccapp": {
+      "address": "0x1bc016c00f8d603c41a582d5da745905b9d034e5",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-modifier",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2025-08-basebebopsettlement": {
+      "address": "0xbeb0b0623f66be8ce162ebdfa2ec543a522f4ea6",
+      "chain": "base",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-validation",
+        "vuln/dependency/unchecked-return-value"
+      ]
+    },
+    "2025-08-beefyzaprouter": {
+      "address": "0xf49f7bb6f4f50d272a0914a671895c4384696e5a",
+      "chain": "arbitrum",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-validation",
+        "vuln/logic/missing-check",
+        "vuln/dependency/unsafe-external-call"
+      ]
+    },
+    "2025-08-d3xai": {
+      "address": "0xaec58fbd7ed8008a3742f6d4ffaa9f4b0ecbc30e",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2025-08-grizzifi": {
+      "address": "0x21ab8943380b752306abf4d49c203b011a89266b",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/fake-account-substitution",
+        "vuln/logic/reward-calculation",
+        "vuln/logic/state-update"
+      ]
+    },
+    "2025-08-presalev5": {
+      "address": "0x09c135aacd4a82b08890e930dfdc3143b4578d45",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation",
+        "vuln/governance/flash-loan-attack",
+        "vuln/logic/price-calculation"
+      ]
+    },
+    "2025-08-unverified_6f7a": {
+      "address": "0x338ffeaccf929c88fb9574dc202dc1714b1903e7",
+      "chain": "mainnet",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/missing-modifier",
+        "vuln/defi/price-manipulation",
+        "vuln/logic/incorrect-order-of-operations"
+      ]
+    },
+    "2025-08-yuliai": {
+      "address": "0x8262325bf1d8c3be83eb99f5a74b8458ebb96282",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/price-manipulation",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2025-10-baseswapcallback": {
+      "address": "0xe143b486ab0413df0d6dad2caf6d2f61cac54730",
+      "chain": "base",
+      "year": 2025,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/dependency/unsafe-external-call"
+      ]
+    },
+    "2025-10-tokenholder": {
+      "address": "0x8c7f34436c0037742aecf047e06fd4b27ad01117",
+      "chain": "bsc",
+      "year": 2025,
+      "classes": [
+        "vuln/dependency/unsafe-external-call",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2026-01-futureswap": {
+      "address": "0x010659727ad7716c239e206acd3ebee0fdc9e207",
+      "chain": "arbitrum",
+      "year": 2026,
+      "classes": [
+        "vuln/arithmetic/decimal-mismatch",
+        "vuln/logic/fee-calculation"
+      ]
+    },
+    "2026-01-prxvt": {
+      "address": "0xdac30a5e2612206e2756836ed6764ec5817e6fff",
+      "chain": "base",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/logic/reward-calculation"
+      ]
+    },
+    "2026-01-truebit": {
+      "address": "0xc186e6f0163e21be057e95aa135edd52508d14d3",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/price-calculation",
+        "vuln/arithmetic/division-before-multiply"
+      ]
+    },
+    "2026-03-daycontract": {
+      "address": "0x587984549f7e61c0ed8131b1f6614f592573a43c",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2026-03-venus_the": {
+      "address": "0x1be1ce8352328278ac4e0488436c0f1607282550",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2026-03-wukongstaking": {
+      "address": "0xd828e972b7fc9ad4e6c29628a760386a94cfdeda",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/reentrancy/single-function",
+        "vuln/logic/state-update",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2026-04-blockchainbets": {
+      "address": "0x3331f6359ff4b118ee8a68ed2a1edff0238a4f52",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/incorrect-calculation",
+        "vuln/logic/missing-check",
+        "vuln/logic/reward-calculation"
+      ]
+    },
+    "2026-04-juiceboxrevloans": {
+      "address": "0x1880d832aa283d05b8eab68877717e25fbd550bb",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/missing-validation",
+        "vuln/access-control/missing-auth"
+      ]
+    },
+    "2026-04-perppair": {
+      "address": "0xb68396dd4230253d27589e2004ac37389836ae17",
+      "chain": "linea",
+      "year": 2026,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2026-04-saturnprotocol": {
+      "address": "0x2005e0ca201a37694125ff267ae57872bea0a0ce",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/arithmetic/underflow",
+        "vuln/logic/state-update",
+        "vuln/dos/frozen-funds",
+        "vuln/logic/fee-calculation"
+      ]
+    },
+    "2026-04-subquerysettings": {
+      "address": "0xf6c913c506881d7eb37ce52af4dc8e59fd61694d",
+      "chain": "base",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/missing-modifier",
+        "vuln/access-control/centralization"
+      ]
+    },
+    "2026-04-unverified_a152": {
+      "address": "0xa152751251a72f7d9e8a8998e9eadbefbf10e4f3",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/centralization",
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2026-05-adsharesbridge": {
+      "address": "0xcfcecfe2bd2fed07a9145222e8a7ad9cf1ccd22a",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/secret-exposure",
+        "vuln/bridge/missing-validation"
+      ]
+    },
+    "2026-05-blastfomovault": {
+      "address": "0xbfb18b2c1c1b6b099f0e2b1e962c03210f24900e",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/missing-check",
+        "vuln/access-control/broken-logic",
+        "vuln/logic/reward-calculation"
+      ]
+    },
+    "2026-05-ekubo": {
+      "address": "0xe0e0e08a6a4b9dc7bd67bcb7aade5cf48157d444",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/dependency/unsafe-external-call",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2026-05-joeagent": {
+      "address": "0xb12ce0a21f67a9fc3c8ad1c7dbc4b017b7e67319",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/reentrancy/single-function",
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/logic/state-update"
+      ]
+    },
+    "2026-05-muredistribution": {
+      "address": "0xec9c8e3b9cbe8888d9095dbc97b22c0da6cc4137",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/auth/signature-validation",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2026-05-renegade": {
+      "address": "0xc038933d0b33359f5c87b4b2f92ee0dad11eadc5",
+      "chain": "arbitrum",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/uninitialized-proxy",
+        "vuln/dependency/unsafe-external-call",
+        "vuln/dependency/upgradeable-contract"
+      ]
+    },
+    "2026-05-sharwamargintrading": {
+      "address": "0x729cf665c09ef112c607290415a566fffa45826f",
+      "chain": "arbitrum",
+      "year": 2026,
+      "classes": [
+        "vuln/oracle/spot-price",
+        "vuln/oracle/manipulable-twap",
+        "vuln/logic/price-calculation",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2026-05-sqtokenstaking": {
+      "address": "0x404404a845fff0201f3a4d419b4839fc419c99f7",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/centralization",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2026-05-trustedvolumes": {
+      "address": "0xeeeeee53033f7227d488ae83a27bc9a9d5051756",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/fake-account-substitution",
+        "vuln/auth/signature-validation"
+      ]
+    },
+    "2026-06-ambientcrocswapdex": {
+      "address": "0xaaaaaaaaa24eeeb8d57d431224f73832bc34f688",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2026-06-atohook": {
+      "address": "0xa10de71ddb4e0d51938ef6e0118822e157a62888",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/proxy-storage-collision",
+        "vuln/logic/incorrect-state-transition",
+        "vuln/logic/reward-calculation",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2026-06-cookfinanceissuance": {
+      "address": "0x7db3cbaf736c049933a3af28dbed4a4442aa89d0",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/oracle/price-manipulation",
+        "vuln/logic/incorrect-state-transition",
+        "vuln/defi/flash-loan-attack"
+      ]
+    },
+    "2026-06-dtxt": {
+      "address": "0xac9bf7c320d4ce2d0ac978b83955dd67351897d2",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/wrong-condition",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2026-06-jb": {
+      "address": "0x1b5732eb98911c25acf7bdfaffb9409782cae6d7",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2026-06-novabox": {
+      "address": "0xbc4191167d4b0251cab5201a527daa8a7d3846b0",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/state-update",
+        "vuln/access-control/broken-logic"
+      ]
+    },
+    "2026-06-royalroyalties": {
+      "address": "0xd5b297c08d890376b6cbdba6023a39ffbdf65c78",
+      "chain": "polygon",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/missing-check",
+        "vuln/logic/wrong-condition"
+      ]
+    },
+    "2026-06-topbpool": {
+      "address": "0xb935c3d80229d5d92f3761b17cd81dc2610e3a45",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/governance/timelock-bypass",
+        "vuln/governance/proposal-manipulation"
+      ]
+    },
+    "2026-07-dripsdaihub": {
+      "address": "0x8d321e80487356c846f34456d31ce761776ef697",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/arithmetic/overflow",
+        "vuln/input-validation/boundary",
+        "vuln/logic/missing-validation"
+      ]
+    },
+    "2026-07-indexcoopexchangeissuancetoctou": {
+      "address": "0xc8c85a3b4d03fb3451e7248ff94f780c92f884fd",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/logic/missing-validation",
+        "vuln/dependency/unsafe-external-call",
+        "vuln/reentrancy/cross-contract"
+      ]
+    },
+    "2026-08-moke": {
+      "address": "0x5ae569d8a0539a6a603e96a26ac8caea7ceba377",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/logic/incorrect-state-transition",
+        "vuln/logic/missing-check",
+        "vuln/governance/flash-loan-attack"
+      ]
+    },
+    "2026-08-nexaicfotskim": {
+      "address": "0xae04ae29bdb7ab7eb249d3afa7bc3d37564e8cf9",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/incorrect-state-transition",
+        "vuln/defi/fee-manipulation",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2026-08-usm_fum": {
+      "address": "0x2a7fff44c19f39468064ab5e5c304de01d591675",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/price-calculation",
+        "vuln/arithmetic/rounding",
+        "vuln/governance/flash-loan-attack",
+        "vuln/oracle/price-manipulation"
+      ]
+    },
+    "2026-09-bonfireswap": {
+      "address": "0x17e801e17cefc6334059189c178d4783830e03d3",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/missing-check",
+        "vuln/input-validation/missing"
+      ]
+    },
+    "2026-09-gdctoken": {
+      "address": "0xe3342358e7ccbaebdd1139ad0274c53c5b3ef822",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/fee-calculation",
+        "vuln/logic/incorrect-state-transition",
+        "vuln/reentrancy/single-function",
+        "vuln/access-control/broken-logic"
+      ]
+    },
+    "2026-09-orderfactory": {
+      "address": "0xa27bcd590195b2a9bdc29379de4f040b2d8066e0",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/access-control/missing-signer",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2026-10-alpscon": {
+      "address": "0x9b210da482217afc24074e57f6f8337fe07f0124",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/reward-calculation",
+        "vuln/access-control/broken-logic",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2026-10-bitbaystablevault": {
+      "address": "0x048e88311ca84876aea086125825492e2af2e5a0",
+      "chain": "polygon",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/missing-check",
+        "vuln/defi/share-accounting",
+        "vuln/defi/price-manipulation"
+      ]
+    },
+    "2026-10-flashloopadapter": {
+      "address": "0x16bb8b912da187870c23ec6756bb3fad061283d8",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/dependency/unsafe-external-call",
+        "vuln/input-validation/missing",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2026-10-makerdaoflipkeeper": {
+      "address": "0x68399ed8aa33c5b43f863ee6782de492006a5546",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/dependency/unsafe-external-call",
+        "vuln/logic/incorrect-state-transition"
+      ]
+    },
+    "2026-10-setprotocol": {
+      "address": "0x54e8371c1ec43e58fb53d4ef4ed463c17ba8a6be",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/arithmetic/rounding-direction",
+        "vuln/logic/fee-calculation",
+        "vuln/logic/price-calculation"
+      ]
+    },
+    "2026-10-tipmine": {
+      "address": "0x412c7bd213d4fea88b582a8a0e5b80e2f2d10993",
+      "chain": "bsc",
+      "year": 2026,
+      "classes": [
+        "vuln/access-control/missing-auth",
+        "vuln/logic/incorrect-state-transition",
+        "vuln/logic/missing-check"
+      ]
+    },
+    "2026-10-x7finance": {
+      "address": "0x70000299ee8910ccacd97b1bb560e34f49c9e4f7",
+      "chain": "mainnet",
+      "year": 2026,
+      "classes": [
+        "vuln/logic/missing-state-update",
+        "vuln/logic/incorrect-order-of-operations",
+        "vuln/defi/reward-accounting"
+      ]
+    }
+  },
+  "sound": {
+    "bsc_51e6ac15": {
+      "address": "0x51e6ac1533032e72e92094867fd5921e3ea1bfa0",
+      "chain": "bsc",
+      "implementation": "0x8e341b78c91033bf5dfd01025df47f1c5c44b29a"
+    },
+    "bsc_8c907e0a": {
+      "address": "0x8c907e0a72c3d55627e853f4ec6a96b0c8771145",
+      "chain": "bsc"
+    },
+    "bsc_42981d0b": {
+      "address": "0x42981d0bfbaf196529376ee702f2a9eb9092fcb5",
+      "chain": "bsc",
+      "implementation": "0xa35aae8d40da30bd4b524ae105c27430340b3618"
+    },
+    "bsc_40799357": {
+      "address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe",
+      "chain": "bsc"
+    },
+    "bsc_3d3382ea": {
+      "address": "0x3d3382ea81cc274e5b5fc10650d91b07f738a070",
+      "chain": "bsc"
+    },
+    "mainnet_51491077": {
+      "address": "0x514910771af9ca656af840dff83e8264ecf986ca",
+      "chain": "mainnet"
+    },
+    "mainnet_6352a56c": {
+      "address": "0x6352a56caadc4f1e25cd6c75970fa768a3304e64",
+      "chain": "mainnet",
+      "implementation": "0xe29b6b6e96befe1e9c6f948bcb5a3f71058bda9b"
+    },
+    "mainnet_524cab2e": {
+      "address": "0x524cab2ec69124574082676e6f654a18df49a048",
+      "chain": "mainnet"
+    },
+    "mainnet_a2b4c0af": {
+      "address": "0xa2b4c0af19cc16a6cfacce81f192b024d625817d",
+      "chain": "mainnet"
+    },
+    "mainnet_57b94600": {
+      "address": "0x57b946008913b82e4df85f501cbaed910e58d26c",
+      "chain": "mainnet",
+      "implementation": "0x7c3eeb458732ccd34b0339edb34f1e340929290a"
+    },
+    "mainnet_00000000": {
+      "address": "0x00000000219ab540356cbb839cbe05303d7705fa",
+      "chain": "mainnet"
+    },
+    "mainnet_f3b9569f": {
+      "address": "0xf3b9569f82b18aef890de263b84189bd33ebe452",
+      "chain": "mainnet"
+    },
+    "mainnet_dbdb4d16": {
+      "address": "0xdbdb4d16eda451d0503b854cf79d55697f90c8df",
+      "chain": "mainnet"
+    },
+    "mainnet_d3352606": {
+      "address": "0xd33526068d116ce69f19a9ee46f0bd304f21a51f",
+      "chain": "mainnet"
+    },
+    "mainnet_c662c410": {
+      "address": "0xc662c410c0ecf747543f5ba90660f6abebd9c8c4",
+      "chain": "mainnet"
+    },
+    "mainnet_c3d688b6": {
+      "address": "0xc3d688b66703497daa19211eedff47f25384cdc3",
+      "chain": "mainnet",
+      "implementation": "0x0b07565a8ef48170e15918b251ebd95109b23255"
+    },
+    "mainnet_ae78736c": {
+      "address": "0xae78736cd615f374d3085123a210448e74fc6393",
+      "chain": "mainnet"
+    },
+    "mainnet_ae0ee0a6": {
+      "address": "0xae0ee0a63a2ce6baeeffe56e7714fb4efe48d419",
+      "chain": "mainnet"
+    },
+    "mainnet_720cd16b": {
+      "address": "0x720cd16b011b987da3518fbf38c3071d4f0d1495",
+      "chain": "mainnet"
+    },
+    "mainnet_f977adad": {
+      "address": "0xf977adad470808a92c2765f6fb37df211db4e823",
+      "chain": "mainnet"
+    },
+    "mainnet_f4d2888d": {
+      "address": "0xf4d2888d29d722226fafa5d9b24f9164c092421e",
+      "chain": "mainnet"
+    },
+    "mainnet_e28b3b32": {
+      "address": "0xe28b3b32b6c345a34ff64674606124dd5aceca30",
+      "chain": "mainnet"
+    },
+    "mainnet_d7efb00d": {
+      "address": "0xd7efb00d12c2c13131fd319336fdf952525da2af",
+      "chain": "mainnet"
+    },
+    "mainnet_b64ef51c": {
+      "address": "0xb64ef51c888972c908cfacf59b47c1afbc0ab8ac",
+      "chain": "mainnet"
+    },
+    "mainnet_aaaaaa20": {
+      "address": "0xaaaaaa20d9e0e2461697782ef11675f668207961",
+      "chain": "mainnet"
+    },
+    "mainnet_a342f5d8": {
+      "address": "0xa342f5d851e866e18ff98f351f2c6637f4478db5",
+      "chain": "mainnet",
+      "implementation": "0x7fbf5c9af42a6d146dcc18762f515692cd5f853b"
+    },
+    "mainnet_a1faa113": {
+      "address": "0xa1faa113cbe53436df28ff0aee54275c13b40975",
+      "chain": "mainnet"
+    },
+    "mainnet_92d6c1e3": {
+      "address": "0x92d6c1e31e14520e676a687f0a93788b716beff5",
+      "chain": "mainnet"
+    },
+    "mainnet_902f0971": {
+      "address": "0x902f09715b6303d4173037652fa7377e5b98089e",
+      "chain": "mainnet",
+      "implementation": "0xb830a5afcbebb936c30c607a18bbba9f5b0a592f"
+    },
+    "mainnet_8a90cab2": {
+      "address": "0x8a90cab2b38dba80c64b7734e58ee1db38b8992e",
+      "chain": "mainnet"
+    },
+    "mainnet_8207c1ff": {
+      "address": "0x8207c1ffc5b6804f6024322ccf34f29c3541ae26",
+      "chain": "mainnet"
+    },
+    "mainnet_7dd9c5cb": {
+      "address": "0x7dd9c5cba05e151c895fde1cf355c9a1d5da6429",
+      "chain": "mainnet"
+    },
+    "mainnet_7d8820fa": {
+      "address": "0x7d8820fa92eb1584636f4f5b8515b5476b75171a",
+      "chain": "mainnet"
+    },
+    "mainnet_7d512150": {
+      "address": "0x7d5121505149065b562c789a0145ed750e6e8cdd",
+      "chain": "mainnet"
+    },
+    "mainnet_744d70fd": {
+      "address": "0x744d70fdbe2ba4cf95131626614a1763df805b9e",
+      "chain": "mainnet"
+    },
+    "mainnet_6dd655f1": {
+      "address": "0x6dd655f10d4b9e242ae186d9050b68f725c76d76",
+      "chain": "mainnet"
+    },
+    "mainnet_60e4d786": {
+      "address": "0x60e4d786628fea6478f785a6d7e704777c86a7c6",
+      "chain": "mainnet"
+    },
+    "mainnet_5f98805a": {
+      "address": "0x5f98805a4e8be255a32880fdec7f6728c6568ba0",
+      "chain": "mainnet"
+    },
+    "mainnet_579cea18": {
+      "address": "0x579cea1889991f68acc35ff5c3dd0621ff29b0c9",
+      "chain": "mainnet"
+    },
+    "mainnet_51cb2537": {
+      "address": "0x51cb253744189f11241becb29bedd3f1b5384fdb",
+      "chain": "mainnet"
+    },
+    "mainnet_4da27a54": {
+      "address": "0x4da27a545c0c5b758a6ba100e3a049001de870f5",
+      "chain": "mainnet",
+      "implementation": "0x0fe58fe1caa69951dc924a8c222be19013b89476"
+    },
+    "mainnet_467bccd9": {
+      "address": "0x467bccd9d29f223bce8043b84e8c8b282827790f",
+      "chain": "mainnet"
+    },
+    "mainnet_466cfcd0": {
+      "address": "0x466cfcd0525189b573e794f554b8a751279213ac",
+      "chain": "mainnet"
+    },
+    "mainnet_3819f64f": {
+      "address": "0x3819f64f282bf135d62168c1e513280daf905e06",
+      "chain": "mainnet"
+    },
+    "mainnet_33fd4269": {
+      "address": "0x33fd426905f149f8376e227d0c9d3340aad17af1",
+      "chain": "mainnet",
+      "implementation": "0x142fd5b9d67721efda3a5e2e9be47a96c9b724a4"
+    },
+    "mainnet_3301ee63": {
+      "address": "0x3301ee63fb29f863f2333bd4466acb46cd8323e6",
+      "chain": "mainnet"
+    },
+    "mainnet_31c8eacb": {
+      "address": "0x31c8eacbffdd875c74b94b077895bd78cf1e64a3",
+      "chain": "mainnet"
+    },
+    "mainnet_2f9ec37d": {
+      "address": "0x2f9ec37d6ccfff1cab21733bdadede11c823ccb0",
+      "chain": "mainnet"
+    },
+    "mainnet_27c70cd1": {
+      "address": "0x27c70cd1946795b66be9d954418546998b546634",
+      "chain": "mainnet"
+    },
+    "mainnet_25f8087e": {
+      "address": "0x25f8087ead173b73d6e8b84329989a8eea16cf73",
+      "chain": "mainnet"
+    },
+    "mainnet_1f573d6f": {
+      "address": "0x1f573d6fb3f13d689ff844b4ce37794d79a7ff1c",
+      "chain": "mainnet"
+    },
+    "mainnet_1a92f738": {
+      "address": "0x1a92f7381b9f03921564a437210bb9396471050c",
+      "chain": "mainnet"
+    },
+    "mainnet_06450dee": {
+      "address": "0x06450dee7fd2fb8e39061434babcfc05599a6fb8",
+      "chain": "mainnet"
+    },
+    "mainnet_06012c8c": {
+      "address": "0x06012c8cf97bead5deae237070f9587f8e7a266d",
+      "chain": "mainnet"
+    },
+    "mainnet_03f77241": {
+      "address": "0x03f7724180aa6b939894b5ca4314783b0b36b329",
+      "chain": "mainnet"
+    }
+  }
+}

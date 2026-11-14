@@ -121,8 +121,9 @@ def flawed(a):
     known, kept, why = used_elsewhere(a.set), [], collections.Counter()
     listed = set()
     for other in glob.glob(ROOT + "/testdata/*/manifest.json"):
-        if f"/{a.set}/" not in other:
-            listed |= set(json.load(open(other)).get("flawed", {}))
+        held = json.load(open(other))
+        if f"/{a.set}/" not in other and isinstance(held, dict):
+            listed |= set(held.get("flawed", {}))
     for r in records:
         if r["slug"] in listed:
             why["incident already in another set"] += 1

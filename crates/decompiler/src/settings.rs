@@ -52,6 +52,7 @@ pub fn assume(c: &Contract, open: HashSet<Loc>) {
     let settable = Rc::new(Settable {
         layout: c.compiler.layout,
         open,
+        held: HashSet::new(),
     });
     let mut held = deploy::storage(c);
     let mut taken: BTreeMap<U256, U256> = BTreeMap::new();

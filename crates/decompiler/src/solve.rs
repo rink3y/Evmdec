@@ -69,6 +69,7 @@ pub struct Free {
 pub struct Settable {
     pub layout: MappingLayout,
     pub open: HashSet<Loc>,
+    pub held: HashSet<Loc>,
 }
 
 // A contract address a setting is given when the code asks for one that has code.
@@ -349,8 +350,12 @@ impl Search<'_> {
         };
         let by_caller =
             expr::contains(key, &|n| matches!(n, Node::Env(op::CALLER | op::ORIGIN, _)));
-        let loc = origin::loc_of(key, settings.layout);
-        !by_caller && loc.is_some_and(|loc| !settings.open.contains(&loc))
+        let Some(loc) = origin::loc_of(key, settings.layout) else {
+            return false;
+        };
+        // An entry keyed by the caller is usually a role the caller holds. In a ledger of
+        // balances it is what the caller owns, and any account may own some.
+        settings.held.contains(&loc) || (!by_caller && !settings.open.contains(&loc))
     }
 
     // A setting made equal to the caller, or to what a call answered, would hand out the
@@ -696,11 +701,16 @@ pub fn solve(items: &[Item], want: &[bool], start: &Inputs, free: &Free) -> Opti
         for (place, value) in &firsts {
             offer(&mut better, apply(&current, *place, *value));
         }
-        // A condition over two words can need both moved before it agrees.
+        // A condition over two words can need both moved before it agrees. And a value
+        // that satisfies the wanted check can break an earlier one that bounds it, as a
+        // balance does when it passes the total. The earlier check is then asked for its
+        // own change.
         if better.is_none() {
             for (place, value) in firsts.iter().take(LOOKAHEAD) {
                 let mid = apply(&current, *place, *value);
-                for (place, value) in proposals(items, &mid, free, reached, want[reached]) {
+                let kept = agreed(&replay(items, &mid), want, &observed);
+                let at = kept.min(reached);
+                for (place, value) in proposals(items, &mid, free, at, want[at]) {
                     offer(&mut better, apply(&mid, place, value));
                 }
             }

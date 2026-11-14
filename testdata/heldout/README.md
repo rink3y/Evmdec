@@ -5,9 +5,9 @@ how well does the analyzer do on contracts it has never seen?
 
 ## Rule of use
 
-Nothing is tuned against this set. Rules are developed on `testdata/vuln`, `testdata/mainnet`
-and the labelled fixtures in `testdata/rules`. This set is only scored, with
-`python3 corpus/heldout_bench.py`.
+Nothing is tuned against this set. Rules are developed on `testdata/vuln`,
+`testdata/mainnet`, the incidents in `testdata/incidents` and the labelled fixtures in
+`testdata/rules`. This set is only scored, with `python3 corpus/heldout_bench.py`.
 
 A miss here says which kind of flaw the analyzer does not reach. The fix is a general rule,
 shown on a synthetic fixture or on the development corpus, and then scored here again. A

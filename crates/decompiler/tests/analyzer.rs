@@ -3542,3 +3542,48 @@ fn moving_one_item_has_no_answer_to_refuse_with() {
     let items = report_of(&dispatcher(&format!("{asks_owner} {pulls}")));
     assert!(finding(&items, rule).is_none(), "{:?}", ids(&items));
 }
+
+const ENTRY_OF_WORD: &str =
+    "PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
+
+fn token_with(third: &str) -> Vec<u8> {
+    let entry = |word: &str| format!("{word} {ENTRY_OF_WORD}");
+    let balance_of = format!(
+        "{} SLOAD PUSH1 0x80 MSTORE PUSH1 0x20 PUSH1 0x80 RETURN",
+        entry("PUSH1 0x04 CALLDATALOAD")
+    );
+    let transfer = format!(
+        "PUSH1 0x24 CALLDATALOAD {from} SLOAD DUP2 DUP2 LT PUSH2 @short JUMPI SUB {from} SSTORE \
+         {to} SLOAD PUSH1 0x24 CALLDATALOAD ADD {to} SSTORE STOP :short JUMPDEST PUSH1 0x00 DUP1 REVERT",
+        from = entry("CALLER"),
+        to = entry("PUSH1 0x04 CALLDATALOAD"),
+    );
+    asm(&format!(
+        "PUSH1 0x80 PUSH1 0x40 MSTORE PUSH1 0x00 CALLDATALOAD PUSH1 0xe0 SHR \
+         DUP1 PUSH4 0x70a08231 EQ PUSH2 @a JUMPI DUP1 PUSH4 0xa9059cbb EQ PUSH2 @b JUMPI \
+         PUSH4 0xcccccccc EQ PUSH2 @c JUMPI PUSH1 0x00 DUP1 REVERT \
+         :a JUMPDEST POP {balance_of} :b JUMPDEST POP {transfer} :c JUMPDEST {third}"
+    ))
+}
+
+#[test]
+fn a_call_that_lowers_the_balance_of_an_account_that_took_no_part_is_reported() {
+    let entry = |word: &str| format!("{word} {ENTRY_OF_WORD}");
+    let lowers = |whose: &str, amount: &str| {
+        format!(
+            "{amount} {from} SLOAD DUP2 DUP2 LT PUSH2 @less JUMPI SUB {from} SSTORE STOP \
+             :less JUMPDEST PUSH1 0x00 DUP1 REVERT",
+            from = entry(whose)
+        )
+    };
+    let takes = lowers("PUSH1 0x04 CALLDATALOAD", "PUSH1 0x24 CALLDATALOAD");
+    let rule = "call-lowers-another-accounts-balance";
+    let r = report_of(&token_with(&takes));
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    assert!(f.confirmed, "{f:?}");
+
+    let burns_own = lowers("CALLER", "PUSH1 0x04 CALLDATALOAD");
+    let r = report_of(&token_with(&burns_own));
+    assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
+}

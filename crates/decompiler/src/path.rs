@@ -234,7 +234,10 @@ impl Explorer {
                 if to == Some(block.end) {
                     continue;
                 }
-                let holds = next != Some(block.end);
+                // A long run is read back only up to a limit. The branch at the cut has
+                // no block after it, so which way it went is not known.
+                let Some(next) = next else { continue };
+                let holds = next != block.end;
                 items.push(Item::Check {
                     cond: *cond,
                     holds,

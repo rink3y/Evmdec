@@ -209,7 +209,7 @@ other way to get an input that takes the other branch. The solver is a generator
 decision procedure: it inverts arithmetic back to a word of the call, the value sent or, when
 asked, a storage slot, and every answer it gives is run again on the bytecode before anything
 is built on it. On the 22 audited contracts the lifted conditions agree with the interpreter
-on all 83,865 branches taken. When creation code is given, the constructor is run first and
+on all 95,466 branches taken. When creation code is given, the constructor is run first and
 every check starts from the storage it leaves; with runtime code only, they start from empty
 storage and say so.
 
@@ -361,9 +361,9 @@ recall above is measured on contracts the rules were developed on.
 
 | | |
 |---|---|
-| flawed contracts with the right kind of finding at high or above | 94 / 234 = 40% |
-| the same at medium or above | 134 / 234 = 57% |
-| flawed contracts with any finding at high or above | 119 / 234 = 51% |
+| flawed contracts with the right kind of finding at high or above | 96 / 234 = 41% |
+| the same at medium or above | 135 / 234 = 58% |
+| flawed contracts with any finding at high or above | 121 / 234 = 52% |
 | contracts with no known flaw and nothing at high or above | 80 / 101 = 79% |
 
 The label is the kind of flaw, not the function it is in, so the first row is an upper
@@ -379,6 +379,12 @@ The test of who chooses a selector withdrew `dynamic-call` on six of the contrac
 known flaw, and with it two flawed contracts that had counted as found through a selector the
 caller does not choose. Getting further into a function is not yet finding more of what is
 wrong in it.
+
+The check on what a token holds for others, built on the development incidents, brought the
+first row back to 96 and left the last row at 80. Three scores in a row within two contracts
+of each other say the same thing: the rules that exist find about four in ten of the flaws
+on contracts they were not built on, and each further kind of flaw has to be found for
+itself.
 
 ### Random sample
 

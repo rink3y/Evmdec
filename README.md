@@ -352,11 +352,15 @@ an amount priced from a reading that one transaction can move, a swap of the con
 holdings that anyone can trigger with no minimum, and reward accounting that pays the same
 claim twice. No one rule covers a group: each incident meets its conditions in its own way.
 
-The checks that pay in and take out reach few of these contracts. On the 231, a call by
-which an account pays in and nothing comes back is found on 24, a second call that takes
-something out on 2, and the check on a reading that lasts one call fires on none. Most of
-the flawed contracts are tokens, routers, or pools an owner sets up first, not places an
-account pays into and takes out of in two calls from an empty state.
+The checks that pay in and take out reach few of these contracts, and the reason was
+measured (`EVMDEC_DEBUG_CROSSINGS` prints it for one contract). Every function of every
+contract was run by an account with no role, with settings and answers chosen so that it can
+end: 64% of 8,060 functions end. A function that brings value in exists on 70 of the 231
+contracts. Once an account has paid in, a function that sends value back to that account
+exists on 9 of them, and on 11 when a month passes first. About a third of the contracts are
+tokens, whose value moves inside their own ledger and never crosses the edge. So the shape
+"pay in, then take out" fits about one flawed contract in twenty, whatever is measured on
+it, and the check on a reading that lasts one call fires on none.
 
 ### Held-out set
 

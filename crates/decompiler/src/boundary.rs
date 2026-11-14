@@ -8,9 +8,10 @@ use crate::hex;
 use crate::interp::{self, CallRecord, Outcome};
 use crate::opcode as op;
 use crate::path::{self, Explorers, Limits, Path};
-use crate::solve::{word, Free, Inputs};
+use crate::solve::{word, Free, Inputs, Settable};
 use crate::u256::U256;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 pub const WORK: u64 = 2 * exec::WORK_PER_SECOND;
 
@@ -46,6 +47,7 @@ const MAX_READINGS: usize = 12;
 const MAX_READ_WORDS: usize = 4;
 const MAX_TAKES: usize = 4;
 const LAST_BUILT_IN: u64 = 0x0a;
+const PROFILE_HOLDS: u64 = 1_000_000_000;
 
 // Only what crosses the contract's edge is counted. How the contract records what it
 // owes is never read, so a queue, a mapping and a packed record are all judged alike.
@@ -244,6 +246,10 @@ fn swings(was: U256) -> Vec<U256> {
 
 impl<'a> Pass<'a> {
     fn new(c: &'a Contract) -> Pass<'a> {
+        Pass::new_with(c, MAX_ENTRIES)
+    }
+
+    fn new_with(c: &'a Contract, most: usize) -> Pass<'a> {
         let reached = |f: &&Function| {
             matches!(
                 f.kind,
@@ -271,7 +277,7 @@ impl<'a> Pass<'a> {
                 fixed,
             }
         };
-        let functions = c.functions.iter().filter(reached).take(MAX_ENTRIES);
+        let functions = c.functions.iter().filter(reached).take(most);
         Pass {
             c,
             explorers: Explorers::default(),
@@ -335,6 +341,48 @@ impl<'a> Pass<'a> {
             call.addr,
             &call.input,
         )
+    }
+
+    fn pays_back(&mut self, after: &Held, settable: &Rc<Settable>) -> usize {
+        let mut count = 0;
+        for index in 0..self.entries.len() {
+            if exec::spent() {
+                break;
+            }
+            let entry = &self.entries[index];
+            let function = entry.function;
+            if !function.effects.calls {
+                continue;
+            }
+            let call = Call {
+                function,
+                who: OUTSIDER,
+                calldata: path::fill_words(&entry.calldata, &entry.fixed, path::varied_word),
+                value: U256::ZERO,
+            };
+            let free = Free {
+                words: call.calldata.len() / 32,
+                value: false,
+                storage: false,
+                answers: true,
+                settings: Some(settable.clone()),
+                fixed: entry.fixed.clone(),
+            };
+            let mut inputs = self.inputs(&call, after);
+            inputs.spends_balance = false;
+            let code = self.c.code_of(function);
+            let found = self.explorers.of(code).explore(&inputs, &free, LIMITS);
+            let sends = found.into_iter().filter(Path::succeeded).any(|p| {
+                let ran = Ran {
+                    inputs: p.inputs,
+                    run: p.run,
+                };
+                let net = moved(&ran);
+                !net.ether_out.is_zero() || !net.tokens_out.is_zero()
+            });
+            count += usize::from(sends);
+        }
+        count
     }
 
     // What the contract learns from outside during a run. A transfer answers whether it
@@ -775,6 +823,79 @@ fn report_swing(out: &mut Vec<Finding>, found: &Swung, from: &str) {
         finding.witness = Some(hex::encode(&found.last.inputs.calldata));
         finding.observed = crate::evidence::observed(&found.last.inputs, &found.last.run);
     }
+}
+
+// What crosses the edge when each function is run by an account with no role, from the
+// starting state. This is what a chain of calls is built from: a function that brings
+// value in, and one that sends value to its caller.
+#[derive(Clone, Copy, Default)]
+pub struct Crossing {
+    pub ends: bool,
+    pub brings_in: bool,
+    pub sends_out: bool,
+    // A function that sends value to the account once that account has paid in.
+    pub pays_back: usize,
+}
+
+pub fn crossings(c: &Contract, settable: &Rc<Settable>) -> Vec<(String, Crossing)> {
+    let start = Held {
+        storage: deploy::start(c),
+        ether: U256::ZERO,
+        tokens: U256::from_u64(PROFILE_HOLDS),
+    };
+    let mut pass = Pass::new_with(c, usize::MAX);
+    let mut out = Vec::new();
+    let mut measured = false;
+    for index in 0..pass.entries.len() {
+        if exec::spent() {
+            break;
+        }
+        let entry = &pass.entries[index];
+        let function = entry.function;
+        let call = Call {
+            function,
+            who: OUTSIDER,
+            calldata: path::fill_words(&entry.calldata, &entry.fixed, path::varied_word),
+            value: U256::from_u64(FIRST_VALUE),
+        };
+        let free = Free {
+            words: call.calldata.len() / 32,
+            value: true,
+            storage: false,
+            answers: true,
+            settings: Some(settable.clone()),
+            fixed: entry.fixed.clone(),
+        };
+        let mut inputs = pass.inputs(&call, &start);
+        inputs.spends_balance = false;
+        let code = c.code_of(function);
+        let found = pass.explorers.of(code).explore(&inputs, &free, LIMITS);
+        let mut crossing = Crossing::default();
+        let mut paid: Option<Held> = None;
+        for p in found.into_iter().filter(Path::succeeded) {
+            let ran = Ran {
+                inputs: p.inputs,
+                run: p.run,
+            };
+            let net = moved(&ran);
+            crossing.ends = true;
+            crossing.brings_in |= !net.ether_in.is_zero() || !net.tokens_in.is_zero();
+            crossing.sends_out |= !net.ether_out.is_zero() || !net.tokens_out.is_zero();
+            if net.pays_in_only() && paid.is_none() && ran.run.storage != ran.inputs.storage {
+                paid = Some(Held {
+                    storage: ran.run.storage.clone(),
+                    ether: sum(start.ether, net.ether_in),
+                    tokens: sum(start.tokens, net.tokens_in),
+                });
+            }
+        }
+        if let Some(after) = paid.filter(|_| !measured) {
+            measured = true;
+            crossing.pays_back = pass.pays_back(&after, settable);
+        }
+        out.push((function.name.clone(), crossing));
+    }
+    out
 }
 
 pub fn swing_findings(c: &Contract, out: &mut Vec<Finding>) {

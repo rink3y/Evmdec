@@ -5446,6 +5446,20 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         exec::within(boundary::WORK, || {
             boundary::swing_findings(c, &mut findings)
         });
+        if crate::debug::on("EVMDEC_DEBUG_CROSSINGS") {
+            let settable = std::rc::Rc::new(crate::solve::Settable {
+                layout: c.compiler.layout,
+                open: open.clone(),
+                held: HashSet::new(),
+            });
+            let seen = exec::within(64 * boundary::WORK, || boundary::crossings(c, &settable));
+            for (name, x) in seen {
+                eprintln!(
+                    "[crossings] {name} ends={} in={} out={} back={}",
+                    x.ends, x.brings_in, x.sends_out, x.pays_back
+                );
+            }
+        }
         exec::within(ledger::WORK, || ledger::findings(c, &mut findings));
         if !crate::deploy::assumed(c).is_empty() {
             for finding in &mut findings[measured..] {

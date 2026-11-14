@@ -384,13 +384,13 @@ recall above is measured on contracts the rules were developed on.
 
 | | |
 |---|---|
-| flawed contracts with the right kind of finding at high or above | 98 / 234 = 42% |
-| the same at medium or above | 136 / 234 = 58% |
-| flawed contracts with any finding at high or above | 123 / 234 = 53% |
+| flawed contracts with the right kind of finding at high or above | 100 / 234 = 43% |
+| the same at medium or above | 137 / 234 = 59% |
+| flawed contracts with any finding at high or above | 125 / 234 = 53% |
 | contracts with no known flaw and nothing at high or above | 79 / 101 = 78% |
 
 The label is the kind of flaw, not the function it is in, so the first row is an upper
-bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.48
+bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.50
 for missing checks on who may call, 0.39 for accounting, 0.34 for prices read from outside
 and 0.36 for arithmetic. On the contracts with no known flaw, 8 of the 22 that get a high
 finding get it from `dynamic-call`.
@@ -410,10 +410,12 @@ on contracts they were not built on, and each further kind of flaw has to be fou
 itself.
 
 The search over sequences of calls, built on fixtures and the development incidents, was
-then scored here once: 98 on the first row and 79 on the last. Its finding is high on six
-flawed contracts, two of which nothing else found, and on two contracts with no known flaw,
-one of which had no other high finding. It is one property over the states the search
-reaches. The gain to expect from it comes with the properties still to be added.
+then scored here: 98 on the first row and 79 on the last with its first property, and 100
+and 79 once approvals stay in place and a second property looks at the other account. Its
+findings are high on eight flawed contracts, four of which nothing else found, and on two
+contracts with no known flaw, one of which had no other high finding. These are two
+properties over the states the search reaches. The gain to expect from it comes with the
+properties still to be added.
 
 ### Random sample
 

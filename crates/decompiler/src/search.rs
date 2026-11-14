@@ -60,6 +60,9 @@ struct Kept<'a> {
     // What the actor held just before its first call. Everything the other account did
     // before that is the state the actor found, not something the actor gained.
     base: Option<Holdings>,
+    // Whether a call that brought the other account's value in also wrote storage.
+    // Value that came in with nothing written is value the contract keeps no record of.
+    recorded: bool,
 }
 
 struct Broken {
@@ -67,6 +70,7 @@ struct Broken {
     base: Holdings,
     now: Holdings,
     waited: bool,
+    recorded: bool,
 }
 
 struct Search<'a> {
@@ -111,6 +115,32 @@ fn gained(base: &Holdings, now: &Holdings) -> bool {
     pairs.iter().all(|(a, b)| b >= a) && pairs.iter().any(|(a, b)| b > a)
 }
 
+impl Broken {
+    fn outside(&self) -> bool {
+        let rose = |(asset, held): (&U256, &U256)| {
+            *held > self.base.assets.get(asset).copied().unwrap_or(PURSE)
+        };
+        self.now.ether > self.base.ether || self.now.assets.iter().any(rose)
+    }
+
+    // Ether and outside assets in the contract are what the two accounts paid in, so a
+    // gain in them is the other account's money whenever it is taken. It is only known
+    // to be owed to that account when the contract wrote something as it came in. A
+    // balance in the contract's own ledger can also be a reward that accrues with time.
+    fn severity(&self) -> Severity {
+        match (self.outside(), self.recorded, self.waited) {
+            (true, true, _) | (false, _, false) => Severity::High,
+            _ => Severity::Medium,
+        }
+    }
+
+    fn better_than(&self, other: &Broken) -> bool {
+        // The most severe level sorts first.
+        let rank = |b: &Broken| (b.severity(), b.steps.len());
+        rank(self) < rank(other)
+    }
+}
+
 impl<'a> Search<'a> {
     fn new(c: &'a Contract) -> Search<'a> {
         let reached = |f: &&Function| {
@@ -139,6 +169,7 @@ impl<'a> Search<'a> {
             written: BTreeSet::new(),
             amounts: Vec::new(),
             base: None,
+            recorded: false,
         };
         Search {
             c,
@@ -318,24 +349,26 @@ impl<'a> Search<'a> {
         if !call.value.is_zero() && !amounts.contains(&call.value) {
             amounts.push(call.value);
         }
+        let brought = call.who == OTHER && done.crossed && !done.written.is_empty();
+        let recorded = parent.recorded || brought;
         steps.push(Step { entry: index, call });
         let changed = !done.written.is_empty() || done.crossed;
         if let (Some(base), true) = (&base, changed) {
             let now = world.holdings(ACTOR);
-            let shorter = self
-                .best
-                .as_ref()
-                .is_none_or(|b| steps.len() < b.steps.len());
-            if gained(base, &now) && shorter {
+            if gained(base, &now) {
                 let waited = steps
                     .iter()
                     .any(|s| s.call.who == ACTOR && s.call.seconds_later > 0);
-                self.best = Some(Broken {
+                let found = Broken {
                     steps: steps.clone(),
                     base: base.clone(),
                     now,
                     waited,
-                });
+                    recorded,
+                };
+                if self.best.as_ref().is_none_or(|b| found.better_than(b)) {
+                    self.best = Some(found);
+                }
             }
         }
         if novel && self.kept.len() < MAX_KEPT {
@@ -345,6 +378,7 @@ impl<'a> Search<'a> {
                 written,
                 amounts,
                 base,
+                recorded,
             });
         }
         true
@@ -459,20 +493,20 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
             before.to_hex()
         ));
     }
-    let outside = rose.len() > usize::from(own);
+    let outside = broken.outside();
     let source = match outside {
         true => "The contract held nothing at the start and received only what the two accounts paid in, so what the account gained is the other account's payment.",
         false => "Nothing was paid for that balance, in ether or in any asset.",
     };
-    // Ether and outside assets in the contract are what the two accounts paid in, so a
-    // gain in them is the other account's money whenever it is taken. A balance in the
-    // contract's own ledger can also be a reward that accrues with time.
-    let (severity, timing) = match broken.waited && !outside {
-        false => (Severity::High, ""),
-        true => (
-            Severity::Medium,
-            " The gain needs time to pass between the calls, as a reward that accrues would. Whether that reward is meant to be open to an account that paid nothing is for a reader to judge.",
-        ),
+    let severity = broken.severity();
+    let timing = match (severity, outside) {
+        (Severity::High, _) => "",
+        (_, true) => {
+            " No call that brought that payment in wrote anything to storage, so the contract keeps no record of whose it is. A contract that only passes value on within one transaction leaves what stays behind open in this way."
+        }
+        (_, false) => {
+            " The gain needs time to pass between the calls, as a reward that accrues would. Whether that reward is meant to be open to an account that paid nothing is for a reader to judge."
+        }
     };
     let own_calls = broken.steps.iter().filter(|s| s.call.who == ACTOR).count();
     push(

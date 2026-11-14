@@ -381,15 +381,15 @@ recall above is measured on contracts the rules were developed on.
 
 | | |
 |---|---|
-| flawed contracts with the right kind of finding at high or above | 96 / 234 = 41% |
-| the same at medium or above | 135 / 234 = 58% |
-| flawed contracts with any finding at high or above | 121 / 234 = 52% |
-| contracts with no known flaw and nothing at high or above | 80 / 101 = 79% |
+| flawed contracts with the right kind of finding at high or above | 98 / 234 = 42% |
+| the same at medium or above | 136 / 234 = 58% |
+| flawed contracts with any finding at high or above | 123 / 234 = 53% |
+| contracts with no known flaw and nothing at high or above | 79 / 101 = 78% |
 
 The label is the kind of flaw, not the function it is in, so the first row is an upper
-bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.46
-for missing checks on who may call, 0.37 for accounting, 0.33 for prices read from outside
-and 0.29 for arithmetic. On the contracts with no known flaw, 9 of the 21 that get a high
+bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.48
+for missing checks on who may call, 0.39 for accounting, 0.34 for prices read from outside
+and 0.36 for arithmetic. On the contracts with no known flaw, 9 of the 22 that get a high
 finding get it from `dynamic-call`.
 
 The set was first scored at 96, 121 and 78 on the first, third and fourth rows. The assumed
@@ -405,6 +405,12 @@ first row back to 96 and left the last row at 80. Three scores in a row within t
 of each other say the same thing: the rules that exist find about four in ten of the flaws
 on contracts they were not built on, and each further kind of flaw has to be found for
 itself.
+
+The search over sequences of calls, built on fixtures and the development incidents, was
+then scored here once: 98 on the first row and 79 on the last. Its finding is high on six
+flawed contracts, two of which nothing else found, and on two contracts with no known flaw,
+one of which had no other high finding. It is one property over the states the search
+reaches. The gain to expect from it comes with the properties still to be added.
 
 ### Random sample
 

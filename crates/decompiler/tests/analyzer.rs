@@ -3659,4 +3659,9 @@ fn the_search_finds_an_account_that_ends_with_more_than_it_started_with() {
     let pays_what_is_recorded = dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP");
     let r = report_of(&pays_what_is_recorded);
     assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
+
+    let keeps_no_record = dispatcher3("STOP", &pay_out_everything(), "STOP");
+    let r = report_of(&keeps_no_record);
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium, "{f:?}");
 }

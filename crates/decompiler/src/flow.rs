@@ -1,4 +1,4 @@
-use crate::abi::{self, SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
+use crate::abi::{self, SEL_BALANCE_OF, SEL_OWNER_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::analyze::{display_name, push, Confidence, Finding, Severity};
 use crate::cross::World;
 use crate::decompile::{Contract, Function};
@@ -227,6 +227,8 @@ impl<'a> Pass<'a> {
             words: inputs.calldata.len() / 32,
             value: false,
             storage: false,
+            answers: true,
+            settings: None,
             fixed,
         };
         (inputs, free)
@@ -312,7 +314,7 @@ impl<'a> Pass<'a> {
         if self.pays_from_nothing(g, q, asset, back) {
             return false;
         }
-        report_gain(out, d, g, q, asset, back, deploy::start_text(&self.start));
+        report_gain(out, d, g, q, asset, back, deploy::started_from(self.c));
         true
     }
 
@@ -353,7 +355,7 @@ impl<'a> Pass<'a> {
                 None,
                 format!(
                     "Starting from {}, one account pays in {} of {} through `{}`, and a second account then makes the same payment. The first account's call to `{}` now ends normally and sends it {}. Before the second payment the same call sent less, so the difference comes out of what the second account paid. The run assumes the contract holds enough to pay.",
-                    deploy::start_text(&self.start),
+                    deploy::started_from(self.c),
                     paid.to_hex(),
                     asset_text(asset),
                     d.function.name,
@@ -574,9 +576,16 @@ impl<'a> Pass<'a> {
             let (start, free) = self.base(f, path::varied_word);
             let found = self.explore(f, &start, &free, LIMITS);
             let asks = |p: &&Path| {
+                // An asset that is asked who owns one item moves items, not amounts. Moving
+                // an item returns nothing, so there is no answer it could refuse with.
+                let items = |asset: U256| {
+                    let owner = |c: &CallRecord| selector(&c.input) == Some(SEL_OWNER_OF);
+                    p.run.calls.iter().any(|c| c.addr == asset && owner(c))
+                };
                 let transfer = |c: &CallRecord| {
                     let s = selector(&c.input);
-                    c.kind == op::CALL && (s == Some(SEL_TRANSFER) || s == Some(SEL_TRANSFER_FROM))
+                    let moves = s == Some(SEL_TRANSFER) || s == Some(SEL_TRANSFER_FROM);
+                    c.kind == op::CALL && moves && !items(c.addr)
                 };
                 p.succeeded() && p.run.calls.iter().any(transfer)
             };
@@ -954,7 +963,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     let mut pass = Pass {
         c,
         explorers: Explorers::default(),
-        start: deploy::storage(c),
+        start: deploy::start(c),
     };
     let deposits = pass.deposits(layout);
     for d in &deposits {

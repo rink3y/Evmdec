@@ -2,8 +2,8 @@ use crate::cfg::Program;
 use crate::exec::{self, FrameRun};
 use crate::expr;
 use crate::interp::{self, Host};
-use crate::lift::{Lifter, Stmt, Term};
-use crate::solve::{self, Free, Inputs, Item};
+use crate::lift::{self, Lifter, Stmt, Term};
+use crate::solve::{self, Free, Given, Inputs, Item};
 use crate::u256::U256;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -98,6 +98,7 @@ pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
         storage: HashMap::new(),
         returned: Vec::new(),
         replies: Vec::new(),
+        answers: Vec::new(),
         given: Vec::new(),
         balance: DEFAULT_BALANCE,
         signed: None,
@@ -107,12 +108,48 @@ pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
     }
 }
 
+fn last_check(p: &Path) -> Option<expr::ExprId> {
+    p.items.iter().rev().find_map(|item| match item {
+        Item::Check { cond, .. } => Some(*cond),
+        Item::Store { .. } => None,
+    })
+}
+
+fn stopped_on(p: &Path) -> &'static str {
+    let Some(cond) = last_check(p) else {
+        return "nothing";
+    };
+    let env =
+        |which: u8| expr::contains(cond, &|n| matches!(n, expr::Node::Env(o, _) if *o == which));
+    let answer = expr::contains(cond, &|n| {
+        matches!(n, expr::Node::ReturnData(..) | expr::Node::CallResult(_))
+    });
+    let stored = expr::contains(cond, &|n| matches!(n, expr::Node::SLoad(..)));
+    let caller = env(crate::opcode::CALLER);
+    match (answer || env(crate::opcode::RETURNDATASIZE), caller, stored) {
+        (true, ..) => "answer",
+        (_, true, true) => "caller-against-storage",
+        (_, true, false) => "caller",
+        (_, _, true) => "storage",
+        _ if env(crate::opcode::CALLVALUE) => "value",
+        _ => "input",
+    }
+}
+
 impl Explorer {
     pub fn new(code: &[u8]) -> Explorer {
         Explorer {
             prog: Program::new(code.to_vec()),
             late: Cell::new(0),
         }
+    }
+
+    // A finding names where its statement starts. The instruction it is about comes
+    // later in the same block.
+    pub fn rest_of_block(&self, pc: usize) -> std::ops::Range<usize> {
+        let block = self.prog.block_at_pc.range(..=pc).next_back();
+        let end = block.map_or(pc + 1, |(_, id)| self.prog.blocks[*id].end);
+        pc..end.max(pc + 1)
     }
 
     // The run alone, without reading it back into expressions. Reading back costs far
@@ -128,6 +165,7 @@ impl Explorer {
         host.number = inputs.number;
         host.forced_return = inputs.returned.clone();
         host.replies = inputs.replies.clone();
+        host.answers = inputs.answers.clone();
         host.signed = inputs.signed.clone();
         host.failing = inputs.failing;
         host.spends_balance = inputs.spends_balance;
@@ -158,8 +196,12 @@ impl Explorer {
         let mut items = Vec::new();
         let mut truth = Vec::new();
         let mut effects = Vec::new();
+        let mut made = Vec::new();
         for (i, node) in nodes.iter().enumerate() {
-            for st in &node.stmts {
+            for (at, st) in node.stmts.iter().enumerate() {
+                if let Stmt::Call { seq, .. } = st {
+                    made.push((*seq, lift::call_stamp(i, at + 1)));
+                }
                 match st {
                     Stmt::SStore {
                         key,
@@ -192,7 +234,10 @@ impl Explorer {
                 if to == Some(block.end) {
                     continue;
                 }
-                let holds = next != Some(block.end);
+                // A long run is read back only up to a limit. The branch at the cut has
+                // no block after it, so which way it went is not known.
+                let Some(next) = next else { continue };
+                let holds = next != block.end;
                 items.push(Item::Check {
                     cond: *cond,
                     holds,
@@ -202,22 +247,29 @@ impl Explorer {
             }
         }
         let mut inputs = inputs.clone();
-        let made = effects.iter().filter_map(|st| match st {
-            Stmt::Call { seq, .. } => Some(*seq),
-            _ => None,
-        });
         let mut outside = 0;
         inputs.given = made
+            .iter()
             .zip(&run.calls)
-            .map(|(seq, call)| {
-                let (replies, default) = (&inputs.replies, &inputs.returned);
+            .enumerate()
+            .map(|(index, ((seq, size), call))| {
+                let (signed, replies) = (&inputs.signed, &inputs.replies);
+                let chosen = interp::own_answer(&inputs.answers, index);
                 let moved = interp::moving_answer(&inputs.moving, outside, call.addr, &call.input);
                 let went_out = interp::goes_outside(&inputs.moving, call.addr, &call.input);
                 outside += usize::from(call.kind == crate::opcode::CALL && went_out);
-                let data = moved.unwrap_or_else(|| {
-                    interp::answer(&inputs.signed, replies, default, call.addr, &call.input)
-                });
-                (seq, data)
+                let by_default =
+                    interp::answered_by_default(signed, replies, call.addr, &call.input);
+                let open = moved.is_none() && by_default;
+                let usual =
+                    || interp::answer(signed, replies, &inputs.returned, call.addr, &call.input);
+                let data = moved.unwrap_or_else(|| chosen.cloned().unwrap_or_else(usual));
+                Given {
+                    seq: *seq,
+                    size: *size,
+                    open,
+                    data,
+                }
             })
             .collect();
         Path {
@@ -232,6 +284,25 @@ impl Explorer {
 
     // Each new path is only kept after the bytecode really ran it.
     pub fn explore(&self, start: &Inputs, free: &Free, limits: Limits) -> Vec<Path> {
+        let paths = self.search(start, free, limits);
+        if crate::debug::on("EVMDEC_DEBUG_STOPS") {
+            let finished = paths.iter().any(Path::succeeded);
+            let deepest = paths.iter().max_by_key(|p| p.truth.len());
+            let stop = deepest.filter(|_| !finished).map_or("-", stopped_on);
+            let last = deepest.filter(|_| !finished).and_then(last_check);
+            let shown = last.map_or(String::new(), |c| {
+                crate::emit::fmt_expr(c, &Default::default())
+            });
+            let shown: String = shown.chars().take(120).collect();
+            eprintln!(
+                "[stops] finished={finished} storage={} answers={} on={stop} last={shown}",
+                free.storage, free.answers
+            );
+        }
+        paths
+    }
+
+    fn search(&self, start: &Inputs, free: &Free, limits: Limits) -> Vec<Path> {
         // Past its limit a caller still gets one run of each function, so a slow first
         // function does not hide the rest. The count ends that for a contract with
         // thousands of functions, which would otherwise run every one of them.

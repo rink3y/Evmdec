@@ -12,6 +12,7 @@ pub struct FrameRun {
     pub storage: HashMap<U256, U256>,
     pub logs: Vec<LogRecord>,
     pub calls: Vec<CallRecord>,
+    pub sites: Vec<usize>,
 }
 
 impl FrameRun {
@@ -130,6 +131,7 @@ pub fn run_frame(
         storage: m.storage,
         logs: m.logs,
         calls: m.calls,
+        sites: m.call_sites,
     }
 }
 

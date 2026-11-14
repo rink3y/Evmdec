@@ -525,7 +525,7 @@ pub const SEQ_BITS: u32 = 14;
 // Must be stable across the rounds a node is lifted in, and never zero.
 // A node or an index too large for its bits gets the stamp of an unknown call,
 // which is never taken to be the same as another.
-fn call_stamp(node: usize, index: usize) -> u32 {
+pub fn call_stamp(node: usize, index: usize) -> u32 {
     let nodes = (1usize << (31 - SEQ_BITS)) - 1;
     if node >= nodes || index >= 1 << SEQ_BITS {
         return MERGED_RETURN | node as u32;
@@ -822,12 +822,15 @@ impl Mem {
             }
         }
         let _ = version;
-        if let Some((k, src, _addr, delta, wgen)) = copy_hit {
-            let word = expr::intern(Node::CopiedWord(
-                k,
-                expr::add_const(src, U256::from(delta)),
-                wgen,
-            ));
+        if let Some((k, src, addr, delta, wgen)) = copy_hit {
+            let at = expr::add_const(src, U256::from(delta));
+            let answered = addr
+                .and_then(expr::as_const)
+                .filter(|_| k == op::RETURNDATACOPY);
+            let word = expr::intern(match answered {
+                Some(seq) => Node::ReturnData(seq.low_u64() as u32, at),
+                None => Node::CopiedWord(k, at, wgen),
+            });
             return Some(if n == 32 {
                 word
             } else {
@@ -1090,6 +1093,7 @@ pub struct State {
     sgen: u32,
     called: bool,
     returned: u32,
+    answered: Option<u32>,
 }
 
 impl State {
@@ -1418,6 +1422,7 @@ impl<'a> Lifter<'a> {
             sgen: 0,
             called: !fresh,
             returned: 0,
+            answered: None,
         };
         self.lift_from(unit, state)
     }
@@ -1493,6 +1498,7 @@ impl<'a> Lifter<'a> {
             sgen: 0,
             called: false,
             returned: 0,
+            answered: None,
         };
         state.mem.single_run = true;
         let hidden = Hidden::default();
@@ -1615,6 +1621,7 @@ impl<'a> Lifter<'a> {
                                 sgen: exit.sgen,
                                 called: exit.called,
                                 returned: exit.returned,
+                                answered: exit.answered,
                             },
                         });
                         true
@@ -1629,6 +1636,7 @@ impl<'a> Lifter<'a> {
                             sgen: exit.sgen,
                             called: exit.called,
                             returned: exit.returned,
+                            answered: exit.answered,
                         };
                         let changed = e.state.stack != new_state.stack
                             || e.state.mem.writes != new_state.mem.writes
@@ -2370,7 +2378,12 @@ impl<'a> Lifter<'a> {
                             _ => st.mem.store(dest, l, MVal::Copy(o, src, None)),
                         }
                     } else {
-                        st.mem.store(dest, l, MVal::Copy(o, src, None));
+                        // One run has one call behind each copy of an answer. Naming it lets
+                        // a search value the words read from it, and choose them.
+                        let known = o == op::RETURNDATACOPY && st.mem.single_run;
+                        let answered = st.answered.filter(|_| known);
+                        let from = answered.map(|seq| konst_u64(u64::from(seq)));
+                        st.mem.store(dest, l, MVal::Copy(o, src, from));
                     }
                     next_version(&mut st);
                     stmts.push(Stmt::Copy {
@@ -2524,6 +2537,7 @@ impl<'a> Lifter<'a> {
                     st.stack.push(result);
                     st.called = true;
                     st.returned = call_stamp(nid, stmts.len());
+                    st.answered = Some(seq);
                 }
                 op::CREATE | op::CREATE2 => {
                     let value = pop!();
@@ -2555,6 +2569,7 @@ impl<'a> Lifter<'a> {
                     st.stack.push(result);
                     st.called = true;
                     st.returned = call_stamp(nid, stmts.len());
+                    st.answered = None;
                 }
                 op::RETURN | op::REVERT => {
                     let off = pop!();
@@ -3326,6 +3341,7 @@ impl MemView {
             sgen: 0,
             called: false,
             returned: 0,
+            answered: None,
         };
         apply_mcopy(&mut st, dest, src, len);
         self.mem = st.mem;

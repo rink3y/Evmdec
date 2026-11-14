@@ -5419,6 +5419,9 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     if asked {
         exec::within(confirm::WORK, || confirm::confirm_wraps(c, &mut findings));
         exec::within(confirm::WORK, || confirm::confirm_chance(c, &mut findings));
+        exec::within(confirm::WORK, || {
+            confirm::settle_selectors(c, &mut findings)
+        });
     }
 
     crate::invariant::findings(c, &c.types, &mut findings);
@@ -5428,10 +5431,41 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         .maps
         .extend(authority(&facts, &stores, &uses, &begin, &mut findings));
     if asked {
+        // A test of a stored flag does not keep any caller out, so what such a function
+        // writes is a record of the calls made, not a setting.
+        let anyone = |s: &&origin::Store| !facts[s.by].caller_checked;
+        let open: HashSet<origin::Loc> = stores.iter().filter(anyone).map(|s| s.loc).collect();
+        exec::within(crate::settings::WORK, || {
+            crate::settings::assume(c, open.clone())
+        });
+        report.maps.extend(crate::deploy::settings_section(c));
         report.maps.extend(crate::props::findings(c, &mut findings));
+        let measured = findings.len();
         exec::within(flow::WORK, || flow::findings(c, &mut findings));
         exec::within(boundary::WORK, || boundary::findings(c, &mut findings));
+        exec::within(boundary::WORK, || {
+            boundary::swing_findings(c, &mut findings)
+        });
+        if crate::debug::on("EVMDEC_DEBUG_CROSSINGS") {
+            let settable = std::rc::Rc::new(crate::solve::Settable {
+                layout: c.compiler.layout,
+                open: open.clone(),
+                held: HashSet::new(),
+            });
+            let seen = exec::within(64 * boundary::WORK, || boundary::crossings(c, &settable));
+            for (name, x) in seen {
+                eprintln!(
+                    "[crossings] {name} ends={} in={} out={} back={}",
+                    x.ends, x.brings_in, x.sends_out, x.pays_back
+                );
+            }
+        }
         exec::within(ledger::WORK, || ledger::findings(c, &mut findings));
+        if !crate::deploy::assumed(c).is_empty() {
+            for finding in &mut findings[measured..] {
+                finding.description.push_str(ASSUMED_NOTE);
+            }
+        }
         // A library run by delegatecall keeps its records in this contract's storage.
         for address in &c.library_targets {
             let Some(library) = linked_contract(&ctx, address) else {
@@ -5447,7 +5481,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         }
         exec::within(signed::WORK, || signed::findings(c, &mut findings));
         report.maps.extend(exec::within(standard::WORK, || {
-            standard::findings(c, &mut findings)
+            standard::findings(c, &open, &mut findings)
         }));
     }
 
@@ -6821,6 +6855,8 @@ fn trace_bounds(c: &Contract, facts: &mut [FnFacts], names_for: &dyn Fn(&Functio
             words: TRACE_WORDS,
             value: true,
             storage: true,
+            answers: false,
+            settings: None,
             fixed: Vec::new(),
         };
         let explored = explorer.explore(&start, &free, limits);
@@ -7495,6 +7531,7 @@ fn authority(
     })
 }
 
+const ASSUMED_NOTE: &str = " The runs behind this start from the assumed settings listed in the report: values for storage that no function open to every caller writes, chosen so that the contract's functions accept a call. A deployment set up differently may behave differently.";
 const BEHIND_A_CALLER_CHECK: &str = " The function is behind a msg.sender check, so the re-entering callee must be, or be controlled by, an authorised account (an owner-chosen payee that is itself an owner, for instance).";
 const BEHIND_A_PARTY_CHECK: &str = " The function compares msg.sender with a field of a record that any caller can fill with its own address. The check names a party to that record, not an authority, so it does not limit who is called back.";
 

@@ -1,9 +1,12 @@
+use crate::emit::MappingLayout;
 use crate::expr::{self, ExprId, Node};
 use crate::keccak;
 use crate::lift::Stmt;
 use crate::opcode as op;
+use crate::origin::{self, Loc};
 use crate::u256::U256;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inputs {
@@ -16,12 +19,23 @@ pub struct Inputs {
     pub storage: HashMap<U256, U256>,
     pub returned: Vec<u8>,
     pub replies: Vec<(u32, Vec<u8>)>,
-    pub given: Vec<(u32, Vec<u8>)>,
+    pub answers: Vec<(usize, Vec<u8>)>,
+    pub given: Vec<Given>,
     pub balance: U256,
     pub signed: Option<(Vec<u8>, U256)>,
     pub failing: Option<usize>,
     pub spends_balance: bool,
     pub moving: Vec<crate::interp::MovingBalance>,
+}
+
+// What one call of a run was answered. `size` is the name the code's read of the answer's
+// length carries. `open` says nothing chose the answer, so a search may.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Given {
+    pub seq: u32,
+    pub size: u32,
+    pub open: bool,
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,7 +57,29 @@ pub struct Free {
     pub words: usize,
     pub value: bool,
     pub storage: bool,
+    pub answers: bool,
+    pub settings: Option<Rc<Settable>>,
     pub fixed: Vec<usize>,
+}
+
+// Storage a search may choose without owning the contract: every place except those a
+// function open to any caller writes. What only a constructor or an authorised account
+// sets is how the contract was configured, and that is not in the runtime code.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Settable {
+    pub layout: MappingLayout,
+    pub open: HashSet<Loc>,
+    pub held: HashSet<Loc>,
+}
+
+// A contract address a setting is given when the code asks for one that has code.
+pub const SOME_CONTRACT: U256 = U256::from_u64(0x00c0_11ab_0000_0001);
+
+fn names_someone(e: ExprId) -> bool {
+    expr::contains(e, &|n| {
+        let who = matches!(n, Node::Env(op::CALLER | op::ORIGIN, _));
+        who || matches!(n, Node::ReturnData(..) | Node::CallResult(_))
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +87,11 @@ enum Place {
     Word(usize),
     Value,
     Slot(U256),
+    Answer(usize, usize),
+    AnswerSize(usize),
 }
+
+const MAX_ANSWER: usize = 2048;
 
 const ROUNDS: usize = 96;
 const LOOKAHEAD: usize = 8;
@@ -106,14 +146,18 @@ impl Eval<'_> {
         }
         let out = match expr::node(e) {
             Node::Const(c) => Some(c),
-            Node::Env(o, _) => match o {
+            Node::Env(o, stamp) => match o {
                 op::CALLER | op::ORIGIN => Some(self.inputs.caller),
                 op::ADDRESS => Some(self.inputs.address),
                 op::CALLVALUE => Some(self.inputs.callvalue),
                 op::CALLDATASIZE => Some(U256::from(self.inputs.calldata.len())),
                 op::TIMESTAMP => Some(self.inputs.timestamp),
                 op::NUMBER => Some(self.inputs.number),
-                op::RETURNDATASIZE => Some(U256::from(self.inputs.returned.len())),
+                op::RETURNDATASIZE => {
+                    let given = self.inputs.given.iter().find(|g| g.size == stamp);
+                    let data = given.map_or(&self.inputs.returned, |g| &g.data);
+                    Some(U256::from(data.len()))
+                }
                 op::SELFBALANCE => Some(self.inputs.balance),
                 _ => crate::interp::fixed_in_a_run(o),
             },
@@ -125,8 +169,8 @@ impl Eval<'_> {
             Node::CallResult(_) => Some(U256::ONE),
             Node::ReturnData(seq, off) => {
                 let inputs = self.inputs;
-                let given = inputs.given.iter().find(|(s, _)| *s == seq);
-                let data = given.map_or(&inputs.returned, |(_, data)| data);
+                let given = inputs.given.iter().find(|g| g.seq == seq);
+                let data = given.map_or(&inputs.returned, |g| &g.data);
                 let at = self.value(off).and_then(|o| o.as_usize());
                 at.filter(|o| o.checked_add(32).is_some_and(|end| end <= data.len()))
                     .map(|o| word(data, o))
@@ -145,6 +189,10 @@ impl Eval<'_> {
                     }
                 }
                 known.then(|| U256::from_be_bytes(&keccak::keccak256(&bytes)))
+            }
+            Node::Op(op::EXTCODESIZE, v) => {
+                let asked = self.value(v[0]).filter(|a| *a != self.inputs.address);
+                asked.map(crate::interp::code_size_in_a_run)
             }
             Node::Op(o, v) => {
                 let args: Option<Vec<ExprId>> =
@@ -249,6 +297,7 @@ struct Search<'a> {
     free: &'a Free,
     out: Vec<(Place, U256)>,
     steps: usize,
+    matching: u32,
 }
 
 // Forcing a value follows both sides of every operation, so one condition can cost two to
@@ -271,7 +320,18 @@ impl Search<'_> {
                 (at >= 4 && (at - 4) % 32 == 0 && open).then_some(Place::Word(index))
             }
             Node::Env(op::CALLVALUE, _) if self.free.value => Some(Place::Value),
-            Node::SLoad(key, false, gen) if self.free.storage => {
+            Node::ReturnData(seq, off) if self.free.answers => {
+                let given = &self.eval.inputs.given;
+                let call = given.iter().position(|g| g.seq == seq && g.open)?;
+                let at = self.eval.value(off)?.as_usize()?;
+                (at < MAX_ANSWER).then_some(Place::Answer(call, at))
+            }
+            Node::Env(op::RETURNDATASIZE, stamp) if self.free.answers => {
+                let given = &self.eval.inputs.given;
+                let call = given.iter().position(|g| g.size == stamp && g.open)?;
+                Some(Place::AnswerSize(call))
+            }
+            Node::SLoad(key, false, gen) if self.free.storage || self.settable(key) => {
                 let k = self.eval.value(key)?;
                 let untouched = !self
                     .eval
@@ -284,13 +344,40 @@ impl Search<'_> {
         }
     }
 
+    fn settable(&self, key: ExprId) -> bool {
+        let Some(settings) = &self.free.settings else {
+            return false;
+        };
+        let by_caller =
+            expr::contains(key, &|n| matches!(n, Node::Env(op::CALLER | op::ORIGIN, _)));
+        let Some(loc) = origin::loc_of(key, settings.layout) else {
+            return false;
+        };
+        // An entry keyed by the caller is usually a role the caller holds. In a ledger of
+        // balances it is what the caller owns, and any account may own some.
+        settings.held.contains(&loc) || (!by_caller && !settings.open.contains(&loc))
+    }
+
+    // A setting made equal to the caller, or to what a call answered, would hand out the
+    // role the comparison protects. The owner slot then holds whoever asks, and a
+    // recovered signer matches whatever was signed.
+    fn force_against(&mut self, e: ExprId, target: U256, other: ExprId, depth: u32) {
+        let named = self.free.settings.is_some() && names_someone(other);
+        self.matching += u32::from(named);
+        self.force(e, target, depth);
+        self.matching -= u32::from(named);
+    }
+
     fn force(&mut self, e: ExprId, target: U256, depth: u32) {
         self.steps += 1;
         if depth > 24 || self.steps > MAX_SEARCH_STEPS {
             return;
         }
         if let Some(place) = self.place(e) {
-            self.out.push((place, target));
+            let role = matches!(place, Place::Slot(_)) && !self.free.storage && self.matching > 0;
+            if !role {
+                self.out.push((place, target));
+            }
             return;
         }
         let d = depth + 1;
@@ -321,11 +408,19 @@ impl Search<'_> {
             }
             (op::SUB, [a, b]) => {
                 if let Some(y) = val(self, *b) {
-                    self.force(*a, target.wrapping_add(y), d);
+                    self.force_against(*a, target.wrapping_add(y), *b, d);
                 }
                 if let Some(x) = val(self, *a) {
-                    self.force(*b, x.wrapping_sub(target), d);
+                    self.force_against(*b, x.wrapping_sub(target), *a, d);
                 }
+            }
+            (op::EXTCODESIZE, [a]) | (op::EXTCODESIZE, [a, _]) => {
+                let holder = if target.is_zero() {
+                    U256::ZERO
+                } else {
+                    SOME_CONTRACT
+                };
+                self.force(*a, holder, d);
             }
             (op::MUL, [a, b]) => {
                 for (x, other) in [(*a, *b), (*b, *a)] {
@@ -367,10 +462,10 @@ impl Search<'_> {
             }
             (op::XOR, [a, b]) => {
                 if let Some(y) = val(self, *b) {
-                    self.force(*a, target ^ y, d);
+                    self.force_against(*a, target ^ y, *b, d);
                 }
                 if let Some(x) = val(self, *a) {
-                    self.force(*b, target ^ x, d);
+                    self.force_against(*b, target ^ x, *a, d);
                 }
             }
             (op::NOT, [a]) => self.force(*a, !target, d),
@@ -414,10 +509,10 @@ impl Search<'_> {
                 let (x, y) = (val(self, *a), val(self, *b));
                 let shift = if want { U256::ZERO } else { one };
                 if let Some(y) = y {
-                    self.force(*a, y.wrapping_add(shift), d);
+                    self.force_against(*a, y.wrapping_add(shift), *b, d);
                 }
                 if let Some(x) = x {
-                    self.force(*b, x.wrapping_add(shift), d);
+                    self.force_against(*b, x.wrapping_add(shift), *a, d);
                 }
             }
             (op::LT | op::SLT, [a, b]) => self.order(*a, *b, want, d),
@@ -510,6 +605,7 @@ fn proposals(
         free,
         out: Vec::new(),
         steps: 0,
+        matching: 0,
     };
     let mut seen = 0;
     for item in items {
@@ -540,8 +636,31 @@ fn apply(inputs: &Inputs, place: Place, value: U256) -> Inputs {
         Place::Slot(key) => {
             next.storage.insert(key, value);
         }
+        Place::Answer(call, at) => {
+            let mut data = next.given[call].data.clone();
+            if data.len() < at + 32 {
+                data.resize(at + 32, 0);
+            }
+            data[at..at + 32].copy_from_slice(&value.to_be_bytes());
+            answer_with(&mut next, call, data);
+        }
+        Place::AnswerSize(call) => {
+            if let Some(size) = value.as_usize().filter(|size| *size <= MAX_ANSWER) {
+                let mut data = next.given[call].data.clone();
+                data.resize(size, 0);
+                answer_with(&mut next, call, data);
+            }
+        }
     }
     next
+}
+
+// The record of what was answered is what the conditions are valued against. It has to
+// change with the answer, or the next round would judge the old one.
+fn answer_with(inputs: &mut Inputs, call: usize, data: Vec<u8>) {
+    inputs.given[call].data = data.clone();
+    inputs.answers.retain(|(at, _)| *at != call);
+    inputs.answers.push((call, data));
 }
 
 fn agreed(truth: &[Option<bool>], want: &[bool], observed: &[bool]) -> usize {
@@ -582,11 +701,16 @@ pub fn solve(items: &[Item], want: &[bool], start: &Inputs, free: &Free) -> Opti
         for (place, value) in &firsts {
             offer(&mut better, apply(&current, *place, *value));
         }
-        // A condition over two words can need both moved before it agrees.
+        // A condition over two words can need both moved before it agrees. And a value
+        // that satisfies the wanted check can break an earlier one that bounds it, as a
+        // balance does when it passes the total. The earlier check is then asked for its
+        // own change.
         if better.is_none() {
             for (place, value) in firsts.iter().take(LOOKAHEAD) {
                 let mid = apply(&current, *place, *value);
-                for (place, value) in proposals(items, &mid, free, reached, want[reached]) {
+                let kept = agreed(&replay(items, &mid), want, &observed);
+                let at = kept.min(reached);
+                for (place, value) in proposals(items, &mid, free, at, want[at]) {
                     offer(&mut better, apply(&mid, place, value));
                 }
             }
@@ -613,6 +737,7 @@ mod tests {
             storage: HashMap::new(),
             returned: Vec::new(),
             replies: Vec::new(),
+            answers: Vec::new(),
             given: Vec::new(),
             balance: U256::ZERO,
             signed: None,

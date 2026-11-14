@@ -38,6 +38,7 @@ pub mod lift;
 #[cfg(feature = "rpc")]
 pub mod rpc;
 pub mod seq;
+pub mod settings;
 pub mod sigdb;
 pub mod signed;
 pub mod sigs;

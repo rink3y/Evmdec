@@ -109,6 +109,8 @@ impl<'a> Pass<'a> {
             words: start.calldata.len() / 32,
             value: false,
             storage: false,
+            answers: true,
+            settings: None,
             fixed: shape.fixed.clone(),
         };
         let code = self.c.code_of(f);
@@ -213,7 +215,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     let mut pass = Pass {
         c,
         layout: c.compiler.layout,
-        begin: deploy::storage(c),
+        begin: deploy::start(c),
         explorers: Explorers::default(),
     };
     let external = |f: &&Function| f.kind == FnKind::External && f.effects.writes_storage;

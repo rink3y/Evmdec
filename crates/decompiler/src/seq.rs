@@ -40,6 +40,8 @@ fn free(entry: Entry, storage: bool) -> Free {
         words: entry.words,
         value: true,
         storage,
+        answers: false,
+        settings: None,
         fixed: Vec::new(),
     }
 }

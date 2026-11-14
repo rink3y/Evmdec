@@ -91,6 +91,8 @@ fn runs(c: &Contract) -> Vec<Run<'_>> {
                     words: WORDS.max(calldata.len() / 32),
                     value: true,
                     storage: assumed,
+                    answers: true,
+                    settings: None,
                     fixed: fixed.clone(),
                 };
                 let start = Inputs {

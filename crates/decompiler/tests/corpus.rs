@@ -925,3 +925,22 @@ fn stores_nothing_reads_are_left_out() {
         "the scratch word of a hash the lifter resolved is not printed"
     );
 }
+
+#[test]
+fn a_dynamic_call_is_kept_only_where_a_run_shows_the_caller_chooses_the_selector() {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vuln/smt_token.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
+    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    let report = evmdec::analyze::analyze(&c);
+    let dynamic: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.id == "dynamic-call")
+        .collect();
+    assert_eq!(dynamic.len(), 1, "{dynamic:?}");
+    assert!(dynamic[0].confirmed, "{:?}", dynamic[0]);
+    let function = dynamic[0].function.as_deref().unwrap_or_default();
+    assert!(!function.contains("approveAndCall"), "{function}");
+    let shown = &dynamic[0].description;
+    assert!(shown.contains("The caller decides"), "{shown}");
+}

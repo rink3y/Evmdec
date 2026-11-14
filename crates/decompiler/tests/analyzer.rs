@@ -2784,6 +2784,24 @@ fn cases() -> Vec<Case> {
             || dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP"),
         ),
         pair(
+            "one-call-reading-leaves-a-gain",
+            true,
+            || {
+                dispatcher3(
+                    &pay_in(&credited_at(ASKED_OF_ONE)),
+                    &pay_out_checked(),
+                    "STOP",
+                )
+            },
+            || {
+                dispatcher3(
+                    &pay_in(&credited_plainly(ASKED_OF_ONE)),
+                    &pay_out_checked(),
+                    "STOP",
+                )
+            },
+        ),
+        pair(
             "weak-randomness",
             true,
             || dispatcher(&pays_double_when(BLOCK_MIX)),
@@ -2821,6 +2839,23 @@ fn refunds_outside(place: &str) -> String {
         "PUSH2 0x0e10 {place} LT PUSH2 @open JUMPI CALLVALUE {SEND_TO_CALLER} STOP \
          :open JUMPDEST PUSH1 0x01 PUSH1 0x02 SSTORE STOP"
     )
+}
+
+const ASKED_OF_ONE: &str = "PUSH2 0xfeed";
+const ASKED_OF_NAMED: &str = "PUSH1 0x04 CALLDATALOAD";
+
+fn reading_from(callee: &str) -> String {
+    format!(
+        "PUSH1 0x20 PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 {callee} GAS STATICCALL POP PUSH1 0x00 MLOAD"
+    )
+}
+
+fn credited_at(callee: &str) -> String {
+    format!("{} CALLVALUE MUL", reading_from(callee))
+}
+
+fn credited_plainly(callee: &str) -> String {
+    format!("{} POP CALLVALUE", reading_from(callee))
 }
 
 fn shown(case: &Case, code: &[u8]) -> bool {
@@ -3439,4 +3474,174 @@ fn a_caller_test_against_a_record_anyone_opens_does_not_lower_a_re_entry_finding
     let r = report_of(&dispatcher3(&open, &owner, "STOP"));
     let f = finding(&r, "reentrancy").unwrap_or_else(|| panic!("{:?}", ids(&r)));
     assert_eq!(f.severity, Severity::Medium, "{f:?}");
+}
+
+const NEEDS_TWO_WORDS: &str = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP1 PUSH1 0x11 GAS CALL POP \
+     PUSH1 0x40 RETURNDATASIZE LT ISZERO PUSH2 @long JUMPI PUSH1 0x00 DUP1 REVERT \
+     :long JUMPDEST PUSH1 0x20 PUSH1 0x20 PUSH1 0x80 RETURNDATACOPY PUSH1 0x80 MLOAD \
+     PUSH2 @set JUMPI PUSH1 0x00 DUP1 REVERT :set JUMPDEST PUSH1 0x01 PUSH1 0x01 SSTORE STOP";
+
+#[test]
+fn a_search_lengthens_and_fills_the_answer_a_caller_decodes() {
+    let code = dispatcher(NEEDS_TWO_WORDS);
+    let explorer = evmdec::path::Explorer::new(&code);
+    let start = evmdec::path::inputs_for(Some(0xaaaa_aaaa), 1);
+    let finishes = |answers: bool| {
+        let free = evmdec::solve::Free {
+            words: 1,
+            answers,
+            ..Default::default()
+        };
+        let found = explorer.explore(&start, &free, evmdec::path::Limits::default());
+        found.iter().any(evmdec::path::Path::succeeded)
+    };
+    assert!(finishes(true));
+    assert!(!finishes(false));
+}
+
+fn assumed(r: &analyze::Report) -> Vec<String> {
+    let section = r.maps.iter().find(|s| s.title == "Assumed settings");
+    section.map_or(Vec::new(), |s| s.lines.clone())
+}
+
+const SET_BY_OWNER: &str = "PUSH1 0x01 PUSH1 0x09 SSTORE STOP";
+
+fn behind_flag(label: &str, body: &str) -> String {
+    format!("PUSH1 0x09 SLOAD PUSH2 @{label} JUMPI PUSH1 0x00 DUP1 REVERT :{label} JUMPDEST {body}")
+}
+
+#[test]
+fn a_flag_only_its_owner_sets_is_assumed_and_the_check_behind_it_is_reached() {
+    let owner_sets = format!("{OWNER_GATE} {SET_BY_OWNER}");
+    let code = dispatcher3(
+        &behind_flag("in", &counted_pay_in()),
+        &behind_flag("out", &pay_out_recorded(true)),
+        &owner_sets,
+    );
+    let r = report_of(&code);
+    assert_eq!(assumed(&r).len(), 1, "{:?}", assumed(&r));
+    assert!(assumed(&r)[0].contains("slot 0x9"), "{:?}", assumed(&r));
+    let f = finding(&r, "surplus-open-to-any-account").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(
+        f.description.contains("assumed settings"),
+        "{}",
+        f.description
+    );
+}
+
+#[test]
+fn a_flag_any_caller_sets_is_a_record_and_is_not_assumed() {
+    let code = dispatcher3(
+        &behind_flag("in", &counted_pay_in()),
+        &behind_flag("out", &pay_out_recorded(true)),
+        SET_BY_OWNER,
+    );
+    assert!(assumed(&report_of(&code)).is_empty());
+}
+
+#[test]
+fn no_setting_is_chosen_to_make_the_caller_the_owner() {
+    let owner_only = format!("{OWNER_GATE} PUSH1 0x01 PUSH1 0x01 SSTORE STOP");
+    let r = report_of(&dispatcher(&owner_only));
+    assert!(assumed(&r).is_empty(), "{:?}", assumed(&r));
+    assert_eq!(r.privileged_functions.len(), 1, "{r:?}");
+}
+
+fn calls_with(head: &str, target: &str) -> String {
+    format!(
+        "{head} PUSH1 0x80 MSTORE PUSH1 0x00 DUP1 PUSH1 0x24 PUSH1 0x80 PUSH1 0x00 \
+         {target} GAS CALL POP STOP"
+    )
+}
+
+#[test]
+fn a_selector_that_never_follows_the_call_data_is_not_a_dynamic_call() {
+    let named = "PUSH1 0x04 CALLDATALOAD";
+    let from_storage = dispatcher(&calls_with("PUSH1 0x07 SLOAD", named));
+    let r = report_of(&from_storage);
+    assert!(finding(&r, "dynamic-call").is_none(), "{:?}", ids(&r));
+}
+
+#[test]
+fn moving_one_item_has_no_answer_to_refuse_with() {
+    let asks_owner = "PUSH4 0x6352211e PUSH1 0xe0 SHL PUSH1 0x80 MSTORE PUSH1 0x04 CALLDATALOAD \
+                      PUSH1 0x84 MSTORE PUSH1 0x20 PUSH1 0x00 PUSH1 0x24 PUSH1 0x80 PUSH2 0xa55e \
+                      GAS STATICCALL POP";
+    let pulls = "PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
+                 ADDRESS PUSH1 0xa4 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0xc4 MSTORE PUSH1 0x00 \
+                 DUP1 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 PUSH2 0xa55e GAS CALL POP \
+                 PUSH1 0x01 CALLER SSTORE STOP";
+    let rule = "refused-transfer-treated-as-done";
+    let amounts = report_of(&dispatcher(pulls));
+    assert!(finding(&amounts, rule).is_some(), "{:?}", ids(&amounts));
+    let items = report_of(&dispatcher(&format!("{asks_owner} {pulls}")));
+    assert!(finding(&items, rule).is_none(), "{:?}", ids(&items));
+}
+
+const ENTRY_OF_WORD: &str =
+    "PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
+
+fn token_with(third: &str) -> Vec<u8> {
+    let entry = |word: &str| format!("{word} {ENTRY_OF_WORD}");
+    let balance_of = format!(
+        "{} SLOAD PUSH1 0x80 MSTORE PUSH1 0x20 PUSH1 0x80 RETURN",
+        entry("PUSH1 0x04 CALLDATALOAD")
+    );
+    let transfer = format!(
+        "PUSH1 0x24 CALLDATALOAD {from} SLOAD DUP2 DUP2 LT PUSH2 @short JUMPI SUB {from} SSTORE \
+         {to} SLOAD PUSH1 0x24 CALLDATALOAD ADD {to} SSTORE STOP :short JUMPDEST PUSH1 0x00 DUP1 REVERT",
+        from = entry("CALLER"),
+        to = entry("PUSH1 0x04 CALLDATALOAD"),
+    );
+    asm(&format!(
+        "PUSH1 0x80 PUSH1 0x40 MSTORE PUSH1 0x00 CALLDATALOAD PUSH1 0xe0 SHR \
+         DUP1 PUSH4 0x70a08231 EQ PUSH2 @a JUMPI DUP1 PUSH4 0xa9059cbb EQ PUSH2 @b JUMPI \
+         PUSH4 0xcccccccc EQ PUSH2 @c JUMPI PUSH1 0x00 DUP1 REVERT \
+         :a JUMPDEST POP {balance_of} :b JUMPDEST POP {transfer} :c JUMPDEST {third}"
+    ))
+}
+
+#[test]
+fn a_call_that_lowers_the_balance_of_an_account_that_took_no_part_is_reported() {
+    let entry = |word: &str| format!("{word} {ENTRY_OF_WORD}");
+    let lowers = |whose: &str, amount: &str| {
+        format!(
+            "{amount} {from} SLOAD DUP2 DUP2 LT PUSH2 @less JUMPI SUB {from} SSTORE STOP \
+             :less JUMPDEST PUSH1 0x00 DUP1 REVERT",
+            from = entry(whose)
+        )
+    };
+    let takes = lowers("PUSH1 0x04 CALLDATALOAD", "PUSH1 0x24 CALLDATALOAD");
+    let rule = "call-lowers-another-accounts-balance";
+    let r = report_of(&token_with(&takes));
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    assert!(f.confirmed, "{f:?}");
+
+    let burns_own = lowers("CALLER", "PUSH1 0x04 CALLDATALOAD");
+    let r = report_of(&token_with(&burns_own));
+    assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
+}
+
+#[test]
+fn a_reading_that_differs_for_one_call_must_leave_no_gain() {
+    let rule = "one-call-reading-leaves-a-gain";
+    let vault = |credit: String| dispatcher3(&pay_in(&credit), &pay_out_checked(), "STOP");
+
+    let r = report_of(&vault(credited_at(ASKED_OF_ONE)));
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium, "{f:?}");
+    assert!(f.confirmed, "{f:?}");
+    assert!(
+        f.description.contains("for that one call"),
+        "{}",
+        f.description
+    );
+
+    let r = report_of(&vault(credited_at(ASKED_OF_NAMED)));
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+
+    let r = report_of(&vault(credited_plainly(ASKED_OF_ONE)));
+    assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
 }

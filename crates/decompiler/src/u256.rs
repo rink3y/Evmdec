@@ -48,9 +48,6 @@ impl U256 {
     pub fn low_u64(&self) -> u64 {
         self.0[0]
     }
-    pub fn low_u128(&self) -> u128 {
-        self.0[0] as u128 | ((self.0[1] as u128) << 64)
-    }
     pub fn fits_u64(&self) -> bool {
         self.0[1] == 0 && self.0[2] == 0 && self.0[3] == 0
     }

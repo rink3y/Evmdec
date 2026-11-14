@@ -47,10 +47,10 @@ Every stage is in `crates/decompiler`:
 | `types`, `type_rules` | type recovery as constraint solving over parameters, storage, helpers and merges |
 | `structure`, `emit`, `function`, `sigs`, `sigdb`, `naming` | loops, conditionals and short-circuits; printing; signature dictionary and local index; names inferred from roles |
 | `compiler` | compiler version and feature fingerprints when the metadata is missing |
-| `analyze`, `confirm`, `invariant`, `exec`, `cross` | security rules, concrete confirmation of reachable findings, invariant search, whole-frame and cross-contract executors |
+| `analyze`, `confirm`, `invariant`, `exec` | security rules, concrete confirmation of reachable findings, invariant search, the whole-frame executor |
 | `path`, `solve`, `seq`, `abi`, `deploy` | the path engine: one concrete run lifted into its branch conditions and writes, a solver that inverts a condition back to an input word, a search over short call sequences, ABI-shaped starting inputs, and the storage a constructor leaves |
 | `props`, `flow`, `signed`, `standard`, `origin`, `range`, `evidence` | checks made by running the code: properties inferred from behaviour, what calls take and return, signed messages, the standard ledger interface as measured, where stored values come from, value ranges along a path, and what a confirming run was seen to do |
-| `world`, `search` | the contract with what surrounds it (each account's ether, the books of the assets it calls, the time), and one search over sequences of calls in that world |
+| `world`, `search` | every contract of a run with what surrounds them (code and storage at each address, each account's ether, the books of the assets called, the time), and one search over sequences of calls in that world |
 | `interp`, `verify` | reference EVM interpreter and the block oracle |
 | `rpc`, `fetch`, `decompile`, `slots`, `clock` | chain access, proxy and diamond resolution, the walk over call targets, composition, well-known storage slots, the time limit one dependency is given |
 
@@ -189,7 +189,7 @@ stake or balance mapping anyone can fill is accounting, not authorisation.
 Two passes run after the rules. The confirmation pass drives the concrete executor from a
 fresh state into each reachable sink and marks a finding confirmed with a witness input when
 the effect shows. A finding that spans a call edge is confirmed by running it across the
-fetched contracts (`cross`): calls run the callee's code in the callee's storage, library calls
+fetched contracts (`world`): calls run the callee's code in the callee's storage, library calls
 run in the caller's storage, creations run their init code, and a frame that fails takes its
 writes back. The state is only what was read from the chain: each contract's code, the
 addresses its slots were read to hold, and gates set for the callers a contract's own storage
@@ -235,11 +235,9 @@ done in the pass that confirms what other rules found.
 | reachability | a sink no single input reaches is tried through up to three earlier calls that write the storage it needs; the earlier calls are attached to the finding |
 | arithmetic | an input that takes a path ending normally and makes a stored sum, difference or product wrap; open when no such run exists from the starting storage. A small interval analysis reads the masks, the checks on each path and the orderings they prove; when every stored result on every finished path stays in range, the finding is kept at the lowest severity and says so |
 | properties from behaviour | a mapping and a total that at least two functions move in step, then a path that moves them apart (`entries-total-out-of-step`) or calls out between the two updates (`total-open-at-call`); a slot toggled like a lock and left set on one path (`lock-left-set`); a memory copy of storage changed and dropped (`changed-copy-dropped`); a value written from one block clock and compared with the other (`clock-units-mixed`); a storage slot or memory offset picked by an untested word of the call (`input-picks-storage-slot`, `input-picks-memory-offset`); input one byte short still accepted (`short-input-accepted`); work that grows with a count any caller can raise (`cost-grows-with-open-list`); a bound compared with the block clock that any caller can store (`time-bound-set-by-anyone`) and a time check on a slot nothing sets (`time-window-never-opens`); a payment of value to accounts read from storage that fails as a whole when one of them refuses (`one-refusal-blocks-all`, or confirms `blocking-payout-loop` and `fixed-payee-can-block`) |
-| value flow | an account pays in, then every other function is run from that state: a second call that returns more than was paid (`two-calls-return-more`); the same payment by a second account with the balance the contract reads raised from outside, credited nothing (`inflow-credits-nothing`); a payment run again with the receiver being code that repeats the call, paid twice, also when the payment goes through an asset that runs the receiver's code during the transfer (confirms `reentrancy`, or `reentered-call-pays-again`); a second account repeating the first payment, after which the first account takes out more than it paid (`payout-grows-with-other-payment`); another account's call that pays nothing in and takes nothing out, placed before a payout, lowering it while no argument can refuse the lower amount (`earlier-call-lowers-payout`); what a call hands out and takes compared for two amounts and for their sum at one state, showing a division that rounds toward the caller (`rounding-favours-caller`) |
-| value at the edge | only what crosses the contract's edge is counted, never how the contract records it, so a queue, a mapping and a packed record are judged alike. Every entry point is used, the fallback and receive paths included, and the amount paid is whatever the function's own checks accept. One account pays in, the contract is given a surplus, and a second account with no stake pays in again at several sizes and tries every function that can pay out: taking out more than it paid is `surplus-open-to-any-account`, or `payment-taken-by-other-account` when no surplus was needed. In these runs the balance falls as ether is sent, as it does on chain |
-| a reading that lasts one call | an account pays in and takes out, after a first account has paid in. With every outside answer as first given it gets back no more than it paid. One word of one answer is then a thousand times higher or lower for the length of one of its two calls, and as first given for the other. If the account now ends with more than it paid, and the contract held enough to pay it, a change that lasted one call left a gain that stays (`one-call-reading-leaves-a-gain`). A transfer's answer and a question that names the contract itself are not moved. The finding is high when the caller can move the answer, because it is what an asset reports another account holds or comes from a contract the call data names, and medium otherwise. A contract that reads an answer and does not credit or pay from it is not reported |
+| value flow | an account pays in, then every other function is run from that state: the same payment by a second account with the balance the contract reads raised from outside, credited nothing (`inflow-credits-nothing`); another account's call that pays nothing in and takes nothing out, placed before a payout, lowering it while no argument can refuse the lower amount (`earlier-call-lowers-payout`); what a call hands out and takes compared for two amounts and for their sum at one state, showing a division that rounds toward the caller (`rounding-favours-caller`). These three read the credit from the caller's storage entry, which the search below does not |
 | records against assets | a function that asks two assets named in its call data what the contract holds is run with a balance that moves during its outside call. With two different assets the entries kept under each must change by exactly what that asset reported; only then are they known to be its record. With both words naming one asset, a record that rises by more than the asset did is `ledger-credits-more-than-received`. Also run on libraries the contract calls by delegatecall |
-| sequences of calls | one search over what calls do in order, in a world that holds the contract's storage, each account's ether, the books of every address the contract speaks the standard transfer interface to, and the time. Two accounts with no role start with the same holdings. The books are honest: a transfer the sender cannot cover fails, and a balance asked for is what was really sent. An account that let the contract take an asset in a call of its own leaves that approval standing. A sequence that reaches code no earlier one reached is kept and extended. The next function is taken, three times in four, from those that read a slot the sequence wrote. Inputs come from solving the function's own checks at the state reached, then from changing words to amounts seen earlier in the sequence, a word typed as an address is set to one of the two accounts or the contract, and time may pass between calls. After every call that ends, what the second account holds is compared with what it held before its first call. More of something and less of nothing is `calls-leave-account-with-gain`, with the calls attached. A call that sets a slot it found empty and cannot be made again is set-up, and only the first account makes it. The finding is medium when the gain is only a balance in the contract's own ledger and time had to pass, as a reward that accrues would, and when the value gained came in with nothing written to storage, so that the contract keeps no record of whose it is. After each call by the second account the first account's holdings are compared as well: less of something and more of nothing, through a call it did not make, is `call-leaves-another-account-with-less`. It is high for a balance in the contract's own ledger and medium for an asset that left under the standing approval, since a credit no balance function shows cannot be seen |
+| sequences of calls | one search over what calls do in order, in one world. The world holds the code and storage of the contract and of every contract it is linked to, each account's ether, the books of every address spoken to in the standard transfer interface, and the time. A call to an address that has code runs that code, with delegated calls, created contracts and a failed call undone. Assets keep honest books: a transfer the sender cannot cover fails, a balance asked for is what was really sent, and an account that let a contract take an asset once leaves that approval standing. Any other question to an address without code gets the answer the solver had it give, the same for every call. Two accounts with no role start with the same holdings. A sequence is kept and extended when it reaches code no earlier one reached, or leaves the two accounts' holdings, the slots that are set or the value the contract has no record of in a combination not seen before. The next function is taken, three times in four, from those that read a slot the sequence wrote. Inputs come from solving the function's own checks at the state reached, then from changing the words that are parameters to amounts seen in the sequence, to what the contract holds, and to the accounts in the run. Besides a call, a step may send value straight to the contract outside its functions, let time pass, have the paid account call in again from inside the payment, or let one word of one outside answer read about a thousand times higher or lower for that call only. For a function that needs a payment the search opens with the other account paying, value the contract has no record of arriving, and the actor paying twice at each pair of a few sizes. After every step that ends, three things are checked. The second account holds more of something and less of nothing than before its first call: `calls-leave-account-with-gain`, medium when the gain is only a balance in the contract's own ledger and time had to pass, or when the value came in with nothing written to storage. The same gain when it needs the call made again from inside its payment and the plain call leaves none confirms `reentrancy`, or is `reentered-call-pays-again`. The same gain when it needs the one answer that differed, and the same calls with every answer as first given leave none, is `one-call-reading-leaves-a-gain`, high when the answer is an asset's count of what another account holds or comes from a contract the call data names. And the first account holds less of something and more of nothing through a call it did not make: `call-leaves-another-account-with-less`. A call that sets a slot it found empty and cannot be made again is set-up, and only the first account makes it. The first account never names the second |
 | draws from the block | a function that takes a hash or a remainder of block values and can pay ether is run with a payment, with storage chosen so that its own checks accept the call, until a run pays the caller more than it brought. The same call is then run one to three blocks later with nothing else changed: a payment that is no longer made shows the block decides who is paid (confirms `weak-randomness`). A remainder of the time alone, which places a moment in a schedule, is not taken for a draw |
 | callee answers | each call the contract makes can be answered separately: a transfer that answers false and is treated as done (confirms `erc20-return-ignored`, or `refused-transfer-treated-as-done`); a transfer that returns nothing and makes the function fail (`transfer-without-answer-refused`); a payout that changes when a value read from outside is halved (confirms `no-slippage-bound` and `spot-balance-price`); a function that credits exactly the amount it asked an asset for without reading its own balance (confirms `fee-on-transfer`) |
 | signed messages | a signed call is run, then run again unchanged from the state it left, with recovery answering the signer for the first digest only; accepted again means nothing takes the message out of use (`signed-message-accepted-twice`). Each argument word is then changed in turn: a word that changes what the call does while the digest stays the same is not signed (`signed-call-leaves-word-unsigned`) |
@@ -326,13 +324,13 @@ trust rules were built on and tested against.
 ### Labelled fixtures per rule
 
 `python3 corpus/rule_bench.py`. `testdata/rules` holds a flawed and a sound hand-assembled
-fixture for each of 30 rules that work by running the code, with the expected result in
+fixture for each of 27 rules that work by running the code, with the expected result in
 `manifest.json`.
 
 | | |
 |---|---|
 | fixtures | 62 |
-| rules at precision 1.00 and recall 1.00 | 30 / 30 |
+| rules at precision 1.00 and recall 1.00 | 27 / 27 |
 | results that change when the code is padded after every jump destination | 0 |
 | rules whose sound fixture depends on a guard, and notice when it is removed | 6 / 6 |
 | sound fixtures on which another rule of the table is confirmed without cause | 0 |
@@ -347,32 +345,28 @@ audited code.
 
 `python3 corpus/heldout_bench.py --set incidents`. `testdata/incidents` holds 231 contracts
 from public incidents and 55 with no known flaw, collected like the held-out set below from
-a different third of the same index. This is where misses are read and rules are shaped: 80
+a different third of the same index. This is where misses are read and rules are shaped: 82
 of the 231 get the right kind of finding at high or above. Read by root cause, the largest
 groups among the misses are a token whose code changes a pool's balance outside a transfer,
 an amount priced from a reading that one transaction can move, a swap of the contract's own
 holdings that anyone can trigger with no minimum, and reward accounting that pays the same
 claim twice. No one rule covers a group: each incident meets its conditions in its own way.
 
-The checks that pay in and take out reach few of these contracts, and the reason was
-measured (`EVMDEC_DEBUG_CROSSINGS` prints it for one contract). Every function of every
-contract was run by an account with no role, with settings and answers chosen so that it can
-end: 64% of 8,060 functions end. A function that brings value in exists on 70 of the 231
-contracts. Once an account has paid in, a function that sends value back to that account
-exists on 9 of them, and on 11 when a month passes first. About a third of the contracts are
-tokens, whose value moves inside their own ledger and never crosses the edge. So the shape
-"pay in, then take out" fits about one flawed contract in twenty, whatever is measured on
-it, and the check on a reading that lasts one call fires on none.
+Four older checks each paid in and took out along one fixed shape. Measured on these
+contracts, every function was run by an account with no role with settings and answers
+chosen so that it can end, and 64% of 8,060 functions end. A function that brings value in
+exists on 70 of the 231 contracts, and one that then sends value back to the same account
+on 9. About a third of the contracts are tokens, whose value moves inside their own ledger.
+So one fixed shape fits about one flawed contract in twenty, and on 340 contracts of the
+development corpora those four checks fired only on their own fixtures.
 
-The search over sequences of calls does not start from that shape. On 229 of these contracts
-it finds an input under which a function ends on 223, keeps a state beyond the starting one
-on 224, and reaches a state in which the contract holds value on 43, where the pay-in checks
-reached 24. With the two properties it checks so far it takes that count from 78 to 80 and
-adds no high finding on the 55 contracts with no known flaw. The second property, an
-account left with less by a call it did not make, fires on none of the 286 contracts. The
-gain it brought came from what it needed: approvals that stay, and address words set to the
-accounts in the run. Reaching the states is the base. The properties checked on them are
-what is still to be built.
+They are now one statement checked by the search over sequences of calls: an account with
+no role ends with more than it had. The search reaches a state in which the contract holds
+value on 43 of 229 contracts where the fixed shape reached 24, runs linked contracts' code
+in the same world, and found the gain on every fixture the four checks had. It took the
+count above from 78 to 82 and adds no high finding on the 55 contracts with no known flaw.
+The three value-flow checks that remain read a credit from the caller's storage entry, which
+the search does not, and so far fire only on their fixtures.
 
 ### Held-out set
 
@@ -584,10 +578,9 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
 - The checks with a second account assume the balance the contract reads does not move unless
   a call in the run moves it, and the ordering check only places calls that pay nothing in and
   take nothing out, so that assumption holds.
-- The value-flow and re-entry checks need a function that takes a payment and credits the
-  payer in one call from the starting storage. Contracts that need a longer setup are not
-  reached: none of the reentrancy findings on the 26 exploited contracts is confirmed this
-  way. After a payment the contract is taken to hold what was paid in and no more.
+- The value-flow checks need a function that takes a payment and credits the payer in one
+  call from the starting storage. After a payment the contract is taken to hold what was
+  paid in and no more.
 - The signed-message and standard-interface checks choose storage so that the call can end
   normally, and say so in the finding. They show what the code does in that state, not that
   the state is reachable.
@@ -595,26 +588,27 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   block decides the payment, not how much the deployed contract holds to pay with. A draw
   that needs a second call to settle, or a value fetched from another contract, is reported
   from the code alone and stays unconfirmed.
-- The check at the contract's edge reports that a surplus can be collected, with the calls
-  that do it. It cannot know whether the deployed contract holds a surplus, or how large a
-  loss was. It tries one payment repeated up to eight times and three payments of up to six
-  sizes each, so a gain that needs a longer or finer sequence is not found.
 - The assumed settings are one configuration under which the open functions run, not the one
   a deployment has. A slot written by any function without a caller check is never assumed,
   so what an open initialiser sets stays empty, and a contract whose state lives behind a
   storage pointer passed as an argument gets no settings at all. A finding measured from
   assumed settings holds for that configuration and says which it is.
 - An answer the search chose is one the code accepts, not one a real callee is known to give.
-- The check on a reading that lasts one call moves one word at a time across one pay-in and
-  one take-out, and counts only ether and standard transfers. A gain that needs a longer
-  sequence, or is paid by minting, is not found. It cannot know what moving an answer costs,
-  only that the contract's own code turns a one-call change into a lasting gain.
-- The search over sequences of calls checks two properties so far: an account with no role
-  ending with more than it had, and an account left with less by a call it did not make.
-  It runs one contract, with assets that keep honest books and
-  every other call answered with one word. A gain that needs an asset that misreports, a
-  price that moves, a second contract or more than six calls is not found. It stops when an
-  eighth of its work reaches no new code, so a branch behind a rare input is not reached.
+- The search over sequences of calls is a search, not a proof. It runs two accounts through
+  at most six steps, stops when ten thousand rounds or an eighth of its work reach nothing
+  new, and keeps the first state it meets of each kind, so a gain that needs a third
+  account, a longer sequence or a rare input is not found. Its findings are what happened in
+  a run: the calls are attached and can be made again.
+- In those runs an asset keeps honest books and any other outside answer is the one the
+  solver chose, the same for every call. An asset that misreports, takes a fee or changes
+  what it holds by itself is not modelled. The one answer that differs for one call is
+  about a thousand times higher or lower. The search cannot know what moving an answer
+  costs, only that the contract's own code turns a one-call change into a lasting gain.
+- Value sent straight to the contract is tried only while the contract holds a payment it
+  recorded. A gain taken from it is reported at medium, because the contract keeps no record
+  of whose that value is.
+- A contract the one under test is linked to runs its own code only when its code was
+  fetched with it. From bytecode alone every other address is an asset or answers one word.
 - Whether a called contract passes control on is read from the code that contract has today.
   A payee taken from memory, a helper or another contract's answer is reported as worked out
   at run time, at low confidence, because its origin is not traced.

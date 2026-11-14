@@ -209,7 +209,7 @@ other way to get an input that takes the other branch. The solver is a generator
 decision procedure: it inverts arithmetic back to a word of the call, the value sent or, when
 asked, a storage slot, and every answer it gives is run again on the bytecode before anything
 is built on it. On the 22 audited contracts the lifted conditions agree with the interpreter
-on all 70,261 branches taken. When creation code is given, the constructor is run first and
+on all 83,865 branches taken. When creation code is given, the constructor is run first and
 every check starts from the storage it leaves; with runtime code only, they start from empty
 storage and say so.
 
@@ -313,7 +313,7 @@ whose exploits are public, from The DAO to Balancer V1, with the rules that must
 | missed | the Fence tranche pool on Avalanche. Its limits are computed from an in-memory copy of the record. Reading limits from runs now recovers one of the two, which was invisible before; the other is not in a form the rule recognises, so the pool is still missed |
 | also missed | a swap library that records a gain twice when the asset in and the asset out are the same: the check for it needs the outside call to answer in the shape the code decodes, and the run engine answers with one word. A token whose rewards contract paid user-registered accounts in the middle of a transfer: the rule for it fires on a two-contract fixture, but the rewards contract that address points at today does not make those payments during the call |
 | not counted | Nomad, an upgrade-time state error outside bytecode patterns |
-| high or critical findings on the 22 audited contracts | 27, nearly all on contracts whose purpose is to execute caller-supplied calls |
+| high or critical findings on the 22 audited contracts | 24, nearly all on contracts whose purpose is to execute caller-supplied calls |
 
 The audited corpus is the running false-positive budget for every rule change. The TENDRIL
 token on BSC, whose pool was drained through a hook contract the token trusted, is the case the
@@ -349,16 +349,24 @@ recall above is measured on contracts the rules were developed on.
 
 | | |
 |---|---|
-| flawed contracts with the right kind of finding at high or above | 96 / 234 = 41% |
+| flawed contracts with the right kind of finding at high or above | 94 / 234 = 40% |
 | the same at medium or above | 134 / 234 = 57% |
-| flawed contracts with any finding at high or above | 121 / 234 = 52% |
-| contracts with no known flaw and nothing at high or above | 78 / 101 = 77% |
+| flawed contracts with any finding at high or above | 119 / 234 = 51% |
+| contracts with no known flaw and nothing at high or above | 80 / 101 = 79% |
 
 The label is the kind of flaw, not the function it is in, so the first row is an upper
-bound. By kind, recall is 0.69 for calls that hand control out before state is settled, 0.48
-for missing checks on who may call, 0.37 for accounting, 0.34 for prices read from outside
-and 0.21 for arithmetic. On the contracts with no known flaw, 15 of the 23 that get a high
+bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.46
+for missing checks on who may call, 0.37 for accounting, 0.33 for prices read from outside
+and 0.29 for arithmetic. On the contracts with no known flaw, 9 of the 21 that get a high
 finding get it from `dynamic-call`.
+
+The set was first scored at 96, 121 and 78 on the first, third and fourth rows. The assumed
+settings and the chosen answers were built after that score, on the development corpus, where
+they take more explorations to their end (62% against 57%). They did not raise recall here.
+The test of who chooses a selector withdrew `dynamic-call` on six of the contracts with no
+known flaw, and with it two flawed contracts that had counted as found through a selector the
+caller does not choose. Getting further into a function is not yet finding more of what is
+wrong in it.
 
 ### Random sample
 

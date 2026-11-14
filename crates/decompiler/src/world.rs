@@ -36,6 +36,20 @@ pub struct Call {
     pub seconds_later: u64,
     // A call the sender makes into the same contract when it is paid during this one.
     pub back: Option<(Vec<u8>, U256)>,
+    // One outside answer that reads about a thousand times higher or lower for this
+    // call only: which of the answers asked for, which of its words, and which way.
+    pub swing: Option<(usize, usize, bool)>,
+}
+
+// The answer a call saw differently from every other call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Swung {
+    pub address: U256,
+    // An asset's count of what another account holds follows any transfer to that
+    // account, so whoever calls can move it.
+    pub balance: bool,
+    pub was: U256,
+    pub now: U256,
 }
 
 // What one account holds: ether, each outside asset it touched, and what the contract
@@ -66,6 +80,10 @@ pub struct Done {
     // Whether any ether or asset changed hands, between any two accounts.
     pub moved: bool,
     pub called_back: bool,
+    pub swung: Option<Swung>,
+    // Whether an address without code was asked something outside the transfer
+    // interface, so that what the call did rests on an answer nobody keeps books for.
+    pub asked: bool,
     pub writes: Vec<Write>,
 }
 
@@ -100,6 +118,9 @@ pub struct World {
     ether: HashMap<U256, U256>,
     assets: HashMap<(U256, U256), U256>,
     approved: HashSet<(U256, U256)>,
+    // What an address without code answers to a question outside the transfer
+    // interface. The first answer given stands, so every call sees the same one.
+    readings: HashMap<(U256, u32), Vec<u8>>,
     funded: Vec<U256>,
     timestamp: U256,
     number: U256,
@@ -121,6 +142,8 @@ struct Run {
     target: U256,
     steps: usize,
     back: Option<(Vec<u8>, U256)>,
+    swing: Option<(usize, usize, bool)>,
+    asked: Vec<(U256, u32, U256)>,
     done: Done,
 }
 
@@ -170,6 +193,11 @@ impl World {
         self.funded.push(who);
     }
 
+    pub fn tell(&mut self, address: U256, selector: u32, answer: &[u8]) {
+        let told = self.readings.entry((address, selector));
+        told.or_insert_with(|| answer.to_vec());
+    }
+
     pub fn seed(&mut self, address: U256, slot: U256, value: U256) {
         self.storage.entry(address).or_default().insert(slot, value);
     }
@@ -198,14 +226,25 @@ impl World {
         (self.timestamp, self.number)
     }
 
-    pub fn holds_value(&self, who: U256) -> bool {
-        let asset =
-            |((_, holder), amount): (&(U256, U256), &U256)| *holder == who && !amount.is_zero();
-        !self.ether_of(who).is_zero() || self.assets.iter().any(asset)
+    // Each amount an account holds, of ether and of every asset.
+    pub fn held(&self, who: U256) -> Vec<U256> {
+        let assets = self.assets.iter().filter(|((_, holder), _)| *holder == who);
+        let amounts = assets
+            .map(|(_, amount)| *amount)
+            .chain([self.ether_of(who)]);
+        amounts.filter(|amount| !amount.is_zero()).collect()
     }
 
+    pub fn holds_value(&self, who: U256) -> bool {
+        !self.held(who).is_empty()
+    }
+
+    // Every account that is not a contract holds a purse. A contract holds one only
+    // when it was given one, and the contract under test starts with nothing.
     fn purse(&self, who: U256) -> U256 {
-        match self.funded.contains(&who) {
+        let tested = who == exec::SELF && !self.entries.is_empty();
+        let contract = tested || self.codes.contains_key(&who);
+        match !contract || self.funded.contains(&who) {
             true => PURSE,
             false => U256::ZERO,
         }
@@ -281,7 +320,9 @@ impl World {
             ..Call::default()
         };
         let done = self.clone().call(entry, &call);
-        (done.ended && done.returned.len() >= 32).then(|| word(&done.returned, 0))
+        // A balance worked out from an outside answer is that answer, not a ledger.
+        let own = done.ended && !done.asked && done.returned.len() >= 32;
+        own.then(|| word(&done.returned, 0))
     }
 
     // A call to one function of the contract under test.
@@ -319,6 +360,8 @@ impl World {
             target: account,
             steps: 0,
             back: call.back.clone(),
+            swing: call.swing,
+            asked: Vec::new(),
             done: Done::default(),
         };
         let frame = Frame {
@@ -532,9 +575,40 @@ impl World {
         run.done.called_back |= success;
     }
 
+    // The answer as this call sees it, when it is the one that differs for this call.
+    fn seen(&self, run: &mut Run, key: (U256, u32, U256), mut answer: Vec<u8>) -> Vec<u8> {
+        let Some((nth, word_at, up)) = run.swing else {
+            return answer;
+        };
+        if !run.asked.contains(&key) {
+            run.asked.push(key);
+        }
+        let words = answer.len() / 32;
+        if run.asked.iter().position(|k| *k == key) != Some(nth) || words == 0 {
+            return answer;
+        }
+        let at = 32 * (word_at % words);
+        let was = word(&answer, at);
+        let now = match (up, was.bits() <= 240) {
+            (true, true) => was << 10,
+            (true, false) => was,
+            (false, _) => was >> 10,
+        };
+        if now != was {
+            answer[at..at + 32].copy_from_slice(&now.to_be_bytes());
+            run.done.swung = Some(Swung {
+                address: key.0,
+                balance: key.1 == SEL_BALANCE_OF,
+                was,
+                now,
+            });
+        }
+        answer
+    }
+
     // An address without code. An asset answers from its books. Anything else answers
-    // one word that reads as true, which is what a call that went well most often
-    // returns.
+    // what it was told to, or one word that reads as true, which is what a call that
+    // went well most often returns.
     fn answer(&mut self, call: &CallRecord, from: &Frame, run: &mut Run) -> (bool, Vec<u8>) {
         let (this, user) = (from.account, run.origin);
         let changes = call.kind == op::CALL;
@@ -567,13 +641,29 @@ impl World {
                 (moved, one_word(U256::from(moved)))
             }
             Some(SEL_BALANCE_OF) if call.input.len() >= 36 => {
-                (true, one_word(self.asset_of(call.addr, arg(0))))
+                let held = one_word(self.asset_of(call.addr, arg(0)));
+                let party = arg(0) == this || arg(0) == user;
+                match party {
+                    true => (true, held),
+                    false => (
+                        true,
+                        self.seen(run, (call.addr, SEL_BALANCE_OF, arg(0)), held),
+                    ),
+                }
             }
             Some(SEL_ALLOWANCE) => (true, one_word(U256::MAX)),
             Some(SEL_DECIMALS) => (true, one_word(U256::from_u64(DECIMALS))),
             Some(SEL_TOTAL_SUPPLY) => (true, one_word(PURSE)),
             Some(SEL_APPROVE) => yes,
-            _ => yes,
+            // A payment is not a question, whatever comes back from it.
+            _ if !call.value.is_zero() => yes,
+            asked => {
+                run.done.asked = true;
+                let asked = asked.unwrap_or(0);
+                let told = self.readings.get(&(call.addr, asked)).cloned();
+                let answer = told.unwrap_or(one_word(U256::ONE));
+                (true, self.seen(run, (call.addr, asked, U256::ZERO), answer))
+            }
         };
         if delivered {
             self.calls_back(from, run);

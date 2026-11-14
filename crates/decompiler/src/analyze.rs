@@ -1,5 +1,4 @@
 use crate::abi::{SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
-use crate::boundary;
 use crate::compiler;
 use crate::confirm;
 use crate::decompile::{self, Contract, Function};
@@ -5442,9 +5441,6 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         report.maps.extend(crate::props::findings(c, &mut findings));
         let measured = findings.len();
         exec::within(flow::WORK, || flow::findings(c, &mut findings));
-        exec::within(boundary::WORK, || {
-            boundary::swing_findings(c, &mut findings)
-        });
         exec::within(crate::search::WORK, || {
             crate::search::findings(c, &mut findings)
         });

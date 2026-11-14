@@ -7,9 +7,9 @@ use crate::function::FnKind;
 use crate::hex;
 use crate::interp::Rng;
 use crate::path::{self, Explorers, Limits, Path};
-use crate::solve::{Free, Inputs};
+use crate::solve::{word, Free, Inputs};
 use crate::u256::U256;
-use crate::world::{Call, Done, Holdings, World, PURSE};
+use crate::world::{Call, Done, Holdings, Swung, World, PURSE};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 
@@ -45,6 +45,8 @@ struct Entry<'a> {
     shape: Vec<u8>,
     fixed: Vec<usize>,
     addresses: Vec<usize>,
+    // How many leading words of the call are parameters, as far as the types say.
+    params: usize,
     seeds: Vec<(Vec<u8>, U256)>,
     reads: BTreeSet<U256>,
     helped: HashSet<usize>,
@@ -86,6 +88,9 @@ struct Kept {
     // Whether a call by the actor moved an asset out of the other account.
     taken: bool,
     reentered: bool,
+    // The one answer a call of this sequence saw differently, and whether the call
+    // data named the contract that gave it.
+    swung: Option<(Swung, bool)>,
     other: Holdings,
 }
 
@@ -98,6 +103,7 @@ struct Broken {
     taken: bool,
     // Whether the gain needs the account to call in again while it is being paid.
     reentered: bool,
+    swung: Option<(Swung, bool)>,
 }
 
 // One call by the actor after which the other account has less.
@@ -108,9 +114,10 @@ struct Less {
     waited: bool,
 }
 
-// Which way each holding of the two accounts went, which slots are set, and whether
-// value the contract has no record of was sent to it.
-type Place = (Vec<(U256, Ordering)>, BTreeSet<U256>, bool);
+// Which way each holding of the two accounts went, which slots are set, whether value
+// the contract has no record of was sent to it, and whether a call saw an answer
+// differently.
+type Place = (Vec<(U256, Ordering)>, BTreeSet<U256>, bool, bool);
 
 struct Search<'a> {
     c: &'a Contract,
@@ -123,6 +130,13 @@ struct Search<'a> {
     helps_left: usize,
     best: Option<Broken>,
     less: Option<Less>,
+    // What the solver had outside contracts answer. Every world is told the same.
+    readings: Vec<((U256, u32), Vec<u8>)>,
+}
+
+fn names(data: &[u8], who: U256) -> bool {
+    let words = data.len().saturating_sub(4) / 32;
+    (0..words).any(|i| word(data, 4 + 32 * i) == who)
 }
 
 fn shape(f: &Function) -> (Vec<u8>, Vec<usize>) {
@@ -191,6 +205,13 @@ impl Broken {
     // to be owed to that account when the contract wrote something as it came in. A
     // balance in the contract's own ledger can also be a reward that accrues with time.
     fn severity(&self) -> Severity {
+        // An answer the caller can move is one it will move. Any other may be out of
+        // its reach.
+        match self.swung {
+            Some((swung, named)) if swung.balance || named => return Severity::High,
+            Some(_) => return Severity::Medium,
+            None => {}
+        }
         match (self.outside(), self.recorded || self.taken, self.waited) {
             (true, true, _) | (false, _, false) => Severity::High,
             _ => Severity::Medium,
@@ -199,7 +220,7 @@ impl Broken {
 
     fn better_than(&self, other: &Broken) -> bool {
         // The most severe level sorts first.
-        let rank = |b: &Broken| (b.severity(), b.reentered, b.steps.len());
+        let rank = |b: &Broken| (b.swung.is_some(), b.severity(), b.reentered, b.steps.len());
         rank(self) < rank(other)
     }
 }
@@ -244,6 +265,10 @@ impl<'a> Search<'a> {
                     shape,
                     fixed,
                     addresses: address_words(function),
+                    params: match function.params.len() {
+                        0 => WORDS,
+                        n => n,
+                    },
                     seeds: Vec::new(),
                     reads: BTreeSet::new(),
                     helped: HashSet::new(),
@@ -261,6 +286,7 @@ impl<'a> Search<'a> {
             recorded: false,
             taken: false,
             reentered: false,
+            swung: None,
         };
         Search {
             c,
@@ -273,6 +299,7 @@ impl<'a> Search<'a> {
             rng: Rng::new(SEED),
             best: None,
             less: None,
+            readings: Vec::new(),
         }
     }
 
@@ -308,13 +335,28 @@ impl<'a> Search<'a> {
         let free = Free {
             words: start.calldata.len() / 32,
             value: true,
+            answers: true,
             fixed: entry.fixed.clone(),
             ..Free::default()
         };
         let code = self.c.code_of(entry.function);
         let found = self.explorers.of(code).explore(&start, &free, SEED_LIMITS);
-        let ended = found.into_iter().filter(Path::succeeded);
-        let inputs = ended.map(|p| (p.inputs.calldata, p.inputs.callvalue));
+        let ended: Vec<Path> = found.into_iter().filter(Path::succeeded).collect();
+        for p in ended.iter().take(SEEDS_PER_ENTRY) {
+            for (at, answer) in &p.inputs.answers {
+                let Some(asked) = p.run.calls.get(*at) else {
+                    continue;
+                };
+                let first = asked.input.get(..4).map(|b| [b[0], b[1], b[2], b[3]]);
+                let (address, selector) = (asked.addr, first.map_or(0, u32::from_be_bytes));
+                if !self.readings.iter().any(|(k, _)| *k == (address, selector)) {
+                    self.readings.push(((address, selector), answer.clone()));
+                }
+            }
+        }
+        let inputs = ended
+            .into_iter()
+            .map(|p| (p.inputs.calldata, p.inputs.callvalue));
         inputs.take(SEEDS_PER_ENTRY).collect()
     }
 
@@ -355,8 +397,10 @@ impl<'a> Search<'a> {
             who,
         ];
         // What was paid, and twice that: a credit is often a multiple of the payment.
+        // What the contract holds is the most there is to ask for.
         let seen = self.kept[from].amounts.iter().filter(|a| **a < PURSE);
         pool.extend(seen.flat_map(|a| [*a, *a << 1]));
+        pool.extend(self.kept[from].world.held(exec::SELF));
         if who == ACTOR {
             pool.push(OTHER);
         }
@@ -367,7 +411,7 @@ impl<'a> Search<'a> {
             _ => self.pick(3),
         };
         for _ in 0..changes {
-            let at = self.pick(words);
+            let at = self.pick(words.min(self.entries[index].params));
             if words == 0 || self.entries[index].fixed.contains(&at) {
                 continue;
             }
@@ -405,12 +449,19 @@ impl<'a> Search<'a> {
             true => Some((data.clone(), U256::ZERO)),
             false => None,
         };
+        // One answer from outside reads differently for this call, as it would when
+        // someone moves what it reports for the length of one transaction.
+        let swing = match who == ACTOR && self.kept[from].swung.is_none() && self.pick(8) == 0 {
+            true => Some((self.pick(3), self.pick(4), self.pick(2) == 0)),
+            false => None,
+        };
         Call {
             who,
             data,
             value,
             seconds_later,
             back,
+            swing,
         }
     }
 
@@ -489,14 +540,21 @@ impl<'a> Search<'a> {
     // kept whether or not it is somewhere new.
     fn attempt_and(&mut self, keep: bool, from: usize, index: usize, call: Call) -> Option<usize> {
         let at = self.entries[index].at;
-        let mut world = self.kept[from].world.clone();
+        let mut before = self.kept[from].world.clone();
+        for ((address, selector), answer) in &self.readings {
+            before.tell(*address, *selector, answer);
+        }
+        let mut world = before.clone();
         let mut call = call;
         let mut done = world.call(at, &call);
         // The same call with nothing made from inside it is the plainer account of
         // whatever it shows.
         if done.ended && !done.called_back && call.back.take().is_some() {
-            world = self.kept[from].world.clone();
+            world = before;
             done = world.call(at, &call);
+        }
+        if done.swung.is_none() {
+            call.swing = None;
         }
         let known = &mut self.entries[index].reads;
         if known.len() < MAX_READS {
@@ -520,6 +578,30 @@ impl<'a> Search<'a> {
         }
         let kept = self.settle(keep, from, world, Step::Call(index, call), &done);
         Some(kept.unwrap_or(from))
+    }
+
+    // The world the same steps leave from the start with every answer as first given.
+    fn replayed(&self, steps: &[Step]) -> Option<World> {
+        let mut world = self.kept[0].world.clone();
+        for ((address, selector), answer) in &self.readings {
+            world.tell(*address, *selector, answer);
+        }
+        for step in steps {
+            let ended = match step {
+                Step::Call(index, call) => {
+                    let plain = Call {
+                        swing: None,
+                        ..call.clone()
+                    };
+                    world.call(self.entries[*index].at, &plain).ended
+                }
+                Step::Gift(who, asset, amount) => world.give(*asset, *who, exec::SELF, *amount),
+            };
+            if !ended {
+                return None;
+            }
+        }
+        Some(world)
     }
 
     // What a step that ended leaves: the properties are checked on it, and it is kept
@@ -558,6 +640,10 @@ impl<'a> Search<'a> {
         let brought = !by_actor && done.crossed && !done.written.is_empty();
         let recorded = parent.recorded || brought;
         let reentered = parent.reentered || done.called_back;
+        let swung = match (&step, done.swung) {
+            (Step::Call(_, call), Some(swung)) => Some((swung, names(&call.data, swung.address))),
+            _ => parent.swung,
+        };
         steps.push(step);
         let changed = !done.written.is_empty() || done.moved;
         let other = match changed {
@@ -593,7 +679,8 @@ impl<'a> Search<'a> {
             let set = world.set_slots(exec::SELF);
             let room = self.positions.len() < MAX_POSITIONS && set.len() <= MAX_SET_SLOTS;
             let unrecorded = steps.iter().any(|s| matches!(s, Step::Gift(..)));
-            novel |= room && self.positions.insert((place, set, unrecorded));
+            let place = (place, set, unrecorded, swung.is_some());
+            novel |= room && self.positions.insert(place);
         }
         if let (Some(base), Some(now)) = (&base, now) {
             if gained(base, &now) {
@@ -605,7 +692,17 @@ impl<'a> Search<'a> {
                     recorded,
                     taken,
                     reentered,
+                    swung,
                 };
+                // A gain the same calls leave with every answer as first given is not
+                // owed to the answer that differed.
+                if swung.is_some()
+                    && self
+                        .replayed(&steps)
+                        .is_some_and(|w| gained(base, &w.holdings(ACTOR)))
+                {
+                    found.swung = None;
+                }
                 // A gain the call leaves on its own is not owed to calling in again.
                 if let (true, Some(Step::Call(index, call))) = (done.called_back, steps.last()) {
                     let mut plain = parent.world.clone();
@@ -635,6 +732,7 @@ impl<'a> Search<'a> {
                 recorded,
                 taken,
                 reentered,
+                swung,
                 other,
             });
             return Some(self.kept.len() - 1);
@@ -834,6 +932,41 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
             " The gain needs time to pass between the calls, as a reward that accrues would. Whether that reward is meant to be open to an account that paid nothing is for a reader to judge."
         }
     };
+    if let Some((swung, named)) = broken.swung {
+        let how = match (swung.balance, named) {
+            (true, _) => "That answer is an asset's count of what another account holds, which follows any transfer to that account, so whoever calls can move it.",
+            (false, true) => "That answer comes from a contract the call data names, so whoever calls chooses what gives it.",
+            (false, false) => "Whether a caller can move that answer is not known from this contract alone.",
+        };
+        push(
+            out,
+            "one-call-reading-leaves-a-gain",
+            "A reading that differs for one call leaves the caller with a gain that stays",
+            severity,
+            Confidence::High,
+            Some(function),
+            None,
+            format!(
+                "Starting from {}, {} call(s) were made, the last to `{}`. With every outside answer as first given, the same calls leave the account with no gain. When one word of an answer from {} is {} instead of {} for that one call, and as first given for every other call, the account ends with {} and with no less of anything else. The contract held nothing at the start, so the difference comes out of what the other account paid in. {how}",
+                deploy::started_from(c),
+                broken.steps.len(),
+                function.name,
+                swung.address.to_hex(),
+                swung.now.to_hex(),
+                swung.was.to_hex(),
+                rose.join(" and "),
+            ),
+            Vec::new(),
+            "Do not let an amount that is credited or paid follow a quantity read at the moment of the call. Use the contract's own records, or a value that one transaction cannot move, and bound what an account takes out by what is recorded for it.",
+        );
+        if let Some(finding) = out.last_mut() {
+            finding.setup = shown(earlier);
+            finding.confirmed = true;
+            finding.witness = Some(hex::encode(&last.data));
+            finding.observed = vec![format!("sent by {}", last.who.to_hex())];
+        }
+        return;
+    }
     if broken.reentered {
         let note = format!(
             " Confirmed by running it: after the attached earlier call(s), the attached call is made by an account whose code makes the same call again when it is paid. Every call ends normally and the account ends with {} and with no less of anything else. The same call with nothing made from inside it leaves no gain.",

@@ -3665,3 +3665,53 @@ fn the_search_finds_an_account_that_ends_with_more_than_it_started_with() {
     let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
     assert_eq!(f.severity, Severity::Medium, "{f:?}");
 }
+
+fn asset_pull(label: &str, from: &str, to: &str, amount: &str, then: &str) -> String {
+    let answered =
+        format!("PUSH1 0x80 MLOAD PUSH2 @{label} JUMPI PUSH1 0x00 DUP1 REVERT :{label} JUMPDEST");
+    format!(
+        "PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE {from} PUSH1 0x84 MSTORE \
+         {to} PUSH1 0xa4 MSTORE {amount} PUSH1 0xc4 MSTORE \
+         PUSH1 0x20 PUSH1 0x80 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 PUSH2 0xb1b1 GAS CALL POP \
+         {answered} {then} STOP"
+    )
+}
+
+#[test]
+fn the_search_finds_a_call_that_takes_from_an_account_that_approved_the_contract() {
+    let word = |n: usize| format!("PUSH1 {:#04x} CALLDATALOAD", 4 + 32 * n);
+    let credit = format!(
+        "{} {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP",
+        word(0)
+    );
+    let pays_in = asset_pull("in", "CALLER", "ADDRESS", &word(0), &credit);
+    let again = asset_pull("again", "CALLER", "ADDRESS", &word(0), &credit);
+
+    let named = format!(
+        "{} PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND",
+        word(0)
+    );
+    let to_the_caller = asset_pull("out", &named, "CALLER", &word(1), "");
+    let r = report_of(&dispatcher3(&pays_in, &to_the_caller, "STOP"));
+    let f = finding(&r, "calls-leave-account-with-gain").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    assert!(
+        finding(&r, "call-leaves-another-account-with-less").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+
+    let to_the_contract = asset_pull("out", &named, "ADDRESS", &word(1), "");
+    let r = report_of(&dispatcher3(&pays_in, &to_the_contract, "STOP"));
+    let f = finding(&r, "call-leaves-another-account-with-less")
+        .unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium, "{f:?}");
+
+    let r = report_of(&dispatcher3(&pays_in, &again, "STOP"));
+    for rule in [
+        "calls-leave-account-with-gain",
+        "call-leaves-another-account-with-less",
+    ] {
+        assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
+    }
+}

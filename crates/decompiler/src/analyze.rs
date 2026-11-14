@@ -5486,6 +5486,16 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         report.maps.extend(exec::within(standard::WORK, || {
             standard::findings(c, &open, &mut findings)
         }));
+        // The search and the check of the standard interface can reach the same fall in
+        // another account's balance. The one measured on the interface names the entry.
+        let named: HashSet<Option<String>> = findings
+            .iter()
+            .filter(|f| f.id == "call-lowers-another-accounts-balance")
+            .map(|f| f.function.clone())
+            .collect();
+        findings.retain(|f| {
+            f.id != "call-leaves-another-account-with-less" || !named.contains(&f.function)
+        });
     }
 
     if crate::debug::on("EVMDEC_DEBUG_LOCKS") {

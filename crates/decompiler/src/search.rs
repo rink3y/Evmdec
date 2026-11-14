@@ -39,6 +39,7 @@ struct Entry<'a> {
     function: &'a Function,
     shape: Vec<u8>,
     fixed: Vec<usize>,
+    addresses: Vec<usize>,
     seeds: Vec<(Vec<u8>, U256)>,
     reads: BTreeSet<U256>,
     helped: HashSet<usize>,
@@ -63,6 +64,9 @@ struct Kept<'a> {
     // Whether a call that brought the other account's value in also wrote storage.
     // Value that came in with nothing written is value the contract keeps no record of.
     recorded: bool,
+    // Whether a call by the actor moved an asset out of the other account.
+    taken: bool,
+    other: Holdings,
 }
 
 struct Broken {
@@ -71,6 +75,15 @@ struct Broken {
     now: Holdings,
     waited: bool,
     recorded: bool,
+    taken: bool,
+}
+
+// One call by the actor after which the other account has less.
+struct Less {
+    steps: Vec<Step>,
+    before: Holdings,
+    now: Holdings,
+    waited: bool,
 }
 
 struct Search<'a> {
@@ -82,6 +95,7 @@ struct Search<'a> {
     rng: Rng,
     helps_left: usize,
     best: Option<Broken>,
+    less: Option<Less>,
 }
 
 fn shape(f: &Function) -> (Vec<u8>, Vec<usize>) {
@@ -101,13 +115,21 @@ fn shape(f: &Function) -> (Vec<u8>, Vec<usize>) {
 
 // More of something, and less of nothing. An account that paid ether for what it got
 // did not gain, whatever the price.
+// The words of the call that hold an address, as far as the types found say. The
+// count stops at the first parameter that takes more than one word.
+fn address_words(f: &Function) -> Vec<usize> {
+    let one_word = |ty: &str| !ty.contains(['[', '(']) && ty != "bytes" && ty != "string";
+    let heads = f.params.iter().take_while(|p| one_word(&p.ty));
+    let address = |(_, p): &(usize, &crate::function::Param)| p.ty.starts_with("address");
+    heads.enumerate().filter(address).map(|(i, _)| i).collect()
+}
+
 fn gained(base: &Holdings, now: &Holdings) -> bool {
     let mut pairs = vec![(base.ether, now.ether)];
-    // An asset the account had not touched before is one it still held its whole
-    // purse of.
-    for (asset, held) in &now.assets {
-        let before = base.assets.get(asset).copied();
-        pairs.push((before.unwrap_or(PURSE), *held));
+    // An asset the account has not touched is one it still holds its whole purse of.
+    let of = |h: &Holdings, asset: &U256| h.assets.get(asset).copied().unwrap_or(PURSE);
+    for asset in base.assets.keys().chain(now.assets.keys()) {
+        pairs.push((of(base, asset), of(now, asset)));
     }
     if let (Some(before), Some(after)) = (base.reported, now.reported) {
         pairs.push((before, after));
@@ -128,7 +150,7 @@ impl Broken {
     // to be owed to that account when the contract wrote something as it came in. A
     // balance in the contract's own ledger can also be a reward that accrues with time.
     fn severity(&self) -> Severity {
-        match (self.outside(), self.recorded, self.waited) {
+        match (self.outside(), self.recorded || self.taken, self.waited) {
             (true, true, _) | (false, _, false) => Severity::High,
             _ => Severity::Medium,
         }
@@ -137,6 +159,27 @@ impl Broken {
     fn better_than(&self, other: &Broken) -> bool {
         // The most severe level sorts first.
         let rank = |b: &Broken| (b.severity(), b.steps.len());
+        rank(self) < rank(other)
+    }
+}
+
+impl Less {
+    fn own(&self) -> bool {
+        matches!((self.before.reported, self.now.reported), (Some(a), Some(b)) if b < a)
+    }
+
+    // A balance the contract itself keeps for an account is that account's. An asset
+    // that left under a standing approval may have been credited where a balance
+    // function does not show it.
+    fn severity(&self) -> Severity {
+        match self.own() && !self.waited {
+            true => Severity::High,
+            false => Severity::Medium,
+        }
+    }
+
+    fn better_than(&self, other: &Less) -> bool {
+        let rank = |l: &Less| (l.severity(), l.steps.len());
         rank(self) < rank(other)
     }
 }
@@ -157,19 +200,23 @@ impl<'a> Search<'a> {
                     function,
                     shape,
                     fixed,
+                    addresses: address_words(function),
                     seeds: Vec::new(),
                     reads: BTreeSet::new(),
                     helped: HashSet::new(),
                 }
             })
             .collect();
+        let world = World::new(c, &[ACTOR, OTHER]);
         let start = Kept {
-            world: World::new(c, &[ACTOR, OTHER]),
+            other: world.holdings(OTHER),
+            world,
             steps: Vec::new(),
             written: BTreeSet::new(),
             amounts: Vec::new(),
             base: None,
             recorded: false,
+            taken: false,
         };
         Search {
             c,
@@ -180,6 +227,7 @@ impl<'a> Search<'a> {
             explorers: Explorers::default(),
             rng: Rng::new(SEED),
             best: None,
+            less: None,
         }
     }
 
@@ -250,13 +298,30 @@ impl<'a> Search<'a> {
             pool.push(OTHER);
         }
         let words = data.len().saturating_sub(4) / 32;
-        for _ in 0..self.pick(3) {
+        // Without a solved input the plain shape is all there is, and it was tried.
+        let changes = match seeds {
+            0 => 1 + self.pick(2),
+            _ => self.pick(3),
+        };
+        for _ in 0..changes {
             let at = self.pick(words);
             if words == 0 || self.entries[index].fixed.contains(&at) {
                 continue;
             }
             let with = pool[self.pick(pool.len())];
             data[4 + 32 * at..36 + 32 * at].copy_from_slice(&with.to_be_bytes());
+        }
+        // An address a call names is one of three that mean something here.
+        let other = match who == ACTOR {
+            true => OTHER,
+            false => ACTOR,
+        };
+        let parties = [who, other, exec::SELF];
+        for at in self.entries[index].addresses.clone() {
+            if at < words && self.pick(2) == 0 {
+                let with = parties[self.pick(parties.len())];
+                data[4 + 32 * at..36 + 32 * at].copy_from_slice(&with.to_be_bytes());
+            }
         }
         if self.pick(4) == 0 {
             value = pool[self.pick(3)];
@@ -351,20 +416,39 @@ impl<'a> Search<'a> {
         }
         let brought = call.who == OTHER && done.crossed && !done.written.is_empty();
         let recorded = parent.recorded || brought;
+        let by_actor = call.who == ACTOR;
         steps.push(Step { entry: index, call });
         let changed = !done.written.is_empty() || done.crossed;
+        let other = match changed {
+            true => world.holdings(OTHER),
+            false => parent.other.clone(),
+        };
+        let waited = steps
+            .iter()
+            .any(|s| s.call.who == ACTOR && s.call.seconds_later > 0);
+        let fell = by_actor && gained(&other, &parent.other);
+        let taken = parent.taken || (fell && other.assets != parent.other.assets);
+        if fell {
+            let found = Less {
+                steps: steps.clone(),
+                before: parent.other.clone(),
+                now: other.clone(),
+                waited,
+            };
+            if self.less.as_ref().is_none_or(|l| found.better_than(l)) {
+                self.less = Some(found);
+            }
+        }
         if let (Some(base), true) = (&base, changed) {
             let now = world.holdings(ACTOR);
             if gained(base, &now) {
-                let waited = steps
-                    .iter()
-                    .any(|s| s.call.who == ACTOR && s.call.seconds_later > 0);
                 let found = Broken {
                     steps: steps.clone(),
                     base: base.clone(),
                     now,
                     waited,
                     recorded,
+                    taken,
                 };
                 if self.best.as_ref().is_none_or(|b| found.better_than(b)) {
                     self.best = Some(found);
@@ -379,6 +463,8 @@ impl<'a> Search<'a> {
                 amounts,
                 base,
                 recorded,
+                taken,
+                other,
             });
         }
         true
@@ -494,9 +580,10 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
         ));
     }
     let outside = broken.outside();
-    let source = match outside {
-        true => "The contract held nothing at the start and received only what the two accounts paid in, so what the account gained is the other account's payment.",
-        false => "Nothing was paid for that balance, in ether or in any asset.",
+    let source = match (outside, broken.taken) {
+        (true, true) => "An asset left the other account during these calls, under the approval that account gave the contract when it paid in.",
+        (true, false) => "The contract held nothing at the start and received only what the two accounts paid in, so what the account gained is the other account's payment.",
+        (false, _) => "Nothing was paid for that balance, in ether or in any asset.",
     };
     let severity = broken.severity();
     let timing = match (severity, outside) {
@@ -543,9 +630,65 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
     }
 }
 
+fn report_less(c: &Contract, search: &Search, less: &Less, out: &mut Vec<Finding>) {
+    let Some((last, earlier)) = less.steps.split_last() else {
+        return;
+    };
+    let function = search.entries[last.entry].function;
+    let (before, now) = (&less.before, &less.now);
+    let mut fell = Vec::new();
+    for (asset, held) in &now.assets {
+        let had = before.assets.get(asset).copied().unwrap_or(PURSE);
+        if *held < had {
+            fell.push(format!(
+                "{} less of the asset at {}",
+                (had - *held).to_hex(),
+                asset.to_hex()
+            ));
+        }
+    }
+    if let (true, Some(had), Some(has)) = (less.own(), before.reported, now.reported) {
+        fell.push(format!(
+            "a balance in the contract's own ledger of {} where it had {}",
+            has.to_hex(),
+            had.to_hex()
+        ));
+    }
+    let note = match (less.own(), less.waited) {
+        (true, false) => "",
+        (true, true) => " Time passed between the calls, and a balance that runs down with time would fall in the same way.",
+        (false, _) => " The asset left under the approval that account gave the contract when it paid in. It went to the contract or to a third account, and a credit for it that no balance function shows cannot be seen from outside.",
+    };
+    push(
+        out,
+        "call-leaves-another-account-with-less",
+        "A call leaves an account that took no part in it with less",
+        less.severity(),
+        Confidence::High,
+        Some(function),
+        None,
+        format!(
+            "Starting from {}, {} call(s) were made. The last, to `{}`, was made by an account with no role and ended normally. The other account made no call after its own and is left with {} and with no more of anything else.{note}",
+            deploy::started_from(c),
+            less.steps.len(),
+            function.name,
+            fell.join(" and "),
+        ),
+        Vec::new(),
+        "Let a call lower only what its caller holds, or what an account agreed to in that call.",
+    );
+    if let Some(finding) = out.last_mut() {
+        finding.setup = shown(earlier);
+        finding.confirmed = true;
+        finding.witness = Some(hex::encode(&last.call.data));
+        finding.observed = vec![format!("sent by {}", last.call.who.to_hex())];
+    }
+}
+
 // One search over sequences of calls. It keeps every sequence that reached code no
 // earlier one reached, extends those, and checks after each call whether an account
-// with no role now holds more than before its first call.
+// with no role now holds more than before its first call, and whether the other
+// account holds less than before that call.
 pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return;
@@ -555,7 +698,12 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         return;
     }
     search.run();
+    let taken = search.best.as_ref().is_some_and(|b| b.taken);
     if let Some(broken) = search.best.take() {
         report(c, &search, &broken, out);
+    }
+    // A gain that came out of the other account already says what that account lost.
+    if let (Some(less), false) = (search.less.take(), taken) {
+        report_less(c, &search, &less, out);
     }
 }

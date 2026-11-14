@@ -62,6 +62,7 @@ pub struct World<'a> {
     storage: HashMap<U256, U256>,
     ether: HashMap<U256, U256>,
     assets: HashMap<(U256, U256), U256>,
+    approved: HashSet<(U256, U256)>,
     accounts: Vec<U256>,
     timestamp: U256,
     number: U256,
@@ -101,6 +102,7 @@ impl<'a> World<'a> {
             storage: deploy::start(c),
             ether: HashMap::new(),
             assets: HashMap::new(),
+            approved: HashSet::new(),
             accounts: accounts.to_vec(),
             timestamp: U256::from_u64(1_700_000_000),
             number: U256::from_u64(18_000_000),
@@ -317,10 +319,15 @@ impl Frame<'_, '_> {
                 (moved, one_word(U256::from(moved)))
             }
             Some(SEL_TRANSFER_FROM) if changes && call.input.len() >= 100 => {
-                // An account lets the contract it calls take what the call asks for. No
-                // account lets it take from another.
-                let allowed = arg(0) == self.caller || arg(0) == this;
+                // An account lets the contract it calls take what the call asks for, and
+                // leaves that approval standing, as accounts that use a contract do.
+                let from = (call.addr, arg(0));
+                let own = arg(0) == self.caller || arg(0) == this;
+                let allowed = own || self.world.approved.contains(&from);
                 let moved = allowed && self.world.moves(call.addr, arg(0), arg(1), arg(2));
+                if moved && arg(0) == self.caller {
+                    self.world.approved.insert(from);
+                }
                 self.crossed |= moved && (arg(0) == self.caller || arg(1) == self.caller);
                 (moved, one_word(U256::from(moved)))
             }

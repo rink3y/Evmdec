@@ -21,6 +21,7 @@ FAMILIES = {
         "approval-to-open-spender", "third-party-balance-debit", "unprivileged-balance-credit",
         "trusted-callee-loop", "silent-auth-failure", "storage-collision",
         "call-lowers-another-accounts-balance", "calls-leave-account-with-gain",
+        "call-leaves-another-account-with-less",
     ],
     "reentry": [
         "reentrancy", "reentered-call-pays-again", "control-handed-out-mid-update",
@@ -44,6 +45,7 @@ FAMILIES = {
         "refused-transfer-treated-as-done", "msg-value-in-loop", "msg-value-multicall",
         "call-lowers-another-accounts-balance", "reported-balance-moved-by-another-account",
         "one-call-reading-leaves-a-gain", "calls-leave-account-with-gain",
+        "call-leaves-another-account-with-less",
     ],
     "arithmetic": [
         "unchecked-arithmetic", "unchecked-block-arithmetic", "unchecked-downcast",

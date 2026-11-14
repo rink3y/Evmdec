@@ -1,4 +1,4 @@
-use crate::abi::{self, SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
+use crate::abi::{self, SEL_BALANCE_OF, SEL_OWNER_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::analyze::{display_name, push, Confidence, Finding, Severity};
 use crate::cross::World;
 use crate::decompile::{Contract, Function};
@@ -576,9 +576,16 @@ impl<'a> Pass<'a> {
             let (start, free) = self.base(f, path::varied_word);
             let found = self.explore(f, &start, &free, LIMITS);
             let asks = |p: &&Path| {
+                // An asset that is asked who owns one item moves items, not amounts. Moving
+                // an item returns nothing, so there is no answer it could refuse with.
+                let items = |asset: U256| {
+                    let owner = |c: &CallRecord| selector(&c.input) == Some(SEL_OWNER_OF);
+                    p.run.calls.iter().any(|c| c.addr == asset && owner(c))
+                };
                 let transfer = |c: &CallRecord| {
                     let s = selector(&c.input);
-                    c.kind == op::CALL && (s == Some(SEL_TRANSFER) || s == Some(SEL_TRANSFER_FROM))
+                    let moves = s == Some(SEL_TRANSFER) || s == Some(SEL_TRANSFER_FROM);
+                    c.kind == op::CALL && moves && !items(c.addr)
                 };
                 p.succeeded() && p.run.calls.iter().any(transfer)
             };

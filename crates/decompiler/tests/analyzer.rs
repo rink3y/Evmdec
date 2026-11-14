@@ -3526,3 +3526,19 @@ fn a_selector_that_never_follows_the_call_data_is_not_a_dynamic_call() {
     let r = report_of(&from_storage);
     assert!(finding(&r, "dynamic-call").is_none(), "{:?}", ids(&r));
 }
+
+#[test]
+fn moving_one_item_has_no_answer_to_refuse_with() {
+    let asks_owner = "PUSH4 0x6352211e PUSH1 0xe0 SHL PUSH1 0x80 MSTORE PUSH1 0x04 CALLDATALOAD \
+                      PUSH1 0x84 MSTORE PUSH1 0x20 PUSH1 0x00 PUSH1 0x24 PUSH1 0x80 PUSH2 0xa55e \
+                      GAS STATICCALL POP";
+    let pulls = "PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
+                 ADDRESS PUSH1 0xa4 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0xc4 MSTORE PUSH1 0x00 \
+                 DUP1 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 PUSH2 0xa55e GAS CALL POP \
+                 PUSH1 0x01 CALLER SSTORE STOP";
+    let rule = "refused-transfer-treated-as-done";
+    let amounts = report_of(&dispatcher(pulls));
+    assert!(finding(&amounts, rule).is_some(), "{:?}", ids(&amounts));
+    let items = report_of(&dispatcher(&format!("{asks_owner} {pulls}")));
+    assert!(finding(&items, rule).is_none(), "{:?}", ids(&items));
+}

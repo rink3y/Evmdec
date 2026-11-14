@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("BIN", os.path.join(ROOT, "target", "release", "evmdec"))
-HELD = os.path.join(ROOT, "testdata", "heldout")
 SEV = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 HIGH = SEV["high"]
 
@@ -124,7 +123,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", action="store_true")
     ap.add_argument("--jobs", type=int, default=3)
+    ap.add_argument("--set", default="heldout", help="the set under testdata to score")
     a = ap.parse_args()
+    HELD = os.path.join(ROOT, "testdata", a.set)
     manifest = json.load(open(os.path.join(HELD, "manifest.json")))
     flawed, sound = manifest["flawed"], manifest["sound"]
     paths = [os.path.join(HELD, "flawed", n + ".hex") for n in flawed]

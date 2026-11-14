@@ -99,12 +99,13 @@ def record(path):
     return r
 
 
-def development_addresses():
+# One set never shares a contract with another, or with what the rules were built on.
+def used_elsewhere(own):
     known = set()
     address = re.compile(r"0x[0-9a-fA-F]{40}")
     files = glob.glob(ROOT + "/corpus/*.txt") + glob.glob(ROOT + "/testdata/**/*", recursive=True)
     for f in files:
-        if "/heldout/" in f or not os.path.isfile(f):
+        if f"/{own}/" in f or not os.path.isfile(f):
             continue
         known |= {x.lower() for x in address.findall(os.path.basename(f))}
         if not f.endswith(".hex"):
@@ -117,9 +118,15 @@ def flawed(a):
     os.makedirs(out, exist_ok=True)
     records = [record(f) for f in sorted(glob.glob(a.work + "/pages/*.html"))]
     json.dump(records, open(a.work + "/records.json", "w"), indent=1)
-    known, kept, why = development_addresses(), [], collections.Counter()
+    known, kept, why = used_elsewhere(a.set), [], collections.Counter()
+    listed = set()
+    for other in glob.glob(ROOT + "/testdata/*/manifest.json"):
+        if f"/{a.set}/" not in other:
+            listed |= set(json.load(open(other)).get("flawed", {}))
     for r in records:
-        if not r["candidates"]:
+        if r["slug"] in listed:
+            why["incident already in another set"] += 1
+        elif not r["candidates"]:
             why["no contract listed"] += 1
         elif r["chain"] not in CHAINS:
             why["chain not reachable: " + r["chain"]] += 1
@@ -164,7 +171,7 @@ def sound(a):
     old = called(host, [rng.randrange(a.old_from, a.old_to) for _ in range(a.blocks)])
     new = called(host, [latest - rng.randrange(0, 200000) for _ in range(a.blocks)])
     ranked = sorted(((min(old[x], new[x]), x) for x in old if x in new), reverse=True)
-    exclude = development_addresses()
+    exclude = used_elsewhere(a.set)
     for r in json.load(open(a.work + "/records.json")):
         exclude |= set(r["candidates"])
     kept, seen, why = [], set(), collections.Counter()
@@ -196,7 +203,7 @@ def sound(a):
 
 
 def assemble(a):
-    held = os.path.join(ROOT, "testdata", "heldout")
+    held = os.path.join(ROOT, "testdata", a.set)
     for sub in ("flawed", "sound"):
         shutil.rmtree(os.path.join(held, sub), ignore_errors=True)
         os.makedirs(os.path.join(held, sub))
@@ -240,7 +247,8 @@ def assemble(a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True, help="directory for fetched pages and code, outside the repository")
-    sub = ap.add_subparsers(dest="step", required=True)
+    ap.add_argument("--set", default="heldout", help="the directory under testdata this set is written to")
+    sub = ap.add_subparsers(dest="command", required=True)
     p = sub.add_parser("pages", help="fetch every STEP-th dated incident page, starting at OFFSET")
     p.add_argument("--step", type=int, default=3)
     p.add_argument("--offset", type=int, default=0)
@@ -252,9 +260,9 @@ def main():
     p.add_argument("--blocks", type=int, default=300)
     p.add_argument("--limit", type=int, default=90)
     p.add_argument("--seed", type=int, default=20261114)
-    sub.add_parser("assemble", help="write testdata/heldout from what was fetched")
+    sub.add_parser("assemble", help="write the set under testdata from what was fetched")
     a = ap.parse_args()
-    {"pages": pages, "flawed": flawed, "sound": sound, "assemble": assemble}[a.step](a)
+    {"pages": pages, "flawed": flawed, "sound": sound, "assemble": assemble}[a.command](a)
 
 
 if __name__ == "__main__":

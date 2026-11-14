@@ -122,6 +122,9 @@ pub struct World {
     // interface. The first answer given stands, so every call sees the same one.
     readings: HashMap<(U256, u32), Vec<u8>>,
     funded: Vec<U256>,
+    // The address the contract under test has on chain, when it is known. A contract
+    // it is linked to calls it there.
+    known_as: Option<U256>,
     timestamp: U256,
     number: U256,
     made: u64,
@@ -182,7 +185,48 @@ impl World {
             ..World::new()
         };
         world.storage.insert(exec::SELF, deploy::start(c));
+        world.known_as = c.address.as_deref().and_then(U256::from_hex_str);
+        for (slot, held) in &c.stored_targets {
+            if let (Some(slot), Some(held)) = (U256::from_hex_str(slot), U256::from_hex_str(held)) {
+                world.seed(exec::SELF, slot, held);
+            }
+        }
+        for linked in &c.linked {
+            world.place_contract(linked);
+        }
         world
+    }
+
+    // A deployed contract at its own address, with the code behind it when it is a
+    // proxy and the addresses its storage was read to hold. It holds a purse, as a
+    // contract in use holds something.
+    pub fn place_contract(&mut self, c: &Contract) -> Option<U256> {
+        let address = U256::from_hex_str(c.address.as_deref()?)?;
+        if c.info.runtime.is_empty() {
+            return None;
+        }
+        self.place(address, &c.info.runtime);
+        self.fund(address);
+        let behind = c.parts.iter().skip(1);
+        let units: Vec<U256> = behind
+            .filter_map(|part| {
+                let at = U256::from_hex_str(&part.address)?;
+                self.place(at, &part.runtime);
+                Some(at)
+            })
+            .collect();
+        if let [implementation] = units[..] {
+            let slots = c.delegatecall_slots.iter();
+            for slot in slots.filter_map(|s| U256::from_hex_str(s)) {
+                self.seed(address, slot, implementation);
+            }
+        }
+        for (slot, held) in &c.stored_targets {
+            if let (Some(slot), Some(held)) = (U256::from_hex_str(slot), U256::from_hex_str(held)) {
+                self.seed(address, slot, held);
+            }
+        }
+        Some(address)
     }
 
     pub fn place(&mut self, address: U256, code: &[u8]) {
@@ -524,7 +568,11 @@ impl World {
         if record.addr == U256::from_u64(IDENTITY) {
             return (true, record.input.clone());
         }
-        let Some(code) = self.code_at(record.addr, &record.input) else {
+        let to = match Some(record.addr) == self.known_as {
+            true => exec::SELF,
+            false => record.addr,
+        };
+        let Some(code) = self.code_at(to, &record.input) else {
             return self.answer(record, from, run);
         };
         if from.depth >= MAX_DEPTH {
@@ -533,7 +581,7 @@ impl World {
         let (account, caller, value) = match record.kind {
             op::DELEGATECALL => (from.account, from.caller, from.value),
             op::CALLCODE => (from.account, from.account, record.value),
-            _ => (record.addr, from.account, record.value),
+            _ => (to, from.account, record.value),
         };
         let inner = Frame {
             account,

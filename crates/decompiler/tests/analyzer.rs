@@ -3677,6 +3677,26 @@ fn asset_pull(label: &str, from: &str, to: &str, amount: &str, then: &str) -> St
 }
 
 #[test]
+fn the_search_runs_the_code_of_a_contract_the_one_under_test_calls() {
+    let pays_named =
+        "PUSH1 0x00 DUP1 DUP1 DUP1 PUSH2 0x1001 PUSH1 0x04 CALLDATALOAD GAS CALL POP STOP";
+    let callee = PAYER.trim_start_matches("0x");
+    let passes_caller_on = dispatcher(&format!(
+        "PUSH4 0xaaaaaaaa PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
+         PUSH1 0x00 DUP1 PUSH1 0x24 PUSH1 0x80 PUSH1 0x00 PUSH20 0x{callee} GAS CALL POP STOP"
+    ));
+    let rule = "calls-leave-account-with-gain";
+
+    let r = with_linked(passes_caller_on.clone(), dispatcher(pays_named));
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert!(f.description.contains("a contract this one calls"), "{f:?}");
+
+    let only_its_owner = dispatcher(&format!("{OWNER_GATE} {pays_named}"));
+    let r = with_linked(passes_caller_on, only_its_owner);
+    assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
+}
+
+#[test]
 fn the_search_finds_a_call_that_takes_from_an_account_that_approved_the_contract() {
     let word = |n: usize| format!("PUSH1 {:#04x} CALLDATALOAD", 4 + 32 * n);
     let credit = format!(

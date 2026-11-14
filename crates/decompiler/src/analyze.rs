@@ -7711,40 +7711,6 @@ const NAMED: [U256; 2] = [
 
 const MAX_SHAPES: usize = 18;
 
-fn place_contract(world: &mut CrossWorld, c: &Contract) -> Option<U256> {
-    let address = U256::from_hex_str(c.address.as_deref()?)?;
-    if c.info.runtime.is_empty() {
-        return None;
-    }
-    world.place(address, &c.info.runtime);
-    world.fund(address);
-    let units: Vec<U256> = c
-        .parts
-        .iter()
-        .skip(1)
-        .filter_map(|part| {
-            let at = U256::from_hex_str(&part.address)?;
-            world.place(at, &part.runtime);
-            Some(at)
-        })
-        .collect();
-    if let [implementation] = units[..] {
-        for slot in c
-            .delegatecall_slots
-            .iter()
-            .filter_map(|s| U256::from_hex_str(s))
-        {
-            world.seed(address, slot, implementation);
-        }
-    }
-    for (slot, held) in &c.stored_targets {
-        if let (Some(slot), Some(held)) = (U256::from_hex_str(slot), U256::from_hex_str(held)) {
-            world.seed(address, slot, held);
-        }
-    }
-    Some(address)
-}
-
 // Gates are opened only for callers the contract's storage was read to approve.
 // An unread gate must stay shut, or an unverified finding gets confirmed.
 fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec<u8>> {
@@ -7763,9 +7729,9 @@ fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec
     let balance = U256::ONE << 128;
     let build = |held: &[(U256, U256)]| -> Option<CrossWorld> {
         let mut world = CrossWorld::new();
-        place_contract(&mut world, ctx.c)?;
+        world.place_contract(ctx.c)?;
         for lc in &ctx.c.linked {
-            let Some(address) = place_contract(&mut world, lc) else {
+            let Some(address) = world.place_contract(lc) else {
                 continue;
             };
             let gate = gates(lc);

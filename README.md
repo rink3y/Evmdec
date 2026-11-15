@@ -417,13 +417,13 @@ recall above is measured on contracts the rules were developed on.
 | | |
 |---|---|
 | flawed contracts with the right kind of finding at high or above | 102 / 234 = 44% |
-| the same at medium or above | 140 / 234 = 60% |
-| flawed contracts with any finding at high or above | 127 / 234 = 54% |
+| the same at medium or above | 139 / 234 = 59% |
+| flawed contracts with any finding at high or above | 126 / 234 = 54% |
 | contracts with no known flaw and nothing at high or above | 79 / 101 = 78% |
 
 The label is the kind of flaw, not the function it is in, so the first row is an upper
 bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.51
-for missing checks on who may call, 0.41 for accounting, 0.34 for prices read from outside
+for missing checks on who may call, 0.40 for accounting, 0.34 for prices read from outside
 and 0.36 for arithmetic. On the contracts with no known flaw, 8 of the 22 that get a high
 finding get it from `dynamic-call`.
 
@@ -446,8 +446,9 @@ then scored here: 98 on the first row and 79 on the last with its first property
 79 with standing approvals and a second property, and 102 and 79 once it took over the four
 older pay-in and take-out checks, the re-entry confirmation and the one-call reading check.
 It stayed at 102 and 79 after two more checks were moved into it, token contracts were
-started in use and the world stopped answering for code and signers it does not have, with
-one high finding fewer on the contracts with no known flaw. Its findings are high on three
+started in use, the world stopped answering for code and signers it does not have, and the
+two parts that measured as doing nothing were removed, with one high finding fewer on the
+contracts with no known flaw. Its findings are high on three
 of those contracts, one of which has no other high finding. Each step added a little and none took away, which
 is the most that can be said of a search: it finds what it reaches, and what it reaches
 moves with the order in which it tries things.

@@ -643,6 +643,30 @@ calls. With that code placed the search found 87 of the 231 development incident
 address, with a linked contract's transfers answered from honest books 90, and with a linked
 contract treated as any other address 91. The last is what the search now does.
 
+### Fresh set
+
+`python3 corpus/heldout_bench.py --set fresh`. `testdata/fresh` holds 213 contracts from
+public incidents, taken from the third of the same index that the two sets above leave
+untouched. An incident is kept when one of its classes falls under logic, access control,
+DeFi, arithmetic, reentrancy, authentication, loss of funds, accounting, data integrity,
+economic or math. The set was collected after the checks described in the next section were
+built, and like the held-out set it is only scored. How it was chosen is in
+`testdata/fresh/README.md`.
+
+| | before those checks | with them |
+|---|---|---|
+| flawed contracts with the right kind of finding at high or above | 74 / 213 = 35% | 76 / 213 = 36% |
+| the same at medium or above | 130 / 213 | 131 / 213 |
+| flawed contracts with any finding at high or above | 102 / 213 | 103 / 213 |
+
+By kind, recall with them is 0.48 for calls that hand control out before state is settled,
+0.43 for missing checks on who may call, 0.38 for unchecked input, 0.32 for accounting, 0.28
+for prices read from outside and 0.21 for arithmetic. Both contracts gained are found by the
+check on who a caller test lets through.
+
+Three sets of contracts the rules were not built on now say the same thing: 84 of 231, 104
+of 234 and 76 of 213 get the right kind of finding at high, between 36% and 44%.
+
 ### Checks removed on purpose
 
 `python3 corpus/mutation_bench.py`. The incident sets say whether a flawed contract gets a
@@ -680,6 +704,26 @@ from its peers, not what the value is worth.
 The 25 that still get nothing are mostly a check on who owns one record among many, such as
 one lock or one position, a mint or burn whose other checks still hold, and a write keyed
 by an address the caller names.
+
+### Laws tried and not kept
+
+A check stays when it finds something on contracts it was not shaped on and marks no more
+sound ones. These were built, measured on the development set, and removed.
+
+| what was asked | what the measurement said |
+|---|---|
+| Does a paying call made twice, the same account in two parameters, or an amount one either side of a seen amount leave a gain the search had not found | 83 of 231 with all three, and 84, 84 and 83 with each one off |
+| Does one call pay its caller more when an outside reading that a transaction can move is moved, against the same call with the reading as first given | seen on 2 of 286 contracts, one already found and one with no known flaw |
+| Is a record written without the record that every other function writes with it for the same key | 65 of 231 flawed contracts and 15 of 55 sound ones, 28% against 27% |
+| Does a call by an account with no role, which pays and receives nothing, let an outside contract have what the contract holds and still end when nothing comes back | 3 of 231 flawed contracts and none of 55 sound ones, none at the function its incident names, and no change to any count |
+
+Of the 147 development incidents that are missed, 82 have no finding of the right kind at
+medium or above and 55 have none at all. Rating what is already found differently cannot
+reach those, and the two ratings tried earlier did not carry from one set to the next. The
+largest groups
+are an amount priced from a reading that one transaction can move and a function anyone can
+call that makes the contract trade or burn what it holds. In both, what is lost goes to an
+exchange outside the contract, and the bytecode of the one contract does not show it.
 
 ### False alarms kept
 

@@ -211,6 +211,7 @@ def assemble(a):
     kept = json.load(open(a.work + "/flawed/kept.json"))
     count = collections.Counter(digest(f"{a.work}/flawed/{e['name']}.hex") for e in kept)
     flawed_set, dropped = {}, collections.Counter()
+    only = set(filter(None, a.only.split(",")))
     for e in kept:
         path = f"{a.work}/flawed/{e['name']}.hex"
         # Code that several incidents list first is a router or a pool they share, not the flaw.
@@ -220,6 +221,8 @@ def assemble(a):
             dropped["no class given"] += 1
         elif all(c in NOT_IN_CODE for c in e["classes"]):
             dropped["flaw is not in the code"] += 1
+        elif only and not any(c.split("/")[1] in only for c in e["classes"]):
+            dropped["no class in the categories asked for"] += 1
         else:
             shutil.copy(path, f"{held}/flawed/{e['name']}.hex")
             flawed_set[e["name"]] = {
@@ -261,7 +264,8 @@ def main():
     p.add_argument("--blocks", type=int, default=300)
     p.add_argument("--limit", type=int, default=90)
     p.add_argument("--seed", type=int, default=20261114)
-    sub.add_parser("assemble", help="write the set under testdata from what was fetched")
+    p = sub.add_parser("assemble", help="write the set under testdata from what was fetched")
+    p.add_argument("--only", default="", help="keep incidents with a class in one of these categories, comma-separated")
     a = ap.parse_args()
     {"pages": pages, "flawed": flawed, "sound": sound, "assemble": assemble}[a.command](a)
 

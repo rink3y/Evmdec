@@ -35,6 +35,7 @@ const MAX_POSITIONS: usize = 96;
 const MAX_SET_SLOTS: usize = 64;
 const SEED_LIMITS: Limits = Limits { paths: 6, runs: 18 };
 const FIRST_VALUE: u64 = 0x1001;
+const STAKE: U256 = U256([0, 1 << 16, 0, 0]);
 const SIZES: [u32; 4] = [0, 1, 2, 4];
 const WAITS: [u64; 4] = [3_600, 86_400, 30 * 86_400, 365 * 86_400];
 const UNUSED_SELECTOR: u32 = 0xffff_ffff;
@@ -132,6 +133,39 @@ struct Search<'a> {
     less: Option<Less>,
     // What the solver had outside contracts answer. Every world is told the same.
     readings: Vec<((U256, u32), Vec<u8>)>,
+    // Whether both accounts were given some of the contract's own token to start with.
+    staked: bool,
+}
+
+// A token nobody holds shows nothing of what its code does to a holder. Both accounts
+// start with an amount in the slot the contract's own balance function reads for each
+// of them. A balance function that reads anything else is left alone.
+fn stake(world: &mut World, balance_of: usize) -> bool {
+    let slot = |who: U256| {
+        let call = Call {
+            who,
+            data: exec::calldata(Some(SEL_BALANCE_OF), &[who]),
+            ..Call::default()
+        };
+        let done = world.clone().call(balance_of, &call);
+        let zero = done.ended && done.returned.len() >= 32 && word(&done.returned, 0).is_zero();
+        match (zero, done.read.len()) {
+            (true, 1) => done.read.first().copied(),
+            _ => None,
+        }
+    };
+    let (Some(actor), Some(other)) = (slot(ACTOR), slot(OTHER)) else {
+        return false;
+    };
+    let mut held = world.clone();
+    held.seed(exec::SELF, actor, STAKE);
+    held.seed(exec::SELF, other, STAKE);
+    let holds = |who: U256| held.holdings(who).reported == Some(STAKE);
+    if actor == other || !holds(ACTOR) || !holds(OTHER) {
+        return false;
+    }
+    *world = held;
+    true
 }
 
 fn names(data: &[u8], who: U256) -> bool {
@@ -275,7 +309,10 @@ impl<'a> Search<'a> {
                 }
             })
             .collect();
-        let world = World::of(c, &[ACTOR, OTHER]);
+        let mut world = World::of(c, &[ACTOR, OTHER]);
+        let balance_of = |e: &&Entry| exec::selector_of(e.function) == Some(SEL_BALANCE_OF);
+        let balance_of = entries.iter().find(balance_of).map(|e| e.at);
+        let staked = balance_of.is_some_and(|at| stake(&mut world, at));
         let start = Kept {
             other: world.holdings(OTHER),
             world,
@@ -300,6 +337,18 @@ impl<'a> Search<'a> {
             best: None,
             less: None,
             readings: Vec::new(),
+            staked,
+        }
+    }
+
+    fn started_from(&self) -> String {
+        let storage = deploy::started_from(self.c);
+        match self.staked {
+            true => format!(
+                "{storage}, with {} of the contract's own token written for each of the two accounts in the slot its balance function reads",
+                STAKE.to_hex()
+            ),
+            false => storage.to_string(),
         }
     }
 
@@ -949,7 +998,7 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
             None,
             format!(
                 "Starting from {}, {} call(s) were made, the last to `{}`. With every outside answer as first given, the same calls leave the account with no gain. When one word of an answer from {} is {} instead of {} for that one call, and as first given for every other call, the account ends with {} and with no less of anything else. The contract held nothing at the start, so the difference comes out of what the other account paid in. {how}",
-                deploy::started_from(c),
+                search.started_from(),
                 broken.steps.len(),
                 function.name,
                 swung.address.to_hex(),
@@ -1015,7 +1064,7 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
         None,
         format!(
             "Starting from {}, {} call(s) were made, {} of them by an account with no role, the last to `{}`. Every call ended normally. That account ends with {} and with no less of anything else. {source}{timing} The assets the contract calls keep honest books in these runs: a transfer the sender cannot cover fails, and the contract is told it holds exactly what was sent to it.",
-            deploy::started_from(c),
+            search.started_from(),
             broken.steps.len(),
             own_calls,
             function.name,
@@ -1039,7 +1088,7 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
     }
 }
 
-fn report_less(c: &Contract, search: &Search, less: &Less, out: &mut Vec<Finding>) {
+fn report_less(search: &Search, less: &Less, out: &mut Vec<Finding>) {
     let Some((Step::Call(entry, last), earlier)) = less.steps.split_last() else {
         return;
     };
@@ -1078,7 +1127,7 @@ fn report_less(c: &Contract, search: &Search, less: &Less, out: &mut Vec<Finding
         None,
         format!(
             "Starting from {}, {} call(s) were made. The last, to `{}`, was made by an account with no role and ended normally. The other account made no call after its own and is left with {} and with no more of anything else.{note}",
-            deploy::started_from(c),
+            search.started_from(),
             less.steps.len(),
             function.name,
             fell.join(" and "),
@@ -1113,6 +1162,6 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     }
     // A gain that came out of the other account already says what that account lost.
     if let (Some(less), false) = (search.less.take(), taken) {
-        report_less(c, &search, &less, out);
+        report_less(&search, &less, out);
     }
 }

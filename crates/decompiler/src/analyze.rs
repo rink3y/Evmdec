@@ -3905,11 +3905,13 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                 } => {
                     let target = emit::fmt_expr(*addr, names);
                     let line = emit::fmt_stmt(stmt, names);
-                    external_calls.insert(format!(
-                        "{}: {}",
-                        display_name(f),
-                        line.trim_end_matches(';')
-                    ));
+                    if !expr::as_const(*addr).is_some_and(crate::interp::built_in) {
+                        external_calls.insert(format!(
+                            "{}: {}",
+                            display_name(f),
+                            line.trim_end_matches(';')
+                        ));
+                    }
                     let in_len_c = expr::as_const(*in_len).and_then(|l| l.as_usize());
                     let selector: Option<u32> = input
                         .as_ref()
@@ -3934,7 +3936,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                         || matches!(expr::node(*gas), Node::Op(op::MUL, ref v) if expr::as_const(v[1]) == Some(U256::from_u64(2300)) || expr::as_const(v[0]) == Some(U256::from_u64(2300)));
                     let user_target = from_calldata(*addr) || from_caller(*addr);
                     let storage_target = from_storage(*addr);
-                    let precompile = expr::as_const(*addr).is_some_and(|a| a <= U256::from_u64(10));
+                    let precompile =
+                        expr::as_const(*addr).is_some_and(crate::interp::holds_no_code);
 
                     if *kind == op::DELEGATECALL || *kind == op::CALLCODE {
                         if f.kind == FnKind::Fallback {
@@ -5144,10 +5147,17 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 | Node::Op(op::EQ, _)
                         )
                     {
-                        let cap = const_slot_keys(*cond)
-                            .iter()
-                            .filter_map(|k| caps.get(k).copied())
-                            .max();
+                        let keys = const_slot_keys(*cond);
+                        // A bound no function of the runtime code writes was set once,
+                        // when the contract was made, and cannot grow.
+                        let fixed = |k: &U256| {
+                            !ctx.slot_writes.contains(k)
+                                && !ctx.field_writes.iter().any(|(slot, _, _)| slot == k)
+                        };
+                        if !keys.is_empty() && keys.iter().all(fixed) {
+                            break;
+                        }
+                        let cap = keys.iter().filter_map(|k| caps.get(k).copied()).max();
                         if let Some(cap) = cap {
                             push(&mut findings, "storage-bounded-loop", "Loop bounded by a capped storage counter", Severity::Info, Confidence::Medium, Some(f), Some(nd.pc),
                                 format!("`{}` loops while `{}`; the bound is a counter the contract never lets exceed {}, so the loop cannot grow without limit.", f.name, emit::fmt_expr(*cond, &names), cap), vec![], "Informational.");

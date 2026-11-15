@@ -548,12 +548,28 @@ fn a_rule_stays_silent_where_it_was_once_wrong() {
         let code = evmdec::hex::decode(hex.trim()).unwrap();
         let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
         let r = evmdec::analyze::analyze(&c);
-        let rule = case["rule"].as_str().unwrap();
-        let fired: Vec<_> = r.findings.iter().filter(|f| f.id == rule).collect();
-        assert!(fired.is_empty(), "{name}: {rule} fired: {fired:?}");
-        checked += 1;
+        for rule in case["rules"].as_array().unwrap() {
+            let rule = rule.as_str().unwrap();
+            let fired: Vec<_> = r.findings.iter().filter(|f| f.id == rule).collect();
+            assert!(fired.is_empty(), "{name}: {rule} fired: {fired:?}");
+            checked += 1;
+        }
     }
     assert!(checked > 0);
+}
+
+#[test]
+fn a_getter_that_copies_a_string_through_a_built_in_contract_changes_nothing() {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/false_alarms/classic_f8784090.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
+    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    let r = evmdec::analyze::analyze(&c);
+    let open = &r.unauthenticated_state_changers;
+    for getter in ["name", "symbol", "version"] {
+        assert!(!open.iter().any(|f| f.starts_with(getter)), "{open:?}");
+    }
+    assert_eq!(r.external_calls.len(), 1, "{:?}", r.external_calls);
 }
 
 #[test]

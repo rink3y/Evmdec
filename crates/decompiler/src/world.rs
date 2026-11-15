@@ -17,7 +17,6 @@ const SEL_TOTAL_SUPPLY: u32 = 0x1816_0ddd;
 const SEL_DECIMALS: u32 = 0x313c_e567;
 const DECIMALS: u64 = 18;
 const IDENTITY: u64 = 4;
-const LAST_BUILT_IN: u64 = 0x0a;
 const NO_ONE: U256 = U256::from_u64(0x0000_dead_0000_dead);
 const STEPS_PER_CALL: usize = 600_000;
 const MAX_DEPTH: usize = 12;
@@ -569,7 +568,7 @@ impl World {
         // No other built-in contract is run. One that recovers a signer answers with an
         // account that is no one in the run and is not zero, so that no signature is
         // taken to be good and no unset signer matches it.
-        if record.addr.fits_u64() && (1..=LAST_BUILT_IN).contains(&record.addr.low_u64()) {
+        if crate::interp::built_in(record.addr) {
             return (true, one_word(NO_ONE));
         }
         let to = match Some(record.addr) == self.known_as {

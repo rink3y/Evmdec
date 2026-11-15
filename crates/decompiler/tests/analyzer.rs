@@ -3275,7 +3275,7 @@ fn a_caller_test_against_a_record_anyone_opens_does_not_lower_a_re_entry_finding
     assert_eq!(f.severity, Severity::Medium, "{f:?}");
 }
 
-const NEEDS_TWO_WORDS: &str = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP1 PUSH1 0x11 GAS CALL POP \
+const NEEDS_TWO_WORDS: &str = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP1 PUSH1 0x21 GAS CALL POP \
      PUSH1 0x40 RETURNDATASIZE LT ISZERO PUSH2 @long JUMPI PUSH1 0x00 DUP1 REVERT \
      :long JUMPDEST PUSH1 0x20 PUSH1 0x20 PUSH1 0x80 RETURNDATACOPY PUSH1 0x80 MLOAD \
      PUSH2 @set JUMPI PUSH1 0x00 DUP1 REVERT :set JUMPDEST PUSH1 0x01 PUSH1 0x01 SSTORE STOP";

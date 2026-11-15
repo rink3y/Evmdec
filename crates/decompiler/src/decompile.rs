@@ -1333,9 +1333,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                             if matches!(*kind, op::CALL | op::STATICCALL | op::CALLCODE) =>
                         {
                             let low = c & expr::mask_bits(160);
-                            let is_precompile =
-                                low.fits_u64() && (1..=0x11).contains(&low.low_u64());
-                            if !low.is_zero() && !is_precompile {
+                            if !low.is_zero() && !crate::interp::built_in(low) {
                                 let h = low.to_hex_padded(20);
                                 if *kind != op::STATICCALL && !written_targets.contains(&h) {
                                     written_targets.push(h.clone());

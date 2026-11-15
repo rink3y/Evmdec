@@ -298,13 +298,14 @@ pub fn effects(l: &Lifted) -> Effects {
             match s {
                 Stmt::SStore { .. } => e.writes_storage = true,
                 Stmt::Log { .. } => e.logs = true,
-                Stmt::Call { kind, .. } => {
-                    if *kind == op::STATICCALL {
+                Stmt::Call { kind, addr, .. } => {
+                    let built_in = expr::as_const(*addr).is_some_and(crate::interp::built_in);
+                    if *kind == op::STATICCALL || built_in {
                         e.static_calls = true;
                     } else {
                         e.calls = true;
                     }
-                    if *kind == op::DELEGATECALL || *kind == op::CALLCODE {
+                    if !built_in && (*kind == op::DELEGATECALL || *kind == op::CALLCODE) {
                         e.delegatecall = true;
                     }
                 }

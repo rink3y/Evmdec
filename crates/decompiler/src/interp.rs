@@ -305,7 +305,7 @@ const CONTROLLED_SEED: u64 = 0x5eed;
 // as an address must have none, and neither may a stored address that a search set to a
 // small number to make a flag read as true.
 fn code_size(seed: u64, a: U256) -> U256 {
-    if a.fits_u64() && a.low_u64() <= LAST_PRECOMPILE {
+    if holds_no_code(a) {
         return U256::ZERO;
     }
     let drawn = h(&[&seed.to_be_bytes()[..], b"size", &a.to_be_bytes()].concat());
@@ -323,7 +323,17 @@ pub fn own_answer(answers: &[(usize, Vec<u8>)], call: usize) -> Option<&Vec<u8>>
         .map(|(_, data)| data)
 }
 
-const LAST_PRECOMPILE: u64 = 0x0a;
+const LAST_PRECOMPILE: u64 = 0x11;
+
+// The built-in contracts keep no state and run no code of anyone's. A call to one is
+// arithmetic, whatever opcode makes it.
+pub(crate) fn holds_no_code(addr: U256) -> bool {
+    addr.fits_u64() && addr.low_u64() <= LAST_PRECOMPILE
+}
+
+pub(crate) fn built_in(addr: U256) -> bool {
+    addr.fits_u64() && (1..=LAST_PRECOMPILE).contains(&addr.low_u64())
+}
 
 // An answer a check set on purpose is part of what that check measures. Only the answer
 // nothing chose is left for a search to shape.
@@ -336,7 +346,7 @@ pub fn answered_by_default(
     let selector = input
         .get(..4)
         .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-    let built_in = addr.fits_u64() && (1..=LAST_PRECOMPILE).contains(&addr.low_u64());
+    let built_in = built_in(addr);
     let recovered = addr == RECOVER && signed.is_some();
     !built_in && !recovered && !replies.iter().any(|(s, _)| Some(*s) == selector)
 }

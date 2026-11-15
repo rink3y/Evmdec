@@ -137,6 +137,7 @@ struct Less {
     before: Holdings,
     now: Holdings,
     waited: bool,
+    told: bool,
 }
 
 // Which way each holding of the two accounts went, which slots are set, whether value
@@ -305,7 +306,7 @@ impl Less {
     // that left under a standing approval may have been credited where a balance
     // function does not show it.
     fn severity(&self) -> Severity {
-        match self.own() && !self.waited {
+        match self.own() && !self.waited && !self.told {
             true => Severity::High,
             false => Severity::Medium,
         }
@@ -366,7 +367,7 @@ impl<'a> Search<'a> {
         };
         Search {
             c,
-            helps_left: 3 * entries.len(),
+            helps_left: 6 * entries.len(),
             entries,
             kept: vec![start],
             covered: HashSet::new(),
@@ -785,6 +786,7 @@ impl<'a> Search<'a> {
                 before: parent.other.clone(),
                 now: other.clone(),
                 waited,
+                told,
             };
             if self.less.as_ref().is_none_or(|l| found.better_than(l)) {
                 self.less = Some(found);
@@ -1004,20 +1006,20 @@ impl<'a> Search<'a> {
         }
     }
 
-    // What a contract pays back is often sized by what was paid, and random sizes
-    // seldom meet the pair that matters. For each function that needs a payment: the
-    // other account pays, value the contract has no record of arrives, and the actor
+    // Two shapes a random round seldom meets are tried outright for each function the
+    // other account can pay into. What a contract pays back is often sized by what was
+    // paid, and random sizes seldom meet the pair that matters. For a function that
+    // needs a payment: the other account pays, value the contract has no record of arrives, and the actor
     // pays twice at each pair of a few sizes. Every state reached is kept, so that the
     // rounds after it try every way out from there.
     fn opening(&mut self, index: usize) {
-        // A function that also ends without a payment does not size anything by it.
         let seeds = &self.entries[index].seeds;
-        if seeds.iter().any(|(_, value)| value.is_zero()) {
-            return;
-        }
-        let Some((data, value)) = seeds.iter().find(|(_, v)| *v < PURSE).cloned() else {
+        let paid = |(_, value): &&(Vec<u8>, U256)| !value.is_zero() && *value < PURSE;
+        let Some((data, value)) = seeds.iter().find(paid).cloned() else {
             return;
         };
+        // A function that also ends without a payment does not size anything by it.
+        let needs_payment = !seeds.iter().any(|(_, value)| value.is_zero());
         let pays = |who: U256, value: U256| Call {
             who,
             data: data.clone(),
@@ -1027,6 +1029,24 @@ impl<'a> Search<'a> {
         let Some(paid_in) = self.attempt_and(true, 0, index, pays(OTHER, value)) else {
             return;
         };
+        if !needs_payment && !self.kept[paid_in].recorded {
+            return;
+        }
+        // The actor pays in while one outside answer reads higher or lower, and then
+        // asks each function for all the contract holds.
+        for (nth, up) in [(0, true), (0, false), (1, true), (1, false)] {
+            let call = Call {
+                swing: Some((nth, 0, up)),
+                ..pays(ACTOR, value)
+            };
+            let swung = self.attempt_and(true, paid_in, index, call);
+            if let Some(swung) = swung.filter(|at| self.kept[*at].swung.is_some()) {
+                self.drain(swung);
+            }
+        }
+        if !needs_payment {
+            return;
+        }
         let Some(given) = self.gift(true, paid_in, OTHER) else {
             return;
         };
@@ -1037,6 +1057,32 @@ impl<'a> Search<'a> {
             };
             for second in SIZES {
                 self.attempt_and(true, once, index, pays(ACTOR, value << second));
+            }
+        }
+    }
+
+    // Every function is asked once, by the actor, for each amount the contract holds.
+    fn drain(&mut self, from: usize) {
+        let held = self.kept[from].world.held(exec::SELF);
+        for index in 0..self.entries.len() {
+            let entry = &self.entries[index];
+            let Some((data, _)) = entry.seeds.first().cloned() else {
+                continue;
+            };
+            let words = data.len().saturating_sub(4) / 32;
+            let free = |at: &usize| !entry.fixed.contains(at) && !entry.addresses.contains(at);
+            let Some(at) = (0..words.min(entry.params)).find(free) else {
+                continue;
+            };
+            for amount in &held {
+                let mut data = data.clone();
+                data[4 + 32 * at..36 + 32 * at].copy_from_slice(&amount.to_be_bytes());
+                let call = Call {
+                    who: ACTOR,
+                    data,
+                    ..Call::default()
+                };
+                self.attempt(from, index, call);
             }
         }
     }
@@ -1076,6 +1122,7 @@ impl<'a> Search<'a> {
             self.opening(index);
         }
         let mut rounds = 0;
+        let mut solved_up_to = self.kept.len();
         let learnt = self.covered.len() + self.positions.len();
         let (mut reached, mut fresh, mut fresh_at) = (learnt, 0, exec::work());
         let stale = |rounds: usize, fresh: usize, fresh_at: u64| {
@@ -1091,18 +1138,24 @@ impl<'a> Search<'a> {
             if learnt > reached {
                 (reached, fresh, fresh_at) = (learnt, rounds, exec::work());
             }
-            // A state the search just reached may be the one a stuck function was
-            // waiting for. Its own checks are solved again from there.
-            if rounds % 64 == 0 && self.kept.len() > 1 {
-                let from = self.kept.len() - 1;
-                let index = self.follows(from);
+            // A function with no working input is often waiting for state. When a new
+            // state wrote a slot such a function reads, its checks are solved from there.
+            for from in solved_up_to..self.kept.len() {
                 let who = match self.kept[from].base {
                     Some(_) => ACTOR,
                     None => OTHER,
                 };
-                self.help(from, index, who);
-                self.help(from, index, ACTOR);
+                let wrote = &self.kept[from].written;
+                let waits =
+                    |e: &Entry| e.seeds.is_empty() && e.reads.iter().any(|k| wrote.contains(k));
+                let waiting: Vec<usize> = (0..self.entries.len())
+                    .filter(|i| waits(&self.entries[*i]))
+                    .collect();
+                for index in waiting {
+                    self.help(from, index, who);
+                }
             }
+            solved_up_to = self.kept.len();
         }
     }
 }
@@ -1314,10 +1367,11 @@ fn report_less(search: &Search, less: &Less, out: &mut Vec<Finding>) {
             had.to_hex()
         ));
     }
-    let note = match (less.own(), less.waited) {
-        (true, false) => "",
-        (true, true) => " Time passed between the calls, and a balance that runs down with time would fall in the same way.",
-        (false, _) => " The asset left under the approval that account gave the contract when it paid in. It went to the contract or to a third account, and a credit for it that no balance function shows cannot be seen from outside.",
+    let note = match (less.told, less.own(), less.waited) {
+        (true, ..) => " One of the calls asked a contract outside this one a question outside the transfer interface, and the answer used is one the code accepts, not one that contract is known to give. If that contract is what decides who may make the call, this does not happen.",
+        (false, true, false) => "",
+        (false, true, true) => " Time passed between the calls, and a balance that runs down with time would fall in the same way.",
+        (false, false, _) => " The asset left under the approval that account gave the contract when it paid in. It went to the contract or to a third account, and a credit for it that no balance function shows cannot be seen from outside.",
     };
     push(
         out,

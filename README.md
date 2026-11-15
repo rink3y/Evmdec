@@ -655,11 +655,17 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   that differs for one call is about a thousand times higher or lower. The search cannot
   know what moving an answer costs, only that the contract's own code turns a one-call
   change into a lasting gain.
-- The solver enters 64 in 100 functions of the development incidents. Half of the rest
-  check their caller. Of the open functions it cannot enter from the starting storage, four
-  times its budget entered six more and letting it choose storage entered half, so those
-  wait for a state the search has to reach. About 670 open functions, 8 in 100 of all, are
-  entered neither way. A decision procedure might enter some of them and none was built.
+- The search enters 64 in 100 functions of the development set, 6,219 of 9,684. The check
+  each of the other 3,465 stops at was read back from its deepest run. 2,038 check their
+  caller. 555 stop at a stored value, a setting or a state no sequence reached. 250 stop at
+  what an outside contract answers. An answer of sixteen words in place of one entered 79
+  more functions, found nothing more on the flawed contracts and put a high finding on one
+  more contract with no known flaw, so the answer stays one word. 161 the solver enters on
+  its own budget and the search, with less per function, did not. 81 are a fallback the
+  dispatcher always refuses, 62 take arrays or structs laid out other than the search
+  guesses, and about 190 belong to a few contracts whose share of work ran out. That leaves
+  about 110 functions, 1 in 100, stopped by arithmetic over their own arguments. That is
+  all a decision procedure could add, and none was built.
 - Value sent straight to the contract is tried only while the contract holds a payment it
   recorded. A gain taken from it is reported at medium, because the contract keeps no record
   of whose that value is.

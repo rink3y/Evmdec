@@ -3638,6 +3638,22 @@ fn the_search_finds_an_account_that_ends_with_more_than_it_started_with() {
     assert_eq!(f.severity, Severity::Medium, "{f:?}");
 }
 
+#[test]
+fn the_search_enters_a_function_that_takes_more_words_than_it_guesses() {
+    let words: Vec<String> = (0..7)
+        .map(|i| format!("PUSH1 0x{:02x} CALLDATALOAD POP", 4 + 32 * i))
+        .collect();
+    let long = format!(
+        "PUSH1 0xe4 CALLDATASIZE LT ISZERO PUSH2 @long JUMPI PUSH1 0x00 DUP1 REVERT \
+         :long JUMPDEST {} {}",
+        words.join(" "),
+        pay_out_everything()
+    );
+    let r = report_of(&dispatcher3(&counted_pay_in(), &long, "STOP"));
+    let found = finding(&r, "calls-leave-account-with-gain");
+    assert!(found.is_some(), "{:?}", ids(&r));
+}
+
 fn asset_pull(label: &str, from: &str, to: &str, amount: &str, then: &str) -> String {
     let answered =
         format!("PUSH1 0x80 MLOAD PUSH2 @{label} JUMPI PUSH1 0x00 DUP1 REVERT :{label} JUMPDEST");

@@ -205,7 +205,10 @@ fn shape(f: &Function) -> (Vec<u8>, Vec<usize>) {
             let unused = Some(UNUSED_SELECTOR);
             (path::inputs_for(unused, WORDS).calldata, Vec::new())
         }
-        _ if shaped.fixed.is_empty() => (path::inputs_for(selector, WORDS).calldata, Vec::new()),
+        _ if shaped.fixed.is_empty() => {
+            let words = WORDS.max(f.params.len());
+            (path::inputs_for(selector, words).calldata, Vec::new())
+        }
         _ => (shaped.calldata, shaped.fixed),
     }
 }

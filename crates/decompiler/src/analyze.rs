@@ -2781,17 +2781,18 @@ fn digest_unseen(digest: ExprId) -> bool {
     }) || mentions(digest, &structured)
 }
 
+fn strip(e: ExprId) -> ExprId {
+    match expr::node(e) {
+        Node::Op(op::ISZERO, v) => strip(v[0]),
+        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
+            strip(v[0])
+        }
+        _ => e,
+    }
+}
+
 // The other side of an equality test that has the wanted value on one side.
 fn compared_with(cond: ExprId, wanted: &dyn Fn(&Node) -> bool) -> Option<ExprId> {
-    fn strip(e: ExprId) -> ExprId {
-        match expr::node(e) {
-            Node::Op(op::ISZERO, v) => strip(v[0]),
-            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-                strip(v[0])
-            }
-            _ => e,
-        }
-    }
     match expr::node(strip(cond)) {
         Node::Op(op::AND | op::OR, v) if v.iter().all(|x| expr::is_boolean(*x)) => {
             v.iter().find_map(|x| compared_with(*x, wanted))
@@ -2818,15 +2819,6 @@ fn asked_directly(addr: ExprId) -> bool {
 }
 
 fn tests_zero(cond: ExprId, wanted: &dyn Fn(&Node) -> bool) -> bool {
-    fn strip(e: ExprId) -> ExprId {
-        match expr::node(e) {
-            Node::Op(op::ISZERO, v) => strip(v[0]),
-            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-                strip(v[0])
-            }
-            _ => e,
-        }
-    }
     let inner = strip(cond);
     match expr::node(inner) {
         Node::Op(op::AND | op::OR, v) if v.iter().all(|x| expr::is_boolean(*x)) => {
@@ -2879,15 +2871,6 @@ fn is_owner_cond(cond: ExprId) -> bool {
 }
 
 fn role_test_root(cond: ExprId) -> Option<U256> {
-    fn strip(e: ExprId) -> ExprId {
-        match expr::node(e) {
-            Node::Op(op::ISZERO, v) => strip(v[0]),
-            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-                strip(v[0])
-            }
-            _ => e,
-        }
-    }
     match expr::node(strip(cond)) {
         Node::SLoad(k, _, _) if from_caller(k) => mapping_root(k),
         _ => None,
@@ -2984,15 +2967,6 @@ pub struct Gates {
 }
 
 pub fn gates(c: &Contract) -> Gates {
-    fn strip(e: ExprId) -> ExprId {
-        match expr::node(e) {
-            Node::Op(op::ISZERO, v) => strip(v[0]),
-            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-                strip(v[0])
-            }
-            _ => e,
-        }
-    }
     let mut out = Gates::default();
     for f in &c.functions {
         let Some(l) = &f.lifted else { continue };
@@ -3048,15 +3022,6 @@ pub fn key_for(key: ExprId, caller: U256) -> Option<U256> {
 }
 
 pub fn is_auth_cond(cond: ExprId) -> bool {
-    fn strip(e: ExprId) -> ExprId {
-        match expr::node(e) {
-            Node::Op(op::ISZERO, v) => strip(v[0]),
-            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-                strip(v[0])
-            }
-            _ => e,
-        }
-    }
     let c = strip(cond);
     match expr::node(c) {
         Node::Op(op::EQ | op::SUB | op::XOR, v) => {

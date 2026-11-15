@@ -397,9 +397,8 @@ pub enum Flow {
     },
     Return(AVal),
     Fallthrough(usize),
-    Halt(u8),
+    Halt,
     BranchUnresolved {
-        target: AVal,
         fallthrough: Option<usize>,
     },
 }
@@ -486,7 +485,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                     AVal::Const(c) | AVal::Pc(c) => {
                         match c.as_usize().and_then(|pc| prog.target_block(pc)) {
                             Some(target) => Flow::Jump(vec![target]),
-                            None => Flow::Halt(op::INVALID),
+                            None => Flow::Halt,
                         }
                     }
                     AVal::Table => Flow::Jump(
@@ -526,10 +525,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         targets: prog.computed_jumps[&b.id].clone(),
                         fallthrough,
                     },
-                    v => Flow::BranchUnresolved {
-                        target: v,
-                        fallthrough,
-                    },
+                    _ => Flow::BranchUnresolved { fallthrough },
                 });
                 break;
             }
@@ -746,7 +742,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                     st.push(v);
                 }
                 if op::is_halt(o) {
-                    flow = Some(Flow::Halt(o));
+                    flow = Some(Flow::Halt);
                     break;
                 }
             }
@@ -754,7 +750,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
     }
     let flow = flow.unwrap_or_else(|| match prog.next_block(b.id) {
         Some(nb) => Flow::Fallthrough(nb),
-        None => Flow::Halt(op::STOP),
+        None => Flow::Halt,
     });
     BlockExit {
         state: st,
@@ -1074,7 +1070,7 @@ impl<'a> Analysis<'a> {
                         work.push_back((f, st.clone()));
                     }
                 }
-                Flow::Halt(_) => summary.may_halt = true,
+                Flow::Halt => summary.may_halt = true,
             }
         }
         summary.blocks = blocks_seen.into_iter().collect();
@@ -1315,7 +1311,7 @@ impl<'a> Analysis<'a> {
             if !follow_computed && prog.computed_jumps.contains_key(&blk) {
                 match exit.flow {
                     Flow::Jump(_) => {
-                        exit.flow = Flow::Halt(op::JUMP);
+                        exit.flow = Flow::Halt;
                         cut = true;
                     }
                     Flow::Branch { fallthrough, .. } => {
@@ -1454,7 +1450,7 @@ impl<'a> Analysis<'a> {
                         succs.push((id, Edge::False));
                     }
                 }
-                Flow::Halt(_) => {}
+                Flow::Halt => {}
             }
             nodes[n].call = call;
             for (s, _) in &succs {

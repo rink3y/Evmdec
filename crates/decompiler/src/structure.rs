@@ -291,7 +291,6 @@ struct Printer<'a> {
     labels: HashSet<usize>,
     nesting: usize,
     loop_stack: Vec<(usize, Option<usize>, usize)>,
-    gotos: usize,
     active: HashSet<usize>,
     next_tmp: u32,
     used: Vec<ExprId>,
@@ -2186,7 +2185,6 @@ impl<'a> Printer<'a> {
         // printed at the top level under a label, so a long chain cannot use up the stack.
         if self.nesting >= MAX_NESTING {
             self.labels.insert(n);
-            self.gotos += 1;
             self.line(depth, &format!("goto L{:x};", self.node_pc(n)));
             return;
         }
@@ -2209,7 +2207,6 @@ impl<'a> Printer<'a> {
                     }
                 } else {
                     self.labels.insert(n);
-                    self.gotos += 1;
                     self.line(
                         depth,
                         &format!("goto L{:x}; // continue outer loop", self.node_pc(n)),
@@ -2222,7 +2219,6 @@ impl<'a> Printer<'a> {
                     self.line(depth, "break;");
                 } else {
                     self.labels.insert(n);
-                    self.gotos += 1;
                     self.line(
                         depth,
                         &format!("goto L{:x}; // break outer loop", self.node_pc(n)),
@@ -2237,7 +2233,6 @@ impl<'a> Printer<'a> {
                 return None;
             }
             self.labels.insert(n);
-            self.gotos += 1;
             self.line(depth, &format!("goto L{:x};", self.node_pc(n)));
             return None;
         }
@@ -2863,15 +2858,9 @@ fn reason_suffix(reason: &Option<String>) -> String {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Structured {
-    pub text: String,
-    pub gotos: usize,
-}
-
 const MAX_NESTING: usize = 400;
 
-pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
+pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
     let g = Graph::new(l);
     let loops = find_loops(&g);
     let mut used: Vec<ExprId> = Vec::new();
@@ -2891,7 +2880,6 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         labels: HashSet::new(),
         nesting: 0,
         loop_stack: Vec::new(),
-        gotos: 0,
         active: HashSet::new(),
         next_tmp: 1 << 30,
         used,
@@ -2944,7 +2932,6 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             labels: p.labels.clone(),
             nesting: 0,
             loop_stack: Vec::new(),
-            gotos: 0,
             active: HashSet::new(),
             facts: Vec::new(),
             stale_plan: std::mem::take(&mut p.stale_plan),
@@ -2977,15 +2964,11 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
                 .filter(|n| !p2.emitted.contains(n))
                 .collect();
         }
-        p.gotos = p2.gotos;
         p2.out
     } else {
         p.out
     };
-    Structured {
-        text: drop_empty_else(&drop_unused_previous(&text)),
-        gotos: p.gotos,
-    }
+    drop_empty_else(&drop_unused_previous(&text))
 }
 
 fn drop_unused_previous(text: &str) -> String {
@@ -3076,7 +3059,7 @@ pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
     let depth = indent.len() / 4;
     let rolled = reroll_peeled_loops(l);
     let bound = bind_shared(&rolled, n);
-    let text = structure(&bound, n, depth).text;
+    let text = structure(&bound, n, depth);
     expr::clear_boolean_marks();
     text
 }

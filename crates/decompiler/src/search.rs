@@ -9,7 +9,7 @@ use crate::interp::Rng;
 use crate::path::{self, Explorers, Limits, Path};
 use crate::solve::{word, Free, Inputs};
 use crate::u256::U256;
-use crate::world::{Call, Done, Holdings, Swung, World, LAST_BUILT_IN, PURSE};
+use crate::world::{Call, Done, Holdings, Swung, World, PURSE};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -38,7 +38,6 @@ const SEED_LIMITS: Limits = Limits { paths: 6, runs: 18 };
 const FIRST_VALUE: u64 = 0x1001;
 const STAKE: U256 = U256([0, 1 << 16, 0, 0]);
 const SIZES: [u32; 4] = [0, 1, 2, 4];
-const WAITS: [u64; 4] = [3_600, 86_400, 30 * 86_400, 365 * 86_400];
 const UNUSED_SELECTOR: u32 = 0xffff_ffff;
 
 struct Entry<'a> {
@@ -62,10 +61,6 @@ enum Step {
 }
 
 impl Step {
-    fn waited_by_actor(&self) -> bool {
-        matches!(self, Step::Call(_, call) if call.who == ACTOR && call.seconds_later > 0)
-    }
-
     fn by_actor(&self) -> bool {
         match self {
             Step::Call(_, call) => call.who == ACTOR,
@@ -93,9 +88,6 @@ struct Kept {
     // The one answer a call of this sequence saw differently, and whether the call
     // data named the contract that gave it.
     swung: Option<(Swung, bool)>,
-    // Whether a call of this sequence got an answer the solver chose for an outside
-    // contract. What follows from it holds only if that contract answers so.
-    told: bool,
     // A call by which the other account takes out from here, and what it then holds.
     exit: Option<(usize, Call, Holdings)>,
     other: Holdings,
@@ -105,13 +97,11 @@ struct Broken {
     steps: Vec<Step>,
     base: Holdings,
     now: Holdings,
-    waited: bool,
     recorded: bool,
     taken: bool,
     // Whether the gain needs the account to call in again while it is being paid.
     reentered: bool,
     swung: Option<(Swung, bool)>,
-    told: bool,
 }
 
 // A call by the actor that moves no value and after which the other account's way out
@@ -136,8 +126,6 @@ struct Less {
     steps: Vec<Step>,
     before: Holdings,
     now: Holdings,
-    waited: bool,
-    told: bool,
 }
 
 // Which way each holding of the two accounts went, which slots are set, whether value
@@ -167,8 +155,6 @@ struct Search<'a> {
     rounded: Option<Rounded>,
     // How often each function has been tried in two parts.
     splits: HashMap<usize, usize>,
-    // What the solver had outside contracts answer. Every world is told the same.
-    readings: Vec<((U256, u32), Vec<u8>)>,
     // Whether both accounts were given some of the contract's own token to start with.
     staked: bool,
 }
@@ -280,13 +266,11 @@ impl Broken {
         match self.swung {
             Some((swung, named)) if swung.balance || named => return Severity::High,
             Some(_) => return Severity::Medium,
-            // An outside contract that answers otherwise may be what forbids the call.
-            None if self.told => return Severity::Medium,
             None => {}
         }
-        match (self.outside(), self.recorded || self.taken, self.waited) {
-            (true, true, _) | (false, _, false) => Severity::High,
-            _ => Severity::Medium,
+        match self.outside() && !self.recorded && !self.taken {
+            true => Severity::Medium,
+            false => Severity::High,
         }
     }
 
@@ -306,7 +290,7 @@ impl Less {
     // that left under a standing approval may have been credited where a balance
     // function does not show it.
     fn severity(&self) -> Severity {
-        match self.own() && !self.waited && !self.told {
+        match self.own() {
             true => Severity::High,
             false => Severity::Medium,
         }
@@ -362,7 +346,6 @@ impl<'a> Search<'a> {
             taken: false,
             reentered: false,
             swung: None,
-            told: false,
             exit: None,
         };
         Search {
@@ -380,7 +363,6 @@ impl<'a> Search<'a> {
             exits: Vec::new(),
             rounded: None,
             splits: HashMap::new(),
-            readings: Vec::new(),
             staked,
         }
     }
@@ -428,28 +410,12 @@ impl<'a> Search<'a> {
         let free = Free {
             words: start.calldata.len() / 32,
             value: true,
-            answers: true,
             fixed: entry.fixed.clone(),
             ..Free::default()
         };
         let code = self.c.code_of(entry.function);
         let found = self.explorers.of(code).explore(&start, &free, SEED_LIMITS);
         let ended: Vec<Path> = found.into_iter().filter(Path::succeeded).collect();
-        for p in ended.iter().take(SEEDS_PER_ENTRY) {
-            for (at, answer) in &p.inputs.answers {
-                let Some(asked) = p.run.calls.get(*at) else {
-                    continue;
-                };
-                if asked.addr.fits_u64() && asked.addr.low_u64() <= LAST_BUILT_IN {
-                    continue;
-                }
-                let first = asked.input.get(..4).map(|b| [b[0], b[1], b[2], b[3]]);
-                let (address, selector) = (asked.addr, first.map_or(0, u32::from_be_bytes));
-                if !self.readings.iter().any(|(k, _)| *k == (address, selector)) {
-                    self.readings.push(((address, selector), answer.clone()));
-                }
-            }
-        }
         let inputs = ended
             .into_iter()
             .map(|p| (p.inputs.calldata, p.inputs.callvalue));
@@ -536,10 +502,6 @@ impl<'a> Search<'a> {
         if resized {
             value = self.size(from);
         }
-        let seconds_later = match self.pick(8) {
-            0 => WAITS[self.pick(WAITS.len())],
-            _ => 0,
-        };
         // An account that is code can make a call of its own when it is paid.
         let back = match who == ACTOR && self.pick(6) == 0 {
             true => Some((data.clone(), U256::ZERO)),
@@ -555,7 +517,6 @@ impl<'a> Search<'a> {
             who,
             data,
             value,
-            seconds_later,
             back,
             swing,
         }
@@ -639,10 +600,7 @@ impl<'a> Search<'a> {
     // kept whether or not it is somewhere new.
     fn attempt_and(&mut self, keep: bool, from: usize, index: usize, call: Call) -> Option<usize> {
         let at = self.entries[index].at;
-        let mut before = self.kept[from].world.clone();
-        for ((address, selector), answer) in &self.readings {
-            before.tell(*address, *selector, answer);
-        }
+        let before = self.kept[from].world.clone();
         let mut world = before.clone();
         let mut call = call;
         let mut done = world.call(at, &call);
@@ -682,9 +640,6 @@ impl<'a> Search<'a> {
     // The world the same steps leave from the start with every answer as first given.
     fn replayed(&self, steps: &[Step]) -> Option<World> {
         let mut world = self.kept[0].world.clone();
-        for ((address, selector), answer) in &self.readings {
-            world.tell(*address, *selector, answer);
-        }
         for step in steps {
             let ended = match step {
                 Step::Call(index, call) => {
@@ -739,7 +694,6 @@ impl<'a> Search<'a> {
         let brought = !by_actor && done.crossed && !done.written.is_empty();
         let recorded = parent.recorded || brought;
         let reentered = parent.reentered || done.called_back;
-        let told = parent.told || done.told;
         let swung = match (&step, done.swung) {
             (Step::Call(_, call), Some(swung)) => Some((swung, names(&call.data, swung.address))),
             _ => parent.swung,
@@ -750,14 +704,16 @@ impl<'a> Search<'a> {
             true => world.holdings(OTHER),
             false => parent.other.clone(),
         };
-        let waited = steps.iter().any(Step::waited_by_actor);
         let took_out = !by_actor && gained(&parent.other, &other);
         let exit = match (steps.last(), took_out && parent.base.is_none()) {
             (Some(Step::Call(index, call)), true) => Some((*index, call.clone(), other.clone())),
             _ => None,
         };
-        if let (Some(Step::Call(index, call)), true) = (steps.last(), by_actor) {
-            let quiet = !done.moved && !done.written.is_empty() && call.seconds_later == 0;
+        // An answer that read differently for one call belongs to the gain it may leave
+        // and to nothing else. Read lower, a refusal can look like a permission.
+        let plain = swung.is_none();
+        if let (Some(Step::Call(index, call)), true) = (steps.last(), by_actor && plain) {
+            let quiet = !done.moved && !done.written.is_empty();
             let found = match (quiet, &parent.exit) {
                 (true, Some(exit)) => self.lowers(parent, &world, exit, &steps),
                 _ => None,
@@ -778,15 +734,13 @@ impl<'a> Search<'a> {
                 self.rounded = self.split(parent, &world, *index, call, &steps);
             }
         }
-        let fell = by_actor && gained(&other, &parent.other);
+        let fell = by_actor && plain && gained(&other, &parent.other);
         let taken = parent.taken || (fell && other.assets != parent.other.assets);
         if fell {
             let found = Less {
                 steps: steps.clone(),
                 before: parent.other.clone(),
                 now: other.clone(),
-                waited,
-                told,
             };
             if self.less.as_ref().is_none_or(|l| found.better_than(l)) {
                 self.less = Some(found);
@@ -817,12 +771,10 @@ impl<'a> Search<'a> {
                     steps: steps.clone(),
                     base: base.clone(),
                     now,
-                    waited,
                     recorded,
                     taken,
                     reentered,
                     swung,
-                    told,
                 };
                 // A gain the same calls leave with every answer as first given is not
                 // owed to the answer that differed.
@@ -867,7 +819,6 @@ impl<'a> Search<'a> {
                 taken,
                 reentered,
                 swung,
-                told,
                 exit: None,
                 other,
             });
@@ -1163,12 +1114,8 @@ impl<'a> Search<'a> {
 fn shown(steps: &[Step]) -> Vec<String> {
     let line = |s: &Step| match s {
         Step::Call(_, call) => {
-            let waited = match call.seconds_later {
-                0 => String::new(),
-                seconds => format!(", {seconds} seconds after the call before it"),
-            };
             format!(
-                "{} with value {} from {}{waited}",
+                "{} with value {} from {}",
                 hex::encode(&call.data),
                 call.value.to_hex(),
                 call.who.to_hex()
@@ -1225,17 +1172,9 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
         (false, ..) => "Nothing was paid for that balance, in ether or in any asset.",
     };
     let severity = broken.severity();
-    let timing = match (severity, broken.told, outside) {
-        (Severity::High, ..) => "",
-        (_, true, _) => {
-            " One of the calls asked a contract outside this one a question outside the transfer interface, and the answer used is one the code accepts, not one that contract is known to give. If that contract is what decides who may make the call, the gain is not there."
-        }
-        (_, false, true) => {
-            " No call that brought that payment in wrote anything to storage, so the contract keeps no record of whose it is. A contract that only passes value on within one transaction leaves what stays behind open in this way."
-        }
-        (_, false, false) => {
-            " The gain needs time to pass between the calls, as a reward that accrues would. Whether that reward is meant to be open to an account that paid nothing is for a reader to judge."
-        }
+    let timing = match severity {
+        Severity::Medium => " No call that brought that payment in wrote anything to storage, so the contract keeps no record of whose it is. A contract that only passes value on within one transaction leaves what stays behind open in this way.",
+        _ => "",
     };
     if let Some((swung, named)) = broken.swung {
         let how = match (swung.balance, named) {
@@ -1367,11 +1306,9 @@ fn report_less(search: &Search, less: &Less, out: &mut Vec<Finding>) {
             had.to_hex()
         ));
     }
-    let note = match (less.told, less.own(), less.waited) {
-        (true, ..) => " One of the calls asked a contract outside this one a question outside the transfer interface, and the answer used is one the code accepts, not one that contract is known to give. If that contract is what decides who may make the call, this does not happen.",
-        (false, true, false) => "",
-        (false, true, true) => " Time passed between the calls, and a balance that runs down with time would fall in the same way.",
-        (false, false, _) => " The asset left under the approval that account gave the contract when it paid in. It went to the contract or to a third account, and a credit for it that no balance function shows cannot be seen from outside.",
+    let note = match less.own() {
+        true => "",
+        false => " The asset left under the approval that account gave the contract when it paid in. It went to the contract or to a third account, and a credit for it that no balance function shows cannot be seen from outside.",
     };
     push(
         out,

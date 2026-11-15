@@ -17,7 +17,7 @@ const SEL_TOTAL_SUPPLY: u32 = 0x1816_0ddd;
 const SEL_DECIMALS: u32 = 0x313c_e567;
 const DECIMALS: u64 = 18;
 const IDENTITY: u64 = 4;
-pub const LAST_BUILT_IN: u64 = 0x0a;
+const LAST_BUILT_IN: u64 = 0x0a;
 const NO_ONE: U256 = U256::from_u64(0x0000_dead_0000_dead);
 const STEPS_PER_CALL: usize = 600_000;
 const MAX_DEPTH: usize = 12;
@@ -35,7 +35,6 @@ pub struct Call {
     pub who: U256,
     pub data: Vec<u8>,
     pub value: U256,
-    pub seconds_later: u64,
     // A call the sender makes into the same contract when it is paid during this one.
     pub back: Option<(Vec<u8>, U256)>,
     // One outside answer that reads about a thousand times higher or lower for this
@@ -86,8 +85,6 @@ pub struct Done {
     // Whether an address without code was asked something outside the transfer
     // interface, so that what the call did rests on an answer nobody keeps books for.
     pub asked: bool,
-    // Whether an answer came from what the world was told and not from any books.
-    pub told: bool,
     pub writes: Vec<Write>,
 }
 
@@ -122,9 +119,6 @@ pub struct World {
     ether: HashMap<U256, U256>,
     assets: HashMap<(U256, U256), U256>,
     approved: HashSet<(U256, U256)>,
-    // What an address without code answers to a question outside the transfer
-    // interface. The first answer given stands, so every call sees the same one.
-    readings: HashMap<(U256, u32), Vec<u8>>,
     funded: Vec<U256>,
     // The address the contract under test has on chain, when it is known. A contract
     // it is linked to calls it there.
@@ -239,11 +233,6 @@ impl World {
 
     pub fn fund(&mut self, who: U256) {
         self.funded.push(who);
-    }
-
-    pub fn tell(&mut self, address: U256, selector: u32, answer: &[u8]) {
-        let told = self.readings.entry((address, selector));
-        told.or_insert_with(|| answer.to_vec());
     }
 
     pub fn seed(&mut self, address: U256, slot: U256, value: U256) {
@@ -411,11 +400,6 @@ impl World {
         // With thousands of stored slots that costs more than running the call.
         exec::spend(2 * self.size() as u64);
         let before = self.clone();
-        let later = U256::from_u64(call.seconds_later);
-        self.timestamp = self.timestamp.wrapping_add(later);
-        self.number = self
-            .number
-            .wrapping_add(U256::from_u64(call.seconds_later / 12));
         let mut run = Run {
             origin: call.who,
             target: account,
@@ -678,8 +662,8 @@ impl World {
     }
 
     // An address without code. An asset answers from its books. Anything else answers
-    // what it was told to, or one word that reads as true, which is what a call that
-    // went well most often returns.
+    // one word that reads as true, which is what a call that went well most often
+    // returns.
     fn answer(&mut self, call: &CallRecord, from: &Frame, run: &mut Run) -> (bool, Vec<u8>) {
         // Code run in the caller's own storage is part of the caller. When it is not
         // there to run, nothing is known of what it would have done or answered.
@@ -738,9 +722,7 @@ impl World {
             asked => {
                 run.done.asked = true;
                 let asked = asked.unwrap_or(0);
-                let told = self.readings.get(&(call.addr, asked)).cloned();
-                run.done.told |= told.is_some();
-                let answer = told.unwrap_or(one_word(U256::ONE));
+                let answer = one_word(U256::ONE);
                 (true, self.seen(run, (call.addr, asked, U256::ZERO), answer))
             }
         };

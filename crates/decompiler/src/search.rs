@@ -9,9 +9,9 @@ use crate::interp::Rng;
 use crate::path::{self, Explorers, Limits, Path};
 use crate::solve::{word, Free, Inputs};
 use crate::u256::U256;
-use crate::world::{Call, Done, Holdings, Swung, World, PURSE};
+use crate::world::{Call, Done, Holdings, Swung, World, LAST_BUILT_IN, PURSE};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub const WORK: u64 = 4 * exec::WORK_PER_SECOND;
 
@@ -33,6 +33,7 @@ const SEEDS_PER_ENTRY: usize = 4;
 const MAX_READS: usize = 1_024;
 const MAX_POSITIONS: usize = 96;
 const MAX_SET_SLOTS: usize = 64;
+const MAX_SPLITS: usize = 24;
 const SEED_LIMITS: Limits = Limits { paths: 6, runs: 18 };
 const FIRST_VALUE: u64 = 0x1001;
 const STAKE: U256 = U256([0, 1 << 16, 0, 0]);
@@ -92,6 +93,11 @@ struct Kept {
     // The one answer a call of this sequence saw differently, and whether the call
     // data named the contract that gave it.
     swung: Option<(Swung, bool)>,
+    // Whether a call of this sequence got an answer the solver chose for an outside
+    // contract. What follows from it holds only if that contract answers so.
+    told: bool,
+    // A call by which the other account takes out from here, and what it then holds.
+    exit: Option<(usize, Call, Holdings)>,
     other: Holdings,
 }
 
@@ -105,6 +111,24 @@ struct Broken {
     // Whether the gain needs the account to call in again while it is being paid.
     reentered: bool,
     swung: Option<(Swung, bool)>,
+    told: bool,
+}
+
+// A call by the actor that moves no value and after which the other account's way out
+// pays it less.
+struct Lowered {
+    steps: Vec<Step>,
+    exit: (usize, Call),
+    before: Holdings,
+    after: Holdings,
+}
+
+// A take-out that costs less in two parts than in one.
+struct Rounded {
+    steps: Vec<Step>,
+    word: usize,
+    whole: U256,
+    parts: (U256, U256),
 }
 
 // One call by the actor after which the other account has less.
@@ -117,8 +141,13 @@ struct Less {
 
 // Which way each holding of the two accounts went, which slots are set, whether value
 // the contract has no record of was sent to it, and whether a call saw an answer
-// differently.
-type Place = (Vec<(U256, Ordering)>, BTreeSet<U256>, bool, bool);
+// higher or lower.
+type Place = (
+    Vec<(U256, Ordering)>,
+    BTreeSet<U256>,
+    bool,
+    Option<Ordering>,
+);
 
 struct Search<'a> {
     c: &'a Contract,
@@ -131,6 +160,12 @@ struct Search<'a> {
     helps_left: usize,
     best: Option<Broken>,
     less: Option<Less>,
+    lowered: Option<Lowered>,
+    // States from which a way out was just found, still to be probed.
+    exits: Vec<usize>,
+    rounded: Option<Rounded>,
+    // How often each function has been tried in two parts.
+    splits: HashMap<usize, usize>,
     // What the solver had outside contracts answer. Every world is told the same.
     readings: Vec<((U256, u32), Vec<u8>)>,
     // Whether both accounts were given some of the contract's own token to start with.
@@ -244,6 +279,8 @@ impl Broken {
         match self.swung {
             Some((swung, named)) if swung.balance || named => return Severity::High,
             Some(_) => return Severity::Medium,
+            // An outside contract that answers otherwise may be what forbids the call.
+            None if self.told => return Severity::Medium,
             None => {}
         }
         match (self.outside(), self.recorded || self.taken, self.waited) {
@@ -324,6 +361,8 @@ impl<'a> Search<'a> {
             taken: false,
             reentered: false,
             swung: None,
+            told: false,
+            exit: None,
         };
         Search {
             c,
@@ -336,6 +375,10 @@ impl<'a> Search<'a> {
             rng: Rng::new(SEED),
             best: None,
             less: None,
+            lowered: None,
+            exits: Vec::new(),
+            rounded: None,
+            splits: HashMap::new(),
             readings: Vec::new(),
             staked,
         }
@@ -396,6 +439,9 @@ impl<'a> Search<'a> {
                 let Some(asked) = p.run.calls.get(*at) else {
                     continue;
                 };
+                if asked.addr.fits_u64() && asked.addr.low_u64() <= LAST_BUILT_IN {
+                    continue;
+                }
                 let first = asked.input.get(..4).map(|b| [b[0], b[1], b[2], b[3]]);
                 let (address, selector) = (asked.addr, first.map_or(0, u32::from_be_bytes));
                 if !self.readings.iter().any(|(k, _)| *k == (address, selector)) {
@@ -545,8 +591,11 @@ impl<'a> Search<'a> {
         };
         // Value sent to a contract nobody has a stake in is nobody's to lose. The other
         // account sends it only while the contract holds a payment it recorded.
+        // Once the actor holds a stake, value sent in by the other account is a present
+        // to it and shows nothing.
         let parent = &self.kept[from];
-        let stake = who == ACTOR || (parent.recorded && parent.world.holds_value(exec::SELF));
+        let held = !acted && parent.recorded && parent.world.holds_value(exec::SELF);
+        let stake = who == ACTOR || held;
         if stake && self.pick(16) == 0 {
             self.gift(false, from, who);
             return;
@@ -689,6 +738,7 @@ impl<'a> Search<'a> {
         let brought = !by_actor && done.crossed && !done.written.is_empty();
         let recorded = parent.recorded || brought;
         let reentered = parent.reentered || done.called_back;
+        let told = parent.told || done.told;
         let swung = match (&step, done.swung) {
             (Step::Call(_, call), Some(swung)) => Some((swung, names(&call.data, swung.address))),
             _ => parent.swung,
@@ -700,6 +750,33 @@ impl<'a> Search<'a> {
             false => parent.other.clone(),
         };
         let waited = steps.iter().any(Step::waited_by_actor);
+        let took_out = !by_actor && gained(&parent.other, &other);
+        let exit = match (steps.last(), took_out && parent.base.is_none()) {
+            (Some(Step::Call(index, call)), true) => Some((*index, call.clone(), other.clone())),
+            _ => None,
+        };
+        if let (Some(Step::Call(index, call)), true) = (steps.last(), by_actor) {
+            let quiet = !done.moved && !done.written.is_empty() && call.seconds_later == 0;
+            let found = match (quiet, &parent.exit) {
+                (true, Some(exit)) => self.lowers(parent, &world, exit, &steps),
+                _ => None,
+            };
+            let shorter = |l: &Lowered| {
+                self.lowered
+                    .as_ref()
+                    .is_none_or(|k| l.steps.len() < k.steps.len())
+            };
+            if let Some(found) = found.filter(shorter) {
+                self.lowered = Some(found);
+            }
+            // Only a call that lowered a record has a cost that two parts could beat.
+            let costs = done.writes.iter().any(|w| w.after < w.before);
+            let tries = self.splits.get(index).copied().unwrap_or(0);
+            if done.crossed && costs && self.rounded.is_none() && tries < MAX_SPLITS {
+                self.splits.insert(*index, tries + 1);
+                self.rounded = self.split(parent, &world, *index, call, &steps);
+            }
+        }
         let fell = by_actor && gained(&other, &parent.other);
         let taken = parent.taken || (fell && other.assets != parent.other.assets);
         if fell {
@@ -728,7 +805,8 @@ impl<'a> Search<'a> {
             let set = world.set_slots(exec::SELF);
             let room = self.positions.len() < MAX_POSITIONS && set.len() <= MAX_SET_SLOTS;
             let unrecorded = steps.iter().any(|s| matches!(s, Step::Gift(..)));
-            let place = (place, set, unrecorded, swung.is_some());
+            let seen = swung.map(|(swung, _)| swung.now.cmp(&swung.was));
+            let place = (place, set, unrecorded, seen);
             novel |= room && self.positions.insert(place);
         }
         if let (Some(base), Some(now)) = (&base, now) {
@@ -742,6 +820,7 @@ impl<'a> Search<'a> {
                     taken,
                     reentered,
                     swung,
+                    told,
                 };
                 // A gain the same calls leave with every answer as first given is not
                 // owed to the answer that differed.
@@ -771,6 +850,10 @@ impl<'a> Search<'a> {
                 }
             }
         }
+        if let (Some(exit), None) = (exit, &self.kept[from].exit) {
+            self.kept[from].exit = Some(exit);
+            self.exits.push(from);
+        }
         if novel && self.kept.len() < MAX_KEPT {
             self.kept.push(Kept {
                 world,
@@ -782,9 +865,117 @@ impl<'a> Search<'a> {
                 taken,
                 reentered,
                 swung,
+                told,
+                exit: None,
                 other,
             });
             return Some(self.kept.len() - 1);
+        }
+        None
+    }
+
+    // Whether the other account's way out pays it less after the actor's call, with no
+    // argument of that way out able to refuse the lower amount.
+    fn lowers(
+        &self,
+        parent: &Kept,
+        now: &World,
+        exit: &(usize, Call, Holdings),
+        steps: &[Step],
+    ) -> Option<Lowered> {
+        let (index, call, before) = exit;
+        let at = self.entries[*index].at;
+        let mut after = now.clone();
+        if !after.call(at, call).ended {
+            return None;
+        }
+        let after = after.holdings(OTHER);
+        if !gained(&after, before) {
+            return None;
+        }
+        // The amount the way out paid before is what a floor would be set to.
+        let of = |h: &Holdings, asset: &U256| h.assets.get(asset).copied().unwrap_or(PURSE);
+        let assets = before.assets.keys();
+        let rises = assets.map(|a| (of(&parent.other, a), of(before, a)));
+        // What the way out paid in ether is what its caller gained and what it sent.
+        let paid = before.ether.checked_add(call.value).unwrap_or(before.ether);
+        let rises = rises.chain([(parent.other.ether, paid)]);
+        let amount = rises
+            .filter(|(had, has)| has > had)
+            .map(|(had, has)| has - had)
+            .max()?;
+        let words = call.data.len().saturating_sub(4) / 32;
+        let floors = (0..words.min(self.entries[*index].params)).any(|word_at| {
+            let mut with = call.clone();
+            with.data[4 + 32 * word_at..36 + 32 * word_at].copy_from_slice(&amount.to_be_bytes());
+            parent.world.clone().call(at, &with).ended && !now.clone().call(at, &with).ended
+        });
+        (!floors).then(|| Lowered {
+            steps: steps.to_vec(),
+            exit: (*index, call.clone()),
+            before: before.clone(),
+            after,
+        })
+    }
+
+    // Whether the last call, made in two parts, leaves the actor holding the same and
+    // some record it lowered less lowered. What a call takes from a record should round
+    // up, and then parts never cost less than the whole.
+    fn split(
+        &self,
+        parent: &Kept,
+        whole: &World,
+        index: usize,
+        call: &Call,
+        steps: &[Step],
+    ) -> Option<Rounded> {
+        let entry = &self.entries[index];
+        let words = call.data.len().saturating_sub(4) / 32;
+        let amount = |at: &usize| word(&call.data, 4 + 32 * at);
+        let sized = |at: &usize| amount(at) >= U256::from_u64(2) && amount(at) < PURSE;
+        let free = |at: &usize| !entry.fixed.contains(at) && !entry.addresses.contains(at);
+        let word_at = (0..words.min(entry.params)).find(|at| free(at) && sized(at))?;
+        let (at, all) = (entry.at, amount(&word_at));
+        let with = |part: U256| {
+            let mut data = call.data.clone();
+            data[4 + 32 * word_at..36 + 32 * word_at].copy_from_slice(&part.to_be_bytes());
+            Call {
+                data,
+                back: None,
+                swing: None,
+                ..call.clone()
+            }
+        };
+        let held = whole.holdings(ACTOR);
+        let before = &parent.world;
+        for first in [U256::ONE, all >> 1, all >> 2] {
+            let second = all - first;
+            let mut parts = before.clone();
+            let ended = !first.is_zero()
+                && parts.call(at, &with(first)).ended
+                && parts.call(at, &with(second)).ended;
+            if !ended || parts.holdings(ACTOR) != held {
+                continue;
+            }
+            let lowered = whole.slots(exec::SELF);
+            let lowered = lowered
+                .iter()
+                .filter(|(slot, value)| **value < before.stored(exec::SELF, **slot));
+            let mut less_taken = false;
+            let mut more_taken = false;
+            for (slot, value) in lowered {
+                let kept = parts.stored(exec::SELF, *slot);
+                less_taken |= kept > *value;
+                more_taken |= kept < *value;
+            }
+            if less_taken && !more_taken {
+                return Some(Rounded {
+                    steps: steps.to_vec(),
+                    word: word_at,
+                    whole: all,
+                    parts: (first, second),
+                });
+            }
         }
         None
     }
@@ -850,6 +1041,27 @@ impl<'a> Search<'a> {
         }
     }
 
+    // From a state the other account can take out of, every function is called once by
+    // the actor with no payment. A random round seldom makes the one quiet call that
+    // changes what the way out pays.
+    fn probe(&mut self, from: usize) {
+        for index in 0..self.entries.len() {
+            let seeds: Vec<Vec<u8>> = self.entries[index]
+                .seeds
+                .iter()
+                .map(|(data, _)| data.clone())
+                .collect();
+            for data in seeds {
+                let call = Call {
+                    who: ACTOR,
+                    data,
+                    ..Call::default()
+                };
+                self.attempt(from, index, call);
+            }
+        }
+    }
+
     fn run(&mut self) {
         for index in 0..self.entries.len() {
             if exec::spent() {
@@ -872,6 +1084,9 @@ impl<'a> Search<'a> {
         while !exec::spent() && rounds < MAX_ROUNDS && !stale(rounds, fresh, fresh_at) {
             rounds += 1;
             self.round();
+            while let Some(from) = self.exits.pop() {
+                self.probe(from);
+            }
             let learnt = self.covered.len() + self.positions.len();
             if learnt > reached {
                 (reached, fresh, fresh_at) = (learnt, rounds, exec::work());
@@ -973,12 +1188,15 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
         (false, ..) => "Nothing was paid for that balance, in ether or in any asset.",
     };
     let severity = broken.severity();
-    let timing = match (severity, outside) {
-        (Severity::High, _) => "",
-        (_, true) => {
+    let timing = match (severity, broken.told, outside) {
+        (Severity::High, ..) => "",
+        (_, true, _) => {
+            " One of the calls asked a contract outside this one a question outside the transfer interface, and the answer used is one the code accepts, not one that contract is known to give. If that contract is what decides who may make the call, the gain is not there."
+        }
+        (_, false, true) => {
             " No call that brought that payment in wrote anything to storage, so the contract keeps no record of whose it is. A contract that only passes value on within one transaction leaves what stays behind open in this way."
         }
-        (_, false) => {
+        (_, false, false) => {
             " The gain needs time to pass between the calls, as a reward that accrues would. Whether that reward is meant to be open to an account that paid nothing is for a reader to judge."
         }
     };
@@ -1143,6 +1361,100 @@ fn report_less(search: &Search, less: &Less, out: &mut Vec<Finding>) {
     }
 }
 
+fn attach(finding: &mut Finding, earlier: &[Step], last: &Call) {
+    finding.setup = shown(earlier);
+    finding.confirmed = true;
+    finding.witness = Some(hex::encode(&last.data));
+    finding.observed = vec![format!("sent by {}", last.who.to_hex())];
+}
+
+fn report_lowered(search: &Search, lowered: &Lowered, out: &mut Vec<Finding>) {
+    let Some(Step::Call(by, _)) = lowered.steps.last() else {
+        return;
+    };
+    let (index, call) = &lowered.exit;
+    let (function, earlier) = (
+        search.entries[*index].function,
+        search.entries[*by].function,
+    );
+    let (before, after) = (&lowered.before, &lowered.after);
+    let of = |h: &Holdings, asset: &U256| h.assets.get(asset).copied().unwrap_or(PURSE);
+    let mut fell = Vec::new();
+    if after.ether < before.ether {
+        fell.push(format!(
+            "{} less ether",
+            (before.ether - after.ether).to_hex()
+        ));
+    }
+    for asset in before
+        .assets
+        .keys()
+        .filter(|a| of(after, a) < of(before, a))
+    {
+        let less = of(before, asset) - of(after, asset);
+        fell.push(format!(
+            "{} less of the asset at {}",
+            less.to_hex(),
+            asset.to_hex()
+        ));
+    }
+    if matches!((before.reported, after.reported), (Some(a), Some(b)) if b < a) {
+        fell.push("a lower balance in the contract's own ledger".to_string());
+    }
+    push(
+        out,
+        "earlier-call-lowers-payout",
+        "Another account's call just before lowers what this call pays, and nothing in the call refuses it",
+        Severity::Medium,
+        Confidence::High,
+        Some(function),
+        None,
+        format!(
+            "Starting from {}, after the attached earlier call(s) an account calls `{}` and is paid. When an account holding no role first calls `{}`, which moves no value in or out, the same call to `{}` still ends normally and leaves its caller with {} than without that call, and with no more of anything. No argument word set to the amount paid before made the lower run fail, so the caller cannot set a floor.",
+            search.started_from(),
+            function.name,
+            earlier.name,
+            function.name,
+            fell.join(" and "),
+        ),
+        Vec::new(),
+        "Take a minimum amount as an argument and fail when the payout is below it.",
+    );
+    if let Some(finding) = out.last_mut() {
+        attach(finding, &lowered.steps, call);
+    }
+}
+
+fn report_rounded(search: &Search, rounded: &Rounded, out: &mut Vec<Finding>) {
+    let Some((Step::Call(entry, last), earlier)) = rounded.steps.split_last() else {
+        return;
+    };
+    let function = search.entries[*entry].function;
+    push(
+        out,
+        "rounding-favours-caller",
+        "A division rounds in the caller's favour",
+        Severity::Medium,
+        Confidence::High,
+        Some(function),
+        None,
+        format!(
+            "Starting from {}, after the attached earlier call(s), `{}` was called once with argument word {} set to {}, and from the same state twice with {} and then {}. The caller ends holding the same either way, and a record the single call lowered is lowered less by the two. What a call takes from a record should round up, and then parts never cost less than the whole. Here they do, so asking in small parts keeps the difference each time.",
+            search.started_from(),
+            function.name,
+            rounded.word,
+            rounded.whole.to_hex(),
+            rounded.parts.0.to_hex(),
+            rounded.parts.1.to_hex(),
+        ),
+        Vec::new(),
+        "Round what the contract hands out down and what it takes up.",
+    );
+    if let Some(finding) = out.last_mut() {
+        attach(finding, earlier, last);
+    }
+}
+
 // One search over sequences of calls. It keeps every sequence that reached code no
 // earlier one reached, extends those, and checks after each call whether an account
 // with no role now holds more than before its first call, and whether the other
@@ -1156,12 +1468,22 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         return;
     }
     search.run();
-    let taken = search.best.as_ref().is_some_and(|b| b.taken);
+    let last = |steps: &[Step]| match steps.last() {
+        Some(Step::Call(entry, _)) => Some(*entry),
+        _ => None,
+    };
+    let gain_at = search.best.as_ref().and_then(|b| last(&b.steps));
     if let Some(broken) = search.best.take() {
         report(c, &search, &broken, out);
     }
-    // A gain that came out of the other account already says what that account lost.
-    if let (Some(less), false) = (search.less.take(), taken) {
+    // A gain through the same function already says what that function lets happen.
+    if let Some(less) = search.less.take().filter(|l| last(&l.steps) != gain_at) {
         report_less(&search, &less, out);
+    }
+    if let Some(lowered) = search.lowered.take() {
+        report_lowered(&search, &lowered, out);
+    }
+    if let Some(rounded) = search.rounded.take() {
+        report_rounded(&search, &rounded, out);
     }
 }

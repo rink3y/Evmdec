@@ -5,7 +5,6 @@ use crate::deploy;
 use crate::emit::MappingLayout;
 use crate::exec;
 use crate::function::FnKind;
-use crate::hex;
 use crate::interp::CallRecord;
 use crate::opcode as op;
 use crate::path::{self, Explorers, Limits, Path};
@@ -18,19 +17,11 @@ const LIMITS: Limits = Limits {
     paths: 12,
     runs: 48,
 };
-const PROBE: Limits = Limits { paths: 6, runs: 16 };
 const WORDS: usize = 8;
 const MAX_FUNCTIONS: usize = 32;
-const MAX_DEPOSITS: usize = 6;
 pub const WORK: u64 = 4 * exec::WORK_PER_SECOND;
 
-const SECOND_CALLER: U256 = U256::from_u64(0xbbbb_bbbb_bbbb_bbbb);
-// About twice the amounts the second account pays in.
-// Raising the balance by that much costs about as much as the payment it is tested against.
-const RAISED_BALANCE: u64 = 0x4000;
 // A payment that passes on no more gas than this cannot make a call from the receiver.
-
-type Fill = fn(usize) -> U256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Asset {
@@ -110,65 +101,13 @@ fn credited(p: &Path, layout: MappingLayout) -> Option<U256> {
     best
 }
 
-fn entry_moves(p: &Path, layout: MappingLayout) -> (U256, U256) {
-    let mut ends: HashMap<U256, (U256, U256)> = HashMap::new();
-    for step in solve::steps(&p.effects, &p.inputs) {
-        let Step::Write {
-            key,
-            slot,
-            before,
-            after,
-        } = step
-        else {
-            continue;
-        };
-        let keyed = ssa::slot_path(key, layout).is_some_and(|path| {
-            path.steps.iter().any(|s| match s {
-                ssa::Step::Key(k) => solve::value_of(*k, &p.inputs) == Some(p.inputs.caller),
-                _ => false,
-            })
-        });
-        if keyed {
-            ends.entry(slot).or_insert((before, after)).1 = after;
-        }
-    }
-    let (mut rise, mut fall) = (U256::ZERO, U256::ZERO);
-    for (before, after) in ends.into_values() {
-        if after > before {
-            rise = sum(rise, after - before);
-        } else {
-            fall = sum(fall, before - after);
-        }
-    }
-    (rise, fall)
-}
-
-fn all_sent(p: &Path) -> U256 {
-    let moved = sent(p).into_iter();
-    moved.fold(U256::ZERO, |all, (_, amount)| sum(all, amount))
-}
-
 fn all_taken(p: &Path) -> U256 {
     let moved = taken(p).into_iter();
     moved.fold(U256::ZERO, |all, (_, amount)| sum(all, amount))
 }
 
-// Small amounts, so a proportion that divides shows its rounding in every one.
-const PARTS: [(u64, u64); 4] = [(3, 3), (5, 6), (7, 9), (10, 13)];
-const MAX_AMOUNT_WORDS: usize = 4;
-const ROUNDING_GAP: U256 = U256::from_u64(2);
-const MAX_OTHER_CALLS: usize = 8;
-
 fn word_reply(value: U256) -> Vec<u8> {
     value.to_be_bytes().to_vec()
-}
-
-struct Deposit<'a> {
-    function: &'a Function,
-    path: Path,
-    taken: Vec<(Asset, U256)>,
-    credit: U256,
-    unit: bool,
 }
 
 struct Pass<'a> {
@@ -220,151 +159,6 @@ impl<'a> Pass<'a> {
             fixed,
         };
         (inputs, free)
-    }
-
-    fn deposits(&mut self, layout: MappingLayout) -> Vec<Deposit<'a>> {
-        let mut out: Vec<Deposit<'a>> = Vec::new();
-        for f in self.externals() {
-            // One check needs a single unit paid in. The others need room to pay out in parts.
-            let sizes: [(u64, Fill); 2] = [(1, |_| U256::ONE), (0x1001, path::varied_word)];
-            for (value, words) in sizes {
-                let (mut start, free) = self.base(f, words);
-                start.callvalue = U256::from_u64(value);
-                start.balance = start.callvalue;
-                let found = self.explore(f, &start, &free, LIMITS);
-                let paid = found.into_iter().find_map(|path| {
-                    let taken = taken(&path);
-                    let credit = credited(&path, layout)?;
-                    let pays = path.succeeded() && !taken.is_empty() && sent(&path).is_empty();
-                    pays.then_some((path, taken, credit))
-                });
-                if let Some((path, taken, credit)) = paid {
-                    out.push(Deposit {
-                        function: f,
-                        path,
-                        taken,
-                        credit,
-                        unit: value == 1,
-                    });
-                }
-            }
-            if out.len() >= MAX_DEPOSITS {
-                break;
-            }
-        }
-        out
-    }
-
-    fn after(&mut self, d: &Deposit, g: &Function) -> Vec<Path> {
-        self.after_from(&d.path.run.storage, d.credit, &d.taken, g)
-    }
-
-    // The contract holds what was paid in and no more. A larger balance would make a fair
-    // share of the balance look like a gain.
-    fn after_from(
-        &mut self,
-        state: &HashMap<U256, U256>,
-        credit: U256,
-        held: &[(Asset, U256)],
-        g: &Function,
-    ) -> Vec<Path> {
-        let twice = sum(credit, credit);
-        let fills: [&dyn Fn(usize) -> U256; 4] =
-            [&|_| credit, &|_| twice, &|_| U256::ZERO, &|_| U256::MAX];
-        let ether = total(held, Asset::Ether);
-        let tokens = held.iter().filter(|(asset, _)| *asset != Asset::Ether);
-        let tokens = tokens.fold(U256::ZERO, |all, (_, amount)| sum(all, *amount));
-        let mut out = Vec::new();
-        for (round, fill) in fills.iter().enumerate() {
-            let (mut start, free) = self.base(g, fill);
-            start.storage = state.clone();
-            start.balance = ether;
-            if !tokens.is_zero() {
-                start.replies.push((SEL_BALANCE_OF, word_reply(tokens)));
-            }
-            let limits = if round == 0 { PROBE } else { LIMITS };
-            let found = self.explore(g, &start, &free, limits);
-            if round == 0 && found.iter().all(|p| p.run.calls.is_empty()) {
-                break;
-            }
-            out.extend(found.into_iter().filter(Path::succeeded));
-        }
-        out
-    }
-
-    fn ordering(&mut self, d: &Deposit, g: &Function, paths: &[Path], out: &mut Vec<Finding>) {
-        let Some(q) = paths.iter().find(|q| !all_sent(q).is_zero()) else {
-            return;
-        };
-        let before = all_sent(q);
-        let functions: Vec<&Function> = self.externals().take(MAX_OTHER_CALLS).collect();
-        for h in functions {
-            let (mut start, free) = self.base(h, path::varied_word);
-            start.storage = d.path.run.storage.clone();
-            start.caller = SECOND_CALLER;
-            let quiet = |p: &Path| {
-                let changed = p.run.storage != p.inputs.storage;
-                p.succeeded() && changed && taken(p).is_empty() && sent(p).is_empty()
-            };
-            let Some(earlier) = self
-                .explore(h, &start, &free, PROBE)
-                .into_iter()
-                .find(quiet)
-            else {
-                continue;
-            };
-            let mut later = q.inputs.clone();
-            later.storage = earlier.run.storage.clone();
-            let after = self.run(g, &later);
-            if !after.succeeded() || all_sent(&after) >= before {
-                continue;
-            }
-            if self.has_floor(g, &q.inputs, &later, before) {
-                return;
-            }
-            push(
-                out,
-                "earlier-call-lowers-payout",
-                "Another account's call just before lowers what this call pays, and nothing in the call refuses it",
-                Severity::Medium,
-                Confidence::High,
-                Some(g),
-                None,
-                format!(
-                    "After the first attached call, `{}` sends its caller {}. When a second account holding no role first calls `{}`, paying nothing in and taking nothing out, the same call to `{}` still ends normally and sends {}. No argument word set to the higher amount made the lower run fail, so the caller cannot set a floor.",
-                    g.name,
-                    before.to_hex(),
-                    h.name,
-                    g.name,
-                    all_sent(&after).to_hex(),
-                ),
-                Vec::new(),
-                "Take a minimum amount as an argument and fail when the payout is below it.",
-            );
-            if let Some(last) = out.last_mut() {
-                last.setup = vec![
-                    hex::encode(&d.path.inputs.calldata),
-                    hex::encode(&earlier.inputs.calldata),
-                ];
-                last.confirm(&after);
-            }
-            return;
-        }
-    }
-
-    fn has_floor(&mut self, g: &Function, good: &Inputs, bad: &Inputs, amount: U256) -> bool {
-        let words = (good.calldata.len().saturating_sub(4) / 32).min(MAX_AMOUNT_WORDS);
-        (0..words).any(|index| {
-            let with = |inputs: &Inputs| {
-                let mut out = inputs.clone();
-                let at = 4 + 32 * index;
-                out.calldata[at..at + 32].copy_from_slice(&amount.to_be_bytes());
-                out
-            };
-            let kept = self.run(g, &with(good));
-            let refused = self.run(g, &with(bad));
-            kept.succeeded() && all_sent(&kept) == amount && !refused.succeeded()
-        })
     }
 
     fn run(&mut self, f: &Function, inputs: &Inputs) -> Path {
@@ -472,144 +266,6 @@ impl<'a> Pass<'a> {
             finding.confirm(p);
         }
     }
-
-    // What a call hands the caller should round down, and what it takes should round up.
-    // For a rule that rounds down, two parts never come to more than the whole.
-    // Every amount is tried from one and the same state, so only the rounding differs.
-    fn rounding(
-        &mut self,
-        d: &Deposit,
-        g: &Function,
-        paths: &[Path],
-        layout: MappingLayout,
-        out: &mut Vec<Finding>,
-    ) {
-        let Some(base) = paths.first() else { return };
-        let skew = sum(d.credit.wrapping_mul(U256::from_u64(3)), U256::ONE);
-        let words = (base.inputs.calldata.len().saturating_sub(4) / 32).min(MAX_AMOUNT_WORDS);
-        for index in 0..words {
-            let mut measure = |amount: u64| {
-                let mut inputs = base.inputs.clone();
-                let at = 4 + 32 * index;
-                inputs.calldata[at..at + 32].copy_from_slice(&U256::from_u64(amount).to_be_bytes());
-                (inputs.balance, inputs.returned) = (skew, word_reply(skew));
-                let run = self.run(g, &inputs);
-                let (rise, fall) = entry_moves(&run, layout);
-                let gets = sum(rise, all_sent(&run));
-                let gives = sum(fall, all_taken(&run));
-                run.succeeded().then_some((gets, gives, run))
-            };
-            let (mut over, mut under, mut shown) = (0, 0, None);
-            for (a, b) in PARTS {
-                let (Some(x), Some(y), Some(whole)) = (measure(a), measure(b), measure(a + b))
-                else {
-                    continue;
-                };
-                // One side of the exchange has to follow the amount exactly.
-                // A call the word does not steer gives the same twice and proves nothing.
-                let exact =
-                    |part: U256, other: U256, all: U256| !all.is_zero() && sum(part, other) == all;
-                // Rounding loses less than one unit per division. A larger gap is a price
-                // that depends on the amount, which is a curve and not a rounding.
-                let near = |more: U256, less: U256| more > less && more - less <= ROUNDING_GAP;
-                let more_in_parts = near(sum(x.0, y.0), whole.0) && exact(x.1, y.1, whole.1);
-                let less_in_parts = near(whole.1, sum(x.1, y.1)) && exact(x.0, y.0, whole.0);
-                over += usize::from(more_in_parts);
-                under += usize::from(less_in_parts);
-                if more_in_parts || less_in_parts {
-                    shown.get_or_insert((a, b, x, y, whole));
-                }
-            }
-            let Some((a, b, x, y, whole)) = shown.filter(|_| over >= 2 || under >= 2) else {
-                continue;
-            };
-            let (what, parts, one) = if over >= 2 {
-                ("hands the caller", sum(x.0, y.0), whole.0)
-            } else {
-                ("takes from the caller", sum(x.1, y.1), whole.1)
-            };
-            push(
-                out,
-                "rounding-favours-caller",
-                "A division rounds in the caller's favour",
-                Severity::Medium,
-                Confidence::High,
-                Some(g),
-                None,
-                format!(
-                    "`{}` was run from one state with argument word {index} set to {a}, to {b} and to {}. What it {what} came to {} for the two parts together and {} for the whole. What a call hands out should round down and what it takes should round up, and then parts never beat the whole. Here they do, so the division rounds toward the caller and asking in small parts gains the difference each time. The state follows the attached earlier call, with the balance the contract reads set to {}.",
-                    g.name,
-                    a + b,
-                    parts.to_hex(),
-                    one.to_hex(),
-                    skew.to_hex(),
-                ),
-                Vec::new(),
-                "Round what the contract hands out down and what it takes up.",
-            );
-            if let Some(last) = out.last_mut() {
-                last.setup = vec![hex::encode(&d.path.inputs.calldata)];
-                last.confirm(&whole.2);
-            }
-            return;
-        }
-    }
-
-    fn uncredited(&mut self, d: &Deposit, layout: MappingLayout, out: &mut Vec<Finding>) {
-        let one_unit = d.taken.iter().all(|(_, amount)| *amount == U256::ONE);
-        if !one_unit {
-            return;
-        }
-        let f = d.function;
-        let (mut start, free) = self.base(f, path::varied_word);
-        start.storage = d.path.run.storage.clone();
-        start.caller = SECOND_CALLER;
-        start.callvalue = match d.taken[0].0 {
-            Asset::Ether => U256::from_u64(0x1001),
-            Asset::Token(_) => U256::ZERO,
-        };
-        let raised = U256::from_u64(RAISED_BALANCE);
-        start.returned = word_reply(raised);
-        start.balance = raised;
-        let found = self.explore(f, &start, &free, LIMITS);
-        let lost = found.into_iter().find(|q| {
-            let paid = taken(q);
-            let real = paid.iter().any(|(_, amount)| *amount > U256::ONE);
-            q.succeeded() && real && credited(q, layout).is_none()
-        });
-        let Some(q) = lost else { return };
-        // With the balance left where the first payment put it the same call must be credited.
-        // Otherwise the function simply records nothing for anyone.
-        let mut honest = q.inputs.clone();
-        honest.returned = word_reply(U256::ONE);
-        honest.balance = U256::ONE;
-        let code = self.c.code_of(f);
-        let explorer = self.explorers.of(code);
-        let plain = explorer.run(&honest);
-        if !plain.succeeded() || credited(&plain, layout).is_none() {
-            return;
-        }
-        push(
-            out,
-            "inflow-credits-nothing",
-            "A payment is taken and nothing is credited once the read balance is raised",
-            Severity::High,
-            Confidence::High,
-            Some(f),
-            None,
-            format!(
-                "`{}` credits the payer in proportion to a balance it reads at the time of the call. After one earlier payment of a single unit, and with that balance raised from outside to {}, the attached call by a second account pays in more than a thousand units, ends normally and credits that account nothing. With the balance left alone the same call is credited. The function has no lower bound on the credit and no offset in the proportion that would keep it above zero.",
-                f.name,
-                raised.to_hex(),
-            ),
-            Vec::new(),
-            "Require a non-zero credit, or add a fixed offset to both sides of the proportion, or track the balance in storage instead of reading it from the asset.",
-        );
-        if let Some(last) = out.last_mut() {
-            last.setup = vec![hex::encode(&d.path.inputs.calldata)];
-            last.confirm(&q);
-        }
-    }
 }
 
 fn confirm_stated_amount(out: &mut [Finding], f: &Function, p: &Path, layout: MappingLayout) {
@@ -674,20 +330,6 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
         explorers: Explorers::default(),
         start: deploy::start(c),
     };
-    let deposits = pass.deposits(layout);
-    for d in &deposits {
-        pass.uncredited(d, layout, out);
-        let larger = |o: &Deposit| o.function.pc == d.function.pc && !o.unit;
-        if d.unit && deposits.iter().any(larger) {
-            continue;
-        }
-        let functions: Vec<&Function> = pass.externals().collect();
-        for g in functions {
-            let paths = pass.after(d, g);
-            pass.rounding(d, g, &paths, layout, out);
-            pass.ordering(d, g, &paths, out);
-        }
-    }
     pass.answers(layout, out);
     pass.moved_by_answer(out);
 }

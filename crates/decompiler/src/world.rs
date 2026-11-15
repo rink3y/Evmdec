@@ -17,6 +17,8 @@ const SEL_TOTAL_SUPPLY: u32 = 0x1816_0ddd;
 const SEL_DECIMALS: u32 = 0x313c_e567;
 const DECIMALS: u64 = 18;
 const IDENTITY: u64 = 4;
+pub const LAST_BUILT_IN: u64 = 0x0a;
+const NO_ONE: U256 = U256::from_u64(0x0000_dead_0000_dead);
 const STEPS_PER_CALL: usize = 600_000;
 const MAX_DEPTH: usize = 12;
 // The slots a call touched say which calls depend on which. A few hundred say it as
@@ -84,6 +86,8 @@ pub struct Done {
     // Whether an address without code was asked something outside the transfer
     // interface, so that what the call did rests on an answer nobody keeps books for.
     pub asked: bool,
+    // Whether an answer came from what the world was told and not from any books.
+    pub told: bool,
     pub writes: Vec<Write>,
 }
 
@@ -303,6 +307,19 @@ impl World {
         held.unwrap_or(self.purse(who))
     }
 
+    // Whether any account holds a different amount of anything than in another world.
+    // A book entry that only spells out what an account held anyway is no difference.
+    fn holds_other_than(&self, other: &World) -> bool {
+        let ether = self.ether.keys().chain(other.ether.keys());
+        let assets = self.assets.keys().chain(other.assets.keys());
+        ether
+            .into_iter()
+            .any(|who| self.ether_of(*who) != other.ether_of(*who))
+            || assets
+                .into_iter()
+                .any(|(asset, who)| self.asset_of(*asset, *who) != other.asset_of(*asset, *who))
+    }
+
     fn pays(&mut self, from: U256, to: U256, amount: U256) -> bool {
         let held = self.ether_of(from);
         if held < amount {
@@ -425,7 +442,7 @@ impl World {
         let mut done = run.done;
         (done.ended, done.returned) = (ended, returned);
         done.crossed |= !call.value.is_zero();
-        done.moved = self.ether != before.ether || self.assets != before.assets;
+        done.moved = self.holds_other_than(&before);
         if !ended {
             *self = before;
             done.writes.clear();
@@ -568,6 +585,12 @@ impl World {
         if record.addr == U256::from_u64(IDENTITY) {
             return (true, record.input.clone());
         }
+        // No other built-in contract is run. One that recovers a signer answers with an
+        // account that is no one in the run and is not zero, so that no signature is
+        // taken to be good and no unset signer matches it.
+        if record.addr.fits_u64() && (1..=LAST_BUILT_IN).contains(&record.addr.low_u64()) {
+            return (true, one_word(NO_ONE));
+        }
         let to = match Some(record.addr) == self.known_as {
             true => exec::SELF,
             false => record.addr,
@@ -658,6 +681,11 @@ impl World {
     // what it was told to, or one word that reads as true, which is what a call that
     // went well most often returns.
     fn answer(&mut self, call: &CallRecord, from: &Frame, run: &mut Run) -> (bool, Vec<u8>) {
+        // Code run in the caller's own storage is part of the caller. When it is not
+        // there to run, nothing is known of what it would have done or answered.
+        if matches!(call.kind, op::DELEGATECALL | op::CALLCODE) {
+            return (true, Vec::new());
+        }
         let (this, user) = (from.account, run.origin);
         let changes = call.kind == op::CALL;
         if changes && !call.value.is_zero() {
@@ -705,10 +733,13 @@ impl World {
             Some(SEL_APPROVE) => yes,
             // A payment is not a question, whatever comes back from it.
             _ if !call.value.is_zero() => yes,
+            // An account of the run is not a contract and has nothing to answer with.
+            _ if self.funded.contains(&call.addr) => (true, Vec::new()),
             asked => {
                 run.done.asked = true;
                 let asked = asked.unwrap_or(0);
                 let told = self.readings.get(&(call.addr, asked)).cloned();
+                run.done.told |= told.is_some();
                 let answer = told.unwrap_or(one_word(U256::ONE));
                 (true, self.seen(run, (call.addr, asked, U256::ZERO), answer))
             }

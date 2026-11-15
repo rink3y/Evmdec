@@ -1970,7 +1970,7 @@ const CALLER_ENTRY: &str =
     "CALLER PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
 
 fn flow_ids(code: &[u8]) -> Vec<String> {
-    let ours = ["calls-leave-account-with-gain", "inflow-credits-nothing"];
+    let ours = ["calls-leave-account-with-gain"];
     analyze::analyze(&decompile::decompile(code, &Options::default()))
         .findings
         .iter()
@@ -1990,15 +1990,6 @@ fn a_pair_of_calls_that_returns_more_than_it_took_is_reported() {
 
     let exact = dispatcher3(&pay_in("CALLVALUE"), &pay_out, "STOP");
     assert!(flow_ids(&exact).is_empty(), "{:?}", flow_ids(&exact));
-}
-
-#[test]
-fn a_share_of_a_balance_read_from_outside_can_round_a_payment_to_nothing() {
-    let vault = share_vault;
-    assert_eq!(flow_ids(&vault("")), ["inflow-credits-nothing"]);
-
-    let floor = "DUP1 PUSH2 @some JUMPI PUSH1 0x00 DUP1 REVERT :some JUMPDEST";
-    assert!(flow_ids(&vault(floor)).is_empty());
 }
 
 #[test]
@@ -2326,22 +2317,6 @@ fn pay_out_all(clear_first: bool) -> String {
     }
 }
 
-fn share_vault(guard: &str) -> Vec<u8> {
-    let asset = "PUSH2 0xb1b1";
-    dispatcher(&format!(
-        "PUSH4 0x70a08231 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE ADDRESS PUSH1 0x84 MSTORE \
-         PUSH1 0x20 PUSH1 0x80 PUSH1 0x24 PUSH1 0x80 {asset} GAS STATICCALL POP \
-         PUSH1 0x80 MLOAD PUSH1 0x01 SLOAD PUSH1 0x04 CALLDATALOAD \
-         DUP2 ISZERO PUSH2 @first JUMPI DUP3 DUP3 DUP3 MUL DIV PUSH2 @join JUMP \
-         :first JUMPDEST DUP1 :join JUMPDEST {guard} \
-         PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
-         ADDRESS PUSH1 0xa4 MSTORE DUP2 PUSH1 0xc4 MSTORE \
-         PUSH1 0x00 DUP1 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 {asset} GAS CALL POP \
-         {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE \
-         DUP3 ADD PUSH1 0x01 SSTORE STOP"
-    ))
-}
-
 fn signed_payment(counted: bool) -> Vec<u8> {
     let (extra, len, after) = match counted {
         true => (
@@ -2624,12 +2599,6 @@ fn cases() -> Vec<Case> {
             || dispatcher3(&pay_in("CALLVALUE"), &pay_out_all(true), "STOP"),
         ),
         pair(
-            "inflow-credits-nothing",
-            true,
-            || share_vault(""),
-            || share_vault("DUP1 PUSH2 @some JUMPI PUSH1 0x00 DUP1 REVERT :some JUMPDEST"),
-        ),
-        pair(
             "changed-copy-dropped",
             true,
             || dispatcher(&format!("{COPY_AND_CHANGE} STOP")),
@@ -2906,12 +2875,11 @@ fn the_labelled_fixtures_score_every_rule_at_full_precision_and_recall() {
 
 // A fixture is a few instructions and leaves out what its own rule does not need.
 // These findings are true of the fixture named, so they are expected there.
-const TRUE_OF_A_SOUND_FIXTURE: [(&str, &str); 7] = [
+const TRUE_OF_A_SOUND_FIXTURE: [(&str, &str); 6] = [
     // It credits a payment at par whatever the contract holds, so a later payer shares a
     // surplus that stood behind the earlier one.
     ("rounding-favours-caller", "calls-leave-account-with-gain"),
     ("", "short-input-accepted"),
-    ("inflow-credits-nothing", "refused-transfer-treated-as-done"),
     (
         "reentrancy|reentered-call-pays-again",
         "refused-transfer-treated-as-done",
@@ -2968,8 +2936,7 @@ fn padding_the_code_changes_no_labelled_result() {
     }
 }
 
-const SOUND_BY_A_GUARD: [&str; 6] = [
-    "inflow-credits-nothing",
+const SOUND_BY_A_GUARD: [&str; 5] = [
     "refused-transfer-treated-as-done|erc20-return-ignored|unchecked-token-pull",
     "input-picks-storage-slot",
     "short-input-accepted",

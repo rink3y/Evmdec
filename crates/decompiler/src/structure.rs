@@ -291,7 +291,6 @@ struct Printer<'a> {
     labels: HashSet<usize>,
     nesting: usize,
     loop_stack: Vec<(usize, Option<usize>, usize)>,
-    gotos: usize,
     active: HashSet<usize>,
     next_tmp: u32,
     used: Vec<ExprId>,
@@ -759,27 +758,6 @@ fn with_init(e: ExprId, init: &HashMap<ExprId, ExprId>) -> ExprId {
 fn reroll_peeled_loops(l: &Lifted) -> Lifted {
     let g = Graph::new(l);
     let loops = find_loops(&g);
-    let debug = crate::debug::on("EVMDEC_DEBUG_PEEL");
-    if debug && !loops.is_empty() {
-        for nd in &l.nodes {
-            eprintln!(
-                "[peel]   node {} block {} pc {:#x} succs {:?} stmts {} term {}",
-                nd.id,
-                nd.block,
-                nd.pc,
-                nd.succs,
-                nd.stmts.len(),
-                match &nd.term {
-                    Term::Jump(_) => "jump".to_string(),
-                    Term::Branch { .. } => "branch".to_string(),
-                    other => format!("{other:?}").chars().take(30).collect(),
-                }
-            );
-        }
-        for (h, lp) in &loops {
-            eprintln!("[peel]   loop {} body {:?}", h, lp.body);
-        }
-    }
     let mut out = l.clone();
     let mut changed = false;
     let mut consumed: HashSet<usize> = HashSet::new();
@@ -806,20 +784,8 @@ fn reroll_peeled_loops(l: &Lifted) -> Lifted {
             }
         }
         let Some((hp, q0, (init, pairs))) = found else {
-            if debug {
-                eprintln!(
-                    "[peel] loop at {} (block {:#x}): no peeled iteration",
-                    h, l.nodes[h].pc
-                );
-            }
             continue;
         };
-        if debug {
-            eprintln!(
-                "[peel] loop at {} (block {:#x}): copy {} of node {} is one iteration ({} node pairs)",
-                h, l.nodes[h].pc, hp, q0, pairs.len()
-            );
-        }
         let preds: Vec<usize> = g.preds[hp].clone();
         for p in preds {
             let m: HashMap<usize, usize> = HashMap::from([(hp, q0)]);
@@ -856,12 +822,6 @@ fn reroll_peeled_loops(l: &Lifted) -> Lifted {
 }
 
 fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
-    let debug = crate::debug::on("EVMDEC_DEBUG_PEEL");
-    let fail = |why: &str| {
-        if debug {
-            eprintln!("[peel]     copy {} of {}: {}", hp, q0, why);
-        }
-    };
     let mut pairs: Vec<(usize, usize)> = vec![(hp, q0)];
     let mut i = 0;
     while i < pairs.len() {
@@ -869,7 +829,6 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
         i += 1;
         let (ps, qs) = (&l.nodes[p].succs, &l.nodes[q].succs);
         if ps.len() != qs.len() {
-            fail("successor counts differ");
             return None;
         }
         for (&a, &b) in ps.iter().zip(qs) {
@@ -877,7 +836,6 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
                 continue;
             }
             if lp.body.contains(&a) || l.nodes[a].block != l.nodes[b].block {
-                fail(&format!("successors {a}/{b} are not copies"));
                 return None;
             }
             match pairs.iter().find(|(x, _)| *x == a) {
@@ -891,11 +849,10 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
         }
     }
     let mut sub: HashMap<ExprId, ExprId> = HashMap::new();
-    let mut derived: Vec<(usize, usize, ExprId, ExprId)> = Vec::new();
+    let mut derived: Vec<(ExprId, ExprId)> = Vec::new();
     for (p, q) in &pairs {
         let (sp, sq) = (&l.nodes[*p].entry_stack, &l.nodes[*q].entry_stack);
         if sp.len() != sq.len() {
-            fail(&format!("stack heights of {p}/{q} differ"));
             return None;
         }
         for (a, b) in sp.iter().zip(sq) {
@@ -903,28 +860,19 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
                 continue;
             }
             if !matches!(expr::node(*b), Node::Var(_)) {
-                derived.push((*p, *q, *a, *b));
+                derived.push((*a, *b));
                 continue;
             }
             if sub.insert(*b, *a).is_some_and(|old| old != *a) {
-                fail("a loop variable has two initial values");
                 return None;
             }
         }
     }
     if sub.is_empty() {
-        fail("no variables differ");
         return None;
     }
-    for (p, q, a, b) in derived {
+    for (a, b) in derived {
         if with_init(b, &sub) != a {
-            fail(&format!(
-                "stack of {}/{} differs beyond the variables: {} vs {}",
-                p,
-                q,
-                emit::fmt_expr(a, &Names::default()),
-                emit::fmt_expr(b, &Names::default())
-            ));
             return None;
         }
     }
@@ -992,15 +940,12 @@ fn peel_of(l: &Lifted, lp: &Loop, q0: usize, hp: usize) -> Option<Peel> {
     };
     for (p, q) in &pairs {
         if !same_stmts(*p, *q) {
-            fail(&format!("statements of {p}/{q} differ"));
             return None;
         }
         if !same_term(*p, *q) {
-            fail(&format!("terminators of {p}/{q} differ"));
             return None;
         }
         if !same_edges(*p, *q) {
-            fail(&format!("phi copies out of {p}/{q} differ"));
             return None;
         }
     }
@@ -1085,21 +1030,7 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
         }
     }
     let mut dead = HashSet::new();
-    let debug = crate::debug::on("EVMDEC_DEBUG_DEAD");
     for nd in &l.nodes {
-        if debug && nd.stmts.iter().any(|s| matches!(s, Stmt::Copy { .. })) {
-            eprintln!(
-                "[dead] node {} succs {:?} reads_ahead_succ {} term_reads {} stmts {:?}",
-                nd.id,
-                nd.succs,
-                nd.succs.iter().any(|s| reads_ahead[*s]),
-                term_reads_memory(&nd.term),
-                nd.stmts
-                    .iter()
-                    .map(|s| emit::fmt_stmt(s, &Names::default()))
-                    .collect::<Vec<_>>()
-            );
-        }
         if nd.succs.iter().any(|s| reads_ahead[*s]) || term_reads_memory(&nd.term) {
             continue;
         }
@@ -1544,14 +1475,7 @@ fn available_at(
             (Some(Pos::Stmt(i)), false) => i,
             _ => l.nodes[x].stmts.len(),
         };
-        if let Some(bad) = l.nodes[x].stmts[..limit].iter().find(|s| !clean_stmt(s)) {
-            if crate::debug::on("EVMDEC_DEBUG_BIND") {
-                eprintln!(
-                    "[bind]   node {} blocks hoisting: {}",
-                    x,
-                    emit::fmt_stmt(bad, &Names::default())
-                );
-            }
+        if l.nodes[x].stmts[..limit].iter().any(|s| !clean_stmt(s)) {
             return false;
         }
         if limit == l.nodes[x].stmts.len() && !clean_edges(x) {
@@ -1593,7 +1517,6 @@ fn reaches_within(l: &Lifted, a: usize, b: usize, within: &HashSet<usize>) -> bo
 
 fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
     let g = Graph::new(l);
-    let debug = crate::debug::on("EVMDEC_DEBUG_BIND");
     let mut uses: HashMap<ExprId, Vec<(usize, Pos)>> = HashMap::new();
     let mut count: HashMap<ExprId, usize> = HashMap::new();
     let mut first_seen: HashMap<ExprId, usize> = HashMap::new();
@@ -1664,14 +1587,6 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
                 .filter(|u| !at.iter().any(|v| v != u && dominated_by(v.0, v.1, u)))
                 .collect();
             if d == f || !available_at(l, &g, names, d, &frontier, e) {
-                if debug {
-                    eprintln!(
-                        "[bind] skip {} (dominator {} not usable; uses {:?})",
-                        emit::fmt_expr(e, &Names::default()),
-                        d,
-                        at
-                    );
-                }
                 continue;
             }
             (d, Pos::Term)
@@ -1704,12 +1619,6 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
                 stack.extend(l.nodes[x].succs.iter().copied());
             }
             if clobbered {
-                if debug {
-                    eprintln!(
-                        "[bind] skip {} (a variable it reads is reassigned before a use)",
-                        emit::fmt_expr(e, &Names::default())
-                    );
-                }
                 continue;
             }
         }
@@ -1756,14 +1665,6 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
         }
         if bound.iter().any(|(t, _)| *t == expr::node(e)) || !bindable(e) {
             continue;
-        }
-        if debug {
-            eprintln!(
-                "[bind] node {} {:?}: {}",
-                f,
-                pos,
-                emit::fmt_expr(e, &Names::default())
-            );
         }
         let var = expr::intern(Node::Var(next_var));
         next_var += 1;
@@ -2284,7 +2185,6 @@ impl<'a> Printer<'a> {
         // printed at the top level under a label, so a long chain cannot use up the stack.
         if self.nesting >= MAX_NESTING {
             self.labels.insert(n);
-            self.gotos += 1;
             self.line(depth, &format!("goto L{:x};", self.node_pc(n)));
             return;
         }
@@ -2307,7 +2207,6 @@ impl<'a> Printer<'a> {
                     }
                 } else {
                     self.labels.insert(n);
-                    self.gotos += 1;
                     self.line(
                         depth,
                         &format!("goto L{:x}; // continue outer loop", self.node_pc(n)),
@@ -2320,7 +2219,6 @@ impl<'a> Printer<'a> {
                     self.line(depth, "break;");
                 } else {
                     self.labels.insert(n);
-                    self.gotos += 1;
                     self.line(
                         depth,
                         &format!("goto L{:x}; // break outer loop", self.node_pc(n)),
@@ -2335,7 +2233,6 @@ impl<'a> Printer<'a> {
                 return None;
             }
             self.labels.insert(n);
-            self.gotos += 1;
             self.line(depth, &format!("goto L{:x};", self.node_pc(n)));
             return None;
         }
@@ -2487,30 +2384,6 @@ impl<'a> Printer<'a> {
             true => cond_node,
             false => header,
         };
-        if crate::debug::on("EVMDEC_DEBUG_LOOP") {
-            let tf = match &nd.term {
-                Term::Branch { t, f, .. } => format!(
-                    "branch t={:?} (in body {:?}) f={} (in body {})",
-                    t,
-                    t.map(|t| body.contains(&t)),
-                    f,
-                    body.contains(f)
-                ),
-                Term::Jump(j) => format!("jump {}", j),
-                Term::Switch { .. } => "switch".into(),
-                _ => "other".into(),
-            };
-            eprintln!(
-                "loop header {} pc={:#x} stmts={} {} body={:?} exits={:?} while={}",
-                header,
-                self.node_pc(header),
-                nd.stmts.len(),
-                tf,
-                body.iter().collect::<Vec<_>>(),
-                exits,
-                while_cond.is_some()
-            );
-        }
         self.loop_stack.push((header, exit, depth + 1));
         match while_cond {
             Some((c, first)) => {
@@ -2803,17 +2676,6 @@ impl<'a> Printer<'a> {
         if self.names.bool_returns.as_slice() != [true] {
             return None;
         }
-        if crate::debug::on("EVMDEC_DEBUG_FOLD") {
-            eprintln!(
-                "[fold] bool return sides {} {:?} {:?} / {} {:?} {:?}",
-                t,
-                self.l.nodes[t].stmts,
-                self.l.nodes[t].term,
-                f,
-                self.l.nodes[f].stmts,
-                self.l.nodes[f].term
-            );
-        }
         let as_flag = |e: ExprId| match expr::as_const(e) {
             Some(c) if c.is_zero() => Some(false),
             Some(c) if c == U256::ONE => Some(true),
@@ -2996,15 +2858,9 @@ fn reason_suffix(reason: &Option<String>) -> String {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Structured {
-    pub text: String,
-    pub gotos: usize,
-}
-
 const MAX_NESTING: usize = 400;
 
-pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
+pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
     let g = Graph::new(l);
     let loops = find_loops(&g);
     let mut used: Vec<ExprId> = Vec::new();
@@ -3024,7 +2880,6 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
         labels: HashSet::new(),
         nesting: 0,
         loop_stack: Vec::new(),
-        gotos: 0,
         active: HashSet::new(),
         next_tmp: 1 << 30,
         used,
@@ -3077,7 +2932,6 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
             labels: p.labels.clone(),
             nesting: 0,
             loop_stack: Vec::new(),
-            gotos: 0,
             active: HashSet::new(),
             facts: Vec::new(),
             stale_plan: std::mem::take(&mut p.stale_plan),
@@ -3110,15 +2964,11 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> Structured {
                 .filter(|n| !p2.emitted.contains(n))
                 .collect();
         }
-        p.gotos = p2.gotos;
         p2.out
     } else {
         p.out
     };
-    Structured {
-        text: drop_empty_else(&drop_unused_previous(&text)),
-        gotos: p.gotos,
-    }
+    drop_empty_else(&drop_unused_previous(&text))
 }
 
 fn drop_unused_previous(text: &str) -> String {
@@ -3209,7 +3059,7 @@ pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
     let depth = indent.len() / 4;
     let rolled = reroll_peeled_loops(l);
     let bound = bind_shared(&rolled, n);
-    let text = structure(&bound, n, depth).text;
+    let text = structure(&bound, n, depth);
     expr::clear_boolean_marks();
     text
 }

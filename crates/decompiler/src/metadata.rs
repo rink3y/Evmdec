@@ -277,14 +277,6 @@ pub fn constant_step(st: &mut Vec<Option<U256>>, i: &disasm::Instruction) {
     }
 }
 
-pub fn constant_stack(insns: &[disasm::Instruction]) -> Vec<Option<U256>> {
-    let mut st: Vec<Option<U256>> = Vec::new();
-    for i in insns {
-        constant_step(&mut st, i);
-    }
-    st
-}
-
 // Runtime code that loads constants with CODECOPY in a returning block has the same shape.
 // A constructor never reads calldata.
 // Creation code ends in the runtime's trailer plus its arguments.

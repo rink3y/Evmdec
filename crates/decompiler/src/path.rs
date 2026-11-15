@@ -108,34 +108,6 @@ pub fn inputs_for(selector: Option<u32>, words: usize) -> Inputs {
     }
 }
 
-fn last_check(p: &Path) -> Option<expr::ExprId> {
-    p.items.iter().rev().find_map(|item| match item {
-        Item::Check { cond, .. } => Some(*cond),
-        Item::Store { .. } => None,
-    })
-}
-
-fn stopped_on(p: &Path) -> &'static str {
-    let Some(cond) = last_check(p) else {
-        return "nothing";
-    };
-    let env =
-        |which: u8| expr::contains(cond, &|n| matches!(n, expr::Node::Env(o, _) if *o == which));
-    let answer = expr::contains(cond, &|n| {
-        matches!(n, expr::Node::ReturnData(..) | expr::Node::CallResult(_))
-    });
-    let stored = expr::contains(cond, &|n| matches!(n, expr::Node::SLoad(..)));
-    let caller = env(crate::opcode::CALLER);
-    match (answer || env(crate::opcode::RETURNDATASIZE), caller, stored) {
-        (true, ..) => "answer",
-        (_, true, true) => "caller-against-storage",
-        (_, true, false) => "caller",
-        (_, _, true) => "storage",
-        _ if env(crate::opcode::CALLVALUE) => "value",
-        _ => "input",
-    }
-}
-
 impl Explorer {
     pub fn new(code: &[u8]) -> Explorer {
         Explorer {
@@ -284,22 +256,7 @@ impl Explorer {
 
     // Each new path is only kept after the bytecode really ran it.
     pub fn explore(&self, start: &Inputs, free: &Free, limits: Limits) -> Vec<Path> {
-        let paths = self.search(start, free, limits);
-        if crate::debug::on("EVMDEC_DEBUG_STOPS") {
-            let finished = paths.iter().any(Path::succeeded);
-            let deepest = paths.iter().max_by_key(|p| p.truth.len());
-            let stop = deepest.filter(|_| !finished).map_or("-", stopped_on);
-            let last = deepest.filter(|_| !finished).and_then(last_check);
-            let shown = last.map_or(String::new(), |c| {
-                crate::emit::fmt_expr(c, &Default::default())
-            });
-            let shown: String = shown.chars().take(120).collect();
-            eprintln!(
-                "[stops] finished={finished} storage={} answers={} on={stop} last={shown}",
-                free.storage, free.answers
-            );
-        }
-        paths
+        self.search(start, free, limits)
     }
 
     fn search(&self, start: &Inputs, free: &Free, limits: Limits) -> Vec<Path> {

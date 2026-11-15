@@ -58,6 +58,7 @@ def main():
     tot = dict(abi=0, found=0, match=0, mut_ok=0, mut_n=0, par_ok=0, par_n=0, ret_ok=0, ret_n=0, ev=0, ev_found=0, time=0.0, blocks=0, covered=0, unresolved=0)
     ty = dict(par_words=0, par_exact=0, ret_words=0, ret_exact=0)
     wrong = []
+    kinds = {'bytes': [0, 0], 'array': [0, 0], 'struct': [0, 0]}
     rows = []
     for f in sorted(os.listdir(a.dir)):
         if not f.endswith('.hex'): continue
@@ -122,14 +123,25 @@ def main():
                     return word_types(base) * int(m2.group(2))
                 return [{'uint': 'uint256', 'int': 'int256'}.get(tt, tt)]
             def same(decl, ours):
-                if decl == 'dynamic': return ours in ('bytes', 'string') or ours.endswith('[]')
+                if decl == 'dynamic': return ours in ('bytes', 'string') or ours.endswith('[]') or ours.startswith('(')
                 return decl == ours
+            def kind(t):
+                if t.endswith(']'): return 'array'
+                if t.startswith('tuple') or t.startswith('('): return 'struct'
+                return 'bytes'
             decl_in = [w for x in it.get('inputs', []) for w in word_types(x)]
             if len(decl_in) == len(fx['params']):
                 for d, p in zip(decl_in, fx['params']):
                     ty['par_words'] += 1
                     if same(d, p['ty']): ty['par_exact'] += 1
                     else: wrong.append(f"{name} {sig(it)} param {p['name']}: abi={d} ours={p['ty']}")
+                top = [x for x in it.get('inputs', []) for _ in range(head_words(x))]
+                for x, p in zip(top, fx['params']):
+                    if is_dynamic(x):
+                        want = kind(x['type'])
+                        kinds[want][1] += 1
+                        if kind(p['ty']) == want: kinds[want][0] += 1
+                        elif a.v: print(f"   kind {name} {sig(it)} {p['name']}: abi={x['type']} ours={p['ty']}")
             decl_out = [w for x in it.get('outputs', []) for w in word_types(x)]
             if decl_out and len(decl_out) == len(fx['returns']) and 'dynamic' not in decl_out:
                 for d, r in zip(decl_out, fx['returns']):
@@ -169,6 +181,7 @@ def main():
     print(f"\nselectors: recall {tot['match']}/{tot['abi']} = {100*tot['match']/max(1,tot['abi']):.1f}%  precision {tot['match']}/{tot['found']} = {100*tot['match']/max(1,tot['found']):.1f}%")
     print(f"mutability: {tot['mut_ok']}/{n} = {100*tot['mut_ok']/n:.1f}%   params: {tot['par_ok']}/{n} = {100*tot['par_ok']/n:.1f}%   returns: {tot['ret_ok']}/{n} = {100*tot['ret_ok']/n:.1f}%")
     print(f"param types: {ty['par_exact']}/{ty['par_words']} = {100*ty['par_exact']/max(1,ty['par_words']):.1f}%   return types: {ty['ret_exact']}/{ty['ret_words']} = {100*ty['ret_exact']/max(1,ty['ret_words']):.1f}%")
+    print('kind of each dynamic parameter: ' + '   '.join(f"{k} {v[0]}/{v[1]}" for k, v in kinds.items()))
     if a.v:
         for w in wrong: print('   ' + w)
     floors = [

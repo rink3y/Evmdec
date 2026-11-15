@@ -483,7 +483,6 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
     for (u, ln) in &l.node_map {
         inv.insert(*ln, *u);
     }
-    let debug = crate::debug::on("EVMDEC_DEBUG_LOOPS");
     let mut out = Vec::new();
     let step32 = |assigns: &Vec<(ExprId, ExprId)>, var: ExprId| -> bool {
         assigns.iter().any(|(v, val)| {
@@ -544,16 +543,6 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
         let (Some(&xu), Some(&bu), Some(&eu)) = (inv.get(&x), inv.get(&b), inv.get(&e)) else {
             continue;
         };
-        if debug {
-            eprintln!(
-                "[loops]  candidate latch {} pc {:#x} body {} exit {} cond {:?}",
-                x,
-                xn.pc,
-                b,
-                e,
-                expr::node(*cond)
-            );
-        }
         if b != x {
             if let (Node::Var(_), Node::Var(_), Some(assigns)) =
                 (expr::node(*bo), expr::node(bs), l.edge_assigns.get(&(b, x)))
@@ -606,13 +595,6 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
             .filter(|v| matches!(expr::node(*v), Node::Var(_)) && tbs.contains(v))
             .collect();
         let Some(iv) = shared.first().copied() else {
-            if debug {
-                eprintln!(
-                    "[loops]   reject: no shared counter var in {:?} / {:?}",
-                    tbo.iter().map(|e| expr::node(*e)).collect::<Vec<_>>(),
-                    tbs.iter().map(|e| expr::node(*e)).collect::<Vec<_>>()
-                );
-            }
             continue;
         };
         let (phi_node, rotated) = if b == x {
@@ -626,13 +608,6 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
         {
             (b, true)
         } else {
-            if debug {
-                eprintln!(
-                    "[loops]   reject: no +32 step for the counter (assigns b->x {:?}, x->b {:?})",
-                    l.edge_assigns.get(&(b, x)).map(|a| a.len()),
-                    l.edge_assigns.get(&(x, b)).map(|a| a.len())
-                );
-            }
             continue;
         };
         if b == x && !l.edge_assigns.get(&(b, b)).is_some_and(|a| step32(a, iv)) {
@@ -653,19 +628,9 @@ pub fn copy_loops(l: &Lifted) -> Vec<CopyLoop> {
             _ => None,
         };
         let Some(on_true) = continues_on_true else {
-            if debug {
-                eprintln!(
-                    "[loops]   reject: condition shape {:?} (rotated {})",
-                    expr::node(*cond),
-                    rotated
-                );
-            }
             continue;
         };
         if (on_true && *t != b) || (!on_true && *f != b) {
-            if debug {
-                eprintln!("[loops]   reject: branch direction");
-            }
             continue;
         }
         let pn = &l.nodes[phi_node];

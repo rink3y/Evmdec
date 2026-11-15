@@ -1153,20 +1153,13 @@ pub struct CalleeSummary {
     pub maybe_mstores: Vec<ExprId>,
 }
 
-fn fail_summary(code: u32) -> Option<CalleeSummary> {
-    if crate::debug::on("EVMDEC_DEBUG_SUMMARY") {
-        eprintln!("[summary] not summarisable (reason {})", code);
-    }
-    None
-}
-
 pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
     let mut n = l.entry;
     let mut seen = HashSet::new();
     let mut sum = CalleeSummary::default();
     loop {
         if !seen.insert(n) || seen.len() > 64 {
-            return fail_summary(1);
+            return None;
         }
         let nd = &l.nodes[n];
         for s in &nd.stmts {
@@ -1177,7 +1170,7 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                     width: 32,
                     ..
                 } => sum.mstores.push((*off, *val)),
-                Stmt::MStore { .. } => return fail_summary(201),
+                Stmt::MStore { .. } => return None,
                 Stmt::Copy {
                     kind: op::MCOPY,
                     dest,
@@ -1188,7 +1181,7 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                 Stmt::Copy { .. }
                 | Stmt::Internal { .. }
                 | Stmt::Call { .. }
-                | Stmt::Create { .. } => return fail_summary(202),
+                | Stmt::Create { .. } => return None,
                 Stmt::SStore { .. } | Stmt::Log { .. } => sum.side_effects = true,
                 Stmt::Require {
                     cond,
@@ -1226,7 +1219,7 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                     && sum.guards.iter().all(|(c, d, _)| {
                         simple(c) && d.as_ref().is_none_or(|d| d.iter().all(simple))
                     });
-                return if ok { Some(sum) } else { fail_summary(100) };
+                return if ok { Some(sum) } else { None };
             }
             Term::Jump(t) => n = *t,
             Term::Branch { cond, t, f } => {
@@ -1296,7 +1289,7 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                                     && sum.guards.iter().all(|(c, d, _)| {
                                         simple(c) && d.as_ref().is_none_or(|d| d.iter().all(simple))
                                     });
-                                return if ok { Some(sum) } else { fail_summary(100) };
+                                return if ok { Some(sum) } else { None };
                             }
                             _ => {}
                         }
@@ -1344,10 +1337,10 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                         sum.guards.push((op1(op::ISZERO, *cond), None, true));
                         n = *f;
                     }
-                    _ => return fail_summary(204),
+                    _ => return None,
                 }
             }
-            _ => return fail_summary(205),
+            _ => return None,
         }
     }
 }
@@ -1430,18 +1423,6 @@ impl<'a> Lifter<'a> {
     pub fn lift_summarizing(&self, unit: &Unit, initial: Option<(Vec<ExprId>, bool)>) -> Lifted {
         let l = self.lift(unit, initial.clone());
         let loops = crate::idiom::copy_loops(&l);
-        if crate::debug::on("EVMDEC_DEBUG_LOOPS") {
-            eprintln!(
-                "[loops] unit entry block {} ({:#x}): {} copy loop(s) {:?}",
-                unit.entry_block,
-                self.prog.blocks[unit.entry_block].start,
-                loops.len(),
-                loops
-                    .iter()
-                    .map(|c| (c.entry, c.latch, c.body, c.exit))
-                    .collect::<Vec<_>>()
-            );
-        }
         if loops.is_empty() || self.oracle {
             return l;
         }
@@ -2151,33 +2132,6 @@ impl<'a> Lifter<'a> {
                 op::MLOAD => {
                     let off = pop!();
                     let v = st.mem.load_word(off, st.version);
-                    if crate::debug::on("EVMDEC_DEBUG_LOAD")
-                        && std::env::var("EVMDEC_DEBUG_LOAD").is_ok_and(|w| w == ins.pc.to_string())
-                    {
-                        eprintln!(
-                            "MLOAD pc={} off={:?} norm={:?} -> {:?}",
-                            ins.pc,
-                            expr::node(off),
-                            norm_offset(off),
-                            expr::node(v)
-                        );
-                        for w in &st.mem.writes {
-                            eprintln!(
-                                "  write base={:?} off={} len={:?} val={} gen={}",
-                                w.base.map(expr::node),
-                                w.off,
-                                w.len,
-                                match &w.val {
-                                    MVal::Word(_) => "word",
-                                    MVal::Byte(_) => "byte",
-                                    MVal::Copy(..) => "copy",
-                                    MVal::CallOut(_) => "callout",
-                                    MVal::Unknown => "unknown",
-                                },
-                                w.gen
-                            );
-                        }
-                    }
                     st.stack.push(v);
                 }
                 op::MSTORE | op::MSTORE8 => {
@@ -2456,38 +2410,6 @@ impl<'a> Lifter<'a> {
                         hidden.add(nid, st.mem.consumers(in_off, l.low_u64()));
                     }
                     let result = expr::intern(Node::CallResult(seq));
-                    let wanted = crate::debug::on("EVMDEC_DEBUG_HEAD")
-                        .then(|| std::env::var("EVMDEC_DEBUG_HEAD").ok())
-                        .flatten();
-                    if let Some(want) = wanted {
-                        if want == "all" || want == ins.pc.to_string() {
-                            eprintln!(
-                                "CALL pc={} in_off={:?} norm={:?} version={} gen={} clobber={}",
-                                ins.pc,
-                                expr::node(in_off),
-                                norm_offset(in_off),
-                                st.version,
-                                st.mem.gen,
-                                st.mem.clobber_gen
-                            );
-                            for w in &st.mem.writes {
-                                eprintln!(
-                                    "  write base={:?} off={} len={:?} val={} gen={}",
-                                    w.base.map(expr::node),
-                                    w.off,
-                                    w.len,
-                                    match &w.val {
-                                        MVal::Word(_) => "word",
-                                        MVal::Byte(_) => "byte",
-                                        MVal::Copy(..) => "copy",
-                                        MVal::CallOut(_) => "callout",
-                                        MVal::Unknown => "unknown",
-                                    },
-                                    w.gen
-                                );
-                            }
-                        }
-                    }
                     let input_head: Vec<ExprId> = if expr::as_const(in_len) == Some(U256::ZERO) {
                         Vec::new()
                     } else {

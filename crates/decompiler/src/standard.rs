@@ -551,20 +551,14 @@ fn others(bench: &mut Bench, report: &mut Report, open: &HashSet<Loc>) {
     let Some(transfer) = bench.function(SEL_TRANSFER) else {
         return;
     };
-    let trace = crate::debug::on("EVMDEC_DEBUG_OTHERS");
-    let said = |what: &str| {
-        if trace {
-            eprintln!("[others] {what}");
-        }
-    };
     let Some(held) = bench.holding() else {
-        return said("no state in which the holder is reported to hold tokens");
+        return;
     };
     let Some(given) = bench.sent(transfer, &held) else {
-        return said("the holder could not pass tokens on");
+        return;
     };
     let Some(root) = scaled_ledger(&bench.moves(&given), HOLDER) else {
-        return said("no ledger entry fell when the holder passed tokens on");
+        return;
     };
     // Any account may hold tokens, so an entry of the ledger is left for the search to
     // fill. Without that a function that takes from an account stops for lack of a balance
@@ -601,12 +595,6 @@ fn others(bench: &mut Bench, report: &mut Report, open: &HashSet<Loc>) {
             ..flat
         };
         let found = bench.explorer(f).explore(&start, &free, OTHER_LIMITS);
-        let acted = |q: &&Path| q.succeeded() && q.run.storage != q.inputs.storage;
-        said(&format!(
-            "{}: {} runs changed storage",
-            f.name,
-            found.iter().filter(acted).count()
-        ));
         for q in found {
             // A signed message is the holder's own permission, and no run here signs one.
             let signed = q.run.calls.iter().any(|c| c.addr == RECOVER);
@@ -623,9 +611,7 @@ fn others(bench: &mut Bench, report: &mut Report, open: &HashSet<Loc>) {
             if !bench.explorer(f).run_only(&again).succeeded() {
                 continue;
             }
-            if other_entry_falls(bench, report, f, &q, root)
-                || report_moves(bench, report, f, &q, root)
-            {
+            if other_entry_falls(bench, report, f, &q, root) {
                 break;
             }
         }
@@ -666,49 +652,6 @@ fn other_entry_falls(
             keys[0].to_hex(),
             pair.0.to_hex(),
             pair.1.to_hex(),
-        ),
-    );
-    true
-}
-
-fn report_moves(
-    bench: &mut Bench,
-    report: &mut Report,
-    f: &Function,
-    q: &Path,
-    root: Root,
-) -> bool {
-    let entry = (root, vec![HOLDER]);
-    let touched = bench
-        .moves(q)
-        .get(&entry)
-        .is_some_and(|pair| pair.0 != pair.1);
-    if touched || names(&q.inputs.calldata, HOLDER) {
-        return false;
-    }
-    let before = bench.answer(SEL_BALANCE_OF, &[HOLDER], &q.inputs.storage);
-    let after = bench.answer(SEL_BALANCE_OF, &[HOLDER], &q.run.storage);
-    let (Some(before), Some(after)) = (before, after) else {
-        return false;
-    };
-    if before == after || before.is_zero() {
-        return false;
-    }
-    let (severity, way) = match after < before {
-        true => (Severity::High, "fell"),
-        false => (Severity::Medium, "rose"),
-    };
-    report.differs_at(
-        "reported-balance-moved-by-another-account",
-        "A call changes what the contract reports another account holds",
-        severity,
-        f,
-        q,
-        format!(
-            "`{}` was called by an account holding no role. An account it does not name, whose balance entry it did not write, was reported to hold {} before the call and {} after it, so its balance {way} without a transfer. A pool that holds this token keeps reserves that no longer match what it holds, and whoever settles the difference takes it.",
-            f.name,
-            before.to_hex(),
-            after.to_hex(),
         ),
     );
     true

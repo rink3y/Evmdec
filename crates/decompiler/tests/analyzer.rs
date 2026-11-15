@@ -475,77 +475,16 @@ fn an_unguarded_selfdestruct_is_confirmed_but_a_guarded_one_is_not() {
 }
 
 #[test]
-fn a_free_self_credit_is_reported_and_a_paid_one_is_not() {
-    const ENTRY: &str =
-        "CALLER PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
-    let credit = format!("{ENTRY} DUP1 SLOAD PUSH1 0x01 ADD SWAP1 SSTORE STOP");
-    let debit = format!(
-        "{ENTRY} PUSH1 0x04 CALLDATALOAD DUP2 SLOAD DUP2 GT ISZERO PUSH2 @okb JUMPI PUSH1 0x00 DUP1 REVERT :okb JUMPDEST DUP2 SLOAD SUB SWAP1 SSTORE STOP"
-    );
-    let hits = |code: &[u8]| -> Vec<String> {
-        let r = analyze::analyze(&decompile::decompile(code, &Options::default()));
-        r.findings
-            .iter()
-            .filter(|f| f.id == "unprivileged-balance-credit")
-            .map(|f| f.function.as_deref().unwrap_or_default().to_owned())
-            .collect()
-    };
+fn a_token_that_credits_its_caller_for_nothing_is_found_by_the_search() {
+    let rule = "calls-leave-account-with-gain";
+    let entry = format!("CALLER {ENTRY_OF_WORD}");
+    let credit = format!("{entry} SLOAD PUSH1 0x01 ADD {entry} SSTORE STOP");
+    let r = report_of(&token_with(&credit));
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
 
-    let free = dispatcher3(&credit, &debit, "STOP");
-    let r = analyze::analyze(&decompile::decompile(&free, &Options::default()));
-    let f = finding(&r, "unprivileged-balance-credit").unwrap_or_else(|| panic!("{:?}", ids(&r)));
-    assert_eq!(f.severity, Severity::High);
-    assert!(
-        f.function
-            .as_deref()
-            .is_some_and(|n| n.contains("aaaaaaaa")),
-        "{f:?}"
-    );
-    assert!(f
-        .evidence
-        .iter()
-        .any(|e| e.starts_with("witness calldata: 0xaaaaaaaa")));
-    assert_eq!(
-        hits(&free).len(),
-        1,
-        "burn() is checked and must not be reported"
-    );
-
-    let paid = dispatcher3(
-        &format!("CALLVALUE PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST {credit}"),
-        &debit,
-        "STOP",
-    );
-    assert!(
-        hits(&paid).is_empty(),
-        "a paid credit must not be reported: {:?}",
-        hits(&paid)
-    );
-
-    let unchecked = format!("{ENTRY} DUP1 SLOAD PUSH1 0x01 SWAP1 SUB SWAP1 SSTORE STOP");
-    let wrapping = dispatcher3(
-        &format!("CALLVALUE PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST {credit}"),
-        &unchecked,
-        &debit,
-    );
-    assert_eq!(
-        hits(&wrapping),
-        vec!["func_bbbbbbbb [0xbbbbbbbb]".to_string()]
-    );
-
-    let signed_like = dispatcher3(
-        &format!("CALLVALUE PUSH2 @ok JUMPI PUSH1 0x00 DUP1 REVERT :ok JUMPDEST {credit}"),
-        &unchecked,
-        "STOP",
-    );
-    assert!(hits(&signed_like).is_empty(), "{:?}", hits(&signed_like));
-
-    let counter = dispatcher3(&credit, "STOP", "STOP");
-    assert!(
-        hits(&counter).is_empty(),
-        "a counter must not be reported: {:?}",
-        hits(&counter)
-    );
+    let r = report_of(&token_with("STOP"));
+    assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
 }
 
 #[test]
@@ -996,11 +935,7 @@ const AMOUNT: &str = "PUSH1 0x44 CALLDATALOAD";
 
 fn conservation_ids(code: &[u8]) -> Vec<String> {
     let r = analyze::analyze(&decompile::decompile(code, &Options::default()));
-    let ours = [
-        "stale-ledger-write",
-        "unbalanced-ledger-move",
-        "ledger-total-mismatch",
-    ];
+    let ours = ["stale-ledger-write", "ledger-total-mismatch"];
     r.findings
         .iter()
         .filter(|f| ours.contains(&f.id.as_str()))
@@ -1034,29 +969,6 @@ fn an_entry_raised_from_a_value_read_before_the_other_was_lowered_is_reported() 
          EQ ISZERO PUSH2 @go JUMPI PUSH1 0x00 DUP1 REVERT :go JUMPDEST";
     let guarded = format!("{keys_differ} {both_read_first}");
     assert!(conservation_ids(&dispatcher(&guarded)).is_empty());
-}
-
-#[test]
-fn a_credit_nothing_pays_for_is_reported_when_no_total_records_it() {
-    const CALLER_ENTRY: &str =
-        "CALLER PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
-    let (from, to) = (account_entry("0x04"), account_entry("0x24"));
-    let moved = format!(
-        "{from} DUP1 SLOAD {AMOUNT} SWAP1 SUB SWAP1 SSTORE \
-         {to} DUP1 SLOAD {AMOUNT} ADD SWAP1 SSTORE"
-    );
-    let extra = format!("{CALLER_ENTRY} DUP1 SLOAD PUSH1 0x64 CALLDATALOAD ADD SWAP1 SSTORE");
-    let hits = conservation_ids(&dispatcher(&format!("{moved} {extra} STOP")));
-    assert_eq!(
-        hits,
-        ["unbalanced-ledger-move func_aaaaaaaa [0xaaaaaaaa]"],
-        "{hits:?}"
-    );
-    assert!(conservation_ids(&dispatcher(&format!("{moved} STOP"))).is_empty());
-
-    let recorded = "PUSH1 0x05 SLOAD PUSH1 0x64 CALLDATALOAD ADD PUSH1 0x05 SSTORE";
-    let with_total = format!("{moved} {extra} {recorded} STOP");
-    assert!(conservation_ids(&dispatcher(&with_total)).is_empty());
 }
 
 #[test]
@@ -1778,12 +1690,7 @@ fn a_call_that_needs_earlier_storage_is_reached_through_the_call_that_writes_it(
 }
 
 fn property_ids(code: &[u8]) -> Vec<String> {
-    let ours = [
-        "entries-total-out-of-step",
-        "total-open-at-call",
-        "lock-left-set",
-        "changed-copy-dropped",
-    ];
+    let ours = ["entries-total-out-of-step", "lock-left-set"];
     analyze::analyze(&decompile::decompile(code, &Options::default()))
         .findings
         .iter()
@@ -1829,26 +1736,6 @@ fn a_run_that_breaks_an_inferred_property_is_reported_with_its_input() {
         "STOP",
     );
     assert!(property_ids(&in_step).is_empty());
-
-    let call_out = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP1 PUSH1 0x04 CALLDATALOAD GAS CALL POP";
-    let open = dispatcher3(
-        &format!("{entry_up} {total_up} STOP"),
-        &format!("{entry_down} {call_out} {total_down} STOP"),
-        "STOP",
-    );
-    assert_eq!(
-        property_ids(&open),
-        ["total-open-at-call func_bbbbbbbb [0xbbbbbbbb] High"]
-    );
-    let closed = dispatcher3(
-        &format!("{entry_up} {total_up} STOP"),
-        &format!("{entry_down} {total_down} {call_out} STOP"),
-        "STOP",
-    );
-    assert!(
-        property_ids(&closed).is_empty(),
-        "both are updated before the call"
-    );
 }
 
 #[test]
@@ -1871,7 +1758,7 @@ fn a_path_that_leaves_a_toggled_slot_set_is_reported() {
 }
 
 fn origin_ids(code: &[u8]) -> Vec<String> {
-    let ours = ["stored-input-call-target", "gate-on-open-slot"];
+    let ours = ["stored-input-call-target"];
     analyze::analyze(&decompile::decompile(code, &Options::default()))
         .findings
         .iter()
@@ -1888,27 +1775,7 @@ fn origin_ids(code: &[u8]) -> Vec<String> {
 }
 
 #[test]
-fn a_value_is_followed_back_through_the_slots_it_is_copied_from() {
-    let marks = "PUSH1 0x01 PUSH1 0x09 SSTORE STOP";
-    let proposes = "PUSH1 0x04 CALLDATALOAD PUSH1 0x01 SSTORE STOP";
-    let accepts = "PUSH1 0x01 SLOAD PUSH1 0x00 SSTORE STOP";
-    let two_hops = dispatcher3(proposes, accepts, &format!("{OWNER_GATE} {marks}"));
-    assert_eq!(
-        origin_ids(&two_hops),
-        ["gate-on-open-slot func_cccccccc [0xcccccccc] High"],
-        "slot 0 is filled from slot 1, which anyone fills"
-    );
-    let gate_b = OWNER_GATE.replace("@ok", "@okb").replace(":ok", ":okb");
-    let guarded = dispatcher3(
-        proposes,
-        &format!("{gate_b} {accepts}"),
-        &format!("{OWNER_GATE} {marks}"),
-    );
-    assert!(
-        origin_ids(&guarded).is_empty(),
-        "the copy is behind the gate"
-    );
-
+fn a_call_target_any_caller_stored_is_reported() {
     let entry = account_entry("0x04");
     let own_entry =
         "CALLER PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
@@ -1970,13 +1837,13 @@ const CALLER_ENTRY: &str =
     "CALLER PUSH1 0x00 MSTORE PUSH1 0x00 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
 
 fn flow_ids(code: &[u8]) -> Vec<String> {
-    let ours = ["two-calls-return-more", "inflow-credits-nothing"];
+    let ours = ["calls-leave-account-with-gain"];
     analyze::analyze(&decompile::decompile(code, &Options::default()))
         .findings
         .iter()
         .filter(|f| ours.contains(&f.id.as_str()))
         .map(|f| {
-            assert!(f.confirmed && f.witness.is_some() && f.setup.len() == 1);
+            assert!(f.confirmed && f.witness.is_some() && !f.setup.is_empty());
             f.id.clone()
         })
         .collect()
@@ -1986,38 +1853,10 @@ fn flow_ids(code: &[u8]) -> Vec<String> {
 fn a_pair_of_calls_that_returns_more_than_it_took_is_reported() {
     let pay_out = pay_out_checked();
     let doubled = dispatcher3(&pay_in("CALLVALUE PUSH1 0x02 MUL"), &pay_out, "STOP");
-    assert_eq!(flow_ids(&doubled), ["two-calls-return-more"]);
+    assert_eq!(flow_ids(&doubled), ["calls-leave-account-with-gain"]);
 
     let exact = dispatcher3(&pay_in("CALLVALUE"), &pay_out, "STOP");
     assert!(flow_ids(&exact).is_empty(), "{:?}", flow_ids(&exact));
-}
-
-#[test]
-fn a_share_of_a_balance_read_from_outside_can_round_a_payment_to_nothing() {
-    let vault = share_vault;
-    assert_eq!(flow_ids(&vault("")), ["inflow-credits-nothing"]);
-
-    let floor = "DUP1 PUSH2 @some JUMPI PUSH1 0x00 DUP1 REVERT :some JUMPDEST";
-    assert!(flow_ids(&vault(floor)).is_empty());
-}
-
-#[test]
-fn a_change_made_to_a_memory_copy_of_storage_and_then_dropped_is_reported() {
-    let copy_and_change =
-        "PUSH1 0x05 SLOAD PUSH1 0x80 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0x80 MSTORE";
-    let dropped = dispatcher(&format!("{copy_and_change} STOP"));
-    assert_eq!(
-        property_ids(&dropped),
-        ["changed-copy-dropped func_aaaaaaaa [0xaaaaaaaa] High"]
-    );
-
-    let stored = dispatcher(&format!(
-        "{copy_and_change} PUSH1 0x80 MLOAD PUSH1 0x05 SSTORE STOP"
-    ));
-    assert!(property_ids(&stored).is_empty());
-
-    let returned = dispatcher(&format!("{copy_and_change} PUSH1 0x20 PUSH1 0x80 RETURN"));
-    assert!(property_ids(&returned).is_empty());
 }
 
 #[test]
@@ -2077,7 +1916,7 @@ fn report_of(code: &[u8]) -> analyze::Report {
 }
 
 #[test]
-fn phases_are_recovered_and_one_that_is_never_entered_is_reported() {
+fn phases_are_recovered_from_the_values_functions_wait_for() {
     let step = |at: u8, then: &str| {
         format!(
             "PUSH1 0x03 SLOAD PUSH1 {at:#04x} EQ PUSH2 @at{at} JUMPI {REVERT} \
@@ -2102,13 +1941,6 @@ fn phases_are_recovered_and_one_that_is_never_entered_is_reported() {
         line.contains("from 0 to 1") && line.contains("from 1 to 2"),
         "{line}"
     );
-    assert!(
-        finding(&r, "phase-never-entered").is_some(),
-        "{:?}",
-        ids(&r)
-    );
-
-    assert!(finding(&report_of(&machine(2)), "phase-never-entered").is_none());
 }
 
 fn deployed(constructor: &str, runtime: &[u8]) -> Vec<u8> {
@@ -2122,12 +1954,11 @@ fn deployed(constructor: &str, runtime: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn a_caller_check_on_a_slot_nothing_sets_is_reported_with_the_authority_map() {
+fn the_authority_map_says_which_slot_decides_who_may_call() {
     let runtime = dispatcher(&format!("{OWNER_GATE} CALLER SELFDESTRUCT"));
     let marks = "PUSH1 0x01 PUSH1 0x09 SSTORE";
 
     let r = report_of(&deployed(marks, &runtime));
-    assert!(finding(&r, "gate-never-set").is_some(), "{:?}", ids(&r));
     let map = r
         .maps
         .iter()
@@ -2137,7 +1968,6 @@ fn a_caller_check_on_a_slot_nothing_sets_is_reported_with_the_authority_map() {
 
     let owned = format!("{marks} CALLER PUSH1 0x00 SSTORE");
     let r = report_of(&deployed(&owned, &runtime));
-    assert!(finding(&r, "gate-never-set").is_none());
     let deployment = r.maps.iter().find(|s| s.title == "Deployment");
     let lines = &deployment.expect("a section").lines;
     assert!(lines.contains(&"slot 0x0 is set to the deployer".to_string()));
@@ -2253,39 +2083,6 @@ fn pay_in(credit: &str) -> String {
     format!("{credit} {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP")
 }
 
-const DIFFERENT_ASSETS: &str = "PUSH1 0x24 CALLDATALOAD PUSH1 0x04 CALLDATALOAD EQ ISZERO \
-     PUSH2 @apart JUMPI PUSH1 0x00 DUP1 REVERT :apart JUMPDEST";
-
-fn asset_records(guard: &str) -> String {
-    let held = |asset: &str| {
-        format!(
-            "PUSH4 0x70a08231 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE ADDRESS PUSH1 0x84 MSTORE \
-             PUSH1 0x20 PUSH1 0x80 PUSH1 0x24 PUSH1 0x80 {asset} GAS STATICCALL POP \
-             PUSH1 0x80 MLOAD"
-        )
-    };
-    let record = |asset: &str| {
-        format!(
-            "{asset} PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE \
-             PUSH1 0x40 PUSH1 0x00 KECCAK256"
-        )
-    };
-    let (given, taken) = ("PUSH1 0x04 CALLDATALOAD", "PUSH1 0x24 CALLDATALOAD");
-    let outside = "PUSH4 0x12345678 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE \
-                   PUSH1 0x00 DUP1 PUSH1 0x04 PUSH1 0x80 PUSH1 0x00 PUSH2 0xd0d0 GAS CALL POP";
-    format!(
-        "{guard} {} {} {outside} {} {} \
-         DUP3 SWAP1 SUB {} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP \
-         DUP3 SUB {} DUP1 SLOAD DUP3 SWAP1 SUB SWAP1 SSTORE STOP",
-        held(given),
-        held(taken),
-        held(given),
-        held(taken),
-        record(taken),
-        record(given),
-    )
-}
-
 fn counted_pay_in() -> String {
     format!(
         "CALLVALUE {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE \
@@ -2324,22 +2121,6 @@ fn pay_out_all(clear_first: bool) -> String {
         true => format!("{CALLER_ENTRY} DUP1 SLOAD PUSH1 0x00 DUP3 SSTORE {pays} POP POP STOP"),
         false => format!("{CALLER_ENTRY} DUP1 SLOAD {pays} POP PUSH1 0x00 SWAP1 SSTORE STOP"),
     }
-}
-
-fn share_vault(guard: &str) -> Vec<u8> {
-    let asset = "PUSH2 0xb1b1";
-    dispatcher(&format!(
-        "PUSH4 0x70a08231 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE ADDRESS PUSH1 0x84 MSTORE \
-         PUSH1 0x20 PUSH1 0x80 PUSH1 0x24 PUSH1 0x80 {asset} GAS STATICCALL POP \
-         PUSH1 0x80 MLOAD PUSH1 0x01 SLOAD PUSH1 0x04 CALLDATALOAD \
-         DUP2 ISZERO PUSH2 @first JUMPI DUP3 DUP3 DUP3 MUL DIV PUSH2 @join JUMP \
-         :first JUMPDEST DUP1 :join JUMPDEST {guard} \
-         PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
-         ADDRESS PUSH1 0xa4 MSTORE DUP2 PUSH1 0xc4 MSTORE \
-         PUSH1 0x00 DUP1 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 {asset} GAS CALL POP \
-         {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE \
-         DUP3 ADD PUSH1 0x01 SSTORE STOP"
-    ))
 }
 
 fn signed_payment(counted: bool) -> Vec<u8> {
@@ -2526,36 +2307,6 @@ fn limits_with_a_copied_record(draw_subtracts_both: bool) -> Vec<u8> {
     )
 }
 
-fn clocked(clock: &str) -> Vec<u8> {
-    dispatcher3(
-        &format!("{clock} PUSH1 0x04 CALLDATALOAD ADD PUSH1 0x05 SSTORE STOP"),
-        &format!(
-            "PUSH1 0x05 SLOAD TIMESTAMP GT PUSH2 @ok JUMPI {REVERT} :ok JUMPDEST \
-             PUSH1 0x01 PUSH1 0x06 SSTORE STOP"
-        ),
-        "STOP",
-    )
-}
-
-fn phased(last: u8) -> Vec<u8> {
-    let step = |at: u8, then: &str| {
-        format!(
-            "PUSH1 0x03 SLOAD PUSH1 {at:#04x} EQ PUSH2 @at{at} JUMPI {REVERT} \
-             :at{at} JUMPDEST {then} STOP"
-        )
-    };
-    dispatcher3(
-        &step(0, "PUSH1 0x01 PUSH1 0x03 SSTORE"),
-        &step(1, "PUSH1 0x02 PUSH1 0x03 SSTORE"),
-        &step(last, "PUSH1 0x01 PUSH1 0x07 SSTORE"),
-    )
-}
-
-fn gated_after(constructor: &str) -> Vec<u8> {
-    let runtime = dispatcher(&format!("{OWNER_GATE} CALLER SELFDESTRUCT"));
-    deployed(constructor, &runtime)
-}
-
 fn pulls(check: &str) -> Vec<u8> {
     dispatcher(&format!(
         "PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
@@ -2589,11 +2340,8 @@ const SPENDS: &str = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x01 PUSH1
      PUSH2 @allowed JUMPI PUSH1 0x00 DUP1 REVERT :allowed JUMPDEST \
      DUP3 SWAP1 SUB SWAP1 SSTORE";
 
-const COPY_AND_CHANGE: &str =
-    "PUSH1 0x05 SLOAD PUSH1 0x80 MSTORE PUSH1 0x04 CALLDATALOAD PUSH1 0x80 MSTORE";
 const AIMED_WRITE: &str = "PUSH1 0x24 CALLDATALOAD PUSH1 0x04 CALLDATALOAD SSTORE STOP";
 const STORE_WORD: &str = "PUSH1 0x04 CALLDATALOAD PUSH1 0x01 SSTORE STOP";
-const MARKS: &str = "PUSH1 0x01 PUSH1 0x09 SSTORE";
 
 fn cases() -> Vec<Case> {
     let pair = |rule, confirmed, flawed: fn() -> Vec<u8>, sound: fn() -> Vec<u8>| {
@@ -2606,7 +2354,7 @@ fn cases() -> Vec<Case> {
     };
     let all = [
         pair(
-            "two-calls-return-more",
+            "calls-leave-account-with-gain",
             true,
             || {
                 dispatcher3(
@@ -2624,32 +2372,10 @@ fn cases() -> Vec<Case> {
             || dispatcher3(&pay_in("CALLVALUE"), &pay_out_all(true), "STOP"),
         ),
         pair(
-            "inflow-credits-nothing",
-            true,
-            || share_vault(""),
-            || share_vault("DUP1 PUSH2 @some JUMPI PUSH1 0x00 DUP1 REVERT :some JUMPDEST"),
-        ),
-        pair(
-            "changed-copy-dropped",
-            true,
-            || dispatcher(&format!("{COPY_AND_CHANGE} STOP")),
-            || {
-                dispatcher(&format!(
-                    "{COPY_AND_CHANGE} PUSH1 0x80 MLOAD PUSH1 0x05 SSTORE STOP"
-                ))
-            },
-        ),
-        pair(
             "signed-message-accepted-twice",
             true,
             || signed_payment(false),
             || signed_payment(true),
-        ),
-        pair(
-            "clock-units-mixed",
-            true,
-            || clocked("NUMBER"),
-            || clocked("TIMESTAMP"),
         ),
         pair(
             "signed-call-leaves-word-unsigned",
@@ -2688,7 +2414,7 @@ fn cases() -> Vec<Case> {
             || asset_vault(true),
         ),
         pair(
-            "payout-grows-with-other-payment",
+            "calls-leave-account-with-gain",
             true,
             || pooled(false),
             || pooled(true),
@@ -2710,13 +2436,6 @@ fn cases() -> Vec<Case> {
             false,
             || limits_with_a_copied_record(false),
             || limits_with_a_copied_record(true),
-        ),
-        pair("phase-never-entered", false, || phased(5), || phased(2)),
-        pair(
-            "gate-never-set",
-            false,
-            || gated_after(MARKS),
-            || gated_after(&format!("{MARKS} CALLER PUSH1 0x00 SSTORE")),
         ),
         pair(
             "refused-transfer-treated-as-done|erc20-return-ignored|unchecked-token-pull",
@@ -2766,19 +2485,13 @@ fn cases() -> Vec<Case> {
             },
         ),
         pair(
-            "ledger-credits-more-than-received",
-            true,
-            || dispatcher(&asset_records("")),
-            || dispatcher(&asset_records(DIFFERENT_ASSETS)),
-        ),
-        pair(
-            "surplus-open-to-any-account",
+            "calls-leave-account-with-gain",
             true,
             || dispatcher3(&counted_pay_in(), &pay_out_recorded(true), "STOP"),
             || dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP"),
         ),
         pair(
-            "payment-taken-by-other-account",
+            "calls-leave-account-with-gain",
             true,
             || dispatcher3(&counted_pay_in(), &pay_out_everything(), "STOP"),
             || dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP"),
@@ -2906,18 +2619,15 @@ fn the_labelled_fixtures_score_every_rule_at_full_precision_and_recall() {
 
 // A fixture is a few instructions and leaves out what its own rule does not need.
 // These findings are true of the fixture named, so they are expected there.
-const TRUE_OF_A_SOUND_FIXTURE: [(&str, &str); 7] = [
+const TRUE_OF_A_SOUND_FIXTURE: [(&str, &str); 4] = [
     // It credits a payment at par whatever the contract holds, so a later payer shares a
     // surplus that stood behind the earlier one.
-    ("rounding-favours-caller", "surplus-open-to-any-account"),
+    ("rounding-favours-caller", "calls-leave-account-with-gain"),
     ("", "short-input-accepted"),
-    ("inflow-credits-nothing", "refused-transfer-treated-as-done"),
     (
         "reentrancy|reentered-call-pays-again",
         "refused-transfer-treated-as-done",
     ),
-    ("clock-units-mixed", "unchecked-arithmetic"),
-    ("clock-units-mixed", "time-bound-set-by-anyone"),
     (
         "signed-call-leaves-word-unsigned",
         "signed-message-accepted-twice",
@@ -2968,8 +2678,7 @@ fn padding_the_code_changes_no_labelled_result() {
     }
 }
 
-const SOUND_BY_A_GUARD: [&str; 6] = [
-    "inflow-credits-nothing",
+const SOUND_BY_A_GUARD: [&str; 5] = [
     "refused-transfer-treated-as-done|erc20-return-ignored|unchecked-token-pull",
     "input-picks-storage-slot",
     "short-input-accepted",
@@ -3099,14 +2808,13 @@ fn fired(code_hex: &str, id: &str) -> bool {
 #[test]
 fn a_token_bought_with_ether_is_not_a_larger_refund() {
     let presale = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461003e57600080fd5b5034336000526000602052604060002080548201905550005b5033600052600060205260406000208054801561008a576000825563a9059cbb60e01b608052336084528060a4526020608060446080600061b1b15af11561008a576080511561008a57005b600080fd";
-    assert!(!fired(presale, "two-calls-return-more"));
+    assert!(!fired(presale, "calls-leave-account-with-gain"));
 }
 
 #[test]
 fn a_fair_share_of_the_balance_is_not_a_gain() {
     let vault = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461006057600080fd5b5034600154801561003c578147038183020461003e565b815b80156100a3578082016001553360005260006020526040600020805482019055005b5060043580156100a357336000526000602052604060002080548281106100a357829003905560015481810360015581470204600080808084335af1156100a357005b600080fd";
-    assert!(!fired(vault, "two-calls-return-more"));
-    assert!(!fired(vault, "payout-grows-with-other-payment"));
+    assert!(!fired(vault, "calls-leave-account-with-gain"));
 }
 
 #[test]
@@ -3149,12 +2857,6 @@ fn a_note_packed_beside_a_time_bound_does_not_set_the_bound() {
 fn two_payments_to_one_stored_account_are_one_payee() {
     let twice = "608060405260003560e01c8063aaaaaaaa1461001a57600080fd5b50600080808060016000545af11561003f57600080808060026000545af11561003f57005b600080fd";
     assert!(!fired(twice, "one-refusal-blocks-all"));
-}
-
-#[test]
-fn a_branch_on_a_phase_is_not_a_wait_for_it() {
-    let branch = "608060405260003560e01c8063aaaaaaaa14610025578063bbbbbbbb1461003c57600080fd5b5060005415610035576000600055005b6001600055005b5060026000541461004e576009600955005b600760095500";
-    assert!(!fired(branch, "phase-never-entered"));
 }
 
 #[test]
@@ -3521,7 +3223,7 @@ fn a_flag_only_its_owner_sets_is_assumed_and_the_check_behind_it_is_reached() {
     let r = report_of(&code);
     assert_eq!(assumed(&r).len(), 1, "{:?}", assumed(&r));
     assert!(assumed(&r)[0].contains("slot 0x9"), "{:?}", assumed(&r));
-    let f = finding(&r, "surplus-open-to-any-account").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    let f = finding(&r, "calls-leave-account-with-gain").unwrap_or_else(|| panic!("{:?}", ids(&r)));
     assert!(
         f.description.contains("assumed settings"),
         "{}",
@@ -3638,10 +3340,171 @@ fn a_reading_that_differs_for_one_call_must_leave_no_gain() {
         f.description
     );
 
+    // A caller that names the contract it asks can also name an account, which answers
+    // nothing at all. The gain is then there without any answer reading differently.
     let r = report_of(&vault(credited_at(ASKED_OF_NAMED)));
-    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
-    assert_eq!(f.severity, Severity::High, "{f:?}");
+    let high = |id: &str| finding(&r, id).is_some_and(|f| f.severity == Severity::High);
+    assert!(
+        high(rule) || high("calls-leave-account-with-gain"),
+        "{:?}",
+        ids(&r)
+    );
 
     let r = report_of(&vault(credited_plainly(ASKED_OF_ONE)));
     assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
+}
+
+#[test]
+fn the_search_finds_an_account_that_ends_with_more_than_it_started_with() {
+    let rule = "calls-leave-account-with-gain";
+    let takes_all = dispatcher3(&counted_pay_in(), &pay_out_everything(), "STOP");
+    let r = report_of(&takes_all);
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    assert!(f.confirmed, "{f:?}");
+    assert!(!f.setup.is_empty(), "{f:?}");
+
+    let pays_what_is_recorded = dispatcher3(&counted_pay_in(), &pay_out_recorded(false), "STOP");
+    let r = report_of(&pays_what_is_recorded);
+    assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
+
+    let keeps_no_record = dispatcher3("STOP", &pay_out_everything(), "STOP");
+    let r = report_of(&keeps_no_record);
+    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium, "{f:?}");
+}
+
+#[test]
+fn running_the_code_an_upgrade_just_stored_is_not_a_finding_of_its_own() {
+    let runs = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 GAS DELEGATECALL POP STOP";
+    let through = "PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x05 SLOAD GAS DELEGATECALL POP STOP";
+    let severity = |stores: &str| {
+        let gated = format!("{OWNER_GATE} PUSH1 0x04 CALLDATALOAD {stores} {runs}");
+        let r = report_of(&dispatcher3(&gated, "STOP", through));
+        let f = finding(&r, "delegatecall-user-target").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+        f.severity
+    };
+    assert_eq!(severity("DUP1 PUSH1 0x05 SSTORE"), Severity::Info);
+    assert_eq!(severity(""), Severity::High);
+    assert_eq!(severity("DUP1 PUSH1 0x06 SSTORE"), Severity::High);
+}
+
+#[test]
+fn a_value_passed_by_pointer_is_typed_by_how_the_code_decodes_it() {
+    const POINTER: &str = "PUSH1 0x04 CALLDATALOAD";
+    const ADDRESS: &str = "PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND";
+    let first_type = |body: &str| {
+        let c = decompile::decompile(&dispatcher(body), &Options::default());
+        let f = c.functions.iter().find(|f| !f.params.is_empty());
+        f.unwrap_or_else(|| panic!("no parameters")).params[0]
+            .ty
+            .clone()
+    };
+
+    let head = format!(
+        "PUSH1 0x60 {POINTER} PUSH1 0x04 ADD CALLDATASIZE SUB SLT ISZERO PUSH2 @ok JUMPI \
+         {REVERT} :ok JUMPDEST"
+    );
+    let second = format!("{POINTER} PUSH1 0x24 ADD CALLDATALOAD {ADDRESS} PUSH1 0x01 SSTORE");
+    let third = format!(
+        "{POINTER} PUSH1 0x44 ADD CALLDATALOAD {POINTER} ADD PUSH1 0x04 ADD CALLDATALOAD \
+         PUSH1 0x02 SSTORE STOP"
+    );
+    assert_eq!(
+        first_type(&format!("{head} {second} {third}")),
+        "(uint256,address,bytes)"
+    );
+
+    let length = format!("{POINTER} PUSH1 0x04 ADD CALLDATALOAD");
+    let in_bounds = format!(
+        "CALLDATASIZE {length} PUSH1 0x05 SHL {POINTER} PUSH1 0x24 ADD ADD GT ISZERO \
+         PUSH2 @ok JUMPI {REVERT} :ok JUMPDEST"
+    );
+    let element = format!(
+        "PUSH1 0x24 CALLDATALOAD PUSH1 0x05 SHL {POINTER} PUSH1 0x24 ADD ADD CALLDATALOAD \
+         {ADDRESS} PUSH1 0x01 SSTORE STOP"
+    );
+    assert_eq!(first_type(&format!("{in_bounds} {element}")), "address[]");
+
+    let copied = format!(
+        "{length} {POINTER} PUSH1 0x24 ADD PUSH1 0x80 CALLDATACOPY PUSH1 0x80 MLOAD \
+         PUSH1 0x01 SSTORE STOP"
+    );
+    assert_eq!(first_type(&copied), "bytes");
+
+    let four_members = format!(
+        "PUSH1 0x80 {POINTER} PUSH1 0x04 ADD CALLDATASIZE SUB SLT ISZERO PUSH2 @ok JUMPI \
+         {REVERT} :ok JUMPDEST {POINTER} PUSH1 0x64 ADD CALLDATALOAD {POINTER} ADD \
+         PUSH1 0x04 ADD CALLDATALOAD POP {}",
+        pay_out_everything()
+    );
+    let r = report_of(&dispatcher3(&counted_pay_in(), &four_members, "STOP"));
+    let entered = finding(&r, "calls-leave-account-with-gain");
+    assert!(entered.is_some(), "{:?}", ids(&r));
+}
+
+#[test]
+fn the_search_enters_a_function_that_takes_more_words_than_it_guesses() {
+    let words: Vec<String> = (0..7)
+        .map(|i| format!("PUSH1 0x{:02x} CALLDATALOAD POP", 4 + 32 * i))
+        .collect();
+    let long = format!(
+        "PUSH1 0xe4 CALLDATASIZE LT ISZERO PUSH2 @long JUMPI PUSH1 0x00 DUP1 REVERT \
+         :long JUMPDEST {} {}",
+        words.join(" "),
+        pay_out_everything()
+    );
+    let r = report_of(&dispatcher3(&counted_pay_in(), &long, "STOP"));
+    let found = finding(&r, "calls-leave-account-with-gain");
+    assert!(found.is_some(), "{:?}", ids(&r));
+}
+
+fn asset_pull(label: &str, from: &str, to: &str, amount: &str, then: &str) -> String {
+    let answered =
+        format!("PUSH1 0x80 MLOAD PUSH2 @{label} JUMPI PUSH1 0x00 DUP1 REVERT :{label} JUMPDEST");
+    format!(
+        "PUSH4 0x23b872dd PUSH1 0xe0 SHL PUSH1 0x80 MSTORE {from} PUSH1 0x84 MSTORE \
+         {to} PUSH1 0xa4 MSTORE {amount} PUSH1 0xc4 MSTORE \
+         PUSH1 0x20 PUSH1 0x80 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 PUSH2 0xb1b1 GAS CALL POP \
+         {answered} {then} STOP"
+    )
+}
+
+#[test]
+fn the_search_finds_a_call_that_takes_from_an_account_that_approved_the_contract() {
+    let word = |n: usize| format!("PUSH1 {:#04x} CALLDATALOAD", 4 + 32 * n);
+    let credit = format!(
+        "{} {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP",
+        word(0)
+    );
+    let pays_in = asset_pull("in", "CALLER", "ADDRESS", &word(0), &credit);
+    let again = asset_pull("again", "CALLER", "ADDRESS", &word(0), &credit);
+
+    let named = format!(
+        "{} PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND",
+        word(0)
+    );
+    let to_the_caller = asset_pull("out", &named, "CALLER", &word(1), "");
+    let r = report_of(&dispatcher3(&pays_in, &to_the_caller, "STOP"));
+    let f = finding(&r, "calls-leave-account-with-gain").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    assert!(
+        finding(&r, "call-leaves-another-account-with-less").is_none(),
+        "{:?}",
+        ids(&r)
+    );
+
+    let to_the_contract = asset_pull("out", &named, "ADDRESS", &word(1), "");
+    let r = report_of(&dispatcher3(&pays_in, &to_the_contract, "STOP"));
+    let f = finding(&r, "call-leaves-another-account-with-less")
+        .unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium, "{f:?}");
+
+    let r = report_of(&dispatcher3(&pays_in, &again, "STOP"));
+    for rule in [
+        "calls-leave-account-with-gain",
+        "call-leaves-another-account-with-less",
+    ] {
+        assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
+    }
 }

@@ -1,15 +1,12 @@
 use crate::abi::{SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
-use crate::boundary;
 use crate::compiler;
 use crate::confirm;
-use crate::cross::World as CrossWorld;
 use crate::decompile::{self, Contract, Function};
 use crate::emit::{self, Names, SlotSpace};
 use crate::exec;
 use crate::expr::{self, ExprId, Node};
 use crate::flow;
 use crate::function::FnKind;
-use crate::ledger;
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::origin::{self, Model};
@@ -19,6 +16,7 @@ use crate::ssa;
 use crate::standard;
 use crate::type_rules;
 use crate::u256::U256;
+use crate::world::{Call, World as CrossWorld};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -263,11 +261,9 @@ const MAX_INLINED_EVENTS: usize = 12_000;
 
 #[derive(Clone)]
 struct Event {
-    node: usize,
     pc: usize,
     callee: Option<usize>,
     inst: usize,
-    inner: usize,
     path: Vec<(usize, Option<usize>, usize)>,
     stmt: Option<Stmt>,
     term: Option<Term>,
@@ -332,7 +328,6 @@ struct FnFacts {
     ledger_writes: Vec<LedgerWrite>,
     total_changes: Vec<(ExprId, Change)>,
     stale_moves: Vec<StaleMove>,
-    surplus_moves: Vec<SurplusMove>,
 }
 
 #[derive(Clone, Debug)]
@@ -543,12 +538,6 @@ struct StaleMove {
     lines: [String; 2],
 }
 
-#[derive(Clone, Debug)]
-struct SurplusMove {
-    surplus: Vec<String>,
-    lines: Vec<String>,
-}
-
 fn change_of(val: ExprId, key: ExprId) -> (Change, Option<u32>) {
     let own = |e: ExprId| match expr::node(e) {
         Node::SLoad(k, false, g) if k == key => Some(g),
@@ -565,20 +554,6 @@ fn change_of(val: ExprId, key: ExprId) -> (Change, Option<u32>) {
             _ => (Change::Set, None),
         },
         _ => (Change::Set, None),
-    }
-}
-
-fn add_terms(e: ExprId, sign: i64, terms: &mut BTreeMap<ExprId, i64>, depth: u32) {
-    match expr::node(e) {
-        Node::Op(op::ADD, v) if depth < 16 => {
-            add_terms(v[0], sign, terms, depth + 1);
-            add_terms(v[1], sign, terms, depth + 1);
-        }
-        Node::Op(op::SUB, v) if depth < 16 => {
-            add_terms(v[0], sign, terms, depth + 1);
-            add_terms(v[1], -sign, terms, depth + 1);
-        }
-        _ => *terms.entry(e).or_insert(0) += sign,
     }
 }
 
@@ -652,51 +627,6 @@ fn stale_moves(ctx: &Ctx, l: &Lifted, events: &[Event], writes: &[LedgerWrite]) 
                 });
             }
         }
-    }
-    out
-}
-
-fn surplus_moves(
-    ctx: &Ctx,
-    l: &Lifted,
-    events: &[Event],
-    writes: &[LedgerWrite],
-    totals: &[(ExprId, Change)],
-    names: &Names,
-) -> Vec<SurplusMove> {
-    if totals.iter().any(|(_, c)| matches!(c, Change::Up(_))) {
-        return Vec::new();
-    }
-    let mut roots: Vec<U256> = writes.iter().map(|w| w.root).collect();
-    roots.sort();
-    roots.dedup();
-    let mut out = Vec::new();
-    for root in roots {
-        let on: Vec<&LedgerWrite> = writes.iter().filter(|w| w.root == root).collect();
-        let falls = on.iter().any(|w| matches!(w.change, Change::Down(_)));
-        let plain = on.iter().all(|w| w.change != Change::Set && !w.in_loop);
-        let chained = on
-            .windows(2)
-            .all(|w| ev_reaches(ctx, l, &events[w[0].at], &events[w[1].at]));
-        if !falls || !plain || !chained {
-            continue;
-        }
-        let mut terms: BTreeMap<ExprId, i64> = BTreeMap::new();
-        for w in &on {
-            match w.change {
-                Change::Up(amount) => add_terms(amount, 1, &mut terms, 0),
-                Change::Down(amount) => add_terms(amount, -1, &mut terms, 0),
-                Change::Set => {}
-            }
-        }
-        terms.retain(|_, n| *n != 0);
-        if terms.is_empty() || terms.values().any(|n| *n < 0) {
-            continue;
-        }
-        out.push(SurplusMove {
-            surplus: terms.keys().map(|e| emit::fmt_expr(*e, names)).collect(),
-            lines: on.iter().map(|w| w.line.clone()).collect(),
-        });
     }
     out
 }
@@ -818,13 +748,11 @@ fn collect_facts(
         ledger_writes: Vec::new(),
         total_changes: Vec::new(),
         stale_moves: Vec::new(),
-        surplus_moves: Vec::new(),
     };
     if let Some(l) = &f.lifted {
         let own = names.clone();
         let (writes, totals) = ledger_writes(events, ctx.c.compiler.layout, &own);
         facts.stale_moves = stale_moves(ctx, l, events, &writes);
-        facts.surplus_moves = surplus_moves(ctx, l, events, &writes, &totals, &own);
         facts.ledger_writes = writes;
         facts.total_changes = totals;
     }
@@ -1115,24 +1043,6 @@ fn collect_facts(
             limits_in(e, layout, names, &mut seen, &mut candidates);
         }
     }
-    if crate::debug::on("EVMDEC_DEBUG_LIMITS") && !candidates.is_empty() {
-        eprintln!(
-            "[outflow] {} moves={} outflows={:?} others={:?}",
-            facts.name,
-            facts.moves_value,
-            outflows
-                .iter()
-                .map(|a| emit::fmt_expr(*a, names))
-                .collect::<Vec<_>>(),
-            candidates
-                .iter()
-                .map(|(_, o)| emit::fmt_expr(*o, names))
-                .collect::<Vec<_>>()
-        );
-    }
-    if crate::debug::on("EVMDEC_DEBUG_UNPLACED") {
-        debug_unplaced(&facts.name, events, layout, names);
-    }
     facts.ref_bounds = candidates.iter().map(|(b, _)| b.clone()).collect();
     for ev in events {
         if let Some(Term::Return {
@@ -1151,41 +1061,6 @@ fn collect_facts(
         .filter(|(_, other)| limits_outflow(*other, &outflows))
         .map(|(b, _)| b)
         .collect();
-    if crate::debug::on("EVMDEC_DEBUG_LIMITS") {
-        for b in &facts.avail_bounds {
-            let show = |set: &BTreeSet<Field>| {
-                set.iter()
-                    .map(|f| b.names.get(f).cloned().unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join(" + ")
-            };
-            eprintln!(
-                "[limit] {} moves={} : ({}) - ({})",
-                facts.name,
-                facts.moves_value,
-                show(&b.added),
-                show(&b.subbed)
-            );
-        }
-    }
-    if crate::debug::on("EVMDEC_DEBUG_FACTS") {
-        eprintln!(
-            "[facts] {} checked={} init={} time={} auth={:?} writes={} ether={} sd={} dc={} guards={:?}",
-            facts.name,
-            facts.caller_checked,
-            facts.init_guarded,
-            facts.time_gated,
-            facts.auth_slots.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>(),
-            facts.const_writes.len(),
-            facts.ether_out.len(),
-            facts.selfdestructs.len(),
-            facts.delegatecalls.len(),
-            guard_conds(events)
-                .iter()
-                .map(|c| emit::fmt_cond(*c, names))
-                .collect::<Vec<_>>()
-        );
-    }
     facts
 }
 
@@ -1936,78 +1811,6 @@ fn linear_fields(
     }
 }
 
-fn unplaced_terms(e: ExprId, sign: i32, names: &Names, out: &mut Vec<String>, budget: &mut u32) {
-    if *budget == 0 {
-        return;
-    }
-    *budget -= 1;
-    match expr::node(e) {
-        Node::Op(op::ADD, v) => {
-            for x in v {
-                unplaced_terms(x, sign, names, out, budget);
-            }
-        }
-        Node::Op(op::SUB, v) if v.len() == 2 => {
-            unplaced_terms(v[0], sign, names, out, budget);
-            unplaced_terms(v[1], -sign, names, out, budget);
-        }
-        Node::Op(op::AND, v) if v.len() == 2 => {
-            for x in v {
-                if !expr::is_const(x) {
-                    unplaced_terms(x, sign, names, out, budget);
-                }
-            }
-        }
-        Node::MLoad(..) | Node::IntRet(..) | Node::Var(_) => {
-            out.push(format!(
-                "{}{}",
-                if sign > 0 { "+" } else { "-" },
-                emit::fmt_expr(e, names)
-            ));
-        }
-        _ => {}
-    }
-}
-
-fn debug_unplaced(name: &str, events: &[Event], layout: emit::MappingLayout, names: &Names) {
-    let mut seen = HashSet::new();
-    for ev in events {
-        for e in ev
-            .stmt
-            .iter()
-            .flat_map(lift::stmt_exprs)
-            .chain(ev.term.iter().flat_map(lift::term_exprs))
-        {
-            let mut stack = vec![e];
-            while let Some(x) = stack.pop() {
-                if !seen.insert(x) || seen.len() > 50_000 {
-                    continue;
-                }
-                if let Node::Op(op::SUB, _) = expr::node(x) {
-                    let mut coef = BTreeMap::new();
-                    let mut labels = HashMap::new();
-                    let mut budget = 256;
-                    linear_fields(x, 1, layout, names, &mut coef, &mut labels, &mut budget);
-                    let mut un = Vec::new();
-                    let mut b2 = 256;
-                    unplaced_terms(x, 1, names, &mut un, &mut b2);
-                    if coef.values().any(|c| *c < 0) && !un.is_empty() {
-                        let fields: Vec<String> = coef
-                            .iter()
-                            .filter(|(_, c)| **c != 0)
-                            .map(|(f, c)| {
-                                format!("{}{}", if *c > 0 { "+" } else { "-" }, labels[f])
-                            })
-                            .collect();
-                        eprintln!("[unplaced] {} fields={:?} unplaced={:?}", name, fields, un);
-                    }
-                }
-                stack.extend(expr::children(x));
-            }
-        }
-    }
-}
-
 fn linear_bound(e: ExprId, layout: emit::MappingLayout, names: &Names) -> Option<AvailBound> {
     let mut coef = BTreeMap::new();
     let mut labels = HashMap::new();
@@ -2694,10 +2497,6 @@ fn events_of_in(
         )
     };
     let loops = loop_nodes(l);
-    let dbg_memview = crate::debug::on("EVMDEC_DEBUG_MEMVIEW")
-        .then(|| std::env::var("EVMDEC_DEBUG_MEMVIEW").ok())
-        .flatten();
-    let dbg_unfresh = crate::debug::on("EVMDEC_DEBUG_UNFRESH");
     let mut out = Vec::new();
     let order = lift::reverse_postorder(l);
     // A helper's copies between its blocks can hold the only read of a call's answer.
@@ -2708,15 +2507,6 @@ fn events_of_in(
     }
     if !loops.is_empty() {
         let w = writes_of(ctx, loops.iter().map(|n| &l.nodes[*n]), &mut HashSet::new());
-        if dbg_unfresh {
-            eprintln!(
-                "loops in callee={:?} entry pc={}: writes={}",
-                callee,
-                l.nodes[l.entry].pc,
-                w.as_ref()
-                    .map_or("pointer".to_string(), |w| format!("{} slots", w.len()))
-            );
-        }
         forget_writes(mem, w);
     }
     for nid in order {
@@ -2772,33 +2562,7 @@ fn events_of_in(
                 let inlined = depth > 0 && ctx.internals.get(t).is_some_and(|f| f.lifted.is_some());
                 if !inlined {
                     let w = callee_writes(ctx, *t, &mut HashSet::new());
-                    if dbg_unfresh {
-                        eprintln!(
-                            "non-inlined call to {} from callee={:?} depth={}: writes={}",
-                            t,
-                            callee,
-                            depth,
-                            w.as_ref()
-                                .map_or("pointer".to_string(), |w| format!("{} slots", w.len()))
-                        );
-                    }
                     forget_writes(mem, w);
-                }
-            }
-            if let Some(want) = &dbg_memview {
-                if let Stmt::MStore { off, val, .. } = &s {
-                    let w =
-                        u64::from_str_radix(want.trim_start_matches("0x"), 16).unwrap_or(u64::MAX);
-                    if expr::as_const(*off) == Some(U256::from_u64(w)) {
-                        eprintln!(
-                            "memview store [{}] = {} (callee={:?} node={} pc={})",
-                            want,
-                            emit::fmt_expr(*val, &Names::default()),
-                            callee,
-                            nid,
-                            nd.pc
-                        );
-                    }
                 }
             }
             match &s {
@@ -2854,11 +2618,9 @@ fn events_of_in(
                                 }
                             }
                             out.push(Event {
-                                node: anchor,
                                 pc: nd.pc,
                                 callee,
                                 inst,
-                                inner: nid,
                                 path: path.clone(),
                                 stmt: Some(s.clone()),
                                 term: None,
@@ -2886,11 +2648,9 @@ fn events_of_in(
                 }
             }
             out.push(Event {
-                node: anchor,
                 pc: nd.pc,
                 callee,
                 inst,
-                inner: nid,
                 path: path.clone(),
                 stmt: Some(s),
                 term: None,
@@ -2899,11 +2659,9 @@ fn events_of_in(
         }
         let term = lift::map_term(&nd.term, &|e| apply(e, mem));
         out.push(Event {
-            node: anchor,
             pc: nd.pc,
             callee,
             inst,
-            inner: nid,
             path: path.clone(),
             stmt: None,
             term: Some(term),
@@ -3023,17 +2781,18 @@ fn digest_unseen(digest: ExprId) -> bool {
     }) || mentions(digest, &structured)
 }
 
+fn strip(e: ExprId) -> ExprId {
+    match expr::node(e) {
+        Node::Op(op::ISZERO, v) => strip(v[0]),
+        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
+            strip(v[0])
+        }
+        _ => e,
+    }
+}
+
 // The other side of an equality test that has the wanted value on one side.
 fn compared_with(cond: ExprId, wanted: &dyn Fn(&Node) -> bool) -> Option<ExprId> {
-    fn strip(e: ExprId) -> ExprId {
-        match expr::node(e) {
-            Node::Op(op::ISZERO, v) => strip(v[0]),
-            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-                strip(v[0])
-            }
-            _ => e,
-        }
-    }
     match expr::node(strip(cond)) {
         Node::Op(op::AND | op::OR, v) if v.iter().all(|x| expr::is_boolean(*x)) => {
             v.iter().find_map(|x| compared_with(*x, wanted))
@@ -3060,15 +2819,6 @@ fn asked_directly(addr: ExprId) -> bool {
 }
 
 fn tests_zero(cond: ExprId, wanted: &dyn Fn(&Node) -> bool) -> bool {
-    fn strip(e: ExprId) -> ExprId {
-        match expr::node(e) {
-            Node::Op(op::ISZERO, v) => strip(v[0]),
-            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-                strip(v[0])
-            }
-            _ => e,
-        }
-    }
     let inner = strip(cond);
     match expr::node(inner) {
         Node::Op(op::AND | op::OR, v) if v.iter().all(|x| expr::is_boolean(*x)) => {
@@ -3121,15 +2871,6 @@ fn is_owner_cond(cond: ExprId) -> bool {
 }
 
 fn role_test_root(cond: ExprId) -> Option<U256> {
-    fn strip(e: ExprId) -> ExprId {
-        match expr::node(e) {
-            Node::Op(op::ISZERO, v) => strip(v[0]),
-            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-                strip(v[0])
-            }
-            _ => e,
-        }
-    }
     match expr::node(strip(cond)) {
         Node::SLoad(k, _, _) if from_caller(k) => mapping_root(k),
         _ => None,
@@ -3226,15 +2967,6 @@ pub struct Gates {
 }
 
 pub fn gates(c: &Contract) -> Gates {
-    fn strip(e: ExprId) -> ExprId {
-        match expr::node(e) {
-            Node::Op(op::ISZERO, v) => strip(v[0]),
-            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-                strip(v[0])
-            }
-            _ => e,
-        }
-    }
     let mut out = Gates::default();
     for f in &c.functions {
         let Some(l) = &f.lifted else { continue };
@@ -3290,15 +3022,6 @@ pub fn key_for(key: ExprId, caller: U256) -> Option<U256> {
 }
 
 pub fn is_auth_cond(cond: ExprId) -> bool {
-    fn strip(e: ExprId) -> ExprId {
-        match expr::node(e) {
-            Node::Op(op::ISZERO, v) => strip(v[0]),
-            Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => {
-                strip(v[0])
-            }
-            _ => e,
-        }
-    }
     let c = strip(cond);
     match expr::node(c) {
         Node::Op(op::EQ | op::SUB | op::XOR, v) => {
@@ -4085,20 +3808,6 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                         .and_then(|w0| emit::leading_selector(w0, in_len_c));
                     let selector_known =
                         selector.is_some() || expr::as_const(*in_len) == Some(U256::ZERO);
-                    if crate::debug::on("EVMDEC_DEBUG_CALLS") {
-                        eprintln!(
-                            "call pc={} fn={} sel={:?} head=[{}] in_len={}",
-                            ev.pc,
-                            f.name,
-                            selector,
-                            input_head
-                                .iter()
-                                .map(|w| emit::fmt_expr(*w, names))
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            emit::fmt_expr(*in_len, names)
-                        );
-                    }
                     let words_view: Option<&Vec<ExprId>> =
                         input.as_ref().or(if input_head.is_empty() {
                             None
@@ -4138,8 +3847,23 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 format!("`{}` delegatecalls to `{}`, which is derived from calldata, without any msg.sender check. Anyone can execute arbitrary code in this contract's storage context (take over storage, selfdestruct).", f.name, target),
                                 vec![line.clone()], "Restrict the target to a whitelist or trusted storage slot and gate the function with access control.");
                         } else if from_calldata(*addr) {
-                            push(&mut findings, "delegatecall-user-target", "Delegatecall target derived from calldata (access-controlled)", Severity::High, Confidence::Medium, Some(f), Some(ev.pc),
-                                format!("`{}` delegatecalls to `{}` derived from calldata. Only safe if the caller check is sufficient and the target is trusted.", f.name, target), vec![line.clone()], "Validate the target against an allowlist even for privileged callers.");
+                            // Storing the target where the contract takes its code from and
+                            // then running it is an upgrade. Whoever may upgrade may already
+                            // run any code here, so the call adds nothing to that power.
+                            let code_slot = |key: ExprId| {
+                                let slot = expr::as_const(key).map(|k| k.to_hex_padded(32));
+                                slot.is_some_and(|k| ctx.c.delegatecall_slots.contains(&k))
+                            };
+                            let upgrade = events.iter().any(|e2| {
+                                matches!(&e2.stmt, Some(Stmt::SStore { key, val, .. })
+                                    if code_slot(*key) && expr::has_part(*val, unmask(*addr)))
+                            });
+                            let (severity, rest) = match upgrade {
+                                true => (Severity::Info, "The same address is stored as the code this contract runs, so this is its upgrade path."),
+                                false => (Severity::High, "Only safe if the caller check is sufficient and the target is trusted."),
+                            };
+                            push(&mut findings, "delegatecall-user-target", "Delegatecall target derived from calldata (access-controlled)", severity, Confidence::Medium, Some(f), Some(ev.pc),
+                                format!("`{}` delegatecalls to `{}` derived from calldata. {rest}", f.name, target), vec![line.clone()], "Validate the target against an allowlist even for privileged callers.");
                         } else if !storage_target && !is_const_addr(*addr) {
                             push(&mut findings, "delegatecall-dynamic-target", "Delegatecall to a computed address", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                 format!("`{}` delegatecalls to `{}`.", f.name, target), vec![line.clone()], "Make sure the computed implementation cannot be influenced by callers.");
@@ -4150,18 +3874,11 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                     // code then trusts. The rules about what a call changes stay with calls that can.
                     let plain = *kind == op::CALL || *kind == op::CALLCODE;
                     if plain || *kind == op::STATICCALL {
-                        let later_write = plain && events[i + 1..].iter().any(|e2| {
-                            let hit = matches!(&e2.stmt, Some(Stmt::SStore { .. }))
-                                && ev_reaches(&ctx, l, ev, e2);
-                            if hit && crate::debug::on("EVMDEC_DEBUG_REENTRANCY") {
-                                eprintln!(
-                                    "[reentrancy] {} call pc={} inst={} inner={} node={} callee={:?} -> store pc={} inst={} inner={} node={} callee={:?}: {}",
-                                    f.name, ev.pc, ev.inst, ev.inner, ev.node, ev.callee, e2.pc, e2.inst, e2.inner, e2.node, e2.callee,
-                                    e2.stmt.as_ref().map(|st| emit::fmt_stmt(st, names)).unwrap_or_default()
-                                );
-                            }
-                            hit
-                        });
+                        let later_write = plain
+                            && events[i + 1..].iter().any(|e2| {
+                                matches!(&e2.stmt, Some(Stmt::SStore { .. }))
+                                    && ev_reaches(&ctx, l, ev, e2)
+                            });
                         let hook = selector.is_some_and(|s| CALLBACK_SELECTORS.contains(&s));
                         if later_write && !precompile {
                             let (id, sev, conf, extra) = if guarded_calls.contains(&i) {
@@ -5424,12 +5141,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         });
     }
 
-    crate::invariant::findings(c, &c.types, &mut findings);
-    let begin = crate::deploy::storage(c);
     report.maps.extend(crate::deploy::section(c));
-    report
-        .maps
-        .extend(authority(&facts, &stores, &uses, &begin, &mut findings));
+    report.maps.extend(authority(&facts, &stores, &uses));
     if asked {
         // A test of a stored flag does not keep any caller out, so what such a function
         // writes is a record of the calls made, not a setting.
@@ -5442,59 +5155,30 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         report.maps.extend(crate::props::findings(c, &mut findings));
         let measured = findings.len();
         exec::within(flow::WORK, || flow::findings(c, &mut findings));
-        exec::within(boundary::WORK, || boundary::findings(c, &mut findings));
-        exec::within(boundary::WORK, || {
-            boundary::swing_findings(c, &mut findings)
+        exec::within(crate::search::WORK, || {
+            crate::search::findings(c, &mut findings)
         });
-        if crate::debug::on("EVMDEC_DEBUG_CROSSINGS") {
-            let settable = std::rc::Rc::new(crate::solve::Settable {
-                layout: c.compiler.layout,
-                open: open.clone(),
-                held: HashSet::new(),
-            });
-            let seen = exec::within(64 * boundary::WORK, || boundary::crossings(c, &settable));
-            for (name, x) in seen {
-                eprintln!(
-                    "[crossings] {name} ends={} in={} out={} back={}",
-                    x.ends, x.brings_in, x.sends_out, x.pays_back
-                );
-            }
-        }
-        exec::within(ledger::WORK, || ledger::findings(c, &mut findings));
         if !crate::deploy::assumed(c).is_empty() {
             for finding in &mut findings[measured..] {
                 finding.description.push_str(ASSUMED_NOTE);
-            }
-        }
-        // A library run by delegatecall keeps its records in this contract's storage.
-        for address in &c.library_targets {
-            let Some(library) = linked_contract(&ctx, address) else {
-                continue;
-            };
-            let mut found = Vec::new();
-            exec::within(ledger::WORK, || ledger::findings(library, &mut found));
-            for mut finding in found {
-                let name = finding.function.take().unwrap_or_default();
-                finding.function = Some(format!("{name} @ {address}"));
-                findings.push(finding);
             }
         }
         exec::within(signed::WORK, || signed::findings(c, &mut findings));
         report.maps.extend(exec::within(standard::WORK, || {
             standard::findings(c, &open, &mut findings)
         }));
+        // The search and the check of the standard interface can reach the same fall in
+        // another account's balance. The one measured on the interface names the entry.
+        let named: HashSet<Option<String>> = findings
+            .iter()
+            .filter(|f| f.id == "call-lowers-another-accounts-balance")
+            .map(|f| f.function.clone())
+            .collect();
+        findings.retain(|f| {
+            f.id != "call-leaves-another-account-with-less" || !named.contains(&f.function)
+        });
     }
 
-    if crate::debug::on("EVMDEC_DEBUG_LOCKS") {
-        for (slot, fs) in &lock_slots {
-            eprintln!(
-                "[locks] slot {:?} used by {} function(s): {:?}",
-                expr::as_const(*slot).map(|c| c.to_hex()),
-                fs.len(),
-                fs.iter().map(|pc| format!("{:#x}", pc)).collect::<Vec<_>>()
-            );
-        }
-    }
     // The compilers with this fault gave every function a slot of its own. Three locks that
     // several functions share are three named locks from a compiler that works. A version
     // the trailer names and that is not one of the three is taken at its word.
@@ -5969,22 +5653,6 @@ fn capped_slots(c: &Contract) -> HashMap<U256, u64> {
             }
         }
     }
-    if crate::debug::on("EVMDEC_DEBUG_CAPS") {
-        for (k, ws) in &writes {
-            eprintln!(
-                "[caps] slot {} writes: {:?} bounds: {:?}",
-                k.to_decimal(),
-                ws.iter()
-                    .map(|(fi, v)| format!("fn{}={}", fi, emit::fmt_expr(*v, &Names::default())))
-                    .collect::<Vec<_>>(),
-                bounds
-                    .iter()
-                    .filter(|((_, kk), _)| kk == k)
-                    .map(|((fi, _), c)| format!("fn{}<{}", fi, c))
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
     let mut out = HashMap::new();
     'slots: for (k, ws) in writes {
         let mut cap = 0u64;
@@ -6101,17 +5769,6 @@ fn reverse_quote(
         SEL_TRANSFER_FROM => {
             let to = emit::shifted_word_len(words, 1, in_len);
             let amt = emit::shifted_word_len(words, 2, in_len);
-            if crate::debug::on("EVMDEC_DEBUG_RQ") {
-                eprintln!(
-                    "[rq] transferFrom to={} amt={} to_this={} div={} bound={:?} words={}",
-                    emit::fmt_expr(to, &names),
-                    emit::fmt_expr(amt, &names),
-                    mentions(to, &|n| matches!(n, Node::Env(op::ADDRESS, _))),
-                    computed_by_division(ctx, events, amt),
-                    only_nonzero_bound(ctx, l, events, amt),
-                    words.len()
-                );
-            }
             if !mentions(to, &|n| matches!(n, Node::Env(op::ADDRESS, _))) {
                 return None;
             }
@@ -6315,7 +5972,6 @@ fn trust_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let slot_const = |e: ExprId| expr::as_const(e);
     let ledgers: HashSet<U256> = crate::invariant::balance_mappings(&c.types)
         .into_iter()
-        .map(|l| l.root)
         .filter(|r| crate::invariant::is_ledger(c, *r))
         .collect();
     let mut pool_slots: HashSet<U256> = HashSet::new();
@@ -6426,15 +6082,6 @@ fn trust_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 .is_some_and(|k| x.auth_slots.iter().any(|(s, _)| slot_const(*s) == Some(k)));
             if gate_target || (target_slot.is_none() && !from_calldata(unmask(d.key))) {
                 continue;
-            }
-            if crate::debug::on("EVMDEC_DEBUG_TRUST") {
-                eprintln!(
-                    "[trust] {} debit {} key={:?} allowances={:?}",
-                    x.name,
-                    d.account_text,
-                    unmask(d.key),
-                    x.allowance_of
-                );
             }
             if from_caller(d.key)
                 || x.allowance_of.contains(&unmask(d.key))
@@ -6994,27 +6641,6 @@ fn mark_handoffs(
             u.function == index && target && model.of(u.value).open()
         });
         let through_callee = f.linked_calls.iter().find_map(|call| handed_on(ctx, call));
-        if crate::debug::on("EVMDEC_DEBUG_HANDOFF") {
-            let calls: Vec<String> = f
-                .linked_calls
-                .iter()
-                .map(|c| {
-                    format!(
-                        "{}:{:x?}:after={}",
-                        &c.address[..8],
-                        c.selector,
-                        c.acts_after
-                    )
-                })
-                .collect();
-            eprintln!(
-                "[handoff] {} {} open={filled_by_callers} word={:?} payees={} calls={calls:?}",
-                ctx.c.address.as_deref().unwrap_or("?"),
-                f.name,
-                f.input_callee,
-                f.payees.iter().filter(|p| worked_out(**p)).count(),
-            );
-        }
         let handed = if filled_by_callers {
             Handed {
                 to: String::from("an address read from storage that any caller can fill"),
@@ -7462,15 +7088,7 @@ fn stored_uses(
     }
 }
 
-// A fixed slot that an ungated function fills straight from its input is the older rules' ground.
-// These two report what they cannot see: values that arrive through other slots or sit in mappings.
-fn authority(
-    facts: &[FnFacts],
-    stores: &[origin::Store],
-    uses: &[StoredUse],
-    begin: &HashMap<U256, U256>,
-    findings: &mut Vec<Finding>,
-) -> Option<Section> {
+fn authority(facts: &[FnFacts], stores: &[origin::Store], uses: &[StoredUse]) -> Option<Section> {
     let mut gates: BTreeMap<origin::Loc, BTreeSet<usize>> = BTreeMap::new();
     for u in uses.iter().filter(|u| matches!(u.kind, UseKind::Gate)) {
         gates.entry(u.loc).or_default().insert(u.function);
@@ -7506,24 +7124,6 @@ fn authority(
             "{place} decides who may call {}. {set_by}",
             gated.iter().map(name).collect::<Vec<_>>().join(", "),
         ));
-        let unset = !begin.is_empty() && begin.get(&loc.0).is_none_or(|v| v.is_zero());
-        if let (true, true, 0, Some(first)) = (setters.is_empty(), unset, loc.1, gated.first()) {
-            push_fact(
-                findings,
-                "gate-never-set",
-                "A caller check reads a slot that nothing ever sets",
-                Severity::Low,
-                Confidence::Medium,
-                &facts[*first],
-                format!(
-                    "{} function(s) compare the caller with slot {}. The constructor leaves that slot at zero and no function in the runtime code writes it, so no account can pass the check and what it protects cannot be called.",
-                    gated.len(),
-                    loc.0.to_hex(),
-                ),
-                Vec::new(),
-                "Set the slot during construction, or add an authorised function that sets it, or remove the dead functions.",
-            );
-        }
     }
     (!lines.is_empty()).then_some(Section {
         title: "Authority map".to_string(),
@@ -7602,25 +7202,7 @@ fn origin_findings(
                     );
                 }
             }
-            UseKind::Gate => {
-                if !fixed || !told.insert((usize::MAX, u.loc, true)) {
-                    continue;
-                }
-                push_fact(
-                    findings,
-                    "gate-on-open-slot",
-                    "An access check compares the caller with a value any caller can put there",
-                    Severity::High,
-                    Confidence::Medium,
-                    f,
-                    format!(
-                        "`{}` compares `msg.sender` with a slot. No function stores an argument there directly, but following the stores back through the slots the value is copied from, it can be an argument or the caller of a function that needs no role. The check then passes for whoever made those calls.",
-                        f.name,
-                    ),
-                    vec![u.line.clone()],
-                    "Gate every function on the path that fills the slot.",
-                );
-            }
+            UseKind::Gate => {}
         }
     }
 }
@@ -7717,39 +7299,6 @@ const NAMED: [U256; 2] = [
 
 const MAX_SHAPES: usize = 18;
 
-fn place_contract(world: &mut CrossWorld, c: &Contract) -> Option<U256> {
-    let address = U256::from_hex_str(c.address.as_deref()?)?;
-    if c.info.runtime.is_empty() {
-        return None;
-    }
-    world.place(address, c.info.runtime.clone());
-    let units: Vec<U256> = c
-        .parts
-        .iter()
-        .skip(1)
-        .filter_map(|part| {
-            let at = U256::from_hex_str(&part.address)?;
-            world.place(at, part.runtime.clone());
-            Some(at)
-        })
-        .collect();
-    if let [implementation] = units[..] {
-        for slot in c
-            .delegatecall_slots
-            .iter()
-            .filter_map(|s| U256::from_hex_str(s))
-        {
-            world.seed(address, slot, implementation);
-        }
-    }
-    for (slot, held) in &c.stored_targets {
-        if let (Some(slot), Some(held)) = (U256::from_hex_str(slot), U256::from_hex_str(held)) {
-            world.seed(address, slot, held);
-        }
-    }
-    Some(address)
-}
-
 // Gates are opened only for callers the contract's storage was read to approve.
 // An unread gate must stay shut, or an unverified finding gets confirmed.
 fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec<u8>> {
@@ -7768,9 +7317,9 @@ fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec
     let balance = U256::ONE << 128;
     let build = |held: &[(U256, U256)]| -> Option<CrossWorld> {
         let mut world = CrossWorld::new();
-        place_contract(&mut world, ctx.c)?;
+        world.place_contract(ctx.c)?;
         for lc in &ctx.c.linked {
-            let Some(address) = place_contract(&mut world, lc) else {
+            let Some(address) = world.place_contract(lc) else {
                 continue;
             };
             let gate = gates(lc);
@@ -7794,17 +7343,21 @@ fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec
         args[word as usize] = account;
         let data = exec::calldata(selector, &args);
         let mut world = build(held)?;
-        world
-            .run(root, exec::CALLER, U256::ZERO, data.clone())
-            .then_some((data, world))
+        let call = Call {
+            who: exec::CALLER,
+            data: data.clone(),
+            ..Call::default()
+        };
+        let done = world.run(root, &call);
+        done.ended.then_some((data, world, done.writes))
     };
     let far = |world: &CrossWorld, at: U256| match fixed_target {
         Some(target) => at == target,
         None => world.was_made(at),
     };
     let written = |account: U256| -> Option<HashSet<(U256, U256)>> {
-        let (_, world) = run(account, &vec![U256::ZERO; nargs], &[])?;
-        let slots = world.writes().iter().filter(|w| far(&world, w.address));
+        let (_, world, writes) = run(account, &vec![U256::ZERO; nargs], &[])?;
+        let slots = writes.iter().filter(|w| far(&world, w.address));
         Some(slots.map(|w| (w.address, w.slot)).collect())
     };
     let (first, second) = (written(NAMED[0])?, written(NAMED[1])?);
@@ -7825,7 +7378,7 @@ fn confirm_passed(ctx: &Ctx, f: &FnFacts, word: u32, target: &str) -> Option<Vec
         }
     }
     let lowered = |account: usize, shape: &[U256]| -> Option<Vec<u8>> {
-        let (data, world) = run(NAMED[account], shape, &own[account])?;
+        let (data, world, _) = run(NAMED[account], shape, &own[account])?;
         own[account]
             .iter()
             .any(|(address, slot)| world.stored(*address, *slot) < balance)
@@ -7965,23 +7518,6 @@ fn conservation_findings(
                 ),
                 m.lines.to_vec(),
                 "Read the second entry after the first write is stored, or require the two keys to differ.",
-            );
-        }
-        if let Some(m) = f.surplus_moves.first() {
-            push_fact(
-                findings,
-                "unbalanced-ledger-move",
-                "A ledger's entries rise by more than they fall and no total changes",
-                Severity::Medium,
-                Confidence::Medium,
-                f,
-                format!(
-                    "Along one chain of writes in `{}` the entries of a mapping rise by {} more than they fall, and the function raises no total. The difference is not taken from any entry, so the ledger's sum grows without a record of it.",
-                    f.name,
-                    m.surplus.join(" + ")
-                ),
-                m.lines.clone(),
-                "Take every amount credited from an entry that is debited by it, or record it in the total.",
             );
         }
     }

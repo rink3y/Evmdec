@@ -225,10 +225,6 @@ pub fn next_seq() -> u32 {
     })
 }
 
-pub fn arena_size() -> usize {
-    ARENA.with(|a| a.borrow().nodes.len())
-}
-
 pub fn konst(v: U256) -> ExprId {
     intern(Node::Const(v))
 }

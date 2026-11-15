@@ -173,8 +173,7 @@
       "year": 2021,
       "bug": "deposit(): trusts owner() and delegatedTransferERC20() answers of a caller-supplied contract, then mints",
       "expected": [
-        "untrusted-return-data",
-        "untrusted-callee"
+        "untrusted-return-data"
       ],
       "min_severity": "medium"
     },
@@ -274,7 +273,7 @@
       "year": 2026,
       "bug": "queue that pays each entry 125% from the shared balance: ether held beyond the queue goes to whoever fills the queue",
       "expected": [
-        "surplus-open-to-any-account"
+        "calls-leave-account-with-gain"
       ],
       "min_severity": "high"
     },
@@ -284,7 +283,7 @@
       "year": 2026,
       "bug": "swap with the same asset in and out records the gain twice on one ledger entry",
       "expected": [
-        "ledger-credits-more-than-received"
+        "calls-leave-account-with-gain"
       ],
       "min_severity": "high"
     },

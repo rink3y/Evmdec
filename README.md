@@ -345,11 +345,12 @@ whose exploits are public, from The DAO to Balancer V1, with the rules that must
 
 | | |
 |---|---|
-| known bugs found | 26 / 29 |
+| known bugs found | 25 / 29 |
 | missed | the Fence tranche pool on Avalanche. Its limits are computed from an in-memory copy of the record. Reading limits from runs now recovers one of the two, which was invisible before; the other is not in a form the rule recognises, so the pool is still missed |
 | also missed | a swap library that records a gain twice when the asset in and the asset out are the same: the check for it needs the outside call to answer in the shape the code decodes, and the run engine answers with one word. A token whose rewards contract paid user-registered accounts in the middle of a transfer: the rule for it fires on a two-contract fixture, but the rewards contract that address points at today does not make those payments during the call |
+| found at a lower rating than its label asks | the Poly Network cross-chain manager. Its call with a computed target and selector is reported, at medium: no run shows the caller choosing the selector, because the call sits behind a signature check, and read from the code alone that rule is as common on sound contracts as on flawed ones |
 | not counted | Nomad, an upgrade-time state error outside bytecode patterns |
-| high or critical findings on the 22 audited contracts | 24, nearly all on contracts whose purpose is to execute caller-supplied calls |
+| high or critical findings on the 22 audited contracts | 19, most on contracts whose purpose is to execute caller-supplied calls |
 
 The audited corpus is the running false-positive budget for every rule change. The TENDRIL
 token on BSC, whose pool was drained through a hook contract the token trusted, is the case the
@@ -379,7 +380,7 @@ audited code.
 
 `python3 corpus/heldout_bench.py --set incidents`. `testdata/incidents` holds 231 contracts
 from public incidents and 55 with no known flaw, collected like the held-out set below from
-a different third of the same index. This is where misses are read and rules are shaped: 84
+a different third of the same index. This is where misses are read and rules are shaped: 89
 of the 231 get the right kind of finding at high or above. Read by root cause, the largest
 groups among the misses are a token whose code changes a pool's balance outside a transfer,
 an amount priced from a reading that one transaction can move, a swap of the contract's own
@@ -405,6 +406,14 @@ states the search reaches, by what accounts hold and by which records a call low
 third reported a payment credited nothing, which cannot be told from a payment that stores
 a value it already held without knowing which storage write is a credit. It had fired only
 on its own fixture and is removed.
+
+Two ratings were then set from what the rules do on this set and on the audited corpus,
+231 flawed contracts against 77 with no known flaw. `inconsistent-access-control` fired at
+medium on 43 flawed contracts and 2 sound ones, and is now high. `dynamic-call` fired at
+high and low confidence on 26 flawed contracts and 8 sound ones, which is the same rate, and
+is now high only where a run showed the caller choosing the selector. Together they took
+the count above from 84 to 89, the sound contracts with nothing at high from 37 to 41 of 55,
+and the high findings on the audited corpus from 24 to 19.
 
 ### Held-out set
 

@@ -633,6 +633,37 @@ calls. With that code placed the search found 87 of the 231 development incident
 address, with a linked contract's transfers answered from honest books 90, and with a linked
 contract treated as any other address 91. The last is what the search now does.
 
+### Checks removed on purpose
+
+`python3 corpus/mutation_bench.py`. The incident sets say whether a flawed contract gets a
+finding of the right family. They do not say which function is flawed. This bench makes its
+own answers: it takes each contract with no known flaw, finds a test that compares the
+caller with something, and rewrites it in place so that it always passes and no longer reads
+the caller. The function behind that test is now open, and which one is known. A mutant
+counts as found when its report gains a finding at high that the original did not have.
+
+| | |
+|---|---|
+| mutants made from the 55 sound development contracts, up to 4 each | 95 |
+| mutants that open something the analyzer can see | 63 |
+| of those, a new finding at high | 12 |
+| a new finding at medium only | 9 |
+| nothing new at medium or above | 42 |
+
+Two in three opened functions get nothing. An opened function is reported today when what
+it does matches a rule: it writes the owner, moves value out, lowers another account's
+balance. One that only sets a fee, pauses, or mints to a list is open and not reported,
+because nothing in the bytecode says it was meant to be closed.
+
+### False alarms kept
+
+`testdata/false_alarms` holds deployed contracts on which a rule once reported something
+that is not there, each with the rule that must stay silent and why. A test runs them. The
+first is a token whose three-word transfer lowers the named account only on the branch where
+that account is the caller, and leaves without reverting otherwise. Two rules looked at the
+write and not at the path to it. Both now ask whether every path to the write first found
+the caller to be the account.
+
 ### Random sample
 
 `corpus/harvest.py` collects the `to` address of every transaction in random recent mainnet

@@ -608,6 +608,43 @@ fn a_proxy_composite_takes_every_implementation_function_and_flags_slot_collisio
     assert!(finding(&r, "storage-collision").is_some(), "{:?}", ids(&r));
 }
 
+#[test]
+fn a_debit_reached_only_when_the_caller_is_the_account_is_the_callers_own() {
+    const MASK: &str = "PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND";
+    const ENTRY: &str =
+        "PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE PUSH1 0x40 PUSH1 0x00 KECCAK256";
+    let from = format!("PUSH1 0x04 CALLDATALOAD {MASK}");
+    let to = format!("PUSH1 0x24 CALLDATALOAD {MASK}");
+    let moves = format!(
+        "{from} {ENTRY} DUP1 SLOAD PUSH1 0x44 CALLDATALOAD SWAP1 SUB SWAP1 SSTORE \
+         {to} {ENTRY} DUP1 SLOAD PUSH1 0x44 CALLDATALOAD ADD SWAP1 SSTORE STOP"
+    );
+    let found = |guard: &str| {
+        let code = dispatcher3(&format!("{guard} {moves}"), "STOP", "STOP");
+        let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+        finding(&r, "third-party-balance-debit").map(|f| f.severity)
+    };
+    assert_eq!(found(""), Some(Severity::High));
+
+    let leaves_quietly = format!("{from} CALLER EQ PUSH2 @own JUMPI STOP :own JUMPDEST");
+    assert_eq!(found(&leaves_quietly), None);
+
+    let reverts = format!("{from} CALLER EQ PUSH2 @own JUMPI {REVERT} :own JUMPDEST");
+    assert_eq!(found(&reverts), None);
+
+    let other_account = format!("{to} CALLER EQ PUSH2 @own JUMPI STOP :own JUMPDEST");
+    assert_eq!(found(&other_account), Some(Severity::High));
+
+    let pulls = asset_pull("pulled", &from, "ADDRESS", "PUSH1 0x44 CALLDATALOAD", "");
+    let pulled = |guard: &str| {
+        let code = dispatcher3(&format!("{guard} {pulls}"), "STOP", "STOP");
+        let r = analyze::analyze(&decompile::decompile(&code, &Options::default()));
+        finding(&r, "arbitrary-transferfrom").is_some()
+    };
+    assert!(pulled(""));
+    assert!(!pulled(&leaves_quietly));
+}
+
 fn call_stored(slot: u8, selector: u32, extra: &str, len: u8) -> String {
     format!(
         "PUSH4 {selector:#010x} PUSH1 0xe0 SHL PUSH1 0x00 MSTORE {extra} PUSH1 0x00 PUSH1 0x00 PUSH1 {len:#04x} PUSH1 0x00 PUSH1 0x00 PUSH1 {slot:#04x} SLOAD GAS CALL POP STOP"

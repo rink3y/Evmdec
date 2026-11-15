@@ -345,6 +345,7 @@ struct Debit {
     key: ExprId,
     account_text: String,
     line: String,
+    own: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -702,6 +703,69 @@ fn is_time_cond(cond: ExprId) -> bool {
     })
 }
 
+// Whether the condition says the caller is the account, and on which side of it.
+fn caller_is(cond: ExprId, account: ExprId) -> Option<bool> {
+    let sender = |e: ExprId| matches!(expr::node(unmask(e)), Node::Env(op::CALLER, _));
+    let named = |e: ExprId| unmask(e) == unmask(account);
+    let pair = |v: &[ExprId]| (sender(v[0]) && named(v[1])) || (sender(v[1]) && named(v[0]));
+    match expr::node(cond) {
+        Node::Op(op::EQ, v) if pair(&v) => Some(true),
+        Node::Op(op::SUB | op::XOR, v) if pair(&v) => Some(false),
+        Node::Op(op::ISZERO, v) => caller_is(v[0], account).map(|side| !side),
+        _ => None,
+    }
+}
+
+// A write that every path reaches only after the caller was found to be the account is a
+// write to the caller's own entry, whether the other side of the test reverts or leaves
+// without a word.
+fn only_for_caller(
+    ctx: &Ctx,
+    f: &Function,
+    before: &[Event],
+    write: &Event,
+    account: ExprId,
+) -> bool {
+    let Some(top) = &f.lifted else {
+        return false;
+    };
+    before.iter().any(|test| {
+        if let Some(Stmt::Require { cond, .. }) = &test.stmt {
+            return caller_is(*cond, account) == Some(true);
+        }
+        let Some(Term::Branch { cond, t, f }) = &test.term else {
+            return false;
+        };
+        let Some(side) = caller_is(*cond, account) else {
+            return false;
+        };
+        let level = test.path.len() - 1;
+        let outer = |e: &Event| e.path.get(..level).map(<[_]>::to_vec);
+        let Some((_, _, written)) = write.path.get(level) else {
+            return false;
+        };
+        if outer(test) != outer(write) || test.path[level].0 != write.path[level].0 {
+            return false;
+        }
+        let graph = match level {
+            0 => Some(top),
+            _ => {
+                let inner = test.path[level].1.and_then(|pc| ctx.internals.get(&pc));
+                inner.and_then(|c| c.lifted.as_ref())
+            }
+        };
+        let Some(graph) = graph else {
+            return false;
+        };
+        let (same, other) = match side {
+            true => (*t, Some(*f)),
+            false => (Some(*f), *t),
+        };
+        let reached = |from: Option<usize>| from.is_some_and(|n| ctx.reaches(graph, n, *written));
+        reached(same) && !reached(other)
+    })
+}
+
 fn reads_slot(e: ExprId, slot: ExprId) -> bool {
     mentions(e, &|n| matches!(n, Node::SLoad(k, false, _) if *k == slot))
 }
@@ -829,6 +893,7 @@ fn collect_facts(
                             key: account,
                             account_text: emit::fmt_expr(account, names),
                             line: emit::fmt_stmt(st, names),
+                            own: only_for_caller(ctx, f, &events[..at], ev, account),
                         });
                     }
                 }
@@ -4132,7 +4197,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                     }
                                     _ => false,
                                 });
-                                if from_user && !allowance && !signed {
+                                let own = only_for_caller(&ctx, f, &events[..i], ev, from);
+                                if from_user && !allowance && !signed && !own {
                                     push(&mut findings, "arbitrary-transferfrom", "transferFrom with a caller-chosen `from` address", Severity::High, Confidence::Medium, Some(f), Some(ev.pc),
                                         format!("`{}` calls `transferFrom({}, …)` on `{}` where `from` comes from calldata, with no msg.sender check, no allowance bookkeeping keyed by the caller and no signature. Anyone can move tokens that other users approved to this contract.", f.name, emit::fmt_expr(from, names), target),
                                         vec![line.clone()], "Only transfer from msg.sender, or check an allowance/signature that the `from` account granted to the caller.");
@@ -6074,7 +6140,7 @@ fn trust_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
             continue;
         }
         for d in &x.debits {
-            if !ledgers.contains(&d.root) {
+            if d.own || !ledgers.contains(&d.root) {
                 continue;
             }
             let target_slot = ssa::stored_address_slot(d.key).and_then(slot_const);

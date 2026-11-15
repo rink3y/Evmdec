@@ -305,6 +305,8 @@ struct FnFacts {
     caller_checked: bool,
     auth_slots: Vec<(ExprId, String)>,
     const_writes: Vec<(ExprId, WriteSource, String)>,
+    settings: Vec<String>,
+    reads_caller: bool,
     ether_out: Vec<(ExprId, ExprId, String)>,
     selfdestructs: Vec<(ExprId, String)>,
     delegatecalls: Vec<(ExprId, String)>,
@@ -789,6 +791,8 @@ fn collect_facts(
         caller_checked,
         auth_slots: Vec::new(),
         const_writes: Vec::new(),
+        settings: Vec::new(),
+        reads_caller: false,
         ether_out: Vec::new(),
         selfdestructs: Vec::new(),
         delegatecalls: Vec::new(),
@@ -1067,6 +1071,32 @@ fn collect_facts(
     facts.moves_value = !facts.ether_out.is_empty()
         || !facts.debits.is_empty()
         || call_selector.values().any(|s| *s == SEL_TRANSFER);
+    let by_caller = |e: ExprId| mentions(e, &|n| matches!(n, Node::Env(op::CALLER, _)));
+    facts.reads_caller = events.iter().any(|ev| match (&ev.stmt, &ev.term) {
+        (_, Some(Term::Branch { cond, .. })) => by_caller(*cond),
+        (Some(Stmt::Require { cond, .. }), _) => by_caller(*cond),
+        _ => false,
+    });
+    let plain = events.iter().all(|ev| match &ev.stmt {
+        Some(Stmt::Call { .. } | Stmt::Create { .. }) => false,
+        Some(Stmt::SStore { key, val, .. }) => !by_caller(*key) && !by_caller(*val),
+        _ => true,
+    });
+    if plain {
+        facts.settings = events
+            .iter()
+            .filter_map(|ev| match &ev.stmt {
+                Some(
+                    st @ Stmt::SStore {
+                        val,
+                        transient: false,
+                        ..
+                    },
+                ) if input_outside_loads(*val) => Some(emit::fmt_stmt(st, names)),
+                _ => None,
+            })
+            .collect();
+    }
     let mut outflows: Vec<ExprId> = facts.ether_out.iter().map(|(_, v, _)| *v).collect();
     let mut candidates: Vec<(AvailBound, ExprId)> = Vec::new();
     let mut seen = HashSet::new();
@@ -1755,6 +1785,21 @@ fn forget_writes(mem: &mut lift::MemView, writes: Option<Vec<(ExprId, Option<u64
 
 fn mentions(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
     expr::contains(e, pred)
+}
+fn input_outside_loads(e: ExprId) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        match expr::node(x) {
+            Node::CallDataLoad(_) | Node::CopiedWord(op::CALLDATACOPY, _, _) => return true,
+            Node::SLoad(..) => {}
+            _ => stack.extend(expr::children(x)),
+        }
+    }
+    false
 }
 fn mentions_outside(e: ExprId, target: ExprId, excluded: ExprId) -> bool {
     let mut seen = HashSet::new();
@@ -6335,6 +6380,10 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     for g in followers.iter().filter(|g| !g.init_guarded) {
         gated_slots.extend(g.const_writes.iter().map(|(s, _, _)| *s));
     }
+    let setters = followers
+        .iter()
+        .filter(|g| !g.init_guarded && !g.settings.is_empty())
+        .count();
     let gated_pays_storage = followers
         .iter()
         .any(|g| g.ether_out.iter().any(|(a, _, _)| from_storage(*a)));
@@ -6409,6 +6458,17 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 does.push(
                     "writes a storage slot that is otherwise written only behind the check".into(),
                 );
+                raise(&mut sev, Severity::Medium);
+                evidence.push(line.clone());
+            }
+        }
+        let open =
+            !x.reads_caller && !x.init_guarded && !x.account_authorised && !x.signature_authorised;
+        if open && setters >= 2 && does.is_empty() {
+            if let Some(line) = x.settings.first() {
+                does.push(format!(
+                    "stores a value its caller chooses, which {setters} checked functions also do"
+                ));
                 raise(&mut sev, Severity::Medium);
                 evidence.push(line.clone());
             }

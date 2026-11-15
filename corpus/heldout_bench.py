@@ -21,7 +21,8 @@ FAMILIES = {
         "approval-to-open-spender", "third-party-balance-debit",
         "trusted-callee-loop", "silent-auth-failure", "storage-collision",
         "call-lowers-another-accounts-balance", "calls-leave-account-with-gain",
-        "call-leaves-another-account-with-less",
+        "call-leaves-another-account-with-less", "caller-gives-itself-a-role",
+        "caller-clears-a-role",
     ],
     "reentry": [
         "reentrancy", "reentered-call-pays-again", "control-handed-out-mid-update",

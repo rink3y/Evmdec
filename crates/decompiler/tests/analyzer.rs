@@ -294,6 +294,25 @@ fn access_control_policy_flags_the_odd_one_out() {
 }
 
 #[test]
+fn a_setter_with_no_caller_test_stands_out_among_checked_ones() {
+    let a = format!("{OWNER_GATE} PUSH1 0x04 CALLDATALOAD PUSH1 0x07 SSTORE STOP");
+    let b = "PUSH1 0x00 SLOAD CALLER EQ PUSH2 @ok2 JUMPI PUSH1 0x00 DUP1 REVERT :ok2 JUMPDEST PUSH1 0x04 CALLDATALOAD PUSH1 0x08 SSTORE STOP";
+    let marked = |c: &str| {
+        let r = report_of(&dispatcher3(&a, b, c));
+        let f = finding(&r, "inconsistent-access-control");
+        f.is_some_and(|f| f.description.contains("its caller chooses"))
+    };
+    assert!(marked(
+        "PUSH1 0x03 PUSH1 0x04 CALLDATALOAD MUL PUSH1 0x09 SSTORE STOP"
+    ));
+    let own = "PUSH1 0x04 CALLDATALOAD CALLER EQ PUSH2 @ok3 JUMPI PUSH1 0x00 DUP1 REVERT :ok3 JUMPDEST PUSH1 0x24 CALLDATALOAD PUSH1 0x09 SSTORE STOP";
+    assert!(!marked(own));
+    assert!(!marked(
+        "PUSH1 0x04 CALLDATALOAD SLOAD PUSH1 0x09 SSTORE STOP"
+    ));
+}
+
+#[test]
 fn attack_chains_are_assembled_across_functions() {
     let a = "CALLER PUSH1 0x00 SSTORE STOP";
     let b = format!("{OWNER_GATE} PUSH1 0x00 DUP1 DUP1 DUP1 SELFBALANCE CALLER GAS CALL POP STOP");
@@ -2403,6 +2422,12 @@ fn cases() -> Vec<Case> {
             || dispatcher3(&pay_in("CALLVALUE"), &pay_out_checked(), "STOP"),
         ),
         pair(
+            "caller-gives-itself-a-role",
+            true,
+            || role_setter(false),
+            || role_setter(true),
+        ),
+        pair(
             "reentrancy|reentered-call-pays-again",
             true,
             || dispatcher3(&pay_in("CALLVALUE"), &pay_out_all(false), "STOP"),
@@ -3478,6 +3503,40 @@ fn a_value_passed_by_pointer_is_typed_by_how_the_code_decodes_it() {
     let r = report_of(&dispatcher3(&counted_pay_in(), &four_members, "STOP"));
     let entered = finding(&r, "calls-leave-account-with-gain");
     assert!(entered.is_some(), "{:?}", ids(&r));
+}
+
+fn role_setter(checked: bool) -> Vec<u8> {
+    let gate = if checked { OWNER_GATE } else { "" };
+    let names = format!("{gate} PUSH1 0x04 CALLDATALOAD PUSH1 0x00 SSTORE STOP");
+    let gated = "PUSH1 0x00 SLOAD CALLER EQ PUSH2 @ok2 JUMPI PUSH1 0x00 DUP1 REVERT :ok2 JUMPDEST PUSH1 0x01 PUSH1 0x09 SSTORE STOP";
+    dispatcher3(&names, gated, "STOP")
+}
+
+#[test]
+fn an_account_with_no_role_must_not_change_who_a_check_lets_through() {
+    let taken = "caller-gives-itself-a-role";
+    let r = report_of(&role_setter(false));
+    let f = finding(&r, taken).unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::High, "{f:?}");
+    assert!(f.confirmed, "{f:?}");
+
+    let r = report_of(&role_setter(true));
+    assert!(finding(&r, taken).is_none(), "{:?}", ids(&r));
+
+    let gated = format!("{OWNER_GATE} PUSH1 0x01 PUSH1 0x09 SSTORE STOP");
+    let first_only = "PUSH1 0x00 SLOAD ISZERO PUSH2 @new JUMPI PUSH1 0x00 DUP1 REVERT :new JUMPDEST CALLER PUSH1 0x00 SSTORE STOP";
+    let r = report_of(&dispatcher3(first_only, &gated, "STOP"));
+    assert!(finding(&r, taken).is_none(), "{:?}", ids(&r));
+
+    let gives_up = "PUSH1 0x00 PUSH1 0x00 SSTORE STOP";
+    let owned = deployed(
+        "CALLER PUSH1 0x00 SSTORE",
+        &dispatcher3(gives_up, &gated, "STOP"),
+    );
+    let r = report_of(&owned);
+    let f = finding(&r, "caller-clears-a-role").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+    assert_eq!(f.severity, Severity::Medium, "{f:?}");
+    assert!(finding(&r, taken).is_none(), "{:?}", ids(&r));
 }
 
 #[test]

@@ -883,7 +883,7 @@ fn types_join_evidence_across_keys_fields_and_layouts() {
         ),
         (
             "oneinch_v5.hex",
-            "function func_62e238bb(bytes arg0, bytes arg1, bytes arg2, uint256 arg3, uint256 arg4, uint256 arg5)",
+            "function func_62e238bb((uint256,address,address,address,address,address,uint256,uint256,uint256,bytes) arg0, bytes arg1, bytes arg2, uint256 arg3, uint256 arg4, uint256 arg5)",
         ),
     ] {
         assert!(source(file).contains(header), "{file}: missing `{header}`");

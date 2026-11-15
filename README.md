@@ -264,6 +264,7 @@ last column is within what the order of the search moves by itself.
 | the next function is taken, three times in four, from those that read a slot the sequence wrote: a call matters to the calls that depend on it | 1 | 26 | 82 |
 | a state is kept for where the holdings and set slots stand, not only for new code: paying in reaches no new code the second time, and is what a take-out needs | 2 | 26 | 80 |
 | a function still without an input is solved again from each state that wrote what it reads: half the open functions the solver cannot enter are waiting for state | 0 | 26 | 81 |
+| a call that left the other account with less is tried again with the caller named in each address word, from every state where the caller has not acted: what left went where the call named, and the caller's address lands there only by chance | 0 | 26 | 82 |
 | both accounts start with some of the contract's own token: a token nobody holds shows nothing | 0 | 26 | 81 |
 | a payment is resized to amounts already seen in the sequence: what a contract pays back is sized by what was paid | 0 | 26 | 81 |
 | a word of the call is set to an amount seen, to twice that, or to what the contract holds: the most there is to ask for | 1 | 26 | 84 |
@@ -330,6 +331,9 @@ TriCrypto-NG, the CREATE2 deployer, UNI), and one on 26 exploited contracts.
 | parameter count | 513 / 515 |
 | return count | 514 / 515 |
 | parameter types, exact Solidity type | 913 / 955 |
+| parameters passed by pointer read as the right kind: byte string, array, struct | 108 / 108 |
+| arrays and structs with the right layout of members and elements | 40 / 43 |
+| arrays and structs with every member and element type exact | 24 / 43 |
 | return types | 366 / 380 |
 | events | 119 / 121 |
 | code blocks covered by some function | 10,810 / 10,810 |
@@ -340,7 +344,18 @@ The mutability misses are `view` functions that make external calls on a pre-0.5
 proxy getters that fall through to `delegatecall`. Most type misses are `bytes32` mapping keys,
 which the bytecode handles exactly like a number. A `bytes32` is recovered where the code shows
 it: a hash or signature half passed to `ecrecover`, a block or code hash, a hash-like constant,
-or a comparison with a text literal. With the signature dictionary on, the declared parameter
+or a comparison with a text literal.
+
+A parameter passed by pointer is typed by how the code decodes it. A struct is checked for
+a fixed number of bytes after its pointer and read at fixed places after it, an array has
+its length scaled by the size of one element, and a byte string has neither. Before this
+every such parameter was `bytes`, right for the 65 byte strings and wrong for the 34 arrays
+and 9 structs. A member or element is `address` where the code masks it to 160 bits and
+`uint256` otherwise: a narrower mask may be one field taken out of a packed word. The three
+layouts still missed are arrays whose elements the code walks with a moving pointer. With the
+right shapes the search enters 9 more functions of the development set, 6,228 of 9,684.
+
+With the signature dictionary on, the declared parameter
 types are used directly (939 / 955) and flow on into the storage and helpers they reach.
 
 ### Block oracle
@@ -596,14 +611,13 @@ returned code.
 
 | | one contract | by address |
 |---|---|---|
-| development incidents with the right kind of finding at high | 83 / 231 | 91 / 231 |
-| development contracts with no known flaw and nothing at high | 41 / 55 | 35 / 55 |
+| development incidents with the right kind of finding at high | 83 / 231 | 90 / 231 |
+| development contracts with no known flaw and nothing at high | 41 / 55 | 38 / 55 |
 | held-out incidents with the right kind of finding at high | 102 / 234 | 107 / 233 |
 | held-out contracts with no known flaw and nothing at high | 79 / 101 | 74 / 101 |
 
 Linked code adds a few findings and marks a few more sound contracts. It does not close the
-distance to the incidents that are missed. The by-address column was measured before the
-rules named under "What each rule has found" were removed.
+distance to the incidents that are missed.
 
 The first run by address gave 87 and 33 of 55 on the development set, and 106 and 70 of 101
 on the held-out set. Two faults showed in it. Both were found on the development set and

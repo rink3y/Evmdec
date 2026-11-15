@@ -34,6 +34,7 @@ const MAX_READS: usize = 1_024;
 const MAX_POSITIONS: usize = 96;
 const MAX_SET_SLOTS: usize = 64;
 const MAX_SPLITS: usize = 24;
+const MAX_FRESH_STARTS: usize = 48;
 const SEED_LIMITS: Limits = Limits { paths: 6, runs: 18 };
 const FIRST_VALUE: u64 = 0x1001;
 const STAKE: U256 = U256([0, 1 << 16, 0, 0]);
@@ -152,6 +153,7 @@ struct Search<'a> {
     lowered: Option<Lowered>,
     // States from which a way out was just found, still to be probed.
     exits: Vec<usize>,
+    renamed: Vec<(usize, Call)>,
     rounded: Option<Rounded>,
     // How often each function has been tried in two parts.
     splits: HashMap<usize, usize>,
@@ -364,6 +366,7 @@ impl<'a> Search<'a> {
             less: None,
             lowered: None,
             exits: Vec::new(),
+            renamed: Vec::new(),
             rounded: None,
             splits: HashMap::new(),
             staked,
@@ -747,6 +750,19 @@ impl<'a> Search<'a> {
             };
             if self.less.as_ref().is_none_or(|l| found.better_than(l)) {
                 self.less = Some(found);
+                // What left the other account went where the call named. The same call
+                // naming the caller in each of those places is tried next, and not left
+                // to the chance of the caller's address being drawn there.
+                if let Some(Step::Call(index, call)) = steps.last() {
+                    for word in &self.entries[*index].addresses {
+                        let at = 4 + 32 * word;
+                        let mut named = call.clone();
+                        if named.data.len() >= at + 32 {
+                            named.data[at..at + 32].copy_from_slice(&ACTOR.to_be_bytes());
+                            self.renamed.push((*index, named));
+                        }
+                    }
+                }
             }
         }
         let now = match (&base, changed) {
@@ -1085,6 +1101,15 @@ impl<'a> Search<'a> {
         while !exec::spent() && rounds < MAX_ROUNDS && !stale(rounds, fresh, fresh_at) {
             rounds += 1;
             self.round();
+            // A caller that paid anything before has not gained, so these start where
+            // it has not acted yet.
+            while let Some((index, call)) = self.renamed.pop() {
+                let fresh = |k: &usize| self.kept[*k].base.is_none();
+                let starts: Vec<usize> = (0..self.kept.len()).filter(fresh).collect();
+                for from in starts.into_iter().take(MAX_FRESH_STARTS) {
+                    self.attempt(from, index, call.clone());
+                }
+            }
             while let Some(from) = self.exits.pop() {
                 self.probe(from);
             }

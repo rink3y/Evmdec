@@ -3390,6 +3390,60 @@ fn running_the_code_an_upgrade_just_stored_is_not_a_finding_of_its_own() {
 }
 
 #[test]
+fn a_value_passed_by_pointer_is_typed_by_how_the_code_decodes_it() {
+    const POINTER: &str = "PUSH1 0x04 CALLDATALOAD";
+    const ADDRESS: &str = "PUSH20 0xffffffffffffffffffffffffffffffffffffffff AND";
+    let first_type = |body: &str| {
+        let c = decompile::decompile(&dispatcher(body), &Options::default());
+        let f = c.functions.iter().find(|f| !f.params.is_empty());
+        f.unwrap_or_else(|| panic!("no parameters")).params[0]
+            .ty
+            .clone()
+    };
+
+    let head = format!(
+        "PUSH1 0x60 {POINTER} PUSH1 0x04 ADD CALLDATASIZE SUB SLT ISZERO PUSH2 @ok JUMPI \
+         {REVERT} :ok JUMPDEST"
+    );
+    let second = format!("{POINTER} PUSH1 0x24 ADD CALLDATALOAD {ADDRESS} PUSH1 0x01 SSTORE");
+    let third = format!(
+        "{POINTER} PUSH1 0x44 ADD CALLDATALOAD {POINTER} ADD PUSH1 0x04 ADD CALLDATALOAD \
+         PUSH1 0x02 SSTORE STOP"
+    );
+    assert_eq!(
+        first_type(&format!("{head} {second} {third}")),
+        "(uint256,address,bytes)"
+    );
+
+    let length = format!("{POINTER} PUSH1 0x04 ADD CALLDATALOAD");
+    let in_bounds = format!(
+        "CALLDATASIZE {length} PUSH1 0x05 SHL {POINTER} PUSH1 0x24 ADD ADD GT ISZERO \
+         PUSH2 @ok JUMPI {REVERT} :ok JUMPDEST"
+    );
+    let element = format!(
+        "PUSH1 0x24 CALLDATALOAD PUSH1 0x05 SHL {POINTER} PUSH1 0x24 ADD ADD CALLDATALOAD \
+         {ADDRESS} PUSH1 0x01 SSTORE STOP"
+    );
+    assert_eq!(first_type(&format!("{in_bounds} {element}")), "address[]");
+
+    let copied = format!(
+        "{length} {POINTER} PUSH1 0x24 ADD PUSH1 0x80 CALLDATACOPY PUSH1 0x80 MLOAD \
+         PUSH1 0x01 SSTORE STOP"
+    );
+    assert_eq!(first_type(&copied), "bytes");
+
+    let four_members = format!(
+        "PUSH1 0x80 {POINTER} PUSH1 0x04 ADD CALLDATASIZE SUB SLT ISZERO PUSH2 @ok JUMPI \
+         {REVERT} :ok JUMPDEST {POINTER} PUSH1 0x64 ADD CALLDATALOAD {POINTER} ADD \
+         PUSH1 0x04 ADD CALLDATALOAD POP {}",
+        pay_out_everything()
+    );
+    let r = report_of(&dispatcher3(&counted_pay_in(), &four_members, "STOP"));
+    let entered = finding(&r, "calls-leave-account-with-gain");
+    assert!(entered.is_some(), "{:?}", ids(&r));
+}
+
+#[test]
 fn the_search_enters_a_function_that_takes_more_words_than_it_guesses() {
     let words: Vec<String> = (0..7)
         .map(|i| format!("PUSH1 0x{:02x} CALLDATALOAD POP", 4 + 32 * i))

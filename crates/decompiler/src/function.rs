@@ -452,7 +452,227 @@ pub fn packing_masks(roots: &[Root]) -> HashSet<ExprId> {
     out
 }
 
+type Start = (Vec<ExprId>, u64);
+
+const MAX_MEMBERS: u64 = 32;
+const MAX_STRIDE: u64 = 16;
+const MAX_NESTING: u32 = 2;
+
+fn sum_of(e: ExprId, minus: bool, parts: &mut [Vec<ExprId>; 2], konst: &mut U256, depth: u32) {
+    let (same, other) = (minus, !minus);
+    match expr::node(e) {
+        Node::Const(c) if minus => *konst = konst.wrapping_sub(c),
+        Node::Const(c) => *konst = konst.wrapping_add(c),
+        Node::Op(op::ADD, v) if depth < 8 => {
+            sum_of(v[0], same, parts, konst, depth + 1);
+            sum_of(v[1], same, parts, konst, depth + 1);
+        }
+        Node::Op(op::SUB, v) if depth < 8 => {
+            sum_of(v[0], same, parts, konst, depth + 1);
+            sum_of(v[1], other, parts, konst, depth + 1);
+        }
+        _ => parts[usize::from(minus)].push(e),
+    }
+}
+
+fn start_of(offset: ExprId) -> Option<Start> {
+    let (mut parts, mut konst) = ([Vec::new(), Vec::new()], U256::ZERO);
+    sum_of(offset, false, &mut parts, &mut konst, 0);
+    let [mut plus, minus] = parts;
+    if plus.is_empty() || plus.len() > 3 || !minus.is_empty() || !konst.fits_u64() {
+        return None;
+    }
+    plus.sort();
+    Some((plus, konst.low_u64()))
+}
+
+fn left_after(e: ExprId) -> Option<Start> {
+    let (mut parts, mut konst) = ([Vec::new(), Vec::new()], U256::ZERO);
+    sum_of(e, false, &mut parts, &mut konst, 0);
+    let [plus, mut past] = parts;
+    let size = |e: &ExprId| matches!(expr::node(*e), Node::Env(op::CALLDATASIZE, _));
+    let after = U256::ZERO.wrapping_sub(konst);
+    if plus.len() != 1 || !size(&plus[0]) || past.is_empty() || !after.fits_u64() {
+        return None;
+    }
+    past.sort();
+    Some((past, after.low_u64()))
+}
+
+// A struct is decoded by checking that a fixed number of bytes follow its pointer and
+// reading fields at fixed places after it. An array has its length scaled by the size of
+// one element. A byte string has neither.
+#[derive(Default)]
+struct Pointed {
+    loads: HashMap<Start, ExprId>,
+    heads: HashMap<Start, u64>,
+    strides: HashMap<ExprId, u64>,
+    addresses: HashSet<ExprId>,
+    tails: HashMap<ExprId, Vec<(Vec<ExprId>, u64)>>,
+}
+
+impl Pointed {
+    fn note(&mut self, x: ExprId, n: &Node) {
+        let load = |e: ExprId| matches!(expr::node(e), Node::CallDataLoad(_));
+        match n {
+            Node::CallDataLoad(offset) => {
+                if let Some(at) = start_of(*offset) {
+                    self.loads.entry(at).or_insert(x);
+                }
+            }
+            Node::Op(op::MUL, v) => {
+                for (length, by) in [(v[0], v[1]), (v[1], v[0])] {
+                    let words = expr::as_const(by)
+                        .filter(|c| c.fits_u64())
+                        .map(|c| c.low_u64());
+                    if let Some(w) =
+                        words.filter(|w| *w % 32 == 0 && (1..=MAX_STRIDE).contains(&(*w / 32)))
+                    {
+                        let stride = self.strides.entry(length).or_insert(w / 32);
+                        *stride = (*stride).max(w / 32);
+                    }
+                }
+            }
+            Node::Op(op::SHL, v) => {
+                let shift = expr::as_const(v[0])
+                    .filter(|c| c.fits_u64())
+                    .map(|c| c.low_u64());
+                if let Some(s) = shift.filter(|s| (5..=9).contains(s)) {
+                    let stride = self.strides.entry(v[1]).or_insert(1 << (s - 5));
+                    *stride = (*stride).max(1 << (s - 5));
+                }
+            }
+            // A narrower mask on a member may be one field taken out of a packed word,
+            // which says nothing of how wide the member is declared.
+            Node::Op(op::AND, v) if load(v[0]) => {
+                if expr::as_const(v[1]) == Some(expr::mask_bits(160)) {
+                    self.addresses.insert(v[0]);
+                }
+            }
+            Node::Op(op::LT | op::GT | op::SLT | op::SGT, v) => {
+                for (left, bound) in [(v[0], v[1]), (v[1], v[0])] {
+                    let Some((past, after)) = left_after(left) else {
+                        continue;
+                    };
+                    let words = expr::as_const(bound).filter(|c| c.fits_u64());
+                    let words = words.map(|c| c.low_u64()).filter(|n| n % 32 == 0);
+                    match words {
+                        Some(n) if (1..=MAX_MEMBERS).contains(&(n / 32)) => {
+                            let head = self.heads.entry((past, after)).or_insert(n);
+                            *head = (*head).max(n);
+                        }
+                        None if load(bound) => {
+                            self.tails.entry(bound).or_default().push((past, after));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn word(&self, address: bool) -> String {
+        match address {
+            true => "address".to_string(),
+            false => "uint256".to_string(),
+        }
+    }
+
+    fn type_at(&self, at: &Start, depth: u32) -> String {
+        self.typed(at, self.heads.get(at).copied(), depth)
+    }
+
+    // A nested value's position is counted from where the outer value's words begin, not
+    // from the start of the call data.
+    fn within(&self, outer: &Start, pointer: ExprId, depth: u32) -> Option<String> {
+        let (through, from) = outer;
+        let mut inner = through.clone();
+        inner.push(pointer);
+        inner.sort();
+        if depth >= MAX_NESTING || !self.loads.keys().any(|(terms, _)| *terms == inner) {
+            return None;
+        }
+        // A struct reached this way is checked by comparing its pointer with what is
+        // left of the call data less its head. One word of head is also what a byte
+        // string has, so that says nothing.
+        let checked = self.tails.get(&pointer).into_iter().flatten();
+        let head = checked
+            .filter(|(minus, after)| minus == through && *after > *from)
+            .map(|(_, after)| after - from + 1)
+            .find(|n| n % 32 == 0 && (2..=MAX_MEMBERS).contains(&(n / 32)));
+        let start = (inner, *from);
+        Some(self.typed(&start, head.or(self.heads.get(&start).copied()), depth + 1))
+    }
+
+    fn array_at(&self, at: &Start, words: u64, depth: u32) -> String {
+        let (through, from) = at;
+        let first = from + 32;
+        // An element is read at an index, which is no pointer, past the length.
+        let read = |member: u64| {
+            let pointer = |t: &&ExprId| matches!(expr::node(**t), Node::CallDataLoad(_));
+            let mut found: Vec<ExprId> = self
+                .loads
+                .iter()
+                .filter(|((terms, k), _)| {
+                    let index: Vec<&ExprId> =
+                        terms.iter().filter(|t| !through.contains(t)).collect();
+                    let inside = terms.len() == through.len() + index.len() && index.len() <= 1;
+                    inside && !index.iter().any(pointer) && *k == first + 32 * member
+                })
+                .map(|(_, load)| *load)
+                .collect();
+            found.sort();
+            found
+        };
+        let plain =
+            |member: u64| self.word(read(member).iter().any(|l| self.addresses.contains(l)));
+        if words > 1 {
+            let members: Vec<String> = (0..words).map(plain).collect();
+            return format!("({})[]", members.join(","));
+        }
+        let data = (through.clone(), first);
+        let nested = read(0)
+            .into_iter()
+            .find_map(|l| self.within(&data, l, depth));
+        format!("{}[]", nested.unwrap_or_else(|| plain(0)))
+    }
+
+    fn typed(&self, at: &Start, head: Option<u64>, depth: u32) -> String {
+        let (through, from) = at;
+        let Some(head) = head else {
+            let length = self.loads.get(at);
+            return match length.and_then(|l| self.strides.get(l)) {
+                Some(words) => self.array_at(at, *words, depth),
+                None => "bytes".to_string(),
+            };
+        };
+        let mut members: Vec<Option<String>> = (0..head / 32)
+            .map(|k| {
+                let member = *self.loads.get(&(through.clone(), from + 32 * k))?;
+                let nested = self.within(at, member, depth);
+                Some(nested.unwrap_or_else(|| self.word(self.addresses.contains(&member))))
+            })
+            .collect();
+        // A struct is only passed by pointer when one of its members is. When the code
+        // reads none of them through a pointer, the last one it leaves unread is taken
+        // to be that member.
+        let by_pointer = |ty: &String| ty == "bytes" || ty.ends_with("[]") || ty.starts_with('(');
+        if !members.iter().flatten().any(by_pointer) {
+            let unread = members.iter().rposition(Option::is_none);
+            let last = unread.unwrap_or(members.len() - 1);
+            members[last] = Some("bytes".to_string());
+        }
+        let members: Vec<String> = members
+            .into_iter()
+            .map(|m| m.unwrap_or("uint256".into()))
+            .collect();
+        format!("({})", members.join(","))
+    }
+}
+
 pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
+    let mut pointed = Pointed::default();
     let mut max_idx: Option<u32> = None;
     let mut types: HashMap<u32, String> = HashMap::new();
     let mut dynamic: HashSet<u32> = HashSet::new();
@@ -466,6 +686,7 @@ pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
                 continue;
             }
             let n = expr::node(x);
+            pointed.note(x, &n);
             match &n {
                 Node::CallDataLoad(off) => {
                     if let Some(i) = calldata_word_index(*off) {
@@ -600,7 +821,8 @@ pub fn infer_params_from(roots: &[Root]) -> Vec<Param> {
     (0..count)
         .map(|i| {
             let ty = if dynamic.contains(&i) {
-                "bytes".to_string()
+                let pointer = expr::calldataload(expr::konst_u64(4 + 32 * u64::from(i)));
+                pointed.type_at(&(vec![pointer], 4), 0)
             } else {
                 types.get(&i).cloned().unwrap_or_else(|| "uint256".into())
             };

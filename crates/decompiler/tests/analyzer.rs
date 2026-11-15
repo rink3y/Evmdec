@@ -2104,6 +2104,11 @@ fn a_standard_interface_is_measured_and_not_taken_on_trust() {
         measured(&ledger("DUP1", "")),
         ["transferfrom-ignores-allowance"]
     );
+    assert!(measured(&ledger("DUP1", &counts_what_was_moved())).is_empty());
+    assert_eq!(
+        measured(&ledger("DUP1", &reads_and_never_counts())),
+        ["allowance-not-spent"]
+    );
 }
 
 #[test]
@@ -2396,6 +2401,30 @@ const SPENDS: &str = "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 0x01 PUSH1
      PUSH2 @allowed JUMPI PUSH1 0x00 DUP1 REVERT :allowed JUMPDEST \
      DUP3 SWAP1 SUB SWAP1 SSTORE";
 
+fn allowance_slot(mapping: u8) -> String {
+    format!(
+        "PUSH1 0x04 CALLDATALOAD PUSH1 0x00 MSTORE PUSH1 {mapping:#04x} PUSH1 0x20 MSTORE \
+         PUSH1 0x40 PUSH1 0x00 KECCAK256 PUSH1 0x20 MSTORE CALLER PUSH1 0x00 MSTORE \
+         PUSH1 0x40 PUSH1 0x00 KECCAK256"
+    )
+}
+
+fn counts_what_was_moved() -> String {
+    format!(
+        "{} SLOAD {} DUP1 SLOAD DUP4 ADD DUP1 DUP4 LT ISZERO PUSH2 @within JUMPI {REVERT} \
+         :within JUMPDEST SWAP1 SSTORE POP",
+        allowance_slot(1),
+        allowance_slot(2)
+    )
+}
+
+fn reads_and_never_counts() -> String {
+    format!(
+        "{} SLOAD DUP2 DUP2 LT ISZERO PUSH2 @enough JUMPI {REVERT} :enough JUMPDEST POP",
+        allowance_slot(1)
+    )
+}
+
 const AIMED_WRITE: &str = "PUSH1 0x24 CALLDATALOAD PUSH1 0x04 CALLDATALOAD SSTORE STOP";
 const STORE_WORD: &str = "PUSH1 0x04 CALLDATALOAD PUSH1 0x01 SSTORE STOP";
 
@@ -2534,6 +2563,12 @@ fn cases() -> Vec<Case> {
             true,
             || ledger("DUP1", ""),
             || ledger("DUP1", SPENDS),
+        ),
+        pair(
+            "allowance-not-spent",
+            true,
+            || ledger("DUP1", &reads_and_never_counts()),
+            || ledger("DUP1", &counts_what_was_moved()),
         ),
         pair(
             "input-picks-storage-slot",

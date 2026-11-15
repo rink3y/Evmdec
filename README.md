@@ -401,7 +401,7 @@ trust rules were built on and tested against.
 ### Labelled fixtures per rule
 
 `python3 corpus/rule_bench.py`. `testdata/rules` holds a flawed and a sound hand-assembled
-fixture for each of 22 rules that work by running the code, with the expected result in
+fixture for each of 23 rules that work by running the code, with the expected result in
 `manifest.json`.
 
 | | |
@@ -570,9 +570,9 @@ recall above is measured on contracts the rules were developed on.
 
 | | |
 |---|---|
-| flawed contracts with the right kind of finding at high or above | 108 / 234 = 46% |
-| the same at medium or above | 140 / 234 = 60% |
-| flawed contracts with any finding at high or above | 135 / 234 = 58% |
+| flawed contracts with the right kind of finding at high or above | 107 / 234 = 46% |
+| the same at medium or above | 139 / 234 = 59% |
+| flawed contracts with any finding at high or above | 134 / 234 = 57% |
 | contracts with no known flaw and nothing at high or above | 78 / 101 = 77% |
 
 The label is the kind of flaw, not the function it is in, so the first row is an upper
@@ -615,7 +615,9 @@ took the first row to 104 and put a high finding on one more contract with no kn
 Empty storage cannot tell a first set-up from a takeover, so the call is now run again with
 the role held by another account, and only a change that survives that is reported. That
 form gave 104 on the first row and 79 on the last. Rating each report as a whole, described
-under the fresh set below, then gave the table above: 108 and 78.
+under the fresh set below, then gave 108 and 78. The check of an allowance was then
+corrected, as told under "False alarms kept". One contract here had counted as found through
+that check alone, on a finding that was not true, which leaves the table above: 107 and 78.
 
 ### Both sets by address
 
@@ -665,12 +667,15 @@ designed, and like the held-out set it is only scored. How it was chosen is in
 | the same at medium or above | 130 / 213 | 131 / 213 | 131 / 213 |
 | flawed contracts with any finding at high or above | 102 / 213 | 103 / 213 | 105 / 213 |
 
-By kind, recall in the last column is 0.48 for calls that hand control out before state is
-settled, 0.45 for missing checks on who may call, 0.40 for unchecked input, 0.33 for
-accounting, 0.28 for prices read from outside and 0.21 for arithmetic.
+By kind, recall today is 0.48 for calls that hand control out before state is settled, 0.44
+for missing checks on who may call, 0.40 for unchecked input, 0.32 for accounting, 0.28 for
+prices read from outside and 0.18 for arithmetic.
+
+The corrected check of an allowance took one contract off the last column, which had
+counted as found through a finding that was not true: 77 of 213 today.
 
 Three sets of contracts now say much the same thing. The two the rules were not built on
-give 108 of 234 and 78 of 213, 46% and 37%.
+give 107 of 234 and 77 of 213, 46% and 36%.
 
 ### Rating a report as a whole
 
@@ -779,6 +784,16 @@ first is a token whose three-word transfer lowers the named account only on the 
 that account is the caller, and leaves without reverting otherwise. Two rules looked at the
 write and not at the path to it. Both now ask whether every path to the write first found
 the caller to be the account.
+
+The second is a token that never lowers an allowance. Its `transferFrom` adds what it moved
+to a second record keyed by holder and caller and refuses once that record would pass the
+allowance, so no spender moves more than it was allowed. The check on the standard
+interface reported that the allowance was not lowered, at high. It now asks what an
+allowance is for: the same call is made again three times, with everything put back but
+what is keyed by holder and caller, and the finding is made only when every one of them
+goes through. On this token the second call is refused. Seven incident contracts of the
+three sets had the finding. Three keep it and four lose it, and two of those four had
+counted as found through it alone, one on the held-out set and one on the fresh set.
 
 ### Random sample
 

@@ -27,6 +27,7 @@ pub const WORK: u64 = 2 * exec::WORK_PER_SECOND;
 const HOLDER: U256 = U256::from_u64(0xf00d_f00d_f00d_f00d);
 const RECEIVER: U256 = U256::from_u64(0x7070_7070_7070_7070);
 const AMOUNT: U256 = U256::from_u64(0x1001);
+const REPEATS: usize = 3;
 const ACTOR: U256 = U256::from_u64(0xac70_ac70_ac70_ac70);
 const RECOVER: U256 = U256::ONE;
 const OTHER_LIMITS: Limits = Limits { paths: 8, runs: 24 };
@@ -186,6 +187,37 @@ impl<'a> Bench<'a> {
             }
         }
         Some(((slot.root, offset), out))
+    }
+
+    // An allowance is a limit on the total moved, however the code keeps count of it.
+    // The same call is made again with every write put back except those the count may
+    // be kept in. A refusal then comes from the count and from nothing else the first
+    // call left, such as a time of last use.
+    fn refused_again(&mut self, f: &Function, p: &Path, count: &dyn Fn(&Entry) -> bool) -> bool {
+        let mut inputs = p.inputs.clone();
+        inputs.storage = p.run.storage.clone();
+        let mut put_back: Vec<(U256, U256)> = Vec::new();
+        for step in solve::steps(&p.effects, &p.inputs) {
+            let Step::Write {
+                key, slot, before, ..
+            } = step
+            else {
+                continue;
+            };
+            let counted = self.keys(key, &p.inputs).is_some_and(|e| count(&e));
+            if !counted && !put_back.iter().any(|(s, _)| *s == slot) {
+                put_back.push((slot, before));
+            }
+        }
+        for _ in 0..REPEATS {
+            inputs.storage.extend(put_back.iter().copied());
+            let run = self.explorer(f).run_only(&inputs);
+            if !run.succeeded() {
+                return true;
+            }
+            inputs.storage = run.storage;
+        }
+        false
     }
 
     fn moves(&self, p: &Path) -> BTreeMap<Entry, (U256, U256)> {
@@ -486,44 +518,45 @@ fn transfer_from(bench: &mut Bench, report: &mut Report) {
         let ones = (v & v.wrapping_add(U256::ONE)).is_zero();
         ones && v >= U256::from_u64(u64::MAX)
     };
-    match allowance {
-        Some((_, pair)) if fell(*pair) == taken => report.lines.push(format!(
+    let spent = allowance.is_some_and(|(_, pair)| fell(*pair) == taken);
+    let no_limit = match allowance {
+        Some((_, pair)) => unlimited(pair.0),
+        None => p.inputs.storage.iter().any(|(_, v)| unlimited(*v)),
+    };
+    if spent {
+        report.lines.push(format!(
             "`{name}` reads an allowance keyed by holder and caller and lowers it by the amount moved."
-        )),
-        Some((_, pair)) if !unlimited(pair.0) => report.differs(
+        ));
+    } else if no_limit {
+        if allowance.is_none() {
+            report.lines.push(format!(
+                "`{name}` reads an allowance keyed by holder and caller and leaves one set to no limit as it is."
+            ));
+        }
+    } else if bench.refused_again(f, &p, &both) {
+        report.lines.push(format!(
+            "`{name}` reads an allowance keyed by holder and caller and does not lower it. It keeps count another way: the same call made again, with everything put back but what is keyed by holder and caller, is refused."
+        ));
+    } else {
+        let did = match allowance {
+            Some((_, pair)) => format!(
+                "changed a value keyed by holder and caller from {} to {}",
+                pair.0.to_hex(),
+                pair.1.to_hex()
+            ),
+            None => "read the allowance without writing it back".to_string(),
+        };
+        report.differs(
             "allowance-not-spent",
-            "An allowance is not lowered by the amount moved",
+            "An allowance does not limit the total moved",
             Severity::High,
             f,
             &p,
             format!(
-                "`{name}` lowered the holder's entry by {} and changed the allowance from {} to {}.",
-                taken.to_hex(),
-                pair.0.to_hex(),
-                pair.1.to_hex()
+                "`{name}` lowered the holder's entry by {} and {did}. The same call was then made {REPEATS} more times, with everything put back each time but what is keyed by holder and caller, and every one ended normally.",
+                taken.to_hex()
             ),
-        ),
-        None => {
-            let held = p.inputs.storage.iter().any(|(_, v)| unlimited(*v));
-            if held {
-                report.lines.push(format!(
-                    "`{name}` reads an allowance keyed by holder and caller and leaves one set to no limit as it is."
-                ));
-            } else {
-                report.differs(
-                    "allowance-not-spent",
-                    "An allowance is not lowered by the amount moved",
-                    Severity::High,
-                    f,
-                    &p,
-                    format!(
-                        "`{name}` lowered the holder's entry by {} and read the allowance without writing it back.",
-                        taken.to_hex()
-                    ),
-                );
-            }
-        }
-        _ => {}
+        );
     }
 }
 

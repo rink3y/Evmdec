@@ -5,5 +5,11 @@
     "chain": "classic",
     "rule": "third-party-balance-debit",
     "why": "the three-word transfer lowers the named account only on the branch where that account is the caller, and leaves without reverting otherwise"
+  },
+  "classic_f8784090": {
+    "address": "0xf87840900718e5b2b161d16fc06ad55265b57237",
+    "chain": "classic",
+    "rule": "allowance-not-spent",
+    "why": "transferFrom leaves the allowance as it is and adds what it moved to a second record keyed by holder and caller, and refuses once that record would pass the allowance"
   }
 }

@@ -642,7 +642,8 @@ returned code.
 | held-out contracts with no known flaw and nothing at high | 79 / 101 | 74 / 101 |
 
 Linked code adds a few findings and marks a few more sound contracts. It does not close the
-distance to the incidents that are missed.
+distance to the incidents that are missed. With every check described below in place, the
+development set reads 97 of 231 and 39 of 55 by address, against 91 and 42 for one contract.
 
 The first run by address gave 87 and 33 of 55 on the development set, and 106 and 70 of 101
 on the held-out set. Two faults showed in it. Both were found on the development set and
@@ -783,6 +784,7 @@ sound ones. These were built, measured on the development set, and removed.
 | Is a writer that needs a slot to be empty and then fills it a one-time set-up | did not clear the contract it was built for, and took a critical finding off one held-out incident |
 | Is a balance taken by a role holder worth less than high | 11 incident contracts and 2 sound ones change, and what it says of them is true |
 | Does the search settle more findings when it is aimed at the place each one points to | one more confirmed over all sets |
+| Does a contract fetched with the one under test answer better with its own code, once its own functions have been called to set it up | by address 97 of 231 as it is; 97 when its code answers only where it reads nothing unset, with 3 reports changed; 95 when its code answers wherever the call ends; and 95 again after every function of each such contract was called first and what it stored was kept |
 
 Of the 147 development incidents that are missed, 82 have no finding of the right kind at
 medium or above and 55 have none at all. Rating what is already found differently cannot
@@ -853,9 +855,18 @@ A rule's finding and a law the search checks are seldom about the same function.
 findings a run could confirm, a law of the search fires in the same function for 4. So the
 laws do not stand in for the rules. They find other things, and a rule's finding is settled
 only by a test aimed at it, which settles as much as it can reach. Aiming the search itself
-at the place a finding points to reached one more. What would reach further is a contract
-set up the way it is used, with the contracts around it set up through their own functions,
-and that has not been built.
+at the place a finding points to reached one more.
+
+What looked likely to reach further was a contract set up the way it is used, with the
+contracts around it set up through their own functions. That was built and measured by
+address on the development set, where 69 of the 231 incidents ask a fetched contract
+something outside the transfer interface during a run, and 43 of those are missed. It
+changed nothing. Runs called 669 different functions of fetched contracts. 90 of them could
+answer from their code and what the run had stored. The rest failed or read storage nothing
+had set, and what is asked for most is a balance, a transfer, a supply and a pool's
+reserves. That state is a contract's history. No function gives it to a caller, so calling
+every function of each fetched contract first stored something in most of them and changed
+no report. It exists only on the chain, which this tool does not read.
 
 `python3 corpus/parity_bench.py` is how each of these changes was read: it dumps what every
 rule finds on every contract of every set and says which findings two dumps differ in, by

@@ -344,7 +344,7 @@ audited code.
 
 `python3 corpus/heldout_bench.py --set incidents`. `testdata/incidents` holds 231 contracts
 from public incidents and 55 with no known flaw, collected like the held-out set below from
-a different third of the same index. This is where misses are read and rules are shaped: 82
+a different third of the same index. This is where misses are read and rules are shaped: 83
 of the 231 get the right kind of finding at high or above. Read by root cause, the largest
 groups among the misses are a token whose code changes a pool's balance outside a transfer,
 an amount priced from a reading that one transaction can move, a swap of the contract's own
@@ -362,7 +362,7 @@ development corpora those four checks fired only on their own fixtures.
 They are now one statement checked by the search over sequences of calls: an account with
 no role ends with more than it had. The search finds an input under which a function ends
 on 223 of 229 of these contracts, runs linked contracts' code in the same world, and found
-the gain on every fixture the four checks had. It took the count above from 78 to 82 and
+the gain on every fixture the four checks had. It took the count above from 78 to 83 and
 adds no high finding on the 55 contracts with no known flaw.
 Three more checks each built a pay-in of their own. Two of them, the call that lowers
 another account's payout and the take-out that costs less in parts, are now checked on the
@@ -383,12 +383,12 @@ recall above is measured on contracts the rules were developed on.
 |---|---|
 | flawed contracts with the right kind of finding at high or above | 102 / 234 = 44% |
 | the same at medium or above | 140 / 234 = 60% |
-| flawed contracts with any finding at high or above | 126 / 234 = 54% |
+| flawed contracts with any finding at high or above | 127 / 234 = 54% |
 | contracts with no known flaw and nothing at high or above | 79 / 101 = 78% |
 
 The label is the kind of flaw, not the function it is in, so the first row is an upper
 bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.51
-for missing checks on who may call, 0.40 for accounting, 0.34 for prices read from outside
+for missing checks on who may call, 0.41 for accounting, 0.34 for prices read from outside
 and 0.36 for arithmetic. On the contracts with no known flaw, 8 of the 22 that get a high
 finding get it from `dynamic-call`.
 
@@ -410,8 +410,10 @@ The search over sequences of calls, built on fixtures and the development incide
 then scored here: 98 on the first row and 79 on the last with its first property, 100 and
 79 with standing approvals and a second property, and 102 and 79 once it took over the four
 older pay-in and take-out checks, the re-entry confirmation and the one-call reading check.
-Its findings are high on ten flawed contracts and on three contracts with no known flaw,
-one of which has no other high finding. Each step added a little and none took away, which
+It stayed at 102 and 79 after two more checks were moved into it, token contracts were
+started in use and the world stopped answering for code and signers it does not have, with
+one high finding fewer on the contracts with no known flaw. Its findings are high on three
+of those contracts, one of which has no other high finding. Each step added a little and none took away, which
 is the most that can be said of a search: it finds what it reaches, and what it reaches
 moves with the order in which it tries things.
 

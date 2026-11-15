@@ -7,7 +7,6 @@ use crate::exec;
 use crate::expr::{self, ExprId, Node};
 use crate::flow;
 use crate::function::FnKind;
-use crate::ledger;
 use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::origin::{self, Model};
@@ -5251,23 +5250,9 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         exec::within(crate::search::WORK, || {
             crate::search::findings(c, &mut findings)
         });
-        exec::within(ledger::WORK, || ledger::findings(c, &mut findings));
         if !crate::deploy::assumed(c).is_empty() {
             for finding in &mut findings[measured..] {
                 finding.description.push_str(ASSUMED_NOTE);
-            }
-        }
-        // A library run by delegatecall keeps its records in this contract's storage.
-        for address in &c.library_targets {
-            let Some(library) = linked_contract(&ctx, address) else {
-                continue;
-            };
-            let mut found = Vec::new();
-            exec::within(ledger::WORK, || ledger::findings(library, &mut found));
-            for mut finding in found {
-                let name = finding.function.take().unwrap_or_default();
-                finding.function = Some(format!("{name} @ {address}"));
-                findings.push(finding);
             }
         }
         exec::within(signed::WORK, || signed::findings(c, &mut findings));

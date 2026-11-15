@@ -2,7 +2,6 @@ pub mod disasm;
 pub mod hex;
 pub mod idiom;
 pub mod keccak;
-pub mod ledger;
 pub mod metadata;
 pub mod naming;
 pub mod opcode;

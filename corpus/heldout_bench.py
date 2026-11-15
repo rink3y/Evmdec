@@ -34,7 +34,6 @@ FAMILIES = {
     ],
     "accounting": [
         "earlier-call-lowers-payout", "rounding-favours-caller",
-        "ledger-credits-more-than-received",
         "ledger-total-mismatch", "entries-total-out-of-step", "inconsistent-liability-accounting",
         "unbalanced-ledger-move", "stale-ledger-write", "changed-copy-dropped",
         "division-before-multiplication", "fee-on-transfer", "transfer-creates-value",

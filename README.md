@@ -235,7 +235,6 @@ done in the pass that confirms what other rules found.
 | reachability | a sink no single input reaches is tried through up to three earlier calls that write the storage it needs; the earlier calls are attached to the finding |
 | arithmetic | an input that takes a path ending normally and makes a stored sum, difference or product wrap; open when no such run exists from the starting storage. A small interval analysis reads the masks, the checks on each path and the orderings they prove; when every stored result on every finished path stays in range, the finding is kept at the lowest severity and says so |
 | properties from behaviour | a mapping and a total that at least two functions move in step, then a path that moves them apart (`entries-total-out-of-step`) or calls out between the two updates (`total-open-at-call`); a slot toggled like a lock and left set on one path (`lock-left-set`); a memory copy of storage changed and dropped (`changed-copy-dropped`); a value written from one block clock and compared with the other (`clock-units-mixed`); a storage slot or memory offset picked by an untested word of the call (`input-picks-storage-slot`, `input-picks-memory-offset`); input one byte short still accepted (`short-input-accepted`); work that grows with a count any caller can raise (`cost-grows-with-open-list`); a bound compared with the block clock that any caller can store (`time-bound-set-by-anyone`) and a time check on a slot nothing sets (`time-window-never-opens`); a payment of value to accounts read from storage that fails as a whole when one of them refuses (`one-refusal-blocks-all`, or confirms `blocking-payout-loop` and `fixed-payee-can-block`) |
-| records against assets | a function that asks two assets named in its call data what the contract holds is run with a balance that moves during its outside call. With two different assets the entries kept under each must change by exactly what that asset reported; only then are they known to be its record. With both words naming one asset, a record that rises by more than the asset did is `ledger-credits-more-than-received`. Also run on libraries the contract calls by delegatecall |
 | sequences of calls | one search over what calls do in order, in one world. The world holds the code and storage of the contract and of every contract it is linked to, each account's ether, and the books of every address spoken to in the standard transfer interface. A call to an address that has code runs that code, with delegated calls, created contracts and a failed call undone. Assets keep honest books: a transfer the sender cannot cover fails, a balance asked for is what was really sent, and an account that let a contract take an asset once leaves that approval standing. Two accounts with no role start with the same holdings, and when the contract has a balance function that reads one slot for each account, both start with an amount of its token written there. A sequence is kept and extended when it reaches code no earlier one reached, or leaves the two accounts' holdings, the slots that are set, the value the contract has no record of or an answer read differently in a combination not seen before. Inputs come from solving the function's own checks at the state reached, and a function still without an input is solved again from each new state that wrote a slot it reads. After every step that ends, the properties in the table below are checked on the state it leaves. No assumption stands in for a check: a call that recovers a signer answers with an account that is no one, a delegated call to code that is not in the run returns nothing, and an account of the run answers no question |
 | draws from the block | a function that takes a hash or a remainder of block values and can pay ether is run with a payment, with storage chosen so that its own checks accept the call, until a run pays the caller more than it brought. The same call is then run one to three blocks later with nothing else changed: a payment that is no longer made shows the block decides who is paid (confirms `weak-randomness`). A remainder of the time alone, which places a moment in a schedule, is not taken for a draw |
 | callee answers | each call the contract makes can be answered separately: a transfer that answers false and is treated as done (confirms `erc20-return-ignored`, or `refused-transfer-treated-as-done`); a transfer that returns nothing and makes the function fail (`transfer-without-answer-refused`); a payout that changes when a value read from outside is halved (confirms `no-slippage-bound` and `spot-balance-price`); a function that credits exactly the amount it asked an asset for without reading its own balance (confirms `fee-on-transfer`) |
@@ -257,7 +256,7 @@ What the search checks on every state it reaches:
 | a take-out that lowers a record less when it is made in two parts than in one, with the caller holding the same either way | `rounding-favours-caller` |
 
 Each part of the search is there because switching it off costs something that was measured.
-The columns are labelled fixtures wrong of 60, known-vulnerable contracts found of 29, and
+The columns are labelled fixtures wrong of 58, known-vulnerable contracts found of 29, and
 development incidents with the right kind of finding at high of 231. With everything on
 they read 0, 26 and 83 at the time of the measurement, and a difference of one or two in the
 last column is within what the order of the search moves by itself.
@@ -358,13 +357,13 @@ trust rules were built on and tested against.
 ### Labelled fixtures per rule
 
 `python3 corpus/rule_bench.py`. `testdata/rules` holds a flawed and a sound hand-assembled
-fixture for each of 26 rules that work by running the code, with the expected result in
+fixture for each of 25 rules that work by running the code, with the expected result in
 `manifest.json`.
 
 | | |
 |---|---|
-| fixtures | 60 |
-| rules at precision 1.00 and recall 1.00 | 26 / 26 |
+| fixtures | 58 |
+| rules at precision 1.00 and recall 1.00 | 25 / 25 |
 | results that change when the code is padded after every jump destination | 0 |
 | rules whose sound fixture depends on a guard, and notice when it is removed | 5 / 5 |
 | sound fixtures on which another rule of the table is confirmed without cause | 0 |
@@ -374,6 +373,104 @@ contracts 38 findings are confirmed by a run, and the checks added here raise on
 low-severity findings of their own. `vuln_bench.py` prints the per-rule table for the real
 corpora: labels, how many were caught, and how often each rule fires at medium or higher on
 audited code.
+
+### What each rule has found
+
+Every rule was run over the 344 real contracts the rules were developed on: the 231 flawed
+and 55 sound development incidents, and 58 more from the mainnet, known-vulnerable and
+regression corpora. The last column counts the development incidents that are found at high
+through that rule and no other of the right kind. A rule is here because of its row. Notes
+that are not findings, such as the compiler version, are left out.
+
+| rule | flawed of 231 | at high | sound of 55 | at high | other of 58 | found by it alone |
+|---|---|---|---|---|---|---|
+| `reentrancy` | 125 | 39 | 12 | 3 | 22 | 11 |
+| `call-in-loop` | 67 | 0 | 10 | 0 | 19 | 0 |
+| `division-before-multiplication` | 66 | 0 | 6 | 0 | 14 | 0 |
+| `untrusted-return-data` | 48 | 0 | 5 | 0 | 13 | 0 |
+| `unchecked-block-arithmetic` | 49 | 0 | 2 | 0 | 4 | 0 |
+| `dynamic-call` | 37 | 26 | 7 | 6 | 10 | 10 |
+| `inconsistent-access-control` | 42 | 0 | 2 | 0 | 4 | 0 |
+| `unchecked-arithmetic` | 17 | 0 | 5 | 0 | 15 | 0 |
+| `transfer-without-answer-refused` | 27 | 0 | 3 | 0 | 5 | 0 |
+| `attack-chain` | 26 | 9 | 3 | 0 | 4 | 3 |
+| `silent-auth-failure` | 18 | 0 | 4 | 0 | 10 | 0 |
+| `unprotected-ether-withdrawal` | 16 | 0 | 2 | 0 | 9 | 0 |
+| `unchecked-downcast` | 22 | 0 | 2 | 0 | 2 | 0 |
+| `third-party-balance-debit` | 22 | 17 | 3 | 2 | 0 | 8 |
+| `fixed-payee-can-block` | 18 | 0 | 2 | 0 | 4 | 0 |
+| `fee-on-transfer` | 18 | 0 | 3 | 0 | 2 | 0 |
+| `unchecked-call` | 14 | 0 | 2 | 0 | 8 | 0 |
+| `narrow-counter` | 13 | 0 | 5 | 0 | 3 | 0 |
+| `signature-malleability` | 9 | 0 | 3 | 0 | 7 | 0 |
+| `delegatecall-dynamic-target` | 14 | 0 | 0 | 0 | 4 | 0 |
+| `pair-sync-after-state-change` | 17 | 17 | 0 | 0 | 1 | 8 |
+| `trusted-callee-loop` | 14 | 0 | 1 | 0 | 3 | 0 |
+| `short-input-accepted` | 1 | 0 | 6 | 0 | 9 | 0 |
+| `spot-balance-price` | 12 | 0 | 2 | 0 | 2 | 0 |
+| `locked-ether` | 13 | 0 | 1 | 0 | 0 | 0 |
+| `arbitrary-transferfrom` | 9 | 9 | 0 | 0 | 4 | 5 |
+| `storage-bounded-loop` | 5 | 0 | 0 | 0 | 9 | 0 |
+| `weak-randomness` | 7 | 2 | 2 | 0 | 4 | 0 |
+| `calls-leave-account-with-gain` | 9 | 8 | 0 | 0 | 2 | 5 |
+| `delegatecall-user-target` | 10 | 10 | 0 | 0 | 1 | 3 |
+| `time-bound-set-by-anyone` | 11 | 0 | 0 | 0 | 0 | 0 |
+| `msg-value-in-loop` | 6 | 0 | 1 | 0 | 3 | 0 |
+| `no-slippage-bound` | 9 | 0 | 0 | 0 | 1 | 0 |
+| `time-window-never-opens` | 9 | 0 | 0 | 0 | 1 | 0 |
+| `arbitrary-call` | 5 | 5 | 0 | 0 | 4 | 2 |
+| `unprivileged-balance-credit` | 5 | 5 | 4 | 4 | 0 | 1 |
+| `address-from-arithmetic` | 7 | 0 | 1 | 0 | 0 | 0 |
+| `erc20-return-ignored` | 5 | 0 | 2 | 0 | 1 | 0 |
+| `refused-transfer-treated-as-done` | 8 | 8 | 0 | 0 | 0 | 7 |
+| `arbitrary-delegatecall` | 2 | 2 | 2 | 2 | 2 | 0 |
+| `oracle-unchecked` | 5 | 0 | 1 | 0 | 0 | 0 |
+| `msg-value-multicall` | 3 | 0 | 0 | 0 | 2 | 0 |
+| `ecrecover-zero` | 1 | 0 | 1 | 0 | 2 | 0 |
+| `signature-replay-domain` | 2 | 0 | 1 | 0 | 1 | 0 |
+| `signed-unsigned-confusion` | 4 | 0 | 0 | 0 | 0 | 0 |
+| `stored-input-call-target` | 2 | 0 | 0 | 0 | 2 | 0 |
+| `call-leaves-another-account-with-less` | 3 | 2 | 0 | 0 | 0 | 1 |
+| `hash-as-number` | 2 | 0 | 1 | 0 | 0 | 0 |
+| `signature-replay-nonce` | 0 | 0 | 1 | 0 | 2 | 0 |
+| `transfer-delivers-less` | 2 | 0 | 1 | 0 | 0 | 0 |
+| `transfer-touches-third-entry` | 1 | 0 | 2 | 0 | 0 | 0 |
+| `unchecked-token-pull` | 1 | 1 | 1 | 1 | 1 | 0 |
+| `unprotected-upgrade` | 3 | 3 | 0 | 0 | 0 | 0 |
+| `allowance-not-spent` | 2 | 2 | 0 | 0 | 0 | 1 |
+| `call-lowers-another-accounts-balance` | 2 | 2 | 0 | 0 | 0 | 1 |
+| `inconsistent-liability-accounting` | 1 | 1 | 1 | 1 | 0 | 0 |
+| `reverse-quote-rounding` | 1 | 0 | 0 | 0 | 2 | 0 |
+| `rounding-favours-caller` | 2 | 0 | 0 | 0 | 0 | 0 |
+| `selfdestruct` | 0 | 0 | 0 | 0 | 4 | 0 |
+| `earlier-call-lowers-payout` | 0 | 0 | 0 | 0 | 1 | 0 |
+| `entries-total-out-of-step` | 1 | 0 | 0 | 0 | 0 | 0 |
+| `lock-left-set` | 1 | 0 | 0 | 0 | 0 | 0 |
+| `reported-balance-differs` | 0 | 0 | 1 | 0 | 0 | 0 |
+| `transferfrom-ignores-allowance` | 1 | 1 | 0 | 0 | 0 | 0 |
+| `unbounded-payout-parameter` | 0 | 0 | 0 | 0 | 1 | 0 |
+| `unprotected-owner-write` | 0 | 0 | 0 | 0 | 1 | 0 |
+| `vyper-reentrancy-lock-bug` | 0 | 0 | 0 | 0 | 1 | 0 |
+| `blocking-payout-loop` | 0 | 0 | 0 | 0 | 1 | 0 |
+
+30 rules fire on none of the 344. They stay for one of three reasons. 7 read the code of a
+linked contract, and these corpora hold one contract each: `approval-to-open-spender`,
+`control-handed-out-mid-update`, `linked-call-unanswered`, `linked-callee-defect`,
+`unbound-account-passed-on`, `unbound-address-made-privileged`, `value-to-non-payable`. 6
+fire on a contract of the held-out set: `cost-grows-with-open-list`,
+`ledger-total-mismatch`, `signed-call-leaves-word-unsigned`, `stale-ledger-write`,
+`transfer-changes-supply`, `unprotected-initializer`. The other 17 have fired on a fixture
+only, and each is the one check for its class of flaw: `changed-copy-dropped`,
+`clock-units-mixed`, `gate-never-set`, `gate-on-open-slot`, `input-picks-memory-offset`,
+`input-picks-storage-slot`, `one-call-reading-leaves-a-gain`, `one-refusal-blocks-all`,
+`phase-never-entered`, `reentered-call-pays-again`,
+`reported-balance-moved-by-another-account`, `signed-message-accepted-twice`,
+`storage-collision`, `total-open-at-call`, `transfer-creates-value`, `tx-origin`,
+`unbalanced-ledger-move`. They are the first to go if the list is cut further.
+
+One pass was removed on this count. It compared the records a contract keeps for two assets
+against what each asset reported, was written for one contract of the known-vulnerable
+corpus, and fired on neither that contract nor any other of 679.
 
 ### Development incidents
 

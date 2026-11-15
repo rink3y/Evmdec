@@ -2244,39 +2244,6 @@ fn pay_in(credit: &str) -> String {
     format!("{credit} {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP STOP")
 }
 
-const DIFFERENT_ASSETS: &str = "PUSH1 0x24 CALLDATALOAD PUSH1 0x04 CALLDATALOAD EQ ISZERO \
-     PUSH2 @apart JUMPI PUSH1 0x00 DUP1 REVERT :apart JUMPDEST";
-
-fn asset_records(guard: &str) -> String {
-    let held = |asset: &str| {
-        format!(
-            "PUSH4 0x70a08231 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE ADDRESS PUSH1 0x84 MSTORE \
-             PUSH1 0x20 PUSH1 0x80 PUSH1 0x24 PUSH1 0x80 {asset} GAS STATICCALL POP \
-             PUSH1 0x80 MLOAD"
-        )
-    };
-    let record = |asset: &str| {
-        format!(
-            "{asset} PUSH1 0x00 MSTORE PUSH1 0x03 PUSH1 0x20 MSTORE \
-             PUSH1 0x40 PUSH1 0x00 KECCAK256"
-        )
-    };
-    let (given, taken) = ("PUSH1 0x04 CALLDATALOAD", "PUSH1 0x24 CALLDATALOAD");
-    let outside = "PUSH4 0x12345678 PUSH1 0xe0 SHL PUSH1 0x80 MSTORE \
-                   PUSH1 0x00 DUP1 PUSH1 0x04 PUSH1 0x80 PUSH1 0x00 PUSH2 0xd0d0 GAS CALL POP";
-    format!(
-        "{guard} {} {} {outside} {} {} \
-         DUP3 SWAP1 SUB {} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE POP \
-         DUP3 SUB {} DUP1 SLOAD DUP3 SWAP1 SUB SWAP1 SSTORE STOP",
-        held(given),
-        held(taken),
-        held(given),
-        held(taken),
-        record(taken),
-        record(given),
-    )
-}
-
 fn counted_pay_in() -> String {
     format!(
         "CALLVALUE {CALLER_ENTRY} DUP1 SLOAD DUP3 ADD SWAP1 SSTORE \
@@ -2733,12 +2700,6 @@ fn cases() -> Vec<Case> {
                      :in JUMPDEST {AIMED_WRITE}"
                 ))
             },
-        ),
-        pair(
-            "ledger-credits-more-than-received",
-            true,
-            || dispatcher(&asset_records("")),
-            || dispatcher(&asset_records(DIFFERENT_ASSETS)),
         ),
         pair(
             "calls-leave-account-with-gain",

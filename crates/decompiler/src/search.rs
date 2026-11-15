@@ -154,8 +154,6 @@ fn shape(f: &Function) -> (Vec<u8>, Vec<usize>) {
     }
 }
 
-// More of something, and less of nothing. An account that paid ether for what it got
-// did not gain, whatever the price.
 // The words of the call that hold an address, as far as the types found say. The
 // count stops at the first parameter that takes more than one word.
 fn address_words(f: &Function) -> Vec<usize> {
@@ -165,6 +163,8 @@ fn address_words(f: &Function) -> Vec<usize> {
     heads.enumerate().filter(address).map(|(i, _)| i).collect()
 }
 
+// More of something, and less of nothing. An account that paid ether for what it got
+// did not gain, whatever the price.
 fn gained(base: &Holdings, now: &Holdings) -> bool {
     let mut pairs = vec![(base.ether, now.ether)];
     // An asset the account has not touched is one it still holds its whole purse of.

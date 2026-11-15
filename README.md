@@ -361,10 +361,10 @@ So one fixed shape fits about one flawed contract in twenty, and on 340 contract
 development corpora those four checks fired only on their own fixtures.
 
 They are now one statement checked by the search over sequences of calls: an account with
-no role ends with more than it had. The search reaches a state in which the contract holds
-value on 43 of 229 contracts where the fixed shape reached 24, runs linked contracts' code
-in the same world, and found the gain on every fixture the four checks had. It took the
-count above from 78 to 82 and adds no high finding on the 55 contracts with no known flaw.
+no role ends with more than it had. The search finds an input under which a function ends
+on 223 of 229 of these contracts, runs linked contracts' code in the same world, and found
+the gain on every fixture the four checks had. It took the count above from 78 to 82 and
+adds no high finding on the 55 contracts with no known flaw.
 The three value-flow checks that remain read a credit from the caller's storage entry, which
 the search does not, and so far fire only on their fixtures.
 
@@ -378,14 +378,14 @@ recall above is measured on contracts the rules were developed on.
 
 | | |
 |---|---|
-| flawed contracts with the right kind of finding at high or above | 100 / 234 = 43% |
-| the same at medium or above | 137 / 234 = 59% |
-| flawed contracts with any finding at high or above | 125 / 234 = 53% |
+| flawed contracts with the right kind of finding at high or above | 102 / 234 = 44% |
+| the same at medium or above | 140 / 234 = 60% |
+| flawed contracts with any finding at high or above | 126 / 234 = 54% |
 | contracts with no known flaw and nothing at high or above | 79 / 101 = 78% |
 
 The label is the kind of flaw, not the function it is in, so the first row is an upper
-bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.50
-for missing checks on who may call, 0.39 for accounting, 0.34 for prices read from outside
+bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.51
+for missing checks on who may call, 0.40 for accounting, 0.34 for prices read from outside
 and 0.36 for arithmetic. On the contracts with no known flaw, 8 of the 22 that get a high
 finding get it from `dynamic-call`.
 
@@ -404,12 +404,13 @@ on contracts they were not built on, and each further kind of flaw has to be fou
 itself.
 
 The search over sequences of calls, built on fixtures and the development incidents, was
-then scored here: 98 on the first row and 79 on the last with its first property, and 100
-and 79 once approvals stay in place and a second property looks at the other account. Its
-findings are high on eight flawed contracts, four of which nothing else found, and on two
-contracts with no known flaw, one of which had no other high finding. These are two
-properties over the states the search reaches. The gain to expect from it comes with the
-properties still to be added.
+then scored here: 98 on the first row and 79 on the last with its first property, 100 and
+79 with standing approvals and a second property, and 102 and 79 once it took over the four
+older pay-in and take-out checks, the re-entry confirmation and the one-call reading check.
+Its findings are high on ten flawed contracts and on three contracts with no known flaw,
+one of which has no other high finding. Each step added a little and none took away, which
+is the most that can be said of a search: it finds what it reaches, and what it reaches
+moves with the order in which it tries things.
 
 ### Random sample
 

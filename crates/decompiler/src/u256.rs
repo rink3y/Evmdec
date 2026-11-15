@@ -12,9 +12,6 @@ impl U256 {
     pub const fn from_u64(v: u64) -> U256 {
         U256([v, 0, 0, 0])
     }
-    pub const fn from_u128(v: u128) -> U256 {
-        U256([v as u64, (v >> 64) as u64, 0, 0])
-    }
 
     pub fn from_be_bytes(bytes: &[u8]) -> U256 {
         let mut buf = [0u8; 32];

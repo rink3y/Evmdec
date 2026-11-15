@@ -655,19 +655,20 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   that differs for one call is about a thousand times higher or lower. The search cannot
   know what moving an answer costs, only that the contract's own code turns a one-call
   change into a lasting gain.
-- The search enters 64 in 100 functions of the development set, 6,219 of 9,684. The check
-  each of the other 3,465 stops at was read back from its deepest run. 2,038 check their
-  caller. 555 stop at a stored value, a setting or a state no sequence reached. 250 stop at
-  what an outside contract answers. An answer of sixteen words in place of one entered 79
-  more functions, found nothing more on the flawed contracts and put a high finding on one
-  more contract with no known flaw, so the answer stays one word. 161 the solver enters
-  alone. The world refuses 121 of those whatever the contract holds, most because they
-  pass the call on to code that was not given, and 33 need more solver work than the
-  search spends on one function. 81 are a fallback the dispatcher always refuses, 62 take
-  arrays or structs laid out other than the search guesses, and about 190 belong to a few
-  contracts whose share of work ran out. That leaves about 110 functions, 1 in 100,
-  stopped by arithmetic over their own arguments. That is all a decision procedure could
-  add, and none was built.
+- The search enters 64 in 100 functions of the development set, 6,219 of 9,684. Each of
+  the other 3,465 was then given to the solver alone, with work of its own. 2,169 check
+  their caller. 392 run once the solver may choose any storage, so they wait for a state
+  that earlier calls have to build. 88 run under a setting the settings pass could have
+  chosen and did not. 174 the solver enters as they are, and the world then refuses most
+  of them whatever the contract holds, because they pass the call on to code that was not
+  given. 642 run under no storage at all. Read from the check their deepest run stops at,
+  about 250 of those wait on what an outside contract answers, 81 are a fallback the
+  dispatcher always refuses, 62 take arrays or structs laid out other than the search
+  guesses, and about 110, 1 in 100 of all functions, are stopped by arithmetic over their
+  own arguments. That last group is all a decision procedure could add, and none was
+  built. An answer of sixteen words in place of one entered 79 more functions, found
+  nothing more on the flawed contracts and put a high finding on one more contract with no
+  known flaw, so the answer stays one word.
 - Value sent straight to the contract is tried only while the contract holds a payment it
   recorded. A gain taken from it is reported at medium, because the contract keeps no record
   of whose that value is.

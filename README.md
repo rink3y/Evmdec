@@ -660,12 +660,14 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   caller. 555 stop at a stored value, a setting or a state no sequence reached. 250 stop at
   what an outside contract answers. An answer of sixteen words in place of one entered 79
   more functions, found nothing more on the flawed contracts and put a high finding on one
-  more contract with no known flaw, so the answer stays one word. 161 the solver enters on
-  its own budget and the search, with less per function, did not. 81 are a fallback the
-  dispatcher always refuses, 62 take arrays or structs laid out other than the search
-  guesses, and about 190 belong to a few contracts whose share of work ran out. That leaves
-  about 110 functions, 1 in 100, stopped by arithmetic over their own arguments. That is
-  all a decision procedure could add, and none was built.
+  more contract with no known flaw, so the answer stays one word. 161 the solver enters
+  alone. The world refuses 121 of those whatever the contract holds, most because they
+  pass the call on to code that was not given, and 33 need more solver work than the
+  search spends on one function. 81 are a fallback the dispatcher always refuses, 62 take
+  arrays or structs laid out other than the search guesses, and about 190 belong to a few
+  contracts whose share of work ran out. That leaves about 110 functions, 1 in 100,
+  stopped by arithmetic over their own arguments. That is all a decision procedure could
+  add, and none was built.
 - Value sent straight to the contract is tried only while the contract holds a payment it
   recorded. A gain taken from it is reported at medium, because the contract keeps no record
   of whose that value is.

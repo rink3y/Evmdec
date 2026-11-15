@@ -1,4 +1,4 @@
-use crate::abi::{SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
+use crate::abi::{selector, SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::decompile::Contract;
 use crate::deploy;
 use crate::disasm;
@@ -86,9 +86,16 @@ pub struct Done {
     // interface, so that what the call did rests on an answer nobody keeps books for.
     pub asked: bool,
     pub writes: Vec<Write>,
-    // The calls the contract under test made: where in its code, and the first four
-    // bytes it sent.
-    pub made: Vec<(usize, [u8; 4])>,
+    pub made: Vec<Made>,
+}
+
+// A call the contract under test made: where in its code, to which address, and the
+// first four bytes it sent when it sent that many.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Made {
+    pub at: usize,
+    pub to: U256,
+    pub first: Option<[u8; 4]>,
 }
 
 struct Code {
@@ -149,11 +156,6 @@ struct Run {
     swing: Option<(usize, usize, bool)>,
     asked: Vec<(U256, u32, U256)>,
     done: Done,
-}
-
-fn selector(input: &[u8]) -> Option<u32> {
-    let b = input.get(..4)?;
-    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn one_word(value: U256) -> Vec<u8> {
@@ -498,13 +500,10 @@ impl World {
                 }
                 Some(Outcome::Call(index)) => {
                     let record = m.calls[index].clone();
-                    let first = record
-                        .input
-                        .get(..4)
-                        .and_then(|b| <[u8; 4]>::try_from(b).ok());
-                    if let (true, Some(first)) = (watched && run.done.made.len() < MAX_MADE, first)
-                    {
-                        run.done.made.push((at, first));
+                    if watched && run.done.made.len() < MAX_MADE {
+                        let first = record.input.get(..4).and_then(|b| b.try_into().ok());
+                        let to = record.addr;
+                        run.done.made.push(Made { at, to, first });
                     }
                     let own = std::mem::take(&mut m.storage);
                     self.storage.insert(f.account, own);
@@ -826,7 +825,16 @@ mod tests {
         let done = world.run(FIRST, &call);
         let site = passes_on(op::CALL).len() - 2;
         assert!(done.ended);
-        assert_eq!(done.made, [(site, [0xde, 0xad, 0xbe, 0xef])]);
+        let first = Some([0xde, 0xad, 0xbe, 0xef]);
+        let to = U256::from_u64(0xf2);
+        assert_eq!(
+            done.made,
+            [Made {
+                at: site,
+                to,
+                first
+            }]
+        );
     }
 
     fn world(first: &[u8], second: &[u8]) -> World {

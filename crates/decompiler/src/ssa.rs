@@ -50,14 +50,6 @@ impl SlotPath {
     }
 }
 
-pub fn space_of(transient: bool) -> SlotSpace {
-    if transient {
-        SlotSpace::Transient
-    } else {
-        SlotSpace::Persistent
-    }
-}
-
 fn key_and_slot(words: &[ExprId], layout: MappingLayout) -> (ExprId, ExprId) {
     let small = |e: ExprId| expr::as_const(e).is_some_and(|c| c.bits() <= 16);
     if layout == MappingLayout::Vyper || (small(words[0]) && !small(words[1])) {

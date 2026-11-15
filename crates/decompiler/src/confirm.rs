@@ -643,9 +643,19 @@ pub(crate) fn chosen_note(reached: &str, first: [u8; 4], at: usize, then: [u8; 4
     )
 }
 
-pub fn settle_selectors(c: &Contract, findings: &mut Vec<Finding>) {
+// What a report says of a finding that a run settled the other way. `part` is what the
+// rule took the caller to pick.
+pub(crate) fn withdrawn(gone: &Finding, part: &str) -> String {
+    format!(
+        "`{}`: a rule read the call there as one whose target the caller picks (`{}`). The call was reached and the call data changed four bytes at a time, and {part} never changed.",
+        gone.function.as_deref().unwrap_or_default(),
+        gone.id,
+    )
+}
+
+pub fn settle_selectors(c: &Contract, findings: &mut Vec<Finding>) -> Vec<String> {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
-        return;
+        return Vec::new();
     }
     let mut fixed = Vec::new();
     for (index, finding) in findings.iter_mut().enumerate() {
@@ -679,7 +689,8 @@ pub fn settle_selectors(c: &Contract, findings: &mut Vec<Finding>) {
             }
         }
     }
-    for index in fixed.into_iter().rev() {
-        findings.remove(index);
-    }
+    let gone = fixed.into_iter().rev().map(|index| findings.remove(index));
+    let mut lines: Vec<String> = gone.map(|f| withdrawn(&f, "the function called")).collect();
+    lines.reverse();
+    lines
 }

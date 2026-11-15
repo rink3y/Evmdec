@@ -29,11 +29,6 @@ enum Asset {
     Token(U256),
 }
 
-fn selector(input: &[u8]) -> Option<u32> {
-    let b = input.get(..4)?;
-    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-}
-
 fn taken(p: &Path) -> Vec<(Asset, U256)> {
     let mut out = Vec::new();
     if !p.inputs.callvalue.is_zero() {
@@ -41,7 +36,7 @@ fn taken(p: &Path) -> Vec<(Asset, U256)> {
     }
     for call in &p.run.calls {
         let pulls = call.kind == op::CALL
-            && selector(&call.input) == Some(SEL_TRANSFER_FROM)
+            && abi::selector(&call.input) == Some(SEL_TRANSFER_FROM)
             && call.input.len() >= 100
             && word(&call.input, 4) == p.inputs.caller
             && word(&call.input, 36) == p.inputs.address;
@@ -58,7 +53,7 @@ fn sent(p: &Path) -> Vec<(Asset, U256)> {
         if call.addr == p.inputs.caller && !call.value.is_zero() {
             out.push((Asset::Ether, call.value));
         }
-        let pays = selector(&call.input) == Some(SEL_TRANSFER)
+        let pays = abi::selector(&call.input) == Some(SEL_TRANSFER)
             && call.input.len() >= 68
             && word(&call.input, 4) == p.inputs.caller;
         if pays {
@@ -178,11 +173,11 @@ impl<'a> Pass<'a> {
                 // An asset that is asked who owns one item moves items, not amounts. Moving
                 // an item returns nothing, so there is no answer it could refuse with.
                 let items = |asset: U256| {
-                    let owner = |c: &CallRecord| selector(&c.input) == Some(SEL_OWNER_OF);
+                    let owner = |c: &CallRecord| abi::selector(&c.input) == Some(SEL_OWNER_OF);
                     p.run.calls.iter().any(|c| c.addr == asset && owner(c))
                 };
                 let transfer = |c: &CallRecord| {
-                    let s = selector(&c.input);
+                    let s = abi::selector(&c.input);
                     let moves = s == Some(SEL_TRANSFER) || s == Some(SEL_TRANSFER_FROM);
                     c.kind == op::CALL && moves && !items(c.addr)
                 };
@@ -270,7 +265,7 @@ impl<'a> Pass<'a> {
 
 fn confirm_stated_amount(out: &mut [Finding], f: &Function, p: &Path, layout: MappingLayout) {
     let pulled = all_taken(p);
-    let measured = |c: &CallRecord| selector(&c.input) == Some(SEL_BALANCE_OF);
+    let measured = |c: &CallRecord| abi::selector(&c.input) == Some(SEL_BALANCE_OF);
     let trusted = credited(p, layout) == Some(pulled) && !p.run.calls.iter().any(measured);
     let name = display_name(f);
     let known = out

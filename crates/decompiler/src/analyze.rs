@@ -171,38 +171,10 @@ pub struct FnSummary {
     pub(crate) returns: Option<ExprId>,
 }
 
-fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
-    lift::node_exprs(&lift::LNode {
-        id: 0,
-        block: 0,
-        pc: 0,
-        stmts: vec![s.clone()],
-        term: Term::Stop,
-        preds: vec![],
-        succs: vec![],
-        entry_stack: vec![],
-        exit_stack: vec![],
-    })
-}
-
-fn term_exprs(t: &Term) -> Vec<ExprId> {
-    lift::node_exprs(&lift::LNode {
-        id: 0,
-        block: 0,
-        pc: 0,
-        stmts: vec![],
-        term: t.clone(),
-        preds: vec![],
-        succs: vec![],
-        entry_stack: vec![],
-        exit_stack: vec![],
-    })
-}
-
 fn event_exprs(e: &Event) -> Vec<ExprId> {
-    let mut v = e.stmt.as_ref().map(stmt_exprs).unwrap_or_default();
+    let mut v = e.stmt.as_ref().map(lift::stmt_exprs).unwrap_or_default();
     if let Some(t) = &e.term {
-        v.extend(term_exprs(t));
+        v.extend(lift::term_exprs(t));
     }
     v
 }
@@ -3760,7 +3732,7 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         let checked = |e: &Event| -> Vec<ExprId> {
             let stmt = match &e.stmt {
                 Some(Stmt::Drop(_)) | None => Vec::new(),
-                Some(other) => stmt_exprs(other),
+                Some(other) => lift::stmt_exprs(other),
             };
             let term = match &e.term {
                 Some(Term::Branch { cond, .. }) => vec![*cond],
@@ -5256,12 +5228,13 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
     type_rules::findings(c, &c.types, names_for, &mut findings);
 
     exec::within(confirm::WORK, || confirm::confirm(c, &mut findings));
+    let mut withdrawn: Vec<String> = Vec::new();
     if asked {
         exec::within(confirm::WORK, || confirm::confirm_wraps(c, &mut findings));
         exec::within(confirm::WORK, || confirm::confirm_chance(c, &mut findings));
-        exec::within(confirm::WORK, || {
+        withdrawn.extend(exec::within(confirm::WORK, || {
             confirm::settle_selectors(c, &mut findings)
-        });
+        }));
     }
 
     report.maps.extend(crate::deploy::section(c));
@@ -5278,9 +5251,15 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         report.maps.extend(crate::props::findings(c, &mut findings));
         let measured = findings.len();
         exec::within(flow::WORK, || flow::findings(c, &mut findings));
-        exec::within(crate::search::WORK, || {
+        withdrawn.extend(exec::within(crate::search::WORK, || {
             crate::search::findings(c, &mut findings)
-        });
+        }));
+        if !withdrawn.is_empty() {
+            report.maps.push(Section {
+                title: "Tested by running and not reported".to_string(),
+                lines: withdrawn,
+            });
+        }
         if !crate::deploy::assumed(c).is_empty() {
             for finding in &mut findings[measured..] {
                 finding.description.push_str(ASSUMED_NOTE);

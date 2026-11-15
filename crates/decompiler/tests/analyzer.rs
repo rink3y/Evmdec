@@ -3359,6 +3359,14 @@ fn a_selector_that_never_follows_the_call_data_is_not_a_dynamic_call() {
     let from_storage = dispatcher(&calls_with("PUSH1 0x07 SLOAD", named));
     let r = report_of(&from_storage);
     assert!(finding(&r, "dynamic-call").is_none(), "{:?}", ids(&r));
+    let tested = r
+        .maps
+        .iter()
+        .find(|s| s.title.starts_with("Tested by running"));
+    let lines = &tested
+        .expect("the withdrawn finding is accounted for")
+        .lines;
+    assert!(lines[0].contains("`dynamic-call`"), "{lines:?}");
 }
 
 #[test]

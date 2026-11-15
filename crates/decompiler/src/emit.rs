@@ -456,20 +456,6 @@ pub fn is_add_const(e: ExprId, base: ExprId, k: u64) -> bool {
     }
 }
 
-fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
-    crate::lift::node_exprs(&crate::lift::LNode {
-        id: 0,
-        block: 0,
-        pc: 0,
-        stmts: vec![s.clone()],
-        term: Term::Stop,
-        preds: vec![],
-        succs: vec![],
-        entry_stack: vec![],
-        exit_stack: vec![],
-    })
-}
-
 fn written_range(s: &Stmt) -> Option<(u64, u64)> {
     match s {
         Stmt::MStore { off, width, .. } => {
@@ -491,7 +477,7 @@ fn reads_memory(s: &Stmt) -> bool {
             // A word copied from call data or code is fixed by its source.
             // Only one copied from memory depends on what memory held.
             let from_memory = |n: &Node| matches!(n, Node::CopiedWord(op::MCOPY, ..));
-            stmt_exprs(s).iter().any(|e| {
+            crate::lift::stmt_exprs(s).iter().any(|e| {
                 expr::holds(*e, kind::MLOAD | kind::KECCAK_MEM)
                     || (expr::holds(*e, kind::COPIED_WORD) && expr::contains(*e, &from_memory))
             })

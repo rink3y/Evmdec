@@ -137,6 +137,11 @@ impl Encoder {
     }
 }
 
+pub(crate) fn selector(input: &[u8]) -> Option<u32> {
+    let b = input.get(..4)?;
+    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
 pub fn layout(selector: Option<u32>, types: &[String]) -> Layout {
     layout_with(selector, types, 1)
 }

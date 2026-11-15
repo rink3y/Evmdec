@@ -17,6 +17,9 @@ def analyze(path):
 
 # The misses are listed in the README: flaws no rule here reaches yet.
 MIN_HITS = 26
+# High findings on the audited contracts. A change that adds one has to be read, and this
+# number raised on purpose if the finding is true.
+MAX_AUDITED_HIGH = 23
 
 def main():
     ap = argparse.ArgumentParser()
@@ -79,6 +82,9 @@ def main():
         print(f"{rule:<34}{n:>9}{c:>7}{recall:>8}  {alerts.get(rule, 0)}")
     if hits < MIN_HITS or not good:
         print(f"FAIL recall {hits}/{total} is under {MIN_HITS}, or the audited corpus is missing")
+        sys.exit(1)
+    if hc_total > MAX_AUDITED_HIGH:
+        print(f"FAIL {hc_total} high findings on the audited corpus, over {MAX_AUDITED_HIGH}")
         sys.exit(1)
 
 if __name__ == "__main__":

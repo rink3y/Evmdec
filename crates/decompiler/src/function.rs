@@ -80,10 +80,6 @@ pub fn dispatcher_nonpayable(main: &Lifted, dispatcher: &HashSet<usize>) -> bool
     false
 }
 
-fn mentions(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
-    expr::contains(e, pred)
-}
-
 pub fn discover(main: &Lifted) -> Dispatch {
     let mut functions: Vec<Discovered> = Vec::new();
     let mut entries: HashSet<usize> = HashSet::new();
@@ -320,10 +316,10 @@ pub fn effects(l: &Lifted) -> Effects {
             e.selfdestruct = true;
         }
         for x in lift::node_exprs(nd) {
-            if mentions(x, &|n| matches!(n, Node::SLoad(..))) {
+            if expr::contains(x, &|n| matches!(n, Node::SLoad(..))) {
                 e.reads_storage = true;
             }
-            if mentions(x, &|n| {
+            if expr::contains(x, &|n| {
                 matches!(n, Node::Env(o, _) if matches!(*o, op::CALLER | op::ORIGIN | op::TIMESTAMP | op::NUMBER | op::COINBASE | op::GASLIMIT | op::CHAINID | op::SELFBALANCE | op::BASEFEE | op::ADDRESS | op::PREVRANDAO | op::GASPRICE | op::BLOBBASEFEE))
                     || matches!(n, Node::Op(o, _) if matches!(*o, op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH | op::BLOCKHASH))
             }) {

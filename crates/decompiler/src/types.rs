@@ -417,7 +417,7 @@ impl TypeEnv {
             }
             Node::SLoad(key, transient, _) => {
                 let path = ssa::slot_path(key, self.layout)?;
-                Some(Loc::Slot(path.shape(ssa::space_of(transient))))
+                Some(Loc::Slot(path.shape(SlotSpace::from_transient(transient))))
             }
             Node::IntRet(seq, index) => self
                 .callee_of
@@ -529,7 +529,7 @@ impl TypeEnv {
                 let Some(path) = ssa::slot_path(*key, self.layout) else {
                     return;
                 };
-                let space = ssa::space_of(*transient);
+                let space = SlotSpace::from_transient(*transient);
                 let shape = path.shape(space);
                 self.note_keys(&path, space, pc);
                 let fields = match self.vyper {
@@ -662,7 +662,7 @@ impl TypeEnv {
             match &n {
                 Node::SLoad(key, transient, _) => {
                     if let Some(path) = ssa::slot_path(*key, self.layout) {
-                        self.note_keys(&path, ssa::space_of(*transient), scope);
+                        self.note_keys(&path, SlotSpace::from_transient(*transient), scope);
                     }
                 }
                 Node::Op(o, v) => self.op_use(*o, v, parent, scope),

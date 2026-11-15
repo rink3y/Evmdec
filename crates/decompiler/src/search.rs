@@ -13,7 +13,7 @@ use crate::opcode as op;
 use crate::path::{self, Explorers, Limits, Path};
 use crate::solve::{word, Free, Inputs};
 use crate::u256::U256;
-use crate::world::{Call, Done, Holdings, Swung, World, PURSE};
+use crate::world::{Call, Done, Holdings, Made, Swung, World, PURSE};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -102,11 +102,11 @@ fn role_slots(c: &Contract) -> BTreeSet<U256> {
 
 // What a call by the account with no role did to a slot that names who a check lets
 // through.
-struct Chosen {
+struct Chosen<K> {
     steps: Vec<Step>,
     at: usize,
-    first: [u8; 4],
-    then: [u8; 4],
+    first: K,
+    then: K,
 }
 
 struct Role {
@@ -696,10 +696,10 @@ impl<'a> Search<'a> {
         if !done.ended {
             return None;
         }
-        for (pc, _) in &done.made {
+        for made in &done.made {
             if self.sites.len() < MAX_SITES {
                 let first = (from, index, call.clone());
-                self.sites.entry(*pc).or_insert(first);
+                self.sites.entry(made.at).or_insert(first);
             }
         }
         // The starting state stands for a contract in use. A call that sets a slot it
@@ -763,11 +763,17 @@ impl<'a> Search<'a> {
         }
     }
 
-    // The question `confirm::settle_selectors` asks, asked from a state that a sequence
-    // of calls reached. `Some(None)` is a selector no change to the call data moved.
-    fn selector_chosen(&self, site: &std::ops::Range<usize>) -> Option<Option<Chosen>> {
+    // Whether what the contract calls follows the call data, asked from a state that a
+    // sequence of calls reached. `seen` reads the part in question off a call made: its
+    // first four bytes, or the address called. The call data is changed four bytes at a
+    // time. `Some(None)` is a part no change moved.
+    fn tracks<K: PartialEq + Copy>(
+        &self,
+        site: &std::ops::Range<usize>,
+        seen: impl Fn(&Made) -> Option<K>,
+    ) -> Option<Option<Chosen<K>>> {
         let (pc, (from, index, call)) = self.sites.range(site.clone()).next()?;
-        let at_site = |done: &Done| done.made.iter().find(|(at, _)| at == pc).map(|(_, s)| *s);
+        let at_site = |done: &Done| done.made.iter().find(|m| m.at == *pc).and_then(&seen);
         let entry = self.entries[*index].at;
         let run = |call: &Call| self.kept[*from].world.clone().call(entry, call);
         let first = at_site(&run(call))?;
@@ -1572,12 +1578,15 @@ fn report_role(search: &Search, role: &Role, out: &mut Vec<Finding>) {
     }
 }
 
-// A call whose selector the single-call check could not reach is judged from the states
-// the search reached, with the same test and the same two outcomes.
-fn settle_selectors(search: &mut Search, c: &Contract, out: &mut Vec<Finding>) {
+const TARGET_IDS: [&str; 2] = ["arbitrary-call", "arbitrary-delegatecall"];
+// A finding that says the caller picks what is called is judged from the states the
+// search reached: the call data is changed and the call either follows it or does not.
+// One that follows is shown with the run. One that does not is not there to report.
+fn settle_calls(search: &mut Search, c: &Contract, out: &mut Vec<Finding>) -> Vec<String> {
     let mut fixed = Vec::new();
     for (index, finding) in out.iter_mut().enumerate() {
-        if finding.id != confirm::SELECTOR_ID || finding.confirmed {
+        let selector = finding.id == confirm::SELECTOR_ID;
+        if finding.confirmed || !(selector || TARGET_IDS.contains(&finding.id.as_str())) {
             continue;
         }
         let (Some(pc), Some(name)) = (finding.pc, finding.function.as_deref()) else {
@@ -1591,24 +1600,53 @@ fn settle_selectors(search: &mut Search, c: &Contract, out: &mut Vec<Finding>) {
             .explorers
             .of(c.code_of(f))
             .rest_of_block(c.local_pc(f, pc));
-        match search.selector_chosen(&site) {
+        let reached = "from a state that earlier calls left";
+        let shown = match selector {
+            true => search.tracks(&site, |m| m.first).map(|chosen| {
+                chosen.map(|c| {
+                    let note = confirm::chosen_note(reached, c.first, c.at, c.then);
+                    (c.steps, note)
+                })
+            }),
+            false => search.tracks(&site, |m| Some(m.to)).map(|chosen| {
+                chosen.map(|c| {
+                    let note = format!(
+                        " Confirmed by running it, {reached}: the call goes to {}, and with bytes {} to {} of the call data changed it goes to {}. The caller decides which address is called.",
+                        c.first.to_hex(),
+                        c.at,
+                        c.at + 3,
+                        c.then.to_hex(),
+                    );
+                    (c.steps, note)
+                })
+            }),
+        };
+        match shown {
             None => {}
             Some(None) => fixed.push(index),
-            Some(Some(chosen)) => {
-                let Some((Step::Call(_, last), earlier)) = chosen.steps.split_last() else {
+            Some(Some((steps, note))) => {
+                let Some((Step::Call(_, last), earlier)) = steps.split_last() else {
                     continue;
                 };
-                let reached = "from a state that earlier calls left";
-                let note = confirm::chosen_note(reached, chosen.first, chosen.at, chosen.then);
                 finding.description.push_str(&note);
-                finding.confidence = Confidence::Medium;
+                if selector {
+                    finding.confidence = Confidence::Medium;
+                }
                 attach(finding, earlier, last);
             }
         }
     }
+    let mut withdrawn = Vec::new();
     for index in fixed.into_iter().rev() {
-        out.remove(index);
+        let gone = out.remove(index);
+        let part = match gone.id == confirm::SELECTOR_ID {
+            true => "the function called",
+            false => "the address called",
+        };
+        withdrawn.push(confirm::withdrawn(&gone, part));
     }
+    withdrawn.reverse();
+    withdrawn
 }
 
 fn attach(finding: &mut Finding, earlier: &[Step], last: &Call) {
@@ -1709,13 +1747,14 @@ fn report_rounded(search: &Search, rounded: &Rounded, out: &mut Vec<Finding>) {
 // earlier one reached, extends those, and checks after each call whether an account
 // with no role now holds more than before its first call, and whether the other
 // account holds less than before that call.
-pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
+// Returns what it tested and withdrew, one line for each finding.
+pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Vec<String> {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
-        return;
+        return Vec::new();
     }
     let mut search = Search::new(c);
     if search.entries.is_empty() {
-        return;
+        return Vec::new();
     }
     search.run();
     let last = |steps: &[Step]| match steps.last() {
@@ -1733,11 +1772,12 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     if let Some(role) = search.role.take() {
         report_role(&search, &role, out);
     }
-    settle_selectors(&mut search, c, out);
+    let withdrawn = settle_calls(&mut search, c, out);
     if let Some(lowered) = search.lowered.take() {
         report_lowered(&search, &lowered, out);
     }
     if let Some(rounded) = search.rounded.take() {
         report_rounded(&search, &rounded, out);
     }
+    withdrawn
 }

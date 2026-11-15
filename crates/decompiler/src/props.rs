@@ -6,7 +6,7 @@ use crate::emit::MappingLayout;
 use crate::exec;
 use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
-use crate::lift::{Stmt, Term};
+use crate::lift::Stmt;
 use crate::opcode as op;
 use crate::path::{self, Explorers, Limits, Path};
 use crate::solve::{self, Free, Inputs, Item, Step};
@@ -220,55 +220,6 @@ fn out_of_step(all: &[Run], layout: MappingLayout, pairs: &[(U256, U256)], out: 
     }
 }
 
-fn open_at_call(
-    all: &[Run],
-    layout: MappingLayout,
-    pairs: &[(U256, U256)],
-    out: &mut Vec<Finding>,
-) {
-    for (root, total) in pairs {
-        let mut told: BTreeSet<usize> = BTreeSet::new();
-        for run in all.iter().filter(|r| !r.assumed) {
-            let handed_out = run.steps.iter().enumerate().find(|(i, step)| {
-                let outside = match step {
-                    Step::Call { kind, to } => {
-                        let precompile =
-                            to.is_some_and(|a| a.fits_u64() && (1..0x12).contains(&a.low_u64()));
-                        *kind != op::STATICCALL && !precompile
-                    }
-                    _ => false,
-                };
-                if !outside {
-                    return false;
-                }
-                let so_far = deltas(&run.steps[..*i], layout);
-                let moved = so_far.get(&Place::Entry(*root)).copied();
-                let counted = so_far.get(&Place::Fixed(*total)).copied();
-                moved.unwrap_or(U256::ZERO) != counted.unwrap_or(U256::ZERO)
-            });
-            let end = deltas(&run.steps, layout);
-            let settled = end.get(&Place::Entry(*root)) == end.get(&Place::Fixed(*total));
-            if handed_out.is_none() || !settled || !told.insert(run.function.pc) {
-                continue;
-            }
-            report(
-                out,
-                run,
-                "total-open-at-call",
-                "A call leaves the contract while a mapping and its total disagree",
-                Severity::Medium,
-                format!(
-                    "`{}` keeps the entries of the mapping at {} and the value in {} in step by the time it ends, but it makes a call to another account after changing one and before changing the other. Code that runs during that call, and anything that reads this contract from there, sees the two out of step.",
-                    run.function.name,
-                    slot_text(*root),
-                    slot_text(*total),
-                ),
-                "Finish both updates before the call, or hold a lock that every reader and writer of the two respects.",
-            );
-        }
-    }
-}
-
 fn lock_left(all: &[Run], out: &mut Vec<Finding>) {
     let ends = |run: &Run, slot: U256| -> Option<(U256, U256, usize)> {
         let writes: Vec<(U256, U256)> = run
@@ -364,106 +315,10 @@ fn from_the_call(e: ExprId) -> bool {
     })
 }
 
-// Scratch space and the free pointer sit below this and are rewritten all the time.
-const FIRST_ALLOCATED: u64 = 0x80;
-
-fn dropped_change(run: &Run) -> Option<(ExprId, ExprId)> {
-    let effects = &run.path.effects;
-    let mut copies: HashMap<ExprId, ExprId> = HashMap::new();
-    let mut changed: Vec<(usize, ExprId, ExprId)> = Vec::new();
-    for (i, st) in effects.iter().enumerate() {
-        let Stmt::MStore { off, val, .. } = st else {
-            continue;
-        };
-        let allocated = expr::as_const(*off).is_some_and(|o| o >= U256::from_u64(FIRST_ALLOCATED));
-        if !allocated {
-            continue;
-        }
-        if let Some(key) = read_of_one_slot(*val) {
-            copies.insert(*off, key);
-        } else if let Some(key) = copies.remove(off) {
-            if from_the_call(*val) {
-                changed.push((i, key, *val));
-            }
-        }
-    }
-    let end_uses = |val: ExprId| match &run.path.end {
-        Some(Term::Return { data, .. }) => data
-            .as_ref()
-            .is_none_or(|words| words.iter().any(|w| expr::has_part(*w, val))),
-        Some(Term::Stop) => false,
-        _ => true,
-    };
-    let checked = |val: ExprId| {
-        run.path.items.iter().any(|item| match item {
-            Item::Check { cond, .. } => expr::has_part(*cond, val),
-            Item::Store { .. } => false,
-        })
-    };
-    changed.into_iter().find_map(|(at, key, val)| {
-        let used_later = effects[at + 1..].iter().any(|st| match st {
-            Stmt::SStore { key: k, val: v, .. } => *k == key || expr::has_part(*v, val),
-            Stmt::Call { input, value, .. } => {
-                let sent = value.is_some_and(|v| expr::has_part(v, val));
-                sent || input
-                    .as_ref()
-                    .is_none_or(|words| words.iter().any(|w| expr::has_part(*w, val)))
-            }
-            Stmt::Log { data, topics, .. } => {
-                topics.iter().any(|t| expr::has_part(*t, val))
-                    || data
-                        .as_ref()
-                        .is_none_or(|words| words.iter().any(|w| expr::has_part(*w, val)))
-            }
-            Stmt::Create { .. } => true,
-            Stmt::MStore { val: v, .. } => *v != val && expr::has_part(*v, val),
-            _ => false,
-        });
-        (!used_later && !end_uses(val) && !checked(val)).then_some((key, val))
-    })
-}
-
-fn dropped_changes(all: &[Run], out: &mut Vec<Finding>) {
-    let mut told: BTreeSet<usize> = BTreeSet::new();
-    for run in all.iter().filter(|r| !r.assumed) {
-        let Some((key, _)) = dropped_change(run) else {
-            continue;
-        };
-        if !told.insert(run.function.pc) {
-            continue;
-        }
-        let place = match solve::value_of(key, &run.path.inputs) {
-            Some(slot) => slot_text(slot),
-            None => "a stored record".to_string(),
-        };
-        report(
-            out,
-            run,
-            "changed-copy-dropped",
-            "A stored value is copied to memory, changed there and never stored back",
-            Severity::Medium,
-            format!(
-                "`{}` reads {} into memory and then overwrites that memory word with a value taken from the call. On this path the function ends normally without writing the slot, and the new value is not returned, logged, passed to a call or tested. The change is lost, which is what a record declared as a memory copy instead of a storage reference does.",
-                run.function.name, place,
-            ),
-            "Write the changed record back to storage, or work on a storage reference instead of a memory copy.",
-        );
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Clock {
     Time,
     Height,
-}
-
-impl Clock {
-    fn text(self) -> &'static str {
-        match self {
-            Clock::Time => "the block timestamp",
-            Clock::Height => "the block number",
-        }
-    }
 }
 
 fn clock_of(e: ExprId) -> Option<Clock> {
@@ -490,61 +345,6 @@ fn places_read(e: ExprId, layout: MappingLayout) -> Vec<Place> {
         }
     }
     out
-}
-
-fn clock_mix(all: &[Run], layout: MappingLayout, out: &mut Vec<Finding>) {
-    let mut written: BTreeMap<Place, BTreeSet<Clock>> = BTreeMap::new();
-    for run in all {
-        for item in &run.path.items {
-            let Item::Store { key, val, .. } = item else {
-                continue;
-            };
-            if let (Some(p), Some(clock)) = (place(*key, layout), clock_of(*val)) {
-                written.entry(p).or_default().insert(clock);
-            }
-        }
-    }
-    let mut told: BTreeSet<Place> = BTreeSet::new();
-    for run in all.iter().filter(|r| !r.assumed) {
-        for item in &run.path.items {
-            let Item::Check { cond, .. } = item else {
-                continue;
-            };
-            let Some(read) = clock_of(*cond) else {
-                continue;
-            };
-            for p in places_read(*cond, layout) {
-                let Some(kinds) = written.get(&p) else {
-                    continue;
-                };
-                let other = kinds.iter().find(|k| **k != read);
-                let (Some(other), false) = (other, kinds.contains(&read)) else {
-                    continue;
-                };
-                if !told.insert(p) {
-                    continue;
-                }
-                let where_ = match p {
-                    Place::Fixed(slot) => slot_text(slot),
-                    Place::Entry(root) => format!("the mapping at {}", slot_text(root)),
-                };
-                report(
-                    out,
-                    run,
-                    "clock-units-mixed",
-                    "A value kept in one clock is compared with the other",
-                    Severity::Medium,
-                    format!(
-                        "Every write of {where_} found takes its value from {}. `{}` compares it with {}. The two count in different units, so the comparison does not mean what either side intends.",
-                        other.text(),
-                        run.function.name,
-                        read.text(),
-                    ),
-                    "Keep and compare the value in one clock.",
-                );
-            }
-        }
-    }
 }
 
 fn bits_read(cond: ExprId, slot: U256) -> U256 {
@@ -749,14 +549,7 @@ fn read_field(word: U256, field: Field) -> U256 {
     (word >> field.1) & field.2
 }
 
-fn phases(
-    c: &Contract,
-    all: &[Run],
-    begin: &HashMap<U256, U256>,
-    out: &mut Vec<Finding>,
-) -> Option<Section> {
-    // A writer with no finished run could be the one that enters the missing phase.
-    let every_writer_seen = every_writer_seen(c, all);
+fn phases(all: &[Run], begin: &HashMap<U256, U256>) -> Option<Section> {
     let small = |v: &U256| v.fits_u64() && v.low_u64() <= MAX_PHASE;
     let wanted = |run: &Run| {
         let mut out: BTreeMap<Field, U256> = BTreeMap::new();
@@ -845,36 +638,6 @@ fn phases(
                 list.join(", "),
                 value.low_u64()
             ));
-            let entered = *value == at_start || moves.iter().any(|(_, to, _)| to == value);
-            let witness = all
-                .iter()
-                .find(|r| functions.contains(r.function.name.as_str()));
-            let effect = |r: &&Run| r.function.effects.writes_storage || r.function.effects.calls;
-            let witness = witness.filter(effect).filter(|_| every_writer_seen);
-            if let (false, Some(run)) = (entered, witness) {
-                let known = if begin.is_empty() {
-                    " Only runtime code was given, so a constructor that sets it cannot be ruled out."
-                } else {
-                    ""
-                };
-                push(
-                    out,
-                    "phase-never-entered",
-                    "Functions wait for a phase that no path enters",
-                    Severity::Low,
-                    if begin.is_empty() { Confidence::Low } else { Confidence::Medium },
-                    Some(run.function),
-                    None,
-                    format!(
-                        "{} run only while {name} holds {}. Other functions move that value between phases, but none of the paths found leaves it at {} and it does not start there, so these functions cannot be reached.{known}",
-                        list.join(", "),
-                        value.low_u64(),
-                        value.low_u64(),
-                    ),
-                    Vec::new(),
-                    "Add the missing transition, or remove the functions that wait for it.",
-                );
-            }
         }
         lines.push(line);
     }
@@ -914,53 +677,35 @@ fn unbounded_word(run: &Run, place: ExprId) -> Option<ExprId> {
 }
 
 fn aimed_writes(all: &[Run], out: &mut Vec<Finding>) {
-    let mut told: BTreeSet<(usize, bool)> = BTreeSet::new();
+    let mut told: BTreeSet<usize> = BTreeSet::new();
     for run in all.iter().filter(|r| !r.assumed) {
         for st in &run.path.effects {
-            let (place, val, storage) = match st {
-                Stmt::SStore {
-                    key,
-                    val,
-                    transient: false,
-                    ..
-                } => (*key, *val, true),
-                Stmt::MStore { off, val, .. } => (*off, *val, false),
-                _ => continue,
+            let Stmt::SStore {
+                key,
+                val,
+                transient: false,
+                ..
+            } = st
+            else {
+                continue;
             };
-            if !from_the_call(val) || unbounded_word(run, place).is_none() {
+            if !from_the_call(*val) || unbounded_word(run, *key).is_none() {
                 continue;
             }
-            if !told.insert((run.function.pc, storage)) {
+            if !told.insert(run.function.pc) {
                 continue;
             }
-            let (id, title, severity, what, advice) = if storage {
-                (
-                    "input-picks-storage-slot",
-                    "A storage slot is chosen by the call with no bound",
-                    Severity::High,
-                    "a storage slot whose number is computed from a word of the call, not from a hash of it",
-                    "Bound the index before the write, or key the data through a mapping.",
-                )
-            } else {
-                (
-                    "input-picks-memory-offset",
-                    "A memory offset is chosen by the call with no bound",
-                    Severity::Low,
-                    "memory at an offset computed from a word of the call",
-                    "Bound the offset against the allocated length before the write.",
-                )
-            };
             report(
                 out,
                 run,
-                id,
-                title,
-                severity,
+                "input-picks-storage-slot",
+                "A storage slot is chosen by the call with no bound",
+                Severity::High,
                 format!(
-                    "`{}` writes a value taken from the call to {what}. No check on this path tests that word, so the caller picks where the write lands.",
+                    "`{}` writes a value taken from the call to a storage slot whose number is computed from a word of the call, not from a hash of it. No check on this path tests that word, so the caller picks where the write lands.",
                     run.function.name,
                 ),
-                advice,
+                "Bound the index before the write, or key the data through a mapping.",
             );
         }
     }
@@ -1185,15 +930,12 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) -> Vec<Section> {
     let all = exec::within(WORK, || runs(c));
     let pairs = in_step_pairs(&all, layout);
     out_of_step(&all, layout, &pairs, out);
-    open_at_call(&all, layout, &pairs, out);
     lock_left(&all, out);
-    dropped_changes(&all, out);
-    clock_mix(&all, layout, out);
     aimed_writes(&all, out);
     short_input(c, &all, out);
     let begin = deploy::storage(c);
     refusing_payee(c, &all, out);
     time_bounds(c, &all, &begin, layout, out);
     exec::within(GROWTH_WORK, || growth(c, &all, &begin, out));
-    phases(c, &all, &begin, out).into_iter().collect()
+    phases(&all, &begin).into_iter().collect()
 }

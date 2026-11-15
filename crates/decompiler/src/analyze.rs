@@ -328,7 +328,6 @@ struct FnFacts {
     ledger_writes: Vec<LedgerWrite>,
     total_changes: Vec<(ExprId, Change)>,
     stale_moves: Vec<StaleMove>,
-    surplus_moves: Vec<SurplusMove>,
 }
 
 #[derive(Clone, Debug)]
@@ -539,12 +538,6 @@ struct StaleMove {
     lines: [String; 2],
 }
 
-#[derive(Clone, Debug)]
-struct SurplusMove {
-    surplus: Vec<String>,
-    lines: Vec<String>,
-}
-
 fn change_of(val: ExprId, key: ExprId) -> (Change, Option<u32>) {
     let own = |e: ExprId| match expr::node(e) {
         Node::SLoad(k, false, g) if k == key => Some(g),
@@ -561,20 +554,6 @@ fn change_of(val: ExprId, key: ExprId) -> (Change, Option<u32>) {
             _ => (Change::Set, None),
         },
         _ => (Change::Set, None),
-    }
-}
-
-fn add_terms(e: ExprId, sign: i64, terms: &mut BTreeMap<ExprId, i64>, depth: u32) {
-    match expr::node(e) {
-        Node::Op(op::ADD, v) if depth < 16 => {
-            add_terms(v[0], sign, terms, depth + 1);
-            add_terms(v[1], sign, terms, depth + 1);
-        }
-        Node::Op(op::SUB, v) if depth < 16 => {
-            add_terms(v[0], sign, terms, depth + 1);
-            add_terms(v[1], -sign, terms, depth + 1);
-        }
-        _ => *terms.entry(e).or_insert(0) += sign,
     }
 }
 
@@ -648,51 +627,6 @@ fn stale_moves(ctx: &Ctx, l: &Lifted, events: &[Event], writes: &[LedgerWrite]) 
                 });
             }
         }
-    }
-    out
-}
-
-fn surplus_moves(
-    ctx: &Ctx,
-    l: &Lifted,
-    events: &[Event],
-    writes: &[LedgerWrite],
-    totals: &[(ExprId, Change)],
-    names: &Names,
-) -> Vec<SurplusMove> {
-    if totals.iter().any(|(_, c)| matches!(c, Change::Up(_))) {
-        return Vec::new();
-    }
-    let mut roots: Vec<U256> = writes.iter().map(|w| w.root).collect();
-    roots.sort();
-    roots.dedup();
-    let mut out = Vec::new();
-    for root in roots {
-        let on: Vec<&LedgerWrite> = writes.iter().filter(|w| w.root == root).collect();
-        let falls = on.iter().any(|w| matches!(w.change, Change::Down(_)));
-        let plain = on.iter().all(|w| w.change != Change::Set && !w.in_loop);
-        let chained = on
-            .windows(2)
-            .all(|w| ev_reaches(ctx, l, &events[w[0].at], &events[w[1].at]));
-        if !falls || !plain || !chained {
-            continue;
-        }
-        let mut terms: BTreeMap<ExprId, i64> = BTreeMap::new();
-        for w in &on {
-            match w.change {
-                Change::Up(amount) => add_terms(amount, 1, &mut terms, 0),
-                Change::Down(amount) => add_terms(amount, -1, &mut terms, 0),
-                Change::Set => {}
-            }
-        }
-        terms.retain(|_, n| *n != 0);
-        if terms.is_empty() || terms.values().any(|n| *n < 0) {
-            continue;
-        }
-        out.push(SurplusMove {
-            surplus: terms.keys().map(|e| emit::fmt_expr(*e, names)).collect(),
-            lines: on.iter().map(|w| w.line.clone()).collect(),
-        });
     }
     out
 }
@@ -814,13 +748,11 @@ fn collect_facts(
         ledger_writes: Vec::new(),
         total_changes: Vec::new(),
         stale_moves: Vec::new(),
-        surplus_moves: Vec::new(),
     };
     if let Some(l) = &f.lifted {
         let own = names.clone();
         let (writes, totals) = ledger_writes(events, ctx.c.compiler.layout, &own);
         facts.stale_moves = stale_moves(ctx, l, events, &writes);
-        facts.surplus_moves = surplus_moves(ctx, l, events, &writes, &totals, &own);
         facts.ledger_writes = writes;
         facts.total_changes = totals;
     }
@@ -5244,12 +5176,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         });
     }
 
-    crate::invariant::findings(c, &c.types, &mut findings);
-    let begin = crate::deploy::storage(c);
     report.maps.extend(crate::deploy::section(c));
-    report
-        .maps
-        .extend(authority(&facts, &stores, &uses, &begin, &mut findings));
+    report.maps.extend(authority(&facts, &stores, &uses));
     if asked {
         // A test of a stored flag does not keep any caller out, so what such a function
         // writes is a record of the calls made, not a setting.
@@ -6079,7 +6007,6 @@ fn trust_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
     let slot_const = |e: ExprId| expr::as_const(e);
     let ledgers: HashSet<U256> = crate::invariant::balance_mappings(&c.types)
         .into_iter()
-        .map(|l| l.root)
         .filter(|r| crate::invariant::is_ledger(c, *r))
         .collect();
     let mut pool_slots: HashSet<U256> = HashSet::new();
@@ -7196,15 +7123,7 @@ fn stored_uses(
     }
 }
 
-// A fixed slot that an ungated function fills straight from its input is the older rules' ground.
-// These two report what they cannot see: values that arrive through other slots or sit in mappings.
-fn authority(
-    facts: &[FnFacts],
-    stores: &[origin::Store],
-    uses: &[StoredUse],
-    begin: &HashMap<U256, U256>,
-    findings: &mut Vec<Finding>,
-) -> Option<Section> {
+fn authority(facts: &[FnFacts], stores: &[origin::Store], uses: &[StoredUse]) -> Option<Section> {
     let mut gates: BTreeMap<origin::Loc, BTreeSet<usize>> = BTreeMap::new();
     for u in uses.iter().filter(|u| matches!(u.kind, UseKind::Gate)) {
         gates.entry(u.loc).or_default().insert(u.function);
@@ -7240,24 +7159,6 @@ fn authority(
             "{place} decides who may call {}. {set_by}",
             gated.iter().map(name).collect::<Vec<_>>().join(", "),
         ));
-        let unset = !begin.is_empty() && begin.get(&loc.0).is_none_or(|v| v.is_zero());
-        if let (true, true, 0, Some(first)) = (setters.is_empty(), unset, loc.1, gated.first()) {
-            push_fact(
-                findings,
-                "gate-never-set",
-                "A caller check reads a slot that nothing ever sets",
-                Severity::Low,
-                Confidence::Medium,
-                &facts[*first],
-                format!(
-                    "{} function(s) compare the caller with slot {}. The constructor leaves that slot at zero and no function in the runtime code writes it, so no account can pass the check and what it protects cannot be called.",
-                    gated.len(),
-                    loc.0.to_hex(),
-                ),
-                Vec::new(),
-                "Set the slot during construction, or add an authorised function that sets it, or remove the dead functions.",
-            );
-        }
     }
     (!lines.is_empty()).then_some(Section {
         title: "Authority map".to_string(),
@@ -7336,25 +7237,7 @@ fn origin_findings(
                     );
                 }
             }
-            UseKind::Gate => {
-                if !fixed || !told.insert((usize::MAX, u.loc, true)) {
-                    continue;
-                }
-                push_fact(
-                    findings,
-                    "gate-on-open-slot",
-                    "An access check compares the caller with a value any caller can put there",
-                    Severity::High,
-                    Confidence::Medium,
-                    f,
-                    format!(
-                        "`{}` compares `msg.sender` with a slot. No function stores an argument there directly, but following the stores back through the slots the value is copied from, it can be an argument or the caller of a function that needs no role. The check then passes for whoever made those calls.",
-                        f.name,
-                    ),
-                    vec![u.line.clone()],
-                    "Gate every function on the path that fills the slot.",
-                );
-            }
+            UseKind::Gate => {}
         }
     }
 }
@@ -7670,23 +7553,6 @@ fn conservation_findings(
                 ),
                 m.lines.to_vec(),
                 "Read the second entry after the first write is stored, or require the two keys to differ.",
-            );
-        }
-        if let Some(m) = f.surplus_moves.first() {
-            push_fact(
-                findings,
-                "unbalanced-ledger-move",
-                "A ledger's entries rise by more than they fall and no total changes",
-                Severity::Medium,
-                Confidence::Medium,
-                f,
-                format!(
-                    "Along one chain of writes in `{}` the entries of a mapping rise by {} more than they fall, and the function raises no total. The difference is not taken from any entry, so the ledger's sum grows without a record of it.",
-                    f.name,
-                    m.surplus.join(" + ")
-                ),
-                m.lines.clone(),
-                "Take every amount credited from an entry that is debited by it, or record it in the total.",
             );
         }
     }

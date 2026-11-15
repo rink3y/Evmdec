@@ -5642,6 +5642,7 @@ fn settle(c: &Contract, mut findings: Vec<Finding>) -> Vec<Finding> {
             observed: Vec::new(),
         });
     }
+    crate::weigh::rate(&mut findings);
     findings.sort_by(|a, b| {
         a.severity
             .cmp(&b.severity)

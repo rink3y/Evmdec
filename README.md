@@ -668,7 +668,10 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
   own arguments. That last group is all a decision procedure could add, and none was
   built. An answer of sixteen words in place of one entered 79 more functions, found
   nothing more on the flawed contracts and put a high finding on one more contract with no
-  known flaw, so the answer stays one word.
+  known flaw, so the answer stays one word. Sixteen more words of call data behind a
+  shaped argument entered one more function. A settings pass with three times the work,
+  twice the functions and three times the settings entered 15 fewer and found the same.
+  Neither was kept.
 - Value sent straight to the contract is tried only while the contract holds a payment it
   recorded. A gain taken from it is reported at medium, because the contract keeps no record
   of whose that value is.

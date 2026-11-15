@@ -5251,9 +5251,13 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         report.maps.extend(crate::props::findings(c, &mut findings));
         let measured = findings.len();
         exec::within(flow::WORK, || flow::findings(c, &mut findings));
-        withdrawn.extend(exec::within(crate::search::WORK, || {
+        let tested = exec::within(crate::search::WORK, || {
             crate::search::findings(c, &mut findings)
-        }));
+        });
+        // What the search withdrew was found before it ran, so what was measured from
+        // the assumed settings now starts that many places earlier.
+        let measured = measured.saturating_sub(tested.len());
+        withdrawn.extend(tested);
         if !withdrawn.is_empty() {
             report.maps.push(Section {
                 title: "Tested by running and not reported".to_string(),

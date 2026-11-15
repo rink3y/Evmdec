@@ -42,7 +42,12 @@ def dump(a):
     with ThreadPoolExecutor(a.jobs) as pool:
         found = dict(pool.map(run, contracts()))
     json.dump(found, open(a.out, "w"))
-    print(len(found), "contracts,", sum(v is None for v in found.values()), "not analysed")
+    failed = sorted(name for name, rows in found.items() if rows is None)
+    print(len(found), "contracts,", len(failed), "not analysed")
+    # A contract with no report is a crash or a hang, and neither is a finding that went away.
+    for name in failed:
+        print("  not analysed:", name)
+    return 1 if failed else 0
 
 
 def diff(a):
@@ -81,7 +86,7 @@ def main():
     p.add_argument("after")
     p.add_argument("--min", default="medium", choices=sorted(SEV, key=SEV.get))
     a = ap.parse_args()
-    {"dump": dump, "diff": diff}[a.command](a)
+    return {"dump": dump, "diff": diff}[a.command](a)
 
 
 if __name__ == "__main__":

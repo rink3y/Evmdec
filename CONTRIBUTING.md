@@ -42,6 +42,16 @@ again on the bytecode before a finding is built on it, and a finding that chose 
 a run says so. Standard interfaces are measured, never assumed: a selector says what a function
 is called, not what it does.
 
+A rule that states something a run can settle is a lead, and the run is the judge. A finding
+the run shows is confirmed with it. One the run shows to be otherwise is taken out and listed
+in the report as tested. One no run reached stays as the rule rated it.
+
+A change to a rule is read with `python3 corpus/parity_bench.py`: dump before, dump after,
+and the diff says which findings came and went, by rule and by set. A finding that leaves the
+known-vulnerable corpus has to be explained, and one that appears at high on a contract with
+no known flaw has to be read. A deployed contract on which a rule was wrong goes into
+`testdata/false_alarms` with the rule that must stay silent there and why.
+
 ## Style
 
 Google's Rust style guide, `rustfmt.toml` as committed. Named-field structs over tuples of more

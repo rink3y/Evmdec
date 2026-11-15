@@ -186,6 +186,12 @@ What counts as an access check is decided per contract: `msg.sender == owner` al
 test of `mapping[msg.sender]` only when every function writing the mapping is itself gated. A
 stake or balance mapping anyone can fill is accounting, not authorisation.
 
+A finding that says the caller picks what the contract calls is a claim a run can settle. The
+call data is changed four bytes at a time and the function or address called either follows
+it or does not. One that follows is confirmed with the run. One that never moves is taken
+out of the findings and listed in the report under "Tested by running and not reported", so
+nothing a rule said goes missing without a word.
+
 A last step reads each report as a whole and may rate a medium finding high on the weight
 of everything found on the same contract. It never lowers a finding. It is described and
 measured under "Rating a report as a whole".
@@ -767,6 +773,10 @@ sound ones. These were built, measured on the development set, and removed.
 | Does the search find more when it favours the functions whose calls led somewhere new | 82 of 231 against 84 without it |
 | Does a call made from inside a payment find more when it may go to another function | 83 of 231 against 84, and nothing new |
 | Is the caller charged less than the same sum comes to when no remainder is dropped | seen on none of 286 contracts |
+| Does a caller test count when it is one half of a joined condition | 308 more functions counted as checked, among them the function behind the best-known reentrancy of all: the code does not say which half is required and which is an alternative |
+| Is a writer that needs a slot to be empty and then fills it a one-time set-up | did not clear the contract it was built for, and took a critical finding off one held-out incident |
+| Is a balance taken by a role holder worth less than high | 11 incident contracts and 2 sound ones change, and what it says of them is true |
+| Does the search settle more findings when it is aimed at the place each one points to | one more confirmed over all sets |
 
 Of the 147 development incidents that are missed, 82 have no finding of the right kind at
 medium or above and 55 have none at all. Rating what is already found differently cannot
@@ -794,6 +804,55 @@ what is keyed by holder and caller, and the finding is made only when every one 
 goes through. On this token the second call is refused. Seven incident contracts of the
 three sets had the finding. Three keep it and four lose it, and two of those four had
 counted as found through it alone, one on the held-out set and one on the fresh set.
+
+The same token showed three more things that were not so. Its getters for name, symbol and
+version were listed as functions that change state, their string copies were listed as
+outside calls, and the copy loop was reported as one that can outgrow a block. A compiler of
+that age copies memory through a built-in contract. A call to a built-in contract keeps no
+state and runs nobody's code, so it is no longer an effect or an outside call, and a loop
+whose bound no function of the runtime code writes cannot grow and is no longer reported.
+
+The third is a token that burns what is sent to its own address. The entry it lowers is the
+named account's only on the branch where that account is the contract, and it was reported
+at high as a balance taken from another account. The path test that accepts a write reached
+only when the account is the caller accepts the contract itself the same way.
+
+### Every rule on contracts with no known flaw
+
+Each fix above began with one wrong report. To find the rest without waiting for them, every
+rule was run over the 77 contracts with no known flaw that may be read, the 55 of the
+development set and the 22 audited ones, and every finding at high was read.
+
+| rule | contracts it marks high | what the findings are |
+|---|---|---|
+| `dynamic-call` | 10 | the check of who picks the selector never reached the call, so the finding stayed with nothing behind it |
+| `reentrancy` | 5 | a write after a call, stated from the order of the code and not shown by a run |
+| `arbitrary-call` | 3 | one aggregator that calls what it is told, which is true of it, and two contracts that need a signature or a listed caller first |
+| `arbitrary-delegatecall` | 3 | the same two contracts, and an upgrade path |
+| `third-party-balance-debit` | 2 | the self-burning token above, and a role holder's own power, which is true of it |
+
+Two things came out of it. Some findings were wrong in what they said, and those are fixed
+and kept as tests. Most of the rest are not wrong in what they say but were never tested:
+over all three incident sets and the audited contracts, the older pass that confirms a
+finding by reaching it confirms 36 of 398, and the check of who picks a selector decided
+four in ten. A finding nobody could test stays as its rule rated it.
+
+The check of who picks what is called now also runs from the states the search reaches, where
+the call is reached after earlier calls have set the contract up. Over all sets it settles
+eight more findings as a selector fixed by the code and confirms two call targets, none of
+them on a contract with no known flaw.
+
+A rule's finding and a law the search checks are seldom about the same function. Of the 398
+findings a run could confirm, a law of the search fires in the same function for 4. So the
+laws do not stand in for the rules. They find other things, and a rule's finding is settled
+only by a test aimed at it, which settles as much as it can reach. Aiming the search itself
+at the place a finding points to reached one more. What would reach further is a contract
+set up the way it is used, with the contracts around it set up through their own functions,
+and that has not been built.
+
+`python3 corpus/parity_bench.py` is how each of these changes was read: it dumps what every
+rule finds on every contract of every set and says which findings two dumps differ in, by
+rule and by set. The static passes take under a minute over 889 contracts.
 
 ### Random sample
 
@@ -928,6 +987,12 @@ python3 corpus/vuln_bench.py
 python3 corpus/rule_bench.py
 RUNS=8 ./corpus/verify_all.sh
 ```
+
+Before and after a change to a rule, `python3 corpus/parity_bench.py dump OUT` and then
+`diff BEFORE AFTER` show every finding the change added or removed, by rule and by set. The
+known-vulnerable bench fails when a flaw it knows is no longer found, or when high findings
+on the audited contracts rise above the number they have today. A contract on which a rule
+was once wrong goes into `testdata/false_alarms`, where a test keeps that rule silent.
 
 The Rust crates follow Google's Rust style guide with `rustfmt.toml` as committed, and clippy
 is kept at zero warnings. Comments are few and only say why. There are no documentation

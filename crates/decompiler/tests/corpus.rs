@@ -563,6 +563,20 @@ fn a_rule_stays_silent_where_it_was_once_wrong() {
 }
 
 #[test]
+fn a_finding_the_search_withdraws_leaves_the_rest_of_the_report_in_place() {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/incidents/flawed/2024-01-mimspell2.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
+    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    let r = evmdec::analyze::analyze(&c);
+    let tested = r
+        .maps
+        .iter()
+        .find(|s| s.title.starts_with("Tested by running"));
+    assert!(tested.is_some_and(|s| !s.lines.is_empty()), "{:?}", r.maps);
+}
+
+#[test]
 fn a_getter_that_copies_a_string_through_a_built_in_contract_changes_nothing() {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/false_alarms/classic_f8784090.hex");

@@ -647,7 +647,7 @@ pub(crate) fn chosen_note(reached: &str, first: [u8; 4], at: usize, then: [u8; 4
 // rule took the caller to pick.
 pub(crate) fn withdrawn(gone: &Finding, part: &str) -> String {
     format!(
-        "`{}`: a rule read the call there as one whose target the caller picks (`{}`). The call was reached and the call data changed four bytes at a time, and {part} never changed.",
+        "`{}`: a rule read the call there as one where the caller picks what is called (`{}`). The call was reached and the call data changed four bytes at a time, and {part} never changed.",
         gone.function.as_deref().unwrap_or_default(),
         gone.id,
     )

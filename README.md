@@ -528,9 +528,10 @@ of the search, as the table of passes above says.
 
 `python3 corpus/heldout_bench.py --set incidents`. `testdata/incidents` holds 231 contracts
 from public incidents and 55 with no known flaw, collected like the held-out set below from
-a different third of the same index. This is where misses are read and rules are shaped: 93
-of the 231 get the right kind of finding at high or above, 84 before each report is rated
-as a whole with weights that were fitted on this same set. Read by root cause, the largest
+a different third of the same index. This is where misses are read and rules are shaped: 91
+of the 231 get the right kind of finding at high or above, 83 before each report is rated
+as a whole with weights that were fitted on this same set, and 42 of the 55 have nothing at
+high. Read by root cause, the largest
 groups among the misses are a token whose code changes a pool's balance outside a transfer,
 an amount priced from a reading that one transaction can move, a swap of the contract's own
 holdings that anyone can trigger with no minimum, and reward accounting that pays the same
@@ -702,17 +703,22 @@ flaw gains a high finding.
 
 | | each rule alone | report rated as a whole |
 |---|---|---|
-| development incidents found, cross-validated | 84.0 / 231 | 90.8 / 231 |
-| contracts with no known flaw and nothing at high, cross-validated | 57.0 / 77 | 57.0 / 77 |
-| held-out incidents found | 104 / 234 | 108 / 234 |
+| development incidents found, cross-validated | 83.0 / 231 | 89.8 / 231 |
+| contracts with no known flaw and nothing at high, cross-validated | 58.0 / 77 | 58.0 / 77 |
+| held-out incidents found | 103 / 234 | 107 / 234 |
 | held-out contracts with no known flaw and nothing at high | 79 / 101 | 78 / 101 |
-| fresh incidents found | 76 / 213 | 78 / 213 |
-| opened functions found at high (mutation bench) | 19 / 66 | 21 / 66 |
+| fresh incidents found | 75 / 213 | 77 / 213 |
+| opened functions found at high (mutation bench) | 19 / 66 | 20 / 66 |
 
 It carries to both sets it was not fitted on, by four and two contracts, and it marks one
 held-out contract with no known flaw that was clean before. A contract with no known flaw
-that already had a high finding also tends to gain more of them: the held-out ones carry 57
+that already had a high finding also tends to gain more of them: the held-out ones carry 59
 high findings where they carried 43.
+
+The weights are fitted again whenever a rule changes what it reports, and the table is from
+the last fit. Each count of incidents found was one higher before the fixes under "False
+alarms kept" and the findings a run now withdraws. A contract counted as found through a
+finding that was not true is no longer counted.
 
 The same weights were first used both ways, so that a high finding with no run to show it
 was rated medium when the sum was -2 or lower. On the held-out set that gave 107 and 79.
@@ -733,15 +739,15 @@ counts as found when its report gains a finding at high that the original did no
 |---|---|
 | mutants made from the 55 sound development contracts, up to 4 each | 95 |
 | mutants that open something the analyzer can see | 66 |
-| of those, a new finding at high | 21 |
-| a new finding at medium only | 20 |
+| of those, a new finding at high | 20 |
+| a new finding at medium only | 21 |
 | nothing new at medium or above | 25 |
 
 When the bench was first run the same rows read 63, 12, 9 and 42: two in three opened
 functions got nothing, because an opened function was reported only when what it does
 matches a rule. Two checks were then built against these mutants and kept because they add
 no finding on the 55 contracts the mutants are made from. They gave 19, 22 and 25, and
-rating each report as a whole moved two more to high.
+rating each report as a whole moves one more to high.
 
 The first is run by the search. Some function compares its caller with the address in a
 slot. If a call by an account with no role, sending nothing and asking no outside contract
@@ -840,7 +846,8 @@ four in ten. A finding nobody could test stays as its rule rated it.
 The check of who picks what is called now also runs from the states the search reaches, where
 the call is reached after earlier calls have set the contract up. Over all sets it settles
 eight more findings as a selector fixed by the code and confirms two call targets, none of
-them on a contract with no known flaw.
+them on a contract with no known flaw. One of the eight was the only high finding on a
+development incident whose flaw is elsewhere, which had counted as found.
 
 A rule's finding and a law the search checks are seldom about the same function. Of the 398
 findings a run could confirm, a law of the search fires in the same function for 4. So the

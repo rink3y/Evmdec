@@ -705,9 +705,11 @@ fn is_time_cond(cond: ExprId) -> bool {
     })
 }
 
-// Whether the condition says the caller is the account, and on which side of it.
+// Whether the condition says the caller is the account, and on which side of it. The
+// contract itself counts as the caller here: what it holds is its own to lower.
 fn caller_is(cond: ExprId, account: ExprId) -> Option<bool> {
-    let sender = |e: ExprId| matches!(expr::node(unmask(e)), Node::Env(op::CALLER, _));
+    let own = |n: Node| matches!(n, Node::Env(op::CALLER | op::ADDRESS, _));
+    let sender = |e: ExprId| own(expr::node(unmask(e)));
     let named = |e: ExprId| unmask(e) == unmask(account);
     let pair = |v: &[ExprId]| (sender(v[0]) && named(v[1])) || (sender(v[1]) && named(v[0]));
     match expr::node(cond) {

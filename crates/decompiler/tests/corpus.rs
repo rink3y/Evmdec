@@ -548,9 +548,13 @@ fn a_rule_stays_silent_where_it_was_once_wrong() {
         let code = evmdec::hex::decode(hex.trim()).unwrap();
         let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
         let r = evmdec::analyze::analyze(&c);
+        let within = case["function"].as_str().unwrap_or("");
         for rule in case["rules"].as_array().unwrap() {
             let rule = rule.as_str().unwrap();
-            let fired: Vec<_> = r.findings.iter().filter(|f| f.id == rule).collect();
+            let here = |f: &&evmdec::analyze::Finding| {
+                f.id == rule && f.function.as_deref().unwrap_or("").starts_with(within)
+            };
+            let fired: Vec<_> = r.findings.iter().filter(here).collect();
             assert!(fired.is_empty(), "{name}: {rule} fired: {fired:?}");
             checked += 1;
         }

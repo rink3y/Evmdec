@@ -1,5 +1,6 @@
 use crate::abi::{self, SEL_BALANCE_OF, SEL_TRANSFER, SEL_TRANSFER_FROM};
 use crate::analyze::{display_name, push, Confidence, Finding, Severity};
+use crate::confirm;
 use crate::decompile::{Contract, Function};
 use crate::deploy;
 use crate::exec;
@@ -14,7 +15,7 @@ use crate::solve::{word, Free, Inputs};
 use crate::u256::U256;
 use crate::world::{Call, Done, Holdings, Swung, World, PURSE};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub const WORK: u64 = 4 * exec::WORK_PER_SECOND;
 
@@ -39,6 +40,7 @@ const MAX_SET_SLOTS: usize = 64;
 const MAX_SPLITS: usize = 24;
 const MAX_FRESH_STARTS: usize = 48;
 const MAX_ROLE_TRIES: usize = 16;
+const MAX_SITES: usize = 256;
 const SEED_LIMITS: Limits = Limits { paths: 6, runs: 18 };
 const FIRST_VALUE: u64 = 0x1001;
 const STAKE: U256 = U256([0, 1 << 16, 0, 0]);
@@ -100,6 +102,13 @@ fn role_slots(c: &Contract) -> BTreeSet<U256> {
 
 // What a call by the account with no role did to a slot that names who a check lets
 // through.
+struct Chosen {
+    steps: Vec<Step>,
+    at: usize,
+    first: [u8; 4],
+    then: [u8; 4],
+}
+
 struct Role {
     steps: Vec<Step>,
     slot: U256,
@@ -210,6 +219,8 @@ struct Search<'a> {
     roles: BTreeSet<U256>,
     role: Option<Role>,
     role_tries: usize,
+    // For each place the contract called out from, the first call that got there.
+    sites: BTreeMap<usize, (usize, usize, Call)>,
     // How often each function has been tried in two parts.
     splits: HashMap<usize, usize>,
     // Whether both accounts were given some of the contract's own token to start with.
@@ -426,6 +437,7 @@ impl<'a> Search<'a> {
             roles: role_slots(c),
             role: None,
             role_tries: 0,
+            sites: BTreeMap::new(),
             splits: HashMap::new(),
             staked,
         }
@@ -684,6 +696,12 @@ impl<'a> Search<'a> {
         if !done.ended {
             return None;
         }
+        for (pc, _) in &done.made {
+            if self.sites.len() < MAX_SITES {
+                let first = (from, index, call.clone());
+                self.sites.entry(*pc).or_insert(first);
+            }
+        }
         // The starting state stands for a contract in use. A call that sets a slot it
         // found empty and cannot be made again is the contract's set-up. The other
         // account may make it, which is how the state a later call needs comes to be.
@@ -743,6 +761,43 @@ impl<'a> Search<'a> {
             true if now.is_zero() => Some(false),
             _ => None,
         }
+    }
+
+    // The question `confirm::settle_selectors` asks, asked from a state that a sequence
+    // of calls reached. `Some(None)` is a selector no change to the call data moved.
+    fn selector_chosen(&self, site: &std::ops::Range<usize>) -> Option<Option<Chosen>> {
+        let (pc, (from, index, call)) = self.sites.range(site.clone()).next()?;
+        let at_site = |done: &Done| done.made.iter().find(|(at, _)| at == pc).map(|(_, s)| *s);
+        let entry = self.entries[*index].at;
+        let run = |call: &Call| self.kept[*from].world.clone().call(entry, call);
+        let first = at_site(&run(call))?;
+        let chunks = (call.data.len().saturating_sub(4) / 4).min(confirm::MAX_CHUNKS);
+        let mut trials = 0;
+        for chunk in 0..chunks {
+            if exec::spent() {
+                return None;
+            }
+            let at = 4 + 4 * chunk;
+            let mut changed = call.clone();
+            for (byte, flip) in changed.data[at..at + 4].iter_mut().zip(confirm::FLIP) {
+                *byte ^= flip;
+            }
+            let Some(then) = at_site(&run(&changed)) else {
+                continue;
+            };
+            trials += 1;
+            if then != first {
+                let mut steps = self.kept[*from].steps.clone();
+                steps.push(Step::Call(*index, call.clone()));
+                return Some(Some(Chosen {
+                    steps,
+                    at,
+                    first,
+                    then,
+                }));
+            }
+        }
+        (trials >= confirm::MIN_TRIALS).then_some(None)
     }
 
     // What a step that ended leaves: the properties are checked on it, and it is kept
@@ -1517,6 +1572,45 @@ fn report_role(search: &Search, role: &Role, out: &mut Vec<Finding>) {
     }
 }
 
+// A call whose selector the single-call check could not reach is judged from the states
+// the search reached, with the same test and the same two outcomes.
+fn settle_selectors(search: &mut Search, c: &Contract, out: &mut Vec<Finding>) {
+    let mut fixed = Vec::new();
+    for (index, finding) in out.iter_mut().enumerate() {
+        if finding.id != confirm::SELECTOR_ID || finding.confirmed {
+            continue;
+        }
+        let (Some(pc), Some(name)) = (finding.pc, finding.function.as_deref()) else {
+            continue;
+        };
+        let external = |f: &&Function| f.kind == FnKind::External && display_name(f) == name;
+        let Some(f) = c.functions.iter().find(external) else {
+            continue;
+        };
+        let site = search
+            .explorers
+            .of(c.code_of(f))
+            .rest_of_block(c.local_pc(f, pc));
+        match search.selector_chosen(&site) {
+            None => {}
+            Some(None) => fixed.push(index),
+            Some(Some(chosen)) => {
+                let Some((Step::Call(_, last), earlier)) = chosen.steps.split_last() else {
+                    continue;
+                };
+                let reached = "from a state that earlier calls left";
+                let note = confirm::chosen_note(reached, chosen.first, chosen.at, chosen.then);
+                finding.description.push_str(&note);
+                finding.confidence = Confidence::Medium;
+                attach(finding, earlier, last);
+            }
+        }
+    }
+    for index in fixed.into_iter().rev() {
+        out.remove(index);
+    }
+}
+
 fn attach(finding: &mut Finding, earlier: &[Step], last: &Call) {
     finding.setup = shown(earlier);
     finding.confirmed = true;
@@ -1639,6 +1733,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     if let Some(role) = search.role.take() {
         report_role(&search, &role, out);
     }
+    settle_selectors(&mut search, c, out);
     if let Some(lowered) = search.lowered.take() {
         report_lowered(&search, &lowered, out);
     }

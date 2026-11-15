@@ -547,14 +547,14 @@ pub fn confirm_chance(c: &Contract, findings: &mut [Finding]) {
     }
 }
 
-const SELECTOR_ID: &str = "dynamic-call";
+pub(crate) const SELECTOR_ID: &str = "dynamic-call";
 const SELECTOR_LIMITS: Limits = Limits {
     paths: 16,
     runs: 60,
 };
-const MAX_CHUNKS: usize = 256;
-const MIN_TRIALS: usize = 4;
-const FLIP: [u8; 4] = [0xa5; 4];
+pub(crate) const MAX_CHUNKS: usize = 256;
+pub(crate) const MIN_TRIALS: usize = 4;
+pub(crate) const FLIP: [u8; 4] = [0xa5; 4];
 
 enum Selector {
     Chosen {
@@ -634,6 +634,15 @@ fn selector_under_change(explorer: &Explorer, f: &Function, pc: usize) -> Select
     Selector::Unknown
 }
 
+pub(crate) fn chosen_note(reached: &str, first: [u8; 4], at: usize, then: [u8; 4]) -> String {
+    format!(
+        " Confirmed by running it, {reached}: the payload begins with 0x{}, and with bytes {at} to {} of the call data changed it begins with 0x{}. The caller decides which function is called.",
+        hex::encode(&first),
+        at + 3,
+        hex::encode(&then),
+    )
+}
+
 pub fn settle_selectors(c: &Contract, findings: &mut Vec<Finding>) {
     if std::env::var("EVMDEC_NO_CONFIRM").is_ok() || c.info.runtime.is_empty() {
         return;
@@ -661,12 +670,10 @@ pub fn settle_selectors(c: &Contract, findings: &mut Vec<Finding>) {
             Selector::Chosen { run, at, then } => {
                 let site = explorer.rest_of_block(c.local_pc(f, pc));
                 let first = selector_at(&run.run, &site).unwrap_or_default();
-                finding.description.push_str(&format!(
-                    " Confirmed by running it, with storage chosen so that the call is reached: the payload begins with 0x{}, and with bytes {at} to {} of the call data changed it begins with 0x{}. The caller decides which function is called.",
-                    hex::encode(&first),
-                    at + 3,
-                    hex::encode(&then),
-                ));
+                let reached = "with storage chosen so that the call is reached";
+                finding
+                    .description
+                    .push_str(&chosen_note(reached, first, at, then));
                 finding.confidence = Confidence::Medium;
                 finding.confirm(&run);
             }

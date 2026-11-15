@@ -24,6 +24,7 @@ const MAX_DEPTH: usize = 12;
 // well as thousands, and a set of thousands costs more to keep than the call to run.
 const MAX_KEYS: usize = 256;
 const MAX_WRITES: usize = 4_096;
+const MAX_MADE: usize = 32;
 const FIRST_MADE: u64 = 0xc0de_0000_0000;
 // What every funded account starts with, in ether and in each asset. Large enough to
 // pay for any call, and far from the top so that sums stay in range.
@@ -85,6 +86,9 @@ pub struct Done {
     // interface, so that what the call did rests on an answer nobody keeps books for.
     pub asked: bool,
     pub writes: Vec<Write>,
+    // The calls the contract under test made: where in its code, and the first four
+    // bytes it sent.
+    pub made: Vec<(usize, [u8; 4])>,
 }
 
 struct Code {
@@ -494,6 +498,14 @@ impl World {
                 }
                 Some(Outcome::Call(index)) => {
                     let record = m.calls[index].clone();
+                    let first = record
+                        .input
+                        .get(..4)
+                        .and_then(|b| <[u8; 4]>::try_from(b).ok());
+                    if let (true, Some(first)) = (watched && run.done.made.len() < MAX_MADE, first)
+                    {
+                        run.done.made.push((at, first));
+                    }
                     let own = std::mem::take(&mut m.storage);
                     self.storage.insert(f.account, own);
                     let (success, data) = self.outside(&record, f, run);
@@ -803,6 +815,18 @@ mod tests {
             data,
             ..Call::default()
         }
+    }
+
+    #[test]
+    fn a_call_out_is_recorded_with_where_it_was_made_and_what_it_began_with() {
+        let mut world = World::new();
+        world.place(FIRST, &passes_on(op::CALL));
+        let mut call = naming(0x09);
+        call.data[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let done = world.run(FIRST, &call);
+        let site = passes_on(op::CALL).len() - 2;
+        assert!(done.ended);
+        assert_eq!(done.made, [(site, [0xde, 0xad, 0xbe, 0xef])]);
     }
 
     fn world(first: &[u8], second: &[u8]) -> World {

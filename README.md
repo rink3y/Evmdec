@@ -598,7 +598,9 @@ comments. `.claude/agents/rust-style-reviewer.md` reviews a change against the g
 - The search over sequences of calls is a search, not a proof. It runs two accounts through
   at most six steps, stops when ten thousand rounds or an eighth of its work reach nothing
   new, and keeps the first state it meets of each kind, so a gain that needs a third
-  account, a longer sequence or a rare input is not found. Its findings are what happened in
+  account, a longer sequence or a rare input is not found. Keeping the state that leaves
+  the actor better off instead of the first was tried and found nothing more on the
+  development incidents. Its findings are what happened in
   a run: the calls are attached and can be made again.
 - In those runs an asset keeps honest books and any other outside answer is the one the
   solver chose, the same for every call. An asset that misreports, takes a fee or changes

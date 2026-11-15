@@ -277,7 +277,7 @@ fn access_control_policy_flags_the_odd_one_out() {
         .iter()
         .find(|f| f.id == "inconsistent-access-control")
         .unwrap_or_else(|| panic!("{:?}", ids(&r)));
-    assert_eq!(f.severity, Severity::High);
+    assert_eq!(f.severity, Severity::Medium);
     assert!(
         f.function
             .as_deref()

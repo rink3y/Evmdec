@@ -16,7 +16,7 @@ def analyze(path):
     return json.loads(out.stdout), None
 
 # The misses are listed in the README: flaws no rule here reaches yet.
-MIN_HITS = 25
+MIN_HITS = 26
 
 def main():
     ap = argparse.ArgumentParser()

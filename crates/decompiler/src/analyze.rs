@@ -5228,14 +5228,6 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         exec::within(confirm::WORK, || {
             confirm::settle_selectors(c, &mut findings)
         });
-        // Read from the code alone this rule is as common on contracts with no known
-        // flaw as on flawed ones. It is high only where a run showed the caller choosing.
-        for finding in findings
-            .iter_mut()
-            .filter(|f| f.id == "dynamic-call" && !f.confirmed)
-        {
-            finding.severity = finding.severity.max(Severity::Medium);
-        }
     }
 
     crate::invariant::findings(c, &c.types, &mut findings);
@@ -6406,7 +6398,13 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
         }
         let mut does: Vec<String> = Vec::new();
         let mut evidence: Vec<String> = Vec::new();
+        let mut sev = Severity::Low;
         let mut conf = Confidence::Medium;
+        let raise = |sev: &mut Severity, to: Severity| {
+            if to < *sev {
+                *sev = to;
+            }
+        };
         for (addr, _, line) in &x.ether_out {
             if from_caller(*addr)
                 || from_calldata(*addr)
@@ -6416,6 +6414,7 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 continue;
             }
             does.push("sends ether to an address held in storage".into());
+            raise(&mut sev, Severity::Medium);
             conf = Confidence::Low;
             evidence.push(line.clone());
         }
@@ -6426,6 +6425,14 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
             } else {
                 "self-destructs".into()
             });
+            raise(
+                &mut sev,
+                if to_user {
+                    Severity::High
+                } else {
+                    Severity::Medium
+                },
+            );
             evidence.push(line.clone());
         }
         for (t, line) in &x.delegatecalls {
@@ -6433,6 +6440,7 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 continue;
             }
             does.push("delegatecalls an address held in storage".into());
+            raise(&mut sev, Severity::Medium);
             evidence.push(line.clone());
         }
         for (slot, _, line) in &x.const_writes {
@@ -6443,6 +6451,7 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 does.push(
                     "writes a storage slot that is otherwise written only behind the check".into(),
                 );
+                raise(&mut sev, Severity::Medium);
                 evidence.push(line.clone());
             }
         }
@@ -6457,9 +6466,7 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
         } else {
             ""
         };
-        // The omission is what is rated, whatever the function then does. On the development
-        // incidents it told flawed contracts from sound ones better than any rule rated high.
-        push_fact(findings, "inconsistent-access-control", "Missing access control, judged by the contract's own policy", Severity::High, conf, x,
+        push_fact(findings, "inconsistent-access-control", "Missing access control, judged by the contract's own policy", sev, conf, x,
             format!("{} state-changing functions ({}) require msg.sender to match {}. `{}` has no such check yet {}.{} Either the omission is intentional and should be documented, or a modifier is missing.",
                 followers.len(), join_names(&follower_names, 4), join_names(&policy_names, 2), x.name, does.join(", "), time_note),
             evidence, "Apply the same access control as the sibling functions, or make the public intent explicit.");

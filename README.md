@@ -454,7 +454,8 @@ that are not findings, such as the compiler version, are left out.
 | `blocking-payout-loop` | 0 | 0 | 0 | 0 | 1 | 0 |
 
 30 rules fire on none of the 344. They stay for one of three reasons. 7 read the code of a
-linked contract, and these corpora hold one contract each: `approval-to-open-spender`,
+linked contract, and these corpora hold one contract each. By address they fire on 43 of the
+231 flawed development contracts and 2 of the 55 sound ones: `approval-to-open-spender`,
 `control-handed-out-mid-update`, `linked-call-unanswered`, `linked-callee-defect`,
 `unbound-account-passed-on`, `unbound-address-made-privileged`, `value-to-non-payable`. 6
 fire on a contract of the held-out set: `cost-grows-with-open-list`,
@@ -559,6 +560,38 @@ contracts with no known flaw. Its findings are high on three
 of those contracts, one of which has no other high finding. Each step added a little and none took away, which
 is the most that can be said of a search: it finds what it reaches, and what it reaches
 moves with the order in which it tries things.
+
+### Both sets by address
+
+The two sets above hold one contract each. Given an address, the tool also fetches the code
+of the contracts that contract calls, two call edges deep, and the addresses its storage
+holds for them. It reads no balance, price or reserve. Both sets were run that way on
+2026-11-15, against the code each address has today. One held-out address no longer
+returned code.
+
+| | one contract | by address |
+|---|---|---|
+| development incidents with the right kind of finding at high | 84 / 231 | 91 / 231 |
+| development contracts with no known flaw and nothing at high | 37 / 55 | 35 / 55 |
+| held-out incidents with the right kind of finding at high | 102 / 234 | 107 / 233 |
+| held-out contracts with no known flaw and nothing at high | 79 / 101 | 74 / 101 |
+
+Linked code adds a few findings and marks a few more sound contracts. It does not close the
+distance to the incidents that are missed.
+
+The first run by address gave 87 and 33 of 55 on the development set, and 106 and 70 of 101
+on the held-out set. Two faults showed in it. Both were found on the development set and
+then checked on the held-out set.
+
+A function that stores an address as the code the contract runs and then runs it was
+reported at high. That is the upgrade path of an ordinary proxy, and whoever may upgrade
+may already run any code there. It is now a note. By address, 16 sound contracts of the two
+sets had the finding at high and 1 still does. All 21 flawed contracts that had it keep it.
+
+The search ran the fetched code of linked contracts on empty storage, where it refuses most
+calls. With that code placed the search found 87 of the 231 development incidents by
+address, with a linked contract's transfers answered from honest books 90, and with a linked
+contract treated as any other address 91. The last is what the search now does.
 
 ### Random sample
 

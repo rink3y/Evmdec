@@ -119,16 +119,8 @@ fn load(file: &PathBuf) -> Result<Vec<u8>> {
     Ok(code)
 }
 
-fn unknown_selectors(c: &Contract) -> Vec<u32> {
-    let unnamed = c.functions.iter().filter(|f| f.signature.is_none());
-    let selectors = unnamed.filter_map(|f| f.selector.as_ref());
-    selectors
-        .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        .collect()
-}
-
 fn look_up(c: &Contract) -> std::collections::HashMap<u32, String> {
-    let selectors = unknown_selectors(c);
+    let selectors = c.unknown_selectors();
     let found = evmdec::sigs::lookup_online(&selectors);
     eprintln!(
         "resolved {} of {} unknown selectors online",

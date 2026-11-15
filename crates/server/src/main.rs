@@ -117,15 +117,6 @@ fn error(status: StatusCode, msg: impl Into<String>) -> axum::response::Response
     (status, Json(json!({"error": msg.into()}))).into_response()
 }
 
-fn unknown_selectors(c: &Contract) -> Vec<u32> {
-    c.functions
-        .iter()
-        .filter(|f| f.signature.is_none())
-        .filter_map(|f| f.selector.as_ref())
-        .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        .collect()
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lookup {
     Offline,
@@ -169,7 +160,7 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
     let mut cache = CodeCache::new();
     let mut c = source.obtain(&opts, &mut cache)?;
     if lookup == Lookup::Online {
-        let sels = unknown_selectors(&c);
+        let sels = c.unknown_selectors();
         if !sels.is_empty() {
             opts.extra_sigs = evmdec::sigs::lookup_online(&sels);
             if !opts.extra_sigs.is_empty() {

@@ -434,7 +434,11 @@ fn created_code(ctx: &Ctx, off: ExprId, len: ExprId, init: Option<&[ExprId]>) ->
     ))
 }
 
-fn made_by_call(ctx: &Ctx, st: &Stmt) -> Option<String> {
+fn linked_function<R>(
+    ctx: &Ctx,
+    st: &Stmt,
+    read: impl FnOnce(&FnSummary, &[ExprId], Option<usize>) -> Option<R>,
+) -> Option<R> {
     let Stmt::Call {
         addr,
         input,
@@ -454,12 +458,15 @@ fn made_by_call(ctx: &Ctx, st: &Stmt) -> Option<String> {
     let address = linked_address(ctx, *addr)?;
     let report = ctx.world.report(&address)?;
     let hex = format!("{selector:#010x}");
-    report
+    let summary = report
         .summaries
         .iter()
-        .find(|g| g.selector.eq_ignore_ascii_case(&hex))?
-        .creates
-        .clone()
+        .find(|g| g.selector.eq_ignore_ascii_case(&hex))?;
+    read(summary, words, len)
+}
+
+fn made_by_call(ctx: &Ctx, st: &Stmt) -> Option<String> {
+    linked_function(ctx, st, |g, _, _| g.creates.clone())
 }
 
 fn linked_address(ctx: &Ctx, e: ExprId) -> Option<String> {
@@ -1082,14 +1089,7 @@ fn collect_facts(
                 in_len,
                 ..
             }) => {
-                let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
-                let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
-                let selector = words
-                    .first()
-                    .and_then(|w0| emit::leading_selector(*w0, len));
-                if selector == Some(SEL_TRANSFER) && words.len() >= 2 {
-                    outflows.push(emit::shifted_word_len(words, 1, len));
-                }
+                outflows.extend(token_sent(input, input_head, *in_len));
             }
             Some(Stmt::SStore {
                 key,
@@ -1318,39 +1318,17 @@ fn computed_return(events: &[Event]) -> Option<ExprId> {
 }
 
 fn computed_result(ctx: &Ctx, st: &Stmt) -> Option<ExprId> {
-    let Stmt::Call {
-        addr,
-        input,
-        input_head,
-        in_len,
-        ..
-    } = st
-    else {
-        return None;
-    };
-    if !ctx.world.has_other(ctx.c) {
-        return None;
-    }
-    let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
-    let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
-    let selector = emit::leading_selector(*words.first()?, len)?;
-    let address = linked_address(ctx, *addr)?;
-    let report = ctx.world.report(&address)?;
-    let hex = format!("{selector:#010x}");
-    let returns = report
-        .summaries
-        .iter()
-        .find(|g| g.selector.eq_ignore_ascii_case(&hex))?
-        .returns?;
-    Some(expr::substitute(
-        returns,
-        &|n| match n {
-            Node::CallDataLoad(off) => emit::calldata_word_index(*off)
-                .map(|i| emit::shifted_word_len(words, i as usize, len)),
-            _ => None,
-        },
-        &mut HashMap::new(),
-    ))
+    linked_function(ctx, st, |g, words, len| {
+        Some(expr::substitute(
+            g.returns?,
+            &|n| match n {
+                Node::CallDataLoad(off) => emit::calldata_word_index(*off)
+                    .map(|i| emit::shifted_word_len(words, i as usize, len)),
+                _ => None,
+            },
+            &mut HashMap::new(),
+        ))
+    })
 }
 
 fn slot_place(key: ExprId) -> Option<(Option<u32>, U256)> {
@@ -6641,14 +6619,7 @@ fn trace_bounds(c: &Contract, facts: &mut [FnFacts], names_for: &dyn Fn(&Functio
                         ..
                     } => {
                         outflows.extend(value.filter(|v| !expr::is_const(*v)));
-                        let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
-                        let len = expr::as_const(*in_len).and_then(|l| l.as_usize());
-                        let selector = words
-                            .first()
-                            .and_then(|w0| emit::leading_selector(*w0, len));
-                        if selector == Some(SEL_TRANSFER) && words.len() >= 2 {
-                            outflows.push(emit::shifted_word_len(words, 1, len));
-                        }
+                        outflows.extend(token_sent(input, input_head, *in_len));
                     }
                     Stmt::SStore { key, val, .. } => outflows.extend(subtracts_from(*val, *key)),
                     _ => {}
@@ -7735,6 +7706,17 @@ fn risk_score(findings: &[Finding]) -> u32 {
         })
         .sum();
     (top + extra).round().min(100.0) as u32
+}
+
+fn token_sent(
+    input: &Option<Vec<ExprId>>,
+    input_head: &[ExprId],
+    in_len: ExprId,
+) -> Option<ExprId> {
+    let words: &[ExprId] = input.as_deref().unwrap_or(input_head);
+    let len = expr::as_const(in_len).and_then(|l| l.as_usize());
+    let selector = emit::leading_selector(*words.first()?, len)?;
+    (selector == SEL_TRANSFER && words.len() >= 2).then(|| emit::shifted_word_len(words, 1, len))
 }
 
 fn w0_selector(input: &Option<Vec<ExprId>>, in_len: ExprId) -> Option<u32> {

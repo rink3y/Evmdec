@@ -292,6 +292,15 @@ pub struct StorageCollision {
 
 impl Contract {
     #[must_use]
+    pub fn unknown_selectors(&self) -> Vec<u32> {
+        let unnamed = self.functions.iter().filter(|f| f.signature.is_none());
+        let selectors = unnamed.filter_map(|f| f.selector.as_ref());
+        selectors
+            .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .collect()
+    }
+
+    #[must_use]
     pub fn code_of(&self, f: &Function) -> &[u8] {
         match self.parts.get(f.part) {
             Some(p) => &p.runtime,

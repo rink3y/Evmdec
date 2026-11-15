@@ -1,7 +1,6 @@
 use crate::keccak;
-use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -191,35 +190,6 @@ impl SigDb {
     }
 }
 
-pub fn write(path: &Path, entries: impl IntoIterator<Item = ([u8; 32], String)>) -> io::Result<()> {
-    let mut pool: Vec<u8> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut table: Vec<(u64, u32)> = Vec::new();
-    for (hash, sig) in entries {
-        if seen.contains(&sig) {
-            continue;
-        }
-        let off = u32::try_from(pool.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pool over 4 GiB"))?;
-        pool.extend_from_slice(sig.as_bytes());
-        pool.push(0);
-        let prefix = u64::from_be_bytes(hash[0..8].try_into().expect("hash[0..8] is 8 bytes"));
-        table.push((prefix, off));
-        seen.insert(sig);
-    }
-    table.sort_unstable();
-    let mut out = io::BufWriter::new(File::create(path)?);
-    out.write_all(MAGIC)?;
-    out.write_all(&(table.len() as u64).to_le_bytes())?;
-    out.write_all(&(HEADER_LEN + table.len() as u64 * ENTRY_LEN).to_le_bytes())?;
-    for (prefix, off) in &table {
-        out.write_all(&prefix.to_le_bytes())?;
-        out.write_all(&off.to_le_bytes())?;
-    }
-    out.write_all(&pool)?;
-    out.flush()
-}
-
 fn default_paths() -> Vec<PathBuf> {
     let mut v = vec![PathBuf::from("sigs.idx")];
     if let Ok(exe) = std::env::current_exe() {
@@ -251,6 +221,39 @@ pub fn global() -> Option<&'static SigDb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::io::Write;
+
+    // The real index is built by corpus/build_sigs.py. This writer only makes fixtures for
+    // the reader, in the same format.
+    fn write(path: &Path, entries: impl IntoIterator<Item = ([u8; 32], String)>) -> io::Result<()> {
+        let mut pool: Vec<u8> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut table: Vec<(u64, u32)> = Vec::new();
+        for (hash, sig) in entries {
+            if seen.contains(&sig) {
+                continue;
+            }
+            let off = u32::try_from(pool.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pool over 4 GiB"))?;
+            pool.extend_from_slice(sig.as_bytes());
+            pool.push(0);
+            let prefix = u64::from_be_bytes(hash[0..8].try_into().expect("hash[0..8] is 8 bytes"));
+            table.push((prefix, off));
+            seen.insert(sig);
+        }
+        table.sort_unstable();
+        let mut out = io::BufWriter::new(File::create(path)?);
+        out.write_all(MAGIC)?;
+        out.write_all(&(table.len() as u64).to_le_bytes())?;
+        out.write_all(&(HEADER_LEN + table.len() as u64 * ENTRY_LEN).to_le_bytes())?;
+        for (prefix, off) in &table {
+            out.write_all(&prefix.to_le_bytes())?;
+            out.write_all(&off.to_le_bytes())?;
+        }
+        out.write_all(&pool)?;
+        out.flush()
+    }
 
     fn h(s: &str) -> [u8; 32] {
         keccak::keccak256(s.as_bytes())

@@ -262,11 +262,9 @@ const MAX_INLINED_EVENTS: usize = 12_000;
 
 #[derive(Clone)]
 struct Event {
-    node: usize,
     pc: usize,
     callee: Option<usize>,
     inst: usize,
-    inner: usize,
     path: Vec<(usize, Option<usize>, usize)>,
     stmt: Option<Stmt>,
     term: Option<Term>,
@@ -1114,24 +1112,6 @@ fn collect_facts(
             limits_in(e, layout, names, &mut seen, &mut candidates);
         }
     }
-    if crate::debug::on("EVMDEC_DEBUG_LIMITS") && !candidates.is_empty() {
-        eprintln!(
-            "[outflow] {} moves={} outflows={:?} others={:?}",
-            facts.name,
-            facts.moves_value,
-            outflows
-                .iter()
-                .map(|a| emit::fmt_expr(*a, names))
-                .collect::<Vec<_>>(),
-            candidates
-                .iter()
-                .map(|(_, o)| emit::fmt_expr(*o, names))
-                .collect::<Vec<_>>()
-        );
-    }
-    if crate::debug::on("EVMDEC_DEBUG_UNPLACED") {
-        debug_unplaced(&facts.name, events, layout, names);
-    }
     facts.ref_bounds = candidates.iter().map(|(b, _)| b.clone()).collect();
     for ev in events {
         if let Some(Term::Return {
@@ -1150,41 +1130,6 @@ fn collect_facts(
         .filter(|(_, other)| limits_outflow(*other, &outflows))
         .map(|(b, _)| b)
         .collect();
-    if crate::debug::on("EVMDEC_DEBUG_LIMITS") {
-        for b in &facts.avail_bounds {
-            let show = |set: &BTreeSet<Field>| {
-                set.iter()
-                    .map(|f| b.names.get(f).cloned().unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join(" + ")
-            };
-            eprintln!(
-                "[limit] {} moves={} : ({}) - ({})",
-                facts.name,
-                facts.moves_value,
-                show(&b.added),
-                show(&b.subbed)
-            );
-        }
-    }
-    if crate::debug::on("EVMDEC_DEBUG_FACTS") {
-        eprintln!(
-            "[facts] {} checked={} init={} time={} auth={:?} writes={} ether={} sd={} dc={} guards={:?}",
-            facts.name,
-            facts.caller_checked,
-            facts.init_guarded,
-            facts.time_gated,
-            facts.auth_slots.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>(),
-            facts.const_writes.len(),
-            facts.ether_out.len(),
-            facts.selfdestructs.len(),
-            facts.delegatecalls.len(),
-            guard_conds(events)
-                .iter()
-                .map(|c| emit::fmt_cond(*c, names))
-                .collect::<Vec<_>>()
-        );
-    }
     facts
 }
 
@@ -1935,78 +1880,6 @@ fn linear_fields(
     }
 }
 
-fn unplaced_terms(e: ExprId, sign: i32, names: &Names, out: &mut Vec<String>, budget: &mut u32) {
-    if *budget == 0 {
-        return;
-    }
-    *budget -= 1;
-    match expr::node(e) {
-        Node::Op(op::ADD, v) => {
-            for x in v {
-                unplaced_terms(x, sign, names, out, budget);
-            }
-        }
-        Node::Op(op::SUB, v) if v.len() == 2 => {
-            unplaced_terms(v[0], sign, names, out, budget);
-            unplaced_terms(v[1], -sign, names, out, budget);
-        }
-        Node::Op(op::AND, v) if v.len() == 2 => {
-            for x in v {
-                if !expr::is_const(x) {
-                    unplaced_terms(x, sign, names, out, budget);
-                }
-            }
-        }
-        Node::MLoad(..) | Node::IntRet(..) | Node::Var(_) => {
-            out.push(format!(
-                "{}{}",
-                if sign > 0 { "+" } else { "-" },
-                emit::fmt_expr(e, names)
-            ));
-        }
-        _ => {}
-    }
-}
-
-fn debug_unplaced(name: &str, events: &[Event], layout: emit::MappingLayout, names: &Names) {
-    let mut seen = HashSet::new();
-    for ev in events {
-        for e in ev
-            .stmt
-            .iter()
-            .flat_map(lift::stmt_exprs)
-            .chain(ev.term.iter().flat_map(lift::term_exprs))
-        {
-            let mut stack = vec![e];
-            while let Some(x) = stack.pop() {
-                if !seen.insert(x) || seen.len() > 50_000 {
-                    continue;
-                }
-                if let Node::Op(op::SUB, _) = expr::node(x) {
-                    let mut coef = BTreeMap::new();
-                    let mut labels = HashMap::new();
-                    let mut budget = 256;
-                    linear_fields(x, 1, layout, names, &mut coef, &mut labels, &mut budget);
-                    let mut un = Vec::new();
-                    let mut b2 = 256;
-                    unplaced_terms(x, 1, names, &mut un, &mut b2);
-                    if coef.values().any(|c| *c < 0) && !un.is_empty() {
-                        let fields: Vec<String> = coef
-                            .iter()
-                            .filter(|(_, c)| **c != 0)
-                            .map(|(f, c)| {
-                                format!("{}{}", if *c > 0 { "+" } else { "-" }, labels[f])
-                            })
-                            .collect();
-                        eprintln!("[unplaced] {} fields={:?} unplaced={:?}", name, fields, un);
-                    }
-                }
-                stack.extend(expr::children(x));
-            }
-        }
-    }
-}
-
 fn linear_bound(e: ExprId, layout: emit::MappingLayout, names: &Names) -> Option<AvailBound> {
     let mut coef = BTreeMap::new();
     let mut labels = HashMap::new();
@@ -2693,10 +2566,6 @@ fn events_of_in(
         )
     };
     let loops = loop_nodes(l);
-    let dbg_memview = crate::debug::on("EVMDEC_DEBUG_MEMVIEW")
-        .then(|| std::env::var("EVMDEC_DEBUG_MEMVIEW").ok())
-        .flatten();
-    let dbg_unfresh = crate::debug::on("EVMDEC_DEBUG_UNFRESH");
     let mut out = Vec::new();
     let order = lift::reverse_postorder(l);
     // A helper's copies between its blocks can hold the only read of a call's answer.
@@ -2707,15 +2576,6 @@ fn events_of_in(
     }
     if !loops.is_empty() {
         let w = writes_of(ctx, loops.iter().map(|n| &l.nodes[*n]), &mut HashSet::new());
-        if dbg_unfresh {
-            eprintln!(
-                "loops in callee={:?} entry pc={}: writes={}",
-                callee,
-                l.nodes[l.entry].pc,
-                w.as_ref()
-                    .map_or("pointer".to_string(), |w| format!("{} slots", w.len()))
-            );
-        }
         forget_writes(mem, w);
     }
     for nid in order {
@@ -2771,33 +2631,7 @@ fn events_of_in(
                 let inlined = depth > 0 && ctx.internals.get(t).is_some_and(|f| f.lifted.is_some());
                 if !inlined {
                     let w = callee_writes(ctx, *t, &mut HashSet::new());
-                    if dbg_unfresh {
-                        eprintln!(
-                            "non-inlined call to {} from callee={:?} depth={}: writes={}",
-                            t,
-                            callee,
-                            depth,
-                            w.as_ref()
-                                .map_or("pointer".to_string(), |w| format!("{} slots", w.len()))
-                        );
-                    }
                     forget_writes(mem, w);
-                }
-            }
-            if let Some(want) = &dbg_memview {
-                if let Stmt::MStore { off, val, .. } = &s {
-                    let w =
-                        u64::from_str_radix(want.trim_start_matches("0x"), 16).unwrap_or(u64::MAX);
-                    if expr::as_const(*off) == Some(U256::from_u64(w)) {
-                        eprintln!(
-                            "memview store [{}] = {} (callee={:?} node={} pc={})",
-                            want,
-                            emit::fmt_expr(*val, &Names::default()),
-                            callee,
-                            nid,
-                            nd.pc
-                        );
-                    }
                 }
             }
             match &s {
@@ -2853,11 +2687,9 @@ fn events_of_in(
                                 }
                             }
                             out.push(Event {
-                                node: anchor,
                                 pc: nd.pc,
                                 callee,
                                 inst,
-                                inner: nid,
                                 path: path.clone(),
                                 stmt: Some(s.clone()),
                                 term: None,
@@ -2885,11 +2717,9 @@ fn events_of_in(
                 }
             }
             out.push(Event {
-                node: anchor,
                 pc: nd.pc,
                 callee,
                 inst,
-                inner: nid,
                 path: path.clone(),
                 stmt: Some(s),
                 term: None,
@@ -2898,11 +2728,9 @@ fn events_of_in(
         }
         let term = lift::map_term(&nd.term, &|e| apply(e, mem));
         out.push(Event {
-            node: anchor,
             pc: nd.pc,
             callee,
             inst,
-            inner: nid,
             path: path.clone(),
             stmt: None,
             term: Some(term),
@@ -4084,20 +3912,6 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                         .and_then(|w0| emit::leading_selector(w0, in_len_c));
                     let selector_known =
                         selector.is_some() || expr::as_const(*in_len) == Some(U256::ZERO);
-                    if crate::debug::on("EVMDEC_DEBUG_CALLS") {
-                        eprintln!(
-                            "call pc={} fn={} sel={:?} head=[{}] in_len={}",
-                            ev.pc,
-                            f.name,
-                            selector,
-                            input_head
-                                .iter()
-                                .map(|w| emit::fmt_expr(*w, names))
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            emit::fmt_expr(*in_len, names)
-                        );
-                    }
                     let words_view: Option<&Vec<ExprId>> =
                         input.as_ref().or(if input_head.is_empty() {
                             None
@@ -4149,18 +3963,11 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                     // code then trusts. The rules about what a call changes stay with calls that can.
                     let plain = *kind == op::CALL || *kind == op::CALLCODE;
                     if plain || *kind == op::STATICCALL {
-                        let later_write = plain && events[i + 1..].iter().any(|e2| {
-                            let hit = matches!(&e2.stmt, Some(Stmt::SStore { .. }))
-                                && ev_reaches(&ctx, l, ev, e2);
-                            if hit && crate::debug::on("EVMDEC_DEBUG_REENTRANCY") {
-                                eprintln!(
-                                    "[reentrancy] {} call pc={} inst={} inner={} node={} callee={:?} -> store pc={} inst={} inner={} node={} callee={:?}: {}",
-                                    f.name, ev.pc, ev.inst, ev.inner, ev.node, ev.callee, e2.pc, e2.inst, e2.inner, e2.node, e2.callee,
-                                    e2.stmt.as_ref().map(|st| emit::fmt_stmt(st, names)).unwrap_or_default()
-                                );
-                            }
-                            hit
-                        });
+                        let later_write = plain
+                            && events[i + 1..].iter().any(|e2| {
+                                matches!(&e2.stmt, Some(Stmt::SStore { .. }))
+                                    && ev_reaches(&ctx, l, ev, e2)
+                            });
                         let hook = selector.is_some_and(|s| CALLBACK_SELECTORS.contains(&s));
                         if later_write && !precompile {
                             let (id, sev, conf, extra) = if guarded_calls.contains(&i) {
@@ -5479,16 +5286,6 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
         });
     }
 
-    if crate::debug::on("EVMDEC_DEBUG_LOCKS") {
-        for (slot, fs) in &lock_slots {
-            eprintln!(
-                "[locks] slot {:?} used by {} function(s): {:?}",
-                expr::as_const(*slot).map(|c| c.to_hex()),
-                fs.len(),
-                fs.iter().map(|pc| format!("{:#x}", pc)).collect::<Vec<_>>()
-            );
-        }
-    }
     // The compilers with this fault gave every function a slot of its own. Three locks that
     // several functions share are three named locks from a compiler that works. A version
     // the trailer names and that is not one of the three is taken at its word.
@@ -5963,22 +5760,6 @@ fn capped_slots(c: &Contract) -> HashMap<U256, u64> {
             }
         }
     }
-    if crate::debug::on("EVMDEC_DEBUG_CAPS") {
-        for (k, ws) in &writes {
-            eprintln!(
-                "[caps] slot {} writes: {:?} bounds: {:?}",
-                k.to_decimal(),
-                ws.iter()
-                    .map(|(fi, v)| format!("fn{}={}", fi, emit::fmt_expr(*v, &Names::default())))
-                    .collect::<Vec<_>>(),
-                bounds
-                    .iter()
-                    .filter(|((_, kk), _)| kk == k)
-                    .map(|((fi, _), c)| format!("fn{}<{}", fi, c))
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
     let mut out = HashMap::new();
     'slots: for (k, ws) in writes {
         let mut cap = 0u64;
@@ -6095,17 +5876,6 @@ fn reverse_quote(
         SEL_TRANSFER_FROM => {
             let to = emit::shifted_word_len(words, 1, in_len);
             let amt = emit::shifted_word_len(words, 2, in_len);
-            if crate::debug::on("EVMDEC_DEBUG_RQ") {
-                eprintln!(
-                    "[rq] transferFrom to={} amt={} to_this={} div={} bound={:?} words={}",
-                    emit::fmt_expr(to, &names),
-                    emit::fmt_expr(amt, &names),
-                    mentions(to, &|n| matches!(n, Node::Env(op::ADDRESS, _))),
-                    computed_by_division(ctx, events, amt),
-                    only_nonzero_bound(ctx, l, events, amt),
-                    words.len()
-                );
-            }
             if !mentions(to, &|n| matches!(n, Node::Env(op::ADDRESS, _))) {
                 return None;
             }
@@ -6420,15 +6190,6 @@ fn trust_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 .is_some_and(|k| x.auth_slots.iter().any(|(s, _)| slot_const(*s) == Some(k)));
             if gate_target || (target_slot.is_none() && !from_calldata(unmask(d.key))) {
                 continue;
-            }
-            if crate::debug::on("EVMDEC_DEBUG_TRUST") {
-                eprintln!(
-                    "[trust] {} debit {} key={:?} allowances={:?}",
-                    x.name,
-                    d.account_text,
-                    unmask(d.key),
-                    x.allowance_of
-                );
             }
             if from_caller(d.key)
                 || x.allowance_of.contains(&unmask(d.key))
@@ -6988,27 +6749,6 @@ fn mark_handoffs(
             u.function == index && target && model.of(u.value).open()
         });
         let through_callee = f.linked_calls.iter().find_map(|call| handed_on(ctx, call));
-        if crate::debug::on("EVMDEC_DEBUG_HANDOFF") {
-            let calls: Vec<String> = f
-                .linked_calls
-                .iter()
-                .map(|c| {
-                    format!(
-                        "{}:{:x?}:after={}",
-                        &c.address[..8],
-                        c.selector,
-                        c.acts_after
-                    )
-                })
-                .collect();
-            eprintln!(
-                "[handoff] {} {} open={filled_by_callers} word={:?} payees={} calls={calls:?}",
-                ctx.c.address.as_deref().unwrap_or("?"),
-                f.name,
-                f.input_callee,
-                f.payees.iter().filter(|p| worked_out(**p)).count(),
-            );
-        }
         let handed = if filled_by_callers {
             Handed {
                 to: String::from("an address read from storage that any caller can fill"),

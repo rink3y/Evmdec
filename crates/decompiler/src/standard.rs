@@ -551,20 +551,14 @@ fn others(bench: &mut Bench, report: &mut Report, open: &HashSet<Loc>) {
     let Some(transfer) = bench.function(SEL_TRANSFER) else {
         return;
     };
-    let trace = crate::debug::on("EVMDEC_DEBUG_OTHERS");
-    let said = |what: &str| {
-        if trace {
-            eprintln!("[others] {what}");
-        }
-    };
     let Some(held) = bench.holding() else {
-        return said("no state in which the holder is reported to hold tokens");
+        return;
     };
     let Some(given) = bench.sent(transfer, &held) else {
-        return said("the holder could not pass tokens on");
+        return;
     };
     let Some(root) = scaled_ledger(&bench.moves(&given), HOLDER) else {
-        return said("no ledger entry fell when the holder passed tokens on");
+        return;
     };
     // Any account may hold tokens, so an entry of the ledger is left for the search to
     // fill. Without that a function that takes from an account stops for lack of a balance
@@ -601,12 +595,6 @@ fn others(bench: &mut Bench, report: &mut Report, open: &HashSet<Loc>) {
             ..flat
         };
         let found = bench.explorer(f).explore(&start, &free, OTHER_LIMITS);
-        let acted = |q: &&Path| q.succeeded() && q.run.storage != q.inputs.storage;
-        said(&format!(
-            "{}: {} runs changed storage",
-            f.name,
-            found.iter().filter(acted).count()
-        ));
         for q in found {
             // A signed message is the holder's own permission, and no run here signs one.
             let signed = q.run.calls.iter().any(|c| c.addr == RECOVER);

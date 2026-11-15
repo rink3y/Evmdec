@@ -271,54 +271,6 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            if std::env::var("EVMDEC_DEBUG").is_ok() {
-                for (f, u) in &rec.functions {
-                    let calls = u.nodes.iter().filter(|n| n.call.is_some()).count();
-                    let rets: Vec<String> = u
-                        .nodes
-                        .iter()
-                        .filter_map(|n| n.returns_via.map(|v| format!("{:?}", v)))
-                        .collect();
-                    let unres: Vec<String> = u
-                        .nodes
-                        .iter()
-                        .filter(|n| n.unresolved)
-                        .map(|n| format!("{:#x}", prog.blocks[n.block].end))
-                        .collect();
-                    println!(
-                        "  function {:#x}: nodes={} calls={} returns_via={:?} unresolved={:?}",
-                        prog.blocks[*f].start,
-                        u.nodes.len(),
-                        calls,
-                        rets.iter().take(3).collect::<Vec<_>>(),
-                        unres
-                    );
-                }
-                for (b, u) in &rec.orphans {
-                    let unres: Vec<String> = u
-                        .nodes
-                        .iter()
-                        .filter(|n| n.unresolved)
-                        .map(|n| format!("{:#x}", prog.blocks[n.block].end))
-                        .collect();
-                    if !unres.is_empty() || u.nodes.len() > 1 {
-                        println!(
-                            "  orphan {:#x}: nodes={} unresolved={:?}",
-                            prog.blocks[*b].start,
-                            u.nodes.len(),
-                            unres
-                        );
-                    }
-                }
-                let unres: Vec<String> = rec
-                    .main
-                    .nodes
-                    .iter()
-                    .filter(|n| n.unresolved)
-                    .map(|n| format!("{:#x}", prog.blocks[n.block].end))
-                    .collect();
-                println!("  main unresolved={:?}", unres);
-            }
         }
         Cmd::Decompile {
             input,

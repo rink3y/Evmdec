@@ -1234,14 +1234,6 @@ impl<'a> Analysis<'a> {
             if list.len() >= MAX_BLOCK_CONTEXTS {
                 return list[0];
             }
-            if crate::debug::on("EVMDEC_DEBUG_CTX") && !list.is_empty() {
-                eprintln!(
-                    "[ctx] block {:#x}: new context {:?} vs existing {:?}",
-                    prog.blocks[blk].start,
-                    key.1,
-                    nodes[list[0]].entry.sig(prog)
-                );
-            }
             let id = nodes.len();
             list.push(id);
             nodes.push(UNode {

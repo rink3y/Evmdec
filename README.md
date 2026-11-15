@@ -533,8 +533,6 @@ remote nodes in at most 240 seconds, and code over 1 MiB is refused.
 | `EVMDEC_TIMING` | print the time spent in each stage |
 | `PORT` | listening port of the server, default 8080 |
 
-Variables starting with `EVMDEC_DEBUG_` print traces of one stage and are for development.
-
 ## Development
 
 ```sh

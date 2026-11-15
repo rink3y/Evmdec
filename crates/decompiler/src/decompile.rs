@@ -765,25 +765,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             by_block.push((*b, l));
         }
         let mut sums = HashMap::new();
-        let debug_sum = crate::debug::on("EVMDEC_DEBUG_SUMMARY");
         for (b, l) in &by_block {
-            if debug_sum {
-                eprintln!(
-                    "[summary] round {} function {:#x}:",
-                    _round, prog.blocks[*b].start
-                );
-            }
             if let Some(sm) = lift::summarize(l) {
-                if debug_sum {
-                    eprintln!(
-                        "[summary]   ok: returns {} mstores {} copies {} maybe {} guards {}",
-                        sm.returns.len(),
-                        sm.mstores.len(),
-                        sm.copies.len(),
-                        sm.maybe_mstores.len(),
-                        sm.guards.len()
-                    );
-                }
                 sums.insert(*b, sm);
             }
         }
@@ -1974,13 +1957,12 @@ pub fn make_names(
 }
 
 fn refine_types(functions: &mut [Function], env: &TypeEnv) {
-    let debug = crate::debug::on("EVMDEC_DEBUG_TYPES");
     for f in functions.iter_mut() {
         let Some(l) = &f.lifted else { continue };
         match f.kind {
             FnKind::External => {
                 refine_params(f.pc, &mut f.params, env);
-                refine_returns(&mut f.returns, l, f.pc, &f.name, env, debug);
+                refine_returns(&mut f.returns, l, f.pc, env);
             }
             FnKind::Internal => {
                 f.params = internal_params(l, f.pc, f.n_args, env);
@@ -2006,14 +1988,7 @@ fn refine_params(pc: usize, params: &mut [Param], env: &TypeEnv) {
     }
 }
 
-fn refine_returns(
-    returns: &mut [String],
-    l: &Lifted,
-    pc: usize,
-    name: &str,
-    env: &TypeEnv,
-    debug: bool,
-) {
+fn refine_returns(returns: &mut [String], l: &Lifted, pc: usize, env: &TypeEnv) {
     let rets: Vec<&[ExprId]> = l
         .nodes
         .iter()
@@ -2041,16 +2016,6 @@ fn refine_returns(
         }
         if ty != "uint256" {
             continue;
-        }
-        if debug {
-            eprintln!(
-                "[types] return {} of {} (pc {:#x}): {:?} from {:?}",
-                i,
-                name,
-                pc,
-                t,
-                rets.iter().map(|w| expr::node(w[i])).collect::<Vec<_>>()
-            );
         }
         if let Some(t) = t.solidity() {
             *ty = t;

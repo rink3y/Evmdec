@@ -215,7 +215,6 @@ pub struct TypeEnv {
     // Vyper validates by range checks and never masks a value to its declared width.
     // A mask or shift there is the program's own arithmetic.
     vyper: bool,
-    debug: bool,
     ids: HashMap<Loc, usize>,
     classes: Vec<Class>,
     // Sequence numbers are per lifted graph, so the function scopes them.
@@ -248,7 +247,6 @@ pub fn solve(
     let mut env = TypeEnv {
         layout,
         vyper: layout == MappingLayout::Vyper,
-        debug: crate::debug::on("EVMDEC_DEBUG_TYPES"),
         ids: HashMap::new(),
         classes: Vec::new(),
         callee_of: HashMap::new(),
@@ -287,9 +285,6 @@ pub fn solve(
     if env.keys_are_words() {
         env.propagate();
         env.run();
-    }
-    if env.debug {
-        env.debug_dump();
     }
     env
 }
@@ -341,11 +336,6 @@ impl TypeEnv {
 
     fn arith(&mut self, e: ExprId, scope: usize, by: u8) {
         let loc = self.location(e, scope);
-        if self.debug {
-            if let Some(l) = &loc {
-                eprintln!("[types] arith on {:?} by {}", l, op::name(by));
-            }
-        }
         let scaled = matches!(
             by,
             op::MUL | op::DIV | op::SDIV | op::MOD | op::SMOD | op::EXP | op::MULMOD
@@ -797,17 +787,6 @@ impl TypeEnv {
                     continue;
                 }
                 let loc = self.location(x, scope);
-                if self.debug {
-                    if let Some(l) = &loc {
-                        eprintln!(
-                            "[types] mask {} on {:?} under {:?}: {:?}",
-                            m.bits(),
-                            l,
-                            parent.map(op::name),
-                            expr::node(x)
-                        );
-                    }
-                }
                 self.hint(loc, Ty::of_mask(m.bits()));
             } else if let Some(bytes) = high_mask_bytes(m) {
                 // Under an OR this mask keeps the rest of a packed word while one field is
@@ -930,36 +909,6 @@ impl TypeEnv {
             if !changed {
                 break;
             }
-        }
-    }
-
-    fn debug_dump(&self) {
-        let mut locs: Vec<(&Loc, &usize)> = self.ids.iter().collect();
-        locs.sort_by_key(|(_, i)| **i);
-        for (loc, i) in locs {
-            let c = &self.classes[*i];
-            if c.resolved == Ty::Unknown && c.hints == Ty::Unknown && c.weak == Ty::Unknown {
-                continue;
-            }
-            let defs: Vec<String> = c
-                .defs
-                .iter()
-                .take(4)
-                .map(|(e, _)| format!("{:?}", expr::node(*e)))
-                .collect();
-            eprintln!(
-                "[types] #{} {:?}: {:?} (defs {:?} x{} {:?}, hints {:?}, weak {:?}, {:?}, from {:?})",
-                i,
-                loc,
-                c.resolved,
-                c.from_defs,
-                c.defs.len(),
-                defs,
-                c.hints,
-                c.weak,
-                c.flags,
-                c.sources
-            );
         }
     }
 

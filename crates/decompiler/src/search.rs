@@ -1104,22 +1104,6 @@ impl<'a> Search<'a> {
                 self.help(from, index, ACTOR);
             }
         }
-        if crate::debug::on("EVMDEC_DEBUG_SEARCH") {
-            let seeded = self.entries.iter().filter(|e| !e.seeds.is_empty()).count();
-            let holding = self
-                .kept
-                .iter()
-                .filter(|k| k.world.holds_value(exec::SELF))
-                .count();
-            eprintln!(
-                "[search] work={} entries={} seeded={seeded} rounds={rounds} kept={} holding={holding} covered={} broken={}",
-                exec::work(),
-                self.entries.len(),
-                self.kept.len(),
-                self.covered.len(),
-                self.best.is_some()
-            );
-        }
     }
 }
 

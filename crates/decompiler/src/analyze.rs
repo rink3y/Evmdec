@@ -305,6 +305,8 @@ struct FnFacts {
     caller_checked: bool,
     auth_slots: Vec<(ExprId, String)>,
     const_writes: Vec<(ExprId, WriteSource, String)>,
+    settings: Vec<String>,
+    reads_caller: bool,
     ether_out: Vec<(ExprId, ExprId, String)>,
     selfdestructs: Vec<(ExprId, String)>,
     delegatecalls: Vec<(ExprId, String)>,
@@ -345,6 +347,7 @@ struct Debit {
     key: ExprId,
     account_text: String,
     line: String,
+    own: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -702,6 +705,69 @@ fn is_time_cond(cond: ExprId) -> bool {
     })
 }
 
+// Whether the condition says the caller is the account, and on which side of it.
+fn caller_is(cond: ExprId, account: ExprId) -> Option<bool> {
+    let sender = |e: ExprId| matches!(expr::node(unmask(e)), Node::Env(op::CALLER, _));
+    let named = |e: ExprId| unmask(e) == unmask(account);
+    let pair = |v: &[ExprId]| (sender(v[0]) && named(v[1])) || (sender(v[1]) && named(v[0]));
+    match expr::node(cond) {
+        Node::Op(op::EQ, v) if pair(&v) => Some(true),
+        Node::Op(op::SUB | op::XOR, v) if pair(&v) => Some(false),
+        Node::Op(op::ISZERO, v) => caller_is(v[0], account).map(|side| !side),
+        _ => None,
+    }
+}
+
+// A write that every path reaches only after the caller was found to be the account is a
+// write to the caller's own entry, whether the other side of the test reverts or leaves
+// without a word.
+fn only_for_caller(
+    ctx: &Ctx,
+    f: &Function,
+    before: &[Event],
+    write: &Event,
+    account: ExprId,
+) -> bool {
+    let Some(top) = &f.lifted else {
+        return false;
+    };
+    before.iter().any(|test| {
+        if let Some(Stmt::Require { cond, .. }) = &test.stmt {
+            return caller_is(*cond, account) == Some(true);
+        }
+        let Some(Term::Branch { cond, t, f }) = &test.term else {
+            return false;
+        };
+        let Some(side) = caller_is(*cond, account) else {
+            return false;
+        };
+        let level = test.path.len() - 1;
+        let outer = |e: &Event| e.path.get(..level).map(<[_]>::to_vec);
+        let Some((_, _, written)) = write.path.get(level) else {
+            return false;
+        };
+        if outer(test) != outer(write) || test.path[level].0 != write.path[level].0 {
+            return false;
+        }
+        let graph = match level {
+            0 => Some(top),
+            _ => {
+                let inner = test.path[level].1.and_then(|pc| ctx.internals.get(&pc));
+                inner.and_then(|c| c.lifted.as_ref())
+            }
+        };
+        let Some(graph) = graph else {
+            return false;
+        };
+        let (same, other) = match side {
+            true => (*t, Some(*f)),
+            false => (Some(*f), *t),
+        };
+        let reached = |from: Option<usize>| from.is_some_and(|n| ctx.reaches(graph, n, *written));
+        reached(same) && !reached(other)
+    })
+}
+
 fn reads_slot(e: ExprId, slot: ExprId) -> bool {
     mentions(e, &|n| matches!(n, Node::SLoad(k, false, _) if *k == slot))
 }
@@ -725,6 +791,8 @@ fn collect_facts(
         caller_checked,
         auth_slots: Vec::new(),
         const_writes: Vec::new(),
+        settings: Vec::new(),
+        reads_caller: false,
         ether_out: Vec::new(),
         selfdestructs: Vec::new(),
         delegatecalls: Vec::new(),
@@ -829,6 +897,7 @@ fn collect_facts(
                             key: account,
                             account_text: emit::fmt_expr(account, names),
                             line: emit::fmt_stmt(st, names),
+                            own: only_for_caller(ctx, f, &events[..at], ev, account),
                         });
                     }
                 }
@@ -1002,6 +1071,32 @@ fn collect_facts(
     facts.moves_value = !facts.ether_out.is_empty()
         || !facts.debits.is_empty()
         || call_selector.values().any(|s| *s == SEL_TRANSFER);
+    let by_caller = |e: ExprId| mentions(e, &|n| matches!(n, Node::Env(op::CALLER, _)));
+    facts.reads_caller = events.iter().any(|ev| match (&ev.stmt, &ev.term) {
+        (_, Some(Term::Branch { cond, .. })) => by_caller(*cond),
+        (Some(Stmt::Require { cond, .. }), _) => by_caller(*cond),
+        _ => false,
+    });
+    let plain = events.iter().all(|ev| match &ev.stmt {
+        Some(Stmt::Call { .. } | Stmt::Create { .. }) => false,
+        Some(Stmt::SStore { key, val, .. }) => !by_caller(*key) && !by_caller(*val),
+        _ => true,
+    });
+    if plain {
+        facts.settings = events
+            .iter()
+            .filter_map(|ev| match &ev.stmt {
+                Some(
+                    st @ Stmt::SStore {
+                        val,
+                        transient: false,
+                        ..
+                    },
+                ) if input_outside_loads(*val) => Some(emit::fmt_stmt(st, names)),
+                _ => None,
+            })
+            .collect();
+    }
     let mut outflows: Vec<ExprId> = facts.ether_out.iter().map(|(_, v, _)| *v).collect();
     let mut candidates: Vec<(AvailBound, ExprId)> = Vec::new();
     let mut seen = HashSet::new();
@@ -1690,6 +1785,21 @@ fn forget_writes(mem: &mut lift::MemView, writes: Option<Vec<(ExprId, Option<u64
 
 fn mentions(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
     expr::contains(e, pred)
+}
+fn input_outside_loads(e: ExprId) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        match expr::node(x) {
+            Node::CallDataLoad(_) | Node::CopiedWord(op::CALLDATACOPY, _, _) => return true,
+            Node::SLoad(..) => {}
+            _ => stack.extend(expr::children(x)),
+        }
+    }
+    false
 }
 fn mentions_outside(e: ExprId, target: ExprId, excluded: ExprId) -> bool {
     let mut seen = HashSet::new();
@@ -4132,7 +4242,8 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                     }
                                     _ => false,
                                 });
-                                if from_user && !allowance && !signed {
+                                let own = only_for_caller(&ctx, f, &events[..i], ev, from);
+                                if from_user && !allowance && !signed && !own {
                                     push(&mut findings, "arbitrary-transferfrom", "transferFrom with a caller-chosen `from` address", Severity::High, Confidence::Medium, Some(f), Some(ev.pc),
                                         format!("`{}` calls `transferFrom({}, …)` on `{}` where `from` comes from calldata, with no msg.sender check, no allowance bookkeeping keyed by the caller and no signature. Anyone can move tokens that other users approved to this contract.", f.name, emit::fmt_expr(from, names), target),
                                         vec![line.clone()], "Only transfer from msg.sender, or check an allowance/signature that the `from` account granted to the caller.");
@@ -5531,6 +5642,7 @@ fn settle(c: &Contract, mut findings: Vec<Finding>) -> Vec<Finding> {
             observed: Vec::new(),
         });
     }
+    crate::weigh::rate(&mut findings);
     findings.sort_by(|a, b| {
         a.severity
             .cmp(&b.severity)
@@ -6074,7 +6186,7 @@ fn trust_findings(ctx: &Ctx, facts: &[FnFacts], findings: &mut Vec<Finding>) {
             continue;
         }
         for d in &x.debits {
-            if !ledgers.contains(&d.root) {
+            if d.own || !ledgers.contains(&d.root) {
                 continue;
             }
             let target_slot = ssa::stored_address_slot(d.key).and_then(slot_const);
@@ -6269,6 +6381,10 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
     for g in followers.iter().filter(|g| !g.init_guarded) {
         gated_slots.extend(g.const_writes.iter().map(|(s, _, _)| *s));
     }
+    let setters = followers
+        .iter()
+        .filter(|g| !g.init_guarded && !g.settings.is_empty())
+        .count();
     let gated_pays_storage = followers
         .iter()
         .any(|g| g.ether_out.iter().any(|(a, _, _)| from_storage(*a)));
@@ -6343,6 +6459,17 @@ fn policy_findings(facts: &[FnFacts], findings: &mut Vec<Finding>) {
                 does.push(
                     "writes a storage slot that is otherwise written only behind the check".into(),
                 );
+                raise(&mut sev, Severity::Medium);
+                evidence.push(line.clone());
+            }
+        }
+        let open =
+            !x.reads_caller && !x.init_guarded && !x.account_authorised && !x.signature_authorised;
+        if open && setters >= 2 && does.is_empty() {
+            if let Some(line) = x.settings.first() {
+                does.push(format!(
+                    "stores a value its caller chooses, which {setters} checked functions also do"
+                ));
                 raise(&mut sev, Severity::Medium);
                 evidence.push(line.clone());
             }

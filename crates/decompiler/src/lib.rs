@@ -47,4 +47,5 @@ pub mod structure;
 pub mod type_rules;
 pub mod types;
 pub mod verify;
+mod weigh;
 pub mod world;

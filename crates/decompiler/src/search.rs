@@ -3,9 +3,12 @@ use crate::analyze::{display_name, push, Confidence, Finding, Severity};
 use crate::decompile::{Contract, Function};
 use crate::deploy;
 use crate::exec;
+use crate::expr::{self, ExprId, Node};
 use crate::function::FnKind;
 use crate::hex;
 use crate::interp::Rng;
+use crate::lift::{Stmt, Term};
+use crate::opcode as op;
 use crate::path::{self, Explorers, Limits, Path};
 use crate::solve::{word, Free, Inputs};
 use crate::u256::U256;
@@ -35,6 +38,7 @@ const MAX_POSITIONS: usize = 96;
 const MAX_SET_SLOTS: usize = 64;
 const MAX_SPLITS: usize = 24;
 const MAX_FRESH_STARTS: usize = 48;
+const MAX_ROLE_TRIES: usize = 16;
 const SEED_LIMITS: Limits = Limits { paths: 6, runs: 18 };
 const FIRST_VALUE: u64 = 0x1001;
 const STAKE: U256 = U256([0, 1 << 16, 0, 0]);
@@ -52,6 +56,54 @@ struct Entry<'a> {
     seeds: Vec<(Vec<u8>, U256)>,
     reads: BTreeSet<U256>,
     helped: HashSet<usize>,
+}
+
+// The slots whose stored address some check compares the caller with. Holding one is
+// what lets an account past that check.
+fn role_slots(c: &Contract) -> BTreeSet<U256> {
+    let bare = |e: ExprId| match expr::node(e) {
+        Node::Op(op::AND, v) if expr::as_const(v[1]) == Some(expr::mask_bits(160)) => v[0],
+        _ => e,
+    };
+    let caller = |e: ExprId| matches!(expr::node(bare(e)), Node::Env(op::CALLER, _));
+    let slot = |e: ExprId| match expr::node(bare(e)) {
+        Node::SLoad(k, false, _) => expr::as_const(k),
+        _ => None,
+    };
+    let mut out = BTreeSet::new();
+    let graphs = c.functions.iter().filter_map(|f| f.lifted.as_ref());
+    for nd in graphs.flat_map(|l| l.nodes.iter()) {
+        let required = nd.stmts.iter().filter_map(|s| match s {
+            Stmt::Require { cond, .. } => Some(*cond),
+            _ => None,
+        });
+        let branched = match &nd.term {
+            Term::Branch { cond, .. } => Some(*cond),
+            _ => None,
+        };
+        let mut stack: Vec<ExprId> = required.chain(branched).collect();
+        let mut seen = HashSet::new();
+        while let Some(e) = stack.pop() {
+            if !seen.insert(e) || seen.len() > MAX_READS {
+                continue;
+            }
+            if let Node::Op(op::EQ | op::SUB | op::XOR, v) = expr::node(e) {
+                let pairs = [(v[0], v[1]), (v[1], v[0])];
+                let named = pairs.iter().filter(|(a, _)| caller(*a));
+                out.extend(named.filter_map(|(_, b)| slot(*b)));
+            }
+            stack.extend(expr::children(e));
+        }
+    }
+    out
+}
+
+// What a call by the account with no role did to a slot that names who a check lets
+// through.
+struct Role {
+    steps: Vec<Step>,
+    slot: U256,
+    taken: bool,
 }
 
 #[derive(Clone)]
@@ -155,6 +207,9 @@ struct Search<'a> {
     exits: Vec<usize>,
     renamed: Vec<(usize, Call)>,
     rounded: Option<Rounded>,
+    roles: BTreeSet<U256>,
+    role: Option<Role>,
+    role_tries: usize,
     // How often each function has been tried in two parts.
     splits: HashMap<usize, usize>,
     // Whether both accounts were given some of the contract's own token to start with.
@@ -368,6 +423,9 @@ impl<'a> Search<'a> {
             exits: Vec::new(),
             renamed: Vec::new(),
             rounded: None,
+            roles: role_slots(c),
+            role: None,
+            role_tries: 0,
             splits: HashMap::new(),
             staked,
         }
@@ -664,6 +722,29 @@ impl<'a> Search<'a> {
         Some(world)
     }
 
+    // Empty storage cannot tell a first set-up from a takeover. The last step is run
+    // again with the role held by another account.
+    fn takes_from_holder(&self, steps: &[Step], slot: U256) -> Option<bool> {
+        let (Step::Call(index, call), earlier) = steps.split_last()? else {
+            return None;
+        };
+        let mut world = self.replayed(earlier)?;
+        let mask = expr::mask_bits(160);
+        let held = world.stored(exec::SELF, slot);
+        world.seed(exec::SELF, slot, (held & !mask) | OTHER);
+        let plain = Call {
+            swing: None,
+            ..call.clone()
+        };
+        let done = world.call(self.entries[*index].at, &plain);
+        let now = world.stored(exec::SELF, slot) & mask;
+        match done.ended && !done.asked {
+            true if now == ACTOR => Some(true),
+            true if now.is_zero() => Some(false),
+            _ => None,
+        }
+    }
+
     // What a step that ended leaves: the properties are checked on it, and it is kept
     // to continue from when it is somewhere new.
     fn settle(
@@ -738,6 +819,35 @@ impl<'a> Search<'a> {
             if done.crossed && costs && self.rounded.is_none() && tries < MAX_SPLITS {
                 self.splits.insert(*index, tries + 1);
                 self.rounded = self.split(parent, &world, *index, call, &steps);
+            }
+        }
+        let unpaid = match steps.last() {
+            Some(Step::Call(_, call)) => call.value.is_zero(),
+            _ => false,
+        };
+        // An account let past a check by what it paid has bought its place. A call
+        // that went through because an unknown contract said yes shows nothing.
+        if by_actor && plain && unpaid && !done.asked && self.role_tries < MAX_ROLE_TRIES {
+            let low = |v: U256| v & expr::mask_bits(160);
+            let named = |w: &&crate::world::Write| {
+                let role = w.address == exec::SELF && self.roles.contains(&w.slot);
+                role && (low(w.after) == ACTOR || low(w.after).is_zero())
+            };
+            let slots: BTreeSet<U256> = done.writes.iter().filter(named).map(|w| w.slot).collect();
+            for slot in slots {
+                self.role_tries += 1;
+                let taken = self.takes_from_holder(&steps, slot);
+                let better = self
+                    .role
+                    .as_ref()
+                    .is_none_or(|r| taken == Some(true) && !r.taken);
+                if let (Some(taken), true) = (taken, better) {
+                    self.role = Some(Role {
+                        steps: steps.clone(),
+                        slot,
+                        taken,
+                    });
+                }
             }
         }
         let fell = by_actor && plain && gained(&other, &parent.other);
@@ -1363,6 +1473,50 @@ fn report_less(search: &Search, less: &Less, out: &mut Vec<Finding>) {
     }
 }
 
+fn report_role(search: &Search, role: &Role, out: &mut Vec<Finding>) {
+    let Some((Step::Call(entry, last), earlier)) = role.steps.split_last() else {
+        return;
+    };
+    let function = search.entries[*entry].function;
+    let (id, title, severity, now, advice) = match role.taken {
+        true => (
+            "caller-gives-itself-a-role",
+            "An account with no role makes itself the one a check lets through",
+            Severity::High,
+            "was first given to another account, and after the last call it holds the caller's address, so the caller passes a check it did not pass before",
+            "Let only the account the slot already names, or one it has agreed to, change who it names.",
+        ),
+        false => (
+            "caller-clears-a-role",
+            "An account with no role removes the one a check lets through",
+            Severity::Medium,
+            "was first given to another account, and after the last call it holds none, so no account passes that check any more",
+            "Let only the account the slot names give the role up.",
+        ),
+    };
+    push(
+        out,
+        id,
+        title,
+        severity,
+        Confidence::High,
+        Some(function),
+        None,
+        format!(
+            "Starting from {}, {} call(s) were made, the last to `{}` by an account with no role, sending no ether and asking no outside contract anything. Every call ended normally. Some function compares its caller with the address in slot {} and lets only that one through. That slot {now}.",
+            search.started_from(),
+            role.steps.len(),
+            function.name,
+            role.slot.to_hex(),
+        ),
+        Vec::new(),
+        advice,
+    );
+    if let Some(finding) = out.last_mut() {
+        attach(finding, earlier, last);
+    }
+}
+
 fn attach(finding: &mut Finding, earlier: &[Step], last: &Call) {
     finding.setup = shown(earlier);
     finding.confirmed = true;
@@ -1481,6 +1635,9 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     // A gain through the same function already says what that function lets happen.
     if let Some(less) = search.less.take().filter(|l| last(&l.steps) != gain_at) {
         report_less(&search, &less, out);
+    }
+    if let Some(role) = search.role.take() {
+        report_role(&search, &role, out);
     }
     if let Some(lowered) = search.lowered.take() {
         report_lowered(&search, &lowered, out);

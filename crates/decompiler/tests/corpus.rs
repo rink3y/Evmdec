@@ -537,6 +537,26 @@ fn tribe_reads_as_source_and_is_rated_by_its_logic() {
 }
 
 #[test]
+fn a_rule_stays_silent_where_it_was_once_wrong() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/false_alarms");
+    let text = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+    let listed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let cases = listed.as_object().unwrap();
+    let mut checked = 0;
+    for (name, case) in cases.iter().filter(|(name, _)| !name.starts_with('_')) {
+        let hex = std::fs::read_to_string(dir.join(format!("{name}.hex"))).unwrap();
+        let code = evmdec::hex::decode(hex.trim()).unwrap();
+        let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+        let r = evmdec::analyze::analyze(&c);
+        let rule = case["rule"].as_str().unwrap();
+        let fired: Vec<_> = r.findings.iter().filter(|f| f.id == rule).collect();
+        assert!(fired.is_empty(), "{name}: {rule} fired: {fired:?}");
+        checked += 1;
+    }
+    assert!(checked > 0);
+}
+
+#[test]
 fn lobby_calls_into_its_own_deployment() {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/lobby.hex");
     let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();

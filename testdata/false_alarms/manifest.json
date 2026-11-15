@@ -1,0 +1,9 @@
+{
+  "_comment": "Deployed contracts on which a rule once reported something that is not there. Each entry names the rule that must stay silent on that contract and says why the finding was wrong.",
+  "classic_85deeaf2": {
+    "address": "0x85deeaf2ba09efe9ef236bf43e5347c8cda3af9a",
+    "chain": "classic",
+    "rule": "third-party-balance-debit",
+    "why": "the three-word transfer lowers the named account only on the branch where that account is the caller, and leaves without reverting otherwise"
+  }
+}

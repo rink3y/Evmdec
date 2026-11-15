@@ -170,7 +170,7 @@ substituted. No rule names a contract, a protocol, a token or an address.
 |---|---|
 | calls | reentrancy (lock recognised only when a slot is tested, set and restored; ERC721, ERC1155 and ERC777 hooks; severity by reachability), unchecked call and token results, arbitrary and run-time dispatched `call` and `delegatecall`, `transferFrom` on a caller-chosen account, decisions trusted to a caller-supplied contract, calls in loops, blocking payout loops |
 | value | reverse-quoted amounts, payouts without a slippage bound, spot balances as a price, fee-on-transfer assumptions, division before multiplication, `msg.value` reused in loops and multicalls, unbounded payout parameters, wrapping arithmetic on pre-0.8 compilers and inside `unchecked` blocks |
-| authority | owner and initializer writes without access control, silent authorisation failures, `tx.origin`, `selfdestruct` by reachability, unprotected upgrades, ether withdrawable by anyone (sending back what the same call brought is a refund and is not counted), a caller check that is one half of a joined condition, access control by intent (`inconsistent-access-control`), attack chains (a write anyone can make paired with the function that trusts it) |
+| authority | owner and initializer writes without access control, silent authorisation failures, `tx.origin`, `selfdestruct` by reachability, unprotected upgrades, ether withdrawable by anyone (sending back what the same call brought is a refund and is not counted), a caller check that is one half of a joined condition, access control by intent (`inconsistent-access-control`: a function that never reads its caller and writes what checked functions write, or stores a value its caller chooses where two or more checked functions do the same), attack chains (a write anyone can make paired with the function that trusts it) |
 | trust | a gate that trusts a contract the token itself calls on a public path (`trusted-callee-loop`), a balance lowered on an account the caller neither owns nor has an allowance for (`third-party-balance-debit`, critical when the account is a market counterparty recognised by behaviour: singled out by transfer guards, returned by a factory, read as a ledger, or called with a pool interface), a pair `sync()` reachable after balances changed (`pair-sync-after-state-change`) |
 | linked contracts | when the contracts this one calls were fetched with it, each edge is held against the other side's own code and report: a selector the called contract has no function for and nothing to catch (`linked-call-unanswered`); ether sent to a function that rejects it, or with no function selected to code without a payable receive or fallback (`value-to-non-payable`); a called function its own contract's report rates high or critical (`linked-callee-defect`); and an `approve` whose spender moves tokens from accounts its caller picks (`approval-to-open-spender`). The target is a fixed address or one read from a slot whose content was fetched |
 | control passed on | each function's summary says whether it hands control to an address an ordinary caller can choose: a word of its call data, storage any caller can fill, an account it works out while running and pays with more than the stipend, or a function of another contract that does one of these. A caller that makes such a call and then writes storage or calls out again gets `control-handed-out-mid-update`, naming the chain. A callee that calls a word of its call data is not blamed when the caller fixes that word |
@@ -185,6 +185,10 @@ substituted. No rule names a contract, a protocol, a token or an address.
 What counts as an access check is decided per contract: `msg.sender == owner` always, and a
 test of `mapping[msg.sender]` only when every function writing the mapping is itself gated. A
 stake or balance mapping anyone can fill is accounting, not authorisation.
+
+A last step reads each report as a whole and may rate a medium finding high on the weight
+of everything found on the same contract. It never lowers a finding. It is described and
+measured under "Rating a report as a whole".
 
 Two passes run after the rules. The confirmation pass drives the concrete executor from a
 fresh state into each reachable sink and marks a finding confirmed with a witness input when
@@ -252,6 +256,7 @@ What the search checks on every state it reaches:
 | the first account holds less of something and more of nothing through a call it did not make | `call-leaves-another-account-with-less`, high for a balance in the contract's own ledger |
 | a call by the second account that moves no value, after which the first account's way out pays it less, where no argument of that way out set to the amount paid before makes it fail | `earlier-call-lowers-payout` |
 | a take-out that lowers a record less when it is made in two parts than in one, with the caller holding the same either way | `rounding-favours-caller` |
+| a call by the second account that sends nothing and asks no outside contract anything leaves its own address, or none, in a slot some function compares its caller with, and does so again when that slot first names another account | `caller-gives-itself-a-role`, high. `caller-clears-a-role`, medium |
 
 Each part of the search is there because switching it off costs something that was measured.
 The columns are labelled fixtures wrong of 50, known-vulnerable contracts found of 29, and
@@ -302,7 +307,7 @@ that reaches a finding. The last was removed. It reported a balance credited for
 when the function had taken a token payment or was the contract's one-time set-up, the
 search finds the same credit with honest books, and without it 4 more sound contracts have
 nothing at high for 1 incident less. On the held-out set it found no incident alone. The
-tool as it stands is the last row: 83 of 231 and 41 of 55.
+tool as it stood when this table was made is the last row: 83 of 231 and 41 of 55.
 
 A confirmed finding carries the input, any earlier calls, and what the run was seen to do: who
 sent it, the slots that changed and their values before and after, the calls made, and how it
@@ -396,7 +401,7 @@ trust rules were built on and tested against.
 ### Labelled fixtures per rule
 
 `python3 corpus/rule_bench.py`. `testdata/rules` holds a flawed and a sound hand-assembled
-fixture for each of 21 rules that work by running the code, with the expected result in
+fixture for each of 22 rules that work by running the code, with the expected result in
 `manifest.json`.
 
 | | |
@@ -517,8 +522,9 @@ of the search, as the table of passes above says.
 
 `python3 corpus/heldout_bench.py --set incidents`. `testdata/incidents` holds 231 contracts
 from public incidents and 55 with no known flaw, collected like the held-out set below from
-a different third of the same index. This is where misses are read and rules are shaped: 83
-of the 231 get the right kind of finding at high or above. Read by root cause, the largest
+a different third of the same index. This is where misses are read and rules are shaped: 93
+of the 231 get the right kind of finding at high or above, 84 before each report is rated
+as a whole with weights that were fitted on this same set. Read by root cause, the largest
 groups among the misses are a token whose code changes a pool's balance outside a transfer,
 an amount priced from a reading that one transaction can move, a swap of the contract's own
 holdings that anyone can trigger with no minimum, and reward accounting that pays the same
@@ -564,15 +570,15 @@ recall above is measured on contracts the rules were developed on.
 
 | | |
 |---|---|
-| flawed contracts with the right kind of finding at high or above | 102 / 234 = 44% |
-| the same at medium or above | 139 / 234 = 59% |
-| flawed contracts with any finding at high or above | 126 / 234 = 54% |
-| contracts with no known flaw and nothing at high or above | 79 / 101 = 78% |
+| flawed contracts with the right kind of finding at high or above | 108 / 234 = 46% |
+| the same at medium or above | 140 / 234 = 60% |
+| flawed contracts with any finding at high or above | 135 / 234 = 58% |
+| contracts with no known flaw and nothing at high or above | 78 / 101 = 77% |
 
 The label is the kind of flaw, not the function it is in, so the first row is an upper
-bound. By kind, recall is 0.67 for calls that hand control out before state is settled, 0.51
-for missing checks on who may call, 0.40 for accounting, 0.34 for prices read from outside
-and 0.36 for arithmetic. On the contracts with no known flaw, 8 of the 22 that get a high
+bound. By kind, recall is 0.69 for calls that hand control out before state is settled, 0.54
+for missing checks on who may call, 0.42 for accounting, 0.35 for prices read from outside
+and 0.36 for arithmetic. On the contracts with no known flaw, 8 of the 23 that get a high
 finding get it from `dynamic-call`.
 
 The set was first scored at 96, 121 and 78 on the first, third and fourth rows. The assumed
@@ -600,6 +606,16 @@ contracts with no known flaw. Its findings are high on three
 of those contracts, one of which has no other high finding. Each step added a little and none took away, which
 is the most that can be said of a search: it finds what it reaches, and what it reaches
 moves with the order in which it tries things.
+
+Two checks that state a law instead of a shape were scored here next. The first asks
+whether every path to a balance write first found the caller to be the account, and left
+the table where it was while removing a false report on a deployed token. The second asks
+whether an account with no role can change who a caller check lets through. Its first form
+took the first row to 104 and put a high finding on one more contract with no known flaw.
+Empty storage cannot tell a first set-up from a takeover, so the call is now run again with
+the role held by another account, and only a change that survives that is reported. That
+form gave 104 on the first row and 79 on the last. Rating each report as a whole, described
+under the fresh set below, then gave the table above: 108 and 78.
 
 ### Both sets by address
 
@@ -632,6 +648,137 @@ The search ran the fetched code of linked contracts on empty storage, where it r
 calls. With that code placed the search found 87 of the 231 development incidents by
 address, with a linked contract's transfers answered from honest books 90, and with a linked
 contract treated as any other address 91. The last is what the search now does.
+
+### Fresh set
+
+`python3 corpus/heldout_bench.py --set fresh`. `testdata/fresh` holds 213 contracts from
+public incidents, taken from the third of the same index that the two sets above leave
+untouched. An incident is kept when one of its classes falls under logic, access control,
+DeFi, arithmetic, reentrancy, authentication, loss of funds, accounting, data integrity,
+economic or math. The set was collected after the checks of the next two sections were
+designed, and like the held-out set it is only scored. How it was chosen is in
+`testdata/fresh/README.md`.
+
+| | before those checks | with the new checks | and each report rated as a whole |
+|---|---|---|---|
+| flawed contracts with the right kind of finding at high or above | 74 / 213 = 35% | 76 / 213 | 78 / 213 = 37% |
+| the same at medium or above | 130 / 213 | 131 / 213 | 131 / 213 |
+| flawed contracts with any finding at high or above | 102 / 213 | 103 / 213 | 105 / 213 |
+
+By kind, recall in the last column is 0.48 for calls that hand control out before state is
+settled, 0.45 for missing checks on who may call, 0.40 for unchecked input, 0.33 for
+accounting, 0.28 for prices read from outside and 0.21 for arithmetic.
+
+Three sets of contracts now say much the same thing. The two the rules were not built on
+give 108 of 234 and 78 of 213, 46% and 37%.
+
+### Rating a report as a whole
+
+`python3 corpus/evidence_fit.py`. Each rule rates its own finding from what it saw. Two
+earlier attempts to change the rating of one rule from its record on one set did not carry
+to the next set. This step rates the report instead of the rule.
+
+Every rule that fires at medium or above has a weight: the logarithm of how much more often
+it fires at that level on the 231 development incidents than on 77 contracts with no known
+flaw, the 55 of the development set and the 22 audited ones. The weights of a report are
+added. When the sum reaches 3.5, a medium finding whose own weight is positive is rated
+high. A finding rated this way says so in its text, and `EVMDEC_AS_FOUND` switches the step
+off. The 52 weights are in `crates/decompiler/src/weights.tsv`.
+
+The bound was chosen on the development set alone, by scoring each fifth of it with weights
+fitted on the other four fifths. It is the lowest bound at which no contract with no known
+flaw gains a high finding.
+
+| | each rule alone | report rated as a whole |
+|---|---|---|
+| development incidents found, cross-validated | 84.0 / 231 | 90.8 / 231 |
+| contracts with no known flaw and nothing at high, cross-validated | 57.0 / 77 | 57.0 / 77 |
+| held-out incidents found | 104 / 234 | 108 / 234 |
+| held-out contracts with no known flaw and nothing at high | 79 / 101 | 78 / 101 |
+| fresh incidents found | 76 / 213 | 78 / 213 |
+| opened functions found at high (mutation bench) | 19 / 66 | 21 / 66 |
+
+It carries to both sets it was not fitted on, by four and two contracts, and it marks one
+held-out contract with no known flaw that was clean before. A contract with no known flaw
+that already had a high finding also tends to gain more of them: the held-out ones carry 57
+high findings where they carried 43.
+
+The same weights were first used both ways, so that a high finding with no run to show it
+was rated medium when the sum was -2 or lower. On the held-out set that gave 107 and 79.
+It also rated a true finding on the known-vulnerable corpus medium, because two unrelated
+findings on the same contract are common on sound code. A step that can hide what a rule
+found is not worth one cleared contract, so the report is only ever rated up.
+
+### Checks removed on purpose
+
+`python3 corpus/mutation_bench.py`. The incident sets say whether a flawed contract gets a
+finding of the right family. They do not say which function is flawed. This bench makes its
+own answers: it takes each contract with no known flaw, finds a test that compares the
+caller with something, and rewrites it in place so that it always passes and no longer reads
+the caller. The function behind that test is now open, and which one is known. A mutant
+counts as found when its report gains a finding at high that the original did not have.
+
+| | |
+|---|---|
+| mutants made from the 55 sound development contracts, up to 4 each | 95 |
+| mutants that open something the analyzer can see | 66 |
+| of those, a new finding at high | 21 |
+| a new finding at medium only | 20 |
+| nothing new at medium or above | 25 |
+
+When the bench was first run the same rows read 63, 12, 9 and 42: two in three opened
+functions got nothing, because an opened function was reported only when what it does
+matches a rule. Two checks were then built against these mutants and kept because they add
+no finding on the 55 contracts the mutants are made from. They gave 19, 22 and 25, and
+rating each report as a whole moved two more to high.
+
+The first is run by the search. Some function compares its caller with the address in a
+slot. If a call by an account with no role, sending nothing and asking no outside contract
+anything, leaves its own address or none in that slot, and still does when the slot first
+names another account, the account has changed who that check lets through. It finds the
+opened ownership transfers and the opened renouncements.
+
+The second compares a function with its peers. A function that never reads its caller,
+calls nothing, and stores a value its caller chooses is reported at medium when two or more
+functions of the same contract do the same behind a caller check. It finds the opened fee,
+limit and flag setters. It stays at medium: the bytecode shows that the function differs
+from its peers, not what the value is worth.
+
+The 25 that still get nothing are mostly a check on who owns one record among many, such as
+one lock or one position, a mint or burn whose other checks still hold, and a write keyed
+by an address the caller names.
+
+### Laws tried and not kept
+
+A check stays when it finds something on contracts it was not shaped on and marks no more
+sound ones. These were built, measured on the development set, and removed.
+
+| what was asked | what the measurement said |
+|---|---|
+| Does a paying call made twice, the same account in two parameters, or an amount one either side of a seen amount leave a gain the search had not found | 83 of 231 with all three, and 84, 84 and 83 with each one off |
+| Does one call pay its caller more when an outside reading that a transaction can move is moved, against the same call with the reading as first given | seen on 2 of 286 contracts, one already found and one with no known flaw |
+| Is a record written without the record that every other function writes with it for the same key | 65 of 231 flawed contracts and 15 of 55 sound ones, 28% against 27% |
+| Does a call by an account with no role, which pays and receives nothing, let an outside contract have what the contract holds and still end when nothing comes back | 3 of 231 flawed contracts and none of 55 sound ones, none at the function its incident names, and no change to any count |
+| Does the search find more when it favours the functions whose calls led somewhere new | 82 of 231 against 84 without it |
+| Does a call made from inside a payment find more when it may go to another function | 83 of 231 against 84, and nothing new |
+| Is the caller charged less than the same sum comes to when no remainder is dropped | seen on none of 286 contracts |
+
+Of the 147 development incidents that are missed, 82 have no finding of the right kind at
+medium or above and 55 have none at all. Rating what is already found differently cannot
+reach those, and the two ratings tried earlier did not carry from one set to the next. The
+largest groups
+are an amount priced from a reading that one transaction can move and a function anyone can
+call that makes the contract trade or burn what it holds. In both, what is lost goes to an
+exchange outside the contract, and the bytecode of the one contract does not show it.
+
+### False alarms kept
+
+`testdata/false_alarms` holds deployed contracts on which a rule once reported something
+that is not there, each with the rule that must stay silent and why. A test runs them. The
+first is a token whose three-word transfer lowers the named account only on the branch where
+that account is the caller, and leaves without reverting otherwise. Two rules looked at the
+write and not at the path to it. Both now ask whether every path to the write first found
+the caller to be the account.
 
 ### Random sample
 
@@ -751,6 +898,7 @@ remote nodes in at most 240 seconds, and code over 1 MiB is refused.
 | `EVMDEC_RPC_URL` | comma-separated JSON-RPC endpoints, used in place of the public list. The chain asked for has to be the chain they serve; a request for another chain is refused |
 | `EVMDEC_SIGS` | path of the signature index; empty disables it. Default search: `./sigs.idx`, next to the binary, `/var/lib/evmdec/sigs.idx`, `~/.evmdec/sigs.idx` |
 | `EVMDEC_NO_CONFIRM` | skip the checks made by running the code |
+| `EVMDEC_AS_FOUND` | leave every finding at the severity its own rule gave it, without rating the report as a whole |
 | `EVMDEC_TIMING` | print the time spent in each stage |
 | `PORT` | listening port of the server, default 8080 |
 

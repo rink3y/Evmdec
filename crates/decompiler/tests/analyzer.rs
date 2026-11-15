@@ -3600,6 +3600,21 @@ fn the_search_finds_an_account_that_ends_with_more_than_it_started_with() {
 }
 
 #[test]
+fn running_the_code_an_upgrade_just_stored_is_not_a_finding_of_its_own() {
+    let runs = "PUSH1 0x00 DUP1 DUP1 DUP1 DUP5 GAS DELEGATECALL POP STOP";
+    let through = "PUSH1 0x00 DUP1 DUP1 DUP1 PUSH1 0x05 SLOAD GAS DELEGATECALL POP STOP";
+    let severity = |stores: &str| {
+        let gated = format!("{OWNER_GATE} PUSH1 0x04 CALLDATALOAD {stores} {runs}");
+        let r = report_of(&dispatcher3(&gated, "STOP", through));
+        let f = finding(&r, "delegatecall-user-target").unwrap_or_else(|| panic!("{:?}", ids(&r)));
+        f.severity
+    };
+    assert_eq!(severity("DUP1 PUSH1 0x05 SSTORE"), Severity::Info);
+    assert_eq!(severity(""), Severity::High);
+    assert_eq!(severity("DUP1 PUSH1 0x06 SSTORE"), Severity::High);
+}
+
+#[test]
 fn the_search_enters_a_function_that_takes_more_words_than_it_guesses() {
     let words: Vec<String> = (0..7)
         .map(|i| format!("PUSH1 0x{:02x} CALLDATALOAD POP", 4 + 32 * i))
@@ -3624,26 +3639,6 @@ fn asset_pull(label: &str, from: &str, to: &str, amount: &str, then: &str) -> St
          PUSH1 0x20 PUSH1 0x80 PUSH1 0x64 PUSH1 0x80 PUSH1 0x00 PUSH2 0xb1b1 GAS CALL POP \
          {answered} {then} STOP"
     )
-}
-
-#[test]
-fn the_search_runs_the_code_of_a_contract_the_one_under_test_calls() {
-    let pays_named =
-        "PUSH1 0x00 DUP1 DUP1 DUP1 PUSH2 0x1001 PUSH1 0x04 CALLDATALOAD GAS CALL POP STOP";
-    let callee = PAYER.trim_start_matches("0x");
-    let passes_caller_on = dispatcher(&format!(
-        "PUSH4 0xaaaaaaaa PUSH1 0xe0 SHL PUSH1 0x80 MSTORE CALLER PUSH1 0x84 MSTORE \
-         PUSH1 0x00 DUP1 PUSH1 0x24 PUSH1 0x80 PUSH1 0x00 PUSH20 0x{callee} GAS CALL POP STOP"
-    ));
-    let rule = "calls-leave-account-with-gain";
-
-    let r = with_linked(passes_caller_on.clone(), dispatcher(pays_named));
-    let f = finding(&r, rule).unwrap_or_else(|| panic!("{:?}", ids(&r)));
-    assert!(f.description.contains("a contract this one calls"), "{f:?}");
-
-    let only_its_owner = dispatcher(&format!("{OWNER_GATE} {pays_named}"));
-    let r = with_linked(passes_caller_on, only_its_owner);
-    assert!(finding(&r, rule).is_none(), "{:?}", ids(&r));
 }
 
 #[test]

@@ -189,9 +189,6 @@ impl World {
                 world.seed(exec::SELF, slot, held);
             }
         }
-        for linked in &c.linked {
-            world.place_contract(linked);
-        }
         world
     }
 

@@ -3950,8 +3950,23 @@ fn analyze_in<'a>(c: &'a Contract, world: &'a World<'a>) -> Report {
                                 format!("`{}` delegatecalls to `{}`, which is derived from calldata, without any msg.sender check. Anyone can execute arbitrary code in this contract's storage context (take over storage, selfdestruct).", f.name, target),
                                 vec![line.clone()], "Restrict the target to a whitelist or trusted storage slot and gate the function with access control.");
                         } else if from_calldata(*addr) {
-                            push(&mut findings, "delegatecall-user-target", "Delegatecall target derived from calldata (access-controlled)", Severity::High, Confidence::Medium, Some(f), Some(ev.pc),
-                                format!("`{}` delegatecalls to `{}` derived from calldata. Only safe if the caller check is sufficient and the target is trusted.", f.name, target), vec![line.clone()], "Validate the target against an allowlist even for privileged callers.");
+                            // Storing the target where the contract takes its code from and
+                            // then running it is an upgrade. Whoever may upgrade may already
+                            // run any code here, so the call adds nothing to that power.
+                            let code_slot = |key: ExprId| {
+                                let slot = expr::as_const(key).map(|k| k.to_hex_padded(32));
+                                slot.is_some_and(|k| ctx.c.delegatecall_slots.contains(&k))
+                            };
+                            let upgrade = events.iter().any(|e2| {
+                                matches!(&e2.stmt, Some(Stmt::SStore { key, val, .. })
+                                    if code_slot(*key) && expr::has_part(*val, unmask(*addr)))
+                            });
+                            let (severity, rest) = match upgrade {
+                                true => (Severity::Info, "The same address is stored as the code this contract runs, so this is its upgrade path."),
+                                false => (Severity::High, "Only safe if the caller check is sufficient and the target is trusted."),
+                            };
+                            push(&mut findings, "delegatecall-user-target", "Delegatecall target derived from calldata (access-controlled)", severity, Confidence::Medium, Some(f), Some(ev.pc),
+                                format!("`{}` delegatecalls to `{}` derived from calldata. {rest}", f.name, target), vec![line.clone()], "Validate the target against an allowlist even for privileged callers.");
                         } else if !storage_target && !is_const_addr(*addr) {
                             push(&mut findings, "delegatecall-dynamic-target", "Delegatecall to a computed address", Severity::Medium, Confidence::Low, Some(f), Some(ev.pc),
                                 format!("`{}` delegatecalls to `{}`.", f.name, target), vec![line.clone()], "Make sure the computed implementation cannot be influenced by callers.");

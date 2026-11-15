@@ -1139,7 +1139,7 @@ fn shown(steps: &[Step]) -> Vec<String> {
     steps.iter().map(line).collect()
 }
 
-fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>) {
+fn report(search: &Search, broken: &Broken, out: &mut Vec<Finding>) {
     let Some((Step::Call(entry, last), earlier)) = broken.steps.split_last() else {
         return;
     };
@@ -1168,11 +1168,10 @@ fn report(c: &Contract, search: &Search, broken: &Broken, out: &mut Vec<Finding>
         ));
     }
     let outside = broken.outside();
-    let source = match (outside, broken.taken, c.linked.is_empty()) {
-        (true, true, _) => "An asset left the other account during these calls, under the approval that account gave the contract when it paid in.",
-        (true, false, true) => "The contract held nothing at the start and received only what the two accounts paid in, so what the account gained is the other account's payment.",
-        (true, false, false) => "The contract held nothing at the start, so what the account gained is the other account's payment or was held by a contract this one calls, whose code ran as it is.",
-        (false, ..) => "Nothing was paid for that balance, in ether or in any asset.",
+    let source = match (outside, broken.taken) {
+        (true, true) => "An asset left the other account during these calls, under the approval that account gave the contract when it paid in.",
+        (true, false) => "The contract held nothing at the start and received only what the two accounts paid in, so what the account gained is the other account's payment.",
+        (false, _) => "Nothing was paid for that balance, in ether or in any asset.",
     };
     let severity = broken.severity();
     let timing = match severity {
@@ -1452,7 +1451,7 @@ pub fn findings(c: &Contract, out: &mut Vec<Finding>) {
     };
     let gain_at = search.best.as_ref().and_then(|b| last(&b.steps));
     if let Some(broken) = search.best.take() {
-        report(c, &search, &broken, out);
+        report(&search, &broken, out);
     }
     // A gain through the same function already says what that function lets happen.
     if let Some(less) = search.less.take().filter(|l| last(&l.steps) != gain_at) {

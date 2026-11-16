@@ -230,8 +230,16 @@ ether of every account its calls reach, are read from the chain at one block as 
 for them, at most 4,000 reads in 240 seconds, and the report says when a read got no answer.
 The owner stands in for the account the code compares its caller with. The owner, a user and
 the account with no role are given a purse of each token the calls move, written into the
-token's own balance cells where those can be found, and the report lists each. A block other
-than the newest needs a node that keeps old state.
+token's own balance cells where those can be found, and the report lists each. The account
+with no role is also tried as a holder of the contract's own ledger, as anyone who bought
+some would be. The real holders the chain has are accounts too: a record the contract keeps
+for one of them, lowered by a call it did not make, is a finding. A block other than the
+newest needs a node that keeps old state.
+
+An address is also run in a world guessed from its code, because one block may lack the
+holders or settings a flaw needs. A finding only that world shows says so, and so does each
+thing that world took to hold. What one run shows is one finding: a payer's loss and a
+receiver's gain in the same call are listed together.
 
 From source the compiler is downloaded for the pragma, the same runtime code is analysed as
 from bytecode, and each finding carries the file and line from the source map. The two inputs
@@ -313,34 +321,37 @@ set was split off once, its answer key and reports are never read during develop
 its reviewers return counts only.
 
 The target is 95 to 99% precision and recall. It is not met. Measured on the held-out set,
-234 exploited contracts and 101 with no known flaw, scored twice by separate reviewers:
+234 exploited contracts and 101 with no known flaw, scored three times by separate reviewers:
 
-| | first score | latest score |
-|---|---|---|
-| known flaws found at the right place for the right reason | 13 of 234, 5.6% | 12 of 234, 5.1% |
-| more at the right place with the wrong reason | 6 | 4 |
-| findings that are correct | 25 of 49, 51.0% | 23 of 48, 47.9% |
-| contracts with no known flaw that got a finding | 1 of 101, 1.0% | 1 of 101, 1.0% |
-| time per contract | median 0.7 s, slowest 7.5 s | median 0.7 s, 90% under 2.6 s, slowest 10.2 s |
+| | first score | second score | third score, by address |
+|---|---|---|---|
+| known flaws found at the right place for the right reason | 13 of 234, 5.6% | 12 of 234, 5.1% | 20 of 234, 8.5% |
+| more at the right place with the wrong reason | 6 | 4 | 10 |
+| findings that are correct | 25 of 49, 51.0% | 23 of 48, 47.9% | 45 of 88, 51.1% |
+| contracts with no known flaw that got a finding | 1 of 101 | 1 of 101 | 4 of 101 |
+| time per contract | median 0.7 s | median 0.7 s, slowest 10.2 s | median 7.9 s, 90% under 29.6 s, with chain reads |
 
-By kind of flaw in the latest score, among those in the analysed contract: initialization 4
-of 9, access control 6 of 47, accounting 1 of 68, input validation 1 of 28, price or reading 0
-of 43, re-entry 0 of 11, signature or replay 0 of 6, arithmetic 0 of 5.
+The third score ran each contract by address on the chain's state at the block before its
+incident, plus the guessed world. On chain state 38 of 56 findings were correct, in the
+guessed world 7 of 32. By kind of flaw, among those in the analysed contract: access control
+8 of 47, input validation 5 of 28, initialization 5 of 9, accounting 1 of 68, unchecked
+external call 1 of 1, price or reading 0 of 43, re-entry 0 of 11, signature or replay 0 of 6,
+arithmetic 0 of 5.
 
-On the development set, where every false finding was read and its cause fixed, the same
-build finds 17 of 231 known flaws (7.4%), 29 of its 36 findings are correct (81%), and none
-of 55 contracts with no known flaw gets a finding. The held-out set did not follow: what was
-fixed on one set of contracts was general in form and still did not reach the other set's
-flaws. That gap is the honest measure of where the tool stands.
+On the development set, where every false finding was read and its cause fixed, the latest
+reviewed build finds 31 of 231 known flaws (13.4%) by address, 48 of its 60 findings are
+correct (80%), and none of 55 contracts with no known flaw gets a finding. The held-out set
+does not follow at the same rate: what is fixed on one set of contracts is general in form
+and reaches fewer of the other set's flaws. That gap is the honest measure of where the
+tool stands.
 
-Why recall is where it is: 145 of the 234 flaws only show with a real outside contract in a
-particular state, a pool with reserves or a price source, and the tool runs one contract with
-stand-ins for the rest. Of the 89 that show on the contract alone, most are never reached:
-a diagnosis of the 82 such misses on the development set put 52 down to a flawed function
-that never ran to its end for the account with no role, because its arguments are nested
-records the tool does not build, because the state a constructor left cannot be rebuilt from
-runtime code, or because it expects a contract of the caller's to answer and call back. The
-pull request that introduced this analyzer logs every run and what was changed after it.
+Why recall is where it is: 145 of the 234 held-out flaws only show with a real outside
+contract in a particular state, and the account with no role can only call the contract
+under test. It cannot trade in a pool, call a pair's skim or sync, or act in a lending market.
+Of the flaws that show on the contract alone, a fresh diagnosis of the 74 development misses
+put 41 down to a flawed function that never ran to its end for the account with no role, 18
+to state the run lacked, and 9 to steps the search did not try. The pull request that
+introduced this analyzer logs every run and what was changed after it.
 
 ### Decompiler against verified source
 
@@ -354,16 +365,17 @@ checks and reverts. A function matches only when all six agree.
 | first, after ten causes were fixed | the same 14 | 73 of 99 |
 | second, fresh | 8 (Vyper 0.2.8 and 0.4.3, solc 0.4.21 to 0.8.36, a beacon proxy) | 55 of 83 |
 | both, after a second round of fixes | all 22 | 136 of 182, no regressions |
+| both, after a third round of fixes | all 22 | 157 of 182, 4 regressions from one cause |
 
-That is 75% against a target of 95 to 99%. Every mismatch was traced to its
-cause in the decompiler, and each cause gets a general fix and a test. The block oracle
-passed every one of these functions: it checks lifting, and these faults are made after it,
-in inlining, structuring and printing. What is still open, by how many functions it breaks:
-shared code tails whose call sites do not fit their declarations (8), call data built from
-overlapping writes printed as shifted words (6), checked arithmetic that prints like
-unchecked (5), a memory write not printed (4), a read printed after a call it was made
-before (3), dropped call data validation (2), a packed field mask (1), and 17 functions
-that are right but unclear, most from one cloned region whose labels repeat.
+That is 86% against a target of 95 to 99%. Every mismatch was traced to its cause in the
+decompiler, and each cause gets a general fix and a test. The block oracle passed every one
+of these functions: it checks lifting, and these faults are made after it, in inlining,
+structuring and printing. Still wrong in 13 functions: an addition not marked unchecked in a
+helper printed apart (4), a copy into memory by the identity precompile or a call's output
+not printed (5), a transfer printed before a checked subtraction that runs first (1), a
+revert that reads names never assigned (2), a stray division (1). Right but unclear in 12: a
+loop printed several times with jumps into the middle of its copies, and calls shown only as
+raw memory writes.
 
 ## Quick start
 

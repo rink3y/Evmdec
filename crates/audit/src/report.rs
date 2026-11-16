@@ -338,9 +338,13 @@ fn step_on(ex: &Explorer, step: &Step, name_own: bool) -> String {
         Step::Funded => {
             "the contract already holds ether and assets that were sent to it".to_string()
         }
-        Step::Holds => {
+        Step::Holds { from: None } => {
             "the account with no role holds a thousand units in the contract's own ledger, as anyone who came by some would".to_string()
         }
+        Step::Holds { from: Some(from) } => format!(
+            "the account with no role holds some of the contract's own ledger, sent to it by {} through the contract's own transfer",
+            holder(*from)
+        ),
         Step::Told {
             to,
             selector,

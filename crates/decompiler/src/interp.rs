@@ -347,6 +347,11 @@ impl<'a> Machine<'a> {
     // Code that runs a frame many times lowers the limit to this.
     pub const LOOPED_MOVE_LIMIT: usize = 1 << 23;
 
+    #[must_use]
+    pub fn moved(&self) -> usize {
+        self.moved
+    }
+
     fn moving(&mut self, bytes: usize) -> Result<(), String> {
         self.moved = self.moved.saturating_add(bytes);
         if self.moved > self.move_limit {

@@ -35,6 +35,7 @@ any call and far enough from the top that sums stay in range. */
 pub const PURSE: U256 = U256([0, 0, 1 << 32, 0]);
 
 const STEP_LIMIT: u64 = 300_000;
+const FREE_MEMORY: usize = 4_096;
 const MAX_DEPTH: usize = 10;
 const MAX_EVENTS: usize = 8_000;
 const MAX_CMPS: usize = 600;
@@ -729,8 +730,15 @@ impl World {
             }
             (false, Vec::new(), Vec::new())
         };
+        let mut charged = 0;
         loop {
-            tx.run.steps += 1;
+            /* A step that grows, copies or hashes memory costs by its size, as it does in
+            gas. Counted as one step it lets a call do megabytes of work for nothing. Eight
+            words take about as long as one plain step. What an ordinary frame moves is
+            left out, so its count is what it always was. */
+            let owed = m.moved().saturating_sub(FREE_MEMORY) / 256;
+            tx.run.steps += 1 + (owed - charged) as u64;
+            charged = owed;
             if tx.run.steps > STEP_LIMIT {
                 tx.run.halt = Halt::Steps;
                 return (false, Vec::new(), Vec::new());
@@ -818,6 +826,18 @@ impl World {
                 op::EXTCODESIZE => {
                     let who = low_address(m.stack[n - 1]);
                     Some((1, Some((self.code_size(who), sh.stack[n - 1].with(EXT)))))
+                }
+                op::EXTCODEHASH => {
+                    let who = low_address(m.stack[n - 1]);
+                    let hash = match self.code_at(who) {
+                        Some(code) => U256::from_be_bytes(&keccak256(&code.bytes)),
+                        // An account with no code has the hash of nothing, which is not zero.
+                        None if self.code_size(who).is_zero() => {
+                            U256::from_be_bytes(&keccak256(&[]))
+                        }
+                        None => host.extcodehash(who),
+                    };
+                    Some((1, Some((hash, sh.stack[n - 1].with(EXT)))))
                 }
                 _ => None,
             };
@@ -1608,6 +1628,27 @@ impl World {
         true
     }
 
+    // The account is sent half of what a holder has by the contract's own transfer.
+    pub fn hold_from(&mut self, holder: Addr, who: Addr) -> bool {
+        let subject = self.subject;
+        let part = self.holding(subject, holder) >> 1;
+        let mut data = SEL_TRANSFER.to_be_bytes().to_vec();
+        data.extend_from_slice(&who.to_be_bytes());
+        data.extend_from_slice(&part.to_be_bytes());
+        let ask = Msg {
+            from: holder,
+            to: subject,
+            data,
+            ..Msg::default()
+        };
+        let mut tried = self.clone();
+        if part.is_zero() || !tried.send(&ask).ok || tried.holding(subject, who).is_zero() {
+            return false;
+        }
+        *self = tried;
+        true
+    }
+
     /* An address with no code. An asset answers from its books. Anything else answers
     what the world was told it answers, or one word that reads as true. */
     fn asked(
@@ -1891,6 +1932,13 @@ mod tests {
         let (_, run) = run("600160005404600155", Vec::new(), ACTOR);
         let stores: Vec<_> = run.stores().collect();
         assert!(stores[0].3.has(STORE) && !stores[0].3.has(MATH));
+    }
+
+    #[test]
+    fn memory_a_call_grows_is_counted_by_its_size() {
+        // mstore(0x100000, 1)
+        let (_, run) = run("60016210000052", Vec::new(), ACTOR);
+        assert!(run.ok && run.steps > 4_000, "{}", run.steps);
     }
 
     #[test]

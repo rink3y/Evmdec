@@ -227,7 +227,7 @@ fn a_call_that_cuts_what_a_third_account_holds_is_found_on_the_side_of_a_test_it
     assert_eq!(cut.selector.as_deref(), Some("0xa9059cbb"));
     assert!(cut.shown.contains(&pool.to_hex()), "{}", cut.shown);
     assert!(
-        cut.steps[0].contains("holds a thousand units"),
+        cut.steps[0].contains("sent to it by a user"),
         "{:?}",
         cut.steps
     );
@@ -330,4 +330,30 @@ fn a_payout_sized_by_what_a_pool_holds_is_found_with_the_send_and_the_call_that_
     assert!(counted.contains("sync") && counted.contains(&pool.to_hex()));
     assert!(bought.contains(&desk.to_hex()), "{bought}");
     assert!(paid.cause.contains(&pool.to_hex()), "{}", paid.cause);
+}
+
+#[test]
+fn a_wait_counted_from_a_stored_time_is_waited_out_in_seconds_or_in_days() {
+    let report = report("Vest.hex");
+    for selector in ["0x159090bd", "0xfff209b5"] {
+        let take = report
+            .functions
+            .iter()
+            .find(|f| f.selector.as_deref() == Some(selector));
+        let take = take.expect("take");
+        assert!(take.ends_for.contains(&"a user"), "{:?}", take.stopped_by);
+    }
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+}
+
+#[test]
+fn an_account_with_no_code_has_the_code_hash_of_nothing() {
+    // put() lets in only callers whose code hash is zero or the hash of no code.
+    let report = report("Door.hex");
+    let put = report
+        .functions
+        .iter()
+        .find(|f| f.selector.as_deref() == Some("0x549262ba"));
+    let put = put.expect("put()");
+    assert!(put.ends_for.contains(&"a user"), "{:?}", put.stopped_by);
 }

@@ -59,8 +59,10 @@ pub enum Step {
     },
     // The contract holds ether and assets that were sent to it.
     Funded,
-    // The account with no role holds some of the contract's own ledger.
-    Holds,
+    // The account with no role holds some of the contract's own ledger, written there or sent by a holder.
+    Holds {
+        from: Option<Addr>,
+    },
     Sent {
         asset: Option<Addr>,
         to: Addr,
@@ -843,7 +845,7 @@ impl<'a> Explorer<'a> {
                 _ => {}
             }
         }
-        for (o, a, b, ta, tb, returned) in cmps.into_iter().rev().take(tests) {
+        for (nth, (o, a, b, ta, tb, returned)) in cmps.into_iter().rev().take(tests).enumerate() {
             for (tag, was, other) in [(ta, a, b), (tb, b, a)] {
                 let near = [
                     other,
@@ -930,6 +932,21 @@ impl<'a> Explorer<'a> {
                     let mut next = t.clone();
                     next.time = Some(other.wrapping_add(U256::ONE));
                     push(&mut out, next);
+                }
+                /* A time measured from a stored one is short by what the test lacks. The
+                code may count it in a larger unit than seconds. Only the test the run
+                stopped at is waited out, or the waits crowd out every other repair. */
+                let lacks = Some(other.wrapping_sub(was)).filter(|d| other > was && d.bits() <= 32);
+                let measured = nth == 0 && tag.has(CLOCK) && tag.has(MATH);
+                if let (true, Some(lacks)) = (measured, lacks) {
+                    for unit in [1, 3_600, 86_400, 604_800] {
+                        let wait = (lacks.low_u64() + 1).saturating_mul(unit);
+                        if !tag.has(DATA) && wait < TEN_YEARS {
+                            let mut next = t.clone();
+                            next.time = Some(now.wrapping_add(U256::from_u64(wait)));
+                            push(&mut out, next);
+                        }
+                    }
                 }
             }
         }
@@ -1862,8 +1879,11 @@ impl<'a> Explorer<'a> {
                     }
                     base = world.clone();
                 }
-                Step::Holds => {
-                    world.hold(ACTOR, STAKE);
+                Step::Holds { from } => {
+                    match from {
+                        Some(holder) => world.hold_from(*holder, ACTOR),
+                        None => world.hold(ACTOR, STAKE),
+                    };
                     base = world.clone();
                 }
                 Step::Sent { asset, to, amount } => {
@@ -2319,11 +2339,16 @@ impl<'a> Explorer<'a> {
     holding for the account with no role, so one state gives it one. */
     fn as_holder(&mut self) {
         let mut world = self.states[0].world.clone();
-        if !world.hold(ACTOR, STAKE) {
+        /* A holding sent by one who has some goes through the contract's own transfer,
+        which keeps every record it has of a holder. A cell written here keeps one. */
+        let from = [USER, OWNER]
+            .into_iter()
+            .find(|holder| world.hold_from(*holder, ACTOR));
+        if from.is_none() && !world.hold(ACTOR, STAKE) {
             return;
         }
         let mut steps = self.states[0].steps.clone();
-        steps.push(Step::Holds);
+        steps.push(Step::Holds { from });
         self.states.push(State {
             world,
             steps,

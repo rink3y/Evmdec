@@ -886,6 +886,8 @@ fn stand_ins(ex: &Explorer) -> Vec<String> {
     }
     assets.sort();
     assets.dedup();
+    // An asset read from the chain has code, and what was taken to hold of it is said where it was given.
+    assets.retain(|asset| !ex.states[0].world.runs_code(*asset));
     let line = |asset: &Addr| {
         format!(
             "the asset at {} has no code here and is taken to keep honest books. The owner, the user and the account with no role each hold a purse of it and let the contract draw on it",

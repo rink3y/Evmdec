@@ -199,3 +199,31 @@ fn a_list_is_not_emptied_to_end_a_call_its_items_could_end() {
     assert_eq!(kinds, vec![Kind::Gain], "{:?}", report.findings);
     assert_eq!(report.findings[0].selector.as_deref(), Some("0xac41fdb5"));
 }
+
+#[test]
+fn a_call_that_cuts_what_a_third_account_holds_is_found_on_the_side_of_a_test_it_ends_without() {
+    let (token, pool) = (
+        U256::from_hex_str(DEPLOYED_AT).expect("address"),
+        U256::from_hex_str("0x5555555555555555555555555555555555555555").expect("address"),
+    );
+    let mut key = pool.to_be_bytes().to_vec();
+    key.extend_from_slice(&U256::ZERO.to_be_bytes());
+    let held_at = U256::from_be_bytes(&evmdec::keccak::keccak256(&key));
+    let held = U256::from_u64(1) << 70;
+    let mut chain = audit::chain::Table::default();
+    chain.storage.insert((token, held_at), held);
+    chain.storage.insert((token, U256::from_u64(1)), pool);
+    chain.storage.insert((token, U256::from_u64(2)), held);
+    // transfer(address,uint256) to the dead address takes a tenth out of the pool's record.
+    // The account has to hold some, and a plain transfer ends without reaching the cut.
+    let report = report_on_chain("Levy.hex", chain);
+    let cut = report.findings.iter().find(|f| f.kind == Kind::Debit);
+    let cut = cut.unwrap_or_else(|| panic!("{:?}", report.findings));
+    assert_eq!(cut.selector.as_deref(), Some("0xa9059cbb"));
+    assert!(cut.shown.contains(&pool.to_hex()), "{}", cut.shown);
+    assert!(
+        cut.steps[0].contains("holds a thousand units"),
+        "{:?}",
+        cut.steps
+    );
+}

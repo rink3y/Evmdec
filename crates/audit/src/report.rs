@@ -118,6 +118,14 @@ fn who(account: Addr) -> &'static str {
     }
 }
 
+// An account this world did not make has no name but its address.
+fn holder(account: Addr) -> String {
+    match who(account) {
+        "another account" => format!("the account at {}", account.to_hex()),
+        known => known.to_string(),
+    }
+}
+
 fn short(value: U256) -> String {
     match value {
         v if v == ACTOR => "<account>".to_string(),
@@ -276,15 +284,23 @@ fn step_text(ex: &Explorer, step: &Step) -> String {
         Step::Funded => {
             "the contract already holds ether and assets that were sent to it".to_string()
         }
+        Step::Holds => {
+            "the account with no role holds a thousand units in the contract's own ledger, as anyone who came by some would".to_string()
+        }
         Step::Told {
             to,
             selector,
             answer,
-        } => format!(
-            "the contract at {} is taken to answer {selector:#010x} with {} bytes",
-            to.to_hex(),
-            answer.len()
-        ),
+        } => {
+            let said = match answer.len() {
+                32 => short(U256::from_be_bytes(answer)),
+                n => format!("{n} bytes"),
+            };
+            format!(
+                "the contract at {} is taken to answer {selector:#010x} with {said}",
+                to.to_hex()
+            )
+        }
         Step::Call { entry, msg } => {
             let e = &ex.entries[*entry];
             let words = msg.data.len().saturating_sub(4) / 32;
@@ -395,7 +411,7 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
             );
             let shown = format!(
                 "{} ended with {} less of {} and made no call.",
-                capital(who(victim)),
+                capital(&holder(victim)),
                 short(v.breach.amount),
                 asset_name(asset)
             );
@@ -419,6 +435,9 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
             let keyed = match key {
                 Some(key) if key.tag.only(CALLER) => "the caller's own entry",
                 Some(_) => "the entry of an account named in the call data",
+                None if v.breach.victim.is_some_and(|a| who(a) == "another account") => {
+                    "the entry of an account that the call data does not name"
+                }
                 None => "an entry",
             };
             let (title, shown) = match v.breach.kind {
@@ -433,7 +452,7 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
                     format!("An account with no role lowers another account's entry in {name}"),
                     format!(
                         "{} had {} less recorded and made no call.",
-                        capital(who(v.breach.victim.unwrap_or(USER))),
+                        capital(&holder(v.breach.victim.unwrap_or(USER))),
                         short(v.breach.amount)
                     ),
                 ),

@@ -1053,8 +1053,19 @@ impl World {
                         },
                     );
                 }
-                result = result.with(MATH);
+                /* Unoptimised code adds nothing and multiplies by one to reach a field at
+                the start of a slot. The word is still the word that was read. */
+                let neutral = match o {
+                    op::MUL => U256::ONE,
+                    _ => U256::ZERO,
+                };
+                let left = o != op::SUB && a == neutral && tag(sh, 0).is_none();
+                let right = b == neutral && tag(sh, 1).is_none();
+                if !left && !right {
+                    result = result.with(MATH);
+                }
             }
+            op::DIV | op::SDIV if val(1) == U256::ONE && tag(sh, 1).is_none() => {}
             op::DIV | op::SDIV | op::MOD | op::SMOD | op::ADDMOD | op::MULMOD | op::EXP => {
                 result = result.with(MATH);
             }
@@ -1083,6 +1094,25 @@ impl World {
                     .wrapping_mul(31)
                     .wrapping_add((pc as u32) << 1 | u32::from(taken));
                 tx.edges.insert(edge);
+                /* A test compiled as a difference, or a part of the call data used as the
+                test itself, compares with zero without a comparison being made. */
+                let bare = cond.has(DATA) && !cond.has(CMP) && cond.word().is_some();
+                if tx.cmps < MAX_CMPS && bare {
+                    tx.cmps += 1;
+                    let (a, b, ta, tb) = (val(1), U256::ZERO, cond, Tag::NONE);
+                    let op = op::ISZERO;
+                    Self::event(
+                        tx,
+                        Event::Cmp {
+                            pc,
+                            op,
+                            a,
+                            b,
+                            ta,
+                            tb,
+                        },
+                    );
+                }
                 if !cond.is_none() {
                     let depth = f.depth;
                     Self::event(
@@ -1448,6 +1478,18 @@ impl World {
         found
     }
 
+    /* Writes a holding of the contract's own ledger for one account, in the cell the
+    contract answers that account's balance from. False where it answers from no cell. */
+    pub fn hold(&mut self, who: Addr, amount: U256) -> bool {
+        let mut data = SEL_BALANCE_OF.to_be_bytes().to_vec();
+        data.extend_from_slice(&who.to_be_bytes());
+        let Some((account, slot)) = self.answered_from(self.subject, data, &[who]) else {
+            return false;
+        };
+        self.seed(account, slot, amount);
+        true
+    }
+
     /* An address with no code. An asset answers from its books. Anything else answers
     what the world was told it answers, or one word that reads as true. */
     fn asked(
@@ -1723,6 +1765,24 @@ mod tests {
             assert!(run.ok);
             assert_eq!(run.hooked, calls_back, "{code}");
         }
+    }
+
+    #[test]
+    fn a_word_divided_by_one_is_still_the_word_that_was_read() {
+        // sstore(1, sload(0) / 1)
+        let (_, run) = run("600160005404600155", Vec::new(), ACTOR);
+        let stores: Vec<_> = run.stores().collect();
+        assert!(stores[0].3.has(STORE) && !stores[0].3.has(MATH));
+    }
+
+    #[test]
+    fn a_test_made_by_subtracting_is_a_comparison_of_the_word_with_zero() {
+        // if (calldataload(4) - 5) jump
+        let mut data = vec![0; 4];
+        data.extend_from_slice(&U256::from_u64(7).to_be_bytes());
+        let (_, run) = run("600560043503600a57005b00", data, ACTOR);
+        let bare = |e: &Event| matches!(e, Event::Cmp { op: op::ISZERO, a, ta, .. } if *a == U256::from_u64(2) && ta.word() == Some(0));
+        assert!(run.events.iter().any(bare), "{:?}", run.events);
     }
 
     #[test]

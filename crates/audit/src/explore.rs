@@ -52,6 +52,8 @@ pub enum Step {
     },
     // The contract holds ether and assets that were sent to it.
     Funded,
+    // The account with no role holds some of the contract's own ledger.
+    Holds,
 }
 
 #[derive(Clone)]
@@ -68,6 +70,9 @@ pub struct State {
     about it. Nobody has a claim on such value, and a contract that passes value on holds
     none of it between calls. A gain picked up from here is not taken from anyone. */
     pub stray: bool,
+    /* The account with no role was handed a holding here. What it then draws on that
+    holding is not taken from anyone, so only what happens to others is reported. */
+    pub granted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -324,6 +329,7 @@ impl<'a> Explorer<'a> {
             spent: U256::ZERO,
             raced: false,
             stray: false,
+            granted: false,
         };
         Explorer {
             c,
@@ -625,7 +631,7 @@ impl<'a> Explorer<'a> {
     other way: a part of the call data, the value sent, the length of the call data
     or of an outside answer, or the time. */
     #[allow(clippy::too_many_lines)]
-    fn mutations(&self, t: &Try, run: &Run, now: U256) -> Vec<Try> {
+    fn mutations(&self, t: &Try, run: &Run, now: U256, tests: usize) -> Vec<Try> {
         let laid = t.shape.layout();
         let mut out: Vec<Try> = Vec::new();
         let mut seen: HashSet<TryKey> = HashSet::new();
@@ -642,7 +648,7 @@ impl<'a> Explorer<'a> {
                 || next.msg.value != t.msg.value
                 || next.time != t.time
                 || next.answers != t.answers;
-            if differs && out.len() < MAX_TRIES && seen.insert(key) {
+            if differs && out.len() < MAX_TRIES.max(tests) && seen.insert(key) {
                 out.push(next);
             }
         };
@@ -691,6 +697,9 @@ impl<'a> Explorer<'a> {
                 let source = tag.call().filter(|_| tag.has(OUT));
                 let source = source.and_then(|k| run.calls.get(k));
                 let source = source.filter(|s| matches!(s.by, Answered::Blank | Answered::Taken));
+                // What a contract answers is the account's to write only where the contract is its own.
+                let own = |s: &&crate::trace::CallOut| Facts::same_party(s.to, ACTOR);
+                let source = source.filter(|s| contract != ALLY || own(s));
                 if let Some((source, selector)) =
                     source.and_then(|s| Some((s, world::selector(&s.input)?)))
                 {
@@ -731,7 +740,7 @@ impl<'a> Explorer<'a> {
             } => Some((*o, *a, *b, *ta, *tb)),
             _ => None,
         });
-        for (o, a, b, ta, tb) in cmps.take(12) {
+        for (o, a, b, ta, tb) in cmps.take(tests) {
             for (tag, was, other) in [(ta, a, b), (tb, b, a)] {
                 let near = [
                     other,
@@ -844,7 +853,7 @@ impl<'a> Explorer<'a> {
                 break;
             }
             let now = self.states[state].world.time;
-            let tries = self.mutations(&best.0, &best.2, now);
+            let tries = self.mutations(&best.0, &best.2, now, 12);
             let emptied = best.0.shape.hollow();
             let mut improved = false;
             for t in tries {
@@ -920,6 +929,7 @@ impl<'a> Explorer<'a> {
             msg: t.msg.clone(),
         });
         let (spent, raced, stray) = (parent.spent, parent.raced, parent.stray);
+        let granted = parent.granted;
         self.states.push(State {
             world,
             steps,
@@ -927,6 +937,7 @@ impl<'a> Explorer<'a> {
             spent,
             raced,
             stray,
+            granted,
         });
         self.states.len() - 1
     }
@@ -1683,6 +1694,10 @@ impl<'a> Explorer<'a> {
                     }
                     base = world.clone();
                 }
+                Step::Holds => {
+                    world.hold(ACTOR, STAKE);
+                    base = world.clone();
+                }
                 Step::Call { msg, .. } => {
                     self.runs += 1;
                     let made = world.send(msg);
@@ -1768,6 +1783,7 @@ impl<'a> Explorer<'a> {
             spent: U256::ZERO,
             raced: false,
             stray: false,
+            granted: false,
         });
         let at = self.states.len() - 1;
         let mut spent = false;
@@ -1817,6 +1833,7 @@ impl<'a> Explorer<'a> {
             spent: U256::ZERO,
             raced: false,
             stray: false,
+            granted: false,
         });
         let at = self.states.len() - 1;
         let mut lost = false;
@@ -1981,6 +1998,7 @@ impl<'a> Explorer<'a> {
                 spent: U256::ZERO,
                 raced: false,
                 stray: false,
+                granted: false,
             });
             let at = self.states.len() - 1;
             for entry in 0..self.entries.len() {
@@ -2104,6 +2122,48 @@ impl<'a> Explorer<'a> {
         (paid_in && waited) || serves
     }
 
+    /* Anyone can come to hold some of what the contract keeps a ledger of, and some
+    functions do nothing for an account that holds none. The chain's state has no
+    holding for the account with no role, so one state gives it one. */
+    fn as_holder(&mut self) {
+        let mut world = self.states[0].world.clone();
+        if !world.hold(ACTOR, STAKE) {
+            return;
+        }
+        let mut steps = self.states[0].steps.clone();
+        steps.push(Step::Holds);
+        self.states.push(State {
+            world,
+            steps,
+            acted: 0,
+            spent: U256::ZERO,
+            raced: false,
+            stray: false,
+            granted: true,
+        });
+    }
+
+    /* A call that ends may have ended on the quiet side of a test: nothing to burn,
+    not the address that is charged, not yet time. The other side of each test on what
+    the caller chose is tried once, and what runs code no call ran before is gone into. */
+    fn other_sides(&mut self, from: usize, entry: usize, t: &Try, run: &Run) -> Vec<Try> {
+        let now = self.states[from].world.time;
+        let mut found = Vec::new();
+        let mut reached: HashSet<u32> = run.edges.iter().copied().collect();
+        for next in self.mutations(t, run, now, 24) {
+            if budget::spent() || found.len() >= 4 {
+                break;
+            }
+            let (_, tried) = self.attempt(from, entry, &next);
+            let new = |e: &&u32| !self.edges.contains(e) && !reached.contains(e);
+            if tried.edges.iter().any(|e| new(&e)) {
+                reached.extend(tried.edges.iter().copied());
+                found.push(next);
+            }
+        }
+        found
+    }
+
     fn attack(&mut self) {
         let mut frontier: Vec<usize> = (0..self.states.len()).collect();
         for _ in 0..ACTOR_DEPTH {
@@ -2116,6 +2176,7 @@ impl<'a> Explorer<'a> {
                     let mut kept = false;
                     let mut seeds: VecDeque<Try> = self.hostile(entry).into();
                     let mut passed = false;
+                    let mut turned = 0;
                     while let Some(seed) = seeds.pop_front() {
                         if budget::spent() {
                             return;
@@ -2126,6 +2187,11 @@ impl<'a> Explorer<'a> {
                         if run.ok && !passed {
                             let more = Self::passed_on(&t, &run, &t.shape.layout());
                             passed = !more.is_empty();
+                            seeds.extend(more);
+                        }
+                        if run.ok && turned < 2 {
+                            let more = self.other_sides(from, entry, &t, &run);
+                            turned += more.len().max(1);
                             seeds.extend(more);
                         }
                         let handed = run.calls.iter().any(|c| c.by == Answered::Taken);
@@ -2148,13 +2214,19 @@ impl<'a> Explorer<'a> {
                             let gains = plain.iter().any(|b| b.kind == Kind::Gain);
                             let stray = self.states[from].stray
                                 || (gains && self.earned(from, &t, &before, &run));
+                            let granted = self.states[from].granted;
+                            let own = |b: &&Breach| matches!(b.kind, Kind::Gain | Kind::Credit);
                             let shown = plain.iter().filter(|b| b.kind != Kind::Gain || !stray);
-                            let shown: Vec<Breach> = shown.cloned().collect();
+                            let shown: Vec<Breach> =
+                                shown.filter(|b| !granted || !own(b)).cloned().collect();
                             let steps = self.history(from, entry, &t.msg);
                             self.report(shown, entry, &steps, &run, (false, false));
-                            self.takes_from_owner(from, entry, &t, &run);
+                            if !granted {
+                                self.takes_from_owner(from, entry, &t, &run);
+                            }
                         }
-                        if handed && open && !self.states[from].stray {
+                        let apart = self.states[from].stray || self.states[from].granted;
+                        if handed && open && !apart {
                             self.reenter(from, entry, &t, &alone);
                         }
                         if run.ok
@@ -2178,6 +2250,7 @@ impl<'a> Explorer<'a> {
     }
 
     pub fn explore(&mut self, work: u64) {
+        let started = budget::used();
         budget::within(work / 5, || match self.on_chain {
             true => self.settle_on_chain(),
             false => self.settle(),
@@ -2185,10 +2258,15 @@ impl<'a> Explorer<'a> {
         budget::within(work / 10, || self.used_by(OWNER, 1));
         budget::within(work / 5, || self.used_by(USER, 2));
         // What the contract holds on the chain is read from it. Nothing more is taken to be there.
-        if !self.on_chain {
-            budget::within(work / 10, || self.sweep());
+        match self.on_chain {
+            true => self.as_holder(),
+            false => budget::within(work / 10, || self.sweep()),
         }
-        budget::within(work / 3, || self.attack());
+        // What the earlier parts left unused goes to the account with no role.
+        let left = work.saturating_sub(budget::used() - started);
+        budget::within(left.saturating_sub(work / 10).max(work / 3), || {
+            self.attack()
+        });
         budget::within(work / 10, || self.used_after());
     }
 }

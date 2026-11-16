@@ -249,7 +249,16 @@ pub fn check(
             });
         }
         if ledger(cell) {
-            let victim = [USER, OWNER].into_iter().find(|v| cell.keyed_by(*v));
+            let person = [USER, OWNER].into_iter().find(|v| cell.keyed_by(*v));
+            /* A contract read from the chain has holders this world did not make. One
+            that is on neither side of the call, and has no other record rise in it, is
+            an account like the user. */
+            let stranger = |v: &U256| {
+                (97..=160).contains(&v.bits()) && !Facts::same_party(*v, ACTOR) && *v != subject
+            };
+            let mut keyed = cell.keys.iter().map(|k| k.value);
+            let bystander = keyed.find(stranger).filter(|v| !rose_for(*v));
+            let victim = person.or(bystander);
             let paid_out = |v: Addr| {
                 kinds
                     .iter()

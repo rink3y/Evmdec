@@ -27,11 +27,6 @@ pub fn spent() -> bool {
 }
 
 #[must_use]
-pub fn left() -> u64 {
-    LEFT.with(Cell::get)
-}
-
-#[must_use]
 pub fn used() -> u64 {
     USED.with(Cell::get)
 }

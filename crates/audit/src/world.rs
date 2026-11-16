@@ -342,11 +342,6 @@ impl World {
         self.code_at(who).is_some()
     }
 
-    #[must_use]
-    pub fn code(&self, who: Addr) -> Option<Vec<u8>> {
-        self.code_at(who).map(|code| code.bytes.clone())
-    }
-
     fn code_at(&self, who: Addr) -> Option<Rc<Code>> {
         let placed = self.codes.get(&who).cloned();
         placed.or_else(|| self.on_chain(who)?.code(who))

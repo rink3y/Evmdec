@@ -3,7 +3,7 @@ use crate::opcode as op;
 use crate::u256::U256;
 use serde::Serialize;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 #[derive(Clone, Debug, Serialize)]
@@ -817,6 +817,8 @@ pub struct Analysis<'a> {
     pub call_targets: RefCell<HashSet<usize>>,
     pub steps: RefCell<usize>,
     pub budget_exhausted: RefCell<bool>,
+    // Blocks whose address was still on the stack where a walk ended.
+    abandoned: RefCell<HashSet<usize>>,
 }
 
 const MAX_EXITS: usize = 24;
@@ -897,6 +899,7 @@ impl<'a> Analysis<'a> {
             call_targets: RefCell::new(HashSet::new()),
             steps: RefCell::new(0),
             budget_exhausted: RefCell::new(false),
+            abandoned: RefCell::default(),
         }
     }
 
@@ -1474,7 +1477,15 @@ impl<'a> Analysis<'a> {
                         succs.push((id, Edge::False));
                     }
                 }
-                Flow::Halt => {}
+                /* Where the code stops, the addresses still on the stack are the places it
+                would have gone back to. No jump is left to take them. */
+                Flow::Halt => {
+                    let places = st.stack.iter().filter_map(|v| {
+                        let pc = to_usize(*v).filter(|pc| prog.jumpdests.contains(pc))?;
+                        prog.target_block(pc)
+                    });
+                    self.abandoned.borrow_mut().extend(places);
+                }
             }
             nodes[n].call = call;
             for (s, _) in &succs {
@@ -1545,6 +1556,8 @@ pub struct Recovered {
     pub main: Unit,
     pub functions: BTreeMap<usize, Unit>,
     pub orphans: BTreeMap<usize, Unit>,
+    // Orphans entered at an address a walk left on the stack where it ended.
+    pub dead_returns: BTreeSet<usize>,
     pub unresolved_jumps: Vec<usize>,
     pub budget_exhausted: bool,
 }
@@ -1562,6 +1575,7 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
             },
             functions: BTreeMap::new(),
             orphans: BTreeMap::new(),
+            dead_returns: BTreeSet::new(),
             unresolved_jumps: vec![],
             budget_exhausted: false,
         };
@@ -1609,6 +1623,7 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
         }
     }
     let mut orphans = BTreeMap::new();
+    let mut dead_returns = BTreeSet::new();
     let mut unresolved = Vec::new();
     let mut orphan_nodes = 0usize;
     for b in &prog.blocks {
@@ -1622,6 +1637,32 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
             let unit =
                 an.build_unit_opts(b.id, AState::new(), ComputedJumps::Ignore, MAX_WALK_NODES);
             orphan_nodes += unit.nodes.len();
+            /* A helper that never returns leaves the address it was to return to unused.
+            Where the code only reached from there does nothing that is seen from outside,
+            the rest is code that is reached another way and printed there. */
+            let acts = |n: &UNode| {
+                let seen = |i: &crate::disasm::Instruction| {
+                    matches!(
+                        i.opcode,
+                        op::SSTORE | op::TSTORE | op::LOG0
+                            ..=op::LOG4
+                                | op::CALL
+                                | op::CALLCODE
+                                | op::DELEGATECALL
+                                | op::STATICCALL
+                                | op::CREATE
+                                | op::CREATE2
+                                | op::SELFDESTRUCT
+                                | op::RETURN
+                                | op::REVERT
+                    )
+                };
+                !covered.contains(&n.block)
+                    && prog.block_insns(&prog.blocks[n.block]).iter().any(seen)
+            };
+            if an.abandoned.borrow().contains(&b.id) && !unit.nodes.iter().any(acts) {
+                dead_returns.insert(b.id);
+            }
             for n in &unit.nodes {
                 covered.insert(n.block);
             }
@@ -1647,6 +1688,7 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
         main,
         functions,
         orphans,
+        dead_returns,
         unresolved_jumps: unresolved,
         budget_exhausted: budget,
     }

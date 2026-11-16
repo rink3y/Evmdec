@@ -421,3 +421,17 @@ fn the_selector_stored_where_the_data_of_a_call_starts_is_named() {
         "{out}"
     );
 }
+
+#[test]
+fn the_address_a_helper_that_never_returns_was_to_go_back_to_is_no_function() {
+    let repeated = text("61000761000e565b5b33600055005b6000356100085760006000fd");
+    assert!(!repeated.contains("orphan_"), "{repeated}");
+    assert_eq!(
+        repeated.matches("stor_0 = msg.sender;").count(),
+        1,
+        "{repeated}"
+    );
+    let own = text("61000761000d565b33600055005b60006000fd");
+    assert!(own.contains("function orphan_0x7("), "{own}");
+    assert!(own.contains("stor_0 = msg.sender;"), "{own}");
+}

@@ -823,7 +823,13 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     let contract_nonpayable = function::dispatcher_nonpayable(&main, &dispatch.dispatcher);
     tick("lift main", &mut tt);
     let mut orphans: BTreeMap<usize, Lifted> = BTreeMap::new();
-    for (b, unit) in &rec.orphans {
+    /* A helper that never returns leaves the address it was to return to unused. The code
+    there is reached by no jump, and what follows it is printed where it is reached. */
+    let reached = rec
+        .orphans
+        .iter()
+        .filter(|(b, _)| !rec.dead_returns.contains(b));
+    for (b, unit) in reached {
         crate::clock::check();
         let t1 = std::time::Instant::now();
         orphans.insert(prog.blocks[*b].start, int_lifter.lift(unit, None));

@@ -222,11 +222,24 @@ fn audit_address(address: &str, chain: &str, block: Option<u64>) -> Result<audit
     });
     match fixed {
         Ok((client, number, time)) => {
-            let c = fetch(&client)?;
+            let mut c = fetch(&client)?;
             // Decompiling took time out of what one client may spend on the network.
-            let fresh = connect().and_then(|client| client.at(Some(number)));
-            let (client, ..) = fresh.map_err(|e| anyhow::anyhow!(e))?;
-            Ok(audit::audit_at(&c, client, chain, number, time))
+            let fresh = || {
+                let at = connect().and_then(|client| client.at(Some(number)));
+                at.map(|(client, ..)| client)
+                    .map_err(|e| anyhow::anyhow!(e))
+            };
+            let node = std::rc::Rc::new(audit::chain::Node::new(fresh()?));
+            if let Some(behind) = audit::handed_to(&c, node, number, time) {
+                let behind = evmdec::rpc::addr_to_string(behind);
+                eprintln!("every call is handed to the code at {behind}: auditing that code on this contract's state");
+                let code = fresh()?.get_code(&behind).map_err(|e| anyhow::anyhow!(e))?;
+                let mut inner = evmdec::decompile::decompile(&code, &Options::default());
+                inner.address.clone_from(&c.address);
+                inner.chain.clone_from(&c.chain);
+                c = inner;
+            }
+            Ok(audit::audit_at(&c, fresh()?, chain, number, time))
         }
         Err(why) => {
             let client = connect().map_err(|e| anyhow::anyhow!(e))?;

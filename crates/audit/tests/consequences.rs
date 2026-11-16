@@ -357,3 +357,29 @@ fn an_account_with_no_code_has_the_code_hash_of_nothing() {
     let put = put.expect("put()");
     assert!(put.ends_for.contains(&"a user"), "{:?}", put.stopped_by);
 }
+
+#[test]
+fn a_contract_that_hands_every_call_to_an_address_in_a_slot_of_its_own_is_a_proxy() {
+    let (proxy, behind) = (
+        U256::from_hex_str(DEPLOYED_AT).expect("address"),
+        U256::from_hex_str("0x6666666666666666666666666666666666666666").expect("address"),
+    );
+    // delegatecall(gas, sload(keccak256(0x1234)), calldata) and return what comes back.
+    let hands_on = "6112346000526020600020543660006000376000600036600084\
+                    5af43d600060003e3d6000f3";
+    let code = evmdec::hex::decode(hands_on).expect("hex");
+    let mut contract = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    contract.address = Some(DEPLOYED_AT.to_string());
+    let slot = evmdec::keccak::keccak256(&U256::from_u64(0x1234).to_be_bytes());
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/source/Vault.hex");
+    let vault = std::fs::read_to_string(path).expect("fixture");
+    let mut chain = audit::chain::Table::default();
+    chain
+        .storage
+        .insert((proxy, U256::from_be_bytes(&slot)), behind);
+    chain
+        .codes
+        .insert(behind, evmdec::hex::decode(vault.trim()).expect("hex"));
+    let found = audit::handed_to(&contract, Rc::new(chain), 100, 1_700_000_000);
+    assert_eq!(found, Some(behind));
+}

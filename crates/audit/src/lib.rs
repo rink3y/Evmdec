@@ -66,6 +66,42 @@ pub fn audit_read(c: &Contract, source: Rc<dyn world::Source>, number: u64, time
     report
 }
 
+/* A contract that hands every call whole to code at an address it reads from its own
+storage is a proxy, whatever slot the address is kept in. A call no function answers
+shows it. The address comes back, and the code there is what there is to audit. */
+#[must_use]
+pub fn handed_to(
+    c: &Contract,
+    source: Rc<dyn world::Source>,
+    number: u64,
+    time: u64,
+) -> Option<world::Addr> {
+    // A proxy the fetch already took apart is modelled with its parts and is left as it is.
+    if c.composite.is_some() || c.proxy.is_some() {
+        return None;
+    }
+    let subject = c.address.as_deref().and_then(evmdec::U256::from_hex_str)?;
+    let mut world = world::World::new();
+    world.subject = subject;
+    world.place(subject, &c.info.runtime);
+    world.read_from(source);
+    (world.number, world.time) = (evmdec::U256::from_u64(number), evmdec::U256::from_u64(time));
+    let mut data = vec![0xfe, 0xed, 0xc0, 0xde];
+    data.extend_from_slice(&[0; 32]);
+    let ask = world::Msg {
+        from: world::ACTOR,
+        to: subject,
+        data: data.clone(),
+        ..world::Msg::default()
+    };
+    let run = world.send(&ask);
+    let whole = run.calls.iter().find(|call| {
+        call.kind == evmdec::opcode::DELEGATECALL && call.from == subject && call.input == data
+    });
+    let behind = whole?.to;
+    world.runs_code(behind).then_some(behind)
+}
+
 #[must_use]
 pub fn audit_at(
     c: &Contract,

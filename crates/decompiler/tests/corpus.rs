@@ -1060,3 +1060,83 @@ fn a_selector_tested_for_zero_is_the_zero_selector() {
     assert!(selectors(&router).contains(&0), "the test is its dispatch");
     assert!(router.source.contains("\"3ebt\""));
 }
+
+fn undeclared_old_values(source: &str) -> Vec<String> {
+    let mut missing = Vec::new();
+    let mut declared: Vec<(String, usize)> = Vec::new();
+    let word = |text: &str| -> String {
+        let end = text.find(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        text[..end.unwrap_or(text.len())].to_string()
+    };
+    for line in source.lines().filter(|l| !l.trim().is_empty()) {
+        let depth = line.len() - line.trim_start().len();
+        declared.retain(|(_, at)| *at <= depth);
+        let made = line.trim_start().strip_prefix("uint256 prev").map(word);
+        let read = match &made {
+            Some(_) => &line[line.find('=').unwrap()..],
+            None => line,
+        };
+        for (at, _) in read.match_indices("prev") {
+            let name = word(&read[at..]);
+            let old_value = name[4..]
+                .trim_start_matches(char::is_numeric)
+                .starts_with('_');
+            let before = read[..at].chars().next_back();
+            let starts = before.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+            if starts && old_value && !declared.iter().any(|(d, _)| *d == name) {
+                missing.push(format!("{name} in {}", line.trim()));
+            }
+        }
+        declared.extend(made.map(|rest| (format!("prev{rest}"), depth)));
+    }
+    missing
+}
+
+#[test]
+fn an_old_value_is_named_where_every_use_of_it_passes() {
+    let files = [
+        "vyper_gauge.hex",
+        "univ3_pool.hex",
+        "layerzero_dvn.hex",
+        "rango_diamond.hex",
+        "oneinch_v6.hex",
+    ];
+    let [gauge, pool, dvn, diamond, router] = files.map(|name| regress(name).source);
+    for source in [&gauge, &pool, &dvn, &diamond, &router] {
+        assert_eq!(undeclared_old_values(source), Vec::<String>::new());
+    }
+    assert!(
+        gauge.contains(
+            "uint256 prev_stor_14 = stor_14;\n        if (mem[0x220] < timestamp_15[prev_stor_14])"
+        ),
+        "the period is read once, ahead of both branches"
+    );
+    let burn = &pool[pool
+        .find("function func_0x4acf(")
+        .expect("the position update")..];
+    let named = burn.find("uint256 prev_feeGrowthGlobal0X128 = feeGrowthGlobal0X128;");
+    assert!(
+        named.expect("the fee growth is kept") < burn.find("if (int128(arg3) != 0) {").unwrap(),
+        "a burn of nothing still has the fee growth it read"
+    );
+    assert!(
+        !pool.contains("prev2_stor_0 &"),
+        "the last write reads slot 0 anew"
+    );
+    assert!(
+        dvn.contains("require(uint64(stor_6) <= uint64(stor_4),"),
+        "the quorum is checked against the size after the change"
+    );
+    assert!(dvn.contains("if (!stor_8[ret_3_0]) {"));
+    let add = &diamond[diamond
+        .find("function orphan_0x36d(")
+        .expect("addFunctions")..];
+    let named = add.find("uint256 prev").expect("the position is kept");
+    assert!(named < add.find("if (uint96(").expect("the first facet test"));
+    assert!(
+        router.contains(
+            "require(stor_5[address(calldata[arg4 + 32])][ret_2_0] == 0, CustomError_c5f2be51());"
+        ),
+        "the lock is read after the permit ran"
+    );
+}

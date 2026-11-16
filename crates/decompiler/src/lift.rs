@@ -126,6 +126,7 @@ pub struct LNode {
     pub succs: Vec<usize>,
     pub entry_stack: Vec<ExprId>,
     pub exit_stack: Vec<ExprId>,
+    pub sgen: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1947,6 +1948,7 @@ impl<'a> Lifter<'a> {
                 succs: vec![],
                 entry_stack: vec![],
                 exit_stack: vec![],
+                sgen: entry.sgen,
             };
             return (ln, st);
         }
@@ -2511,6 +2513,7 @@ impl<'a> Lifter<'a> {
             succs,
             entry_stack: vec![],
             exit_stack: st.stack.clone(),
+            sgen: entry.sgen,
         };
         (ln, st)
     }
@@ -2552,9 +2555,9 @@ impl<'a> Lifter<'a> {
         let summary = self.summaries.get(&call.callee);
         let free_pointer = konst(U256::from_u64(FREE_POINTER));
         let free_now = st.mem.load_word(free_pointer, st.version);
-        let entry_gen = st.mem.gen;
+        let (entry_gen, entry_sgen) = (st.mem.gen, st.sgen);
         let subst = |e: ExprId| -> ExprId {
-            let restamped = expr::restamp_memory(e, entry_gen, &mut HashMap::new());
+            let restamped = expr::restamp(e, entry_gen, entry_sgen, &mut HashMap::new());
             let mut memo = HashMap::new();
             expr::substitute(
                 restamped,

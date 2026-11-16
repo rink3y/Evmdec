@@ -840,11 +840,18 @@ pub fn substitute(
     r
 }
 
-pub fn restamp_memory(e: ExprId, version: u32, memo: &mut HashMap<ExprId, ExprId>) -> ExprId {
+/* A helper counts its versions from zero. Left as they are, what it read from storage
+would be taken for what its caller read at the start. */
+pub fn restamp(
+    e: ExprId,
+    version: u32,
+    storage: u32,
+    memo: &mut HashMap<ExprId, ExprId>,
+) -> ExprId {
     if let Some(r) = memo.get(&e) {
         return *r;
     }
-    let mut again = |x: ExprId| restamp_memory(x, version, memo);
+    let mut again = |x: ExprId| restamp(x, version, storage, memo);
     let r = match node(e) {
         Node::Op(o, v) => {
             let nv: Vec<ExprId> = v.iter().map(|x| again(*x)).collect();
@@ -863,7 +870,8 @@ pub fn restamp_memory(e: ExprId, version: u32, memo: &mut HashMap<ExprId, ExprId
             intern(Node::Keccak(nv, t))
         }
         Node::MLoad(a, _) => intern(Node::MLoad(again(a), version)),
-        Node::SLoad(a, t, ver) => intern(Node::SLoad(again(a), t, ver)),
+        Node::SLoad(a, t, ver) => intern(Node::SLoad(again(a), t, storage + ver.min(1))),
+        Node::Env(op::SELFBALANCE, ver) => intern(Node::Env(op::SELFBALANCE, storage + ver.min(1))),
         Node::CallDataLoad(a) => intern(Node::CallDataLoad(again(a))),
         Node::ReturnData(s, a) => intern(Node::ReturnData(s, again(a))),
         Node::CopiedWord(k, a, ver) => intern(Node::CopiedWord(k, again(a), ver)),

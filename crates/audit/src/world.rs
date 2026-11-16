@@ -7,6 +7,7 @@ use evmdec::interp::{CallRecord, CreateRecord, Host, Machine, Outcome};
 use evmdec::keccak::keccak256;
 use evmdec::opcode as op;
 use evmdec::U256;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -65,6 +66,76 @@ fn code_of(bytes: &[u8]) -> Rc<Code> {
     })
 }
 
+// None is a read that failed. Nothing there reads as zero or as no code.
+pub trait Source {
+    fn storage(&self, address: Addr, slot: U256) -> Option<U256>;
+    fn code(&self, address: Addr) -> Option<Vec<u8>>;
+    fn balance(&self, address: Addr) -> Option<U256>;
+}
+
+#[derive(Default)]
+struct Read {
+    slots: HashMap<(Addr, U256), U256>,
+    codes: HashMap<Addr, Option<Rc<Code>>>,
+    ether: HashMap<Addr, U256>,
+    purses: HashMap<(Addr, Addr), (Addr, U256)>,
+    spoken: HashSet<Addr>,
+    met: Vec<Addr>,
+    reads: u64,
+}
+
+/* The chain behind a world. What was read is shared by every copy of the world, since
+the state at one block is the same for all of them. A read that failed is taken as
+nothing there, and stays that for the rest of the run. */
+#[derive(Clone)]
+struct Chain {
+    source: Rc<dyn Source>,
+    read: Rc<RefCell<Read>>,
+}
+
+impl Chain {
+    fn slot(&self, address: Addr, slot: U256) -> U256 {
+        if let Some(value) = self.read.borrow().slots.get(&(address, slot)) {
+            return *value;
+        }
+        let value = self.source.storage(address, slot).unwrap_or(U256::ZERO);
+        let mut read = self.read.borrow_mut();
+        read.reads += 1;
+        read.slots.insert((address, slot), value);
+        value
+    }
+
+    fn code(&self, address: Addr) -> Option<Rc<Code>> {
+        if let Some(code) = self.read.borrow().codes.get(&address) {
+            return code.clone();
+        }
+        let bytes = self.source.code(address).unwrap_or_default();
+        let runs = !bytes.is_empty() && crate::not_runnable(&bytes).is_none();
+        let code = runs.then(|| code_of(&bytes));
+        let mut read = self.read.borrow_mut();
+        read.reads += 1;
+        read.codes.insert(address, code.clone());
+        code
+    }
+
+    fn ether(&self, address: Addr) -> U256 {
+        if let Some(held) = self.read.borrow().ether.get(&address) {
+            return *held;
+        }
+        let held = self.source.balance(address).unwrap_or(U256::ZERO);
+        let mut read = self.read.borrow_mut();
+        read.reads += 1;
+        read.ether.insert(address, held);
+        held
+    }
+}
+
+// An address this world made up: a person, a stand-in, a contract made here, or a
+// small number. No chain is asked about one.
+fn made_up(who: Addr) -> bool {
+    who.0[3] == 0 && who.0[1] == 0 && who.0[0] >> 32 == 0 && who.0[2].trailing_zeros() >= 24
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Msg {
     pub from: Addr,
@@ -100,6 +171,7 @@ pub struct World {
     answer a one. */
     pub contrary: bool,
     made: u64,
+    chain: Option<Chain>,
 }
 
 struct Frame {
@@ -239,6 +311,27 @@ impl World {
         self.codes.insert(address, code_of(code));
     }
 
+    pub fn read_from(&mut self, source: Rc<dyn Source>) {
+        self.chain = Some(Chain {
+            source,
+            read: Rc::default(),
+        });
+    }
+
+    #[must_use]
+    pub fn reads(&self) -> u64 {
+        self.chain.as_ref().map_or(0, |c| c.read.borrow().reads)
+    }
+
+    fn on_chain(&self, who: Addr) -> Option<&Chain> {
+        self.chain.as_ref().filter(|_| !made_up(who))
+    }
+
+    fn code_at(&self, who: Addr) -> Option<Rc<Code>> {
+        let placed = self.codes.get(&who).cloned();
+        placed.or_else(|| self.on_chain(who)?.code(who))
+    }
+
     pub fn seed(&mut self, address: Addr, slot: U256, value: U256) {
         let slots = self.storage.entry(address).or_default();
         Rc::make_mut(slots).insert(slot, value);
@@ -247,10 +340,11 @@ impl World {
     #[must_use]
     pub fn stored(&self, address: Addr, slot: U256) -> U256 {
         let slots = self.storage.get(&address);
-        slots
-            .and_then(|s| s.get(&slot))
-            .copied()
-            .unwrap_or(U256::ZERO)
+        let written = slots.and_then(|s| s.get(&slot)).copied();
+        written.unwrap_or_else(|| {
+            let chain = self.on_chain(address);
+            chain.map_or(U256::ZERO, |c| c.slot(address, slot))
+        })
     }
 
     #[must_use]
@@ -275,6 +369,11 @@ impl World {
 
     // A contract in use holds ether and assets that were sent to it.
     pub fn enrich(&mut self, who: Addr, of: Option<Addr>) {
+        if let Some((account, slot)) = of.and_then(|asset| self.purse(asset, who)) {
+            let held = self.stored(account, slot);
+            self.seed(account, slot, held.max(PURSE));
+            return;
+        }
         if !self.rich.contains(&(who, of)) {
             self.rich.push((who, of));
         }
@@ -286,15 +385,23 @@ impl World {
 
     #[must_use]
     pub fn ether_of(&self, who: Addr) -> U256 {
-        let start = match self.is_person(who) || self.rich.contains(&(who, None)) {
+        let start = || match self.is_person(who) || self.rich.contains(&(who, None)) {
             true => PURSE,
-            false => U256::ZERO,
+            false => self.on_chain(who).map_or(U256::ZERO, |c| c.ether(who)),
         };
-        self.ether.get(&who).copied().unwrap_or(start)
+        self.ether.get(&who).copied().unwrap_or_else(start)
+    }
+
+    fn purse(&self, asset: Addr, who: Addr) -> Option<(Addr, U256)> {
+        let read = self.chain.as_ref()?.read.borrow();
+        read.purses.get(&(asset, who)).copied()
     }
 
     #[must_use]
     pub fn asset_of(&self, asset: Addr, who: Addr) -> U256 {
+        if let Some((account, slot)) = self.purse(asset, who) {
+            return self.stored(account, slot);
+        }
         let start = match self.is_person(who) || self.rich.contains(&(who, Some(asset))) {
             true => PURSE,
             false => U256::ZERO,
@@ -305,6 +412,9 @@ impl World {
     #[must_use]
     pub fn assets(&self) -> Vec<Addr> {
         let mut all: Vec<Addr> = self.assets.keys().map(|(asset, _)| *asset).collect();
+        if let Some(chain) = &self.chain {
+            all.extend(chain.read.borrow().purses.keys().map(|(asset, _)| *asset));
+        }
         all.sort();
         all.dedup();
         all
@@ -388,7 +498,7 @@ impl World {
             cmps: 0,
         };
         let paid = self.pays(msg.from, msg.to, msg.value);
-        let (ok, output) = match (paid, self.codes.get(&msg.to).cloned()) {
+        let (ok, output) = match (paid, self.code_at(msg.to)) {
             (false, _) => (false, Vec::new()),
             (true, None) => {
                 tx.run.halt = Halt::Done;
@@ -526,11 +636,11 @@ impl World {
     }
 
     fn code_size(&self, who: Addr) -> U256 {
-        if let Some(code) = self.codes.get(&who) {
+        if let Some(code) = self.code_at(who) {
             return U256::from(code.bytes.len());
         }
         let bare = who.is_zero() || built_in(who) || [OWNER, USER, ACTOR].contains(&who);
-        U256::from(!bare)
+        U256::from(!bare && self.on_chain(who).is_none())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1071,7 +1181,7 @@ impl World {
             let tags = vec![join_all(&pending.input).with(HASH); answer.len().min(MAX_TAGGED)];
             return (true, answer, tags, Answered::BuiltIn);
         }
-        if let Some(code) = self.codes.get(&to).cloned() {
+        if let Some(code) = self.code_at(to) {
             if f.depth >= MAX_DEPTH {
                 return said((false, Vec::new()), Answered::Code);
             }
@@ -1108,7 +1218,11 @@ impl World {
             }
             let (ok, output, mut tags) = self.nested(&inner, tx, payer);
             tags.resize(output.len().min(MAX_TAGGED), Tag::NONE);
-            return (ok, output, tags, Answered::Code);
+            let by = match self.keeps_books(record, to, ok && !fixed, pending, f, tx) {
+                true => Answered::Books,
+                false => Answered::Code,
+            };
+            return (ok, output, tags, by);
         }
         // Code run in the caller's own storage is part of the caller. When it is not
         // here to run, nothing is known of what it would have done.
@@ -1145,7 +1259,8 @@ impl World {
             };
             return said((true, answer), Answered::Taken);
         }
-        if to.is_zero() || self.is_person(to) {
+        // An address the chain has no code at is somebody's account, and answers nothing.
+        if to.is_zero() || self.is_person(to) || self.on_chain(to).is_some() {
             return said((true, Vec::new()), Answered::Blank);
         }
         let (answer, by) = self.asked(record, to, fixed, pending, f, tx);
@@ -1157,7 +1272,7 @@ impl World {
         let Some(hook) = tx.hook.take() else {
             return;
         };
-        let Some(code) = self.codes.get(&hook.to).cloned() else {
+        let Some(code) = self.code_at(hook.to) else {
             return;
         };
         let inner = Frame {
@@ -1172,6 +1287,128 @@ impl World {
         };
         let (ok, _, _) = self.nested(&inner, tx, Some(hook.from));
         tx.run.hooked |= ok;
+    }
+
+    /* A contract read from the chain and spoken to in the transfer interface is an
+    asset that keeps its own books. What it was told to move is noted the way the
+    world's own books note it. */
+    fn keeps_books(
+        &self,
+        record: &CallRecord,
+        to: Addr,
+        moved: bool,
+        pending: &Pending,
+        f: &Frame,
+        tx: &mut Tx,
+    ) -> bool {
+        let outside = !self.codes.contains_key(&to) && record.kind != op::DELEGATECALL;
+        let Some(chain) = self.on_chain(to).filter(|_| outside) else {
+            return false;
+        };
+        let arg = |i: usize| word(&record.input, 4 + 32 * i);
+        let arg_tag = |i: usize| pending.args.get(i).copied().unwrap_or(Tag::NONE);
+        let size = record.input.len();
+        let paid = match selector(&record.input) {
+            Some(SEL_TRANSFER) if size >= 68 => Some((f.account, 0)),
+            Some(SEL_TRANSFER_FROM) if size >= 100 => Some((low_address(arg(0)), 1)),
+            Some(SEL_BALANCE_OF) if size >= 36 => None,
+            Some(SEL_APPROVE | SEL_ALLOWANCE | SEL_TOTAL_SUPPLY | SEL_DECIMALS) => return true,
+            _ => return false,
+        };
+        let mut read = chain.read.borrow_mut();
+        if read.spoken.insert(to) {
+            read.met.push(to);
+        }
+        if let Some((from, at)) = paid.filter(|_| moved) {
+            let paid = Event::Pay {
+                asset: Some(to),
+                from,
+                to: low_address(arg(at)),
+                amount: arg(at + 1),
+                to_tag: arg_tag(at),
+                amount_tag: arg_tag(at + 1),
+            };
+            Self::event(tx, paid);
+        }
+        true
+    }
+
+    #[must_use]
+    pub fn met(&self) -> Vec<Addr> {
+        let chain = self.chain.as_ref();
+        chain.map_or_else(Vec::new, |c| std::mem::take(&mut c.read.borrow_mut().met))
+    }
+
+    /* The cell an asset answers a question from. The asset is asked, each cell it
+    loaded under every address the question names is filled in turn, and the one that
+    turns the answer into what it was filled with is the cell. */
+    fn answered_from(&self, asset: Addr, data: Vec<u8>, named: &[Addr]) -> Option<(Addr, U256)> {
+        let ask = Msg {
+            from: ACTOR,
+            to: asset,
+            data,
+            ..Msg::default()
+        };
+        let run = self.clone().send(&ask);
+        if !run.ok || run.output.len() < 32 {
+            return None;
+        }
+        let mark = PURSE + U256::from_u64(0x5eed);
+        let under = |who: &Addr, cell: &Cell| cell.keys.iter().any(|k| k.value == *who);
+        let keyed = run
+            .cells
+            .iter()
+            .filter(|cell| named.iter().all(|who| under(who, cell)));
+        keyed.map(|cell| (cell.account, cell.slot)).find(|at| {
+            let mut tried = self.clone();
+            tried.seed(at.0, at.1, mark);
+            word(&tried.send(&ask).output, 0) == mark
+        })
+    }
+
+    /* Puts an amount of an asset that has code in each person's hands by writing the
+    cells the asset keeps its books in, and leaves the contract under test free to draw
+    on it, as people who use a contract do. False where the books are not plain cells. */
+    pub fn endow(&mut self, asset: Addr, amount: U256) -> bool {
+        let Some(chain) = self.chain.clone() else {
+            return false;
+        };
+        let call = |selector: u32, about: &[Addr]| {
+            let mut data = selector.to_be_bytes().to_vec();
+            for who in about {
+                data.extend_from_slice(&who.to_be_bytes());
+            }
+            data
+        };
+        let subject = self.subject;
+        let mut found = false;
+        for who in [ACTOR, ALLY, USER, OWNER, subject] {
+            let asked = self.answered_from(asset, call(SEL_BALANCE_OF, &[who]), &[who]);
+            let Some((account, slot)) = asked else {
+                continue;
+            };
+            found = true;
+            // What the contract under test records of its own holders is its ledger, not an asset.
+            if asset != subject {
+                let mut read = chain.read.borrow_mut();
+                read.purses.insert((asset, who), (account, slot));
+            }
+            if who != subject {
+                self.seed(account, slot, amount);
+            }
+        }
+        if !found || asset == subject {
+            return found;
+        }
+        for who in [ACTOR, ALLY, USER, OWNER] {
+            let pair = [who, subject];
+            if let Some((account, slot)) =
+                self.answered_from(asset, call(SEL_ALLOWANCE, &pair), &pair)
+            {
+                self.seed(account, slot, U256::MAX);
+            }
+        }
+        found
     }
 
     /* An address with no code. An asset answers from its books. Anything else answers
@@ -1363,6 +1600,56 @@ mod tests {
         assert_eq!(answer(OWNER, false), U256::ONE);
         assert_eq!(answer(ACTOR, false), U256::ZERO);
         assert_eq!(answer(ACTOR, true), U256::ONE);
+    }
+
+    fn deployed(hex: &str) -> Addr {
+        U256::from_hex_str(hex).expect("address")
+    }
+
+    #[test]
+    fn what_no_call_has_written_is_read_from_the_chain_and_code_found_there_is_run() {
+        let other = deployed("0x1111111111111111111111111111111111111111");
+        let mut chain = crate::chain::Table::default();
+        // return(sload(1))
+        let reads_slot_one = evmdec::hex::decode("60015460005260206000f3").expect("hex");
+        chain.codes.insert(other, reads_slot_one);
+        chain.storage.insert((other, U256::ONE), U256::from_u64(9));
+        chain.ether.insert(other, U256::from_u64(3));
+        // call(gas, other, 0, 0, 0, 0, 32); return(0, 32)
+        let code = "60206000600060006000731111111111111111111111111111111111111111\
+                    61fffff15060206000f3";
+        let mut world = World::new();
+        world.place(SUBJECT, &evmdec::hex::decode(code).expect("hex"));
+        world.read_from(Rc::new(chain));
+        let ask = Msg {
+            from: USER,
+            to: SUBJECT,
+            ..Msg::default()
+        };
+        assert_eq!(word(&world.send(&ask).output, 0), U256::from_u64(9));
+        assert_eq!(world.ether_of(other), U256::from_u64(3));
+        world.seed(other, U256::ONE, U256::from_u64(4));
+        assert_eq!(word(&world.send(&ask).output, 0), U256::from_u64(4));
+        assert_eq!(world.reads(), 3, "one read each of code, slot and ether");
+    }
+
+    #[test]
+    fn the_cell_an_asset_with_code_keeps_a_holding_in_is_found_by_asking_it() {
+        let asset = deployed("0x2222222222222222222222222222222222222222");
+        let mut chain = crate::chain::Table::default();
+        // mstore(0, calldataload(4)); mstore(32, 0); return(sload(keccak(0, 64)))
+        let ledger = "6004356000526000602052604060002054600052 60206000f3".replace(' ', "");
+        chain
+            .codes
+            .insert(asset, evmdec::hex::decode(&ledger).expect("hex"));
+        let mut world = World::new();
+        world.read_from(Rc::new(chain));
+        assert!(world.asset_of(asset, ACTOR) == PURSE && world.assets().is_empty());
+        assert!(world.endow(asset, U256::from_u64(70)));
+        assert_eq!(world.assets(), vec![asset]);
+        assert_eq!(world.asset_of(asset, ACTOR), U256::from_u64(70));
+        assert_eq!(world.asset_of(asset, USER), U256::from_u64(70));
+        assert!(world.asset_of(asset, SUBJECT).is_zero());
     }
 
     #[test]

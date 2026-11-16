@@ -4,13 +4,14 @@ use crate::model::Facts;
 use crate::trace::{
     Answered, Event, Place, Run, Tag, CALLER, CLOCK, DATA, MATH, OUT, SIZE, STORE, VALUE,
 };
-use crate::world::{self, Addr, Msg, World, ACTOR, ALLY, OWNER, SUBJECT, USER};
+use crate::world::{self, Addr, Msg, Source, World, ACTOR, ALLY, OWNER, SUBJECT, USER};
 use evmdec::abi;
 use evmdec::decompile::Contract;
 use evmdec::function::{FnKind, Mutability};
 use evmdec::opcode as op;
 use evmdec::U256;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 pub const UNIT: U256 = U256([1_000_000_000_000_000_000, 0, 0, 0]);
 // What an account is taken to hold in a ledger the contract keeps: a thousand units.
@@ -145,6 +146,7 @@ pub struct Explorer<'a> {
     good: Vec<Option<Try>>,
     // The set-up calls the starting world has been through.
     setups: Vec<(usize, Try)>,
+    on_chain: bool,
 }
 
 fn outside(n: usize) -> Addr {
@@ -344,6 +346,29 @@ impl<'a> Explorer<'a> {
                 world.seed(subject, slot, held);
             }
         }
+        Self::starting_from(c, subject, world)
+    }
+
+    #[must_use]
+    pub fn on_chain(
+        c: &'a Contract,
+        source: Rc<dyn Source>,
+        number: u64,
+        time: u64,
+    ) -> Explorer<'a> {
+        let named = c.address.as_deref().and_then(U256::from_hex_str);
+        let subject = named.unwrap_or(SUBJECT);
+        let mut world = World::new();
+        world.subject = subject;
+        world.place(subject, &c.info.runtime);
+        world.read_from(source);
+        (world.number, world.time) = (U256::from_u64(number), U256::from_u64(time));
+        let mut explorer = Self::starting_from(c, subject, world);
+        explorer.on_chain = true;
+        explorer
+    }
+
+    fn starting_from(c: &'a Contract, subject: Addr, world: World) -> Explorer<'a> {
         let entries = entries(c);
         let start = State {
             world,
@@ -375,6 +400,7 @@ impl<'a> Explorer<'a> {
             stopped: Vec::new(),
             good: Vec::new(),
             setups: Vec::new(),
+            on_chain: false,
         }
     }
 
@@ -897,6 +923,119 @@ impl<'a> Explorer<'a> {
         }
     }
 
+    /* A world read from the chain is set up already. What is left to learn is who the
+    people are in it: the account the code compares its caller with, and what the three
+    hold of the assets the calls move. A role kept under the caller's own address
+    cannot be read off the chain without knowing who holds it, so that is still taken. */
+    fn settle_on_chain(&mut self) {
+        let subject = self.subject;
+        if self.states[0].world.endow(subject, STAKE) {
+            self.assumed.push(
+                "each account holds a thousand units in the contract's own ledger, written into the cells it answers balances from".to_string(),
+            );
+        }
+        for _ in 0..4 {
+            let mut changed = false;
+            self.good = vec![None; self.entries.len()];
+            let mut refused: Vec<(usize, Try, Run)> = Vec::new();
+            for entry in 0..self.entries.len() {
+                for who in [OWNER, USER, ACTOR] {
+                    let plain = Try::of(self.seed(entry, who, who, UNIT, U256::ZERO));
+                    let (_, run) = self.attempt(0, entry, &plain);
+                    changed |= self.name_owner(&run);
+                }
+                for seed in self.honest(entry, OWNER) {
+                    if budget::spent() {
+                        return;
+                    }
+                    let (best, world, run) = self.solve(0, entry, Try::of(seed));
+                    changed |= self.name_owner(&run);
+                    if run.ok {
+                        let (_, again) = self.attempt_in(world, entry, &best);
+                        if again.ok {
+                            self.good[entry] = Some(best);
+                        }
+                        break;
+                    }
+                    refused.push((entry, best, run));
+                }
+            }
+            for asset in self.states[0].world.met() {
+                if self.states[0].world.endow(asset, world::PURSE) {
+                    self.assumed.push(format!(
+                        "the owner, the user and the account with no role each hold a purse of the asset at {}, written into the cells it keeps its books in, and let the contract draw on it",
+                        asset.to_hex()
+                    ));
+                    changed = true;
+                }
+            }
+            for (entry, t, run) in refused {
+                if self.good[entry].is_none() {
+                    changed |= self.assume_from(&t, &run, entry, false);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /* On the chain the cells the code compares its caller with name somebody already.
+    The owner here takes that account's place in each of them, so that what it may do
+    is tried. A cell the code also calls names a contract the calls are made to, and
+    is left as it is. */
+    fn name_owner(&mut self, run: &Run) -> bool {
+        let subject = self.subject;
+        let mut named: Vec<(Place, U256, Addr)> = Vec::new();
+        for event in &run.events {
+            let Event::Cmp {
+                op: op::EQ,
+                a,
+                b,
+                ta,
+                tb,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            for (caller, other, holder) in [(ta, tb, b), (tb, ta, a)] {
+                let stored = caller.only(CALLER) && other.has(STORE) && !other.has(DATA);
+                let cell = run.cell_of(*other).filter(|c| c.account == subject);
+                let somebody =
+                    !holder.is_zero() && holder.bits() <= 160 && !self.known.contains(holder);
+                if let (true, true, Some(cell)) = (stored, somebody, cell) {
+                    if cell.keys.iter().all(|k| k.tag.is_none()) {
+                        named.push((cell.place(), cell.slot, *holder));
+                    }
+                }
+            }
+        }
+        let mask = (U256::ONE << 160) - U256::ONE;
+        let mut changed = false;
+        for (place, slot, holder) in named {
+            let called = self.facts.places.get(&place).is_some_and(|p| p.target)
+                || self.c.call_target_slots.contains(&slot.to_hex_padded(32));
+            let held = self.states[0].world.stored(subject, slot);
+            // The address may sit above other fields packed into the same slot.
+            let at = (0..12u32)
+                .map(|bytes| 8 * bytes)
+                .find(|shift| (held >> *shift) & mask == holder);
+            let Some(shift) = at.filter(|_| !called) else {
+                continue;
+            };
+            let named = (held & !(mask << shift)) | (OWNER << shift);
+            self.states[0].world.seed(subject, slot, named);
+            self.assumed.push(format!(
+                "the owner stands for the account at {}, which slot {} names and the code compares the caller with",
+                holder.to_hex(),
+                slot.to_hex()
+            ));
+            changed = true;
+        }
+        changed
+    }
+
     /* A call the owner can make once and not again, and that fills cells it found
     empty, is the contract's set-up. A contract in use has been through it, so the
     world every other call starts from has too. */
@@ -1163,6 +1302,8 @@ impl<'a> Explorer<'a> {
                 options.extend(values.into_iter().map(|v| (cell.slot, v, why.clone())));
             }
         }
+        // The settings a contract read from the chain needs are the ones it has.
+        options.retain(|(slot, _, _)| !self.on_chain || roles.contains(slot));
         for (slot, value, why) in options.into_iter().take(12) {
             if budget::spent() {
                 return false;
@@ -1350,7 +1491,7 @@ impl<'a> Explorer<'a> {
         let used = |i: usize| worked.iter().any(|t| t.cell().is_none_or(|c| c == i));
         let mut doubtful: Vec<U256> = unset
             .into_iter()
-            .filter(|(i, _)| value && used(*i))
+            .filter(|(i, _)| value && used(*i) && !self.on_chain)
             .map(|(_, slot)| slot)
             .collect();
         doubtful.sort();
@@ -1801,7 +1942,10 @@ impl<'a> Explorer<'a> {
     }
 
     pub fn explore(&mut self, work: u64) {
-        budget::within(work / 5, || self.settle());
+        budget::within(work / 5, || match self.on_chain {
+            true => self.settle_on_chain(),
+            false => self.settle(),
+        });
         budget::within(work / 10, || self.used_by(OWNER, 1));
         budget::within(work / 5, || self.used_by(USER, 2));
         budget::within(work / 10, || self.sweep());

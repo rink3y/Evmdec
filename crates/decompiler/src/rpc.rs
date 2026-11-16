@@ -4,7 +4,9 @@ use crate::u256::U256;
 use crate::{expr, keccak};
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
-use std::io::Read;
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -14,6 +16,8 @@ pub struct Chain {
     pub endpoints: &'static [&'static str],
 }
 
+// The last endpoints of a chain are the ones seen to answer for old blocks. They are asked
+// last, so a read of the newest block goes where it always went.
 pub const CHAINS: &[Chain] = &[
     Chain {
         name: "mainnet",
@@ -23,6 +27,8 @@ pub const CHAINS: &[Chain] = &[
             "https://eth.llamarpc.com",
             "https://cloudflare-eth.com",
             "https://rpc.ankr.com/eth",
+            "https://eth-mainnet.public.blastapi.io",
+            "https://rpc.mevblocker.io",
         ],
     },
     Chain {
@@ -39,6 +45,7 @@ pub const CHAINS: &[Chain] = &[
         endpoints: &[
             "https://arbitrum-one-rpc.publicnode.com",
             "https://arb1.arbitrum.io/rpc",
+            "https://arbitrum-one.public.blastapi.io",
         ],
     },
     Chain {
@@ -55,6 +62,7 @@ pub const CHAINS: &[Chain] = &[
         endpoints: &[
             "https://base-rpc.publicnode.com",
             "https://mainnet.base.org",
+            "https://base-mainnet.public.blastapi.io",
         ],
     },
     Chain {
@@ -63,6 +71,7 @@ pub const CHAINS: &[Chain] = &[
         endpoints: &[
             "https://polygon-bor-rpc.publicnode.com",
             "https://polygon-rpc.com",
+            "https://api.zan.top/polygon-mainnet",
         ],
     },
     Chain {
@@ -71,6 +80,8 @@ pub const CHAINS: &[Chain] = &[
         endpoints: &[
             "https://bsc-rpc.publicnode.com",
             "https://bsc-dataseed.binance.org",
+            "https://bsc-mainnet.public.blastapi.io",
+            "https://api.zan.top/bsc-mainnet",
         ],
     },
     Chain {
@@ -153,6 +164,55 @@ pub struct Client {
     calls: Cell<usize>,
     // An endpoint that did not answer is not asked again. Each try costs the full wait.
     dead: RefCell<Vec<bool>>,
+    chain: String,
+    block: Option<u64>,
+    // The endpoint that answered the last read at a fixed block. Few serve old blocks,
+    // and asking the others first costs a refusal from each on every read.
+    first: Cell<usize>,
+    kept: Option<Kept>,
+}
+
+/* What was read at a fixed block, one file for each account, one line for each answer.
+The state at a block never changes, so a second run reads it from here and gets the same
+report without asking a node. */
+#[derive(Clone, Debug)]
+struct Kept {
+    dir: PathBuf,
+    files: RefCell<HashMap<String, HashMap<String, String>>>,
+}
+
+impl Kept {
+    fn recall(&self, account: &str, key: &str) -> Option<String> {
+        let mut files = self.files.borrow_mut();
+        let lines = files.entry(account.to_string()).or_insert_with(|| {
+            let text = std::fs::read_to_string(self.dir.join(account)).unwrap_or_default();
+            let pairs = text.lines().filter_map(|l| l.split_once('\t'));
+            pairs.map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        });
+        lines.get(key).cloned()
+    }
+
+    fn keep(&self, account: &str, key: &str, value: &str) {
+        let mut files = self.files.borrow_mut();
+        let lines = files.entry(account.to_string()).or_default();
+        lines.insert(key.to_string(), value.to_string());
+        let file = std::fs::create_dir_all(&self.dir).and_then(|()| {
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .create(true)
+                .append(true)
+                .open(self.dir.join(account))
+        });
+        // A cache that cannot be written costs the next run its speed and nothing else.
+        if let Ok(mut file) = file {
+            let _ = file.write_all(format!("{key}\t{value}\n").as_bytes());
+        }
+    }
+}
+
+fn cache_dir() -> Option<PathBuf> {
+    let set = std::env::var_os("EVMDEC_STATE_CACHE").filter(|d| !d.is_empty());
+    set.map(PathBuf::from)
 }
 
 fn listed(urls: &str) -> Vec<String> {
@@ -194,8 +254,19 @@ impl Client {
             agent: ureq::AgentBuilder::new().timeout(CALL_TIME).build(),
             started: Instant::now(),
             calls: Cell::new(0),
+            chain: chain.to_ascii_lowercase(),
+            block: None,
+            first: Cell::new(0),
+            kept: None,
         };
-        if let Some(chain) = expected {
+        // Which chain these nodes serve was checked by the run that filled the cache.
+        let checked = cache_dir().map(|dir| Kept {
+            dir: dir.join(&client.chain),
+            files: RefCell::default(),
+        });
+        let nodes = client.endpoints.join(",");
+        let known = |kept: &Kept| kept.recall("nodes", &nodes).is_some();
+        if let Some(chain) = expected.filter(|_| !checked.as_ref().is_some_and(known)) {
             let served = client.chain_id()?;
             if served != chain.id {
                 return Err(format!(
@@ -203,8 +274,80 @@ impl Client {
                     chain.name, chain.id
                 ));
             }
+            if let Some(kept) = &checked {
+                kept.keep("nodes", &nodes, &served.to_string());
+            }
         }
         Ok(client)
+    }
+
+    pub fn at(mut self, block: Option<u64>) -> Result<(Client, u64, u64), String> {
+        let chain = self.chain.clone();
+        let kept = |number: u64| {
+            cache_dir().map(|dir| Kept {
+                dir: dir.join(&chain).join(number.to_string()),
+                files: RefCell::default(),
+            })
+        };
+        let known = block.and_then(|n| Some((n, kept(n)?.recall("block", "time")?)));
+        let number_of = |hex: &str| u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok();
+        let (number, time) = match known.and_then(|(n, time)| Some((n, number_of(&time)?))) {
+            Some(known) => known,
+            None => {
+                let tag = block.map_or("latest".to_string(), |n| format!("{n:#x}"));
+                let head = self.call("eth_getBlockByNumber", json!([tag, false]))?;
+                let field = |name: &str| head.get(name).and_then(Value::as_str).and_then(number_of);
+                let found = field("number").zip(field("timestamp"));
+                found.ok_or_else(|| format!("no node knows block {tag} of {chain}"))?
+            }
+        };
+        self.block = Some(number);
+        self.kept = kept(number);
+        if let Some(kept) = &self.kept {
+            kept.keep("block", "time", &format!("{time:#x}"));
+        }
+        Ok((self, number, time))
+    }
+
+    fn spend_a_call(&self) -> Result<(), String> {
+        if self.calls.get() >= MAX_CALLS {
+            return Err(format!(
+                "the limit of {MAX_CALLS} calls to remote nodes for one request was reached"
+            ));
+        }
+        self.calls.set(self.calls.get() + 1);
+        Ok(())
+    }
+
+    /* At a fixed block any node that answers is believed, since a node that is behind
+    does not have the block at all. A kept answer counts as a call, so the limit falls at
+    the same read whether or not the cache is warm. */
+    fn state(
+        &self,
+        method: &str,
+        account: &str,
+        key: &str,
+        params: impl Fn(&str) -> Value,
+        conclusive: impl Fn(&Value) -> bool,
+    ) -> Result<String, String> {
+        let text = |v: Value| {
+            let s = v.as_str().map(str::to_string);
+            s.ok_or_else(|| format!("{method}: result is not a string"))
+        };
+        let Some(block) = self.block else {
+            return text(self.call_where(method, params("latest"), conclusive)?);
+        };
+        let account = account.to_ascii_lowercase();
+        let kept = self.kept.as_ref();
+        if let Some(known) = kept.and_then(|k| k.recall(&account, key)) {
+            self.spend_a_call()?;
+            return Ok(known);
+        }
+        let read = text(self.call_where(method, params(&format!("{block:#x}")), |_| true)?)?;
+        if let Some(kept) = kept {
+            kept.keep(&account, key, &read);
+        }
+        Ok(read)
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -219,22 +362,19 @@ impl Client {
         params: Value,
         conclusive: impl Fn(&Value) -> bool,
     ) -> Result<Value, String> {
-        if self.calls.get() >= MAX_CALLS {
-            return Err(format!(
-                "the limit of {MAX_CALLS} calls to remote nodes for one request was reached"
-            ));
-        }
         let Some(left) = TOTAL_TIME.checked_sub(self.started.elapsed()) else {
             return Err(format!(
                 "calls to remote nodes had taken {} s",
                 TOTAL_TIME.as_secs()
             ));
         };
-        self.calls.set(self.calls.get() + 1);
+        self.spend_a_call()?;
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let mut last_err = String::from("no endpoint answers");
         let mut inconclusive: Option<Value> = None;
-        for (index, ep) in self.endpoints.iter().enumerate() {
+        let count = self.endpoints.len();
+        for index in (0..count).map(|step| (self.first.get() + step) % count) {
+            let ep = &self.endpoints[index];
             if self.dead.borrow()[index] {
                 continue;
             }
@@ -258,7 +398,12 @@ impl Client {
                             continue;
                         }
                         match v.get("result") {
-                            Some(res) if conclusive(res) => return Ok(res.clone()),
+                            Some(res) if conclusive(res) => {
+                                if self.block.is_some() {
+                                    self.first.set(index);
+                                }
+                                return Ok(res.clone());
+                            }
                             Some(res) => {
                                 inconclusive.get_or_insert_with(|| res.clone());
                             }
@@ -284,9 +429,9 @@ impl Client {
             v.as_str()
                 .is_some_and(|s| s.trim_start_matches("0x").len() > 1)
         };
-        let v = self.call_where("eth_getCode", json!([address, "latest"]), has_code)?;
-        let s = v.as_str().ok_or("eth_getCode: result is not a string")?;
-        let code = hex::decode(s)?;
+        let params = |block: &str| json!([address, block]);
+        let s = self.state("eth_getCode", address, "code", params, has_code)?;
+        let code = hex::decode(&s)?;
         if code.len() > MAX_CODE {
             return Err(format!(
                 "the code at {address} is {} bytes, over the limit of {MAX_CODE}",
@@ -302,21 +447,23 @@ impl Client {
                 .and_then(U256::from_hex_str)
                 .is_some_and(|x| !x.is_zero())
         };
-        let v = self.call_where(
-            "eth_getStorageAt",
-            json!([address, slot, "latest"]),
-            non_zero,
-        )?;
-        let s = v
-            .as_str()
-            .ok_or("eth_getStorageAt: result is not a string")?;
-        U256::from_hex_str(s).ok_or_else(|| format!("bad storage value {}", s))
+        let params = |block: &str| json!([address, slot, block]);
+        let key = format!("slot {slot}");
+        let s = self.state("eth_getStorageAt", address, &key, params, non_zero)?;
+        U256::from_hex_str(&s).ok_or_else(|| format!("bad storage value {}", s))
+    }
+
+    pub fn get_balance(&self, address: &str) -> Result<U256, String> {
+        let params = |block: &str| json!([address, block]);
+        let s = self.state("eth_getBalance", address, "balance", params, |_| true)?;
+        U256::from_hex_str(&s).ok_or_else(|| format!("bad balance {}", s))
     }
 
     pub fn eth_call(&self, to: &str, data: &str) -> Result<Vec<u8>, String> {
-        let v = self.call("eth_call", json!([{"to": to, "data": data}, "latest"]))?;
-        let s = v.as_str().ok_or("eth_call: result is not a string")?;
-        hex::decode(s)
+        let params = |block: &str| json!([{"to": to, "data": data}, block]);
+        let key = format!("call {data}");
+        let s = self.state("eth_call", to, &key, params, |_| true)?;
+        hex::decode(&s)
     }
 
     pub fn chain_id(&self) -> Result<u64, String> {

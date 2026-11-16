@@ -76,6 +76,13 @@ pub struct Stats {
     pub states_kept: usize,
     pub work: u64,
     pub ms: u128,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reads: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -85,6 +92,8 @@ pub struct Report {
     // Why nothing was run, for code this machine cannot run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_run: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub state: Vec<String>,
     pub findings: Vec<Finding>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub chains: Vec<Chain>,
@@ -660,6 +669,7 @@ pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
             .unwrap_or_else(|| "bytecode".to_string()),
         code_size: ex.c.info.runtime.len(),
         not_run: crate::not_runnable(&ex.c.info.runtime).map(str::to_string),
+        state: Vec::new(),
         findings,
         chains,
         functions,
@@ -679,6 +689,7 @@ pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
             states_kept: ex.states.len(),
             work,
             ms,
+            reads: 0,
         },
     }
 }
@@ -698,6 +709,9 @@ pub fn markdown(report: &Report) -> String {
         "{} of {} functions ended under some input, over {} calls and {} kept states, in {} ms.\n\n",
         s.functions_ended, s.functions, s.calls_made, s.states_kept, s.ms
     ));
+    for line in &report.state {
+        out.push_str(&format!("{line}\n\n"));
+    }
     match report.findings.len() {
         0 => out.push_str("## Findings\n\nNo run showed an account with no role gaining, taking from another account, or taking the contract over. That is what was tried, not a proof that nothing can.\n\n"),
         n => out.push_str(&format!("## Findings ({n})\n\n")),
@@ -791,7 +805,11 @@ pub fn markdown(report: &Report) -> String {
         ));
     }
     if !report.assumed.is_empty() {
-        out.push_str("\n## Taken to hold\n\nRuntime code does not say how the contract was set up. These were taken to hold because the owner's own calls are refused without them.\n\n");
+        out.push_str("\n## Taken to hold\n\n");
+        out.push_str(match report.state.is_empty() {
+            true => "Runtime code does not say how the contract was set up. These were taken to hold because the owner's own calls are refused without them.\n\n",
+            false => "The chain holds nothing for the three accounts that act here. These were added to what was read so that they can use the contract.\n\n",
+        });
         for a in &report.assumed {
             out.push_str(&format!("- {a}\n"));
         }
@@ -808,6 +826,7 @@ pub fn merge(reports: Vec<Report>) -> Report {
             subject: String::new(),
             code_size: 0,
             not_run: None,
+            state: Vec::new(),
             findings: Vec::new(),
             chains: Vec::new(),
             functions: Vec::new(),
@@ -828,12 +847,14 @@ pub fn merge(reports: Vec<Report>) -> Report {
         first.findings.append(&mut next.findings);
         first.chains.append(&mut next.chains);
         first.assumed.append(&mut next.assumed);
+        first.state.append(&mut next.state);
         first.stats.functions += next.stats.functions;
         first.stats.functions_ended += next.stats.functions_ended;
         first.stats.calls_made += next.stats.calls_made;
         first.stats.states_kept += next.stats.states_kept;
         first.stats.work += next.stats.work;
         first.stats.ms += next.stats.ms;
+        first.stats.reads += next.stats.reads;
     }
     first
 }

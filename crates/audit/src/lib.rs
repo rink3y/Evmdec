@@ -1,4 +1,5 @@
 pub mod budget;
+pub mod chain;
 pub mod explore;
 pub mod laws;
 pub mod model;
@@ -9,6 +10,7 @@ pub mod world;
 
 use evmdec::decompile::Contract;
 pub use report::{markdown, merge, Report};
+use std::rc::Rc;
 use std::time::Instant;
 
 // The interpreter steps one contract may cost, whatever machine it runs on.
@@ -44,6 +46,40 @@ pub fn audit_within(c: &Contract, work: u64) -> Report {
         started.elapsed().as_millis(),
         budget::used() - before,
     )
+}
+
+#[must_use]
+pub fn audit_read(c: &Contract, source: Rc<dyn world::Source>, number: u64, time: u64) -> Report {
+    let started = Instant::now();
+    let before = budget::used();
+    let mut explorer = explore::Explorer::on_chain(c, source, number, time);
+    if !c.info.runtime.is_empty() && not_runnable(&c.info.runtime).is_none() {
+        explorer.explore(WORK);
+    }
+    let mut report = report::build(
+        &explorer,
+        started.elapsed().as_millis(),
+        budget::used() - before,
+    );
+    report.stats.reads = explorer.states[0].world.reads();
+    report
+}
+
+#[must_use]
+pub fn audit_at(
+    c: &Contract,
+    client: evmdec::rpc::Client,
+    chain: &str,
+    number: u64,
+    time: u64,
+) -> Report {
+    let node = Rc::new(chain::Node::new(client));
+    let mut report = audit_read(c, node.clone(), number, time);
+    report.state.push(format!(
+        "The contract was run on the state of {chain} at block {number}. Its storage, and the code, storage and ether of every account its calls reached, were read from there."
+    ));
+    report.state.extend(node.trouble());
+    report
 }
 
 /* The report of a contract compiled from source. The code that is run is the code

@@ -89,9 +89,21 @@ enum Cmd {
         about = "Audit report from running the code (markdown, or JSON with --json). Takes bytecode, a Solidity file, or a compiler's standard JSON input"
     )]
     Audit {
+        #[arg(help = "A file, or a 0x address to run on the state its chain holds for it")]
         file: PathBuf,
         #[arg(long)]
         json: bool,
+        #[arg(
+            long,
+            default_value = "mainnet",
+            help = "Chain name or id, for an address"
+        )]
+        chain: String,
+        #[arg(
+            long,
+            help = "Block whose state an address is run on. The newest when left out"
+        )]
+        block: Option<u64>,
     },
     #[command(
         about = "Look up selectors (8 hex digits) or event topics (64 hex digits) in the signature dictionary and the local index; with no argument, report which index is in use"
@@ -186,6 +198,47 @@ fn fetch_and_decompile(
         return Ok(c);
     }
     fetch(opts)
+}
+
+fn audit_address(address: &str, chain: &str, block: Option<u64>) -> Result<audit::Report> {
+    let fetch = |client: &Client| {
+        let mut log = |line: &str| eprintln!("{line}");
+        let policy = Policy {
+            depth: 0,
+            ..Policy::default()
+        };
+        let options = Options::default();
+        let mut cache = CodeCache::new();
+        evmdec::fetch::fetch(
+            client, address, chain, &options, policy, &mut cache, &mut log,
+        )
+        .map_err(|e| anyhow::anyhow!(e))
+    };
+    let connect = || Client::new(None, chain);
+    let fixed = connect().and_then(|client| {
+        let (client, number, time) = client.at(block)?;
+        client.get_code(address)?;
+        Ok((client, number, time))
+    });
+    match fixed {
+        Ok((client, number, time)) => {
+            let c = fetch(&client)?;
+            // Decompiling took time out of what one client may spend on the network.
+            let fresh = connect().and_then(|client| client.at(Some(number)));
+            let (client, ..) = fresh.map_err(|e| anyhow::anyhow!(e))?;
+            Ok(audit::audit_at(&c, client, chain, number, time))
+        }
+        Err(why) => {
+            let client = connect().map_err(|e| anyhow::anyhow!(e))?;
+            let c = fetch(&client)?;
+            let mut report = audit::audit(&c);
+            let at = block.map_or("its newest block".to_string(), |n| format!("block {n}"));
+            report.state.push(format!(
+                "The state of {chain} at {at} could not be read: {why}. The contract was run in a world guessed from its code alone."
+            ));
+            Ok(report)
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -419,7 +472,22 @@ fn run(cli: Cli) -> Result<()> {
                 println!("0x{hex} {}", if line.is_empty() { "?" } else { &line });
             }
         }
-        Cmd::Audit { file, json } => {
+        Cmd::Audit {
+            file,
+            json,
+            chain,
+            block,
+        } => {
+            let address = file.to_str().filter(|s| evmdec::rpc::is_address(s));
+            if let Some(address) = address {
+                let report = audit_address(address, &chain, block)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", audit::markdown(&report));
+                }
+                return Ok(());
+            }
             let kind = file.extension().and_then(|e| e.to_str()).unwrap_or("");
             if kind == "sol" || kind == "json" {
                 let built = match kind {

@@ -1,5 +1,7 @@
 use audit::laws::Kind;
+use evmdec::U256;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 fn report(name: &str) -> audit::Report {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -75,4 +77,33 @@ fn what_an_owner_only_door_pays_out_is_held_and_an_open_door_beside_it_is_found(
     assert_eq!(kinds, vec![Kind::Gain], "{:?}", report.findings);
     // emergency(address)
     assert_eq!(report.findings[0].selector.as_deref(), Some("0x45941ee0"));
+}
+
+#[test]
+fn a_contract_read_from_a_chain_is_run_on_what_the_chain_holds_and_not_on_a_guess() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/source/Vault.hex");
+    let hex = std::fs::read_to_string(path).expect("fixture");
+    let code = evmdec::hex::decode(hex.trim()).expect("hex");
+    let mut contract = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+    let at = "0x3333333333333333333333333333333333333333";
+    contract.address = Some(at.to_string());
+    let (vault, deployer) = (
+        U256::from_hex_str(at).expect("address"),
+        U256::from_hex_str("0x4444444444444444444444444444444444444444").expect("address"),
+    );
+    let mut chain = audit::chain::Table::default();
+    chain.storage.insert((vault, U256::ZERO), deployer);
+    chain.ether.insert(vault, U256::from_u64(5));
+    let report = audit::audit_read(&contract, Rc::new(chain), 100, 1_700_000_000);
+    let at = |kind: Kind| report.findings.iter().find(|f| f.kind == kind);
+    // The deployer the chain names is the owner an open setOwner(address) replaces.
+    assert!(at(Kind::Takeover).is_some(), "{:?}", report.findings);
+    assert!(report
+        .assumed
+        .iter()
+        .any(|a| a.contains(&deployer.to_hex())));
+    // sweep(address) pays out the ether the chain says the vault holds. Nobody has to pay in first.
+    let sweep = at(Kind::Gain).expect("the open sweep");
+    assert_eq!(sweep.steps.len(), 1, "{:?}", sweep.steps);
+    assert!(!report.assumed.iter().any(|a| a.contains("ledger at slot")));
 }

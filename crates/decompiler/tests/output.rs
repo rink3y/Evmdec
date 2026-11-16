@@ -174,11 +174,11 @@ fn a_copy_by_the_identity_built_in_of_any_length_is_a_write() {
          61022051602001806102a082610220600060045af150506102a0516000556102c05160015500",
     );
     assert!(
-        out.contains("success_1 = identity.call(mem[0x220:prev_mem_0x220 + 608]);"),
+        out.contains("success_1 = identity.call(mem[0x220:mem[0x220] + 576]);"),
         "{out}"
     );
     assert!(
-        out.contains("mem[0x2a0:+prev_mem_0x220 + 64] = mem[0x220:+prev_mem_0x220 + 64];"),
+        out.contains("mem[0x2a0:+mem[0x220] + 32] = mem[0x220:+mem[0x220] + 32];"),
         "{out}"
     );
 }
@@ -220,4 +220,36 @@ fn a_revert_folded_into_a_require_takes_the_values_its_ways_in_give() {
             && out.contains("CustomError_064a4ec6(msg.data[0:32], calldata[32]));"),
         "{out}"
     );
+}
+
+#[test]
+fn a_word_read_after_a_loop_wrote_it_is_not_the_value_stored_in_the_loop() {
+    let out = text(
+        "6000608052600060a0525b60a051356080510160805260a05160200160a052606060a0511061000a57\
+         60805160005500",
+    );
+    assert!(
+        out.contains("mem[0x80] = mem[0x80] + calldata[mem[0xa0]];"),
+        "{out}"
+    );
+    assert!(out.contains("stor_0 = mem[0x80];"), "{out}");
+}
+
+#[test]
+fn a_word_a_loop_may_have_written_through_an_index_is_not_the_fill_before_it() {
+    let out = text(
+        "6060366080376000610100525b33610100516020026080015261010051600101610100526003610100\
+         511061000c5760a05160005500",
+    );
+    assert!(out.contains("stor_0 = mem[0xa0];"), "{out}");
+}
+
+#[test]
+fn a_stored_value_is_not_read_back_after_a_helper_wrote_what_it_was_made_from() {
+    let out = text(
+        "60003560805261000d610026565b60805160010160a05261001e610026565b60a051600055005b6020\
+         3554608051016080523360015556",
+    );
+    assert!(out.contains("mem[0xa0] = mem[0x80] + 1;"), "{out}");
+    assert!(out.contains("stor_0 = mem[0xa0];"), "{out}");
 }

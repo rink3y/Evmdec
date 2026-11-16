@@ -650,6 +650,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             footprints: HashMap::new(),
             pointer_keepers: HashSet::new(),
             memory_readers: HashSet::new(),
+            free_pointer: true,
             oracle: true,
             copy_loops: Default::default(),
         };
@@ -749,6 +750,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         footprints: HashMap::new(),
         pointer_keepers: HashSet::new(),
         memory_readers: HashSet::new(),
+        free_pointer: profile.kind == compiler::Kind::Solc,
         oracle: false,
         copy_loops: Default::default(),
     };
@@ -812,6 +814,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         footprints: int_lifter.footprints.clone(),
         pointer_keepers: int_lifter.pointer_keepers.clone(),
         memory_readers: int_lifter.memory_readers.clone(),
+        free_pointer: profile.kind == compiler::Kind::Solc,
         oracle: false,
         copy_loops: Default::default(),
     };

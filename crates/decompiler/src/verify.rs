@@ -423,6 +423,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
         footprints: HashMap::new(),
         pointer_keepers: Default::default(),
         memory_readers: Default::default(),
+        free_pointer: true,
         oracle: true,
         copy_loops: Default::default(),
     };

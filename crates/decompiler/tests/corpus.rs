@@ -818,8 +818,8 @@ fn stores_nothing_reads_are_left_out() {
         "a counter tested after its increment reads as the counter"
     );
     assert!(
-        pool.contains("if (loc_2c0 <= prev_loc_2c0) {"),
-        "the value before a store is held in a local where it is compared with the new one"
+        pool.contains("loc_240 = loc_2c0;") && pool.contains("if (loc_2c0 <= loc_240) {"),
+        "the value before a store is read from the word the code saved it in"
     );
 
     let old = source("../../testdata/vuln/kotet.hex");
@@ -1146,13 +1146,10 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
 fn a_read_made_before_a_write_is_not_printed_as_one_made_after() {
     let ramp = regress("vyper_sparse_table.hex").source;
     assert!(
-        ramp.contains(
-            "uint256 prev_loc_180 = loc_180;\n        \
-             loc_180 = loc_e0 * (1320 - loc_180);"
-        ),
-        "a word at a fixed address is kept before it is written: {ramp}"
+        ramp.contains("loc_180 = loc_e0 * (1320 - loc_180);")
+            && ramp.contains("stor_8 = stor_8 + loc_180;"),
+        "a word at a fixed address is read again after it is written: {ramp}"
     );
-    assert!(ramp.contains("stor_8 = stor_8 + loc_e0 * (1320 - prev_loc_180);"));
     let router = regress("via_ir_router.hex").source;
     let start = router.find("function uniswapV3SwapCallback(").unwrap();
     let callback = &router[start..start + router[start..].find("\n    }").unwrap()];

@@ -525,6 +525,9 @@ struct Mem {
     written: BTreeSet<(u64, u64)>,
     entry_loads: Rc<RefCell<MemoryReads>>,
     touched: Rc<RefCell<MemoryWrites>>,
+    pointer_named: bool,
+    // Writes made before this version may be missing from the list.
+    wiped: u32,
 }
 
 const BIG: u64 = 1 << 40;
@@ -588,8 +591,10 @@ fn rounded_down(sum: ExprId, low: ExprId) -> Option<Vec<ExprId>> {
     Some(terms)
 }
 
-// Sound only because an unknown pointer is unsigned and memory never wraps.
-// So p + k lies at or above k. It also never points into the scratch area below 0x80.
+/* Sound only because an unknown pointer is unsigned and memory never wraps.
+So p + k lies at or above k. It also never points into the scratch area below 0x80.
+Code that keeps no free pointer has no blocks of its own to point into. There a computed
+address is an index into the words at fixed places, so it counts as unknown. */
 fn may_alias(
     wb: Option<ExprId>,
     woff: u64,
@@ -597,9 +602,11 @@ fn may_alias(
     rb: Option<ExprId>,
     roff: u64,
     rlen: u64,
+    allocates: bool,
 ) -> bool {
-    let w_wild = wb.is_some_and(wild_base);
-    let r_wild = rb.is_some_and(wild_base);
+    let unknown = |b: ExprId| !allocates || wild_base(b);
+    let w_wild = wb.is_some_and(unknown);
+    let r_wild = rb.is_some_and(unknown);
     let above = |wild: ExprId, fixed: ExprId| -> Option<u64> {
         let mut terms = Vec::new();
         let mut stack = vec![wild];
@@ -636,7 +643,7 @@ fn may_alias(
                     return None;
                 }
                 k = k.saturating_add(c.low_u64());
-            } else if !wild_base(t) {
+            } else if !unknown(t) {
                 return None;
             }
         }
@@ -668,8 +675,10 @@ fn may_alias(
 }
 
 impl Mem {
-    fn new(fresh: bool) -> Mem {
+    fn new(fresh: bool, pointer_named: bool) -> Mem {
         Mem {
+            pointer_named,
+            wiped: 0,
             writes: Vec::new(),
             fresh,
             gen: 0,
@@ -701,7 +710,7 @@ impl Mem {
             if w.base != base {
                 // A write through another pointer may land on the same bytes.
                 // Without the new version two reads around it would count as equal.
-                if may_alias(w.base, w.off, w.len, base, d, n) {
+                if may_alias(w.base, w.off, w.len, base, d, n, self.pointer_named) {
                     v = v.max(w.gen);
                 }
                 continue;
@@ -715,6 +724,59 @@ impl Mem {
             }
         }
         v
+    }
+
+    /* Where the code keeps its variables at fixed places, a write through a computed address
+    may have reached one of them. What a computed address read is taken to be apart from
+    the places written after it, as two blocks the code allocated are. Only a write
+    through that same address counts there. */
+    fn written_since(&self, off: ExprId, n: u64, version: u32) -> bool {
+        let (base, d) = norm_offset(off);
+        let over = |w: &MemWrite| match w.base == base {
+            true => d.saturating_add(n) > w.off && w.len.is_none_or(|l| d < w.off + l),
+            false => {
+                !self.pointer_named
+                    && base.is_none()
+                    && may_alias(w.base, w.off, w.len, base, d, n, self.pointer_named)
+            }
+        };
+        version < self.wiped || self.writes.iter().any(|w| w.gen > version && over(w))
+    }
+
+    /* A stored value prints the memory it read by where that memory is. Once such a place
+    is written again the value would print as the new word, so it is no longer handed to a
+    read of the place it was stored at. A read of the free pointer has a name of its own. */
+    fn current(&self, value: ExprId) -> bool {
+        let reads = kind::MLOAD | kind::KECCAK_MEM | kind::COPIED_WORD;
+        let mut seen: HashSet<ExprId> = HashSet::new();
+        let mut pending = vec![value];
+        while let Some(e) = pending.pop() {
+            if !expr::holds(e, reads) || !seen.insert(e) {
+                continue;
+            }
+            if seen.len() > 4096 {
+                return false;
+            }
+            let unchanged = match expr::node(e) {
+                Node::MLoad(at, _) if self.pointer_named && at == konst_u64(FREE_POINTER) => true,
+                Node::MLoad(at, version) | Node::CopiedWord(op::MCOPY, at, version) => {
+                    !self.written_since(at, 32, version)
+                }
+                Node::KeccakMem(off, len, version) => {
+                    let len = expr::as_const(len).and_then(|l| l.as_usize());
+                    let len = len
+                        .filter(|l| *l <= 8192)
+                        .map_or(u64::MAX / 4, |l| l as u64);
+                    !self.written_since(off, len, version)
+                }
+                _ => true,
+            };
+            if !unchanged {
+                return false;
+            }
+            pending.extend(expr::children(e));
+        }
+        true
     }
 
     fn store(&mut self, off: ExprId, len: Option<u64>, val: MVal) {
@@ -748,6 +810,7 @@ impl Mem {
             self.writes.drain(..64);
             self.fresh = false;
             self.clobber_gen = self.gen + 1;
+            self.wiped = self.clobber_gen;
         }
         self.writes.push(MemWrite {
             base,
@@ -782,9 +845,18 @@ impl Mem {
         self.fresh = false;
         self.gen += 1;
         self.clobber_gen = self.gen;
+        /* A helper of code that allocates is taken to leave alone what its caller read
+        through a pointer, as a value its caller kept on the stack is. */
+        if !self.pointer_named {
+            self.wiped = self.gen;
+        }
     }
 
-    fn load_bytes(&self, off: ExprId, n: u64, version: u32) -> Option<ExprId> {
+    fn load_bytes(&self, off: ExprId, n: u64, _version: u32) -> Option<ExprId> {
+        self.stored_bytes(off, n).filter(|v| self.current(*v))
+    }
+
+    fn stored_bytes(&self, off: ExprId, n: u64) -> Option<ExprId> {
         let (base, d) = norm_offset(off);
         let mut pieces: Vec<Option<(ExprId, u64)>> = vec![None; n as usize];
         let mut copy_hit: Option<(u8, ExprId, Option<ExprId>, u64, u32)> = None;
@@ -794,7 +866,7 @@ impl Mem {
                 break;
             }
             if w.base != base {
-                if may_alias(w.base, w.off, w.len, base, d, n) {
+                if may_alias(w.base, w.off, w.len, base, d, n, self.pointer_named) {
                     return None;
                 }
                 continue;
@@ -850,7 +922,6 @@ impl Mem {
                 MVal::Unknown => return None,
             }
         }
-        let _ = version;
         if let Some((k, src, addr, delta, wgen)) = copy_hit {
             let at = expr::add_const(src, U256::from(delta));
             let answered = addr
@@ -1017,7 +1088,7 @@ impl Mem {
                 break;
             }
             if w.base != base {
-                if may_alias(w.base, w.off, w.len, base, d, len) {
+                if may_alias(w.base, w.off, w.len, base, d, len, self.pointer_named) {
                     return None;
                 }
                 continue;
@@ -1052,10 +1123,8 @@ impl Mem {
             pieces.push((part, run as u8));
             at += run;
         }
-        pieces
-            .iter()
-            .any(|(_, width)| *width != 32)
-            .then_some(pieces)
+        let whole = pieces.iter().all(|(_, width)| *width == 32);
+        (!whole && pieces.iter().all(|(part, _)| self.current(*part))).then_some(pieces)
     }
 
     fn read_region_lossy(&self, off: ExprId, len: u64, version: u32) -> Option<Vec<ExprId>> {
@@ -1080,6 +1149,7 @@ impl Mem {
         self.fresh = false;
         self.gen = merged_version(self.gen, self.gen, stable);
         self.clobber_gen = self.gen;
+        self.wiped = self.gen;
     }
 
     fn intersect(&mut self, other: &Mem, stable: u32) -> bool {
@@ -1089,6 +1159,7 @@ impl Mem {
             a.base == b.base && a.off == b.off && a.len == b.len && a.val == b.val
         };
         let identical = self.gen == other.gen
+            && self.wiped == other.wiped
             && self.clobber_gen == other.clobber_gen
             && self.fresh == other.fresh
             && self.written == other.written
@@ -1157,24 +1228,46 @@ impl Mem {
                 merged[i].origin = None;
             }
         }
+        /* A write only the other side made goes where that side made it, counted by the
+        writes both sides share. At the end of the list it would hide a shared write that
+        came after it, from a read of bytes it may or may not have reached. */
+        let ordered = kept.windows(2).all(|pair| pair[0].1 < pair[1].1);
         let mut placed: HashSet<Place> = mine.keys().copied().collect();
-        for o in &other.writes {
+        let mut ahead: HashMap<usize, Vec<MemWrite>> = HashMap::new();
+        let mut last: Vec<MemWrite> = Vec::new();
+        for (theirs_at, o) in other.writes.iter().enumerate() {
             let (agrees, _) = at(&mine, &self.writes, o);
             if !agrees && placed.insert(place(o)) {
-                merged.push(MemWrite {
+                let unknown = MemWrite {
                     val: MVal::Unknown,
                     origin: None,
                     ..o.clone()
-                });
+                };
+                let next = kept.iter().find(|(_, shared)| *shared > theirs_at);
+                match next.filter(|_| ordered) {
+                    Some((at, _)) => ahead.entry(*at).or_default().push(unknown),
+                    None => last.push(unknown),
+                }
             }
         }
+        if !ahead.is_empty() {
+            let mut all = Vec::with_capacity(merged.len() + last.len());
+            for (i, w) in merged.into_iter().enumerate() {
+                all.extend(ahead.remove(&i).unwrap_or_default());
+                all.push(w);
+            }
+            merged = all;
+        }
+        merged.extend(last);
         let overflow = merged.len().saturating_sub(MAX_TRACKED_WRITES);
         merged.drain(..overflow);
         let before = std::mem::replace(&mut self.writes, merged);
         let written_before = self.written.len();
         self.written.retain(|r| other.written.contains(r));
         self.fresh &= other.fresh && overflow == 0;
-        if overflow > 0 || other.gen != self.gen || other.clobber_gen != self.clobber_gen {
+        let wiped_before = self.wiped;
+        let lost = overflow > 0 || other.wiped != self.wiped;
+        if lost || other.gen != self.gen || other.clobber_gen != self.clobber_gen {
             self.gen = merged_version(self.gen, other.gen, stable);
             self.clobber_gen = self.gen;
             // A write that is unknown after the merge is unknown as of the merge.
@@ -1184,6 +1277,11 @@ impl Mem {
                     w.gen = w.gen.min(self.gen);
                 }
             }
+            // The two sides count apart, so a version one of them lost its writes at
+            // says nothing about the other. The merge is above both.
+            if lost {
+                self.wiped = self.gen;
+            }
         }
         if let Some(pointer) = pointer {
             self.keep_free_pointer(pointer);
@@ -1191,7 +1289,10 @@ impl Mem {
         let changed_writes = before.len() != self.writes.len()
             || before.iter().zip(&self.writes).any(|(a, b)| !same(a, b))
             || self.written.len() != written_before;
-        changed_writes || fresh_before != self.fresh || gen_before != self.gen
+        changed_writes
+            || fresh_before != self.fresh
+            || gen_before != self.gen
+            || wiped_before != self.wiped
     }
 }
 
@@ -1236,6 +1337,7 @@ pub struct Lifter<'a> {
     pub footprints: HashMap<usize, MemoryWrites>,
     pub pointer_keepers: HashSet<usize>,
     pub memory_readers: HashSet<usize>,
+    pub free_pointer: bool,
     pub oracle: bool,
     pub copy_loops: RefCell<HashMap<(usize, usize), CopyLoop>>,
 }
@@ -1522,7 +1624,7 @@ impl<'a> Lifter<'a> {
         let state = State {
             stack: init_stack,
             args_used: 0,
-            mem: Mem::new(fresh),
+            mem: Mem::new(fresh, self.free_pointer),
             storage: Vec::new(),
             version: 0,
             sgen: 0,
@@ -1691,6 +1793,7 @@ impl<'a> Lifter<'a> {
                             || e.state.mem.writes != new_state.mem.writes
                             || e.state.mem.fresh != new_state.mem.fresh
                             || e.state.mem.gen != new_state.mem.gen
+                            || e.state.mem.wiped != new_state.mem.wiped
                             || e.state.storage != new_state.storage
                             || e.state.sgen != new_state.sgen
                             || e.state.returned != new_state.returned;

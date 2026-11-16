@@ -151,6 +151,7 @@ enum MVal {
     Byte(ExprId),
     Copy(u8, ExprId, Option<ExprId>),
     CallOut(u32, u32),
+    Zero,
     Unknown,
 }
 
@@ -908,6 +909,15 @@ impl Mem {
                         }
                     }
                 }
+                MVal::Zero => {
+                    for b in lo..hi {
+                        let i = (b - d) as usize;
+                        if pieces[i].is_none() {
+                            pieces[i] = Some((konst(U256::ZERO), b - d));
+                            covered += 1;
+                        }
+                    }
+                }
                 MVal::Byte(v) => {
                     let i = (lo - d) as usize;
                     if pieces[i].is_none() {
@@ -1121,11 +1131,17 @@ impl Mem {
             let stored = match (&w.val, w.len) {
                 (MVal::Word(v), Some(32)) => *v,
                 (MVal::Byte(v), Some(1)) => op2(op::SHL, konst_u64(248), *v),
+                (MVal::Zero, Some(_)) => konst(U256::ZERO),
                 _ if open.is_empty() => continue,
                 _ => return None,
             };
+            // Zeros have no word of their own, so they are cut where the words read are.
+            let within = |b: u64| match w.val {
+                MVal::Zero => (b - d) % 32,
+                _ => b - w.off,
+            };
             for b in open {
-                bytes[(b - d) as usize] = Some((stored, b - w.off));
+                bytes[(b - d) as usize] = Some((stored, within(b)));
                 missing -= 1;
             }
         }
@@ -1921,6 +1937,9 @@ impl<'a> Lifter<'a> {
                     ln.stmts.retain(|s| {
                         let keep = match s {
                             Stmt::MStore { .. } => !hidden_set.contains(&(i, idx)),
+                            Stmt::Copy { kind, src, .. } if past_call_data(*kind, *src) => {
+                                !hidden_set.contains(&(i, idx))
+                            }
                             _ => true,
                         };
                         idx += 1;
@@ -2646,6 +2665,10 @@ impl<'a> Lifter<'a> {
                             }
                             _ => st.mem.store(dest, l, MVal::Copy(o, src, None)),
                         }
+                    } else if let (true, Some(l)) = (past_call_data(o, src), l) {
+                        // Past the end of the call data every byte reads as zero.
+                        let origin = Some((nid, stmts.len()));
+                        st.mem.store_from(dest, Some(l), MVal::Zero, origin);
                     } else {
                         st.mem.store(dest, l, MVal::Copy(o, src, None));
                     }
@@ -3142,6 +3165,10 @@ impl<'a> Lifter<'a> {
     }
 }
 
+fn past_call_data(kind: u8, src: ExprId) -> bool {
+    kind == op::CALLDATACOPY && src == expr::env(op::CALLDATASIZE)
+}
+
 fn term_succs(t: &Term) -> Vec<usize> {
     match t {
         Term::Jump(n) => vec![*n],
@@ -3382,15 +3409,17 @@ fn without_still_read(
             let Some(ln) = &lnodes[*node] else {
                 return true;
             };
-            let Some(Stmt::MStore {
-                off, width, gen, ..
-            }) = ln.stmts.get(*index)
-            else {
+            let (off, width, gen) = match ln.stmts.get(*index) {
+                Some(Stmt::MStore {
+                    off, width, gen, ..
+                }) => (*off, Some(u64::from(*width)), *gen),
+                Some(Stmt::Copy { dest, len, gen, .. }) => (*dest, const_len(*len), *gen),
+                _ => return true,
+            };
+            let Some(store) = span(off, width).filter(|_| width.is_some()) else {
                 return true;
             };
-            let Some(store) = span(*off, Some(u64::from(*width))).map(|s| (s, *gen)) else {
-                return true;
-            };
+            let store = (store, gen);
             let mut over = Vec::new();
             let (read, on) = scan(&ln.stmts[index + 1..], &ln.term, store, &mut over);
             if read || !on {

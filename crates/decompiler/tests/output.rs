@@ -32,13 +32,15 @@ fn the_count_leading_zeros_opcode_is_read_and_folded() {
 fn a_jump_through_memory_that_a_copy_wrote_is_not_taken_to_go_to_zero() {
     for code in [
         "60205f5f375f51565b33ff",
-        "6020365f375f51565b33ff",
         "5f5f5f5f335afa5060205f5f3e5f51565b33ff",
         "60205f5f5f335afa505f51565b33ff",
     ] {
         let out = text(code);
         assert!(out.contains("selfdestruct(msg.sender);"), "{out}");
     }
+    // Past the end of the call data the copy reads zeros, and nothing can be jumped to at 0.
+    let zeros = text("6020365f375f51565b33ff");
+    assert!(!zeros.contains("selfdestruct"), "{zeros}");
 }
 
 #[test]
@@ -311,4 +313,19 @@ fn a_constant_masked_into_a_higher_byte_is_the_value_of_the_field_at_that_byte()
         (write.bit_offset, write.bits, write.value),
         (0, 8, konst_u64(1))
     );
+}
+
+#[test]
+fn a_message_padded_with_zeros_from_past_the_call_data_is_printed_as_its_text() {
+    let out = text(
+        "60003561004857600d60c0527f696e76616c696420737461746500000000000000000000000000000000\
+         00000060e05260133660ed376308c379a0608052602060a0526064609cfd5b00",
+    );
+    assert!(
+        out.contains("require(msg.data[0:32] != 0, \"invalid state\");"),
+        "{out}"
+    );
+    assert!(!out.contains("msg.data.length"), "{out}");
+    let read = text("60203660803760a05160005500");
+    assert!(read.contains("stor_0 = 0;"), "{read}");
 }

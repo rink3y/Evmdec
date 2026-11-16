@@ -142,3 +142,21 @@ fn a_byte_string_is_grown_to_the_record_the_code_reads_in_it() {
     assert_eq!(kinds, vec![Kind::Gain], "{:?}", report.findings);
     assert_eq!(report.findings[0].selector.as_deref(), Some("0x38926b6d"));
 }
+
+#[test]
+fn a_record_in_a_byte_string_is_filled_by_what_its_words_are_used_for() {
+    let report = report("Courier.hex");
+    let at = |kind: Kind| -> Vec<&str> {
+        let of_kind = report.findings.iter().filter(|f| f.kind == kind);
+        of_kind.filter_map(|f| f.selector.as_deref()).collect()
+    };
+    // deliver(bytes) pays the address its record names. relay(address,bytes) ends with any
+    // bytes, and is found only by passing on the message that moves a user's asset.
+    assert_eq!(
+        at(Kind::Gain),
+        ["0x22133eaf", "0xc28e83fd"],
+        "{:?}",
+        report.findings
+    );
+    assert_eq!(at(Kind::Loss), ["0xc28e83fd"], "{:?}", report.findings);
+}

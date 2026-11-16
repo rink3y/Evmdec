@@ -1,17 +1,16 @@
 use crate::budget;
 use crate::laws::{self, Breach, Kind};
 use crate::model::Facts;
-use crate::shape::{Holds, Node, Role, Shape, Spot};
+use crate::shape::{Holds, Laid, Node, Role, Shape};
 use crate::trace::{
-    Answered, Event, Place, Run, Tag, CALLER, CLOCK, DATA, DATA_WORDS, MATH, OUT, SIZE, STORE,
-    VALUE,
+    Answered, Event, Place, Run, Tag, CALLER, CLOCK, DATA, MATH, OUT, SIZE, STORE, VALUE,
 };
 use crate::world::{self, Addr, Msg, Source, World, ACTOR, ALLY, OWNER, SUBJECT, USER};
 use evmdec::decompile::Contract;
 use evmdec::function::{FnKind, Mutability};
 use evmdec::opcode as op;
 use evmdec::U256;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 pub const UNIT: U256 = U256([1_000_000_000_000_000_000, 0, 0, 0]);
@@ -153,6 +152,8 @@ pub struct Explorer<'a> {
     unspendable: HashSet<(crate::trace::Place, usize)>,
     // For each entry, how far its furthest failed call got and what stopped it.
     pub stopped: Vec<Option<(usize, String)>>,
+    // For each entry, how far the call went whose call data the entry's shape was taken from.
+    reach: Vec<(bool, usize)>,
     // For each entry, a call of the owner's that ended in the starting world.
     good: Vec<Option<Try>>,
     // The set-up calls the starting world has been through.
@@ -344,6 +345,7 @@ impl<'a> Explorer<'a> {
             staked: HashSet::new(),
             unspendable: HashSet::new(),
             stopped: Vec::new(),
+            reach: Vec::new(),
             good: Vec::new(),
             setups: Vec::new(),
             on_chain: false,
@@ -508,24 +510,43 @@ impl<'a> Explorer<'a> {
         (world, run)
     }
 
-    // An address word the contract calls as a contract is filled with one from then on.
+    /* What a run shows of a word of the call data. One the contract calls is the address
+    of a contract, one it pays is an address, and what it pays is an amount. */
     fn learn(&mut self, entry: usize, t: &Try, run: &Run) {
-        let spoken = run
-            .calls
-            .iter()
-            .filter(|c| c.to_tag.has(DATA) && !c.input.is_empty());
-        let words: Vec<usize> = spoken.filter_map(|c| c.to_tag.word()).collect();
-        if words.is_empty() {
+        let mut shown = Vec::new();
+        for call in &run.calls {
+            let holds = match call.input.is_empty() {
+                true => Holds::Address,
+                false => Holds::Callee,
+            };
+            shown.push((call.to_tag, call.to, holds));
+            shown.push((call.value_tag, call.value, Holds::Amount));
+        }
+        for event in &run.events {
+            if let Event::Pay {
+                to,
+                amount,
+                to_tag,
+                amount_tag,
+                ..
+            } = event
+            {
+                shown.push((*to_tag, *to, Holds::Address));
+                shown.push((*amount_tag, *amount, Holds::Amount));
+            }
+        }
+        shown.retain(|(tag, ..)| tag.has(DATA));
+        if shown.is_empty() {
             return;
         }
-        let (_, spots) = t.shape.layout();
-        for word in words {
-            let spot = spots
-                .iter()
-                .find(|s| s.at == 4 + 32 * word && s.role == Role::Value);
+        let laid = t.shape.layout();
+        for (tag, seen, holds) in shown {
+            let spot = laid.about(tag, seen).filter(|s| s.role == Role::Value);
             let node = spot.and_then(|s| self.entries[entry].shape.node_mut(&s.path));
-            if let Some(Node::Word(kind @ (Holds::Address | Holds::Other), _)) = node {
-                *kind = Holds::Callee;
+            match (node, holds) {
+                (Some(Node::Word(kind, _)), Holds::Callee) => *kind = holds,
+                (Some(Node::Word(kind @ Holds::Other, _)), _) => *kind = holds,
+                _ => {}
             }
         }
     }
@@ -535,35 +556,44 @@ impl<'a> Explorer<'a> {
         self.attempt_in(world, entry, t)
     }
 
+    /* The contract passes on a call for its caller: the address called and the bytes
+    sent both come from the call data. What such a call can do is what the contract
+    itself may do, so it is tried with the two messages that move an asset. */
+    fn passed_on(t: &Try, run: &Run, laid: &Laid) -> Vec<Try> {
+        let mut out = Vec::new();
+        for call in &run.calls {
+            let passed_on =
+                call.kind == op::CALL && call.to_tag.has(DATA) && call.input_from.has(DATA);
+            let target = laid.about(call.to_tag, call.to);
+            let target = target.filter(|s| s.role == Role::Value);
+            let sent = call.input_from.word().filter(|w| *w >= 1);
+            let length = sent.and_then(|w| laid.spot_at(w - 1));
+            let length = length.filter(|s| s.role == Role::Length);
+            let (true, Some(target), Some(length)) = (passed_on, target, length) else {
+                continue;
+            };
+            // A contract that measures what its caller received has to see it arrive there.
+            for to in [ALLY, t.msg.from] {
+                let moves = [
+                    world::transfer_from_call(USER, to, UNIT),
+                    world::transfer_call(to, UNIT),
+                ];
+                for payload in moves {
+                    out.extend(t.reshaped(&|shape| {
+                        shape.set(target, outside(0)) && shape.put_bytes(&length.path, &payload)
+                    }));
+                }
+            }
+        }
+        out
+    }
+
     /* What to change so that the comparison a failed run stopped at comes out the
     other way: a part of the call data, the value sent, the length of the call data
     or of an outside answer, or the time. */
     #[allow(clippy::too_many_lines)]
     fn mutations(&self, t: &Try, run: &Run, now: U256) -> Vec<Try> {
-        let (data, spots) = t.shape.layout();
-        let held = |spot: &Spot| {
-            let end = data.len().min(spot.at + 32);
-            let mut word = [0u8; 32];
-            word[..end - spot.at].copy_from_slice(&data[spot.at..end]);
-            U256::from_be_bytes(&word)
-        };
-        let spot_at = |word: usize| {
-            let within = 4 + 32 * word..36 + 32 * word;
-            spots.iter().find(|s| within.contains(&s.at))
-        };
-        /* The part of the call data a word came from. A word reached through an offset
-        carries the offset's place too, and an offset is never what a test is about. */
-        let about = |tag: Tag, seen: U256| {
-            let words = (0..DATA_WORDS).filter(|w| tag.has(DATA) && tag.words >> w & 1 == 1);
-            let found: Vec<&Spot> = words
-                .filter_map(spot_at)
-                .filter(|s| s.role != Role::Head)
-                .collect();
-            let exact = found.iter().find(|s| held(s) == seen).copied();
-            // A word that starts off the grid lies across two words of the call data.
-            let single = found.len() == 1 || found.first().is_some_and(|s| s.at % 32 != 4);
-            exact.or(found.first().copied().filter(|_| single))
-        };
+        let laid = t.shape.layout();
         let mut out: Vec<Try> = Vec::new();
         let mut seen: HashSet<TryKey> = HashSet::new();
         let mut push = |out: &mut Vec<Try>, next: Try| {
@@ -581,28 +611,13 @@ impl<'a> Explorer<'a> {
                 out.push(next);
             }
         };
+        // Only the account with no role sends what a contract holds or may take to itself.
+        if Facts::same_party(t.msg.from, ACTOR) {
+            out.extend(Self::passed_on(t, run, &laid).into_iter().take(MAX_TRIES));
+        }
         for call in &run.calls {
-            /* The contract passes on a call for its caller: the address called and the
-            bytes sent both come from the call data. What such a call can do is what the
-            contract itself may do, so it is tried with the two messages that move an asset. */
-            let passed_on =
-                call.kind == op::CALL && call.to_tag.has(DATA) && call.input_from.has(DATA);
-            let target = about(call.to_tag, call.to).filter(|s| s.role == Role::Value);
-            let sent = call.input_from.word().filter(|w| *w >= 1);
-            let length = sent.and_then(|w| spot_at(w - 1));
-            let length = length.filter(|s| s.role == Role::Length);
-            if let (true, Some(target), Some(length)) = (passed_on, target, length) {
-                let moves = [
-                    world::transfer_from_call(USER, ALLY, UNIT),
-                    world::transfer_call(ALLY, UNIT),
-                ];
-                for payload in moves {
-                    let next = t.reshaped(&|shape| {
-                        shape.set(target, outside(0)) && shape.put_bytes(&length.path, &payload)
-                    });
-                    out.extend(next.into_iter().take(MAX_TRIES.saturating_sub(out.len())));
-                }
-            }
+            let target = laid.about(call.to_tag, call.to);
+            let target = target.filter(|s| s.role == Role::Value);
             // An answer the contract goes on to call has to be the address of a contract.
             let asked = call.to_tag.call().filter(|_| call.to_tag.has(OUT));
             let source = asked.and_then(|k| run.calls.get(k));
@@ -646,11 +661,11 @@ impl<'a> Explorer<'a> {
                     op::EQ => &near[..1],
                     _ => &near,
                 };
-                if let Some(spot) = about(tag, was) {
+                if let Some(spot) = laid.about(tag, was) {
                     let mut wanted = values.to_vec();
                     // A word worked on before the test lacks what the test lacks.
-                    if held(spot) != was {
-                        wanted.insert(0, held(spot).wrapping_add(other.wrapping_sub(was)));
+                    if laid.held(spot) != was {
+                        wanted.insert(0, laid.held(spot).wrapping_add(other.wrapping_sub(was)));
                     }
                     for value in wanted {
                         let next = t.reshaped(&|shape| shape.set(spot, value));
@@ -692,7 +707,7 @@ impl<'a> Explorer<'a> {
                     match tag.call().and_then(|k| run.calls.get(k)) {
                         None => {
                             for len in [len, len + 4] {
-                                let lacks = len.saturating_sub(data.len());
+                                let lacks = len.saturating_sub(laid.data.len());
                                 let next = t.reshaped(&|shape| {
                                     shape.spare.resize(shape.spare.len() + lacks, 0);
                                     lacks > 0
@@ -730,6 +745,14 @@ impl<'a> Explorer<'a> {
     // The input, and the world it leaves, under which a call to the entry ends.
     fn solve(&mut self, state: usize, entry: usize, seed: Try) -> (Try, World, Run) {
         let (world, run) = self.attempt(state, entry, &seed);
+        let from = seed.shape.frame();
+        let plain = from == self.entries[entry].shape.frame();
+        if self.reach.len() < self.entries.len() {
+            self.reach.resize(self.entries.len(), (false, 0));
+        }
+        if plain {
+            self.reach[entry] = self.reach[entry].max((run.ok, run.edges.len()));
+        }
         let mut best = (seed, world, run);
         for _ in 0..ROUNDS {
             if best.2.ok || budget::spent() {
@@ -755,6 +778,16 @@ impl<'a> Explorer<'a> {
             if !improved {
                 break;
             }
+        }
+        /* A call that got further than any before it with more in its call data than
+        the entry's own shape has is what every later call starts from. What the account
+        with no role sends is no model for anyone else. */
+        let reach = (best.2.ok, best.2.edges.len());
+        let plain = plain && !Facts::same_party(best.0.msg.from, ACTOR);
+        if plain && best.0.shape.frame() != from && reach > self.reach[entry] {
+            self.reach[entry] = reach;
+            self.entries[entry].shape = best.0.shape.clone();
+            self.learn(entry, &best.0, &best.2);
         }
         best
     }
@@ -1954,12 +1987,20 @@ impl<'a> Explorer<'a> {
                         continue;
                     }
                     let mut kept = false;
-                    for seed in self.hostile(entry) {
+                    let mut seeds: VecDeque<Try> = self.hostile(entry).into();
+                    let mut passed = false;
+                    while let Some(seed) = seeds.pop_front() {
                         if budget::spent() {
                             return;
                         }
                         let before = self.states[from].world.clone();
                         let (t, world, run) = self.solve(from, entry, seed);
+                        // A call that ends says nothing of what else could have been passed on.
+                        if run.ok && !passed {
+                            let more = Self::passed_on(&t, &run, &t.shape.layout());
+                            passed = !more.is_empty();
+                            seeds.extend(more);
+                        }
                         let handed = run.calls.iter().any(|c| c.by == Answered::Taken);
                         let mut plain = Vec::new();
                         let race = run.ok && self.once_for_all(&world, entry, &t, &run);

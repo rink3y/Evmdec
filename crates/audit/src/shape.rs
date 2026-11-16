@@ -1,3 +1,4 @@
+use crate::trace::{Tag, DATA, DATA_WORDS};
 use evmdec::abi::{self, Ty};
 use evmdec::U256;
 
@@ -50,6 +51,43 @@ pub struct Spot {
     pub at: usize,
     pub path: Vec<usize>,
     pub role: Role,
+}
+
+// The bytes a shape comes to, and what each word of them is.
+pub struct Laid {
+    pub data: Vec<u8>,
+    pub spots: Vec<Spot>,
+}
+
+impl Laid {
+    #[must_use]
+    pub fn held(&self, spot: &Spot) -> U256 {
+        let end = self.data.len().min(spot.at + 32);
+        let mut word = [0u8; 32];
+        word[..end - spot.at].copy_from_slice(&self.data[spot.at..end]);
+        U256::from_be_bytes(&word)
+    }
+
+    #[must_use]
+    pub fn spot_at(&self, word: usize) -> Option<&Spot> {
+        let within = 4 + 32 * word..36 + 32 * word;
+        self.spots.iter().find(|s| within.contains(&s.at))
+    }
+
+    /* The part of the call data a word came from. A word reached through an offset
+    carries the offset's place too, and an offset is never what a test is about. */
+    #[must_use]
+    pub fn about(&self, tag: Tag, seen: U256) -> Option<&Spot> {
+        let words = (0..DATA_WORDS).filter(|w| tag.has(DATA) && tag.words >> w & 1 == 1);
+        let found: Vec<&Spot> = words
+            .filter_map(|w| self.spot_at(w))
+            .filter(|s| s.role != Role::Head)
+            .collect();
+        let exact = found.iter().find(|s| self.held(s) == seen).copied();
+        // A word that starts off the grid lies across two words of the call data.
+        let single = found.len() == 1 || found.first().is_some_and(|s| s.at % 32 != 4);
+        exact.or(found.first().copied().filter(|_| single))
+    }
 }
 
 const MAX_NODES: usize = 256;
@@ -229,7 +267,7 @@ impl Shape {
     }
 
     #[must_use]
-    pub fn layout(&self) -> (Vec<u8>, Vec<Spot>) {
+    pub fn layout(&self) -> Laid {
         let mut enc = Encoder {
             out: self.lead.clone(),
             spots: Vec::new(),
@@ -244,12 +282,15 @@ impl Shape {
             });
         }
         enc.out.extend_from_slice(&self.spare);
-        (enc.out, enc.spots)
+        Laid {
+            data: enc.out,
+            spots: enc.spots,
+        }
     }
 
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        self.layout().0
+        self.layout().data
     }
 
     pub fn node_mut(&mut self, path: &[usize]) -> Option<&mut Node> {
@@ -345,6 +386,14 @@ impl Shape {
         }
     }
 
+    // The shape with nothing in its words: what is laid out where, and no more.
+    #[must_use]
+    pub fn frame(&self) -> Shape {
+        let mut bare = self.clone();
+        bare.each_word(&mut |holds, held| (*holds, *held) = (Holds::Other, U256::ZERO));
+        bare
+    }
+
     // Every list with two items, where it had one.
     #[must_use]
     pub fn paired(&self) -> Option<Shape> {
@@ -401,9 +450,9 @@ mod tests {
         ] {
             let owned: Vec<String> = types.iter().map(|t| (*t).to_string()).collect();
             let known = abi::layout(Some(1), &owned);
-            let (data, spots) = shape(&types).layout();
-            assert_eq!(data, known.calldata, "{types:?}");
-            let heads = spots.iter().filter(|s| s.role == Role::Head);
+            let laid = shape(&types).layout();
+            assert_eq!(laid.data, known.calldata, "{types:?}");
+            let heads = laid.spots.iter().filter(|s| s.role == Role::Head);
             let mut heads: Vec<usize> = heads.map(|s| (s.at - 4) / 32).collect();
             heads.sort_unstable();
             let mut fixed = known.fixed.clone();
@@ -425,11 +474,11 @@ mod tests {
     #[test]
     fn a_grown_byte_string_keeps_every_offset_right() {
         let mut s = shape(&["bytes", "uint256[]"]);
-        let (_, spots) = s.layout();
+        let spots = s.layout().spots;
         let length = spots.iter().find(|s| s.role == Role::Length).expect("one");
         assert!(s.set(length, U256::from_u64(0x60)));
         assert_eq!(words(&s.encode()), [0x40, 0xc0, 0x60, 0, 0, 0, 1, 0]);
-        let (_, spots) = s.layout();
+        let spots = s.layout().spots;
         let third = spots.iter().find(|s| s.at == 4 + 32 * 5).expect("a word");
         assert!(s.set(third, U256::from_u64(7)));
         let list = spots.iter().rfind(|s| s.role == Role::Length).expect("two");
@@ -445,7 +494,7 @@ mod tests {
         };
         (*len, *lead) = (36, vec![0xaa, 0xbb, 0xcc, 0xdd]);
         body.truncate(1);
-        let (data, spots) = s.layout();
+        let Laid { data, spots } = s.layout();
         assert_eq!(data.len(), 4 + 32 * 4);
         assert_eq!(&data[68..72], [0xaa, 0xbb, 0xcc, 0xdd]);
         assert_eq!(

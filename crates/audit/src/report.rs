@@ -179,7 +179,7 @@ fn source(tag: Tag, run: &Run) -> String {
     if tag.has(DATA) {
         parts.push(match tag.word() {
             Some(word) => format!("word {word} of the call data"),
-            None => "the call data".into(),
+            None => "a field of the call data inside a record or list".into(),
         });
     }
     if tag.has(VALUE) {
@@ -204,7 +204,23 @@ fn source(tag: Tag, run: &Run) -> String {
         parts.push("a balance read at that moment".into());
     }
     if tag.has(OUT) {
-        parts.push("an answer from another contract".into());
+        let asked = tag.call().and_then(|k| run.calls.get(k));
+        parts.push(match asked {
+            Some(call) => {
+                let selector = crate::world::selector(&call.input);
+                let name = selector.and_then(evmdec::sigs::function);
+                let what = match (name, selector) {
+                    (Some(sig), _) => format!("`{}`", evmdec::sigs::name_of(&sig)),
+                    (None, Some(selector)) => format!("{selector:#010x}"),
+                    (None, None) => "a plain call".to_string(),
+                };
+                format!(
+                    "the answer of the contract at {} to {what}",
+                    call.to.to_hex()
+                )
+            }
+            None => "an answer from another contract".into(),
+        });
     }
     if tag.has(CLOCK) {
         parts.push("the block time".into());

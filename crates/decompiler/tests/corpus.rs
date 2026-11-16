@@ -1192,3 +1192,28 @@ fn a_helper_declares_every_stack_place_it_reads_and_returns_what_it_makes() {
     assert!(gauge.contains("function _transfer(uint256 amount, address to, address from)"));
     assert!(gauge.contains("_transfer(amount, to, msg.sender);"));
 }
+
+#[test]
+fn copies_of_one_block_have_labels_of_their_own() {
+    let staking = regress("vyper_sparse_table.hex").source;
+    let start = staking
+        .find("function func_0x2cfc(")
+        .expect("the checkpoint helper");
+    let body = &staking[start..start + staking[start..].find("\n    }").unwrap()];
+    let mut labels: Vec<&str> = body
+        .lines()
+        .filter_map(|l| l.trim().strip_suffix(':'))
+        .filter(|l| l.starts_with('L'))
+        .collect();
+    let defined = labels.len();
+    labels.sort_unstable();
+    labels.dedup();
+    assert_eq!(labels.len(), defined, "a label is defined once: {labels:?}");
+    assert!(["L3706", "L3706_2", "L3706_3"]
+        .iter()
+        .all(|l| labels.contains(l)));
+    for goto in body.split("goto ").skip(1) {
+        let target = goto.split(';').next().unwrap();
+        assert!(labels.contains(&target), "goto {target} has its label");
+    }
+}

@@ -2017,8 +2017,8 @@ impl<'a> Printer<'a> {
         self.out.push('\n');
     }
 
-    fn node_pc(&self, n: usize) -> usize {
-        self.l.nodes[n].pc
+    fn label(&self, n: usize) -> String {
+        emit::label(self.l, n)
     }
 
     fn is_small_terminal(&self, mut n: usize) -> bool {
@@ -2519,7 +2519,7 @@ impl<'a> Printer<'a> {
         // printed at the top level under a label, so a long chain cannot use up the stack.
         if self.nesting >= MAX_NESTING {
             self.labels.insert(n);
-            self.line(depth, &format!("goto L{:x};", self.node_pc(n)));
+            self.line(depth, &format!("goto {};", self.label(n)));
             return;
         }
         self.nesting += 1;
@@ -2543,7 +2543,7 @@ impl<'a> Printer<'a> {
                     self.labels.insert(n);
                     self.line(
                         depth,
-                        &format!("goto L{:x}; // continue outer loop", self.node_pc(n)),
+                        &format!("goto {}; // continue outer loop", self.label(n)),
                     );
                 }
                 return None;
@@ -2555,7 +2555,7 @@ impl<'a> Printer<'a> {
                     self.labels.insert(n);
                     self.line(
                         depth,
-                        &format!("goto L{:x}; // break outer loop", self.node_pc(n)),
+                        &format!("goto {}; // break outer loop", self.label(n)),
                     );
                 }
                 return None;
@@ -2567,7 +2567,7 @@ impl<'a> Printer<'a> {
                 return None;
             }
             self.labels.insert(n);
-            self.line(depth, &format!("goto L{:x};", self.node_pc(n)));
+            self.line(depth, &format!("goto {};", self.label(n)));
             return None;
         }
         Some(n)
@@ -2606,7 +2606,7 @@ impl<'a> Printer<'a> {
             }
             self.emitted.insert(n);
             if self.labels.contains(&n) {
-                self.line(depth.saturating_sub(1), &format!("L{:x}:", self.node_pc(n)));
+                self.line(depth.saturating_sub(1), &format!("{}:", self.label(n)));
             }
             if self.try_transfer_idiom(n, stop, depth) {
                 return;
@@ -2655,10 +2655,7 @@ impl<'a> Printer<'a> {
     ) {
         self.emitted.insert(header);
         if self.labels.contains(&header) {
-            self.line(
-                depth.saturating_sub(1),
-                &format!("L{:x}:", self.node_pc(header)),
-            );
+            self.line(depth.saturating_sub(1), &format!("{}:", self.label(header)));
         }
         let exit = match exits.len() {
             0 => None,
@@ -3320,7 +3317,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
     } else {
         p.out
     };
-    drop_empty_else(&drop_unused_previous(&text))
+    emit::name_labels(&drop_empty_else(&drop_unused_previous(&text)))
 }
 
 fn drop_unused_previous(text: &str) -> String {

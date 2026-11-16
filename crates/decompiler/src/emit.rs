@@ -2403,6 +2403,51 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
     })
 }
 
+pub fn label(l: &Lifted, node: usize) -> String {
+    format!("L{:x}@{node}", l.nodes[node].pc)
+}
+
+/* One block is lifted once for each stack it is entered with, so its address alone does
+not name a place. A label keeps the bare address while no other copy is a target too. */
+pub fn name_labels(text: &str) -> String {
+    let marked = |at: usize| -> Option<(usize, usize)> {
+        let pc = text[..at].bytes().rev().take_while(u8::is_ascii_hexdigit);
+        let start = at - pc.count();
+        let node = text[at + 1..].bytes().take_while(u8::is_ascii_digit);
+        let end = at + 1 + node.count();
+        let begins = text[..start].ends_with('L')
+            && !text[..start - 1].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        (begins && start < at && end > at + 1).then_some((start, end))
+    };
+    let labels: Vec<(usize, usize)> = text
+        .match_indices('@')
+        .filter_map(|(at, _)| marked(at))
+        .collect();
+    let mut copies: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
+    let parts = |(start, end): (usize, usize)| {
+        let (pc, node) = text[start..end].split_once('@').expect("a marked label");
+        (pc, node.parse::<usize>().unwrap_or(0))
+    };
+    for l in &labels {
+        let (pc, node) = parts(*l);
+        copies.entry(pc).or_default().insert(node);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for l in labels {
+        let (pc, node) = parts(l);
+        out.push_str(&text[from..l.0]);
+        out.push_str(pc);
+        match copies[pc].iter().position(|n| *n == node) {
+            Some(earlier) if earlier > 0 => out.push_str(&format!("_{}", earlier + 1)),
+            _ => {}
+        }
+        from = l.1;
+    }
+    out.push_str(&text[from..]);
+    out
+}
+
 pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     let mut out = String::new();
     let reach = crate::lift::reachable(l);
@@ -2429,7 +2474,7 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     for (idx, &nid) in order.iter().enumerate() {
         let nd = &l.nodes[nid];
         if needs_label.contains(&nid) {
-            out.push_str(&format!("{}L{:x}:\n", indent, nd.pc));
+            out.push_str(&format!("{}{}:\n", indent, label(l, nid)));
         }
         n.end_block();
         let mut dead = dead_memory_stores(&nd.stmts);
@@ -2451,7 +2496,7 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
                     s.push_str(&format!("{} = {}; ", fmt_expr(*var, n), fmt_expr(*val, n)));
                 }
             }
-            s.push_str(&format!("goto L{:x};", l.nodes[to].pc));
+            s.push_str(&format!("goto {};", label(l, to)));
             s
         };
         let next = order.get(idx + 1).copied();
@@ -2500,7 +2545,7 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
             out.push_str(&format!("{}    uint256 {} = {};\n", indent, name, def));
         }
     }
-    out
+    name_labels(&out)
 }
 
 #[cfg(test)]

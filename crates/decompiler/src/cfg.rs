@@ -372,7 +372,7 @@ pub struct Sig {
 }
 
 impl Sig {
-    fn same_code_shape(&self, other: &Sig) -> bool {
+    fn same_code_shape(&self, other: &Sig, loose: bool) -> bool {
         let code = |s: &Sig| -> Vec<(u16, SigVal)> {
             s.items
                 .iter()
@@ -384,6 +384,7 @@ impl Sig {
             s.mem
                 .iter()
                 .filter(|(_, v)| !matches!(v, SigVal::Slot(_)))
+                .filter(|(_, v)| !(loose && matches!(v, SigVal::Mem(_))))
                 .copied()
                 .collect()
         };
@@ -540,7 +541,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         None => {
                             if !st.mem.regions.is_empty() {
                                 AVal::Table
-                            } else if st.root && !st.mem.clobbered && st.mem.forgotten(o) {
+                            } else if !st.mem.clobbered && st.mem.forgotten(o) {
                                 AVal::Unk
                             } else if st.root && !st.mem.clobbered {
                                 AVal::Const(U256::ZERO)
@@ -1161,12 +1162,31 @@ impl<'a> Analysis<'a> {
         )
     }
 
+    /* A word read from memory the unit did not write stands for what the caller left there.
+    Where copies of it sit splits a block into one node per layout, though only a return
+    through such a word needs that. Without one, the layouts share a node. */
     pub fn build_unit_opts(
         &self,
         entry_block: usize,
         entry_state: AState,
         computed: ComputedJumps,
         max_nodes: usize,
+    ) -> Unit {
+        let unit = self.build_unit_shaped(entry_block, &entry_state, computed, max_nodes, true);
+        let through = |n: &UNode| matches!(n.returns_via, Some(AVal::Mem(_)));
+        match unit.nodes.iter().any(through) {
+            true => self.build_unit_shaped(entry_block, &entry_state, computed, max_nodes, false),
+            false => unit,
+        }
+    }
+
+    fn build_unit_shaped(
+        &self,
+        entry_block: usize,
+        entry_state: &AState,
+        computed: ComputedJumps,
+        max_nodes: usize,
+        loose: bool,
     ) -> Unit {
         let follow_computed = computed == ComputedJumps::Follow;
         let prog = self.prog;
@@ -1227,7 +1247,7 @@ impl<'a> Analysis<'a> {
             let height = |a: &AState| a.stack.len() as isize - a.consumed as isize;
             if let Some(&id) = list.iter().find(|id| {
                 let existing = &nodes[**id].entry;
-                height(existing) == height(st) && existing.sig(prog).same_code_shape(&key.1)
+                height(existing) == height(st) && existing.sig(prog).same_code_shape(&key.1, loose)
             }) {
                 return join(id, st, nodes, work);
             }
@@ -1252,7 +1272,7 @@ impl<'a> Analysis<'a> {
             work.push_back(id);
             id
         };
-        let entry = intern(entry_block, &entry_state, &mut nodes, &mut index, &mut work);
+        let entry = intern(entry_block, entry_state, &mut nodes, &mut index, &mut work);
         while let Some(n) = work.pop_front() {
             crate::clock::check();
             if nodes.len() > max_nodes {

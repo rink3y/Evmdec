@@ -166,3 +166,58 @@ fn a_loop_test_too_long_to_print_in_place_is_worked_out_inside_the_loop() {
     assert!(!before.contains("uint256 t1 ="), "{out}");
     assert!(inside.contains("uint256 t1 ="), "{out}");
 }
+
+#[test]
+fn a_copy_by_the_identity_built_in_of_any_length_is_a_write() {
+    let out = text(
+        "6000356102205260203561001557604035610220525b6060356102205161024001526102205160200161022052\
+         61022051602001806102a082610220600060045af150506102a0516000556102c05160015500",
+    );
+    assert!(
+        out.contains("success_1 = identity.call(mem[0x220:prev_mem_0x220 + 608]);"),
+        "{out}"
+    );
+    assert!(
+        out.contains("mem[0x2a0:+prev_mem_0x220 + 64] = mem[0x220:+prev_mem_0x220 + 64];"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_word_read_before_a_store_over_part_of_it_keeps_the_old_value() {
+    let out = text(
+        "6000356102045260203561001557604035610204525b61020451606035610200526000556102045160015500",
+    );
+    let named = out
+        .find("uint256 prev_mem_0x204 = mem[0x204];")
+        .expect("{out}");
+    let store = out.find("mem[0x200] = calldata[96];").expect("{out}");
+    assert!(named < store, "{out}");
+    assert!(out.contains("stor_0 = prev_mem_0x204;") && out.contains("stor_1 = mem[0x204];"));
+}
+
+#[test]
+fn what_a_call_returns_into_a_fixed_word_is_a_write() {
+    let out = text(
+        "600035610ac05260005b610ac05181556020610ac0600060006000335af15060010180602035116100095700",
+    );
+    assert!(
+        out.contains(
+            "mem[0xac0:+min(32, returndatasize())] = returndata[0:+min(32, returndatasize())];"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_revert_folded_into_a_require_takes_the_values_its_ways_in_give() {
+    let out = text(
+        "6000356020358082116100185790604035811161002357005b606035811161002357005b\
+         63064a4ec660e01b60005260045260245260446000fd",
+    );
+    assert!(
+        out.contains("CustomError_064a4ec6(calldata[32], msg.data[0:32]));")
+            && out.contains("CustomError_064a4ec6(msg.data[0:32], calldata[32]));"),
+        "{out}"
+    );
+}

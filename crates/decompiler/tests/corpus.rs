@@ -468,7 +468,7 @@ fn tribe_reads_as_source() {
         "stor_4.push(address(v2));",
         "stor_3[address(v2)] = true;",
         "if (stor_4.length < stor_7) {",
-        "while (v1 < stor[arg0]) {",
+        "require(v1 < stor[arg0], Panic(assert));",
     ] {
         assert!(src.contains(s), "missing {s}\n{src}");
     }
@@ -737,7 +737,7 @@ fn vyper_fixed_addresses_read_as_locals() {
     let src = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
     for line in [
         "// Memory: loc_N is the variable kept at the fixed memory address 0xN",
-        "while (loc_280 < 2) {",
+        "while (true) {\n            require(loc_280 < 2);",
         "loc_240[loc_280] = loc_240[loc_280] + loc_2a0;",
         "identity.call(mem[0x280:0x2e4])",
     ] {
@@ -1109,7 +1109,7 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
         gauge.contains(
             "uint256 prev_stor_14 = stor_14;\n        \
              uint256 prev_timestamp_15_stor_14 = timestamp_15[prev_stor_14];"
-        ) && gauge.contains("if (prev_stor_5 < prev_timestamp_15_stor_14) {"),
+        ) && gauge.contains("if (prev_stor_5 >= prev_timestamp_15_stor_14) {"),
         "the period is read once, ahead of both branches"
     );
     let burn = &pool[pool
@@ -1210,9 +1210,6 @@ fn copies_of_one_block_have_labels_of_their_own() {
     labels.sort_unstable();
     labels.dedup();
     assert_eq!(labels.len(), defined, "a label is defined once: {labels:?}");
-    assert!(["L3706", "L3706_2", "L3706_3"]
-        .iter()
-        .all(|l| labels.contains(l)));
     for goto in body.split("goto ").skip(1) {
         let target = goto.split(';').next().unwrap();
         assert!(labels.contains(&target), "goto {target} has its label");
@@ -1242,7 +1239,8 @@ fn call_data_is_the_bytes_the_writes_left_under_one_pointer_name() {
     let token = regress("minime_token.hex").source;
     assert!(
         token.contains("mem[ptr1 + 68] = address(this);")
-            && token.contains("address(target).call(mem[ptr1:v1]);"),
+            && token
+                .contains("address(target).call(abi.encodeWithSelector(func_8f4ffcb1.selector, "),
         "the buffer written is the buffer sent"
     );
     let dvn = regress("layerzero_dvn.hex").source;
@@ -1260,7 +1258,7 @@ fn untested_arithmetic_is_marked_and_gas_is_named_where_it_is_read() {
         router.lines().any(tested),
         "a difference the code tests before it is printed bare"
     );
-    assert!(router.contains(" << 144) - checked(arg7 * v"));
+    assert!(router.contains(" = arg7 * v") && router.contains(" << 144) - v"));
     let used = router.find(" + 33000)").expect("the use");
     let name = router[..used].rsplit("unchecked(").next().unwrap();
     let read = router[..used]
@@ -1338,10 +1336,88 @@ fn a_slot_read_before_an_outside_call_is_not_printed_as_read_after_it() {
     );
     assert_eq!(undeclared_old_values(&router), Vec::<String>::new());
     let gauge = regress("vyper_gauge.hex").source;
+    let read = gauge
+        .find("loc_240 = stor_13;")
+        .expect("the supply is kept");
+    let called = gauge[read..].find(".call(").expect("the controller") + read;
+    let divided = gauge[called..]
+        .find(" / loc_240 >= loc_1c0);")
+        .expect("the division");
     assert!(
-        gauge.contains("uint256 prev_stor_13 = stor_13;")
-            && gauge.contains(" / prev_stor_13 >= loc_1c0);"),
+        !gauge[read + 1..called + divided].contains("loc_240 = "),
         "the supply read before the controller is called is the one divided by after"
     );
     assert_eq!(undeclared_old_values(&gauge), Vec::<String>::new());
+}
+
+#[test]
+fn an_operator_the_code_does_not_test_is_marked_wherever_it_is_printed() {
+    let diamond = regress("rango_diamond.hex").source;
+    assert!(
+        diamond.contains("stor[arg0 + 2] = unchecked(prev_stor_arg0_2 + 1);"),
+        "a length kept beside a hashed array is a count, not a place"
+    );
+    let router = regress("oneinch_v6.hex").source;
+    assert!(router.contains("return (unchecked(0 - mem[v1]));"));
+    let via_ir = regress("via_ir_router.hex").source;
+    assert!(
+        !via_ir.contains(" = 0 / "),
+        "a tested quotient is printed only where the code makes it"
+    );
+}
+
+#[test]
+fn a_tested_difference_is_made_before_the_transfer_that_follows_it() {
+    let router = regress("oneinch_v6.hex").source;
+    let lines: Vec<&str> = router.lines().map(str::trim).collect();
+    let refund = lines
+        .iter()
+        .position(|l| l.starts_with("_sendValue(") && l.ends_with(", msg.sender, calldata[arg2]);"))
+        .expect("the refund of what was not spent");
+    let spent = lines[..refund]
+        .iter()
+        .rposition(|l| l.starts_with("v8 = v2 - v"))
+        .expect("the amount spent");
+    assert!(refund - spent <= 2, "{:?}", &lines[spent..=refund]);
+}
+
+#[test]
+fn a_loop_is_printed_once_with_its_tests_inside_it() {
+    let body = |source: &str, name: &str| -> String {
+        let start = source.find(name).expect("the helper");
+        source[start..start + source[start..].find("\n    }").unwrap()].to_string()
+    };
+    let gauge = body(&regress("vyper_gauge.hex").source, "function func_0x71d(");
+    assert_eq!(
+        gauge.matches("func_d3078c94.selector").count(),
+        1,
+        "{gauge}"
+    );
+    assert!(!gauge.contains("goto "), "{gauge}");
+    assert!(gauge.contains("while (true) {\n                require(loc_2a0 >= loc_280);"));
+    let staking = body(
+        &regress("vyper_sparse_table.hex").source,
+        "function func_0x2cfc(",
+    );
+    assert_eq!(staking.matches("transfer.selector").count(), 1, "{staking}");
+}
+
+#[test]
+fn what_calls_return_into_memory_that_is_hashed_is_printed() {
+    let router = regress("oneinch_v6.hex").source;
+    let start = router.find("function func_0x216b(").expect("the callback");
+    let body = &router[start..start + router[start..].find("\n    }").unwrap()];
+    for at in [21, 53, 85] {
+        let line = format!("mem[ptr1 + {at}:+min(32, returndatasize())] = returndata[0:+");
+        assert!(body.contains(&line), "{line}\n{body}");
+    }
+}
+
+#[test]
+fn a_store_past_a_length_rounded_down_does_not_hide_the_head_of_call_data() {
+    let token = regress("minime_token.hex").source;
+    assert!(
+        token.contains(".call(abi.encodeWithSelector(func_8f4ffcb1.selector, msg.sender, value, address(this), ...));"),
+        "{token}"
+    );
 }

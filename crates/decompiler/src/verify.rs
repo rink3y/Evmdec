@@ -714,6 +714,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         src,
                         len,
                         addr,
+                        ..
                     } => {
                         let d = ev.eval(*dest, &mut memo);
                         let sv = ev.eval(*src, &mut memo);

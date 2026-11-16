@@ -63,6 +63,7 @@ pub enum Stmt {
         src: ExprId,
         len: ExprId,
         addr: Option<ExprId>,
+        gen: u32,
     },
     Internal {
         seq: u32,
@@ -562,6 +563,31 @@ fn wild_base(b: ExprId) -> bool {
     expr::holds(b, !(kind::CONST | kind::OP | kind::MLOAD))
 }
 
+fn rounded_down(sum: ExprId, low: ExprId) -> Option<Vec<ExprId>> {
+    let Node::Op(op::AND, m) = expr::node(low) else {
+        return None;
+    };
+    let [a, b] = m[..] else {
+        return None;
+    };
+    let term = match (expr::is_const(a), expr::is_const(b)) {
+        (true, false) => b,
+        (false, true) => a,
+        _ => return None,
+    };
+    let mut terms = Vec::new();
+    let mut stack = vec![sum];
+    while let Some(x) = stack.pop() {
+        match expr::node(x) {
+            Node::Op(op::ADD, v) => stack.extend(v),
+            _ => terms.push(x),
+        }
+    }
+    let at = terms.iter().position(|t| *t == term)?;
+    terms.remove(at);
+    Some(terms)
+}
+
 // Sound only because an unknown pointer is unsigned and memory never wraps.
 // So p + k lies at or above k. It also never points into the scratch area below 0x80.
 fn may_alias(
@@ -583,6 +609,11 @@ fn may_alias(
                     stack.push(v[0]);
                     stack.push(v[1]);
                 }
+                // A sum less the low bits of one of its terms is still at or above the rest.
+                Node::Op(o, v) if o == op::SUB => match rounded_down(v[0], v[1]) {
+                    Some(rest) => stack.extend(rest),
+                    None => terms.push(x),
+                },
                 _ => terms.push(x),
             }
         }
@@ -1963,6 +1994,7 @@ impl<'a> Lifter<'a> {
                     src: src0,
                     len: count,
                     addr: None,
+                    gen: st.mem.gen,
                 };
                 let last = op2(op::SUB, op2(op::ADD, i0, count), konst_u64(32));
                 let final_i = if *rotated {
@@ -1999,6 +2031,7 @@ impl<'a> Lifter<'a> {
                         src,
                         len: whole,
                         addr: None,
+                        gen: st.mem.gen,
                     },
                     after,
                 ))
@@ -2389,6 +2422,7 @@ impl<'a> Lifter<'a> {
                     let l = expr::as_const(len)
                         .and_then(|v| v.as_usize())
                         .map(|v| v as u64);
+                    let gen = st.mem.gen + 1;
                     if o == op::MCOPY {
                         apply_mcopy(&mut st, dest, src, len);
                     } else if o == op::CODECOPY {
@@ -2433,6 +2467,7 @@ impl<'a> Lifter<'a> {
                         src,
                         len,
                         addr: None,
+                        gen,
                     });
                 }
                 op::EXTCODECOPY => {
@@ -2444,13 +2479,14 @@ impl<'a> Lifter<'a> {
                         .and_then(|v| v.as_usize())
                         .map(|v| v as u64);
                     st.mem.store(dest, l, MVal::Copy(o, src, Some(addr)));
-                    next_version(&mut st);
+                    let gen = next_version(&mut st);
                     stmts.push(Stmt::Copy {
                         kind: o,
                         dest,
                         src,
                         len,
                         addr: Some(addr),
+                        gen,
                     });
                 }
                 op::LOG0..=op::LOG4 => {
@@ -2529,8 +2565,9 @@ impl<'a> Lifter<'a> {
                         .map(|v| v as u64);
                     let identity = expr::as_const(addr) == Some(U256::from_u64(4))
                         && (o == op::STATICCALL || o == op::CALL);
-                    let copies =
-                        identity && matches!((ol, il), (Some(o), Some(i)) if 0 < o && o <= i);
+                    let fits = matches!((ol, il), (Some(o), Some(i)) if 0 < o && o <= i);
+                    let copies = identity && (fits || (ol.is_none() && out_len == in_len));
+                    let copied = st.mem.gen + 1;
                     if copies || (identity && ol == Some(0)) {
                         apply_mcopy(&mut st, out_off, in_off, out_len);
                     } else if ol != Some(0) {
@@ -2567,6 +2604,7 @@ impl<'a> Lifter<'a> {
                             src: in_off,
                             len: out_len,
                             addr: None,
+                            gen: copied,
                         });
                     }
                     st.stack.push(result);
@@ -2821,6 +2859,7 @@ impl<'a> Lifter<'a> {
                             src: s2,
                             len: l2,
                             addr: None,
+                            gen: st.mem.gen + 1,
                         });
                     }
                     apply_mcopy(st, d, s2, l2);
@@ -3536,12 +3575,14 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             src,
             len,
             addr,
+            gen,
         } => Stmt::Copy {
             kind: *kind,
             dest: f(*dest),
             src: f(*src),
             len: f(*len),
             addr: addr.map(f),
+            gen: *gen,
         },
         Stmt::Internal {
             seq,

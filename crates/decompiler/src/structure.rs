@@ -324,6 +324,7 @@ struct Printer<'a> {
     given: HashMap<(ExprId, String), usize>,
     stored: Vec<(usize, String, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
+    memory_reads: Vec<Span>,
     // Filled while the printer's &self methods run, hence the cell.
     skipped: RefCell<HashSet<(usize, usize)>>,
 }
@@ -481,7 +482,10 @@ fn stale_loads_in(
                 k == key && t == transient && g <= gen
             }
             (Node::Env(op::SELFBALANCE, g), Overwritten::Balance) => g <= gen,
-            (Node::MLoad(at, g), Overwritten::Memory(addr)) => at == addr && g <= gen,
+            (
+                Node::MLoad(at, g) | Node::CopiedWord(op::MCOPY, at, g),
+                Overwritten::Memory(addr),
+            ) => at == addr && g <= gen,
             _ => false,
         };
         if stale && !out.contains(&x) {
@@ -531,6 +535,103 @@ fn overwrites(st: &Stmt, names: &Names) -> Option<(Overwritten, u32)> {
     }
 }
 
+/* A word copied from memory prints as the word it came from. A write over part of that word
+or of a word at a fixed address changes what the name reads from then on. */
+fn overlapped(
+    st: &Stmt,
+    loads: &HashMap<Overwritten, Vec<(ExprId, u32)>>,
+    exact: Option<Overwritten>,
+    names: &Names,
+) -> Vec<(Overwritten, u32)> {
+    let at = |e: ExprId| {
+        expr::as_const(e)
+            .filter(|c| c.fits_u64())
+            .map(|c| c.low_u64())
+    };
+    let (lo, len, gen) = match st {
+        Stmt::MStore {
+            off, width, gen, ..
+        } => (at(*off), Some(u64::from(*width)), *gen),
+        Stmt::Copy { dest, len, gen, .. } => (at(*dest), at(*len), *gen),
+        _ => return Vec::new(),
+    };
+    let Some(lo) = lo.filter(|_| gen > 0) else {
+        return Vec::new();
+    };
+    let hi = len.map(|n| lo.saturating_add(n));
+    let pointer = |a: ExprId| names.blocks.is_some() && emit::is_free_pointer(a);
+    let hit = |a: u64| a.saturating_add(32) > lo && hi.is_none_or(|h| a < h);
+    let mut out: Vec<(Overwritten, u32)> = loads
+        .keys()
+        .filter(|w| Some(**w) != exact)
+        .filter_map(|w| match w {
+            Overwritten::Memory(a) if !pointer(*a) => at(*a).filter(|a| hit(*a)).map(|_| *w),
+            _ => None,
+        })
+        .map(|w| (w, gen - 1))
+        .collect();
+    out.sort_by_key(|(w, _)| match w {
+        Overwritten::Memory(a) => at(*a),
+        _ => None,
+    });
+    out
+}
+
+fn memory_word(read: ExprId) -> Option<ExprId> {
+    match expr::node(read) {
+        Node::MLoad(at, _) | Node::CopiedWord(op::MCOPY, at, _) => Some(at),
+        _ => None,
+    }
+}
+
+type Span = (Option<ExprId>, u64, u64);
+
+fn span(off: ExprId, len: ExprId) -> Option<Span> {
+    let (base, d) = expr::split_offset(off);
+    let len = expr::as_const(len).filter(|c| c.fits_u64())?.low_u64();
+    let d = Some(d).filter(|d| d.fits_u64())?.low_u64();
+    Some((base, d, d.saturating_add(len)))
+}
+
+fn memory_reads(l: &Lifted) -> Vec<Span> {
+    let word = expr::konst_u64(32);
+    let mut out: Vec<Span> = Vec::new();
+    let mut seen: HashSet<ExprId> = HashSet::new();
+    let mut pending: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
+    pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
+    while let Some(e) = pending.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        out.extend(match expr::node(e) {
+            Node::MLoad(at, _) | Node::CopiedWord(op::MCOPY, at, _) => span(at, word),
+            Node::KeccakMem(off, len, _) => span(off, len),
+            _ => None,
+        });
+        pending.extend(expr::children(e));
+    }
+    for nd in &l.nodes {
+        for st in &nd.stmts {
+            out.extend(match st {
+                Stmt::Call { in_off, in_len, .. } => span(*in_off, *in_len),
+                Stmt::Log { off, len, .. } | Stmt::Create { off, len, .. } => span(*off, *len),
+                Stmt::Copy {
+                    kind: op::MCOPY,
+                    src,
+                    len,
+                    ..
+                } => span(*src, *len),
+                _ => None,
+            });
+        }
+        out.extend(match &nd.term {
+            Term::Return { off, len, .. } | Term::Revert { off, len, .. } => span(*off, *len),
+            _ => None,
+        });
+    }
+    out
+}
+
 fn loads_of(l: &Lifted) -> HashMap<Overwritten, Vec<(ExprId, u32)>> {
     let mut loads: HashMap<Overwritten, Vec<(ExprId, u32)>> = HashMap::new();
     let mut seen: HashSet<ExprId> = HashSet::new();
@@ -541,7 +642,9 @@ fn loads_of(l: &Lifted) -> HashMap<Overwritten, Vec<(ExprId, u32)>> {
             continue;
         }
         let read = match expr::node(e) {
-            Node::MLoad(addr, version) => Some((Overwritten::Memory(addr), version)),
+            Node::MLoad(addr, version) | Node::CopiedWord(op::MCOPY, addr, version) => {
+                Some((Overwritten::Memory(addr), version))
+            }
             Node::SLoad(key, transient, version) => {
                 Some((Overwritten::Slot(key, transient), version))
             }
@@ -928,53 +1031,57 @@ fn plan_stale_loads(l: &Lifted, names: &Names, kept: &mut Kept) -> StalePlan {
     let loads = loads_of(l);
     for nd in &l.nodes {
         for (i, st) in nd.stmts.iter().enumerate() {
-            let Some((what, gen)) = overwrites(st, names) else {
-                continue;
-            };
-            // Only a read made before the write can be stale.
-            // Without one, looking through everything after the write finds nothing.
-            let old = loads.get(&what).into_iter().flatten();
-            let old: Vec<ExprId> = old.filter(|(_, v)| *v <= gen).map(|(e, _)| *e).collect();
-            if old.is_empty() {
-                continue;
-            }
-            let in_block_only = matches!(what, Overwritten::Memory(_));
-            let after = exprs_after(l, nd, i, in_block_only);
-            let forwarded = match st {
-                Stmt::SStore { val, .. } if !expr::is_const(*val) => Some(*val),
-                _ => None,
-            };
-            let skip = forwarded.or(memory_forward(&nd.stmts, i));
-            let written = match st {
-                Stmt::SStore { key, val, .. } => crate::ssa::field_writes(*key, *val),
-                _ => Vec::new(),
-            };
-            let field = |x: ExprId| {
-                let Overwritten::Slot(key, false) = what else {
-                    return None;
+            let exact = overwrites(st, names);
+            let partly = overlapped(st, &loads, exact.map(|w| w.0), names);
+            for (what, gen) in exact.into_iter().chain(partly) {
+                // Only a read made before the write can be stale.
+                // Without one, looking through everything after the write finds nothing.
+                let old = loads.get(&what).into_iter().flatten();
+                let old: Vec<ExprId> = old.filter(|(_, v)| *v <= gen).map(|(e, _)| *e).collect();
+                if old.is_empty() {
+                    continue;
+                }
+                let in_block_only = matches!(what, Overwritten::Memory(_));
+                let after = exprs_after(l, nd, i, in_block_only);
+                let forwarded = match st {
+                    Stmt::SStore { val, .. } if !expr::is_const(*val) => Some(*val),
+                    _ => None,
                 };
-                let (read, version) = named_field(x, names).filter(|(f, _)| f.key == key)?;
-                let apart = |w: &crate::ssa::FieldWrite| {
-                    w.bit_offset >= read.bit_offset + read.bits
-                        || read.bit_offset >= w.bit_offset + w.bits
+                let skip = match Some(what) == exact.map(|w| w.0) {
+                    true => forwarded.or(memory_forward(&nd.stmts, i)),
+                    false => None,
                 };
-                let kept = !written.is_empty() && written.iter().all(apart);
-                Some(!kept && version <= gen)
-            };
-            let mut stale: Vec<ExprId> = Vec::new();
-            for e in after {
-                stale_loads_in(e, what, gen, skip, &field, &mut stale);
+                let written = match st {
+                    Stmt::SStore { key, val, .. } => crate::ssa::field_writes(*key, *val),
+                    _ => Vec::new(),
+                };
+                let field = |x: ExprId| {
+                    let Overwritten::Slot(key, false) = what else {
+                        return None;
+                    };
+                    let (read, version) = named_field(x, names).filter(|(f, _)| f.key == key)?;
+                    let apart = |w: &crate::ssa::FieldWrite| {
+                        w.bit_offset >= read.bit_offset + read.bits
+                            || read.bit_offset >= w.bit_offset + w.bits
+                    };
+                    let kept = !written.is_empty() && written.iter().all(apart);
+                    Some(!kept && version <= gen)
+                };
+                let mut stale: Vec<ExprId> = Vec::new();
+                for e in after {
+                    stale_loads_in(e, what, gen, skip, &field, &mut stale);
+                }
+                /* A word at a fixed address is a variable of the code. What was read from it
+                before the store is looked for in every later block, not only in this one. */
+                if fixed(what) {
+                    let found: HashSet<ExprId> = stale.iter().copied().collect();
+                    stale.extend(old.into_iter().filter(|e| !found.contains(e)));
+                }
+                if stale.is_empty() {
+                    continue;
+                }
+                found.push((nd.id, i, what, gen, stale));
             }
-            /* A word at a fixed address is a variable of the code. What was read from it
-            before the store is looked for in every later block, not only in this one. */
-            if fixed(what) {
-                let found: HashSet<ExprId> = stale.iter().copied().collect();
-                stale.extend(old.into_iter().filter(|e| !found.contains(e)));
-            }
-            if stale.is_empty() {
-                continue;
-            }
-            found.push((nd.id, i, what, gen, stale));
         }
     }
     let mut first_gen: HashMap<ExprId, u32> = HashMap::new();
@@ -1035,7 +1142,7 @@ fn with_init(e: ExprId, init: &HashMap<ExprId, ExprId>) -> ExprId {
     )
 }
 
-fn reroll_peeled_loops(l: &Lifted) -> Lifted {
+pub fn reroll_peeled_loops(l: &Lifted) -> Lifted {
     let g = Graph::new(l);
     let loops = find_loops(&g);
     let mut out = l.clone();
@@ -1801,7 +1908,7 @@ fn reaches_within(l: &Lifted, a: usize, b: usize, within: &HashSet<usize>) -> bo
     false
 }
 
-fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
+pub fn bind_shared(l: &Lifted, names: &Names) -> (Lifted, Bindings) {
     let g = Graph::new(l);
     let mut uses: HashMap<ExprId, Vec<(usize, Pos)>> = HashMap::new();
     let mut count: HashMap<ExprId, usize> = HashMap::new();
@@ -1872,7 +1979,8 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
                 .copied()
                 .filter(|u| !at.iter().any(|v| v != u && dominated_by(v.0, v.1, u)))
                 .collect();
-            if d == f || !available_at(l, &g, names, d, &frontier, e) {
+            // A test printed above the place the code makes it would fail where the code does not.
+            if d == f || names.tests(e) || !available_at(l, &g, names, d, &frontier, e) {
                 continue;
             }
             (d, Pos::Term)
@@ -1910,10 +2018,21 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
         }
         plan.push((f, pos, e));
     }
-    if plan.is_empty() {
-        return l.clone();
-    }
     plan.sort_by_key(|(f, pos, e)| (g.rpo_index[*f], *pos, first_seen[e]));
+    bind(l, &g, plan, &bindable)
+}
+
+type Bindings = Vec<(Node, ExprId)>;
+
+fn bind(
+    l: &Lifted,
+    g: &Graph,
+    plan: Vec<(usize, Pos, ExprId)>,
+    wanted: &dyn Fn(ExprId) -> bool,
+) -> (Lifted, Bindings) {
+    if plan.is_empty() {
+        return (l.clone(), Vec::new());
+    }
     let mut out = l.clone();
     let mut next_var: u32 = 0;
     for nd in &l.nodes {
@@ -1939,17 +2058,19 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
         }
     }
     let mut inserted: Vec<Vec<usize>> = vec![Vec::new(); l.nodes.len()];
-    let mut bound: Vec<(Node, ExprId)> = Vec::new();
+    let mut bound: Vec<(Node, ExprId, usize)> = Vec::new();
     for (f, pos, e) in plan {
         let mut e = e;
-        for (target, var) in &bound {
+        // A name given in another branch is not known here.
+        for (target, var, _) in bound.iter().filter(|(_, _, at)| g.dominates(*at, f)) {
             e = expr::substitute(
                 e,
                 &|n| if n == target { Some(*var) } else { None },
                 &mut HashMap::new(),
             );
         }
-        if bound.iter().any(|(t, _)| *t == expr::node(e)) || !bindable(e) {
+        let known = |(t, _, at): &(Node, ExprId, usize)| *t == expr::node(e) && g.dominates(*at, f);
+        if bound.iter().any(known) || !wanted(e) {
             continue;
         }
         let var = expr::intern(Node::Var(next_var));
@@ -1965,7 +2086,7 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
             .stmts
             .insert(at, Stmt::Assign { var, value: e });
         let target = expr::node(e);
-        bound.push((target.clone(), var));
+        bound.push((target.clone(), var, f));
         let sub = |x: ExprId| {
             expr::substitute(
                 x,
@@ -1992,7 +2113,113 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
             }
         }
     }
-    out
+    let bound = bound.into_iter().map(|(target, var, _)| (target, var));
+    (out, bound.collect())
+}
+
+fn ordered(st: &Stmt, names: &Names) -> bool {
+    match st {
+        Stmt::Call { .. }
+        | Stmt::Create { .. }
+        | Stmt::SStore { .. }
+        | Stmt::Log { .. }
+        | Stmt::Internal { .. } => true,
+        Stmt::Require { cond, data, .. } => !emit::is_hidden_require(*cond, data.as_deref(), names),
+        Stmt::Assign { .. } | Stmt::MStore { .. } | Stmt::Copy { .. } | Stmt::Drop(_) => false,
+    }
+}
+
+/* A test the printer leaves out is told by its operator, and an operator prints where its
+value is used. When a step whose order shows lies between the test and the use, the value
+gets a name where the code tests it. */
+pub fn name_tested(l: &Lifted, names: &Names) -> (Lifted, Bindings) {
+    let g = Graph::new(l);
+    let mut uses: HashMap<ExprId, Vec<(usize, Pos)>> = HashMap::new();
+    let mut first_seen: HashMap<ExprId, usize> = HashMap::new();
+    let mut sites: HashMap<ExprId, Vec<emit::Site>> = HashMap::new();
+    let mut note = |roots: Vec<ExprId>, at: (usize, Pos)| {
+        let mut seen = HashSet::new();
+        let mut stack = roots;
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) || seen.len() > 20_000 {
+                continue;
+            }
+            stack.extend(expr::children(x));
+            if !sites
+                .entry(x)
+                .or_insert_with(|| names.test_sites(x))
+                .is_empty()
+            {
+                let n = first_seen.len();
+                first_seen.entry(x).or_insert(n);
+                uses.entry(x).or_default().push(at);
+            }
+        }
+    };
+    for nd in l.nodes.iter().filter(|nd| g.reachable[nd.id]) {
+        for (i, st) in nd.stmts.iter().enumerate() {
+            let hidden = matches!(st, Stmt::Require { cond, data, .. }
+                if emit::is_hidden_require(*cond, data.as_deref(), names));
+            if !hidden {
+                note(lift::stmt_exprs(st), (nd.id, Pos::Stmt(i)));
+            }
+        }
+        note(lift::term_exprs(&nd.term), (nd.id, Pos::Term));
+    }
+    let mut edges: Vec<&(usize, usize)> = l.edge_assigns.keys().collect();
+    edges.sort_unstable();
+    for edge in edges.into_iter().filter(|k| g.reachable[k.0]) {
+        let read = l.edge_assigns[edge].iter().map(|(_, v)| *v);
+        note(read.collect(), (edge.0, Pos::Edge));
+    }
+    let assigned = |x: usize, reads: &HashSet<ExprId>| {
+        let by_stmt = l.nodes[x]
+            .stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Assign { var, .. } if reads.contains(var)));
+        let mut edges = l.edge_assigns.iter().filter(|((from, _), _)| *from == x);
+        by_stmt || edges.any(|(_, a)| a.iter().any(|(v, _)| reads.contains(v)))
+    };
+    let mut plan: Vec<(usize, Pos, ExprId)> = Vec::new();
+    for (e, at) in &uses {
+        let mut tests = sites[e].clone();
+        tests.retain(|(n, _)| g.reachable[*n]);
+        tests.sort_by_key(|(n, i)| (g.rpo_index[*n], *i));
+        for (n, i) in tests {
+            let after = |(u, p): &&(usize, Pos)| {
+                (*u != n && g.dominates(n, *u)) || (*u == n && *p > Pos::Stmt(i))
+            };
+            let later: Vec<&(usize, Pos)> = at.iter().filter(after).collect();
+            let mut reach: HashMap<usize, Pos> = HashMap::new();
+            let (mut node, mut from) = (n, i + 1);
+            loop {
+                let stmts = &l.nodes[node].stmts[from..];
+                if let Some(k) = stmts.iter().position(|s| ordered(s, names)) {
+                    reach.insert(node, Pos::Stmt(from + k));
+                    break;
+                }
+                reach.insert(node, Pos::Edge);
+                match l.nodes[node].term {
+                    Term::Jump(t) if g.preds[t].len() == 1 && !reach.contains_key(&t) => {
+                        (node, from) = (t, 0);
+                    }
+                    _ => break,
+                }
+            }
+            let beside = |(u, p): &(usize, Pos)| reach.get(u).is_some_and(|last| p <= last);
+            if later.is_empty() || later.iter().all(|u| beside(u)) {
+                continue;
+            }
+            let reads = vars_in(*e);
+            let region = (0..l.nodes.len()).filter(|u| g.reachable[*u] && g.dominates(n, *u));
+            if !reads.is_empty() && region.into_iter().any(|u| assigned(u, &reads)) {
+                continue;
+            }
+            plan.push((n, Pos::Stmt(i), *e));
+        }
+    }
+    plan.sort_by_key(|(f, pos, e)| (g.rpo_index[*f], *pos, first_seen[e]));
+    bind(l, &g, plan, &|e| matches!(expr::node(e), Node::Op(..)))
 }
 
 const DUP_LIMIT: usize = 6;
@@ -2040,13 +2267,32 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn revert_reason(&self, mut n: usize) -> Option<Option<String>> {
+    /* A revert folded into a require loses the edges into it. The values those edges give
+    its arguments are put in, or the arguments read names nothing assigned. */
+    fn revert_reason(&self, from: usize, mut n: usize) -> Option<Option<String>> {
         let mut seen = HashSet::new();
         let mut stores: Vec<(ExprId, ExprId)> = Vec::new();
+        let mut edges: Vec<&[(ExprId, ExprId)]> = Vec::new();
+        let mut prev = from;
         loop {
             if !seen.insert(n) {
                 return None;
             }
+            edges.push(
+                self.l
+                    .edge_assigns
+                    .get(&(prev, n))
+                    .map_or(&[], |a| a.as_slice()),
+            );
+            let entering = |e: ExprId| {
+                edges.iter().rev().fold(e, |e, edge| {
+                    let given = |nd: &Node| {
+                        let var = edge.iter().find(|(var, _)| expr::node(*var) == *nd);
+                        var.map(|(_, value)| *value)
+                    };
+                    expr::substitute(e, &given, &mut HashMap::new())
+                })
+            };
             let nd = &self.l.nodes[n];
             if !nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. })) {
                 return None;
@@ -2059,16 +2305,20 @@ impl<'a> Printer<'a> {
                     ..
                 } = s
                 {
-                    stores.push((*off, *val));
+                    stores.push((entering(*off), entering(*val)));
                 }
             }
             match &nd.term {
-                Term::Jump(t) => n = *t,
+                Term::Jump(t) => (prev, n) = (n, *t),
                 Term::Revert { data, len, off } => {
+                    let data = data
+                        .as_ref()
+                        .map(|w| w.iter().map(|x| entering(*x)).collect::<Vec<_>>());
+                    let off = &entering(*off);
                     return Some(match data {
                         Some(words) if !words.is_empty() => {
                             let p = emit::fmt_payload(
-                                words,
+                                &words,
                                 expr::as_const(*len),
                                 self.names,
                                 PayloadKind::Revert,
@@ -2151,7 +2401,7 @@ impl<'a> Printer<'a> {
         } else {
             return false;
         };
-        if self.revert_reason(revert) != Some(None) {
+        if self.revert_reason(n, revert) != Some(None) {
             return false;
         }
         let (addr, value, cond) = (*addr, *value, *cond);
@@ -2333,13 +2583,19 @@ impl<'a> Printer<'a> {
         let mut replaced: Vec<(ExprId, String)> = Vec::new();
         for (i, s) in self.l.nodes[n].stmts.iter().enumerate() {
             self.names.replace_stale_in_block(replaced.drain(..));
-            if let (Stmt::MStore { off, .. }, Some(stale)) = (s, self.stale_plan.get(&(n, i))) {
-                let current = emit::fmt_mem_word(*off, self.names);
-                let def = format!("uint256 {} = {};", stale[0].1, current);
-                replaced = stale.clone();
+            let planned = self.stale_plan.get(&(n, i)).cloned();
+            if let (Stmt::MStore { off, .. }, Some(stale)) = (s, planned) {
+                for (at, (read, name)) in stale.iter().enumerate() {
+                    if stale[..at].iter().any(|(_, earlier)| earlier == name) {
+                        continue;
+                    }
+                    let word = memory_word(*read).unwrap_or(*off);
+                    let current = emit::fmt_mem_word(word, self.names);
+                    self.line(depth, &format!("uint256 {name} = {current};"));
+                }
+                replaced = stale;
                 self.given
                     .extend(replaced.iter().cloned().map(|name| (name, depth)));
-                self.line(depth, &def);
             }
             if dead.contains(&i) || self.skipped.borrow().contains(&(n, i)) {
                 continue;
@@ -2356,12 +2612,13 @@ impl<'a> Printer<'a> {
             let rewrites_memory = matches!(s, Stmt::MStore { .. });
             if let Some(stale) = self.stale_plan.get(&(n, i)).filter(|_| !rewrites_memory) {
                 let loads = stale.clone();
-                let (what, _) =
-                    overwrites(s, self.names).expect("stale plan entries overwrite something");
+                let written = overwrites(s, self.names).map(|w| w.0);
                 for (at, (read, tmp)) in loads.iter().enumerate() {
                     if loads[..at].iter().any(|(_, earlier)| earlier == tmp) {
                         continue;
                     }
+                    let what = memory_word(*read).map(Overwritten::Memory).or(written);
+                    let what = what.expect("stale plan entries overwrite something");
                     let current = match (emit::field_name(*read, self.names), what) {
                         (Some(field), _) => field,
                         (None, Overwritten::Slot(key, transient)) => {
@@ -2411,6 +2668,9 @@ impl<'a> Printer<'a> {
             }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
+            if let Some(out) = self.call_output(s) {
+                self.line(depth, &out);
+            }
             if let (Stmt::MStore { off, .. }, Some(val)) =
                 (s, memory_forward(&self.l.nodes[n].stmts, i))
             {
@@ -2513,6 +2773,25 @@ impl<'a> Printer<'a> {
                 );
             }
         }
+    }
+
+    /* A call writes what it returns over its output area. Memory read there later by its
+    place would otherwise show only the stores made before the call. */
+    fn call_output(&self, s: &Stmt) -> Option<String> {
+        let Stmt::Call {
+            addr,
+            out_off,
+            out_len,
+            ..
+        } = s
+        else {
+            return None;
+        };
+        let (base, lo, hi) = span(*out_off, *out_len)?;
+        let read = |(b, from, to): &Span| *b == base && *from < hi && lo < *to;
+        let copy = expr::as_const(*addr) == Some(U256::from_u64(4));
+        let shown = !copy && hi > lo && self.memory_reads.iter().any(read);
+        shown.then(|| emit::fmt_call_output(*out_off, *out_len, self.names))
     }
 
     fn transfer(&mut self, from: usize, to: usize, stop: Option<usize>, depth: usize) {
@@ -2666,6 +2945,20 @@ impl<'a> Printer<'a> {
         if self.labels.contains(&header) {
             self.line(depth.saturating_sub(1), &format!("{}:", self.label(header)));
         }
+        /* A way out that only reverts is a test inside the loop. Taken as the exit, the
+        code after the loop was printed inside it and reached by a jump into it. */
+        let ends = |e: &&usize| self.revert_reason(header, **e).is_none();
+        let kept: Vec<usize> = exits.iter().filter(ends).copied().collect();
+        let exits = match kept.is_empty() {
+            true => exits,
+            false => &kept[..],
+        };
+        let after = |x: usize, e: usize| {
+            let up = std::iter::successors(Some(x), |n| self.g.ipdom[*n]);
+            up.take(self.l.nodes.len()).any(|n| n == e)
+        };
+        // Ways out that all lead on to one of them leave the loop there.
+        let joined = |e: &&usize| exits.iter().all(|x| after(*x, **e));
         let exit = match exits.len() {
             0 => None,
             1 => Some(exits[0]),
@@ -2673,7 +2966,7 @@ impl<'a> Printer<'a> {
                 let pd = self.g.ipdom[header];
                 match pd {
                     Some(p) if exits.contains(&p) => Some(p),
-                    _ => Some(exits[0]),
+                    _ => exits.iter().find(joined).or(exits.first()).copied(),
                 }
             }
         };
@@ -2709,9 +3002,10 @@ impl<'a> Printer<'a> {
                 {
                     let test =
                         |e: ExprId| self.names.without_temps(|| emit::fmt_expr(e, self.names));
-                    if body.contains(t) && !body.contains(f) {
+                    let ends = |e: &usize| self.revert_reason(cond_node, *e).is_none();
+                    if body.contains(t) && !body.contains(f) && ends(f) {
                         while_cond = test(*cond).map(|text| (text, *t));
-                    } else if body.contains(f) && !body.contains(t) {
+                    } else if body.contains(f) && !body.contains(t) && ends(t) {
                         while_cond = test(expr::op1(op::ISZERO, *cond)).map(|text| (text, *f));
                     }
                     if let Some((_, into)) = &while_cond {
@@ -2808,8 +3102,8 @@ impl<'a> Printer<'a> {
                 _ => {}
             }
         }
-        let t_rev = t.map_or(Some(None), |t| self.revert_reason(t));
-        let f_rev = self.revert_reason(f);
+        let t_rev = t.map_or(Some(None), |t| self.revert_reason(n, t));
+        let f_rev = self.revert_reason(n, f);
         let join = self.g.ipdom[n];
         if let Some(reason) = f_rev.clone() {
             if let (Some(t), None) = (t, &t_rev) {
@@ -3247,6 +3541,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
             .into_iter()
             .chain(unread_fixed_stores(l, names))
             .collect(),
+        memory_reads: memory_reads(l),
         skipped: Default::default(),
     };
     names.stale.borrow_mut().clear();
@@ -3297,6 +3592,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
             given: HashMap::new(),
             stored: Vec::new(),
             dead_stores: std::mem::take(&mut p.dead_stores),
+            memory_reads: std::mem::take(&mut p.memory_reads),
             skipped: Default::default(),
         };
         names.stale.borrow_mut().clear();
@@ -3416,9 +3712,7 @@ fn drop_empty_once(text: &str) -> String {
 pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
     expr::clear_boolean_marks();
     let depth = indent.len() / 4;
-    let rolled = reroll_peeled_loops(l);
-    let bound = bind_shared(&rolled, n);
-    let text = structure(&bound, n, depth);
+    let text = structure(l, n, depth);
     expr::clear_boolean_marks();
     text
 }

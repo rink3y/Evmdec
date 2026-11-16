@@ -1053,3 +1053,10 @@ fn a_function_behind_the_table_is_printed_to_its_end() {
     );
     assert!(!source.contains("unreachable"));
 }
+
+#[test]
+fn a_selector_tested_for_zero_is_the_zero_selector() {
+    let router = regress("via_ir_router.hex");
+    assert!(selectors(&router).contains(&0), "the test is its dispatch");
+    assert!(router.source.contains("\"3ebt\""));
+}

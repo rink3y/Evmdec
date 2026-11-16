@@ -54,6 +54,12 @@ fn branch_polarity(cond: ExprId) -> Option<(u32, bool)> {
         if let Some(sel) = emit::selector_mismatch(v[0]) {
             return Some((sel, true));
         }
+        if emit::is_selector_expr(v[0]) {
+            return Some((0, true));
+        }
+    }
+    if emit::is_selector_expr(cond) {
+        return Some((0, false));
     }
     None
 }

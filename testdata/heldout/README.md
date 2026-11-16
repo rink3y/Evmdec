@@ -5,18 +5,21 @@ how well does the analyzer do on contracts it has never seen?
 
 ## Rule of use
 
-Nothing is tuned against this set. Rules are developed on `testdata/vuln`,
-`testdata/mainnet` and the incidents in `testdata/incidents`. This set is only scored, with
-`python3 corpus/heldout_bench.py`.
+Nothing is tuned against this set. The analyzer is developed on `testdata/vuln`,
+`testdata/mainnet`, `testdata/source` and the incidents in `testdata/incidents`. This set is
+only scored.
 
-A miss here says which kind of flaw the analyzer does not reach. The fix is a general rule,
-shown on a synthetic fixture or on the development corpus, and then scored here again. A
-change made to turn one contract of this set from a miss into a hit makes the score
-meaningless for every other contract.
+It is scored by reviewers, not by a script. The analyzer is run over the set, and a separate
+reviewer reads each report with a finding against the public write-up of that incident. For
+each finding the reviewer says whether it matches the known flaw at the right place for the
+right reason, is another real issue, is the right place for the wrong reason, is by design,
+or is false. The reviewers return counts only. Nobody who changes the analyzer reads the
+reports or the answer key of this set.
 
-The table in `corpus/heldout_bench.py` that maps a flaw class to the rule families that count
-as finding it was written before any contract of the set was analysed. A new rule is added to
-the family it belongs to. The table is not edited to fit a result.
+A miss here says which kind of flaw the analyzer does not reach. The fix is a general cause,
+shown on a source fixture or on the development sets, and then scored here again. A change
+made to turn one contract of this set from a miss into a hit makes the score meaningless for
+every other contract.
 
 ## What is in it
 

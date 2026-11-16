@@ -89,8 +89,6 @@ pub struct World {
     grants: Rc<HashMap<(Addr, Addr, Addr), U256>>,
     // What an outside contract says to a question nobody keeps books for.
     answers: Rc<HashMap<(Addr, u32), Vec<u8>>>,
-    // Digests the owner or the user is taken to have signed.
-    signed: Rc<HashMap<U256, Addr>>,
     people: Vec<Addr>,
     // Accounts that hold a purse of something without being people. None is ether.
     rich: Vec<(Addr, Option<Addr>)>,
@@ -1064,10 +1062,7 @@ impl World {
                 1 => {
                     /* A signature nobody made recovers to some address nobody holds, a
                     different one for each thing signed, as it does on chain. */
-                    let digest = word(&record.input, 0);
-                    let nobody =
-                        low_address(U256::from_be_bytes(&keccak256(&record.input))) | NO_ONE;
-                    one_word(self.signed.get(&digest).copied().unwrap_or(nobody))
+                    one_word(low_address(U256::from_be_bytes(&keccak256(&record.input))) | NO_ONE)
                 }
                 4 => record.input.clone(),
                 // The other built-in contracts are not run. A digest of the input stands for theirs.

@@ -79,8 +79,6 @@ pub struct Host {
     pub basefee: U256,
     pub blobbasefee: U256,
     pub seed: u64,
-    pub answers: Vec<(usize, Vec<u8>)>,
-    pub signed: Option<(Vec<u8>, U256)>,
     pub intercept_calls: bool,
 }
 
@@ -110,8 +108,6 @@ impl Host {
             basefee: U256::from_u64(rng.below(1 << 36)),
             blobbasefee: U256::from_u64(rng.below(1 << 20)),
             seed: rng.next_u64(),
-            answers: Vec::new(),
-            signed: None,
             intercept_calls: false,
         }
     }
@@ -135,8 +131,6 @@ impl Host {
             basefee: U256::from_u64(BASEFEE),
             blobbasefee: U256::from_u64(BLOBBASEFEE),
             seed: CONTROLLED_SEED,
-            answers: Vec::new(),
-            signed: None,
             intercept_calls: false,
         }
     }

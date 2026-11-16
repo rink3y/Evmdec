@@ -8,7 +8,7 @@ they carry.
 ## Rule of use
 
 The same as the held-out set. Nothing is tuned against it and no contract in it is read to
-shape a rule. It is only scored, with `python3 corpus/heldout_bench.py --set fresh`.
+shape the analyzer. It is only scored, by reviewers who return counts.
 
 ## How it was chosen
 

@@ -1140,10 +1140,11 @@ pub fn fmt_mem_word(off: ExprId, n: &Names) -> String {
     named.unwrap_or_else(|| format!("mem[{}]", fmt_mem_off(off, n)))
 }
 
-// A place inside an allocated block is named like a store to it, so one buffer has one spelling.
+// A place is spelled the way a store to it spells it, so one buffer has one spelling.
 fn fmt_mem_at(e: ExprId, n: &Names) -> String {
     match (expr::as_const(e), block_ref(e, n)) {
         (Some(_), Some((number, offset))) => fmt_block_ref(number, offset),
+        (Some(c), None) if !c.is_zero() && c.bits() <= 64 => c.to_hex(),
         _ => fmt_expr(e, n),
     }
 }
@@ -1645,6 +1646,8 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             format!("returndata_{}[{}]", n.seq(seq), fmt_expr(off, n)),
             P_PRIMARY,
         ),
+        // A word copied from memory is spelled like the store that wrote it.
+        Node::CopiedWord(op::MCOPY, src, _) => (fmt_mem_word(src, n), P_PRIMARY),
         Node::CopiedWord(kind, src, _) => (
             format!("{}[{}]", copy_source(kind), fmt_expr(src, n)),
             P_PRIMARY,
@@ -2648,6 +2651,9 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     fmt_expr(*src, n),
                     fmt_expr(*len, n)
                 ),
+                None if *kind == op::MCOPY => {
+                    format!("mem[{}:+{}]", fmt_mem_at(*src, n), fmt_expr(*len, n))
+                }
                 None => format!(
                     "{}[{}:+{}]",
                     copy_source(*kind),

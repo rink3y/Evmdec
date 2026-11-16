@@ -649,6 +649,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             summaries: HashMap::new(),
             footprints: HashMap::new(),
             pointer_keepers: HashSet::new(),
+            memory_readers: HashSet::new(),
             oracle: true,
             copy_loops: Default::default(),
         };
@@ -747,6 +748,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         summaries: HashMap::new(),
         footprints: HashMap::new(),
         pointer_keepers: HashSet::new(),
+        memory_readers: HashSet::new(),
         oracle: false,
         copy_loops: Default::default(),
     };
@@ -777,13 +779,20 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             .filter(|(_, l)| l.mem_writes.leaves_free_pointer())
             .map(|(b, _)| *b)
             .collect();
+        let memory_readers: HashSet<usize> = by_block
+            .iter()
+            .filter(|(_, l)| l.reads_through_pointers())
+            .map(|(b, _)| prog.blocks[*b].start)
+            .collect();
         let same = sums.len() == int_lifter.summaries.len()
             && sums.keys().all(|k| int_lifter.summaries.contains_key(k))
             && footprints == int_lifter.footprints
-            && pointer_keepers == int_lifter.pointer_keepers;
+            && pointer_keepers == int_lifter.pointer_keepers
+            && memory_readers == int_lifter.memory_readers;
         int_lifter.summaries = sums;
         int_lifter.footprints = footprints;
         int_lifter.pointer_keepers = pointer_keepers;
+        int_lifter.memory_readers = memory_readers;
         if same {
             break;
         }
@@ -802,6 +811,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         summaries: int_lifter.summaries.clone(),
         footprints: int_lifter.footprints.clone(),
         pointer_keepers: int_lifter.pointer_keepers.clone(),
+        memory_readers: int_lifter.memory_readers.clone(),
         oracle: false,
         copy_loops: Default::default(),
     };

@@ -739,7 +739,7 @@ fn vyper_fixed_addresses_read_as_locals() {
         "// Memory: loc_N is the variable kept at the fixed memory address 0xN",
         "while (loc_280 < 2) {",
         "loc_240[loc_280] = loc_240[loc_280] + loc_2a0;",
-        "identity.call(mem[640:740])",
+        "identity.call(mem[0x280:0x2e4])",
     ] {
         assert!(src.contains(line), "missing `{line}`");
     }
@@ -1233,7 +1233,7 @@ fn call_data_is_the_bytes_the_writes_left_under_one_pointer_name() {
     assert!(helper.contains("abi.encodeWithSelector(deposit.selector, arg2, address(this))"));
     let gauge = regress("vyper_gauge.hex").source;
     assert!(
-        gauge.contains("stor_21.call(abi.encodePacked(bytes4(mem[968])));"),
+        gauge.contains("stor_21.call(abi.encodePacked(bytes4(mem[0x3c8])));"),
         "a call of four bytes is not a word"
     );
     let proxy = regress("swap_proxy.hex").source;
@@ -1299,4 +1299,23 @@ fn element_checks_field_masks_and_the_vyper_compiler_are_kept() {
     assert!(regress("vyper_sparse_table.hex")
         .language
         .starts_with("vyper >= 0.3.10"));
+}
+
+#[test]
+fn a_memory_write_that_is_read_later_is_printed() {
+    let router = regress("oneinch_v6.hex").source;
+    let start = router.find("function func_0x216b(").expect("the callback");
+    let first = router[start..].lines().nth(1).expect("its first statement");
+    assert_eq!(
+        first.trim(),
+        "mem[ptr1] = 0xdfe1681d21220a7ddca3f43a9059cbb23b872dd36c785160000000000000000;",
+        "the selectors a helper sends later are stored at entry"
+    );
+    let gauge = regress("vyper_gauge.hex").source;
+    assert!(
+        gauge.contains(
+            "identity.call(mem[0x204:0x228]);\n                mem[0x1a0:+36] = mem[0x204:+36];"
+        ),
+        "the built-in copies over the word the next test reads"
+    );
 }

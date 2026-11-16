@@ -1204,6 +1204,7 @@ pub struct Lifter<'a> {
     pub summaries: HashMap<usize, CalleeSummary>,
     pub footprints: HashMap<usize, MemoryWrites>,
     pub pointer_keepers: HashSet<usize>,
+    pub memory_readers: HashSet<usize>,
     pub oracle: bool,
     pub copy_loops: RefCell<HashMap<(usize, usize), CopyLoop>>,
 }
@@ -1684,7 +1685,7 @@ impl<'a> Lifter<'a> {
             }
         }
 
-        let hidden_set = without_still_read(&lnodes, hidden.all());
+        let hidden_set = without_still_read(&lnodes, hidden.all(), &self.memory_readers);
         let mut nodes: Vec<LNode> = Vec::new();
         let mut map: HashMap<usize, usize> = HashMap::new();
         for (i, ln) in lnodes.iter().enumerate() {
@@ -2528,7 +2529,9 @@ impl<'a> Lifter<'a> {
                         .map(|v| v as u64);
                     let identity = expr::as_const(addr) == Some(U256::from_u64(4))
                         && (o == op::STATICCALL || o == op::CALL);
-                    if identity && matches!((ol, il), (Some(o), Some(i)) if o <= i) {
+                    let copies =
+                        identity && matches!((ol, il), (Some(o), Some(i)) if 0 < o && o <= i);
+                    if copies || (identity && ol == Some(0)) {
                         apply_mcopy(&mut st, out_off, in_off, out_len);
                     } else if ol != Some(0) {
                         st.mem.store(out_off, ol, MVal::CallOut(seq));
@@ -2555,6 +2558,17 @@ impl<'a> Lifter<'a> {
                         result,
                         gen,
                     });
+                    /* The identity built-in is how code before MCOPY copies memory. The
+                    copy is what later reads of the output see, so it is a statement. */
+                    if copies && !self.oracle {
+                        stmts.push(Stmt::Copy {
+                            kind: op::MCOPY,
+                            dest: out_off,
+                            src: in_off,
+                            len: out_len,
+                            addr: None,
+                        });
+                    }
                     st.stack.push(result);
                     st.called = true;
                     st.returned = call_stamp(nid, stmts.len());
@@ -2950,7 +2964,7 @@ fn const_len(len: ExprId) -> Option<u64> {
         .map(|l| l.low_u64())
 }
 
-fn raw_reads(stmts: &[Stmt], term: &Term) -> Vec<RawRead> {
+fn raw_reads(stmts: &[Stmt], term: &Term, readers: &HashSet<usize>) -> Vec<RawRead> {
     let mut reads = Vec::new();
     let word = Some(konst_u64(32));
     let loads = |e: ExprId, reads: &mut Vec<RawRead>| {
@@ -3007,6 +3021,12 @@ fn raw_reads(stmts: &[Stmt], term: &Term) -> Vec<RawRead> {
                 len,
                 ..
             } => reads.push((*src, Some(*len), None)),
+            /* A helper that reads memory through a pointer may read from any place it is
+            handed. A small number is a flag or a count, not a place. */
+            Stmt::Internal { callee, args, .. } if readers.contains(callee) => {
+                let place = |a: &&ExprId| expr::as_const(**a).is_none_or(|c| c.bits() > 6);
+                reads.extend(args.iter().filter(place).map(|a| (*a, None, None)))
+            }
             _ => {}
         }
         for e in stmt_exprs(s) {
@@ -3040,11 +3060,12 @@ fn raw_reads(stmts: &[Stmt], term: &Term) -> Vec<RawRead> {
 fn without_still_read(
     lnodes: &[Option<LNode>],
     hidden: HashSet<(usize, usize)>,
+    readers: &HashSet<usize>,
 ) -> HashSet<(usize, usize)> {
     if hidden.is_empty() {
         return hidden;
     }
-    let reads_any = |ln: &LNode| !raw_reads(&ln.stmts, &ln.term).is_empty();
+    let reads_any = |ln: &LNode| !raw_reads(&ln.stmts, &ln.term, readers).is_empty();
     if !lnodes.iter().flatten().any(reads_any) {
         return hidden;
     }
@@ -3101,7 +3122,7 @@ fn without_still_read(
         };
         let mut same: Vec<Whole> = Vec::new();
         for (i, s) in stmts.iter().enumerate() {
-            if seen(raw_reads(&stmts[i..=i], &Term::Stop), over, &same) {
+            if seen(raw_reads(&stmts[i..=i], &Term::Stop, readers), over, &same) {
                 return (true, false);
             }
             over.extend(written(s));
@@ -3116,7 +3137,7 @@ fn without_still_read(
                 return (false, false);
             }
         }
-        (seen(raw_reads(&[], term), over, &same), true)
+        (seen(raw_reads(&[], term, readers), over, &same), true)
     };
     hidden
         .into_iter()
@@ -3372,6 +3393,11 @@ fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
 }
 
 impl Lifted {
+    #[must_use]
+    pub fn reads_through_pointers(&self) -> bool {
+        self.entry_loads.open_from.is_some()
+    }
+
     #[must_use]
     pub fn entry_free_pointer(&self) -> Option<ExprId> {
         let unit_entry = self

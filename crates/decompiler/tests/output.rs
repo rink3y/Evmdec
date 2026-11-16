@@ -109,14 +109,14 @@ fn a_loop_that_needs_many_rounds_does_not_keep_what_early_rounds_believed() {
 fn a_store_a_hash_consumed_stays_when_a_later_plain_read_needs_it() {
     let out = text("600435608052600160206080205560243561001957610020565b6044356080525b60206080f3");
     assert!(out.contains("mem[0x80] = arg0;"), "{out}");
-    assert!(out.contains("return mem[128:160];"), "{out}");
+    assert!(out.contains("return mem[0x80:0xa0];"), "{out}");
 }
 
 #[test]
 fn the_tail_of_a_memory_copy_comes_from_the_matching_source_bytes() {
     let out = text("5f3560805260203560a052603060806101005e6030610100f3");
     assert!(
-        out.contains("return (msg.data[0:32], mem[160] >> 128);"),
+        out.contains("return (msg.data[0:32], mem[0xa0] >> 128);"),
         "{out}"
     );
 }
@@ -127,7 +127,7 @@ fn two_overlapping_writes_in_a_different_order_per_path_are_not_trusted() {
         "60443561001757600435609052602435608052610024565b6024356080526004356090525b60206090f3",
     );
     assert!(!out.contains("return (arg0);"), "{out}");
-    assert!(out.contains("return mem[144:176];"), "{out}");
+    assert!(out.contains("return mem[0x90:0xb0];"), "{out}");
 }
 
 #[test]

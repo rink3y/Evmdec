@@ -1595,15 +1595,17 @@ fn stmt_reads(s: &Stmt, names: &Names) -> Vec<(ExprId, bool)> {
             value,
             input,
             input_head,
+            layout,
             ..
         } => {
             let mut v = vec![(*gas, false), (*addr, false)];
             if let Some(x) = value {
                 v.push((*x, false));
             }
-            match input {
-                Some(w) => v.extend(words(w)),
-                None => v.extend(words(input_head)),
+            match (layout, input) {
+                (Some(pieces), _) => v.extend(pieces.iter().map(|(e, _)| (*e, true))),
+                (None, Some(w)) => v.extend(words(w)),
+                (None, None) => v.extend(words(input_head)),
             }
             v
         }

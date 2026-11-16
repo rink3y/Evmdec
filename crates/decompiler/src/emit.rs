@@ -707,7 +707,8 @@ pub fn number_blocks(l: &Lifted) -> Blocks {
     let mut number = 0;
     for start in starts {
         let (base, offset) = expr::split_offset(start);
-        if base.is_none() && offset < U256::from_u64(0x80) {
+        // Solidity before 0.4.22 starts its free memory at 0x60.
+        if base.is_none() && offset < U256::from_u64(0x60) {
             continue;
         }
         let at = blocks.entry(base).or_default();
@@ -857,6 +858,26 @@ pub fn fmt_mem_word(off: ExprId, n: &Names) -> String {
             .map(|(name, index)| format!("{name}[{}]", fmt_expr(index, n))),
     };
     named.unwrap_or_else(|| format!("mem[{}]", fmt_mem_off(off, n)))
+}
+
+// A place inside an allocated block is named like a store to it, so one buffer has one spelling.
+fn fmt_mem_at(e: ExprId, n: &Names) -> String {
+    match (expr::as_const(e), block_ref(e, n)) {
+        (Some(_), Some((number, offset))) => fmt_block_ref(number, offset),
+        _ => fmt_expr(e, n),
+    }
+}
+
+pub fn fmt_mem_range(off: ExprId, len: ExprId, n: &Names) -> String {
+    let start = fmt_mem_at(off, n);
+    let end = expr::op2(op::ADD, off, len);
+    let (past, from) = expr::split_offset(end);
+    match past {
+        Some(past) if expr::as_const(off) == Some(from) && block_ref(off, n).is_some() => {
+            format!("mem[{start}:{start} + {}]", fmt_prec(past, P_ADD, n))
+        }
+        _ => format!("mem[{start}:{}]", fmt_mem_at(end, n)),
+    }
 }
 
 pub fn fmt_mem_off(off: ExprId, n: &Names) -> String {
@@ -1325,11 +1346,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             )
         }
         Node::KeccakMem(off, len, _) => (
-            format!(
-                "keccak256(mem[{}:{}])",
-                fmt_expr(off, n),
-                fmt_prec(expr::op2(op::ADD, off, len), 0, n)
-            ),
+            format!("keccak256({})", fmt_mem_range(off, len, n)),
             P_PRIMARY,
         ),
         Node::CallResult(seq) => (format!("success_{}", n.seq(seq)), P_PRIMARY),
@@ -1947,6 +1964,49 @@ pub fn fmt_call_input(
     (None, words.iter().map(|w| fmt_expr(*w, n)).collect())
 }
 
+/* Call data that is not a selector and whole words has no abi.encode form of its true
+length. It is printed as packed bytes, each piece with its width. */
+fn fmt_call_pieces(
+    pieces: &[(ExprId, u8)],
+    n: &Names,
+) -> (Option<String>, Vec<String>, &'static str) {
+    let piece = |(e, width): &(ExprId, u8)| -> String {
+        let bits = 8 * u32::from(*width);
+        match (expr::as_const(*e), expr::node(*e)) {
+            _ if *width == 32 => fmt_expr(*e, n),
+            (Some(c), _) => format!("bytes{width}({})", c.to_hex_padded(usize::from(*width))),
+            (None, Node::Op(op::SHR, v))
+                if expr::as_const(v[0]) == Some(U256::from(256 - bits)) =>
+            {
+                format!("bytes{width}({})", fmt_expr(v[1], n))
+            }
+            _ => match fmt_expr(*e, n) {
+                cast if cast.starts_with(&format!("uint{bits}(")) => {
+                    format!("bytes{width}({cast})")
+                }
+                value => format!("bytes{width}(uint{bits}({value}))"),
+            },
+        }
+    };
+    let usual = pieces[0].1 == 4 && pieces[1..].iter().all(|(_, width)| *width == 32);
+    let encoder = match usual && pieces.len() > 1 {
+        true => "abi.encodeWithSelector",
+        false => "abi.encodePacked",
+    };
+    match expr::as_const(pieces[0].0).filter(|_| usual) {
+        Some(sel) => {
+            let sel = sel.low_u64() as u32;
+            let name = match sigs::function(sel) {
+                Some(sig) => sigs::name_of(&sig).to_string(),
+                None => format!("func_{sel:08x}"),
+            };
+            let args = pieces[1..].iter().map(|(e, _)| fmt_expr(*e, n)).collect();
+            (Some(name), args, encoder)
+        }
+        None => (None, pieces.iter().map(piece).collect(), encoder),
+    }
+}
+
 fn precompile_name(addr: U256) -> Option<&'static str> {
     if !addr.fits_u64() {
         return None;
@@ -2058,11 +2118,9 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
         } => {
             let data_args: Vec<String> = match data {
                 Some(words) => words.iter().map(|w| fmt_expr(*w, n)).collect(),
-                None if expr::as_const(*len) != Some(U256::ZERO) => vec![format!(
-                    "mem[{}:{}]",
-                    fmt_expr(*off, n),
-                    fmt_expr(expr::op2(op::ADD, *off, *len), n)
-                )],
+                None if expr::as_const(*len) != Some(U256::ZERO) => {
+                    vec![fmt_mem_range(*off, *len, n)]
+                }
                 None => Vec::new(),
             };
             fmt_log_parts(topics, data_args, n)
@@ -2077,6 +2135,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             out_len: _,
             input,
             input_head,
+            layout,
             result,
             ..
         } => {
@@ -2107,25 +2166,50 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 op::STATICCALL => "staticcall",
                 _ => "call",
             };
-            let partial = input.is_none() && !n.payload_overrides.borrow().contains_key(in_off);
-            let (fname, mut args) = match input {
-                Some(words) => fmt_call_input(words, expr::as_const(*in_len), n),
-                None if partial => fmt_call_head(input_head, n),
-                None => (None, vec![]),
+            let known = input.is_some() || layout.is_some();
+            let partial = !known && !n.payload_overrides.borrow().contains_key(in_off);
+            let tail = expr::as_const(*in_len).map_or(0, |l| (l.low_u64() % 32) as u8);
+            let aligned = |words: &[ExprId]| -> Vec<(ExprId, u8)> {
+                let last = words.len() - 1;
+                let width = |i: usize| if i == last { tail } else { 32 };
+                words
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| (*w, width(i)))
+                    .collect()
+            };
+            let usual = layout
+                .as_deref()
+                .filter(|l| l[0].1 == 4 && l[1..].iter().all(|(_, width)| *width == 32));
+            /* Code that ors the selector into the first word leaves no piece of four
+            bytes. The words then still give the call when the selector is taken off. */
+            let (fname, mut args, encoder) = match (usual, input) {
+                (Some(pieces), _) => fmt_call_pieces(pieces, n),
+                (None, Some(words)) => match fmt_call_input(words, expr::as_const(*in_len), n) {
+                    (None, _) if layout.is_some() || (tail != 0 && !words.is_empty()) => {
+                        fmt_call_pieces(&layout.clone().unwrap_or_else(|| aligned(words)), n)
+                    }
+                    (fname, args) => (fname, args, "abi.encode"),
+                },
+                (None, None) if partial => {
+                    let (fname, args) = fmt_call_head(input_head, n);
+                    (fname, args, "abi.encode")
+                }
+                (None, None) => (None, vec![], "abi.encode"),
             };
             if partial && fname.is_some() {
                 args.push("...".to_string());
             }
-            let payload = match (&fname, input) {
+            let payload = match (&fname, known) {
                 (Some(f), _) => format!(
                     "abi.encodeWithSelector({}.selector, {})",
                     f,
                     args.join(", ")
                 )
                 .replace(", )", ")"),
-                (None, Some(_)) if args.is_empty() => "\"\"".into(),
-                (None, Some(_)) => format!("abi.encode({})", args.join(", ")),
-                (None, None) => {
+                (None, true) if args.is_empty() => "\"\"".into(),
+                (None, true) => format!("{encoder}({})", args.join(", ")),
+                (None, false) => {
                     if expr::as_const(*in_len) == Some(U256::ZERO) {
                         "\"\"".into()
                     } else if let Some(text) = n.payload_overrides.borrow().get(in_off) {
@@ -2133,11 +2217,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     } else if let Some(pointer) = bytes_value(*in_off, *in_len) {
                         format!("bytes({})", fmt_mem_off(pointer, n))
                     } else {
-                        format!(
-                            "mem[{}:{}]",
-                            fmt_expr(*in_off, n),
-                            fmt_expr(expr::op2(op::ADD, *in_off, *in_len), n)
-                        )
+                        fmt_mem_range(*in_off, *in_len, n)
                     }
                 }
             };
@@ -2176,11 +2256,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
         } => {
             let code = match init {
                 Some(words) if !words.is_empty() => format!("bytecode[{} words]", words.len()),
-                _ => format!(
-                    "mem[{}:{}]",
-                    fmt_expr(*off, n),
-                    fmt_expr(expr::op2(op::ADD, *off, *len), n)
-                ),
+                _ => fmt_mem_range(*off, *len, n),
             };
             let v = if expr::as_const(*value) == Some(U256::ZERO) {
                 String::new()
@@ -2221,7 +2297,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             };
             format!(
                 "mem[{}:+{}] = {};",
-                fmt_expr(*dest, n),
+                fmt_mem_at(*dest, n),
                 fmt_expr(*len, n),
                 src_s
             )
@@ -2330,11 +2406,7 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
                 if expr::as_const(*len) == Some(U256::ZERO) {
                     "return;".into()
                 } else {
-                    format!(
-                        "return mem[{}:{}];",
-                        fmt_expr(*off, n),
-                        fmt_expr(expr::op2(op::ADD, *off, *len), n)
-                    )
+                    format!("return {};", fmt_mem_range(*off, *len, n))
                 }
             }
         },
@@ -2359,11 +2431,7 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
                 if expr::as_const(*len) == Some(U256::ZERO) {
                     "revert();".into()
                 } else {
-                    format!(
-                        "revert(mem[{}:{}]);",
-                        fmt_expr(*off, n),
-                        fmt_expr(expr::op2(op::ADD, *off, *len), n)
-                    )
+                    format!("revert({});", fmt_mem_range(*off, *len, n))
                 }
             }
         },

@@ -42,6 +42,7 @@ pub enum Stmt {
         out_len: ExprId,
         input: Option<Vec<ExprId>>,
         input_head: Vec<ExprId>,
+        layout: Option<Vec<(ExprId, u8)>>,
         result: ExprId,
         gen: Option<u32>,
     },
@@ -488,6 +489,15 @@ pub struct MemoryWrites {
 
 impl MemoryWrites {
     #[must_use]
+    pub fn leaves_free_pointer(&self) -> bool {
+        let end = FREE_POINTER + 32;
+        !self
+            .ranges
+            .iter()
+            .any(|(lo, hi)| *lo < end && *hi > FREE_POINTER)
+    }
+
+    #[must_use]
     pub fn fixed(&self) -> Option<Vec<(u64, u64)>> {
         if self.anywhere {
             return None;
@@ -905,6 +915,31 @@ impl Mem {
         ))
     }
 
+    fn free_pointer_now(&self) -> ExprId {
+        let at = konst_u64(FREE_POINTER);
+        self.load_bytes(at, 32, 0)
+            .unwrap_or_else(|| expr::intern(Node::MLoad(at, self.version_for(at, 32))))
+    }
+
+    /* The free pointer is read far more often than it is written. Where its value is
+    known to be the one it had, saying so keeps one name for one buffer. This is not a
+    write the code makes, so it is not counted as one. */
+    fn keep_free_pointer(&mut self, value: ExprId) {
+        if self.free_pointer_now() == value {
+            return;
+        }
+        self.writes
+            .retain(|w| !(w.base.is_none() && w.off == FREE_POINTER && w.len == Some(32)));
+        self.writes.push(MemWrite {
+            base: None,
+            off: FREE_POINTER,
+            len: Some(32),
+            val: MVal::Word(value),
+            origin: None,
+            gen: self.gen,
+        });
+    }
+
     fn load_word(&self, off: ExprId, version: u32) -> ExprId {
         match self.load_bytes(off, 32, version) {
             Some(v) => v,
@@ -934,6 +969,62 @@ impl Mem {
             )?);
         }
         Some((words, tail))
+    }
+
+    /* Words read at every 32 bytes cut across writes that do not start on those bounds.
+    Following the writes gives each stored value whole. A region made of whole words
+    gives nothing, because the words already say it. */
+    fn read_pieces(&self, off: ExprId, len: u64) -> Option<Vec<(ExprId, u8)>> {
+        if len > 8192 {
+            return None;
+        }
+        let (base, d) = norm_offset(off);
+        let mut bytes: Vec<Option<(ExprId, u64)>> = vec![None; len as usize];
+        let mut missing = bytes.len();
+        for w in self.writes.iter().rev() {
+            if missing == 0 {
+                break;
+            }
+            if w.base != base {
+                if may_alias(w.base, w.off, w.len, base, d, len) {
+                    return None;
+                }
+                continue;
+            }
+            let end = w.off.saturating_add(w.len.unwrap_or(u64::MAX));
+            let open =
+                (w.off.max(d)..end.min(d + len)).filter(|b| bytes[(b - d) as usize].is_none());
+            let open: Vec<u64> = open.collect();
+            let stored = match (&w.val, w.len) {
+                (MVal::Word(v), Some(32)) => *v,
+                (MVal::Byte(v), Some(1)) => op2(op::SHL, konst_u64(248), *v),
+                _ if open.is_empty() => continue,
+                _ => return None,
+            };
+            for b in open {
+                bytes[(b - d) as usize] = Some((stored, b - w.off));
+                missing -= 1;
+            }
+        }
+        let bytes: Vec<(ExprId, u64)> = bytes.into_iter().collect::<Option<_>>()?;
+        let mut pieces = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let (v, first) = bytes[at];
+            let run = bytes[at..]
+                .iter()
+                .zip(first..)
+                .take_while(|((v2, i2), i)| *v2 == v && i2 == i)
+                .count();
+            let low = op2(op::SHR, konst_u64(8 * (32 - first - run as u64)), v);
+            let part = op2(op::AND, low, konst(expr::mask_bits(8 * run as u32)));
+            pieces.push((part, run as u8));
+            at += run;
+        }
+        pieces
+            .iter()
+            .any(|(_, width)| *width != 32)
+            .then_some(pieces)
     }
 
     fn read_region_lossy(&self, off: ExprId, len: u64, version: u32) -> Option<Vec<ExprId>> {
@@ -979,6 +1070,8 @@ impl Mem {
         if identical {
             return false;
         }
+        let pointer = self.free_pointer_now();
+        let pointer = (pointer == other.free_pointer_now()).then_some(pointer);
         type Place = (Option<ExprId>, u64, Option<u64>);
         let place = |w: &MemWrite| -> Place { (w.base, w.off, w.len) };
         let by_place = |writes: &[MemWrite]| {
@@ -1046,15 +1139,9 @@ impl Mem {
         }
         let overflow = merged.len().saturating_sub(MAX_TRACKED_WRITES);
         merged.drain(..overflow);
-        let changed_writes = merged.len() != self.writes.len()
-            || merged
-                .iter()
-                .zip(self.writes.iter())
-                .any(|(a, b)| !(same(a, b)));
-        self.writes = merged;
+        let before = std::mem::replace(&mut self.writes, merged);
         let written_before = self.written.len();
         self.written.retain(|r| other.written.contains(r));
-        let changed_writes = changed_writes || self.written.len() != written_before;
         self.fresh &= other.fresh && overflow == 0;
         if overflow > 0 || other.gen != self.gen || other.clobber_gen != self.clobber_gen {
             self.gen = merged_version(self.gen, other.gen, stable);
@@ -1067,6 +1154,12 @@ impl Mem {
                 }
             }
         }
+        if let Some(pointer) = pointer {
+            self.keep_free_pointer(pointer);
+        }
+        let changed_writes = before.len() != self.writes.len()
+            || before.iter().zip(&self.writes).any(|(a, b)| !same(a, b))
+            || self.written.len() != written_before;
         changed_writes || fresh_before != self.fresh || gen_before != self.gen
     }
 }
@@ -1110,6 +1203,7 @@ pub struct Lifter<'a> {
     pub root: bool,
     pub summaries: HashMap<usize, CalleeSummary>,
     pub footprints: HashMap<usize, MemoryWrites>,
+    pub pointer_keepers: HashSet<usize>,
     pub oracle: bool,
     pub copy_loops: RefCell<HashMap<(usize, usize), CopyLoop>>,
 }
@@ -2391,6 +2485,9 @@ impl<'a> Lifter<'a> {
                     if let (Some(_), Some(l)) = (&input, expr::as_const(in_len)) {
                         hidden.add(nid, st.mem.consumers(in_off, l.low_u64()));
                     }
+                    let layout = expr::as_const(in_len)
+                        .and_then(|l| l.as_usize())
+                        .and_then(|l| st.mem.read_pieces(in_off, l as u64));
                     let result = expr::intern(Node::CallResult(seq));
                     let input_head: Vec<ExprId> = if expr::as_const(in_len) == Some(U256::ZERO) {
                         Vec::new()
@@ -2435,6 +2532,7 @@ impl<'a> Lifter<'a> {
                         out_len,
                         input,
                         input_head,
+                        layout,
                         result,
                         gen,
                     });
@@ -2719,7 +2817,15 @@ impl<'a> Lifter<'a> {
                         st.mem.tick();
                         st.version = st.mem.gen;
                     }
-                    None => st.mem.clobber(),
+                    None => {
+                        st.mem.clobber();
+                        if self.pointer_keepers.contains(&call.callee) {
+                            st.mem.keep_free_pointer(free_now);
+                        } else {
+                            let word = (FREE_POINTER, FREE_POINTER + 32);
+                            st.mem.touched.borrow_mut().ranges.insert(word);
+                        }
+                    }
                 }
                 st.storage.clear();
                 st.sgen += 1;
@@ -3337,6 +3443,7 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             out_len,
             input,
             input_head,
+            layout,
             result,
             gen,
         } => Stmt::Call {
@@ -3351,6 +3458,9 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             out_len: f(*out_len),
             input: fo(input),
             input_head: fv(input_head),
+            layout: layout
+                .as_ref()
+                .map(|l| l.iter().map(|(e, width)| (f(*e), *width)).collect()),
             result: f(*result),
             gen: *gen,
         },
@@ -3480,11 +3590,16 @@ pub fn payload_exprs(n: &LNode) -> Vec<ExprId> {
     for s in &n.stmts {
         match s {
             Stmt::Call {
-                input, input_head, ..
+                input,
+                input_head,
+                layout,
+                ..
             } => {
                 v.extend(input_head.iter().copied());
-                if let Some(d) = input {
-                    v.extend(d.iter().copied());
+                match (input, layout) {
+                    (Some(d), _) => v.extend(d.iter().copied()),
+                    (None, Some(pieces)) => v.extend(pieces.iter().map(|(e, _)| *e)),
+                    (None, None) => {}
                 }
             }
             Stmt::Log { data: Some(d), .. }
@@ -3536,6 +3651,7 @@ pub fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
             out_off,
             out_len,
             input,
+            layout,
             ..
         } => {
             v.push(*gas);
@@ -3544,8 +3660,11 @@ pub fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
                 v.push(*x);
             }
             v.extend([*in_off, *in_len, *out_off, *out_len]);
-            if let Some(d) = input {
-                v.extend(d.iter().copied());
+            // The pieces say again what the words say, so they are listed only without them.
+            match (input, layout) {
+                (Some(d), _) => v.extend(d.iter().copied()),
+                (None, Some(pieces)) => v.extend(pieces.iter().map(|(e, _)| *e)),
+                (None, None) => {}
             }
         }
         Stmt::Create {

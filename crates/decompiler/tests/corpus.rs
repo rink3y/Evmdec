@@ -1217,3 +1217,36 @@ fn copies_of_one_block_have_labels_of_their_own() {
         assert!(labels.contains(&target), "goto {target} has its label");
     }
 }
+
+#[test]
+fn call_data_is_the_bytes_the_writes_left_under_one_pointer_name() {
+    let router = regress("oneinch_v6.hex").source;
+    assert!(
+        router.contains("(abi.encodePacked(bytes4(0x27a9b424), arg5, arg4, ")
+            && router.contains(", 288, 5, bytes5(0x31494e4348)));"),
+        "a selector, ten words and the five bytes of the tag"
+    );
+    let helper = regress("umbrella_batch_helper.hex").source;
+    assert!(helper.contains(
+        ".call(abi.encodeWithSelector(bytes4(uint32(v2)), returndata_2[0], msg.sender, address(this)));"
+    ));
+    assert!(helper.contains("abi.encodeWithSelector(deposit.selector, arg2, address(this))"));
+    let gauge = regress("vyper_gauge.hex").source;
+    assert!(
+        gauge.contains("stor_21.call(abi.encodePacked(bytes4(mem[968])));"),
+        "a call of four bytes is not a word"
+    );
+    let proxy = regress("swap_proxy.hex").source;
+    assert!(proxy.contains("mem[ptr1 + 68] = arg5;") && proxy.contains(".call(mem[ptr1:v2]);"));
+    let token = regress("minime_token.hex").source;
+    assert!(
+        token.contains("mem[ptr1 + 68] = address(this);")
+            && token.contains("address(target).call(mem[ptr1:v1]);"),
+        "the buffer written is the buffer sent"
+    );
+    let dvn = regress("layerzero_dvn.hex").source;
+    assert!(
+        dvn.contains("calldata[v3 + calldata[v3 + 64]], ptr3);")
+            && dvn.contains(".call(mem[ptr3:ret_7_0]);")
+    );
+}

@@ -648,6 +648,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             root: false,
             summaries: HashMap::new(),
             footprints: HashMap::new(),
+            pointer_keepers: HashSet::new(),
             oracle: true,
             copy_loops: Default::default(),
         };
@@ -745,6 +746,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         root: false,
         summaries: HashMap::new(),
         footprints: HashMap::new(),
+        pointer_keepers: HashSet::new(),
         oracle: false,
         copy_loops: Default::default(),
     };
@@ -767,11 +769,21 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             .filter(|_| profile.kind != compiler::Kind::Solc)
             .map(|(b, l)| (*b, l.mem_writes.clone()))
             .collect();
+        /* Solidity writes through pointers only at and above the free pointer's start,
+        so a helper that never stores to the pointer's own word leaves it as it was. */
+        let pointer_keepers: HashSet<usize> = by_block
+            .iter()
+            .filter(|_| profile.kind == compiler::Kind::Solc)
+            .filter(|(_, l)| l.mem_writes.leaves_free_pointer())
+            .map(|(b, _)| *b)
+            .collect();
         let same = sums.len() == int_lifter.summaries.len()
             && sums.keys().all(|k| int_lifter.summaries.contains_key(k))
-            && footprints == int_lifter.footprints;
+            && footprints == int_lifter.footprints
+            && pointer_keepers == int_lifter.pointer_keepers;
         int_lifter.summaries = sums;
         int_lifter.footprints = footprints;
+        int_lifter.pointer_keepers = pointer_keepers;
         if same {
             break;
         }
@@ -789,6 +801,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         root: true,
         summaries: int_lifter.summaries.clone(),
         footprints: int_lifter.footprints.clone(),
+        pointer_keepers: int_lifter.pointer_keepers.clone(),
         oracle: false,
         copy_loops: Default::default(),
     };

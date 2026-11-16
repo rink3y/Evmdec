@@ -421,6 +421,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
         root: false,
         summaries: HashMap::new(),
         footprints: HashMap::new(),
+        pointer_keepers: Default::default(),
         oracle: true,
         copy_loops: Default::default(),
     };

@@ -838,7 +838,12 @@ impl<'a> Explorer<'a> {
                 for who in [OWNER, USER, ACTOR] {
                     let plain = Try::of(self.seed(entry, who, who, UNIT, U256::ZERO));
                     let (_, run) = self.attempt(0, entry, &plain);
-                    changed |= self.assume_stake(&plain, &run, entry, who);
+                    let staked = self.assume_stake(&plain, &run, entry, who);
+                    /* A call with a plain amount comes first. The search would get the
+                    same function to end by asking for nothing, and a total that was
+                    never set would go unseen. */
+                    let total = who == OWNER && !staked && !run.ok;
+                    changed |= staked || (total && self.assume_from(&plain, &run, entry, true));
                 }
                 for seed in self.honest(entry, OWNER) {
                     if budget::spent() {
@@ -872,7 +877,7 @@ impl<'a> Explorer<'a> {
             changed |= set_up;
             for (entry, t, run) in refused {
                 if self.good[entry].is_none() && !set_up {
-                    changed |= self.assume_from(&t, &run, entry);
+                    changed |= self.assume_from(&t, &run, entry, false);
                 }
             }
             if !changed {
@@ -1075,17 +1080,18 @@ impl<'a> Explorer<'a> {
     lacks is given to it. A plain slot that reads as nothing is tried with what the
     code compared it with, then with a total that matches the three stakes, then with a
     plain amount. An entry under a key is left for the calls that fill it. */
-    fn assume_from(&mut self, t: &Try, run: &Run, entry: usize) -> bool {
+    fn assume_from(&mut self, t: &Try, run: &Run, entry: usize, totals: bool) -> bool {
         let subject = self.subject;
         let base = &self.states[0].world;
         let mut options: Vec<(U256, U256, String)> = Vec::new();
         let mut at: HashMap<U256, Place> = HashMap::new();
         let mut roles: Vec<U256> = Vec::new();
         let tests = run.events.iter().rev().filter_map(|e| match e {
-            Event::Branch { tag, .. } if tag.has(STORE) && !tag.has(DATA | VALUE) => Some(*tag),
+            Event::Branch { tag, .. } if tag.has(STORE) && !tag.has(VALUE) => Some(*tag),
             _ => None,
         });
-        for tag in tests.take(3) {
+        let tests = tests.filter(|tag| tag.has(DATA) || !totals);
+        for tag in tests.take(4) {
             let unset = run.events.iter().filter_map(|e| match e {
                 Event::Load { cell, value } if value.is_zero() => Some(*cell),
                 _ => None,
@@ -1125,12 +1131,19 @@ impl<'a> Explorer<'a> {
                     Event::Cmp { a, ta, tb, .. } if tb.cell == this && !ta.has(STORE) => Some(*a),
                     _ => None,
                 });
+                /* A plain slot that reads as nothing and is tested against an amount in the
+                call data is a total. The accounts were given their stakes and the total
+                has to cover them. */
+                let total = tag.has(DATA);
                 let mut values: Vec<U256> = compared
                     .flat_map(|v| [v, v.wrapping_add(U256::ONE), v.wrapping_sub(U256::ONE)])
-                    .take(3)
+                    .take(if total { 0 } else { 3 })
                     .collect();
                 if held.is_zero() {
-                    values.extend([STAKE + STAKE + STAKE, UNIT, U256::ONE]);
+                    values.push(STAKE + STAKE + STAKE);
+                }
+                if held.is_zero() && !total {
+                    values.extend([UNIT, U256::ONE]);
                 }
                 let why = format!(
                     "slot {} is set, since the owner's call needs it",

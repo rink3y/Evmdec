@@ -48,3 +48,12 @@ fn a_report_is_the_same_every_time() {
     let second = serde_json::to_string(&report("Vault.hex").findings).expect("json");
     assert_eq!(first, second);
 }
+
+#[test]
+fn an_open_burn_lowers_a_holder_and_moving_between_own_records_credits_nobody() {
+    let report = report("Token.hex");
+    let kinds: Vec<Kind> = report.findings.iter().map(|f| f.kind).collect();
+    assert_eq!(kinds, vec![Kind::Debit], "{:?}", report.findings);
+    // burn(address,uint256). It only runs with a total that covers the holders' balances.
+    assert_eq!(report.findings[0].selector.as_deref(), Some("0x9dc29fac"));
+}

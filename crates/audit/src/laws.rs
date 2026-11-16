@@ -204,6 +204,15 @@ pub fn check(
         acted && c.arg_tags.iter().any(|t| t.only(crate::trace::CALLER))
     });
     let top = U256::ONE << 255;
+    /* What fell, in this call, in records kept under the account's own address. A rise
+    in one of its records that is no more than that is its own claim moved from one
+    record to another. */
+    let moved = run
+        .stores()
+        .filter(|(c, old, new, _, _)| own(c) && actor_keyed(c) && new < old && *old < top)
+        .fold(U256::ZERO, |sum, (_, old, new, _, _)| {
+            sum.wrapping_add(old - new)
+        });
     for (cell, old, new, tag, _) in run.stores() {
         // A value past half the range is a signed number below zero, not a holding.
         if !own(cell) || old >= top || new >= top {
@@ -215,6 +224,7 @@ pub fn check(
         if actor_keyed(cell)
             && !others
             && new > old
+            && new - old > moved
             && paid_nothing
             && !gave_up
             && !paid_elsewhere

@@ -253,3 +253,39 @@ fn a_stored_value_is_not_read_back_after_a_helper_wrote_what_it_was_made_from() 
     assert!(out.contains("mem[0xa0] = mem[0x80] + 1;"), "{out}");
     assert!(out.contains("stor_0 = mem[0xa0];"), "{out}");
 }
+
+#[test]
+fn what_a_call_returns_is_a_write_for_any_later_read_that_can_reach_it() {
+    let written =
+        "mem[0x80:+min(32, returndatasize())] = returndata[0:+min(32, returndatasize())];";
+    let as_data = text("60206080600060006000335af1506000600060003560806000305af15000");
+    assert!(as_data.contains(written), "{as_data}");
+    assert!(
+        as_data.contains(".call(mem[0x80:msg.data[0:32] + 128]);"),
+        "{as_data}"
+    );
+    let by_pointer = text("60206080600060006000335af1506000355160005500");
+    assert!(by_pointer.contains(written), "{by_pointer}");
+    assert!(
+        by_pointer.contains("stor_0 = mem[msg.data[0:32]];"),
+        "{by_pointer}"
+    );
+}
+
+#[test]
+fn a_word_of_the_output_area_is_the_answer_only_where_its_length_is_tested() {
+    let untested = text("60206080600060006000335af15060805160005500");
+    assert!(
+        untested.contains(
+            "mem[0x80:+min(32, returndatasize())] = returndata[0:+min(32, returndatasize())];"
+        ),
+        "{untested}"
+    );
+    assert!(untested.contains("stor_0 = mem[0x80];"), "{untested}");
+    let tested = text("60206080600060006000335af15060203d101561001c5760006000fd5b60805160005500");
+    assert!(
+        tested.contains("require(returndatasize() >= 32);"),
+        "{tested}"
+    );
+    assert!(tested.contains("stor_0 = returndata_1[0];"), "{tested}");
+}

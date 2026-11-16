@@ -1185,7 +1185,7 @@ fn a_helper_declares_every_stack_place_it_reads_and_returns_what_it_makes() {
             && call.ends_with(", arg2, target, arg0, arg1, ret_1_0);"),
         "the call passes the seven places the helper reads and binds its two results: {call}"
     );
-    assert!(router.contains("return (calldata[arg2 + 128], returndata_2[0]);"));
+    assert!(router.contains("return (calldata[arg2 + 128], mem[0x0]);"));
     let gauge = regress("vyper_gauge.hex").source;
     assert!(gauge.contains("function _transfer(uint256 amount, address to, address from)"));
     assert!(gauge.contains("_transfer(amount, to, msg.sender);"));

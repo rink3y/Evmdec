@@ -150,7 +150,7 @@ enum MVal {
     Word(ExprId),
     Byte(ExprId),
     Copy(u8, ExprId, Option<ExprId>),
-    CallOut(u32),
+    CallOut(u32, u32),
     Unknown,
 }
 
@@ -528,6 +528,10 @@ struct Mem {
     pointer_named: bool,
     // Writes made before this version may be missing from the list.
     wiped: u32,
+    // For the answer with a stamp, a length the code tested it to reach.
+    sized: Vec<(u32, u64)>,
+    // A merged value that is at most the length of the answer with the stamp.
+    capped: Vec<(ExprId, u32)>,
 }
 
 const BIG: u64 = 1 << 40;
@@ -679,6 +683,8 @@ impl Mem {
         Mem {
             pointer_named,
             wiped: 0,
+            sized: Vec::new(),
+            capped: Vec::new(),
             writes: Vec::new(),
             fresh,
             gen: 0,
@@ -777,6 +783,16 @@ impl Mem {
             pending.extend(expr::children(e));
         }
         true
+    }
+
+    fn at_most_answer(&self, value: ExprId, stamp: u32) -> bool {
+        let tested = |c: U256| {
+            let reached = |(at, len): &(u32, u64)| *at == stamp && U256::from(*len) >= c;
+            self.sized.iter().any(reached)
+        };
+        answer_stamp(value) == Some(stamp)
+            || self.capped.contains(&(value, stamp))
+            || expr::as_const(value).is_some_and(tested)
     }
 
     fn store(&mut self, off: ExprId, len: Option<u64>, val: MVal) {
@@ -907,8 +923,13 @@ impl Mem {
                     }
                     return None;
                 }
-                MVal::CallOut(seq) => {
-                    if lo == d && hi == d + n && covered == 0 {
+                /* A call writes no more than it was answered with. Past the end of a short
+                answer the word keeps what it held, so it is the answer only where the
+                code tested the answer to be long enough. */
+                MVal::CallOut(seq, stamp) => {
+                    let reached = |(at, len): &(u32, u64)| at == stamp && *len >= hi - w.off;
+                    let whole = self.sized.iter().any(reached);
+                    if lo == d && hi == d + n && covered == 0 && whole {
                         let seq = *seq;
                         let word = expr::intern(Node::ReturnData(seq, konst_u64(d - w.off)));
                         return Some(if n == 32 {
@@ -1160,6 +1181,8 @@ impl Mem {
         };
         let identical = self.gen == other.gen
             && self.wiped == other.wiped
+            && self.sized == other.sized
+            && self.capped == other.capped
             && self.clobber_gen == other.clobber_gen
             && self.fresh == other.fresh
             && self.written == other.written
@@ -1266,6 +1289,13 @@ impl Mem {
         self.written.retain(|r| other.written.contains(r));
         self.fresh &= other.fresh && overflow == 0;
         let wiped_before = self.wiped;
+        let sized_before = self.sized.len();
+        let tested = |(at, len): &(u32, u64)| {
+            let theirs = other.sized.iter().filter(|(a, _)| a == at).map(|(_, l)| *l);
+            theirs.max().map(|l| (*at, l.min(*len)))
+        };
+        self.sized = self.sized.iter().filter_map(tested).collect();
+        self.capped.retain(|c| other.capped.contains(c));
         let lost = overflow > 0 || other.wiped != self.wiped;
         if lost || other.gen != self.gen || other.clobber_gen != self.clobber_gen {
             self.gen = merged_version(self.gen, other.gen, stable);
@@ -1293,6 +1323,43 @@ impl Mem {
             || fresh_before != self.fresh
             || gen_before != self.gen
             || wiped_before != self.wiped
+            || sized_before != self.sized.len()
+    }
+}
+
+fn answer_stamp(e: ExprId) -> Option<u32> {
+    match expr::node(e) {
+        Node::Env(op::RETURNDATASIZE, stamp) => Some(stamp),
+        _ => None,
+    }
+}
+
+fn answer_length(cond: ExprId, holds: bool, capped: &[(ExprId, u32)]) -> Option<(u32, u64)> {
+    let cap = |e: ExprId| capped.iter().find(|(v, _)| *v == e).map(|(_, at)| *at);
+    let size = |e: ExprId| answer_stamp(e).or_else(|| cap(e));
+    let fixed = |e: ExprId| {
+        expr::as_const(e)
+            .filter(|c| c.fits_u64())
+            .map(|c| c.low_u64())
+    };
+    let Node::Op(o, v) = expr::node(cond) else {
+        return None;
+    };
+    match (o, holds) {
+        (op::ISZERO, _) => answer_length(v[0], !holds, capped),
+        (op::LT | op::SLT, false) | (op::GT | op::SGT, true) => {
+            let least = fixed(v[1])? + u64::from(holds);
+            Some((size(v[0])?, least))
+        }
+        (op::LT | op::SLT, true) | (op::GT | op::SGT, false) => {
+            let least = fixed(v[0])? + u64::from(holds);
+            Some((size(v[1])?, least))
+        }
+        (op::EQ, true) => {
+            let at = size(v[0]).or(size(v[1]))?;
+            Some((at, fixed(v[0]).or(fixed(v[1]))?))
+        }
+        _ => None,
     }
 }
 
@@ -1309,6 +1376,14 @@ pub struct State {
 }
 
 impl State {
+    fn learn(&mut self, cond: ExprId, holds: bool) {
+        if let Some((at, len)) = answer_length(cond, holds, &self.mem.capped) {
+            if !self.mem.sized.contains(&(at, len)) {
+                self.mem.sized.push((at, len));
+            }
+        }
+    }
+
     fn pop(&mut self) -> ExprId {
         match self.stack.pop() {
             Some(v) => v,
@@ -1753,11 +1828,20 @@ impl<'a> Lifter<'a> {
                 lnode.term = remap_term(&lnode.term, &m);
             }
             let succs: Vec<usize> = lnode.succs.clone();
+            let tested = match &lnode.term {
+                Term::Branch { cond, t, f } if *t != Some(*f) => Some((*cond, *t, *f)),
+                _ => None,
+            };
             lnodes[nid] = Some(lnode);
             exit_states[nid] = Some(exit.clone());
             let exit_all = exit;
             for s in succs {
-                let exit = succ_state.get(&s).unwrap_or(&exit_all).clone();
+                let mut exit = succ_state.get(&s).unwrap_or(&exit_all).clone();
+                if let Some((cond, t, f)) = tested {
+                    if t == Some(s) || f == s {
+                        exit.learn(cond, t == Some(s));
+                    }
+                }
                 // The entry is also reached from the caller.
                 let single_pred = unit.nodes[s].preds.len() <= 1 && s != unit.entry;
                 let changed = match &mut entries[s] {
@@ -1794,6 +1878,8 @@ impl<'a> Lifter<'a> {
                             || e.state.mem.fresh != new_state.mem.fresh
                             || e.state.mem.gen != new_state.mem.gen
                             || e.state.mem.wiped != new_state.mem.wiped
+                            || e.state.mem.sized != new_state.mem.sized
+                            || e.state.mem.capped != new_state.mem.capped
                             || e.state.storage != new_state.storage
                             || e.state.sgen != new_state.sgen
                             || e.state.returned != new_state.returned;
@@ -2671,10 +2757,12 @@ impl<'a> Lifter<'a> {
                     let fits = matches!((ol, il), (Some(o), Some(i)) if 0 < o && o <= i);
                     let copies = identity && (fits || (ol.is_none() && out_len == in_len));
                     let copied = st.mem.gen + 1;
+                    let shown = copies && !self.oracle;
+                    let answered = call_stamp(nid, stmts.len() + 1 + usize::from(shown));
                     if copies || (identity && ol == Some(0)) {
                         apply_mcopy(&mut st, out_off, in_off, out_len);
                     } else if ol != Some(0) {
-                        st.mem.store(out_off, ol, MVal::CallOut(seq));
+                        st.mem.store(out_off, ol, MVal::CallOut(seq, answered));
                     }
                     next_version(&mut st);
                     let gen = (o != op::STATICCALL).then_some(st.sgen);
@@ -2700,7 +2788,7 @@ impl<'a> Lifter<'a> {
                     });
                     /* The identity built-in is how code before MCOPY copies memory. The
                     copy is what later reads of the output see, so it is a statement. */
-                    if copies && !self.oracle {
+                    if shown {
                         stmts.push(Stmt::Copy {
                             kind: op::MCOPY,
                             dest: out_off,
@@ -2712,7 +2800,7 @@ impl<'a> Lifter<'a> {
                     }
                     st.stack.push(result);
                     st.called = true;
-                    st.returned = call_stamp(nid, stmts.len());
+                    st.returned = answered;
                 }
                 op::CREATE | op::CREATE2 => {
                     let value = pop!();
@@ -2874,6 +2962,13 @@ impl<'a> Lifter<'a> {
         }
         let unknown_pushed = call.pushed.iter().filter(|v| !v.passes_through()).count();
         let by_position = summary.is_some_and(|s| s.returns.len() == call.pushed.len());
+        // What a folded helper tested holds for the values it hands back.
+        let folded = summary
+            .filter(|s| by_position || s.returns.len() == unknown_pushed)
+            .filter(|s| !s.side_effects);
+        for (cond, _, _) in folded.map_or(&[][..], |s| s.guards.as_slice()) {
+            st.learn(subst(*cond), true);
+        }
         let resolve = |e: ExprId| -> ExprId {
             let mut memo = HashMap::new();
             expr::substitute(
@@ -3425,6 +3520,8 @@ fn merge_into(
         changed = true;
     }
     let el = e.state.stack.len();
+    let mut caps: Vec<(ExprId, u32)> = Vec::new();
+    let mut uncapped: Vec<ExprId> = Vec::new();
     for k in 0..el {
         let from_top = el - 1 - k;
         let exit_val = if from_top < xl {
@@ -3432,21 +3529,46 @@ fn merge_into(
         } else {
             expr::arg((exit.args_used + from_top - xl) as u32)
         };
+        let old = e.state.stack[k];
         if e.phis[k] {
+            let cap = e.state.mem.capped.iter().find(|(v, _)| *v == old);
+            if let Some((_, stamp)) = cap.copied() {
+                match exit_val == old || exit.mem.at_most_answer(exit_val, stamp) {
+                    true => caps.push((old, stamp)),
+                    false => uncapped.push(old),
+                }
+            }
             continue;
         }
-        if exit_val != e.state.stack[k] {
+        if exit_val != old {
             let var = *phi_ids
                 .entry((node, from_top))
                 .or_insert_with(|| merge_var(node, from_top));
+            let stamp = answer_stamp(old).or(answer_stamp(exit_val));
+            let below = |stamp: &u32| {
+                e.state.mem.at_most_answer(old, *stamp) && exit.mem.at_most_answer(exit_val, *stamp)
+            };
+            caps.extend(stamp.filter(below).map(|stamp| (var, stamp)));
             e.state.stack[k] = var;
             e.phis[k] = true;
             changed = true;
         }
     }
+    let capped = e.state.mem.capped.clone();
     if !e.widened && e.state.mem.intersect(&exit.mem, stable) {
         changed = true;
     }
+    /* The smaller of a length and a number is how code bounds what it copies of an answer.
+    A value merged here from that length and from numbers the length was tested to reach
+    is no more than the length on every way in. */
+    let merged = &mut e.state.mem.capped;
+    merged.retain(|(var, _)| !uncapped.contains(var));
+    for cap in caps {
+        if !merged.contains(&cap) {
+            merged.push(cap);
+        }
+    }
+    changed |= *merged != capped;
     let before = e.state.storage.len();
     e.state.storage.retain(|w| exit.storage.contains(w));
     if e.state.storage.len() != before {

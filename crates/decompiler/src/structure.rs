@@ -324,7 +324,7 @@ struct Printer<'a> {
     given: HashMap<(ExprId, String), usize>,
     stored: Vec<(usize, String, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
-    memory_reads: Vec<Span>,
+    memory_reads: Vec<Vec<(usize, Span)>>,
     // Filled while the printer's &self methods run, hence the cell.
     skipped: RefCell<HashSet<(usize, usize)>>,
 }
@@ -586,50 +586,73 @@ fn memory_word(read: ExprId) -> Option<ExprId> {
 
 type Span = (Option<ExprId>, u64, u64);
 
-fn span(off: ExprId, len: ExprId) -> Option<Span> {
+// A length the code works out leaves the end open.
+fn reach(off: ExprId, len: ExprId) -> Span {
     let (base, d) = expr::split_offset(off);
-    let len = expr::as_const(len).filter(|c| c.fits_u64())?.low_u64();
-    let d = Some(d).filter(|d| d.fits_u64())?.low_u64();
-    Some((base, d, d.saturating_add(len)))
+    let fits = |c: U256| c.fits_u64().then(|| c.low_u64());
+    let from = fits(d).unwrap_or(0);
+    let to = expr::as_const(len).and_then(fits);
+    (base, from, to.map_or(u64::MAX, |n| from.saturating_add(n)))
 }
 
-fn memory_reads(l: &Lifted) -> Vec<Span> {
+fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<Span>) {
     let word = expr::konst_u64(32);
-    let mut out: Vec<Span> = Vec::new();
-    let mut seen: HashSet<ExprId> = HashSet::new();
-    let mut pending: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
-    pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
+    let mut pending = roots;
     while let Some(e) = pending.pop() {
         if !seen.insert(e) {
             continue;
         }
-        out.extend(match expr::node(e) {
-            Node::MLoad(at, _) | Node::CopiedWord(op::MCOPY, at, _) => span(at, word),
-            Node::KeccakMem(off, len, _) => span(off, len),
-            _ => None,
-        });
+        match expr::node(e) {
+            Node::MLoad(at, _) | Node::CopiedWord(op::MCOPY, at, _) => out.push(reach(at, word)),
+            Node::KeccakMem(off, len, _) => out.push(reach(off, len)),
+            _ => {}
+        }
         pending.extend(expr::children(e));
     }
+}
+
+/* For each node, the memory each statement reads by its place, with the statement's index.
+What the end of the node and the edges out of it read has the index past the last. */
+fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span)>> {
+    let mut all = Vec::with_capacity(l.nodes.len());
     for nd in &l.nodes {
-        for st in &nd.stmts {
-            out.extend(match st {
-                Stmt::Call { in_off, in_len, .. } => span(*in_off, *in_len),
-                Stmt::Log { off, len, .. } | Stmt::Create { off, len, .. } => span(*off, *len),
+        let mut reads: Vec<(usize, Span)> = Vec::new();
+        for (i, st) in nd.stmts.iter().enumerate() {
+            let mut found = Vec::new();
+            reads_in(lift::stmt_exprs(st), &mut HashSet::new(), &mut found);
+            found.extend(match st {
+                Stmt::Call { in_off, in_len, .. } => Some(reach(*in_off, *in_len)),
+                Stmt::Log { off, len, .. } | Stmt::Create { off, len, .. } => {
+                    Some(reach(*off, *len))
+                }
                 Stmt::Copy {
                     kind: op::MCOPY,
                     src,
                     len,
                     ..
-                } => span(*src, *len),
+                } => Some(reach(*src, *len)),
                 _ => None,
             });
+            reads.extend(found.into_iter().map(|read| (i, read)));
         }
-        out.extend(match &nd.term {
-            Term::Return { off, len, .. } | Term::Revert { off, len, .. } => span(*off, *len),
+        let mut found = Vec::new();
+        let mut roots = lift::term_exprs(&nd.term);
+        let leaving = l
+            .edge_assigns
+            .iter()
+            .filter(|((from, _), _)| *from == nd.id);
+        roots.extend(leaving.flat_map(|(_, assigns)| assigns.iter().map(|(_, v)| *v)));
+        reads_in(roots, &mut HashSet::new(), &mut found);
+        found.extend(match &nd.term {
+            Term::Return { off, len, .. } | Term::Revert { off, len, .. } => {
+                Some(reach(*off, *len))
+            }
             _ => None,
         });
+        reads.extend(found.into_iter().map(|read| (nd.stmts.len(), read)));
+        all.push(reads);
     }
-    out
+    all
 }
 
 fn loads_of(l: &Lifted) -> HashMap<Overwritten, Vec<(ExprId, u32)>> {
@@ -2668,7 +2691,7 @@ impl<'a> Printer<'a> {
             }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
-            if let Some(out) = self.call_output(s) {
+            if let Some(out) = self.call_output(n, i, s) {
                 self.line(depth, &out);
             }
             if let (Stmt::MStore { off, .. }, Some(val)) =
@@ -2775,9 +2798,11 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /* A call writes what it returns over its output area. Memory read there later by its
-    place would otherwise show only the stores made before the call. */
-    fn call_output(&self, s: &Stmt) -> Option<String> {
+    /* A call writes what it returns over its output area. Memory read there later would
+    otherwise show only the stores made before the call. The read may be a load, a hash, a
+    copy, a log, the data of another call or what the function hands back, and it may reach
+    the area through an address the code works out. */
+    fn call_output(&self, n: usize, i: usize, s: &Stmt) -> Option<String> {
         let Stmt::Call {
             addr,
             out_off,
@@ -2787,11 +2812,46 @@ impl<'a> Printer<'a> {
         else {
             return None;
         };
-        let (base, lo, hi) = span(*out_off, *out_len)?;
-        let read = |(b, from, to): &Span| *b == base && *from < hi && lo < *to;
+        let area = reach(*out_off, *out_len);
         let copy = expr::as_const(*addr) == Some(U256::from_u64(4));
-        let shown = !copy && hi > lo && self.memory_reads.iter().any(read);
-        shown.then(|| emit::fmt_call_output(*out_off, *out_len, self.names))
+        if copy || area.2 <= area.1 {
+            return None;
+        }
+        let after = self.g.reached(self.g.succs[n].iter().copied(), &[]);
+        let here = self.memory_reads[n].iter().filter(|(at, _)| *at > i);
+        let later = after
+            .iter()
+            .flat_map(|node| self.memory_reads[*node].iter());
+        let read = here
+            .chain(later)
+            .any(|(_, read)| self.may_overlap(area, *read));
+        /* Memory outlives a helper, so what its caller reads is not seen here. A caller
+        does not read a block the helper allocated unless it is handed the block. */
+        let handed_back =
+            |node: &usize| matches!(self.l.nodes[*node].term, Term::InternalReturn(_));
+        let blocks = self.names.blocks.as_ref();
+        let own = area.0.is_some() && blocks.is_some_and(|known| known.contains_key(&area.0));
+        let kept =
+            self.names.in_helper && !own && std::iter::once(&n).chain(&after).any(handed_back);
+        (read || kept).then(|| emit::fmt_call_output(*out_off, *out_len, self.names))
+    }
+
+    /* Two blocks the code allocated are apart, and so is a block from a fixed place. An
+    address made any other way is unsigned, so it lies at or above the number added to it. */
+    fn may_overlap(&self, a: Span, b: Span) -> bool {
+        if a.0 == b.0 {
+            return a.1 < b.2 && b.1 < a.2;
+        }
+        let blocks = self.names.blocks.as_ref();
+        let placed = |base: Option<ExprId>| {
+            base.is_none() || blocks.is_some_and(|known| known.contains_key(&base))
+        };
+        match (a.0, b.0) {
+            _ if placed(a.0) && placed(b.0) => false,
+            (None, Some(_)) => a.2 > b.1,
+            (Some(_), None) => b.2 > a.1,
+            _ => true,
+        }
     }
 
     fn transfer(&mut self, from: usize, to: usize, stop: Option<usize>, depth: usize) {

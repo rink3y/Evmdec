@@ -79,6 +79,10 @@ pub struct State {
     /* The account got here by making a call that can be made only once by anyone. On a
     contract in use that call has been made, so nothing found from here is reported. */
     pub raced: bool,
+    /* An honest call left value in the contract and the contract wrote nothing down
+    about it. Nobody has a claim on such value, and a contract that passes value on holds
+    none of it between calls. A gain picked up from here is not taken from anyone. */
+    pub stray: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -347,6 +351,7 @@ impl<'a> Explorer<'a> {
             acted: 0,
             spent: U256::ZERO,
             raced: false,
+            stray: false,
         };
         Explorer {
             c,
@@ -805,13 +810,14 @@ impl<'a> Explorer<'a> {
             entry,
             msg: t.msg.clone(),
         });
-        let (spent, raced) = (parent.spent, parent.raced);
+        let (spent, raced, stray) = (parent.spent, parent.raced, parent.stray);
         self.states.push(State {
             world,
             steps,
             acted: parent.acted + usize::from(actor),
             spent,
             raced,
+            stray,
         });
         self.states.len() - 1
     }
@@ -1217,6 +1223,19 @@ impl<'a> Explorer<'a> {
         false
     }
 
+    fn left_behind(&self, before: &World, after: &World, run: &Run) -> bool {
+        let subject = self.subject;
+        let mut kinds: Vec<Option<Addr>> = vec![None];
+        kinds.extend(after.assets().into_iter().map(Some));
+        let held = |world: &World, kind: Option<Addr>| match kind {
+            Some(asset) => world.asset_of(asset, subject),
+            None => world.ether_of(subject),
+        };
+        let more = kinds.iter().any(|k| held(after, *k) > held(before, *k));
+        let recorded = run.changes().iter().any(|(c, ..)| c.account == subject);
+        more && !recorded
+    }
+
     fn used_by(&mut self, who: Addr, depth: usize) {
         let mut frontier: Vec<usize> = (0..self.states.len()).collect();
         for _ in 0..depth {
@@ -1236,7 +1255,10 @@ impl<'a> Explorer<'a> {
                         // even where it runs the same code.
                         let other_way = who == OWNER && kept && run.stores().next().is_some();
                         if run.ok && (self.novel(&run, &world) || other_way) {
-                            next.push(self.keep(from, entry, &t, world, false));
+                            let stray = self.left_behind(&self.states[from].world, &world, &run);
+                            let at = self.keep(from, entry, &t, world, false);
+                            self.states[at].stray |= stray;
+                            next.push(at);
                             if who != OWNER {
                                 break;
                             }
@@ -1427,6 +1449,7 @@ impl<'a> Explorer<'a> {
             acted: 0,
             spent: U256::ZERO,
             raced: false,
+            stray: false,
         });
         let at = self.states.len() - 1;
         let mut spent = false;
@@ -1475,6 +1498,7 @@ impl<'a> Explorer<'a> {
             acted: 0,
             spent: U256::ZERO,
             raced: false,
+            stray: false,
         });
         let at = self.states.len() - 1;
         let mut lost = false;
@@ -1631,6 +1655,7 @@ impl<'a> Explorer<'a> {
                 acted: 0,
                 spent: U256::ZERO,
                 raced: false,
+                stray: false,
             });
             let at = self.states.len() - 1;
             for entry in 0..self.entries.len() {
@@ -1745,11 +1770,14 @@ impl<'a> Explorer<'a> {
                             plain.retain(|b| {
                                 b.kind != Kind::Debit || self.withheld(&before, &world, b)
                             });
+                            let stray = self.states[from].stray;
+                            let shown = plain.iter().filter(|b| b.kind != Kind::Gain || !stray);
+                            let shown: Vec<Breach> = shown.cloned().collect();
                             let steps = self.history(from, entry, &t.msg);
-                            self.report(plain.clone(), entry, &steps, &run, (false, false));
+                            self.report(shown, entry, &steps, &run, (false, false));
                             self.takes_from_owner(from, entry, &t, &run);
                         }
-                        if handed && open {
+                        if handed && open && !self.states[from].stray {
                             self.reenter(from, entry, &t, &plain);
                         }
                         if run.ok

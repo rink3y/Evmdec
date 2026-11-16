@@ -179,3 +179,11 @@ fn words_an_amount_paid_is_worked_out_from_are_all_amounts() {
     assert_eq!(kinds, vec![Kind::Gain], "{:?}", report.findings);
     assert_eq!(report.findings[0].selector.as_deref(), Some("0x6eda12f8"));
 }
+
+#[test]
+fn what_a_call_shows_without_nesting_is_not_found_again_by_nesting_it() {
+    // approveAndCall(address,uint256) records an allowance the caller gives its own contract
+    // and calls that contract. The record buys nothing, called once or from within itself.
+    let report = report("Allow.hex");
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+}

@@ -2083,13 +2083,16 @@ impl<'a> Explorer<'a> {
                             seeds.extend(more);
                         }
                         let handed = run.calls.iter().any(|c| c.by == Answered::Taken);
-                        let mut plain = Vec::new();
+                        // What the call shows by itself, whether or not it was worth reporting.
+                        let mut alone = Vec::new();
                         let race = run.ok && self.once_for_all(&world, entry, &t, &run);
                         let open = !race && !self.states[from].raced;
                         if run.ok && open {
                             let base = self.states[0].world.clone();
                             let spent = self.states[from].spent;
-                            plain = laws::check(&base, &before, &world, &run, &self.facts, spent);
+                            let mut plain =
+                                laws::check(&base, &before, &world, &run, &self.facts, spent);
+                            alone.clone_from(&plain);
                             plain.retain(|b| {
                                 b.kind != Kind::Credit || self.spendable(&before, &world, b, entry)
                             });
@@ -2106,7 +2109,7 @@ impl<'a> Explorer<'a> {
                             self.takes_from_owner(from, entry, &t, &run);
                         }
                         if handed && open && !self.states[from].stray {
-                            self.reenter(from, entry, &t, &plain);
+                            self.reenter(from, entry, &t, &alone);
                         }
                         if run.ok
                             && self.novel(&run, &world)

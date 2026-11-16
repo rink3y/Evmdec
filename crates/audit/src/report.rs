@@ -553,7 +553,7 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
             );
             (title, cause, shown, pc)
         }
-        Kind::Reading => {
+        Kind::PayoutOnReading => {
             let asset = v.breach.asset;
             let cell = v.breach.cell.as_ref();
             let store = run
@@ -567,7 +567,7 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
                 (None, _, Some(paid)) => (paid.5, None),
                 _ => (Tag::NONE, None),
             };
-            let (was, now) = (short(v.breach.was), short(v.breach.amount));
+            let (was, now) = (short(v.breach.paid_before), short(v.breach.amount));
             let shown = match cell {
                 Some(cell) => format!(
                     "The same call raised the account's entry in {} by {was} before its step elsewhere and by {now} after it.",
@@ -673,8 +673,8 @@ fn finding(ex: &Explorer, v: &Violation) -> Finding {
         Kind::Gain | Kind::Loss | Kind::Takeover | Kind::ForeignCode | Kind::Destroyed => {
             Severity::Critical
         }
-        Kind::Reading if v.breach.cell.is_none() => Severity::Critical,
-        Kind::Credit | Kind::Debit | Kind::Reading => Severity::High,
+        Kind::PayoutOnReading if v.breach.cell.is_none() => Severity::Critical,
+        Kind::Credit | Kind::Debit | Kind::PayoutOnReading => Severity::High,
     };
     Finding {
         kind: v.breach.kind,
@@ -692,7 +692,7 @@ fn finding(ex: &Explorer, v: &Violation) -> Finding {
             .enumerate()
             .map(|(i, s)| match i < set_up {
                 true => format!("taken to have been done at set-up: {}", step_text(ex, s)),
-                false => step_on(ex, s, v.breach.kind == Kind::Reading),
+                false => step_on(ex, s, v.breach.kind == Kind::PayoutOnReading),
             })
             .collect(),
         rests_on,

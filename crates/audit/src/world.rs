@@ -170,10 +170,9 @@ pub struct World {
     contracts say yes with a zero, so a finding is tried again with this set and the
     answer a one. */
     pub contrary: bool,
-    // The readings the contract under test takes of other accounts are kept with the run.
     pub noting: bool,
-    /* Readings taken in an earlier run, given again in the order they were taken. This
-    shows what a call does on today's state with yesterday's readings. */
+    /* Given again in the order they were taken. A call that reads a holding before and
+    after it moves something has to get both answers back, not the first one twice. */
     heard: Rc<Vec<Reading>>,
     given: Vec<bool>,
     made: u64,
@@ -405,7 +404,7 @@ impl World {
         self.heard = Rc::new(read);
     }
 
-    // The same question asked again once the answers have run out gets the last one.
+    // A run that asks more often than the first did would otherwise read the new state halfway.
     fn as_before(&mut self, of: Addr, asked: &[u8]) -> Option<Vec<u8>> {
         let same = |r: &Reading| r.of == of && r.asked == asked;
         let fresh = (0..self.heard.len()).find(|i| !self.given[*i] && same(&self.heard[*i]));
@@ -804,8 +803,7 @@ impl World {
                 op::BALANCE => {
                     let who = low_address(m.stack[n - 1]);
                     let outside = f.account == self.subject && who != self.subject;
-                    let before = Some(who).filter(|_| outside);
-                    let before = before.and_then(|who| self.as_before(who, &[]));
+                    let before = outside.then(|| self.as_before(who, &[])).flatten();
                     let held = before.map_or_else(|| self.ether_of(who), |b| word(&b, 0));
                     if outside && self.noting {
                         tx.run.read.push(Reading {
@@ -1283,7 +1281,6 @@ impl World {
         (ok, output, tags, id)
     }
 
-    // Whether the call is one the contract under test makes to another account.
     fn asks_outside(&self, record: &CallRecord, to: Addr, f: &Frame) -> bool {
         let own = matches!(record.kind, op::DELEGATECALL | op::CALLCODE);
         f.account == self.subject && to != self.subject && !own && !built_in(to)
@@ -1571,7 +1568,7 @@ impl World {
         found
     }
 
-    // An account this world gave nothing to holds what the asset itself says it holds.
+    // The books kept here cover only the accounts this world gave a purse to.
     #[must_use]
     pub fn holding(&self, asset: Addr, who: Addr) -> U256 {
         let mut data = SEL_BALANCE_OF.to_be_bytes().to_vec();

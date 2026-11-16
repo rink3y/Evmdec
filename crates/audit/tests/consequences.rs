@@ -290,7 +290,7 @@ fn a_payout_sized_by_what_a_pool_holds_is_found_with_the_send_and_the_call_that_
     let [paid] = &report.findings[..] else {
         panic!("{:?}", report.findings);
     };
-    assert_eq!(paid.kind, Kind::Reading);
+    assert_eq!(paid.kind, Kind::PayoutOnReading);
     assert_eq!(paid.selector.as_deref(), Some("0xa6f2ae3a"));
     let [sent, counted, bought] = &paid.steps[..] else {
         panic!("{:?}", paid.steps);

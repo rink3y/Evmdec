@@ -2427,9 +2427,6 @@ impl<'a> Explorer<'a> {
 
     fn readings(&mut self) {
         let mut paid = std::mem::take(&mut self.paid);
-        if self.trace {
-            eprintln!("readings: {} calls, work left {}", paid.len(), budget::left());
-        }
         // The same call is reported once, from the state fewest steps lead to.
         paid.sort_by_key(|(from, ..)| self.states[*from].steps.len());
         for (from, entry, t) in paid {
@@ -2440,26 +2437,21 @@ impl<'a> Explorer<'a> {
         }
     }
 
-    /* What the contract pays for a call may be sized by what it reads of other
-    accounts at that moment. The account changes such a reading with a step of its own
-    elsewhere and makes the same call again. A larger payout is then tried once more
-    with every reading put back to what it was. If it is still larger, something else
-    the step changed sized it, and nothing is shown. */
+    /* A larger payout after the step is tried once more with every reading put back to
+    what it was. If it is still larger, something else the step changed sized it, and
+    nothing is shown. */
     fn sway(&mut self, from: usize, entry: usize, t: &Try) {
         let mut start = self.states[from].world.clone();
         start.noting = true;
         let (_, first) = self.attempt_in(start.clone(), entry, t);
-        if self.trace {
-            let name = &self.entries[entry].name;
-            let (ok, read) = (first.ok, first.read.len());
-            eprintln!("sway {name} from state {from}: ok={ok} readings={read}");
-        }
         if !first.ok || first.read.is_empty() {
             return;
         }
         let steps = self.steps_elsewhere(&start, &first);
         if self.trace {
-            eprintln!("  {} steps elsewhere", steps.len());
+            let name = &self.entries[entry].name;
+            let (read, steps) = (first.read.len(), steps.len());
+            eprintln!("sway {name} from state {from}: {read} readings, {steps} steps elsewhere");
         }
         for (world, made, on) in steps {
             if budget::spent() {
@@ -2467,9 +2459,6 @@ impl<'a> Explorer<'a> {
             }
             let (after, second) = self.attempt_in(world.clone(), entry, t);
             let found = laws::swayed(&first, &second, &after, &on);
-            if self.trace {
-                eprintln!("  after {made:?}: ok={} found={}", second.ok, found.len());
-            }
             if found.is_empty() {
                 continue;
             }
@@ -2502,10 +2491,35 @@ impl<'a> Explorer<'a> {
         }
     }
 
-    /* The steps the account can take on other accounts that change what `first` read:
-    sending an asset it holds to an account whose holding was read, calling another
-    contract that then writes a cell that was read, or the one after the other. A step
-    that pays the account is a trade of its own and is left out. */
+    /* What a step elsewhere must not do. One that pays the account is a trade of its
+    own. One that leaves more in the contract's hands gave it what it then pays out. One
+    that costs the account is a payment or a gift, and what the contract pays after it
+    may be what was bought or given. A plain send costs too and is let through, since
+    where that went is known. */
+    fn idle(&self, before: &World, after: &World, run: &Run, send: bool) -> bool {
+        let subject = self.subject;
+        let mut kinds: Vec<Option<Addr>> = vec![None];
+        kinds.extend(after.assets().into_iter().map(Some));
+        let held = |world: &World, kind: Option<Addr>, who: Addr| match kind {
+            Some(asset) => world.asset_of(asset, who),
+            None => world.ether_of(who),
+        };
+        let own = |world: &World, kind: Option<Addr>| {
+            held(world, kind, ACTOR).wrapping_add(held(world, kind, ALLY))
+        };
+        let fed = |k: &Option<Addr>| held(after, *k, subject) > held(before, *k, subject);
+        let paid = kinds
+            .iter()
+            .any(|k| own(after, *k) > own(before, *k) || fed(k));
+        let cost = kinds.iter().any(|k| own(after, *k) < own(before, *k));
+        let keyed = |cell: &crate::trace::Cell| cell.keyed_by(ACTOR) || cell.keyed_by(ALLY);
+        let changes = run.changes();
+        let rose = |c: &(&crate::trace::Cell, U256, U256, Tag, usize)| keyed(c.0) && c.2 > c.1;
+        let fell = |c: &(&crate::trace::Cell, U256, U256, Tag, usize)| keyed(c.0) && c.2 < c.1;
+        let spent = cost || changes.iter().any(fell);
+        !paid && !changes.iter().any(rose) && (send || !spent)
+    }
+
     fn steps_elsewhere(
         &mut self,
         start: &World,
@@ -2517,38 +2531,6 @@ impl<'a> Explorer<'a> {
             .filter(|(cell, _)| cell.account != subject)
             .map(|(cell, _)| (cell.account, cell.slot))
             .collect();
-        let pays = |before: &World, after: &World, run: &Run| {
-            let mut kinds: Vec<Option<Addr>> = vec![None];
-            kinds.extend(after.assets().into_iter().map(Some));
-            let held = |world: &World, kind: Option<Addr>| {
-                let of = |who: Addr| match kind {
-                    Some(asset) => world.asset_of(asset, who),
-                    None => world.ether_of(who),
-                };
-                of(ACTOR).wrapping_add(of(ALLY))
-            };
-            let more = kinds.iter().any(|k| held(after, *k) > held(before, *k));
-            let credited = run.changes().iter().any(|(cell, old, new, _, _)| {
-                (cell.keyed_by(ACTOR) || cell.keyed_by(ALLY)) && new > old
-            });
-            more || credited
-        };
-        /* A call elsewhere that costs the account is a payment or a gift, and what the
-        contract pays after it may be what was bought or given. Only a plain send is
-        let through, since where that went is known. */
-        let costs = |before: &World, after: &World, run: &Run| {
-            let mut kinds: Vec<Option<Addr>> = vec![None];
-            kinds.extend(after.assets().into_iter().map(Some));
-            let held = |world: &World, kind: Option<Addr>| match kind {
-                Some(asset) => world.asset_of(asset, ACTOR),
-                None => world.ether_of(ACTOR),
-            };
-            let less = kinds.iter().any(|k| held(after, *k) < held(before, *k));
-            let lowered = run.changes().iter().any(|(cell, old, new, _, _)| {
-                (cell.keyed_by(ACTOR) || cell.keyed_by(ALLY)) && new < old
-            });
-            less || lowered
-        };
         let mut out = Vec::new();
         let mut bases: Vec<(World, Vec<Step>, Option<Addr>)> =
             vec![(start.clone(), Vec::new(), None)];
@@ -2562,7 +2544,7 @@ impl<'a> Explorer<'a> {
                 }),
                 None => world.ether_of(to) > start.ether_of(to),
             };
-            if !run.ok || !arrived || pays(start, &world, &run) {
+            if !run.ok || !arrived || !self.idle(start, &world, &run, true) {
                 continue;
             }
             let step = vec![Step::Sent { asset, to, amount }];
@@ -2584,8 +2566,7 @@ impl<'a> Explorer<'a> {
                         .changes()
                         .iter()
                         .any(|(cell, ..)| read.contains(&(cell.account, cell.slot)));
-                    let trade = pays(&base, &world, &run) || costs(&base, &world, &run);
-                    if !run.ok || !moved || trade {
+                    if !run.ok || !moved || !self.idle(&base, &world, &run, false) {
                         continue;
                     }
                     let mut steps = made.clone();
@@ -2602,10 +2583,8 @@ impl<'a> Explorer<'a> {
         out
     }
 
-    /* Where the account can send something that changes a reading: an account whose
-    holding of an asset the call read, a contract whose own cells it read, and an account
-    whose ether it read. As much again as is held there is sent, which moves the reading
-    far without needing more than anyone has. */
+    /* As much again as is held there is sent. That moves the reading far and needs no
+    more than a holder there already has. */
     fn holdings_read(&self, start: &World, first: &Run) -> Vec<(Option<Addr>, Addr, U256)> {
         let subject = self.subject;
         let assets = start.assets();

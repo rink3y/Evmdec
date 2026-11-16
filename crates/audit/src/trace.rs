@@ -26,8 +26,9 @@ pub const DATA_WORDS: usize = 64;
 
 /* Where a word came from. `words` says which words of the call data, `cell` which
 storage cell of the run's table, `call` which call out, each counted from one. `answer`
-is the call to another account that handed the word back, whatever that account's code
-made it from. */
+is kept apart from `call`. A word another account's code hands back keeps the tags that
+code gave it, and the older checks take a word with `call` set for an answer nobody ran
+code for. */
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Tag {
     pub bits: u16,
@@ -140,7 +141,6 @@ impl Tag {
         (self.answer != 0 && self.answer != MANY).then(|| self.answer as usize - 1)
     }
 
-    // Sized by something outside the contract: what another account said or what one holds.
     #[must_use]
     pub fn read_outside(self) -> bool {
         self.has(OUT | BAL) || self.answer != 0
@@ -301,12 +301,11 @@ pub struct Run {
     pub spent_by_holder: Vec<usize>,
     // Cells written while another contract the call reached was calling back in, and by whom.
     pub called_back: Vec<(usize, U256)>,
-    // What the contract under test read of other accounts, kept only where the world is told to.
+    // Empty unless the world is noting. Every run would carry a copy of each answer otherwise.
     pub read: Vec<Read>,
 }
 
-/* One reading the contract under test took of another account: what it asked and what
-came back. A question with no bytes is the account's ether balance. */
+// An ether balance is kept as a question with no bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Read {
     pub of: U256,

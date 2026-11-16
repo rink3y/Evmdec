@@ -190,7 +190,10 @@ fn prologue(insns: &[Instruction], p: &mut Fingerprints) {
             .any(|x| (op::DUP1..=op::DUP16).contains(&x.opcode));
         if pushes.len() == 2 && pushes.contains(&0x40) && ms <= 4 {
             p.solc_prologue = true;
-            p.via_ir = dups;
+            // The IR pipeline jumps when the call data is long enough for a selector.
+            // The older one jumps when it is too short.
+            let test: Vec<u8> = insns[ms + 1..].iter().take(4).map(|x| x.opcode).collect();
+            p.via_ir = dups || test.ends_with(&[op::CALLDATASIZE, op::LT, op::ISZERO]);
             p.free_pointer = pushes.iter().copied().find(|v| *v != 0x40);
         }
     }

@@ -1165,3 +1165,9 @@ fn a_read_made_before_a_write_is_not_printed_as_one_made_after() {
     assert_eq!(undeclared_old_values(&ramp), Vec::<String>::new());
     assert_eq!(undeclared_old_values(&router), Vec::<String>::new());
 }
+
+#[test]
+fn the_ir_pipeline_is_told_by_its_call_data_test() {
+    assert!(regress("via_ir_router.hex").compiler.via_ir);
+    assert!(!regress("layerzero_dvn.hex").compiler.via_ir);
+}

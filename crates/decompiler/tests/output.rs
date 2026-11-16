@@ -329,3 +329,15 @@ fn a_message_padded_with_zeros_from_past_the_call_data_is_printed_as_its_text() 
     let read = text("60203660803760a05160005500");
     assert!(read.contains("stor_0 = 0;"), "{read}");
 }
+
+#[test]
+fn a_literal_copied_from_the_code_is_printed_as_its_text() {
+    let out = text(
+        "6028600e6080396000356080a00045524332303a207472616e7366657220616d6f756e742065786365\
+         65647320616c6c6f77616e6365",
+    );
+    assert!(
+        out.contains("mem[0x80:+40] = \"ERC20: transfer amount exceeds allowance\";"),
+        "{out}"
+    );
+}

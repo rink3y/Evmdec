@@ -105,6 +105,7 @@ pub enum PayloadKind {
 #[derive(Clone, Debug, Default)]
 pub struct Names {
     pub callee_reads: Option<std::sync::Arc<HashMap<usize, crate::lift::MemoryReads>>>,
+    pub code: std::sync::Arc<Vec<u8>>,
     pub params: HashMap<u32, String>,
     pub in_helper: bool,
     pub aliases: HashMap<ExprId, String>,
@@ -2406,6 +2407,16 @@ pub fn decode_plain_string(words: &[ExprId]) -> Option<String> {
     Some(escape(&String::from_utf8_lossy(&bytes)))
 }
 
+// The bytes of a literal the code keeps in itself say more than where it keeps them.
+fn code_text(kind: u8, src: ExprId, len: ExprId, n: &Names) -> Option<String> {
+    let at = expr::as_const(src)?.as_usize()?;
+    let len = expr::as_const(len)?.as_usize()?;
+    let bytes = n.code.get(at..at.checked_add(len)?)?;
+    let text = |b: &u8| *b >= 0x20 && *b < 0x7f || *b == b'\n' || *b == b'\t';
+    (kind == op::CODECOPY && len >= 4 && bytes.iter().all(text))
+        .then(|| escape(&String::from_utf8_lossy(bytes)))
+}
+
 pub fn escape(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -2831,6 +2842,12 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 ),
                 None if *kind == op::MCOPY => {
                     format!("mem[{}:+{}]", fmt_mem_at(*src, n), fmt_expr(*len, n))
+                }
+                None if code_text(*kind, *src, *len, n).is_some() => {
+                    format!(
+                        "\"{}\"",
+                        code_text(*kind, *src, *len, n).unwrap_or_default()
+                    )
                 }
                 None => format!(
                     "{}[{}:+{}]",

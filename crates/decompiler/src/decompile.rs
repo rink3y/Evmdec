@@ -1173,7 +1173,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         })
         .map(|f| f.pc)
         .collect();
-    let callees = Callees::of(&functions, profile.kind);
+    let mut callees = Callees::of(&functions, profile.kind);
+    callees.code = std::sync::Arc::new(code.to_vec());
     let array_resizers: HashSet<usize> = functions
         .iter()
         .filter(|f| f.kind == FnKind::Internal && f.lifted.as_ref().is_some_and(is_array_resizer))
@@ -1901,6 +1902,7 @@ pub struct Callees {
     pub names: HashMap<usize, String>,
     pub free_pointer: bool,
     pub reads: std::sync::Arc<HashMap<usize, lift::MemoryReads>>,
+    pub code: std::sync::Arc<Vec<u8>>,
 }
 
 fn callee_reads(
@@ -1945,6 +1947,7 @@ impl Callees {
                 .collect(),
             free_pointer: compiler == compiler::Kind::Solc,
             reads: std::sync::Arc::new(callee_reads(functions, compiler == compiler::Kind::Vyper)),
+            code: std::sync::Arc::default(),
         }
     }
 }
@@ -1960,6 +1963,7 @@ pub fn make_names(
         layout,
         callee_names: callees.names.clone(),
         callee_reads: Some(callees.reads.clone()),
+        code: callees.code.clone(),
         blocks: f
             .lifted
             .as_ref()

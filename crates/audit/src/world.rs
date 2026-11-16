@@ -1094,6 +1094,27 @@ impl World {
             }
             op::ADD | op::SUB | op::MUL => {
                 let (a, b) = (val(0), val(1));
+                /* Newer compilers test whether the caller is some account by taking the
+                difference of the two and branching on it. Nobody subtracts from the
+                caller's address for any other reason, so the difference is the test. */
+                let (ta, tb) = (tag(sh, 0), tag(sh, 1));
+                let about_caller = (ta.only(CALLER) && !tb.is_none() && !tb.has(MATH))
+                    || (tb.only(CALLER) && !ta.is_none() && !ta.has(MATH));
+                if o == op::SUB && about_caller && tx.cmps < MAX_CMPS {
+                    tx.cmps += 1;
+                    let op = op::EQ;
+                    Self::event(
+                        tx,
+                        Event::Cmp {
+                            pc,
+                            op,
+                            a,
+                            b,
+                            ta,
+                            tb,
+                        },
+                    );
+                }
                 let wraps = match o {
                     op::ADD => a.overflowing_add(b).1,
                     op::SUB => a.overflowing_sub(b).1,
@@ -1891,6 +1912,14 @@ mod tests {
         let (_, run) = run("600560043503600a57005b00", data, ACTOR);
         let bare = |e: &Event| matches!(e, Event::Cmp { op: op::ISZERO, a, ta, .. } if *a == U256::from_u64(2) && ta.word() == Some(0));
         assert!(run.events.iter().any(bare), "{:?}", run.events);
+    }
+
+    #[test]
+    fn the_caller_less_a_stored_account_is_a_comparison_of_the_two() {
+        // if (sload(0) - caller) jump
+        let (_, run) = run("3360005403600957005b00", Vec::new(), ACTOR);
+        let seen = |e: &Event| matches!(e, Event::Cmp { op: op::EQ, ta, tb, .. } if tb.only(FROM_CALLER) && ta.has(STORE));
+        assert!(run.events.iter().any(seen), "{:?}", run.events);
     }
 
     #[test]

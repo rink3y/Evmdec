@@ -133,3 +133,12 @@ fn interest_paid_at_the_rate_the_chain_holds_is_not_a_gain() {
     assert!(ended.contains(&"an account with no role"), "{ended:?}");
     assert!(report.findings.is_empty(), "{:?}", report.findings);
 }
+
+#[test]
+fn a_byte_string_is_grown_to_the_record_the_code_reads_in_it() {
+    // claim(uint256,bytes). The byte string has to hold one word, a time not yet passed.
+    let report = report("Relay.hex");
+    let kinds: Vec<Kind> = report.findings.iter().map(|f| f.kind).collect();
+    assert_eq!(kinds, vec![Kind::Gain], "{:?}", report.findings);
+    assert_eq!(report.findings[0].selector.as_deref(), Some("0x38926b6d"));
+}

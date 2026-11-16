@@ -4,6 +4,7 @@ pub mod explore;
 pub mod laws;
 pub mod model;
 pub mod report;
+pub mod shape;
 pub mod source;
 pub mod trace;
 pub mod world;

@@ -1,11 +1,12 @@
 use crate::budget;
 use crate::laws::{self, Breach, Kind};
 use crate::model::Facts;
+use crate::shape::{Holds, Node, Role, Shape, Spot};
 use crate::trace::{
-    Answered, Event, Place, Run, Tag, CALLER, CLOCK, DATA, MATH, OUT, SIZE, STORE, VALUE,
+    Answered, Event, Place, Run, Tag, CALLER, CLOCK, DATA, DATA_WORDS, MATH, OUT, SIZE, STORE,
+    VALUE,
 };
 use crate::world::{self, Addr, Msg, Source, World, ACTOR, ALLY, OWNER, SUBJECT, USER};
-use evmdec::abi;
 use evmdec::decompile::Contract;
 use evmdec::function::{FnKind, Mutability};
 use evmdec::opcode as op;
@@ -26,28 +27,12 @@ const ACTOR_DEPTH: usize = 3;
 const UNUSED_SELECTOR: u32 = 0xfeed_c0de;
 const TEN_YEARS: u64 = 315_360_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Word {
-    Address,
-    Flag,
-    Small,
-    Amount,
-    // Points at where a list or a byte string starts. Never changed.
-    Offset,
-    // How many items a list holds.
-    Count,
-    Other,
-}
-
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub function: usize,
     pub selector: Option<u32>,
     pub name: String,
-    template: Vec<u8>,
-    words: Vec<Word>,
-    // The same call with two elements in each list, and what each of its words holds.
-    pair: Option<(Vec<u8>, Vec<Word>)>,
+    shape: Shape,
     pub view: bool,
     pub payable: bool,
 }
@@ -104,17 +89,43 @@ type TryKey = (Vec<u8>, U256, Option<U256>, Vec<Told>);
 #[derive(Clone, Debug)]
 struct Try {
     msg: Msg,
+    shape: Shape,
     answers: Vec<(Addr, u32, Vec<u8>)>,
     time: Option<U256>,
 }
 
 impl Try {
-    fn of(msg: Msg) -> Try {
+    fn of(from: Addr, to: Addr, shape: Shape, value: U256) -> Try {
+        let msg = Msg {
+            from,
+            to,
+            data: shape.encode(),
+            value,
+            hook: None,
+        };
         Try {
+            msg,
+            shape,
+            answers: Vec::new(),
+            time: None,
+        }
+    }
+
+    fn sent(msg: Msg) -> Try {
+        Try {
+            shape: Shape::raw(&msg.data),
             msg,
             answers: Vec::new(),
             time: None,
         }
+    }
+
+    fn reshaped(&self, change: &dyn Fn(&mut Shape) -> bool) -> Option<Try> {
+        let mut next = self.clone();
+        change(&mut next.shape).then(|| {
+            next.msg.data = next.shape.encode();
+            next
+        })
     }
 }
 
@@ -156,24 +167,6 @@ fn outside(n: usize) -> Addr {
     world::account(0xa5, n as u64 + 1)
 }
 
-fn kind_of(ty: &str) -> Word {
-    let bits = |t: &str| {
-        t.trim_start_matches("uint")
-            .trim_start_matches("int")
-            .parse::<u32>()
-    };
-    match ty {
-        t if t.contains(['[', '(']) || t == "bytes" || t == "string" => Word::Other,
-        t if t.starts_with("address") => Word::Address,
-        "bool" => Word::Flag,
-        t if t.starts_with("uint") || t.starts_with("int") => match bits(t) {
-            Ok(n) if n < 64 => Word::Small,
-            _ => Word::Amount,
-        },
-        _ => Word::Amount,
-    }
-}
-
 fn entries(c: &Contract) -> Vec<Entry> {
     let reached =
         |kind: FnKind| matches!(kind, FnKind::External | FnKind::Fallback | FnKind::Receive);
@@ -183,58 +176,16 @@ fn entries(c: &Contract) -> Vec<Entry> {
         let hex = f.selector.as_deref().map(|s| s.trim_start_matches("0x"));
         let selector = hex.and_then(|s| u32::from_str_radix(s, 16).ok());
         let types: Vec<String> = f.params.iter().map(|p| p.ty.clone()).collect();
-        let shaped = |elements: usize| {
-            let layout = abi::layout_with(selector, &types, elements);
-            let template = match f.kind {
-                FnKind::Receive => Vec::new(),
-                FnKind::Fallback => UNUSED_SELECTOR.to_be_bytes().to_vec(),
-                _ => layout.calldata,
-            };
-            let count = template.len().saturating_sub(4) / 32;
-            let mut words = vec![Word::Other; count];
-            // Heads sit one word apart only until the first parameter that takes several.
-            let plain = |ty: &str| !ty.contains('(') && !(ty.contains('[') && !ty.ends_with("[]"));
-            for fixed in layout.fixed.iter().filter(|i| **i < count) {
-                words[*fixed] = Word::Offset;
-            }
-            for (i, ty) in types
-                .iter()
-                .take_while(|t| plain(t))
-                .enumerate()
-                .take(count)
-            {
-                if !layout.fixed.contains(&i) {
-                    words[i] = kind_of(ty);
-                    continue;
-                }
-                words[i] = Word::Offset;
-                // A list of one-word items sits where its head points: a length, then the items.
-                let item = ty
-                    .strip_suffix("[]")
-                    .filter(|item| kind_of(item) != Word::Other);
-                let at = U256::from_be_bytes(&template[4 + 32 * i..36 + 32 * i]).as_usize();
-                if let (Some(item), Some(at)) = (item, at.map(|at| at / 32)) {
-                    if let Some(word) = words.get_mut(at) {
-                        *word = Word::Count;
-                    }
-                    for k in 1..=elements {
-                        if let Some(word) = words.get_mut(at + k) {
-                            *word = kind_of(item);
-                        }
-                    }
-                }
-            }
-            (template, words)
+        let shape = match f.kind {
+            FnKind::Receive => Shape::default(),
+            FnKind::Fallback => Shape::raw(&UNUSED_SELECTOR.to_be_bytes()),
+            _ => Shape::of(selector, &types),
         };
-        let (template, words) = shaped(1);
-        let lists = types.iter().any(|t| t.ends_with("[]"));
         out.push(Entry {
             function,
             selector,
             name: f.name.clone(),
-            template,
-            words,
-            pair: lists.then(|| shaped(2)),
+            shape,
             view: matches!(f.mutability, Mutability::Pure | Mutability::View),
             payable: f.mutability == Mutability::Payable,
         });
@@ -298,14 +249,6 @@ fn obstacle(run: &Run) -> String {
         (_, false) => format!("a test on {} failed", on.join(" and ")),
         _ => format!("stopped with no test in sight ({:?})", run.halt),
     }
-}
-
-fn set_word(data: &mut Vec<u8>, index: usize, value: U256) {
-    let at = 4 + 32 * index;
-    if data.len() < at + 32 {
-        data.resize(at + 32, 0);
-    }
-    data[at..at + 32].copy_from_slice(&value.to_be_bytes());
 }
 
 fn better(new: &Run, old: &Run) -> bool {
@@ -409,45 +352,26 @@ impl<'a> Explorer<'a> {
         }
     }
 
-    fn seed(&self, entry: usize, who: Addr, address: Addr, amount: U256, value: U256) -> Msg {
-        let e = &self.entries[entry];
-        self.fill(entry, &e.template, &e.words, who, address, amount, value)
+    fn seed(&self, entry: usize, who: Addr, address: Addr, amount: U256, value: U256) -> Try {
+        self.fill(&self.entries[entry].shape, who, address, amount, value)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn fill(
-        &self,
-        entry: usize,
-        template: &[u8],
-        words: &[Word],
-        who: Addr,
-        address: Addr,
-        amount: U256,
-        value: U256,
-    ) -> Msg {
-        let mut data = template.to_vec();
-        let targets = &self.facts.entries[entry].target_words;
-        for (i, word) in words.iter().enumerate() {
-            let fill = match word {
-                Word::Address if targets.contains(&i) => outside(0),
-                Word::Address => address,
-                Word::Flag => U256::ONE,
-                Word::Small => U256::ZERO,
-                Word::Amount => amount,
-                Word::Offset | Word::Count | Word::Other => continue,
+    fn fill(&self, shape: &Shape, who: Addr, address: Addr, amount: U256, value: U256) -> Try {
+        let mut shape = shape.clone();
+        shape.each_word(&mut |kind, held| {
+            *held = match kind {
+                Holds::Callee => outside(0),
+                Holds::Address => address,
+                Holds::Flag => U256::ONE,
+                Holds::Small => U256::ZERO,
+                Holds::Amount => amount,
+                Holds::Other => return,
             };
-            set_word(&mut data, i, fill);
-        }
-        Msg {
-            from: who,
-            to: self.subject,
-            data,
-            value,
-            hook: None,
-        }
+        });
+        Try::of(who, self.subject, shape, value)
     }
 
-    fn honest(&self, entry: usize, who: Addr) -> Vec<Msg> {
+    fn honest(&self, entry: usize, who: Addr) -> Vec<Try> {
         let plain = self.seed(entry, who, who, UNIT, U256::ZERO);
         // A function that takes ether is first used the way it is meant to be, with some.
         let mut seeds = match self.entries[entry].payable {
@@ -457,7 +381,11 @@ impl<'a> Explorer<'a> {
         // What an owner registers under an address is as often a contract as itself. On the
         // chain what it registered is there to be read, and a made-up contract in its place
         // undoes the set-up the run is meant to start from.
-        if who == OWNER && !self.on_chain && self.entries[entry].words.contains(&Word::Address) {
+        let kinds = self.entries[entry].shape.kinds();
+        let named = kinds
+            .iter()
+            .any(|k| matches!(k, Holds::Address | Holds::Callee));
+        if who == OWNER && !self.on_chain && named {
             seeds.push(self.seed(entry, who, outside(0), UNIT, U256::ZERO));
         }
         seeds.extend(self.bare_payment(entry, who));
@@ -467,20 +395,14 @@ impl<'a> Explorer<'a> {
 
     /* Old code has one function for a call it does not know and for ether sent with no
     message at all. The second is how most ether reaches a contract. */
-    fn bare_payment(&self, entry: usize, who: Addr) -> Option<Msg> {
+    fn bare_payment(&self, entry: usize, who: Addr) -> Option<Try> {
         let e = &self.entries[entry];
-        let catch_all = e.selector.is_none() && !e.template.is_empty();
-        catch_all.then(|| Msg {
-            from: who,
-            to: self.subject,
-            data: Vec::new(),
-            value: UNIT,
-            hook: None,
-        })
+        let catch_all = e.selector.is_none() && e.shape != Shape::default();
+        catch_all.then(|| Try::of(who, self.subject, Shape::default(), UNIT))
     }
 
     // What an account with no role tries: itself everywhere, then another account in each place.
-    fn hostile(&self, entry: usize) -> Vec<Msg> {
+    fn hostile(&self, entry: usize) -> Vec<Try> {
         let e = &self.entries[entry];
         let mut seeds = vec![self.seed(entry, ACTOR, ACTOR, UNIT, U256::ZERO)];
         if e.payable {
@@ -488,28 +410,28 @@ impl<'a> Explorer<'a> {
         }
         seeds.extend(self.bare_payment(entry, ACTOR));
         seeds.extend(self.naming_contracts(entry, ACTOR));
-        let addresses: Vec<usize> = (0..e.words.len())
-            .filter(|i| e.words[*i] == Word::Address)
+        let kinds = e.shape.kinds();
+        let addresses: Vec<usize> = (0..kinds.len())
+            .filter(|i| matches!(kinds[*i], Holds::Address | Holds::Callee))
             .collect();
         for at in addresses.iter().take(3) {
             for other in [USER, OWNER] {
-                let mut msg = self.seed(entry, ACTOR, ACTOR, UNIT, U256::ZERO);
-                set_word(&mut msg.data, *at, other);
-                seeds.push(msg);
+                let plain = self.seed(entry, ACTOR, ACTOR, UNIT, U256::ZERO);
+                seeds.extend(plain.reshaped(&|shape| shape.put(*at, other)));
             }
         }
         if !addresses.is_empty() {
             seeds.push(self.seed(entry, ACTOR, ALLY, UNIT, U256::ZERO));
         }
-        if e.words.contains(&Word::Amount) {
+        if kinds.contains(&Holds::Amount) {
             seeds.push(self.seed(entry, ACTOR, ACTOR, U256::MAX, U256::ZERO));
             seeds.push(self.seed(entry, ACTOR, ACTOR, U256::ZERO, U256::ZERO));
         }
         // Two items of half the range each add up to nothing where a sum is not checked.
-        if let Some((template, words)) = &e.pair {
+        if let Some(pair) = e.shape.paired() {
             let half = U256::ONE << 255;
-            seeds.push(self.fill(entry, template, words, ACTOR, ACTOR, half, U256::ZERO));
-            seeds.push(self.fill(entry, template, words, ACTOR, ACTOR, UNIT, U256::ZERO));
+            seeds.push(self.fill(&pair, ACTOR, ACTOR, half, U256::ZERO));
+            seeds.push(self.fill(&pair, ACTOR, ACTOR, UNIT, U256::ZERO));
         }
         seeds
     }
@@ -573,6 +495,7 @@ impl<'a> Explorer<'a> {
         }
         self.facts
             .observe(entry, &t.msg, &run, self.subject, &self.known);
+        self.learn(entry, t, &run);
         if self.stopped.len() < self.entries.len() {
             self.stopped.resize(self.entries.len(), None);
         }
@@ -585,19 +508,62 @@ impl<'a> Explorer<'a> {
         (world, run)
     }
 
+    // An address word the contract calls as a contract is filled with one from then on.
+    fn learn(&mut self, entry: usize, t: &Try, run: &Run) {
+        let spoken = run
+            .calls
+            .iter()
+            .filter(|c| c.to_tag.has(DATA) && !c.input.is_empty());
+        let words: Vec<usize> = spoken.filter_map(|c| c.to_tag.word()).collect();
+        if words.is_empty() {
+            return;
+        }
+        let (_, spots) = t.shape.layout();
+        for word in words {
+            let spot = spots
+                .iter()
+                .find(|s| s.at == 4 + 32 * word && s.role == Role::Value);
+            let node = spot.and_then(|s| self.entries[entry].shape.node_mut(&s.path));
+            if let Some(Node::Word(kind @ (Holds::Address | Holds::Other), _)) = node {
+                *kind = Holds::Callee;
+            }
+        }
+    }
+
     fn attempt(&mut self, state: usize, entry: usize, t: &Try) -> (World, Run) {
         let world = self.states[state].world.clone();
         self.attempt_in(world, entry, t)
     }
 
     /* What to change so that the comparison a failed run stopped at comes out the
-    other way: a word of the call data, the value sent, the length of the call data
+    other way: a part of the call data, the value sent, the length of the call data
     or of an outside answer, or the time. */
     #[allow(clippy::too_many_lines)]
-    fn mutations(&self, t: &Try, run: &Run, entry: usize, now: U256) -> Vec<Try> {
-        let e = &self.entries[entry];
-        let free = |w: usize| e.words.get(w).is_none_or(|k| *k != Word::Offset);
-        let count = |w: usize| e.words.get(w) == Some(&Word::Count);
+    fn mutations(&self, t: &Try, run: &Run, now: U256) -> Vec<Try> {
+        let (data, spots) = t.shape.layout();
+        let held = |spot: &Spot| {
+            let end = data.len().min(spot.at + 32);
+            let mut word = [0u8; 32];
+            word[..end - spot.at].copy_from_slice(&data[spot.at..end]);
+            U256::from_be_bytes(&word)
+        };
+        let spot_at = |word: usize| {
+            let within = 4 + 32 * word..36 + 32 * word;
+            spots.iter().find(|s| within.contains(&s.at))
+        };
+        /* The part of the call data a word came from. A word reached through an offset
+        carries the offset's place too, and an offset is never what a test is about. */
+        let about = |tag: Tag, seen: U256| {
+            let words = (0..DATA_WORDS).filter(|w| tag.has(DATA) && tag.words >> w & 1 == 1);
+            let found: Vec<&Spot> = words
+                .filter_map(spot_at)
+                .filter(|s| s.role != Role::Head)
+                .collect();
+            let exact = found.iter().find(|s| held(s) == seen).copied();
+            // A word that starts off the grid lies across two words of the call data.
+            let single = found.len() == 1 || found.first().is_some_and(|s| s.at % 32 != 4);
+            exact.or(found.first().copied().filter(|_| single))
+        };
         let mut out: Vec<Try> = Vec::new();
         let mut seen: HashSet<TryKey> = HashSet::new();
         let mut push = |out: &mut Vec<Try>, next: Try| {
@@ -621,26 +587,20 @@ impl<'a> Explorer<'a> {
             contract itself may do, so it is tried with the two messages that move an asset. */
             let passed_on =
                 call.kind == op::CALL && call.to_tag.has(DATA) && call.input_from.has(DATA);
-            let places = (
-                call.to_tag.word(),
-                call.input_from.word().filter(|w| *w >= 1),
-            );
-            if let (true, (Some(target), Some(at))) = (passed_on, places) {
+            let target = about(call.to_tag, call.to).filter(|s| s.role == Role::Value);
+            let sent = call.input_from.word().filter(|w| *w >= 1);
+            let length = sent.and_then(|w| spot_at(w - 1));
+            let length = length.filter(|s| s.role == Role::Length);
+            if let (true, Some(target), Some(length)) = (passed_on, target, length) {
                 let moves = [
                     world::transfer_from_call(USER, ALLY, UNIT),
                     world::transfer_call(ALLY, UNIT),
                 ];
                 for payload in moves {
-                    let mut next = t.clone();
-                    set_word(&mut next.msg.data, target, outside(0));
-                    set_word(&mut next.msg.data, at - 1, U256::from(payload.len()));
-                    let start = 4 + 32 * at;
-                    let end = start + payload.len().div_ceil(32) * 32;
-                    if next.msg.data.len() < end {
-                        next.msg.data.resize(end, 0);
-                    }
-                    next.msg.data[start..start + payload.len()].copy_from_slice(&payload);
-                    push(&mut out, next);
+                    let next = t.reshaped(&|shape| {
+                        shape.set(target, outside(0)) && shape.put_bytes(&length.path, &payload)
+                    });
+                    out.extend(next.into_iter().take(MAX_TRIES.saturating_sub(out.len())));
                 }
             }
             // An answer the contract goes on to call has to be the address of a contract.
@@ -659,14 +619,9 @@ impl<'a> Explorer<'a> {
             let unanswered = !call.input.is_empty()
                 && call.by == Answered::Blank
                 && (call.to.is_zero() || self.known.contains(&call.to));
-            if let Some(word) = call
-                .to_tag
-                .word()
-                .filter(|w| unanswered && call.to_tag.has(DATA) && free(*w))
-            {
-                let mut next = t.clone();
-                set_word(&mut next.msg.data, word, outside(0));
-                push(&mut out, next);
+            if let Some(target) = target.filter(|_| unanswered) {
+                let next = t.reshaped(&|shape| shape.set(target, outside(0)));
+                next.into_iter().for_each(|next| push(&mut out, next));
             }
         }
         let cmps = run.events.iter().rev().filter_map(|ev| match ev {
@@ -681,7 +636,7 @@ impl<'a> Explorer<'a> {
             _ => None,
         });
         for (o, a, b, ta, tb) in cmps.take(12) {
-            for (tag, other) in [(ta, b), (tb, a)] {
+            for (tag, was, other) in [(ta, a, b), (tb, b, a)] {
                 let near = [
                     other,
                     other.wrapping_add(U256::ONE),
@@ -691,22 +646,15 @@ impl<'a> Explorer<'a> {
                     op::EQ => &near[..1],
                     _ => &near,
                 };
-                if let Some(word) = tag.word().filter(|w| tag.has(DATA) && free(*w)) {
-                    for value in values {
-                        let mut next = t.clone();
-                        set_word(&mut next.msg.data, word, *value);
-                        // A longer list needs its items: each new one is a copy of the first.
-                        let items = value
-                            .as_usize()
-                            .filter(|n| count(word) && (1..=8).contains(n));
-                        for k in 1..items.unwrap_or(0) {
-                            let first =
-                                U256::from_be_bytes(&next.msg.data[4 + 32 * (word + 1)..][..32]);
-                            if next.msg.data.len() < 4 + 32 * (word + 2 + k) {
-                                set_word(&mut next.msg.data, word + 1 + k, first);
-                            }
-                        }
-                        push(&mut out, next);
+                if let Some(spot) = about(tag, was) {
+                    let mut wanted = values.to_vec();
+                    // A word worked on before the test lacks what the test lacks.
+                    if held(spot) != was {
+                        wanted.insert(0, held(spot).wrapping_add(other.wrapping_sub(was)));
+                    }
+                    for value in wanted {
+                        let next = t.reshaped(&|shape| shape.set(spot, value));
+                        next.into_iter().for_each(|next| push(&mut out, next));
                     }
                 }
                 // An outside answer the code compares with something is tried as that thing.
@@ -744,11 +692,12 @@ impl<'a> Explorer<'a> {
                     match tag.call().and_then(|k| run.calls.get(k)) {
                         None => {
                             for len in [len, len + 4] {
-                                let mut next = t.clone();
-                                if next.msg.data.len() < len {
-                                    next.msg.data.resize(len, 0);
-                                    push(&mut out, next);
-                                }
+                                let lacks = len.saturating_sub(data.len());
+                                let next = t.reshaped(&|shape| {
+                                    shape.spare.resize(shape.spare.len() + lacks, 0);
+                                    lacks > 0
+                                });
+                                next.into_iter().for_each(|next| push(&mut out, next));
                             }
                         }
                         Some(call) if call.by == Answered::Blank || call.by == Answered::Taken => {
@@ -787,7 +736,7 @@ impl<'a> Explorer<'a> {
                 break;
             }
             let now = self.states[state].world.time;
-            let tries = self.mutations(&best.0, &best.2, entry, now);
+            let tries = self.mutations(&best.0, &best.2, now);
             let mut improved = false;
             for t in tries {
                 if budget::spent() {
@@ -868,7 +817,7 @@ impl<'a> Explorer<'a> {
             // What works as things are is found first, so that no setting is taken that shuts it.
             for entry in 0..self.entries.len() {
                 for who in [OWNER, USER, ACTOR] {
-                    let plain = Try::of(self.seed(entry, who, who, UNIT, U256::ZERO));
+                    let plain = self.seed(entry, who, who, UNIT, U256::ZERO);
                     let (_, run) = self.attempt(0, entry, &plain);
                     changed |= self.assume_targets(&run);
                     let staked = self.assume_stake(&plain, &run, entry, who);
@@ -882,7 +831,7 @@ impl<'a> Explorer<'a> {
                     if budget::spent() {
                         return;
                     }
-                    let (best, _, run) = self.solve(0, entry, Try::of(seed));
+                    let (best, _, run) = self.solve(0, entry, seed);
                     changed |= self.assume_targets(&run);
                     changed |= self.assume_owner(&best, &run, entry);
                     if run.ok {
@@ -920,7 +869,7 @@ impl<'a> Explorer<'a> {
                 if set_up || self.entries[entry].view || budget::spent() {
                     continue;
                 }
-                let t = Try::of(self.honest(entry, USER).remove(0));
+                let t = self.honest(entry, USER).remove(0);
                 let (_, run) = self.attempt(0, entry, &t);
                 if !run.ok {
                     changed |= self.assume_from(&t, &run, entry, false);
@@ -950,7 +899,7 @@ impl<'a> Explorer<'a> {
             let mut named: Vec<(Place, U256, Addr)> = Vec::new();
             for entry in 0..self.entries.len() {
                 for who in [OWNER, USER, ACTOR] {
-                    let plain = Try::of(self.seed(entry, who, who, UNIT, U256::ZERO));
+                    let plain = self.seed(entry, who, who, UNIT, U256::ZERO);
                     let (_, run) = self.attempt(0, entry, &plain);
                     named.extend(self.compared_with_caller(&run));
                     self.note_contracts(&run);
@@ -959,7 +908,7 @@ impl<'a> Explorer<'a> {
                     if budget::spent() {
                         return;
                     }
-                    let (best, world, run) = self.solve(0, entry, Try::of(seed));
+                    let (best, world, run) = self.solve(0, entry, seed);
                     named.extend(self.compared_with_caller(&run));
                     if run.ok {
                         let (_, again) = self.attempt_in(world, entry, &best);
@@ -1081,10 +1030,10 @@ impl<'a> Explorer<'a> {
         }
     }
 
-    fn naming_contracts(&self, entry: usize, who: Addr) -> Vec<Msg> {
-        let words = &self.entries[entry].words;
-        let places: Vec<usize> = (0..words.len())
-            .filter(|i| words[*i] == Word::Address)
+    fn naming_contracts(&self, entry: usize, who: Addr) -> Vec<Try> {
+        let kinds = self.entries[entry].shape.kinds();
+        let places: Vec<usize> = (0..kinds.len())
+            .filter(|i| matches!(kinds[*i], Holds::Address | Holds::Callee))
             .collect();
         let known = self.contracts.len().min(3);
         let ways = match (places.len(), known) {
@@ -1092,12 +1041,14 @@ impl<'a> Explorer<'a> {
             (_, 1) => 1,
             _ => 2,
         };
-        let seeds = (0..ways).map(|way| {
-            let mut msg = self.seed(entry, who, who, UNIT, U256::ZERO);
-            for (k, at) in places.iter().enumerate() {
-                set_word(&mut msg.data, *at, self.contracts[(way + k) % known]);
-            }
-            msg
+        let seeds = (0..ways).filter_map(|way| {
+            let plain = self.seed(entry, who, who, UNIT, U256::ZERO);
+            plain.reshaped(&|shape| {
+                let named = places.iter().enumerate();
+                named.fold(true, |all, (k, at)| {
+                    shape.put(*at, self.contracts[(way + k) % known]) && all
+                })
+            })
         });
         seeds.collect()
     }
@@ -1119,7 +1070,7 @@ impl<'a> Explorer<'a> {
                 if budget::spent() {
                     return false;
                 }
-                let (t, world, run) = self.solve(0, entry, Try::of(seed));
+                let (t, world, run) = self.solve(0, entry, seed);
                 let subject = self.subject;
                 let fills = run.stores().any(|(c, old, new, _, _)| {
                     c.account == subject && old.is_zero() && !new.is_zero()
@@ -1457,7 +1408,7 @@ impl<'a> Explorer<'a> {
                         if budget::spent() || self.states.len() >= MAX_STATES / 2 {
                             return;
                         }
-                        let (t, world, run) = self.solve(from, entry, Try::of(seed));
+                        let (t, world, run) = self.solve(from, entry, seed);
                         // The owner's second way of filling in an address leads somewhere else
                         // even where it runs the same code.
                         let other_way = who == OWNER && kept && run.stores().next().is_some();
@@ -1665,7 +1616,7 @@ impl<'a> Explorer<'a> {
                 continue;
             }
             let seed = self.seed(entry, ACTOR, USER, breach.total, U256::ZERO);
-            let (t, world, run) = self.solve(at, entry, Try::of(seed));
+            let (t, world, run) = self.solve(at, entry, seed);
             let whole = breach.total.to_be_bytes();
             let asks_all = t.msg.data.len() >= 36 && t.msg.data[4..].chunks(32).any(|w| w == whole);
             if !asks_all || !spends(&world, &run, after) {
@@ -1716,7 +1667,7 @@ impl<'a> Explorer<'a> {
             for amount in [breach.total, STAKE] {
                 let other = if victim == OWNER { USER } else { OWNER };
                 let seed = self.seed(entry, victim, other, amount, U256::ZERO);
-                let (t, _, run) = self.solve(at, entry, Try::of(seed));
+                let (t, _, run) = self.solve(at, entry, seed);
                 let whole = amount.to_be_bytes();
                 let asks_all =
                     t.msg.data.len() >= 36 && t.msg.data[4..].chunks(32).any(|w| w == whole);
@@ -1790,7 +1741,7 @@ impl<'a> Explorer<'a> {
             .filter(|e| *e != entry && self.facts.entries[*e].pays_out)
             .collect();
         for other in paying.into_iter().take(MAX_HOOKS - 1) {
-            hooks.push((other, self.seed(other, ACTOR, ACTOR, UNIT, U256::ZERO)));
+            hooks.push((other, self.seed(other, ACTOR, ACTOR, UNIT, U256::ZERO).msg));
         }
         let base = self.states[0].world.clone();
         let spent = self.states[from].spent;
@@ -1809,7 +1760,7 @@ impl<'a> Explorer<'a> {
             }
             let mut apart: Vec<Breach> = plain.to_vec();
             if first.ok {
-                let (then, second) = self.attempt_in(alone.clone(), inner, &Try::of(hook));
+                let (then, second) = self.attempt_in(alone.clone(), inner, &Try::sent(hook));
                 if second.ok {
                     apart.extend(laws::check(
                         &base,
@@ -1841,7 +1792,14 @@ impl<'a> Explorer<'a> {
     fn sweep(&mut self) {
         for (entry, kind) in self.owed.clone() {
             let facts = &self.facts.entries[entry];
-            if facts.checks_caller && !facts.ended.contains(&ACTOR) {
+            // A caller compared with a word of the call's own data keeps nobody out.
+            let role = |p: &Place| {
+                self.facts
+                    .places
+                    .get(p)
+                    .is_some_and(|p| p.identity || p.gate)
+            };
+            if facts.reads.iter().any(role) && !facts.ended.contains(&ACTOR) {
                 self.facts.keeps.insert(kind);
             }
         }
@@ -1874,7 +1832,7 @@ impl<'a> Explorer<'a> {
                         break;
                     }
                     let before = self.states[at].world.clone();
-                    let (t, world, run) = self.solve(at, entry, Try::of(seed));
+                    let (t, world, run) = self.solve(at, entry, seed);
                     if !run.ok || self.once_for_all(&world, entry, &t, &run) {
                         continue;
                     }
@@ -1914,7 +1872,7 @@ impl<'a> Explorer<'a> {
                         return;
                     }
                     let before = self.states[from].world.clone();
-                    let (t, world, run) = self.solve(from, entry, Try::of(seed));
+                    let (t, world, run) = self.solve(from, entry, seed);
                     if !run.ok {
                         continue;
                     }
@@ -2001,7 +1959,7 @@ impl<'a> Explorer<'a> {
                             return;
                         }
                         let before = self.states[from].world.clone();
-                        let (t, world, run) = self.solve(from, entry, Try::of(seed));
+                        let (t, world, run) = self.solve(from, entry, seed);
                         let handed = run.calls.iter().any(|c| c.by == Answered::Taken);
                         let mut plain = Vec::new();
                         let race = run.ok && self.once_for_all(&world, entry, &t, &run);

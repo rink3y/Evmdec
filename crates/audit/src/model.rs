@@ -51,7 +51,6 @@ pub struct EntryFacts {
     pub takes_in: bool,
     pub calls_out: bool,
     pub runs_other_code: bool,
-    pub target_words: BTreeSet<usize>,
     pub reads: BTreeSet<Place>,
     pub writes: BTreeSet<Place>,
 }
@@ -385,11 +384,6 @@ impl Facts {
         for call in &run.calls {
             facts.calls_out = true;
             facts.runs_other_code |= matches!(call.kind, op::DELEGATECALL | op::CALLCODE);
-            // Ether sent with no message is a payment to an account, not a call to a contract.
-            let spoken_to = call.to_tag.has(DATA) && !call.input.is_empty();
-            if let Some(word) = call.to_tag.word().filter(|_| spoken_to) {
-                facts.target_words.insert(word);
-            }
             let cell = run.cell_of(call.to_tag).filter(|c| c.account == subject);
             if let Some(cell) = cell.filter(|_| call.to_tag.has(STORE)) {
                 self.places.entry(cell.place()).or_default().target = true;

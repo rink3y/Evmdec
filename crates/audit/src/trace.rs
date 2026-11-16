@@ -22,14 +22,14 @@ pub const CHOICE: u16 = 1 << 15;
 const WORKED: u16 = HASH | MATH | CMP;
 
 const MANY: u16 = u16::MAX;
-pub const DATA_WORDS: usize = 32;
+pub const DATA_WORDS: usize = 64;
 
 /* Where a word came from. `words` says which words of the call data, `cell` which
 storage cell of the run's table, `call` which call out, each counted from one. */
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Tag {
     pub bits: u16,
-    pub words: u32,
+    pub words: u64,
     pub cell: u16,
     pub call: u16,
 }

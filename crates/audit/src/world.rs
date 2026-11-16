@@ -932,7 +932,11 @@ impl World {
                     .data_tags
                     .get(at..end.min(f.data_tags.len()))
                     .map_or(Tag::NONE, join_all);
-                result = result.join(read);
+                // What was read says more than where the place to read came from.
+                result = match read.is_none() {
+                    true => result,
+                    false => read,
+                };
             }
             op::CALLDATACOPY => {
                 let (at, len) = (val(1).as_usize().unwrap_or(usize::MAX), len_of(val(2)));
@@ -1580,6 +1584,17 @@ mod tests {
         let stores: Vec<_> = run.stores().collect();
         assert!(stores[0].3.only(FROM_CALLER));
         assert_eq!(stores[1].3.word(), Some(0));
+    }
+
+    #[test]
+    fn a_word_read_through_an_offset_comes_from_where_it_was_read() {
+        // sstore(0, calldataload(calldataload(4) + 4))
+        let mut data = vec![0; 4];
+        data.extend_from_slice(&U256::from_u64(32).to_be_bytes());
+        data.extend_from_slice(&U256::from_u64(7).to_be_bytes());
+        let (world, run) = run("60043560040135600055", data, USER);
+        assert_eq!(world.stored(SUBJECT, U256::ZERO), U256::from_u64(7));
+        assert_eq!(run.stores().next().expect("one store").3.word(), Some(1));
     }
 
     #[test]

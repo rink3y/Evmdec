@@ -289,3 +289,26 @@ fn a_word_of_the_output_area_is_the_answer_only_where_its_length_is_tested() {
     );
     assert!(tested.contains("stor_0 = returndata_1[0];"), "{tested}");
 }
+
+#[test]
+fn a_constant_masked_into_a_higher_byte_is_the_value_of_the_field_at_that_byte() {
+    use evmdec::expr::{calldataload, intern, konst, konst_u64, op2, Node};
+    use evmdec::opcode as op;
+    let key = calldataload(konst_u64(4));
+    let old = intern(Node::SLoad(key, false, 0));
+    let keep = konst(!evmdec::U256::from_u64(0xff00));
+    let stored = op2(op::OR, op2(op::AND, old, keep), konst_u64(0x100));
+    let write = evmdec::ssa::field_write(key, stored).expect("a field write");
+    assert_eq!((write.bit_offset, write.bits), (8, 8));
+    assert_eq!(write.value, konst_u64(1));
+    let low = op2(
+        op::OR,
+        op2(op::AND, old, konst(!evmdec::U256::from_u64(0xff))),
+        konst_u64(1),
+    );
+    let write = evmdec::ssa::field_write(key, low).expect("a field write");
+    assert_eq!(
+        (write.bit_offset, write.bits, write.value),
+        (0, 8, konst_u64(1))
+    );
+}

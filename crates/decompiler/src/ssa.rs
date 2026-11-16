@@ -317,25 +317,37 @@ pub fn field_write(key: ExprId, val: ExprId) -> Option<FieldWrite> {
     let Node::Op(op::OR, v) = expr::node(val) else {
         return None;
     };
-    let cleared_bits = |e: ExprId| -> Option<u32> {
+    let cleared_mask = |e: ExprId| -> Option<U256> {
         let Node::Op(op::AND, w) = expr::node(e) else {
             return None;
         };
         for (a, b) in [(w[0], w[1]), (w[1], w[0])] {
             if let (Node::SLoad(k, false, _), Some(m)) = (expr::node(a), expr::as_const(b)) {
                 if k == key {
-                    return Some(256 - m.count_ones());
+                    return Some(!m);
                 }
             }
         }
         None
     };
     for (old, new) in [(v[0], v[1]), (v[1], v[0])] {
-        let Some(cleared) = cleared_bits(old) else {
+        let Some(mask) = cleared_mask(old) else {
             continue;
         };
+        let cleared = mask.count_ones();
         if let Some(w) = shifted_then_masked(new) {
             return Some(w);
+        }
+        /* The bits the mask clears say which field is written. A constant put there is
+        already in place, so it is the field's value once moved down. */
+        let at = mask.trailing_zeros();
+        if let (Some(c), true) = (expr::as_const(new), cleared > 0) {
+            let whole = (mask >> at).is_low_mask() && (c & !mask).is_zero();
+            return whole.then(|| FieldWrite {
+                bit_offset: at,
+                bits: cleared,
+                value: expr::konst(c >> at),
+            });
         }
         let (shift, inner) = match expr::node(new) {
             Node::Op(op::SHL, w) if expr::as_const(w[0]).is_some_and(|s| s.fits_u64()) => {
@@ -356,7 +368,8 @@ pub fn field_write(key: ExprId, val: ExprId) -> Option<FieldWrite> {
             },
             _ => (cleared, inner),
         };
-        if bits > 0 && shift + bits <= 256 {
+        // A value left where it is cannot be the value of a field that starts higher.
+        if bits > 0 && shift + bits <= 256 && (shift > 0 || at == 0) {
             return Some(FieldWrite {
                 bit_offset: shift,
                 bits,

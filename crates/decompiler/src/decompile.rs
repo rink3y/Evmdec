@@ -1642,11 +1642,17 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
             for root in lift::roots(nd) {
                 let mut stack = vec![root.expr];
                 let mut visited = HashSet::new();
+                let mut cut: HashSet<ExprId> = HashSet::new();
                 while let Some(x) = stack.pop() {
                     if !visited.insert(x) || visited.len() > 20_000 {
                         continue;
                     }
+                    cut.extend(selector_cut(&root, x));
                     if x == root.expr && root.payload {
+                        stack.extend(expr::children(x));
+                        continue;
+                    }
+                    if cut.contains(&x) {
                         stack.extend(expr::children(x));
                         continue;
                     }
@@ -2944,18 +2950,31 @@ fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>,
     }
 }
 
+/* The four bytes of a selector shift every argument of a call, so a word of its data starts
+with the last four bytes of one argument. Those four bytes are a cut the encoding makes,
+not a field the code reads. */
+fn selector_cut(root: &lift::Root, x: ExprId) -> Option<ExprId> {
+    let Node::Op(op::SHL, v) = expr::node(x) else {
+        return None;
+    };
+    let last_four = expr::as_const(v[0]) == Some(U256::from_u64(224));
+    (root.payload && last_four).then_some(v[1])
+}
+
 fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
     let mut seen = HashSet::new();
+    let mut cut: HashSet<ExprId> = HashSet::new();
     let mut stack = vec![root.expr];
     while let Some(x) = stack.pop() {
         if !seen.insert(x) || seen.len() > 50_000 {
             continue;
         }
+        cut.extend(selector_cut(&root, x));
         if x == root.expr && root.payload {
             stack.extend(expr::children(x));
             continue;
         }
-        if let Some((k, off, bits)) = emit::packed_read(x) {
+        if let Some((k, off, bits)) = emit::packed_read(x).filter(|_| !cut.contains(&x)) {
             if off > 0 || bits < 256 {
                 let entry = fields.entry(k).or_default().entry((off, bits)).or_default();
                 if matches!(expr::node(x), Node::Op(op::SIGNEXTEND, _)) {

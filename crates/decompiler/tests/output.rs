@@ -445,3 +445,13 @@ fn a_value_tested_against_zero_and_ordered_against_another_is_a_number() {
     assert!(out.contains("function func_12345678(uint256 key)"), "{out}");
     assert!(out.contains("require(stor_0 >= key);"), "{out}");
 }
+
+#[test]
+fn the_cut_a_selector_makes_through_an_argument_is_no_field_of_storage() {
+    let out = text(
+        "63aabbccdd60e01b6080523360845273ffffffffffffffffffffffffffffffffffffffff6000541660\
+         a4524260c45260006000606460806000335af15000",
+    );
+    assert!(out.contains("address stor_0; // slot 0x0"), "{out}");
+    assert!(!out.contains("uint32"), "{out}");
+}

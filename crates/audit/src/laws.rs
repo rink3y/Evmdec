@@ -1,5 +1,5 @@
 use crate::model::Facts;
-use crate::trace::{Cell, Event, Run, DATA};
+use crate::trace::{Cell, Event, Run, Tag, DATA};
 use crate::world::{Addr, World, ACTOR, ALLY, OWNER, USER};
 use evmdec::opcode as op;
 use evmdec::U256;
@@ -18,6 +18,8 @@ pub enum Kind {
     Credit,
     // The contract's own records of another account are lowered.
     Debit,
+    // What the contract pays the account is sized by a reading the account can change.
+    Reading,
     // A cell the contract compares its caller with now names the account.
     Takeover,
     // The same cell no longer names anyone.
@@ -36,6 +38,8 @@ pub struct Breach {
     pub amount: U256,
     // What the record holds after the call, where the breach is about a record.
     pub total: U256,
+    // What the same call paid before the account changed the reading it rests on.
+    pub was: U256,
     pub victim: Option<Addr>,
     pub cell: Option<Cell>,
     pub call: Option<usize>,
@@ -90,6 +94,7 @@ fn bare(kind: Kind) -> Breach {
         asset: None,
         amount: U256::ZERO,
         total: U256::ZERO,
+        was: U256::ZERO,
         victim: None,
         cell: None,
         call: None,
@@ -111,6 +116,133 @@ pub fn claims_lowered(run: &Run, subject: Addr, base: &World) -> U256 {
         let started = base.stored(subject, cell.slot);
         sum.wrapping_add(*old.min(&started) - *new.min(&started))
     })
+}
+
+fn party(who: Addr) -> bool {
+    Facts::same_party(who, ACTOR)
+}
+
+// A cell of the contract's kept under the account's address, by the slot it sits in.
+fn own_record(cell: &Cell, subject: Addr) -> bool {
+    cell.account == subject && (cell.keyed_by(ACTOR) || cell.keyed_by(ALLY))
+}
+
+type Payment = (Option<Addr>, Addr);
+
+/* What a call paid the account, by asset and by who paid, each with the tag of the
+largest single payment. Then what the account paid, the same way. */
+fn payments(run: &Run) -> (Vec<(Payment, U256, Tag)>, Vec<(Payment, U256)>) {
+    let mut taken: Vec<(Payment, U256, U256, Tag)> = Vec::new();
+    let mut given: Vec<(Payment, U256)> = Vec::new();
+    for event in &run.events {
+        let Event::Pay {
+            asset,
+            from,
+            to,
+            amount,
+            amount_tag,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if amount.is_zero() || party(*from) == party(*to) {
+            continue;
+        }
+        if party(*from) {
+            let key = (*asset, *to);
+            match given.iter_mut().find(|g| g.0 == key) {
+                Some(sum) => sum.1 = sum.1.wrapping_add(*amount),
+                None => given.push((key, *amount)),
+            }
+            continue;
+        }
+        let key = (*asset, *from);
+        match taken.iter_mut().find(|t| t.0 == key) {
+            Some(sum) => {
+                sum.1 = sum.1.wrapping_add(*amount);
+                if *amount > sum.2 {
+                    (sum.2, sum.3) = (*amount, *amount_tag);
+                }
+            }
+            None => taken.push((key, *amount, *amount, *amount_tag)),
+        }
+    }
+    given.sort();
+    let taken = taken.into_iter().map(|(key, sum, _, tag)| (key, sum, tag));
+    (taken.collect(), given)
+}
+
+// Whether the call moved anything to or from the account, in assets or in the contract's records.
+#[must_use]
+pub fn touched(run: &Run, subject: Addr) -> bool {
+    let (taken, given) = payments(run);
+    let recorded = run.changes().iter().any(|(c, ..)| own_record(c, subject));
+    !taken.is_empty() || !given.is_empty() || recorded
+}
+
+/* The same call made twice by the account: `first` from some state, `second` from the
+state its own step on another contract left. Where the account gave the same and the
+second call paid it more, or raised its record further, and that amount was worked out
+from what another account said or holds, the payout rests on a reading the account can
+change. `acted_on` are the accounts its step was made on. What they pay is theirs to
+pay, so only what the contract itself or a person pays counts. The account does not
+have to end ahead, since the step may cost it more than the call pays. */
+#[must_use]
+pub fn swayed(first: &Run, second: &Run, after: &World, acted_on: &[Addr]) -> Vec<Breach> {
+    let subject = after.subject;
+    let ((took, gave), (takes, gives)) = (payments(first), payments(second));
+    let lowered = |run: &Run| {
+        let changes = run.changes();
+        let falls = changes
+            .iter()
+            .filter(|(c, old, new, _, _)| own_record(c, subject) && new < old);
+        falls.fold(U256::ZERO, |sum, (_, old, new, _, _)| {
+            sum.wrapping_add(*old - *new)
+        })
+    };
+    let same_given = gave == gives && lowered(first) == lowered(second);
+    if !first.ok || !second.ok || !same_given {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for ((asset, payer), amount, tag) in takes {
+        let theirs = payer == subject || !after.runs_code(payer);
+        let before = took.iter().find(|t| t.0 == (asset, payer));
+        let was = before.map_or(U256::ZERO, |t| t.1);
+        if theirs && !acted_on.contains(&payer) && amount > was && tag.read_outside() {
+            found.push(Breach {
+                asset,
+                amount,
+                was,
+                ..bare(Kind::Reading)
+            });
+        }
+    }
+    let top = U256::ONE << 255;
+    let rises = |run: &Run| -> Vec<(Cell, U256, Tag)> {
+        let changes = run.changes();
+        let up = changes
+            .iter()
+            .filter(|(c, old, new, _, _)| own_record(c, subject) && new > old && *new < top);
+        up.map(|(c, old, new, tag, _)| ((*c).clone(), *new - *old, *tag))
+            .collect()
+    };
+    let rose = rises(first);
+    for (cell, amount, tag) in rises(second) {
+        let before = rose.iter().find(|r| r.0.slot == cell.slot);
+        let was = before.map_or(U256::ZERO, |r| r.1);
+        if amount > was && tag.read_outside() {
+            found.push(Breach {
+                amount,
+                was,
+                total: after.stored(subject, cell.slot),
+                cell: Some(cell),
+                ..bare(Kind::Reading)
+            });
+        }
+    }
+    found
 }
 
 /* `spent` is what the account gave up of its own recorded claims in earlier calls. An

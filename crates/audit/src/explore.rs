@@ -25,6 +25,10 @@ const MAX_HOOKS: usize = 4;
 const ACTOR_DEPTH: usize = 3;
 const MAX_OUTSIDE: usize = 3;
 const OUTSIDE_ENTRIES: usize = 6;
+const SWAYED_A_STATE: usize = 3;
+const SWAYED_AN_ENTRY: usize = 2;
+const MAX_SENDS: usize = 4;
+const MAX_READ: usize = 8;
 const UNUSED_SELECTOR: u32 = 0xfeed_c0de;
 const TEN_YEARS: u64 = 315_360_000;
 
@@ -57,6 +61,11 @@ pub enum Step {
     Funded,
     // The account with no role holds some of the contract's own ledger.
     Holds,
+    Sent {
+        asset: Option<Addr>,
+        to: Addr,
+        amount: U256,
+    },
 }
 
 #[derive(Clone)]
@@ -178,6 +187,7 @@ pub struct Explorer<'a> {
     named_out: BTreeMap<Addr, usize>,
     aims: Vec<Addr>,
     room: usize,
+    paid: Vec<(usize, usize, Try)>,
 }
 
 fn outside(n: usize) -> Addr {
@@ -285,6 +295,24 @@ fn marked(cell: &crate::trace::Cell) -> (Addr, U256, bool) {
     (cell.account, cell.slot, !cell.keys.is_empty())
 }
 
+fn sent(asset: Option<Addr>, to: Addr, amount: U256) -> Msg {
+    let from = ACTOR;
+    match asset {
+        Some(asset) => Msg {
+            from,
+            to: asset,
+            data: world::transfer_call(to, amount),
+            ..Msg::default()
+        },
+        None => Msg {
+            from,
+            to,
+            value: amount,
+            ..Msg::default()
+        },
+    }
+}
+
 fn alike(a: &Breach, b: &Breach) -> bool {
     let place = |b: &Breach| b.cell.as_ref().map(crate::trace::Cell::place);
     a.kind == b.kind && a.asset == b.asset && a.victim == b.victim && place(a) == place(b)
@@ -385,6 +413,7 @@ impl<'a> Explorer<'a> {
             named_out: BTreeMap::new(),
             aims: Vec::new(),
             room: MAX_STATES,
+            paid: Vec::new(),
         }
     }
 
@@ -500,7 +529,7 @@ impl<'a> Explorer<'a> {
         seeds
     }
 
-    fn attempt_in(&mut self, mut world: World, entry: usize, t: &Try) -> (World, Run) {
+    fn set_for(world: &mut World, t: &Try) {
         for (to, selector, answer) in &t.answers {
             world.answer_with(*to, *selector, answer.clone());
         }
@@ -509,6 +538,10 @@ impl<'a> Explorer<'a> {
             world.number = world.number + U256::from_u64(blocks);
             world.time = time;
         }
+    }
+
+    fn attempt_in(&mut self, mut world: World, entry: usize, t: &Try) -> (World, Run) {
+        Self::set_for(&mut world, t);
         let run = world.send(&t.msg);
         self.runs += 1;
         if t.msg.from == OWNER {
@@ -965,10 +998,9 @@ impl<'a> Explorer<'a> {
         self.edges.len() > before || reshaped
     }
 
-    fn keep(&mut self, from: usize, entry: usize, t: &Try, world: World, actor: bool) -> usize {
-        let parent = &self.states[from];
-        let mut steps = parent.steps.clone();
-        if let Some(until) = t.time.filter(|time| *time > parent.world.time) {
+    fn called(now: U256, entry: usize, t: &Try) -> Vec<Step> {
+        let mut steps = Vec::new();
+        if let Some(until) = t.time.filter(|time| *time > now) {
             steps.push(Step::Wait { until });
         }
         for (to, selector, answer) in &t.answers {
@@ -982,6 +1014,13 @@ impl<'a> Explorer<'a> {
             entry,
             msg: t.msg.clone(),
         });
+        steps
+    }
+
+    fn keep(&mut self, from: usize, entry: usize, t: &Try, world: World, actor: bool) -> usize {
+        let parent = &self.states[from];
+        let mut steps = parent.steps.clone();
+        steps.extend(Self::called(parent.world.time, entry, t));
         let (spent, raced, stray) = (parent.spent, parent.raced, parent.stray);
         let granted = parent.granted;
         self.states.push(State {
@@ -1778,6 +1817,12 @@ impl<'a> Explorer<'a> {
                     world.hold(ACTOR, STAKE);
                     base = world.clone();
                 }
+                Step::Sent { asset, to, amount } => {
+                    self.runs += 1;
+                    if !world.send(&sent(*asset, *to, *amount)).ok {
+                        return false;
+                    }
+                }
                 Step::Call { msg, .. } => {
                     self.runs += 1;
                     let made = world.send(msg);
@@ -2330,6 +2375,15 @@ impl<'a> Explorer<'a> {
                 if !granted {
                     self.takes_from_owner(from, entry, &t, &run);
                 }
+                let seen = |p: &&(usize, usize, Try)| p.0 == from && p.1 == entry;
+                let of_state = self.paid.iter().filter(|p| p.0 == from).count();
+                let of_entry = self.paid.iter().filter(|p| p.1 == entry).count();
+                let fresh = of_state < SWAYED_A_STATE
+                    && of_entry < SWAYED_AN_ENTRY
+                    && !self.paid.iter().any(|p| seen(&p));
+                if self.on_chain && fresh && laws::touched(&run, self.subject) {
+                    self.paid.push((from, entry, t.clone()));
+                }
             }
             let apart = self.states[from].stray || self.states[from].granted;
             if handed && open && !apart && own {
@@ -2351,6 +2405,8 @@ impl<'a> Explorer<'a> {
     and anyone may change some of it. Each step stays short so the search stays cheap. */
     fn reach_out(&mut self) {
         self.add_outside();
+        // The search below takes whatever work it is given, so the readings get theirs first.
+        budget::within(budget::left() / 2, || self.readings());
         if self.entries.len() == self.own {
             return;
         }
@@ -2367,6 +2423,193 @@ impl<'a> Explorer<'a> {
             // An entry that changed nothing the contract reads from the first place is dropped.
             outside.retain(|e| self.facts.entries[*e].ended.contains(&ACTOR));
         }
+    }
+
+    fn readings(&mut self) {
+        let mut paid = std::mem::take(&mut self.paid);
+        // The same call is reported once, from the state fewest steps lead to.
+        paid.sort_by_key(|(from, ..)| self.states[*from].steps.len());
+        for (from, entry, t) in paid {
+            if budget::spent() {
+                return;
+            }
+            self.sway(from, entry, &t);
+        }
+    }
+
+    /* What the contract pays for a call may be sized by what it reads of other
+    accounts at that moment. The account changes such a reading with a step of its own
+    elsewhere and makes the same call again. A larger payout is then tried once more
+    with every reading put back to what it was. If it is still larger, something else
+    the step changed sized it, and nothing is shown. */
+    fn sway(&mut self, from: usize, entry: usize, t: &Try) {
+        let mut start = self.states[from].world.clone();
+        start.noting = true;
+        let (_, first) = self.attempt_in(start.clone(), entry, t);
+        if !first.ok || first.read.is_empty() {
+            return;
+        }
+        for (world, made, on) in self.steps_elsewhere(&start, &first) {
+            if budget::spent() {
+                return;
+            }
+            let (after, second) = self.attempt_in(world.clone(), entry, t);
+            let found = laws::swayed(&first, &second, &after, &on);
+            if found.is_empty() {
+                continue;
+            }
+            let mut as_before = world;
+            as_before.answer_as_before(first.read.clone());
+            Self::set_for(&mut as_before, t);
+            let third = as_before.send(&t.msg);
+            self.runs += 1;
+            let still = laws::swayed(&first, &third, &as_before, &on);
+            let mut steps = self.states[from].steps.clone();
+            steps.extend(made);
+            steps.extend(Self::called(start.time, entry, t));
+            for breach in found {
+                if !third.ok || still.iter().any(|b| alike(b, &breach)) {
+                    continue;
+                }
+                let same = |v: &Violation| v.entry == entry && alike(&v.breach, &breach);
+                if self.found.iter().any(same) {
+                    continue;
+                }
+                self.found.push(Violation {
+                    breach,
+                    entry,
+                    steps: steps.clone(),
+                    run: second.clone(),
+                    via_hook: false,
+                    by_user: false,
+                });
+            }
+        }
+    }
+
+    /* The steps the account can take on other accounts that change what `first` read:
+    sending an asset it holds to an account whose holding was read, calling another
+    contract that then writes a cell that was read, or the one after the other. A step
+    that pays the account is a trade of its own and is left out. */
+    fn steps_elsewhere(
+        &mut self,
+        start: &World,
+        first: &Run,
+    ) -> Vec<(World, Vec<Step>, Vec<Addr>)> {
+        let subject = self.subject;
+        let read: HashSet<(Addr, U256)> = first
+            .loads()
+            .filter(|(cell, _)| cell.account != subject)
+            .map(|(cell, _)| (cell.account, cell.slot))
+            .collect();
+        let pays = |before: &World, after: &World, run: &Run| {
+            let mut kinds: Vec<Option<Addr>> = vec![None];
+            kinds.extend(after.assets().into_iter().map(Some));
+            let held = |world: &World, kind: Option<Addr>| {
+                let of = |who: Addr| match kind {
+                    Some(asset) => world.asset_of(asset, who),
+                    None => world.ether_of(who),
+                };
+                of(ACTOR).wrapping_add(of(ALLY))
+            };
+            let more = kinds.iter().any(|k| held(after, *k) > held(before, *k));
+            let credited = run.changes().iter().any(|(cell, old, new, _, _)| {
+                (cell.keyed_by(ACTOR) || cell.keyed_by(ALLY)) && new > old
+            });
+            more || credited
+        };
+        let mut out = Vec::new();
+        let mut bases: Vec<(World, Vec<Step>, Option<Addr>)> =
+            vec![(start.clone(), Vec::new(), None)];
+        for (asset, to, amount) in self.holdings_read(start, first) {
+            let mut world = start.clone();
+            let run = world.send(&sent(asset, to, amount));
+            self.runs += 1;
+            let arrived = match asset {
+                Some(asset) => run.changes().iter().any(|(cell, old, new, _, _)| {
+                    cell.account == asset && cell.keyed_by(to) && new > old
+                }),
+                None => world.ether_of(to) > start.ether_of(to),
+            };
+            if !run.ok || !arrived || pays(start, &world, &run) {
+                continue;
+            }
+            let step = vec![Step::Sent { asset, to, amount }];
+            out.push((world.clone(), step.clone(), vec![to]));
+            bases.push((world, step, Some(to)));
+        }
+        for (base, made, sent_to) in bases {
+            for entry in self.own..self.entries.len() {
+                let to = self.entries[entry].to;
+                if sent_to.is_some_and(|sent_to| sent_to != to) {
+                    continue;
+                }
+                for seed in self.aimed(entry).into_iter().take(2) {
+                    if budget::spent() {
+                        return out;
+                    }
+                    let (world, run) = self.attempt_in(base.clone(), entry, &seed);
+                    let moved = run
+                        .changes()
+                        .iter()
+                        .any(|(cell, ..)| read.contains(&(cell.account, cell.slot)));
+                    if !run.ok || !moved || pays(&base, &world, &run) {
+                        continue;
+                    }
+                    let mut steps = made.clone();
+                    steps.push(Step::Call {
+                        entry,
+                        msg: seed.msg,
+                    });
+                    let on = sent_to.into_iter().chain([to]).collect();
+                    out.push((world, steps, on));
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /* Where the account can send something that changes a reading: an account whose
+    holding of an asset the call read, a contract whose own cells it read, and an account
+    whose ether it read. As much again as is held there is sent, which moves the reading
+    far without needing more than anyone has. */
+    fn holdings_read(&self, start: &World, first: &Run) -> Vec<(Option<Addr>, Addr, U256)> {
+        let subject = self.subject;
+        let assets = start.assets();
+        let other = |who: &Addr| {
+            (97..=160).contains(&who.bits()) && *who != subject && !self.known.contains(who)
+        };
+        let mut places: Vec<Addr> = Vec::new();
+        for (cell, _) in first.loads().filter(|(cell, _)| cell.account != subject) {
+            match assets.contains(&cell.account) {
+                true => places.extend(cell.keys.iter().map(|k| k.value).filter(other)),
+                false => places.extend(Some(cell.account).filter(other)),
+            }
+        }
+        let mut seen = HashSet::new();
+        places.retain(|to| seen.insert(*to));
+        let mut found: Vec<(Option<Addr>, Addr, U256)> = Vec::new();
+        for to in places.into_iter().take(MAX_SENDS) {
+            for asset in &assets {
+                found.push((Some(*asset), to, start.holding(*asset, to)));
+            }
+        }
+        for read in first.read.iter().filter(|r| r.asked.is_empty()) {
+            if other(&read.of) && !found.iter().any(|f| f.0.is_none() && f.1 == read.of) {
+                found.push((None, read.of, U256::from_be_bytes(&read.said)));
+            }
+        }
+        for (asset, _, amount) in &mut found {
+            let own = match asset {
+                Some(asset) => start.asset_of(*asset, ACTOR),
+                None => start.ether_of(ACTOR),
+            };
+            *amount = (*amount).min(own >> 1);
+        }
+        found.retain(|(_, _, amount)| !amount.is_zero());
+        found.truncate(MAX_SENDS);
+        found
     }
 
     // A step elsewhere is followed at once by calls to the contract, so it is not starved of work.
@@ -2397,12 +2640,15 @@ impl<'a> Explorer<'a> {
         let world = self.states[0].world.clone();
         let held = world.assets();
         let cells = |at: Addr| self.read_out.iter().filter(|c| c.0 == at).count();
+        /* What the account holds of an asset it can send there itself. The calls worth
+        making are to the contracts whose own cells the contract reads. */
         let mut talked: Vec<(bool, usize, usize, Addr, Option<Addr>)> = self
             .talked
             .iter()
-            .map(|(at, (n, behind))| (held.contains(at), cells(*at), *n, *at, *behind))
+            .map(|(at, (n, behind))| (!held.contains(at), cells(*at), *n, *at, *behind))
             .collect();
         talked.sort_by(|a, b| (b.0, b.1, b.2).cmp(&(a.0, a.1, a.2)).then(a.3.cmp(&b.3)));
+        talked.truncate(MAX_READ);
         let mut named: Vec<(usize, Addr)> =
             self.named_out.iter().map(|(at, n)| (*n, *at)).collect();
         named.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -2483,6 +2729,18 @@ impl<'a> Explorer<'a> {
 
     fn note_outside(&mut self, run: &Run) {
         let subject = self.subject;
+        for event in &run.events {
+            if let Event::Load { cell, .. } = event {
+                let cell = &run.cells[*cell];
+                if cell.account != subject {
+                    self.read_out.insert(marked(cell));
+                    // What is read through another contract is read all the same.
+                    if !self.known.contains(&cell.account) {
+                        self.talked.entry(cell.account).or_default();
+                    }
+                }
+            }
+        }
         for call in &run.calls {
             let direct =
                 call.from == subject && !matches!(call.kind, op::DELEGATECALL | op::CALLCODE);
@@ -2498,14 +2756,6 @@ impl<'a> Explorer<'a> {
             if call.kind == op::DELEGATECALL {
                 if let Some(talked) = self.talked.get_mut(&call.from) {
                     talked.1.get_or_insert(call.to);
-                }
-            }
-        }
-        for event in &run.events {
-            if let Event::Load { cell, .. } = event {
-                let cell = &run.cells[*cell];
-                if cell.account != subject {
-                    self.read_out.insert(marked(cell));
                 }
             }
         }

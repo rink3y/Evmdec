@@ -257,3 +257,46 @@ fn a_payout_opened_by_a_call_anyone_may_make_to_another_contract_is_found_with_t
     assert_eq!(paid.steps.len(), 2, "{:?}", paid.steps);
     assert!(paid.steps[0].contains(&gauge.to_hex()), "{:?}", paid.steps);
 }
+
+#[test]
+fn a_payout_sized_by_what_a_pool_holds_is_found_with_the_send_and_the_call_that_move_it() {
+    let at = |hex: &str| U256::from_hex_str(hex).expect("address");
+    let (desk, coin, pool) = (
+        at(DEPLOYED_AT),
+        at("0x7777777777777777777777777777777777777777"),
+        at("0x8888888888888888888888888888888888888888"),
+    );
+    let code = |name: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/source");
+        let hex = std::fs::read_to_string(path.join(name)).expect("fixture");
+        evmdec::hex::decode(hex.trim()).expect("hex")
+    };
+    // Coin keeps what each account holds in the mapping at slot 0.
+    let held_by = |who: U256| {
+        let key = [who.to_be_bytes(), U256::ZERO.to_be_bytes()].concat();
+        U256::from_be_bytes(&evmdec::keccak::keccak256(&key))
+    };
+    let mut chain = audit::chain::Table::default();
+    chain.codes.insert(coin, code("Coin.hex"));
+    chain.codes.insert(pool, code("Pool.hex"));
+    chain.storage.insert((coin, held_by(desk)), U256::ONE << 90);
+    chain.storage.insert((coin, held_by(pool)), U256::ONE << 70);
+    chain.storage.insert((pool, U256::ZERO), coin);
+    chain.storage.insert((pool, U256::ONE), U256::ONE << 70);
+    chain.storage.insert((desk, U256::ZERO), coin);
+    chain.storage.insert((desk, U256::ONE), pool);
+    // buy() sells the desk's coin for one ether at a price read from what the pool last counted.
+    let report = report_on_chain("Desk.hex", chain);
+    let [paid] = &report.findings[..] else {
+        panic!("{:?}", report.findings);
+    };
+    assert_eq!(paid.kind, Kind::Reading);
+    assert_eq!(paid.selector.as_deref(), Some("0xa6f2ae3a"));
+    let [sent, counted, bought] = &paid.steps[..] else {
+        panic!("{:?}", paid.steps);
+    };
+    assert!(sent.contains("sends") && sent.contains(&pool.to_hex()));
+    assert!(counted.contains("sync") && counted.contains(&pool.to_hex()));
+    assert!(bought.contains(&desk.to_hex()), "{bought}");
+    assert!(paid.cause.contains(&pool.to_hex()), "{}", paid.cause);
+}

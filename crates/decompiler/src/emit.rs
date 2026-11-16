@@ -2547,6 +2547,56 @@ pub fn bytes_value(off: ExprId, len: ExprId) -> Option<ExprId> {
     (expr::add_const(pointer, U256::from_u64(32)) == off).then_some(pointer)
 }
 
+fn fmt_call_arg(arg: &crate::lift::Arg, n: &Names) -> String {
+    use crate::lift::Arg;
+    match arg {
+        Arg::Word(e) => fmt_expr(*e, n),
+        Arg::List(words) => {
+            let items: Vec<String> = words.iter().map(|w| fmt_expr(*w, n)).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Arg::Bytes(len, words) => {
+            let mut sized = vec![expr::konst_u64(*len)];
+            sized.extend(words);
+            let fixed: Option<Vec<U256>> = words.iter().map(|w| expr::as_const(*w)).collect();
+            match (decode_plain_string(&sized), fixed) {
+                (Some(text), _) => format!("\"{text}\""),
+                (None, Some(consts)) => {
+                    let bytes: Vec<u8> = consts.iter().flat_map(|c| c.to_be_bytes()).collect();
+                    let digits: Vec<String> = bytes[..(*len as usize).min(bytes.len())]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    format!("hex\"{}\"", digits.concat())
+                }
+                (None, None) if *len == 32 * words.len() as u64 => {
+                    let items: Vec<String> = words.iter().map(|w| fmt_expr(*w, n)).collect();
+                    format!("abi.encode({})", items.join(", "))
+                }
+                (None, None) => {
+                    let items: Vec<String> = words.iter().map(|w| fmt_expr(*w, n)).collect();
+                    format!("bytes{}(abi.encodePacked({}))", len, items.join(", "))
+                }
+            }
+        }
+        Arg::Copied { kind, src, len } => match *kind {
+            op::MCOPY => match bytes_value(*src, *len) {
+                Some(pointer) => format!("bytes({})", fmt_mem_off(pointer, n)),
+                None => format!("mem[{}:+{}]", fmt_mem_at(*src, n), fmt_expr(*len, n)),
+            },
+            _ => match code_text(*kind, *src, *len, n) {
+                Some(text) => format!("\"{text}\""),
+                None => format!(
+                    "{}[{}:+{}]",
+                    copy_source(*kind),
+                    fmt_expr(*src, n),
+                    fmt_expr(*len, n)
+                ),
+            },
+        },
+    }
+}
+
 fn fmt_call_head(head: &[ExprId], n: &Names) -> (Option<String>, Vec<String>) {
     let Some(sel) = head.first().and_then(|w| leading_selector(*w, None)) else {
         return (None, vec![]);
@@ -2684,6 +2734,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             input,
             input_head,
             layout,
+            args: decoded,
             result,
             ..
         } => {
@@ -2746,7 +2797,10 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 }
                 (None, None) => (None, vec![], "abi.encode"),
             };
-            if partial && fname.is_some() {
+            let whole = decoded.as_ref().filter(|_| fname.is_some());
+            if let Some(decoded) = whole {
+                args = decoded.iter().map(|a| fmt_call_arg(a, n)).collect();
+            } else if partial && fname.is_some() {
                 args.push("...".to_string());
             }
             let payload = match (&fname, known) {

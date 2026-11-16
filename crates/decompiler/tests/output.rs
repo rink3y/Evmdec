@@ -249,8 +249,8 @@ fn a_word_a_loop_may_have_written_through_an_index_is_not_the_fill_before_it() {
 #[test]
 fn a_stored_value_is_not_read_back_after_a_helper_wrote_what_it_was_made_from() {
     let out = text(
-        "60003560805261000d610026565b60805160010160a05261001e610026565b60a051600055005b6020\
-         3554608051016080523360015556",
+        "610007610020565b60805160010160a052610018610020565b60a051600055005b6020356100315733\
+         60805233600155565b3260805256",
     );
     assert!(out.contains("mem[0xa0] = mem[0x80] + 1;"), "{out}");
     assert!(out.contains("stor_0 = mem[0xa0];"), "{out}");
@@ -338,6 +338,43 @@ fn a_literal_copied_from_the_code_is_printed_as_its_text() {
     );
     assert!(
         out.contains("mem[0x80:+40] = \"ERC20: transfer amount exceeds allowance\";"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_call_is_printed_with_the_parts_its_head_points_at() {
+    let copied = text(
+        "63aabbccdd60e01b608052600435608452604060a45260443560c452604435606460e43760006000604435\
+         60640160806000335af15000",
+    );
+    assert!(
+        copied.contains(
+            ".call(abi.encodeWithSelector(func_aabbccdd.selector, arg0, msg.data[100:+arg2]));"
+        ),
+        "{copied}"
+    );
+    assert!(!copied.contains("mem[0x"), "{copied}");
+    let fixed = text(
+        "63aabbccdd60e01b608052600435608452606060a45260a060c452600560e4527f68656c6c6f0000000000\
+         0000000000000000000000000000000000000000000061010452600261012452336101445230610164\
+         526000600061010460806000335af15000",
+    );
+    assert!(
+        fixed.contains("func_aabbccdd.selector, arg0, \"hello\", [msg.sender, address(this)]));"),
+        "{fixed}"
+    );
+}
+
+#[test]
+fn a_word_that_only_looks_like_a_pointer_leaves_the_call_as_its_words() {
+    let out = text(
+        "63a9059cbb60e01b608052336084526040 60a45260006000604460806000335af15000"
+            .replace(' ', "")
+            .as_str(),
+    );
+    assert!(
+        out.contains("abi.encodeWithSelector(transfer.selector, msg.sender, 64)"),
         "{out}"
     );
 }

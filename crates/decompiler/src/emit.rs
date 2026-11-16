@@ -2427,6 +2427,14 @@ pub fn escape(s: &str) -> String {
     out
 }
 
+pub fn fmt_call_output(off: ExprId, len: ExprId, n: &Names) -> String {
+    let size = format!("min({}, returndatasize())", fmt_expr(len, n));
+    format!(
+        "mem[{}:+{size}] = returndata[0:+{size}];",
+        fmt_mem_at(off, n)
+    )
+}
+
 pub fn fmt_call_input(
     words: &[ExprId],
     in_len: Option<U256>,
@@ -2693,8 +2701,10 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 op::STATICCALL => "staticcall",
                 _ => "call",
             };
-            let known = input.is_some() || layout.is_some();
-            let partial = !known && !n.payload_overrides.borrow().contains_key(in_off);
+            // The built-in that copies memory reads as the copy printed after it.
+            let copy = expr::as_const(*addr) == Some(U256::from_u64(4));
+            let known = !copy && (input.is_some() || layout.is_some());
+            let partial = !copy && !known && !n.payload_overrides.borrow().contains_key(in_off);
             let tail = expr::as_const(*in_len).map_or(0, |l| (l.low_u64() % 32) as u8);
             let aligned = |words: &[ExprId]| -> Vec<(ExprId, u8)> {
                 let last = words.len() - 1;
@@ -2711,6 +2721,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             /* Code that ors the selector into the first word leaves no piece of four
             bytes. The words then still give the call when the selector is taken off. */
             let (fname, mut args, encoder) = match (usual, input) {
+                _ if copy => (None, vec![], "abi.encode"),
                 (Some(pieces), _) => fmt_call_pieces(pieces, n),
                 (None, Some(words)) => match fmt_call_input(words, expr::as_const(*in_len), n) {
                     (None, _) if layout.is_some() || (tail != 0 && !words.is_empty()) => {
@@ -2739,7 +2750,9 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 (None, false) => {
                     if expr::as_const(*in_len) == Some(U256::ZERO) {
                         "\"\"".into()
-                    } else if let Some(text) = n.payload_overrides.borrow().get(in_off) {
+                    } else if let Some(text) =
+                        n.payload_overrides.borrow().get(in_off).filter(|_| !copy)
+                    {
                         text.clone()
                     } else if let Some(pointer) = bytes_value(*in_off, *in_len) {
                         format!("bytes({})", fmt_mem_off(pointer, n))
@@ -2807,6 +2820,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             src,
             len,
             addr,
+            ..
         } => {
             let src_s = match addr {
                 Some(a) => format!(

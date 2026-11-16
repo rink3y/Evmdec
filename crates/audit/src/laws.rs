@@ -202,7 +202,7 @@ pub fn check(
         acted && c.arg_tags.iter().any(|t| t.only(crate::trace::CALLER))
     });
     let top = U256::ONE << 255;
-    for (cell, old, new, _, _) in run.stores() {
+    for (cell, old, new, tag, _) in run.stores() {
         // A value past half the range is a signed number below zero, not a holding.
         if !own(cell) || old >= top || new >= top {
             continue;
@@ -210,7 +210,13 @@ pub fn check(
         let place = facts.places.get(&cell.place());
         // Whether a record that rose is worth anything is for the caller to show by using it.
         let others = cell.keyed_by(USER) || cell.keyed_by(OWNER);
-        if actor_keyed(cell) && !others && new > old && paid_nothing && !gave_up && !paid_elsewhere
+        if actor_keyed(cell)
+            && !others
+            && new > old
+            && paid_nothing
+            && !gave_up
+            && !paid_elsewhere
+            && !made_up(&tag)
         {
             found.push(Breach {
                 amount: new - old,

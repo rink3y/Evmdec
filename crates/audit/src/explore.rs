@@ -74,6 +74,9 @@ pub struct State {
     pub acted: usize,
     // What the account with no role has given up of its own recorded claims so far.
     pub spent: U256,
+    /* The account got here by making a call that can be made only once by anyone. On a
+    contract in use that call has been made, so nothing found from here is reported. */
+    pub raced: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +338,7 @@ impl<'a> Explorer<'a> {
             steps: Vec::new(),
             acted: 0,
             spent: U256::ZERO,
+            raced: false,
         };
         Explorer {
             c,
@@ -778,12 +782,13 @@ impl<'a> Explorer<'a> {
             entry,
             msg: t.msg.clone(),
         });
-        let spent = parent.spent;
+        let (spent, raced) = (parent.spent, parent.raced);
         self.states.push(State {
             world,
             steps,
             acted: parent.acted + usize::from(actor),
             spent,
+            raced,
         });
         self.states.len() - 1
     }
@@ -793,11 +798,7 @@ impl<'a> Explorer<'a> {
     the owner's own call is refused for the lack of it and goes further with it. */
     fn settle(&mut self) {
         for _ in 0..4 {
-            // Set-up comes before any setting is taken, so that no setting is taken for the lack of it.
             let mut changed = false;
-            while self.setups.len() < 8 && self.set_up() {
-                changed = true;
-            }
             self.good = vec![None; self.entries.len()];
             let mut refused: Vec<(usize, Try, Run)> = Vec::new();
             // What works as things are is found first, so that no setting is taken that shuts it.
@@ -815,14 +816,30 @@ impl<'a> Explorer<'a> {
                     changed |= self.assume_targets(&run);
                     changed |= self.assume_owner(&best, &run, entry);
                     if run.ok {
-                        self.good[entry] = Some(best);
+                        // Remembered only if it can be made again. A call that works once says
+                        // nothing about whether what follows it shut the contract.
+                        let after = {
+                            let mut world = self.states[0].world.clone();
+                            world.send(&best.msg);
+                            world
+                        };
+                        let (_, again) = self.attempt_in(after, entry, &best);
+                        if again.ok {
+                            self.good[entry] = Some(best);
+                        }
                         break;
                     }
                     refused.push((entry, best, run));
                 }
             }
+            // Set-up comes before any setting is taken, so that no setting is taken for the lack of it.
+            let mut set_up = false;
+            while self.setups.len() < 8 && self.set_up() {
+                set_up = true;
+            }
+            changed |= set_up;
             for (entry, t, run) in refused {
-                if self.good[entry].is_none() {
+                if self.good[entry].is_none() && !set_up {
                     changed |= self.assume_from(&t, &run, entry);
                 }
             }
@@ -858,9 +875,12 @@ impl<'a> Explorer<'a> {
                     continue;
                 }
                 let (_, again) = self.attempt_in(world.clone(), entry, &t);
-                if again.ok {
+                // A call that can be made once and shuts what worked before it closes the
+                // contract down. Set-up opens it.
+                if again.ok || self.breaks_others(&world, entry) {
                     continue;
                 }
+                self.good[entry] = None;
                 self.novel(&run, &world);
                 self.states[0].world = world;
                 self.setups.push((entry, t.clone()));
@@ -1323,6 +1343,7 @@ impl<'a> Explorer<'a> {
             steps: Vec::new(),
             acted: 0,
             spent: U256::ZERO,
+            raced: false,
         });
         let at = self.states.len() - 1;
         let mut spent = false;
@@ -1370,6 +1391,7 @@ impl<'a> Explorer<'a> {
             steps: Vec::new(),
             acted: 0,
             spent: U256::ZERO,
+            raced: false,
         });
         let at = self.states.len() - 1;
         let mut lost = false;
@@ -1518,6 +1540,7 @@ impl<'a> Explorer<'a> {
                 steps,
                 acted: 0,
                 spent: U256::ZERO,
+                raced: false,
             });
             let at = self.states.len() - 1;
             for entry in 0..self.entries.len() {
@@ -1530,7 +1553,7 @@ impl<'a> Explorer<'a> {
                     }
                     let before = self.states[at].world.clone();
                     let (t, world, run) = self.solve(at, entry, Try::of(seed));
-                    if !run.ok {
+                    if !run.ok || self.once_for_all(&world, entry, &t, &run) {
                         continue;
                     }
                     let found =
@@ -1550,7 +1573,7 @@ impl<'a> Explorer<'a> {
     changed, and the finding is placed at the call that changed it. */
     fn used_after(&mut self) {
         let acted: Vec<usize> = (0..self.states.len())
-            .filter(|s| self.states[*s].acted > 0)
+            .filter(|s| self.states[*s].acted > 0 && !self.states[*s].raced)
             .collect();
         for from in acted.into_iter().take(MAX_STATES / 4) {
             let blamed = self.states[from].steps.iter().rev().find_map(|s| match s {
@@ -1583,6 +1606,24 @@ impl<'a> Explorer<'a> {
         }
     }
 
+    /* A call that fills plain cells it found empty and that nobody can make again is a
+    step of the contract's set-up or of its closing. Whoever makes it first wins a race
+    at deployment. On a contract in use it is not there to be made. */
+    fn once_for_all(&mut self, after: &World, entry: usize, t: &Try, run: &Run) -> bool {
+        let subject = self.subject;
+        let fills = run.stores().any(|(c, old, new, _, _)| {
+            c.account == subject && c.keys.is_empty() && old.is_zero() && !new.is_zero()
+        });
+        if !fills {
+            return false;
+        }
+        [t.msg.from, USER].into_iter().all(|who| {
+            let mut again = t.clone();
+            again.msg.from = who;
+            !self.attempt_in(after.clone(), entry, &again).1.ok
+        })
+    }
+
     fn attack(&mut self) {
         let mut frontier: Vec<usize> = (0..self.states.len()).collect();
         for _ in 0..ACTOR_DEPTH {
@@ -1601,7 +1642,9 @@ impl<'a> Explorer<'a> {
                         let (t, world, run) = self.solve(from, entry, Try::of(seed));
                         let handed = run.calls.iter().any(|c| c.by == Answered::Taken);
                         let mut plain = Vec::new();
-                        if run.ok {
+                        let race = run.ok && self.once_for_all(&world, entry, &t, &run);
+                        let open = !race && !self.states[from].raced;
+                        if run.ok && open {
                             let base = self.states[0].world.clone();
                             let spent = self.states[from].spent;
                             plain = laws::check(&base, &before, &world, &run, &self.facts, spent);
@@ -1615,7 +1658,7 @@ impl<'a> Explorer<'a> {
                             self.report(plain.clone(), entry, &steps, &run, (false, false));
                             self.takes_from_owner(from, entry, &t, &run);
                         }
-                        if handed {
+                        if handed && open {
                             self.reenter(from, entry, &t, &plain);
                         }
                         if run.ok
@@ -1627,6 +1670,7 @@ impl<'a> Explorer<'a> {
                             let lowered =
                                 laws::claims_lowered(&run, self.subject, &self.states[0].world);
                             self.states[at].spent = self.states[at].spent.wrapping_add(lowered);
+                            self.states[at].raced |= race;
                             next.push(at);
                             kept = true;
                         }

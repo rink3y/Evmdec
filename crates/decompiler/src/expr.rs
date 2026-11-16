@@ -56,6 +56,8 @@ struct Arena {
     depth: Vec<u32>,
     kinds: Vec<u16>,
     seq: u32,
+    // For a hash of bytes written at odd places, the values written and their widths.
+    pieces: HashMap<ExprId, Vec<(ExprId, u8)>>,
 }
 
 thread_local! {
@@ -754,6 +756,29 @@ pub fn size(e: ExprId) -> usize {
     go(e, &mut budget)
 }
 
+pub fn set_pieces(hash: ExprId, pieces: Vec<(ExprId, u8)>) {
+    ARENA.with(|a| a.borrow_mut().pieces.insert(hash, pieces));
+}
+
+pub fn pieces(hash: ExprId) -> Option<Vec<(ExprId, u8)>> {
+    ARENA.with(|a| a.borrow().pieces.get(&hash).cloned())
+}
+
+// The pieces of a hash follow it when its words are rewritten.
+fn rehashed(
+    old: ExprId,
+    words: Vec<ExprId>,
+    tail: u8,
+    again: &mut dyn FnMut(ExprId) -> ExprId,
+) -> ExprId {
+    let new = intern(Node::Keccak(words, tail));
+    if let Some(parts) = pieces(old).filter(|_| new != old) {
+        let parts = parts.into_iter().map(|(e, width)| (again(e), width));
+        set_pieces(new, parts.collect());
+    }
+    new
+}
+
 pub fn children(e: ExprId) -> Vec<ExprId> {
     match node(e) {
         Node::Op(_, v) | Node::Keccak(v, _) => v,
@@ -822,7 +847,7 @@ pub fn substitute(
         }
         Node::Keccak(v, t) => {
             let nv: Vec<ExprId> = v.iter().map(|x| substitute(*x, f, memo)).collect();
-            intern(Node::Keccak(nv, t))
+            rehashed(e, nv, t, &mut |x| substitute(x, f, memo))
         }
         Node::MLoad(a, ver) => intern(Node::MLoad(substitute(a, f, memo), ver)),
         Node::SLoad(a, t, ver) => intern(Node::SLoad(substitute(a, f, memo), t, ver)),
@@ -867,7 +892,7 @@ pub fn restamp(
         }
         Node::Keccak(v, t) => {
             let nv: Vec<ExprId> = v.iter().map(|x| again(*x)).collect();
-            intern(Node::Keccak(nv, t))
+            rehashed(e, nv, t, &mut again)
         }
         Node::MLoad(a, _) => intern(Node::MLoad(again(a), version)),
         Node::SLoad(a, t, ver) => intern(Node::SLoad(again(a), t, storage + ver.min(1))),

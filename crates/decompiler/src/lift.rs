@@ -2634,7 +2634,13 @@ impl<'a> Lifter<'a> {
                                 hidden.add(nid, st.mem.consumers(off, l as u64));
                                 match fold_keccak(&words, tail) {
                                     Some(h) => konst(h),
-                                    None => expr::intern(Node::Keccak(words, tail)),
+                                    None => {
+                                        let hash = expr::intern(Node::Keccak(words, tail));
+                                        if let Some(pieces) = st.mem.read_pieces(off, l as u64) {
+                                            expr::set_pieces(hash, pieces);
+                                        }
+                                        hash
+                                    }
                                 }
                             }
                             None => {

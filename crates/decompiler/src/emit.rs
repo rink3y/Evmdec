@@ -1786,6 +1786,14 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             fmt_slot(key, n, SlotSpace::from_transient(transient)),
             P_PRIMARY,
         ),
+        Node::Keccak(..) if expr::pieces(e).is_some() => {
+            let pieces = expr::pieces(e).unwrap_or_default();
+            let parts: Vec<String> = pieces.iter().map(|p| fmt_piece(p, n)).collect();
+            (
+                format!("keccak256(abi.encodePacked({}))", parts.join(", ")),
+                P_PRIMARY,
+            )
+        }
         Node::Keccak(words, tail) => {
             let mut parts: Vec<String> = Vec::new();
             for (i, w) in words.iter().enumerate() {
@@ -2479,28 +2487,34 @@ pub fn fmt_call_input(
 
 /* Call data that is not a selector and whole words has no abi.encode form of its true
 length. It is printed as packed bytes, each piece with its width. */
+fn fmt_piece((e, width): &(ExprId, u8), n: &Names) -> String {
+    let bits = 8 * u32::from(*width);
+    match (expr::as_const(*e), expr::node(*e)) {
+        _ if *width == 32 => fmt_expr(*e, n),
+        (Some(c), _) => format!("bytes{width}({})", c.to_hex_padded(usize::from(*width))),
+        (None, Node::Op(op::SHR, v)) if expr::as_const(v[0]) == Some(U256::from(256 - bits)) => {
+            format!("bytes{width}({})", fmt_expr(v[1], n))
+        }
+        // Packed, an address is its twenty bytes.
+        (None, Node::Env(op::CALLER | op::ADDRESS | op::ORIGIN | op::COINBASE, _))
+            if *width == 20 =>
+        {
+            fmt_expr(*e, n)
+        }
+        _ => match fmt_expr(*e, n) {
+            cast if cast.starts_with(&format!("uint{bits}(")) => {
+                format!("bytes{width}({cast})")
+            }
+            value => format!("bytes{width}(uint{bits}({value}))"),
+        },
+    }
+}
+
 fn fmt_call_pieces(
     pieces: &[(ExprId, u8)],
     n: &Names,
 ) -> (Option<String>, Vec<String>, &'static str) {
-    let piece = |(e, width): &(ExprId, u8)| -> String {
-        let bits = 8 * u32::from(*width);
-        match (expr::as_const(*e), expr::node(*e)) {
-            _ if *width == 32 => fmt_expr(*e, n),
-            (Some(c), _) => format!("bytes{width}({})", c.to_hex_padded(usize::from(*width))),
-            (None, Node::Op(op::SHR, v))
-                if expr::as_const(v[0]) == Some(U256::from(256 - bits)) =>
-            {
-                format!("bytes{width}({})", fmt_expr(v[1], n))
-            }
-            _ => match fmt_expr(*e, n) {
-                cast if cast.starts_with(&format!("uint{bits}(")) => {
-                    format!("bytes{width}({cast})")
-                }
-                value => format!("bytes{width}(uint{bits}({value}))"),
-            },
-        }
-    };
+    let piece = |p: &(ExprId, u8)| fmt_piece(p, n);
     let usual = pieces[0].1 == 4 && pieces[1..].iter().all(|(_, width)| *width == 32);
     let encoder = match usual && pieces.len() > 1 {
         true => "abi.encodeWithSelector",

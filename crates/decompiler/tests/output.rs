@@ -378,3 +378,12 @@ fn a_word_that_only_looks_like_a_pointer_leaves_the_call_as_its_words() {
         "{out}"
     );
 }
+
+#[test]
+fn a_hash_of_values_written_at_odd_places_is_printed_as_those_values() {
+    let out = text("61190160f01b60805260043560825260243560a252604260802060005500");
+    assert!(
+        out.contains("stor_0 = keccak256(abi.encodePacked(bytes2(0x1901), arg0, arg1));"),
+        "{out}"
+    );
+}

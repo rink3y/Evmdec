@@ -2427,6 +2427,9 @@ impl<'a> Explorer<'a> {
 
     fn readings(&mut self) {
         let mut paid = std::mem::take(&mut self.paid);
+        if self.trace {
+            eprintln!("readings: {} calls, work left {}", paid.len(), budget::left());
+        }
         // The same call is reported once, from the state fewest steps lead to.
         paid.sort_by_key(|(from, ..)| self.states[*from].steps.len());
         for (from, entry, t) in paid {
@@ -2446,15 +2449,27 @@ impl<'a> Explorer<'a> {
         let mut start = self.states[from].world.clone();
         start.noting = true;
         let (_, first) = self.attempt_in(start.clone(), entry, t);
+        if self.trace {
+            let name = &self.entries[entry].name;
+            let (ok, read) = (first.ok, first.read.len());
+            eprintln!("sway {name} from state {from}: ok={ok} readings={read}");
+        }
         if !first.ok || first.read.is_empty() {
             return;
         }
-        for (world, made, on) in self.steps_elsewhere(&start, &first) {
+        let steps = self.steps_elsewhere(&start, &first);
+        if self.trace {
+            eprintln!("  {} steps elsewhere", steps.len());
+        }
+        for (world, made, on) in steps {
             if budget::spent() {
                 return;
             }
             let (after, second) = self.attempt_in(world.clone(), entry, t);
             let found = laws::swayed(&first, &second, &after, &on);
+            if self.trace {
+                eprintln!("  after {made:?}: ok={} found={}", second.ok, found.len());
+            }
             if found.is_empty() {
                 continue;
             }
@@ -2518,6 +2533,22 @@ impl<'a> Explorer<'a> {
             });
             more || credited
         };
+        /* A call elsewhere that costs the account is a payment or a gift, and what the
+        contract pays after it may be what was bought or given. Only a plain send is
+        let through, since where that went is known. */
+        let costs = |before: &World, after: &World, run: &Run| {
+            let mut kinds: Vec<Option<Addr>> = vec![None];
+            kinds.extend(after.assets().into_iter().map(Some));
+            let held = |world: &World, kind: Option<Addr>| match kind {
+                Some(asset) => world.asset_of(asset, ACTOR),
+                None => world.ether_of(ACTOR),
+            };
+            let less = kinds.iter().any(|k| held(after, *k) < held(before, *k));
+            let lowered = run.changes().iter().any(|(cell, old, new, _, _)| {
+                (cell.keyed_by(ACTOR) || cell.keyed_by(ALLY)) && new < old
+            });
+            less || lowered
+        };
         let mut out = Vec::new();
         let mut bases: Vec<(World, Vec<Step>, Option<Addr>)> =
             vec![(start.clone(), Vec::new(), None)];
@@ -2553,7 +2584,8 @@ impl<'a> Explorer<'a> {
                         .changes()
                         .iter()
                         .any(|(cell, ..)| read.contains(&(cell.account, cell.slot)));
-                    if !run.ok || !moved || pays(&base, &world, &run) {
+                    let trade = pays(&base, &world, &run) || costs(&base, &world, &run);
+                    if !run.ok || !moved || trade {
                         continue;
                     }
                     let mut steps = made.clone();

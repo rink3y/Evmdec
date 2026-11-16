@@ -202,7 +202,26 @@ pub fn swayed(first: &Run, second: &Run, after: &World, acted_on: &[Addr]) -> Ve
         })
     };
     let same_given = gave == gives && lowered(first) == lowered(second);
-    if !first.ok || !second.ok || !same_given {
+    /* Where an account the step was made on pays out more than before, the extra may be
+    what the step put there or set free there. That is theirs, whoever hands it on. */
+    let paid_by = |run: &Run, kind: Option<Addr>| {
+        let pays = run.events.iter().filter_map(|e| match e {
+            Event::Pay {
+                asset,
+                from,
+                amount,
+                ..
+            } if *asset == kind && acted_on.contains(from) => Some(*amount),
+            _ => None,
+        });
+        pays.fold(U256::ZERO, |sum, amount| sum.wrapping_add(amount))
+    };
+    let mut kinds: Vec<Option<Addr>> = vec![None];
+    kinds.extend(after.assets().into_iter().map(Some));
+    let from_there = kinds
+        .iter()
+        .any(|k| paid_by(second, *k) > paid_by(first, *k));
+    if !first.ok || !second.ok || !same_given || from_there {
         return Vec::new();
     }
     let mut found = Vec::new();

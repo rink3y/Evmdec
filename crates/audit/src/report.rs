@@ -91,6 +91,8 @@ pub struct Report {
     pub functions: Vec<FunctionModel>,
     pub cells: Vec<CellModel>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub slots_in_code: Vec<crate::model::SlotInCode>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub assumed: Vec<String>,
     pub stats: Stats,
 }
@@ -662,6 +664,13 @@ pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
         chains,
         functions,
         cells,
+        slots_in_code: crate::model::slots_in_code(
+            ex.c,
+            &ex.entries
+                .iter()
+                .map(|e| (e.function, e.name.clone()))
+                .collect::<Vec<_>>(),
+        ),
         assumed: ex.assumed.clone(),
         stats: Stats {
             functions: ex.entries.len(),
@@ -756,6 +765,20 @@ pub fn markdown(report: &Report) -> String {
             out.push_str(&format!("- `{}`: {stopped}\n", f.name));
         }
     }
+    if !report.slots_in_code.is_empty() {
+        out.push_str("\n## How the code uses each fixed slot\n\nRead from the code. A slot one function writes and another compares its caller with, calls, or sends as an amount is where state flows between them. Entries kept under keys are not listed.\n\n| Slot | Written by | Compared with the caller in | Called in | Sent as an amount in | Read by |\n|---|---|---|---|---|---|\n");
+        for s in &report.slots_in_code {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} |\n",
+                s.slot,
+                s.written_by.join(", "),
+                s.compared_with_caller_in.join(", "),
+                s.called_in.join(", "),
+                s.sent_as_amount_in.join(", "),
+                s.read_by.join(", ")
+            ));
+        }
+    }
     out.push_str("\n## Storage as it was used\n\n| Slot | Keys | Used as | Written by | Anyone can write |\n|---|---|---|---|---|\n");
     for c in report.cells.iter().filter(|c| !c.used_as.is_empty()) {
         out.push_str(&format!(
@@ -789,6 +812,7 @@ pub fn merge(reports: Vec<Report>) -> Report {
             chains: Vec::new(),
             functions: Vec::new(),
             cells: Vec::new(),
+            slots_in_code: Vec::new(),
             assumed: Vec::new(),
             stats: Stats::default(),
         };

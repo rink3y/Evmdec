@@ -156,6 +156,102 @@ fn tests_caller(cond: expr::ExprId) -> bool {
     direct || (keyed && !weighed)
 }
 
+/* How one fixed storage slot is used across the entry functions, read from the code.
+This is the flow of state between functions: what one writes, another compares its
+caller with, calls, or sends. Entries kept under keys are not followed here. */
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SlotInCode {
+    pub slot: String,
+    pub written_by: Vec<String>,
+    pub read_by: Vec<String>,
+    pub compared_with_caller_in: Vec<String>,
+    pub called_in: Vec<String>,
+    pub sent_as_amount_in: Vec<String>,
+}
+
+fn fixed_slots(e: expr::ExprId, out: &mut BTreeSet<U256>) {
+    let mut todo = vec![e];
+    let mut seen: BTreeSet<expr::ExprId> = BTreeSet::new();
+    while let Some(x) = todo.pop() {
+        if !seen.insert(x) {
+            continue;
+        }
+        if let Node::SLoad(key, false, _) = expr::node(x) {
+            out.extend(expr::as_const(key));
+        }
+        todo.extend(expr::children(x));
+    }
+}
+
+#[must_use]
+pub fn slots_in_code(c: &Contract, entries: &[(usize, String)]) -> Vec<SlotInCode> {
+    let mut all: BTreeMap<U256, SlotInCode> = BTreeMap::new();
+    for (function, name) in entries {
+        let mut uses: [BTreeSet<U256>; 5] = Default::default();
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        let mut todo = vec![*function];
+        while let Some(index) = todo.pop() {
+            let Some(lifted) = c.functions.get(index).and_then(|f| f.lifted.as_ref()) else {
+                continue;
+            };
+            if !seen.insert(index) {
+                continue;
+            }
+            for node in &lifted.nodes {
+                for e in evmdec::lift::node_exprs(node) {
+                    fixed_slots(e, &mut uses[1]);
+                }
+                for stmt in &node.stmts {
+                    match stmt {
+                        Stmt::SStore {
+                            key,
+                            transient: false,
+                            ..
+                        } => {
+                            uses[0].extend(expr::as_const(*key));
+                        }
+                        Stmt::Call { addr, value, .. } => {
+                            fixed_slots(*addr, &mut uses[3]);
+                            if let Some(value) = value {
+                                fixed_slots(*value, &mut uses[4]);
+                            }
+                        }
+                        Stmt::Require { cond, .. } if tests_caller(*cond) => {
+                            fixed_slots(*cond, &mut uses[2]);
+                        }
+                        Stmt::Internal { callee, .. } => {
+                            todo.extend(c.functions.iter().position(|f| f.pc == *callee));
+                        }
+                        _ => {}
+                    }
+                }
+                if let Term::Branch { cond, .. } | Term::CondJump { cond, .. } = &node.term {
+                    if tests_caller(*cond) {
+                        fixed_slots(*cond, &mut uses[2]);
+                    }
+                }
+            }
+        }
+        for (kind, slots) in uses.iter().enumerate() {
+            for slot in slots {
+                let entry = all.entry(*slot).or_insert_with(|| SlotInCode {
+                    slot: slot.to_hex(),
+                    ..SlotInCode::default()
+                });
+                let list = match kind {
+                    0 => &mut entry.written_by,
+                    1 => &mut entry.read_by,
+                    2 => &mut entry.compared_with_caller_in,
+                    3 => &mut entry.called_in,
+                    _ => &mut entry.sent_as_amount_in,
+                };
+                list.push(name.clone());
+            }
+        }
+    }
+    all.into_values().collect()
+}
+
 #[must_use]
 pub fn in_code(c: &Contract, function: usize) -> InCode {
     let mut found = InCode::default();
@@ -425,6 +521,19 @@ mod tests {
         assert!(!set_owner.tests_caller && set_owner.writes == vec!["0x0".to_string()]);
         // deposit() weighs the caller's balance in an overflow check, which tests nobody.
         assert!(!of("0xd0e30db0").tests_caller);
+        let entry = |selector: &str| {
+            let at = |f: &evmdec::decompile::Function| f.selector.as_deref() == Some(selector);
+            let index = contract.functions.iter().position(at).expect("function");
+            (index, selector.to_string())
+        };
+        let slots = slots_in_code(&contract, &[entry("0x13af4035"), entry("0x839006f2")]);
+        // The open setter writes the slot the guarded function compares its caller with.
+        assert_eq!(slots[0].slot, "0x0");
+        assert_eq!(slots[0].written_by, vec!["0x13af4035".to_string()]);
+        assert_eq!(
+            slots[0].compared_with_caller_in,
+            vec!["0x839006f2".to_string()]
+        );
     }
 
     #[test]

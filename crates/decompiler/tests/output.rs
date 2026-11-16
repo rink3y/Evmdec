@@ -482,3 +482,23 @@ fn a_value_under_the_mask_one_is_a_bit_test_and_no_logical_and() {
     assert!(out.contains("return (stor_27[msg.sender] & 1);"), "{out}");
     assert!(!out.contains("&&"), "{out}");
 }
+
+#[test]
+fn the_overflow_test_of_a_folded_helper_is_told_by_its_sum_or_printed() {
+    let sum = text(
+        "60806040526100116004356001610025565b5f556100206024356003610025565b600155005b8067ffff\
+         ffffffffffff03821161003a570190565b634e487b7160e01b5f52601160045260245ffd",
+    );
+    assert!(sum.contains("stor_0 = arg0 + 1;"), "{sum}");
+    assert!(!sum.contains("unchecked("), "{sum}");
+    let product = text(
+        "60806040526100116004356001610025565b5f556100206024356003610025565b600155005b8067ffff\
+         ffffffffffff03821161003a570290565b634e487b7160e01b5f52601160045260245ffd",
+    );
+    let test = "require(arg1 <= 0xfffffffffffffffc, Panic(arithmetic overflow));";
+    assert!(product.contains(test), "{product}");
+    assert!(
+        product.contains("stor_1 = unchecked(arg1 * 3);"),
+        "{product}"
+    );
+}

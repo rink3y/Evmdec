@@ -1,6 +1,6 @@
 use crate::expr::{self, kind, ExprId, Node};
 use crate::keccak;
-use crate::lift::{Lifted, Stmt, Term, FREE_POINTER};
+use crate::lift::{self, Lifted, Stmt, Term, FREE_POINTER};
 use crate::opcode as op;
 use crate::sigs;
 use crate::u256::U256;
@@ -157,6 +157,33 @@ pub type Site = (usize, usize);
 pub struct Checked {
     ops: HashMap<ExprId, Vec<Site>>,
     divisors: HashMap<ExprId, Vec<Site>>,
+    untold: HashSet<ExprId>,
+    limits: HashMap<ExprId, Vec<(U256, Option<Site>)>>,
+}
+
+impl Checked {
+    /* A product with a constant is tested by holding the other factor to the largest
+    value of a type divided by that constant. The division is done when the code is
+    compiled, so only the quotient is left to compare with. */
+    fn product_limit(&self, e: ExprId) -> Option<Vec<Site>> {
+        let Node::Op(op::MUL, v) = expr::node(e) else {
+            return None;
+        };
+        let mut sites: Option<Vec<Site>> = None;
+        for (x, k) in [(v[0], v[1]), (v[1], v[0])] {
+            let Some(k) = expr::as_const(k).filter(|k| !k.is_zero()) else {
+                continue;
+            };
+            let fits =
+                |limit: &U256| (1..=32u32).any(|bytes| expr::mask_bits(8 * bytes) / k == *limit);
+            for (limit, site) in self.limits.get(&x).into_iter().flatten() {
+                if fits(limit) {
+                    sites.get_or_insert_with(Vec::new).extend(site);
+                }
+            }
+        }
+        sites
+    }
 }
 
 fn tested(set: &mut HashMap<ExprId, Vec<Site>>, e: ExprId, site: Option<Site>) {
@@ -240,6 +267,10 @@ pub fn checked_ops(l: &Lifted) -> Checked {
                                     tested(&mut found.ops, x, site);
                                 }
                             },
+                            // A division by a power of two is lifted as a shift.
+                            Node::Op(op::SHR, d) if doubled_by(d[1], d[0]) => {
+                                tested(&mut found.ops, d[1], site);
+                            }
                             Node::Op(..) => {
                                 tested(&mut found.ops, x, site);
                             }
@@ -279,8 +310,17 @@ pub fn checked_ops(l: &Lifted) -> Checked {
                         if c.is_zero() {
                             tested(&mut found.divisors, x, site);
                         } else if c != max {
-                            let room = expr::konst(max.wrapping_sub(c));
-                            tested(&mut found.ops, expr::op2(op::ADD, x, room), site);
+                            found.limits.entry(x).or_default().push((c, site));
+                            /* The limit is the largest value of a type less what is
+                            added. The type is not known, so each width stands. */
+                            for bytes in (c.byte_len().max(1) as u32)..=32 {
+                                let top = expr::mask_bits(8 * bytes);
+                                if top == c {
+                                    continue;
+                                }
+                                let room = expr::konst(top.wrapping_sub(c));
+                                tested(&mut found.ops, expr::op2(op::ADD, x, room), site);
+                            }
                             let negated = expr::op2(op::SUB, expr::konst(U256::ZERO), x);
                             tested(&mut found.ops, negated, site);
                         }
@@ -299,7 +339,73 @@ pub fn checked_ops(l: &Lifted) -> Checked {
             }
         }
     }
+    found.untold = untold_tests(l, &found, &code);
     found
+}
+
+/* A test that is left out is told by the operator it guards printing bare. When that
+operator stands nowhere in the function nothing tells the test, so it has to be printed. */
+fn untold_tests(
+    l: &Lifted,
+    found: &Checked,
+    code: &dyn Fn(&Option<Vec<ExprId>>) -> Option<u64>,
+) -> HashSet<ExprId> {
+    let mut printed: HashSet<ExprId> = HashSet::new();
+    let mut pending: Vec<ExprId> = Vec::new();
+    for nd in &l.nodes {
+        for s in &nd.stmts {
+            match s {
+                Stmt::Drop(_) => {}
+                Stmt::Require { data, .. } if code(data).is_some() => {}
+                _ => pending.extend(lift::stmt_exprs(s)),
+            }
+        }
+        pending.extend(lift::term_exprs(&nd.term));
+    }
+    pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
+    while let Some(e) = pending.pop() {
+        if printed.insert(e) {
+            pending.extend(expr::children(e));
+        }
+    }
+    let mut told: HashSet<Site> = HashSet::new();
+    for e in &printed {
+        let Node::Op(o, v) = expr::node(*e) else {
+            continue;
+        };
+        let quotient = matches!(o, op::DIV | op::SDIV | op::MOD | op::SMOD);
+        if quotient || matches!(o, op::ADD | op::SUB | op::MUL) {
+            told.extend(found.ops.get(e).into_iter().flatten());
+            told.extend(found.product_limit(*e).into_iter().flatten());
+        }
+        if quotient {
+            told.extend(found.divisors.get(&v[1]).into_iter().flatten());
+        }
+    }
+    let mut untold = HashSet::new();
+    for nd in &l.nodes {
+        for (i, s) in nd.stmts.iter().enumerate() {
+            if let Stmt::Require { cond, data, .. } = s {
+                let overflow = matches!(code(data), Some(PANIC_OVERFLOW | PANIC_DIV_BY_ZERO));
+                if overflow && !told.contains(&(nd.id, i)) {
+                    untold.insert(*cond);
+                }
+            }
+        }
+    }
+    untold
+}
+
+fn doubled_by(product: ExprId, shift: ExprId) -> bool {
+    let (Node::Op(op::MUL, m), Some(k)) = (expr::node(product), expr::as_const(shift)) else {
+        return false;
+    };
+    let factor = |x: &ExprId| {
+        expr::as_const(*x).is_some_and(|c| {
+            c.is_power_of_two() && k.fits_u64() && u64::from(c.trailing_zeros()) == k.low_u64()
+        })
+    };
+    m.iter().any(factor)
 }
 
 fn konst_max() -> U256 {
@@ -494,7 +600,10 @@ impl Names {
         };
         let (tested, safe) = match expr::node(e) {
             Node::Op(op::ADD | op::SUB, _) => (checked.ops.contains_key(&e), false),
-            Node::Op(op::MUL, v) => (checked.ops.contains_key(&e), v.iter().any(|x| shift(*x))),
+            Node::Op(op::MUL, v) => (
+                checked.ops.contains_key(&e) || checked.product_limit(e).is_some(),
+                v.iter().any(|x| shift(*x)),
+            ),
             Node::Op(op::DIV | op::SDIV | op::MOD | op::SMOD, v) => (
                 checked.ops.contains_key(&e) || checked.divisors.contains_key(&v[1]),
                 expr::as_const(v[1]).is_some_and(|c| !c.is_zero()) || shift(v[1]),
@@ -556,6 +665,7 @@ impl Names {
             return Vec::new();
         };
         let mut sites = checked.ops.get(&e).cloned().unwrap_or_default();
+        sites.extend(checked.product_limit(e).into_iter().flatten());
         if let Node::Op(op::DIV | op::SDIV | op::MOD | op::SMOD, v) = expr::node(e) {
             sites.extend(checked.divisors.get(&v[1]).into_iter().flatten());
         }
@@ -592,6 +702,20 @@ impl Names {
                     set.entry(e).or_insert(sites);
                 }
             }
+            let renamed: Vec<(ExprId, Vec<(U256, Option<Site>)>)> = checked
+                .limits
+                .iter()
+                .map(|(e, l)| (expr::substitute(*e, &named, &mut memo), l.clone()))
+                .collect();
+            for (e, limits) in renamed {
+                checked.limits.entry(e).or_insert(limits);
+            }
+            let renamed: Vec<ExprId> = checked
+                .untold
+                .iter()
+                .map(|e| expr::substitute(*e, &named, &mut memo))
+                .collect();
+            checked.untold.extend(renamed);
         }
         for (target, var) in bindings {
             if self.is_base(expr::intern(target.clone()), 0) {
@@ -1007,7 +1131,7 @@ pub fn is_hidden_require(cond: ExprId, data: Option<&[ExprId]>, n: &Names) -> bo
     if is_abi_validator(cond) {
         return true;
     }
-    if !n.hide_checked {
+    if !n.hide_checked || n.checked.as_ref().is_some_and(|c| c.untold.contains(&cond)) {
         return false;
     }
     let Some(words) = data else {

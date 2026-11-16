@@ -123,6 +123,7 @@ pub struct Names {
     pub stale: RefCell<HashMap<ExprId, String>>,
     pub block_stale: RefCell<Vec<ExprId>>,
     pub forwarded: RefCell<HashMap<ExprId, String>>,
+    pub forward_places: RefCell<HashMap<ExprId, ExprId>>,
     pub temp_seq: RefCell<u32>,
     pub seqs: RefCell<HashMap<u32, u32>>,
     pub vars: RefCell<HashMap<u32, u32>>,
@@ -748,8 +749,9 @@ impl Names {
         self.replace_stale(loads);
     }
 
-    pub fn forward(&self, value: ExprId, name: String) {
+    pub fn forward(&self, value: ExprId, name: String, place: ExprId) {
         self.forwarded.borrow_mut().insert(value, name);
+        self.forward_places.borrow_mut().insert(value, place);
         self.memo.borrow_mut().clear();
     }
 

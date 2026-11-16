@@ -502,3 +502,11 @@ fn the_overflow_test_of_a_folded_helper_is_told_by_its_sum_or_printed() {
         "{product}"
     );
 }
+
+#[test]
+fn a_variable_stored_in_a_loop_is_advanced_under_its_own_name() {
+    let out = text("6004355f5b8061010011610013576101005ff35b8181529060a0019060200161000456");
+    assert!(out.contains("mem[v2] = v1;"), "{out}");
+    assert!(out.contains("v1 = v1 + 160;"), "{out}");
+    assert!(!out.contains("mem[v2] = mem[v2] + 160;"), "{out}");
+}

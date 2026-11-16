@@ -322,7 +322,7 @@ struct Printer<'a> {
     scope: HashMap<usize, Vec<(ExprId, String)>>,
     left: HashMap<usize, HashMap<ExprId, String>>,
     given: HashMap<(ExprId, String), usize>,
-    stored: Vec<(usize, String, ExprId)>,
+    stored: Vec<(usize, String, ExprId, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
     memory_reads: Vec<Vec<(usize, Span)>>,
     // Filled while the printer's &self methods run, hence the cell.
@@ -701,7 +701,11 @@ fn memory_forward(stmts: &[Stmt], i: usize) -> Option<ExprId> {
                 | Stmt::Internal { .. }
         )
     };
-    let plain = *gen > 0 && !expr::is_const(*val) && !stmts[i + 1..].iter().any(writes_memory);
+    // A variable has a name of its own, and the word would be printed where the variable
+    // is assigned again.
+    let named = matches!(expr::node(*val), Node::Var(_));
+    let plain =
+        *gen > 0 && !expr::is_const(*val) && !named && !stmts[i + 1..].iter().any(writes_memory);
     plain.then_some(*val)
 }
 
@@ -2518,10 +2522,13 @@ impl<'a> Printer<'a> {
 
     fn refresh_forwarded(&self, n: usize) {
         let mut fw = self.names.forwarded.borrow_mut();
+        let mut places = self.names.forward_places.borrow_mut();
         fw.clear();
-        for (node, name, val) in &self.stored {
+        places.clear();
+        for (node, name, val, key) in &self.stored {
             if *node != n && self.g.dominates(*node, n) {
                 fw.insert(*val, name.clone());
+                places.insert(*val, *key);
             }
         }
     }
@@ -2697,7 +2704,7 @@ impl<'a> Printer<'a> {
                 (s, memory_forward(&self.l.nodes[n].stmts, i))
             {
                 let word = emit::fmt_mem_word(*off, self.names);
-                self.names.forward(val, word);
+                self.names.forward(val, word, *off);
             }
             if let Stmt::SStore {
                 key,
@@ -2707,12 +2714,13 @@ impl<'a> Printer<'a> {
             } = s
             {
                 let name = emit::fmt_slot(*key, self.names, emit::SlotSpace::Persistent);
-                self.stored.retain(|(_, nm, _)| *nm != name);
+                self.stored.retain(|(_, nm, _, _)| *nm != name);
                 let mut fw = self.names.forwarded.borrow_mut();
                 fw.retain(|_, nm| *nm != name);
                 if !expr::is_const(*val) && has_operations(*val, 1) {
-                    self.stored.push((n, name.clone(), *val));
+                    self.stored.push((n, name.clone(), *val, *key));
                     fw.insert(*val, name);
+                    self.names.forward_places.borrow_mut().insert(*val, *key);
                 }
             }
         }
@@ -2745,6 +2753,11 @@ impl<'a> Printer<'a> {
                         }
                         if x != *var {
                             read.extend(writers.get(&x).into_iter().flatten().copied());
+                        }
+                        // A value printed as the place it was stored at reads what the
+                        // place is made of.
+                        if self.names.forwarded.borrow().contains_key(&x) {
+                            stack.extend(self.names.forward_places.borrow().get(&x));
                         }
                         stack.extend(expr::children(x));
                     }

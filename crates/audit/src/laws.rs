@@ -103,12 +103,13 @@ acted. A record it built by paying in during these calls is already counted as w
 paid, so only the part of a fall that goes below the starting level counts here. */
 #[must_use]
 pub fn claims_lowered(run: &Run, subject: Addr, base: &World) -> U256 {
-    let own = run.stores().filter(|(c, old, new, _, _)| {
+    let changes = run.changes();
+    let own = changes.iter().filter(|(c, old, new, _, _)| {
         c.account == subject && (c.keyed_by(ACTOR) || c.keyed_by(ALLY)) && new < old
     });
     own.fold(U256::ZERO, |sum, (cell, old, new, _, _)| {
         let started = base.stored(subject, cell.slot);
-        sum.wrapping_add(old.min(started) - new.min(started))
+        sum.wrapping_add(*old.min(&started) - *new.min(&started))
     })
 }
 
@@ -168,8 +169,9 @@ pub fn check(
 
     let ledger = |cell: &Cell| facts.places.get(&cell.place()).is_some_and(|p| p.ledger());
     let own = |cell: &Cell| cell.account == subject;
+    let changes = run.changes();
     let rose_for = |who: Addr| {
-        let mut stores = run.stores();
+        let mut stores = changes.iter();
         stores.any(|(c, old, new, _, _)| own(c) && ledger(c) && c.keyed_by(who) && new > old)
     };
     for victim in [USER, OWNER] {
@@ -194,7 +196,7 @@ pub fn check(
         .iter()
         .all(|a| of_party(after, *a) >= of_party(base, *a));
     let actor_keyed = |c: &Cell| c.keyed_by(ACTOR) || c.keyed_by(ALLY);
-    let mut stores = run.stores();
+    let mut stores = changes.iter();
     let gave_up =
         stores.any(|(c, old, new, _, _)| own(c) && ledger(c) && actor_keyed(c) && new < old);
     /* The contract told another contract to do something with the caller's address in
@@ -207,13 +209,13 @@ pub fn check(
     /* What fell, in this call, in records kept under the account's own address. A rise
     in one of its records that is no more than that is its own claim moved from one
     record to another. */
-    let moved = run
-        .stores()
+    let moved = changes
+        .iter()
         .filter(|(c, old, new, _, _)| own(c) && actor_keyed(c) && new < old && *old < top)
         .fold(U256::ZERO, |sum, (_, old, new, _, _)| {
-            sum.wrapping_add(old - new)
+            sum.wrapping_add(*old - *new)
         });
-    for (cell, old, new, tag, _) in run.stores() {
+    for (cell, old, new, tag, _) in changes.iter().copied() {
         // A value past half the range is a signed number below zero, not a holding.
         if !own(cell) || old >= top || new >= top {
             continue;

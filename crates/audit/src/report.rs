@@ -425,8 +425,13 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
                 (Kind::Debit, Some(victim)) => consent(run, victim),
                 _ => "",
             };
+            let writes = run.stores().filter(|(c, ..)| Some(*c) == cell).count();
+            let twice = match writes > 1 {
+                true => " The call writes this one entry more than once, and the last write is worked out from what the entry held before the first, so the first write is lost. That happens when the call names the same account on both sides.",
+                false => "",
+            };
             let cause = format!(
-                "The call writes {keyed} in {name}. What it writes is {}.{}{agreed} {tests}{again}",
+                "The call writes {keyed} in {name}. What it writes is {}.{}{twice}{agreed} {tests}{again}",
                 source(tag, run),
                 wrapped(run, tag)
             );

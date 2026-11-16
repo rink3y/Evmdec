@@ -1,4 +1,5 @@
 use evmdec::U256;
+use std::collections::HashMap;
 
 pub const CALLER: u16 = 1;
 pub const ORIGIN: u16 = 1 << 1;
@@ -296,6 +297,35 @@ impl Run {
             } => Some((&self.cells[*cell], *old, *new, *tag, *pc)),
             _ => None,
         })
+    }
+
+    /* What each cell held when the call began and when it ended, for the cells that ended
+    different. A cell written twice in one call is judged by where it ended, since a
+    record that falls and then rises higher has not been given up. */
+    #[must_use]
+    pub fn changes(&self) -> Vec<(&Cell, U256, U256, Tag, usize)> {
+        let mut order: Vec<usize> = Vec::new();
+        let mut ends: HashMap<usize, (U256, U256, Tag, usize)> = HashMap::new();
+        for event in &self.events {
+            if let Event::Store {
+                cell,
+                old,
+                new,
+                tag,
+                pc,
+            } = event
+            {
+                let seen = ends.entry(*cell).or_insert_with(|| {
+                    order.push(*cell);
+                    (*old, *new, *tag, *pc)
+                });
+                (seen.1, seen.2, seen.3) = (*new, *tag, *pc);
+            }
+        }
+        let net = order.into_iter().map(|cell| (cell, ends[&cell]));
+        net.filter(|(_, (old, new, _, _))| old != new)
+            .map(|(cell, (old, new, tag, pc))| (&self.cells[cell], old, new, tag, pc))
+            .collect()
     }
 
     pub fn loads(&self) -> impl Iterator<Item = (&Cell, U256)> {

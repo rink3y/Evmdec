@@ -2396,6 +2396,13 @@ impl<'a> Explorer<'a> {
                 let lowered = laws::claims_lowered(&run, self.subject, &self.states[0].world);
                 self.states[at].spent = self.states[at].spent.wrapping_add(lowered);
                 self.states[at].raced |= race;
+                /* What another contract writes down for the account rests on the purse
+                this world handed it. What it then draws on that is not taken from anyone. */
+                let keyed = |c: &crate::trace::Cell| c.keyed_by(ACTOR) || c.keyed_by(ALLY);
+                let credited = |c: &(&crate::trace::Cell, U256, U256, Tag, usize)| {
+                    c.0.account != self.subject && keyed(c.0) && c.2 > c.1
+                };
+                self.states[at].granted |= !own && run.changes().iter().any(credited);
                 next.push(at);
                 kept = true;
             }

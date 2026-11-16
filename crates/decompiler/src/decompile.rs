@@ -1868,6 +1868,7 @@ pub fn make_names(
             .as_ref()
             .filter(|_| callees.free_pointer)
             .map(emit::number_blocks),
+        in_helper: matches!(f.kind, FnKind::Internal | FnKind::Orphan),
         ..Default::default()
     };
     if f.kind != FnKind::Internal {

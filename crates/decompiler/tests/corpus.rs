@@ -936,3 +936,20 @@ fn a_selector_compared_in_place_is_read_from_the_high_bytes() {
     );
     assert!(!proxy.contains("msg.sig == 0x00000000"));
 }
+
+#[test]
+fn a_call_data_word_read_in_a_helper_is_not_named_like_its_parameters() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/oneinch_v6.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+    let router = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
+    let start = router
+        .find("function func_0x216b(int256 arg0, int256 arg1)")
+        .expect("the callback");
+    let body = &router[start..start + router[start..].find("\n    }").unwrap()];
+    assert!(
+        body.contains("if (calldata[132] == address(this)) {"),
+        "the payer comes from the call data, not from what the caller passed: {body}"
+    );
+    assert!(!body.contains("arg4") && !body.contains("arg5"));
+}

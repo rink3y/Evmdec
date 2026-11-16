@@ -106,6 +106,7 @@ pub enum PayloadKind {
 pub struct Names {
     pub callee_reads: Option<std::sync::Arc<HashMap<usize, crate::lift::MemoryReads>>>,
     pub params: HashMap<u32, String>,
+    pub in_helper: bool,
     pub aliases: HashMap<ExprId, String>,
     pub fields: HashMap<(U256, u32, u32), String>,
     pub args: HashMap<u32, String>,
@@ -1289,7 +1290,8 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
         ),
         Node::Unknown(u) => (format!("unknown_{}", n.seq(u)), P_PRIMARY),
         Node::CallDataLoad(off) => {
-            if let Some(i) = calldata_word_index(off) {
+            // Inside a helper the name argN is taken by what the caller passed.
+            if let Some(i) = calldata_word_index(off).filter(|_| !n.in_helper) {
                 return (
                     n.params
                         .get(&i)

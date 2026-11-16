@@ -170,3 +170,12 @@ fn a_caller_that_has_to_be_a_contract_is_the_accounts_own() {
     kinds.sort();
     assert_eq!(kinds, vec![Kind::Gain, Kind::Loss], "{:?}", report.findings);
 }
+
+#[test]
+fn words_an_amount_paid_is_worked_out_from_are_all_amounts() {
+    // pay(bytes) sends one word of its record and then, unchecked, the second less the first.
+    let report = report("Split.hex");
+    let kinds: Vec<Kind> = report.findings.iter().map(|f| f.kind).collect();
+    assert_eq!(kinds, vec![Kind::Gain], "{:?}", report.findings);
+    assert_eq!(report.findings[0].selector.as_deref(), Some("0x6eda12f8"));
+}

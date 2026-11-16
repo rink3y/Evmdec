@@ -74,15 +74,19 @@ impl Laid {
         self.spots.iter().find(|s| within.contains(&s.at))
     }
 
+    // Every part of the call data a word was worked out from.
+    #[must_use]
+    pub fn behind(&self, tag: Tag) -> Vec<&Spot> {
+        let words = (0..DATA_WORDS).filter(|w| tag.has(DATA) && tag.words >> w & 1 == 1);
+        let spots = words.filter_map(|w| self.spot_at(w));
+        spots.filter(|s| s.role != Role::Head).collect()
+    }
+
     /* The part of the call data a word came from. A word reached through an offset
     carries the offset's place too, and an offset is never what a test is about. */
     #[must_use]
     pub fn about(&self, tag: Tag, seen: U256) -> Option<&Spot> {
-        let words = (0..DATA_WORDS).filter(|w| tag.has(DATA) && tag.words >> w & 1 == 1);
-        let found: Vec<&Spot> = words
-            .filter_map(|w| self.spot_at(w))
-            .filter(|s| s.role != Role::Head)
-            .collect();
+        let found = self.behind(tag);
         let exact = found.iter().find(|s| self.held(s) == seen).copied();
         // A word that starts off the grid lies across two words of the call data.
         let single = found.len() == 1 || found.first().is_some_and(|s| s.at % 32 != 4);

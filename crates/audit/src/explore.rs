@@ -534,11 +534,15 @@ impl<'a> Explorer<'a> {
             };
             shown.push((call.to_tag, call.to, holds));
             shown.push((call.value_tag, call.value, Holds::Amount));
-            for named in world::accounts_named(&call.input) {
-                let seen = call.input.get(4 + 32 * named..36 + 32 * named);
-                let tag = call.arg_tags.get(*named);
-                if let (Answered::Books, Some(seen), Some(tag)) = (call.by, seen, tag) {
-                    shown.push((*tag, U256::from_be_bytes(seen), Holds::Address));
+            let named = world::accounts_named(&call.input);
+            for (at, tag) in call.arg_tags.iter().enumerate() {
+                let seen = call.input.get(4 + 32 * at..36 + 32 * at);
+                let holds = match named.contains(&at) {
+                    true => Holds::Address,
+                    false => Holds::Amount,
+                };
+                if let (Answered::Books, Some(seen)) = (call.by, seen) {
+                    shown.push((*tag, U256::from_be_bytes(seen), holds));
                 }
             }
         }
@@ -561,12 +565,17 @@ impl<'a> Explorer<'a> {
         }
         let laid = t.shape.layout();
         for (tag, seen, holds) in shown {
-            let spot = laid.about(tag, seen).filter(|s| s.role == Role::Value);
-            let node = spot.and_then(|s| self.entries[entry].shape.node_mut(&s.path));
-            match (node, holds) {
-                (Some(Node::Word(kind, _)), Holds::Callee) => *kind = holds,
-                (Some(Node::Word(kind @ Holds::Other, _)), _) => *kind = holds,
-                _ => {}
+            // An amount worked out from several words is worked out from amounts.
+            let spots = match holds {
+                Holds::Amount => laid.behind(tag),
+                _ => laid.about(tag, seen).into_iter().collect(),
+            };
+            for spot in spots.into_iter().filter(|s| s.role == Role::Value) {
+                match (self.entries[entry].shape.node_mut(&spot.path), holds) {
+                    (Some(Node::Word(kind, _)), Holds::Callee) => *kind = holds,
+                    (Some(Node::Word(kind @ Holds::Other, _)), _) => *kind = holds,
+                    _ => {}
+                }
             }
         }
     }

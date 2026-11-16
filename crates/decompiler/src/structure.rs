@@ -593,7 +593,6 @@ fn span(off: ExprId, len: ExprId) -> Option<Span> {
     Some((base, d, d.saturating_add(len)))
 }
 
-// Reads of memory whose place and length the code fixes, each as a base and a range from it.
 fn memory_reads(l: &Lifted) -> Vec<Span> {
     let word = expr::konst_u64(32);
     let mut out: Vec<Span> = Vec::new();

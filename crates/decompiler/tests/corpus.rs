@@ -1239,7 +1239,8 @@ fn call_data_is_the_bytes_the_writes_left_under_one_pointer_name() {
     let token = regress("minime_token.hex").source;
     assert!(
         token.contains("mem[ptr1 + 68] = address(this);")
-            && token.contains("address(target).call(mem[ptr1:v1]);"),
+            && token
+                .contains("address(target).call(abi.encodeWithSelector(func_8f4ffcb1.selector, "),
         "the buffer written is the buffer sent"
     );
     let dvn = regress("layerzero_dvn.hex").source;
@@ -1410,4 +1411,13 @@ fn what_calls_return_into_memory_that_is_hashed_is_printed() {
         let line = format!("mem[ptr1 + {at}:+min(32, returndatasize())] = returndata[0:+");
         assert!(body.contains(&line), "{line}\n{body}");
     }
+}
+
+#[test]
+fn a_store_past_a_length_rounded_down_does_not_hide_the_head_of_call_data() {
+    let token = regress("minime_token.hex").source;
+    assert!(
+        token.contains(".call(abi.encodeWithSelector(func_8f4ffcb1.selector, msg.sender, value, address(this), ...));"),
+        "{token}"
+    );
 }

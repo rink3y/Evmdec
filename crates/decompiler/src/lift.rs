@@ -563,6 +563,31 @@ fn wild_base(b: ExprId) -> bool {
     expr::holds(b, !(kind::CONST | kind::OP | kind::MLOAD))
 }
 
+fn rounded_down(sum: ExprId, low: ExprId) -> Option<Vec<ExprId>> {
+    let Node::Op(op::AND, m) = expr::node(low) else {
+        return None;
+    };
+    let [a, b] = m[..] else {
+        return None;
+    };
+    let term = match (expr::is_const(a), expr::is_const(b)) {
+        (true, false) => b,
+        (false, true) => a,
+        _ => return None,
+    };
+    let mut terms = Vec::new();
+    let mut stack = vec![sum];
+    while let Some(x) = stack.pop() {
+        match expr::node(x) {
+            Node::Op(op::ADD, v) => stack.extend(v),
+            _ => terms.push(x),
+        }
+    }
+    let at = terms.iter().position(|t| *t == term)?;
+    terms.remove(at);
+    Some(terms)
+}
+
 // Sound only because an unknown pointer is unsigned and memory never wraps.
 // So p + k lies at or above k. It also never points into the scratch area below 0x80.
 fn may_alias(
@@ -584,6 +609,11 @@ fn may_alias(
                     stack.push(v[0]);
                     stack.push(v[1]);
                 }
+                // A sum less the low bits of one of its terms is still at or above the rest.
+                Node::Op(o, v) if o == op::SUB => match rounded_down(v[0], v[1]) {
+                    Some(rest) => stack.extend(rest),
+                    None => terms.push(x),
+                },
                 _ => terms.push(x),
             }
         }

@@ -164,6 +164,13 @@ fn cell_name(cell: &Cell, run: &Run) -> String {
             if n == 1 { "" } else { "s" }
         ),
     };
+    // An entry that is a record of several words is named with the word that is meant.
+    let record =
+        |c: &Cell| (c.account, c.root) == (cell.account, cell.root) && c.offset != cell.offset;
+    let own = match !cell.keys.is_empty() && run.cells.iter().any(record) {
+        true => format!("{own}, word {} of the entry", cell.offset),
+        false => own,
+    };
     match cell.account == run.to {
         true => own,
         false => format!("{own} of the contract at {}", cell.account.to_hex()),

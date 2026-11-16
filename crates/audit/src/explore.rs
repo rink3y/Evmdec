@@ -738,18 +738,25 @@ impl<'a> Explorer<'a> {
                 }
             }
         }
-        let cmps = run.events.iter().rev().filter_map(|ev| match ev {
-            Event::Cmp {
-                op: o,
-                a,
-                b,
-                ta,
-                tb,
-                ..
-            } => Some((*o, *a, *b, *ta, *tb)),
-            _ => None,
-        });
-        for (o, a, b, ta, tb) in cmps.take(tests) {
+        /* A length tested after an answer came back is that answer's, also where the
+        place it was copied to was worked out from an earlier answer's length. */
+        let mut returned = None;
+        let mut cmps: Vec<(u8, U256, U256, Tag, Tag, Option<usize>)> = Vec::new();
+        for ev in &run.events {
+            match ev {
+                Event::Returned(call) => returned = Some(*call),
+                Event::Cmp {
+                    op: o,
+                    a,
+                    b,
+                    ta,
+                    tb,
+                    ..
+                } => cmps.push((*o, *a, *b, *ta, *tb, returned)),
+                _ => {}
+            }
+        }
+        for (o, a, b, ta, tb, returned) in cmps.into_iter().rev().take(tests) {
             for (tag, was, other) in [(ta, a, b), (tb, b, a)] {
                 let near = [
                     other,
@@ -803,7 +810,8 @@ impl<'a> Explorer<'a> {
                 }
                 let length = other.as_usize().filter(|n| *n <= 2_048);
                 if let (true, Some(len)) = (tag.has(SIZE), length) {
-                    match tag.call().and_then(|k| run.calls.get(k)) {
+                    let latest = returned.filter(|_| tag.of_several_calls());
+                    match tag.call().or(latest).and_then(|k| run.calls.get(k)) {
                         None => {
                             for len in [len, len + 4] {
                                 let lacks = len.saturating_sub(laid.data.len());

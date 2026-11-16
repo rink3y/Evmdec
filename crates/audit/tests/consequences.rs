@@ -249,3 +249,17 @@ fn a_setting_one_call_needs_is_not_taken_where_it_stops_another_call_sooner() {
     assert!(tune.ends_for.is_empty(), "{:?}", tune.ends_for);
     assert!(report.findings.is_empty(), "{:?}", report.findings);
 }
+
+#[test]
+fn an_answer_decoded_after_an_earlier_one_is_given_the_length_its_decoder_asks_for() {
+    // ask() decodes one word from the first answer and three from the second. The place
+    // the second is copied to is worked out from the length of the first.
+    let report = report("Asker.hex");
+    let ask = report
+        .functions
+        .iter()
+        .find(|f| f.selector.as_deref() == Some("0x4a896384"));
+    let ask = ask.expect("ask()");
+    assert!(ask.ends_for.contains(&"a user"), "{:?}", ask.stopped_by);
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+}

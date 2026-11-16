@@ -128,6 +128,12 @@ impl Tag {
     pub fn call(self) -> Option<usize> {
         (self.call != 0 && self.call != MANY).then(|| self.call as usize - 1)
     }
+
+    // The word was worked out from the answers of more than one call.
+    #[must_use]
+    pub fn of_several_calls(self) -> bool {
+        self.call == MANY
+    }
 }
 
 #[must_use]

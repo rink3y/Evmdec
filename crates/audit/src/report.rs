@@ -461,8 +461,29 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
                 (Kind::Debit, Some(victim)) => consent(run, victim),
                 _ => "",
             };
-            let writes = run.stores().filter(|(c, ..)| Some(*c) == cell).count();
-            let twice = match writes > 1 {
+            /* The first write is lost only where the last one was worked out from a read
+            made before it. A cell read again in between is updated twice on purpose. */
+            let at = |e: &Event| match e {
+                Event::Store { cell: c, .. } => (Some(&run.cells[*c]) == cell, true),
+                Event::Load { cell: c, .. } => (Some(&run.cells[*c]) == cell, false),
+                _ => (false, false),
+            };
+            let touched: Vec<bool> = run
+                .events
+                .iter()
+                .map(at)
+                .filter(|t| t.0)
+                .map(|t| t.1)
+                .collect();
+            let first = touched.iter().position(|write| *write);
+            let last = touched.iter().rposition(|write| *write);
+            let stale = match (first, last) {
+                (Some(first), Some(last)) => {
+                    first < last && touched[first..last].iter().all(|w| *w)
+                }
+                _ => false,
+            };
+            let twice = match stale {
                 true => " The call writes this one entry more than once, and the last write is worked out from what the entry held before the first, so the first write is lost. That happens when the call names the same account on both sides.",
                 false => "",
             };

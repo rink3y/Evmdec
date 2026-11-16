@@ -1291,19 +1291,29 @@ impl<'a> Explorer<'a> {
 
     fn assume_targets(&mut self, run: &Run) -> bool {
         let mut changed = false;
-        for call in &run.calls {
-            let from_store = call.to_tag.has(STORE) && !call.to_tag.has(DATA | MATH);
-            let cell = run
-                .cell_of(call.to_tag)
-                .filter(|c| c.account == self.subject);
+        let called = run.calls.iter().map(|call| {
             // A person does not answer a call. A cell the set-up filled with the owner's address
             // and that the code then calls is the address of a contract.
             let nobody = call.to.is_zero() || (call.to == OWNER && !call.input.is_empty());
-            let (true, true, Some(cell)) = (nobody, from_store, cell) else {
+            (call.to_tag, nobody.then_some(call.to))
+        });
+        /* Newer code asks whether an address has code before it calls it, and stops
+        there when it has none. No call is made, and the test says the same thing. */
+        let sized = run.events.iter().filter_map(|e| match e {
+            Event::Branch { tag, .. } if tag.has(EXT) && !run.ok => Some((*tag, None)),
+            _ => None,
+        });
+        let asked: Vec<(Tag, Option<Addr>)> = called.chain(sized).collect();
+        for (tag, to) in asked {
+            let from_store = tag.has(STORE) && !tag.has(DATA | MATH);
+            let cell = run.cell_of(tag).filter(|c| c.account == self.subject);
+            let (true, Some(cell)) = (from_store, cell) else {
                 continue;
             };
             let held = self.states[0].world.stored(self.subject, cell.slot);
-            if low_address(held) != call.to {
+            let named = low_address(held);
+            let nobody = named.is_zero() || named == OWNER;
+            if to.map_or(!nobody, |to| named != to) {
                 continue;
             }
             let fresh = outside(self.outside.len() + 1);
@@ -1442,11 +1452,12 @@ impl<'a> Explorer<'a> {
                     .flat_map(|v| [v, v.wrapping_add(U256::ONE), v.wrapping_sub(U256::ONE)])
                     .take(if total { 0 } else { 3 })
                     .collect();
+                // The least that lets the call go on is taken. A total has to cover the stakes.
+                if held.is_zero() && !total {
+                    values.extend([U256::ONE, UNIT]);
+                }
                 if held.is_zero() {
                     values.push(STAKE + STAKE + STAKE);
-                }
-                if held.is_zero() && !total {
-                    values.extend([UNIT, U256::ONE]);
                 }
                 let why = format!(
                     "slot {} is set, since the owner's call needs it",
@@ -1457,6 +1468,9 @@ impl<'a> Explorer<'a> {
         }
         // The settings a contract read from the chain needs are the ones it has.
         options.retain(|(slot, _, _)| !self.on_chain || roles.contains(slot));
+        /* Each value is tried and the one that takes the call furthest is kept. Of two
+        that go as far, the smaller is the lesser thing to take for granted. */
+        let mut tried: Vec<(bool, usize, U256, U256, String)> = Vec::new();
         for (slot, value, why) in options.into_iter().take(12) {
             if budget::spent() {
                 return false;
@@ -1477,17 +1491,26 @@ impl<'a> Explorer<'a> {
                 continue;
             }
             world.seed(subject, slot, value);
-            let (_, next) = self.attempt_in(world.clone(), entry, t);
+            let (_, next) = self.attempt_in(world, entry, t);
             // The caller's own entry is as often a balance as a role. Only a role lets the call end.
             let enough = next.ok || !roles.contains(&slot);
-            if enough && better(&next, run) && !self.breaks_others(&world, entry) {
-                let held = self.states[0].world.stored(subject, slot);
-                self.states[0].world.seed(subject, slot, value);
-                self.assumed.push(why);
-                self.settings
-                    .extend(at.get(&slot).map(|place| (*place, slot, held)));
-                return true;
+            if enough && better(&next, run) {
+                tried.push((next.ok, next.edges.len(), slot, value, why));
             }
+        }
+        tried.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)).then(a.3.cmp(&b.3)));
+        for (_, _, slot, value, why) in tried {
+            let mut world = self.states[0].world.clone();
+            world.seed(subject, slot, value);
+            if self.breaks_others(&world, entry) {
+                continue;
+            }
+            let held = self.states[0].world.stored(subject, slot);
+            self.states[0].world.seed(subject, slot, value);
+            self.assumed.push(why);
+            self.settings
+                .extend(at.get(&slot).map(|place| (*place, slot, held)));
+            return true;
         }
         false
     }
@@ -1820,6 +1843,10 @@ impl<'a> Explorer<'a> {
         ) else {
             return false;
         };
+        // Nothing is withheld from an account that could never have spent it.
+        if !before.can_act(victim) {
+            return false;
+        }
         let spends = |run: &Run| {
             let lowered = run
                 .stores()

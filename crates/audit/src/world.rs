@@ -347,6 +347,18 @@ impl World {
         placed.or_else(|| self.on_chain(who)?.code(who))
     }
 
+    /* Whether an account can act on what it holds. A person can. A contract can only
+    through a call its code makes, and code with no call in it never moves anything. */
+    #[must_use]
+    pub fn can_act(&self, who: Addr) -> bool {
+        let calls = |code: Rc<Code>| {
+            let made = evmdec::disasm::disassemble(&code.bytes);
+            let call = [op::CALL, op::CALLCODE, op::DELEGATECALL];
+            made.iter().any(|i| call.contains(&i.opcode))
+        };
+        self.code_at(who).is_none_or(calls)
+    }
+
     pub fn seed(&mut self, address: Addr, slot: U256, value: U256) {
         let slots = self.storage.entry(address).or_default();
         Rc::make_mut(slots).insert(slot, value);
@@ -506,6 +518,7 @@ impl World {
                 edges: Vec::new(),
                 steps: 0,
                 hooked: false,
+                spent_by_holder: Vec::new(),
             },
             hashes: HashMap::new(),
             cell_ids: HashMap::new(),
@@ -726,6 +739,9 @@ impl World {
                     let old = self.stored(f.account, key);
                     let cell = Self::cell(tx, f.account, key);
                     let tag = sh.stack[n - 2];
+                    if new < old && tx.run.cells[cell].keyed_by(f.caller) {
+                        tx.run.spent_by_holder.push(cell);
+                    }
                     Self::event(
                         tx,
                         Event::Store {

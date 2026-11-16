@@ -257,7 +257,9 @@ pub fn check(
                 (97..=160).contains(&v.bits()) && !Facts::same_party(*v, ACTOR) && *v != subject
             };
             let mut keyed = cell.keys.iter().map(|k| k.value);
-            let bystander = keyed.find(stranger).filter(|v| !rose_for(*v));
+            // What a contract called on the way lowers of its own record it spent itself.
+            let spent = run.spent_by_holder.iter().any(|i| &run.cells[*i] == cell);
+            let bystander = keyed.find(stranger).filter(|v| !spent && !rose_for(*v));
             let victim = person.or(bystander);
             let paid_out = |v: Addr| {
                 kinds

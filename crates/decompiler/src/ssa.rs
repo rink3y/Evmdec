@@ -407,10 +407,12 @@ pub fn call_sites(l: &Lifted, arity: impl Fn(usize) -> Option<usize>) -> Vec<Cal
                 continue;
             };
             let Some(k) = arity(*callee) else { continue };
+            /* The arguments start with what the callee reads below its return address.
+            Its own parameters are the last ones. */
             let bound = args
                 .iter()
+                .skip(args.len().saturating_sub(k))
                 .enumerate()
-                .filter(|(j, _)| *j < k)
                 .map(|(j, a)| (j as u32, *a))
                 .collect();
             out.push(CallSite {

@@ -953,3 +953,19 @@ fn a_call_data_word_read_in_a_helper_is_not_named_like_its_parameters() {
     );
     assert!(!body.contains("arg4") && !body.contains("arg5"));
 }
+
+#[test]
+fn an_argument_is_bound_to_the_parameter_that_receives_it() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/oneinch_v6.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+    let router = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
+    let start = router
+        .find("function func_0x4e5e(")
+        .expect("the call helper");
+    let head = &router[start..start + router[start..].find('\n').unwrap()];
+    assert!(
+        head.contains("address target, uint256 arg5, uint256 arg6,"),
+        "the two factors of the value sent are numbers, whatever sits below them: {head}"
+    );
+}

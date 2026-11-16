@@ -475,3 +475,10 @@ fn a_write_through_an_index_tested_to_be_small_does_not_reach_the_words_past_its
         text("33610200524260003560200260800152610200516000556000356020026080015160015500");
     assert!(untested.contains("stor_0 = mem[0x200];"), "{untested}");
 }
+
+#[test]
+fn a_value_under_the_mask_one_is_a_bit_test_and_no_logical_and() {
+    let out = text("335f52601b60205260405f20546001165f5260205ff3");
+    assert!(out.contains("return (stor_27[msg.sender] & 1);"), "{out}");
+    assert!(!out.contains("&&"), "{out}");
+}

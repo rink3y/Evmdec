@@ -1037,6 +1037,11 @@ pub fn is_bool(e: ExprId, n: &Names) -> bool {
         || bool_element(e, n)
 }
 
+// A constant operand is a mask. Only a type that was guessed could make it a truth value.
+fn logical(v: &[ExprId], n: &Names) -> bool {
+    v.iter().all(|x| is_bool(*x, n) && !expr::is_const(*x))
+}
+
 fn bool_element(e: ExprId, n: &Names) -> bool {
     let load = element_typed_load(e, n).unwrap_or(e);
     match expr::node(load) {
@@ -2093,7 +2098,7 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                 P_EQ,
             )
         }
-        (op::AND, 2) if is_bool(v[0], n) && is_bool(v[1], n) => (
+        (op::AND, 2) if logical(v, n) => (
             format!(
                 "{} && {}",
                 fmt_prec(v[0], P_LAND, n),
@@ -2101,7 +2106,7 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             ),
             P_LAND,
         ),
-        (op::OR, 2) if is_bool(v[0], n) && is_bool(v[1], n) => (
+        (op::OR, 2) if logical(v, n) => (
             format!(
                 "{} || {}",
                 fmt_prec(v[0], P_LOR, n),

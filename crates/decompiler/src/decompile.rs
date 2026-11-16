@@ -3011,8 +3011,6 @@ fn collect_sloads(
                             let bits = m.bits();
                             let t = if bits == 160 {
                                 "address".to_string()
-                            } else if bits == 1 {
-                                "bool".to_string()
                             } else if bits % 8 == 0 {
                                 format!("uint{}", bits)
                             } else {

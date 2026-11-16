@@ -906,3 +906,20 @@ fn a_test_settled_on_one_way_in_is_still_made_after_a_join() {
         "a failed call frees its hash again on both ways out: {body}"
     );
 }
+
+#[test]
+fn both_ways_into_a_join_keep_their_own_call_after_it() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/oneinch_v6.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+    let router = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
+    let start = router
+        .find("function func_0x216b(")
+        .expect("the swap callback");
+    let body = &router[start..start + router[start..].find("\n    }").unwrap()];
+    let after = &body[body.find("L21be:").expect("the join")..];
+    assert!(
+        after.contains("token1.selector") && after.contains("token0.selector"),
+        "the pool is asked for the other token whichever one was paid: {after}"
+    );
+}

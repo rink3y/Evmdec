@@ -147,6 +147,9 @@ pub struct Explorer<'a> {
     // The set-up calls the starting world has been through.
     setups: Vec<(usize, Try)>,
     on_chain: bool,
+    // The contracts the chain's state names, and the addresses looked at to find them.
+    contracts: Vec<Addr>,
+    checked: HashSet<Addr>,
 }
 
 fn outside(n: usize) -> Addr {
@@ -401,6 +404,8 @@ impl<'a> Explorer<'a> {
             good: Vec::new(),
             setups: Vec::new(),
             on_chain: false,
+            contracts: Vec::new(),
+            checked: HashSet::new(),
         }
     }
 
@@ -449,11 +454,14 @@ impl<'a> Explorer<'a> {
             true => vec![self.seed(entry, who, who, UNIT, UNIT), plain],
             false => vec![plain],
         };
-        // What an owner registers under an address is as often a contract as itself.
-        if who == OWNER && self.entries[entry].words.contains(&Word::Address) {
+        // What an owner registers under an address is as often a contract as itself. On the
+        // chain what it registered is there to be read, and a made-up contract in its place
+        // undoes the set-up the run is meant to start from.
+        if who == OWNER && !self.on_chain && self.entries[entry].words.contains(&Word::Address) {
             seeds.push(self.seed(entry, who, outside(0), UNIT, U256::ZERO));
         }
         seeds.extend(self.bare_payment(entry, who));
+        seeds.extend(self.naming_contracts(entry, who));
         seeds
     }
 
@@ -479,6 +487,7 @@ impl<'a> Explorer<'a> {
             seeds.insert(0, self.seed(entry, ACTOR, ACTOR, UNIT, UNIT));
         }
         seeds.extend(self.bare_payment(entry, ACTOR));
+        seeds.extend(self.naming_contracts(entry, ACTOR));
         let addresses: Vec<usize> = (0..e.words.len())
             .filter(|i| e.words[*i] == Word::Address)
             .collect();
@@ -931,25 +940,27 @@ impl<'a> Explorer<'a> {
         let subject = self.subject;
         if self.states[0].world.endow(subject, STAKE) {
             self.assumed.push(
-                "each account holds a thousand units in the contract's own ledger, written into the cells it answers balances from".to_string(),
+                "the owner and the user each hold a thousand units in the contract's own ledger, written into the cells it answers balances from".to_string(),
             );
         }
         for _ in 0..4 {
             let mut changed = false;
             self.good = vec![None; self.entries.len()];
             let mut refused: Vec<(usize, Try, Run)> = Vec::new();
+            let mut named: Vec<(Place, U256, Addr)> = Vec::new();
             for entry in 0..self.entries.len() {
                 for who in [OWNER, USER, ACTOR] {
                     let plain = Try::of(self.seed(entry, who, who, UNIT, U256::ZERO));
                     let (_, run) = self.attempt(0, entry, &plain);
-                    changed |= self.name_owner(&run);
+                    named.extend(self.compared_with_caller(&run));
+                    self.note_contracts(&run);
                 }
                 for seed in self.honest(entry, OWNER) {
                     if budget::spent() {
                         return;
                     }
                     let (best, world, run) = self.solve(0, entry, Try::of(seed));
-                    changed |= self.name_owner(&run);
+                    named.extend(self.compared_with_caller(&run));
                     if run.ok {
                         let (_, again) = self.attempt_in(world, entry, &best);
                         if again.ok {
@@ -960,14 +971,18 @@ impl<'a> Explorer<'a> {
                     refused.push((entry, best, run));
                 }
             }
+            changed |= self.name_owner(named);
             for asset in self.states[0].world.met() {
-                if self.states[0].world.endow(asset, world::PURSE) {
-                    self.assumed.push(format!(
-                        "the owner, the user and the account with no role each hold a purse of the asset at {}, written into the cells it keeps its books in, and let the contract draw on it",
-                        asset.to_hex()
-                    ));
-                    changed = true;
+                if !self.contracts.contains(&asset) {
+                    self.contracts.insert(0, asset);
                 }
+                let endowed = self.states[0].world.endow(asset, world::PURSE);
+                let held = match endowed {
+                    true => "the owner, the user and the account with no role each hold a purse of the asset at {}, written into the cells it keeps its books in, and let the contract draw on it",
+                    false => "nobody here holds any of the asset at {}, since it does not answer what an account holds from a cell of its own",
+                };
+                self.assumed.push(held.replace("{}", &asset.to_hex()));
+                changed |= endowed;
             }
             for (entry, t, run) in refused {
                 if self.good[entry].is_none() {
@@ -980,13 +995,8 @@ impl<'a> Explorer<'a> {
         }
     }
 
-    /* On the chain the cells the code compares its caller with name somebody already.
-    The owner here takes that account's place in each of them, so that what it may do
-    is tried. A cell the code also calls names a contract the calls are made to, and
-    is left as it is. */
-    fn name_owner(&mut self, run: &Run) -> bool {
-        let subject = self.subject;
-        let mut named: Vec<(Place, U256, Addr)> = Vec::new();
+    fn compared_with_caller(&self, run: &Run) -> Vec<(Place, U256, Addr)> {
+        let mut named = Vec::new();
         for event in &run.events {
             let Event::Cmp {
                 op: op::EQ,
@@ -1001,7 +1011,7 @@ impl<'a> Explorer<'a> {
             };
             for (caller, other, holder) in [(ta, tb, b), (tb, ta, a)] {
                 let stored = caller.only(CALLER) && other.has(STORE) && !other.has(DATA);
-                let cell = run.cell_of(*other).filter(|c| c.account == subject);
+                let cell = run.cell_of(*other).filter(|c| c.account == self.subject);
                 let somebody =
                     !holder.is_zero() && holder.bits() <= 160 && !self.known.contains(holder);
                 if let (true, true, Some(cell)) = (stored, somebody, cell) {
@@ -1011,8 +1021,20 @@ impl<'a> Explorer<'a> {
                 }
             }
         }
+        named
+    }
+
+    /* On the chain the cells the code compares its caller with name somebody already.
+    The owner here takes that account's place in each of them, so that what it may do
+    is tried. A cell the code also calls names a contract the calls are made to. A cell
+    whose account is shut out of what everyone else may call, as the keeper of a proxy
+    is, names no owner of the contract behind it. Both are left as they are. */
+    fn name_owner(&mut self, mut named: Vec<(Place, U256, Addr)>) -> bool {
+        let subject = self.subject;
         let mask = (U256::ONE << 160) - U256::ONE;
         let mut changed = false;
+        named.sort();
+        named.dedup();
         for (place, slot, holder) in named {
             let called = self.facts.places.get(&place).is_some_and(|p| p.target)
                 || self.c.call_target_slots.contains(&slot.to_hex_padded(32));
@@ -1024,8 +1046,12 @@ impl<'a> Explorer<'a> {
             let Some(shift) = at.filter(|_| !called) else {
                 continue;
             };
-            let named = (held & !(mask << shift)) | (OWNER << shift);
-            self.states[0].world.seed(subject, slot, named);
+            let mut world = self.states[0].world.clone();
+            world.seed(subject, slot, (held & !(mask << shift)) | (OWNER << shift));
+            if self.breaks_others(&world, usize::MAX) {
+                continue;
+            }
+            self.states[0].world = world;
             self.assumed.push(format!(
                 "the owner stands for the account at {}, which slot {} names and the code compares the caller with",
                 holder.to_hex(),
@@ -1034,6 +1060,46 @@ impl<'a> Explorer<'a> {
             changed = true;
         }
         changed
+    }
+
+    /* On the chain the addresses a call is given are mostly contracts the contract
+    already knows: the assets it moves and whatever its own storage names. A call that
+    names a made-up one is refused before it does anything. */
+    fn note_contracts(&mut self, run: &Run) {
+        for event in &run.events {
+            let Event::Load { cell, value } = event else {
+                continue;
+            };
+            let named = low_address(*value);
+            let fresh = named.bits() > 96 && self.checked.len() < 24;
+            if run.cells[*cell].account != self.subject || !fresh || !self.checked.insert(named) {
+                continue;
+            }
+            if !self.known.contains(&named) && self.states[0].world.runs_code(named) {
+                self.contracts.push(named);
+            }
+        }
+    }
+
+    fn naming_contracts(&self, entry: usize, who: Addr) -> Vec<Msg> {
+        let words = &self.entries[entry].words;
+        let places: Vec<usize> = (0..words.len())
+            .filter(|i| words[*i] == Word::Address)
+            .collect();
+        let known = self.contracts.len().min(3);
+        let ways = match (places.len(), known) {
+            (0, _) | (_, 0) => 0,
+            (_, 1) => 1,
+            _ => 2,
+        };
+        let seeds = (0..ways).map(|way| {
+            let mut msg = self.seed(entry, who, who, UNIT, U256::ZERO);
+            for (k, at) in places.iter().enumerate() {
+                set_word(&mut msg.data, *at, self.contracts[(way + k) % known]);
+            }
+            msg
+        });
+        seeds.collect()
     }
 
     /* A call the owner can make once and not again, and that fills cells it found
@@ -1948,7 +2014,10 @@ impl<'a> Explorer<'a> {
         });
         budget::within(work / 10, || self.used_by(OWNER, 1));
         budget::within(work / 5, || self.used_by(USER, 2));
-        budget::within(work / 10, || self.sweep());
+        // What the contract holds on the chain is read from it. Nothing more is taken to be there.
+        if !self.on_chain {
+            budget::within(work / 10, || self.sweep());
+        }
         budget::within(work / 3, || self.attack());
         budget::within(work / 10, || self.used_after());
     }

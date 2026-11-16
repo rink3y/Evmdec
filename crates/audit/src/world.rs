@@ -327,6 +327,11 @@ impl World {
         self.chain.as_ref().filter(|_| !made_up(who))
     }
 
+    #[must_use]
+    pub fn runs_code(&self, who: Addr) -> bool {
+        self.code_at(who).is_some()
+    }
+
     fn code_at(&self, who: Addr) -> Option<Rc<Code>> {
         let placed = self.codes.get(&who).cloned();
         placed.or_else(|| self.on_chain(who)?.code(who))
@@ -547,7 +552,19 @@ impl World {
         };
         if !ok {
             *self = saved;
-            tx.run.events.truncate(events);
+            let undone = tx.run.events.split_off(events);
+            /* On the chain most contracts are reached through a proxy. The tests a
+            refused call made inside the code behind it are the only trace of what
+            refused it, so they stay when everything it did is taken back. */
+            if self.chain.is_some() {
+                let tests = undone.into_iter().filter(|e| {
+                    matches!(
+                        e,
+                        Event::Cmp { .. } | Event::Branch { .. } | Event::Load { .. }
+                    )
+                });
+                tx.run.events.extend(tests);
+            }
         }
         (ok, output, tags)
     }
@@ -1393,7 +1410,11 @@ impl World {
                 let mut read = chain.read.borrow_mut();
                 read.purses.insert((asset, who), (account, slot));
             }
-            if who != subject {
+            /* A holding in the contract under test earns whatever the contract pays its
+            holders. Handed to the account with no role, everything it earned would
+            read as taken. */
+            let unpaid = asset == subject && (who == ACTOR || who == ALLY);
+            if who != subject && !unpaid {
                 self.seed(account, slot, amount);
             }
         }

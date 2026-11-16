@@ -389,6 +389,13 @@ fn a_hash_of_values_written_at_odd_places_is_printed_as_those_values() {
 }
 
 #[test]
+fn a_whole_word_in_a_packed_hash_is_not_printed_as_a_narrower_type() {
+    // mstore8(0x80, 0xff); mstore(0x81, calldataload(4) & 0xffffffffffffffff); sstore(0, keccak256(0x80, 33))
+    let out = text("60ff60805360043567ffffffffffffffff16608152602160802060005500");
+    assert!(out.contains("uint256(uint64(arg0))"), "{out}");
+}
+
+#[test]
 fn the_arguments_of_a_call_stop_before_the_first_word_no_write_is_known_for() {
     let out =
         text("63aabbccdd60e01b60805260043560845236600060a437600060003660240160806000335af15000");

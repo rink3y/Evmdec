@@ -1811,7 +1811,11 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
         ),
         Node::Keccak(..) if expr::pieces(e).is_some() => {
             let pieces = expr::pieces(e).unwrap_or_default();
-            let parts: Vec<String> = pieces.iter().map(|p| fmt_piece(p, n)).collect();
+            let part = |p: &(ExprId, u8)| match p.1 {
+                32 => fmt_whole_word(p.0, n),
+                _ => fmt_piece(p, n),
+            };
+            let parts: Vec<String> = pieces.iter().map(part).collect();
             (
                 format!("keccak256(abi.encodePacked({}))", parts.join(", ")),
                 P_PRIMARY,
@@ -1823,7 +1827,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
                 if tail > 0 && i == words.len() - 1 {
                     parts.push(format!("bytes{}({})", tail, fmt_expr(*w, n)));
                 } else {
-                    parts.push(fmt_expr(*w, n));
+                    parts.push(fmt_whole_word(*w, n));
                 }
             }
             (
@@ -2510,6 +2514,23 @@ pub fn fmt_call_input(
 
 /* Call data that is not a selector and whole words has no abi.encode form of its true
 length. It is printed as packed bytes, each piece with its width. */
+// Packed, a value cast to a narrower type reads as fewer bytes than the word that is hashed.
+fn fmt_whole_word(e: ExprId, n: &Names) -> String {
+    let text = fmt_expr(e, n);
+    let cast = text.split_once('(').map_or("", |(cast, _)| cast);
+    let width = cast.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    let narrow = match cast.strip_suffix(width) {
+        Some("uint" | "int") => width != "256" && !width.is_empty(),
+        Some("bytes") => width != "32" && !width.is_empty(),
+        Some("address" | "bool") => width.is_empty(),
+        _ => false,
+    };
+    match narrow {
+        true => format!("uint256({text})"),
+        false => text,
+    }
+}
+
 fn fmt_piece((e, width): &(ExprId, u8), n: &Names) -> String {
     let bits = 8 * u32::from(*width);
     match (expr::as_const(*e), expr::node(*e)) {

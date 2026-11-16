@@ -322,34 +322,37 @@ set was split off once, its answer key and reports are never read during develop
 its reviewers return counts only.
 
 The target is 95 to 99% precision and recall. It is not met. Measured on the held-out set,
-234 exploited contracts and 101 with no known flaw, scored four times by separate reviewers:
+234 exploited contracts and 101 with no known flaw, scored five times by separate reviewers:
 
-| | first score | second score | third score, by address | fourth score, by address |
-|---|---|---|---|---|
-| known flaws found at the right place for the right reason | 13 of 234, 5.6% | 12 of 234, 5.1% | 20 of 234, 8.5% | 29 of 234, 12.4% |
-| more at the right place with the wrong reason | 6 | 4 | 10 | 8 |
-| findings that are correct | 25 of 49, 51.0% | 23 of 48, 47.9% | 45 of 88, 51.1% | 49 of 83, 59.0% |
-| contracts with no known flaw that got a finding | 1 of 101 | 1 of 101 | 4 of 101 | 4 of 101 |
-| time per contract | median 0.7 s | median 0.7 s, slowest 10.2 s | median 7.9 s, 90% under 29.6 s, with chain reads | median 10.3 s, 90% under 25.6 s, on a shared machine |
+| | first score | second score | third score, by address | fourth score, by address | fifth score, by address |
+|---|---|---|---|---|---|
+| known flaws found at the right place for the right reason | 13 of 234, 5.6% | 12 of 234, 5.1% | 20 of 234, 8.5% | 29 of 234, 12.4% | 31 of 234, 13.2% |
+| more at the right place with the wrong reason | 6 | 4 | 10 | 8 | 10 |
+| findings that are correct | 25 of 49, 51.0% | 23 of 48, 47.9% | 45 of 88, 51.1% | 49 of 83, 59.0% | 52 of 90, 57.8% |
+| contracts with no known flaw that got a finding | 1 of 101 | 1 of 101 | 4 of 101 | 4 of 101 | 4 of 101 |
+| time per contract | median 0.7 s | median 0.7 s, slowest 10.2 s | median 7.9 s, 90% under 29.6 s, with chain reads | median 10.3 s, 90% under 25.6 s, on a shared machine | median 6.3 s, 90% under 17.3 s, slowest 241.8 s. One contract was not finished in 600 s |
 
-The third and fourth scores ran each contract by address on the chain's state at the block
-before its incident, plus the guessed world, on the same blocks both times. In the fourth, 43
-of 60 findings shown on chain state were correct and 6 of 23 shown only in the guessed world.
+The third to fifth scores ran each contract by address on the chain's state at the block
+before its incident, plus the guessed world, on the same blocks each time. In the fifth, 44
+of 64 findings shown on chain state were correct and 8 of 26 shown only in the guessed world.
 By kind of flaw, among those in the analysed contract: access control 12 of 47, accounting 6
-of 68, input validation 5 of 28, initialization 5 of 9, unchecked external call 1 of 1, price
-or reading 0 of 43, re-entry 0 of 11, signature or replay 0 of 6, arithmetic 0 of 5. The
-fourth score is older than the ninth consequence in the table above.
+of 68, input validation 5 of 28, initialization 6 of 9, unchecked external call 1 of 1, price
+or reading 1 of 43, re-entry 0 of 11, signature or replay 0 of 6, arithmetic 0 of 5, other 0
+of 7. The fifth score is the first with the ninth consequence in the table above: it made 4
+findings, 2 the known flaw, 1 another real issue and 1 at the right place for another reason.
+The one contract not finished counts as a miss.
 
 On the development set, where every false finding was read and its cause fixed, the latest
-reviewed build finds 31 of 231 known flaws (13.4%) by address, 48 of its 60 findings are
+reviewed build finds 33 of 231 known flaws (14.3%) by address, 51 of its 64 findings are
 correct (80%), and none of 55 contracts with no known flaw gets a finding. The held-out set
 does not follow at the same rate: what is fixed on one set of contracts is general in form
 and reaches fewer of the other set's flaws. That gap is the honest measure of where the
 tool stands.
 
 Why recall is where it is: 145 of the 234 held-out flaws only show with a real outside
-contract in a particular state, and the account with no role can only call the contract
-under test. It cannot trade in a pool, call a pair's skim or sync, or act in a lending market.
+contract in a particular state. The account with no role may call a few entries of the
+contracts the one under test reads from, and send them what it holds, but it does not trade
+in a pool with a call-back, borrow, or act in a lending market.
 Of the flaws that show on the contract alone, a fresh diagnosis of the 74 development misses
 put 41 down to a flawed function that never ran to its end for the account with no role, 18
 to state the run lacked, and 9 to steps the search did not try. The pull request that

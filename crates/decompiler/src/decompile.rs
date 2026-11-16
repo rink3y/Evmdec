@@ -1176,30 +1176,38 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         .filter(|f| f.kind == FnKind::Internal && f.lifted.as_ref().is_some_and(is_array_resizer))
         .map(|f| f.pc)
         .collect();
+    let printed: Vec<Lifted> = functions
+        .iter()
+        .map(|f| {
+            let l = f.lifted.as_ref().expect("functions are lifted");
+            match opts.flat {
+                true => l.clone(),
+                false => crate::structure::reroll_peeled_loops(l),
+            }
+        })
+        .collect();
     let mut offsets = {
-        let lifted = functions.iter().filter(|_| solc08);
-        let units: Vec<(usize, &Lifted)> = lifted
-            .map(|f| (f.pc, f.lifted.as_ref().expect("functions are lifted")))
-            .collect();
+        let units = functions.iter().zip(&printed).filter(|_| solc08);
+        let units: Vec<(usize, &Lifted)> = units.map(|(f, l)| (f.pc, l)).collect();
         emit::offsets(&units).into_iter()
     };
-    for f in functions.iter_mut() {
+    for (f, l) in functions.iter_mut().zip(printed) {
         let mut names = make_names(f, &storage, layout, &loaders, &callees);
         names.hide_checked = solc08;
-        names.checked = f.lifted.as_ref().filter(|_| solc08).map(emit::checked_ops);
+        names.checked = solc08.then(|| emit::checked_ops(&l));
         names.offsets = offsets.next().unwrap_or_default();
         names.pure_callees = pure_callees.clone();
         names.array_resizers = array_resizers.clone();
-        let l = f
-            .lifted
-            .as_ref()
-            .expect("functions are lifted before they are printed");
         crate::clock::check();
         let t1 = std::time::Instant::now();
         let body = if opts.flat {
-            emit::fmt_flat(l, &names, "        ")
+            emit::fmt_flat(&l, &names, "        ")
         } else {
-            crate::structure::fmt_structured(l, &names, "        ")
+            let (tested, bindings) = crate::structure::name_tested(&l, &names);
+            names.rebind(&bindings);
+            let (bound, bindings) = crate::structure::bind_shared(&tested, &names);
+            names.rebind(&bindings);
+            crate::structure::fmt_structured(&bound, &names, "        ")
         };
         if timing && t1.elapsed().as_millis() > 200 {
             eprintln!(

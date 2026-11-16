@@ -1260,7 +1260,7 @@ fn untested_arithmetic_is_marked_and_gas_is_named_where_it_is_read() {
         router.lines().any(tested),
         "a difference the code tests before it is printed bare"
     );
-    assert!(router.contains(" << 144) - checked(arg7 * v"));
+    assert!(router.contains(" = arg7 * v") && router.contains(" << 144) - v"));
     let used = router.find(" + 33000)").expect("the use");
     let name = router[..used].rsplit("unchecked(").next().unwrap();
     let read = router[..used]
@@ -1344,4 +1344,35 @@ fn a_slot_read_before_an_outside_call_is_not_printed_as_read_after_it() {
         "the supply read before the controller is called is the one divided by after"
     );
     assert_eq!(undeclared_old_values(&gauge), Vec::<String>::new());
+}
+
+#[test]
+fn an_operator_the_code_does_not_test_is_marked_wherever_it_is_printed() {
+    let diamond = regress("rango_diamond.hex").source;
+    assert!(
+        diamond.contains("stor[arg0 + 2] = unchecked(prev_stor_arg0_2 + 1);"),
+        "a length kept beside a hashed array is a count, not a place"
+    );
+    let router = regress("oneinch_v6.hex").source;
+    assert!(router.contains("return (unchecked(0 - mem[v1]));"));
+    let via_ir = regress("via_ir_router.hex").source;
+    assert!(
+        !via_ir.contains(" = 0 / "),
+        "a tested quotient is printed only where the code makes it"
+    );
+}
+
+#[test]
+fn a_tested_difference_is_made_before_the_transfer_that_follows_it() {
+    let router = regress("oneinch_v6.hex").source;
+    let lines: Vec<&str> = router.lines().map(str::trim).collect();
+    let refund = lines
+        .iter()
+        .position(|l| l.starts_with("_sendValue(") && l.ends_with(", msg.sender, calldata[arg2]);"))
+        .expect("the refund of what was not spent");
+    let spent = lines[..refund]
+        .iter()
+        .rposition(|l| l.starts_with("v8 = v2 - v"))
+        .expect("the amount spent");
+    assert!(refund - spent <= 2, "{:?}", &lines[spent..=refund]);
 }

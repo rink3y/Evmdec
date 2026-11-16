@@ -1035,7 +1035,7 @@ fn with_init(e: ExprId, init: &HashMap<ExprId, ExprId>) -> ExprId {
     )
 }
 
-fn reroll_peeled_loops(l: &Lifted) -> Lifted {
+pub fn reroll_peeled_loops(l: &Lifted) -> Lifted {
     let g = Graph::new(l);
     let loops = find_loops(&g);
     let mut out = l.clone();
@@ -1801,7 +1801,7 @@ fn reaches_within(l: &Lifted, a: usize, b: usize, within: &HashSet<usize>) -> bo
     false
 }
 
-fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
+pub fn bind_shared(l: &Lifted, names: &Names) -> (Lifted, Bindings) {
     let g = Graph::new(l);
     let mut uses: HashMap<ExprId, Vec<(usize, Pos)>> = HashMap::new();
     let mut count: HashMap<ExprId, usize> = HashMap::new();
@@ -1872,7 +1872,8 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
                 .copied()
                 .filter(|u| !at.iter().any(|v| v != u && dominated_by(v.0, v.1, u)))
                 .collect();
-            if d == f || !available_at(l, &g, names, d, &frontier, e) {
+            // A test printed above the place the code makes it would fail where the code does not.
+            if d == f || names.tests(e) || !available_at(l, &g, names, d, &frontier, e) {
                 continue;
             }
             (d, Pos::Term)
@@ -1910,10 +1911,21 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
         }
         plan.push((f, pos, e));
     }
-    if plan.is_empty() {
-        return l.clone();
-    }
     plan.sort_by_key(|(f, pos, e)| (g.rpo_index[*f], *pos, first_seen[e]));
+    bind(l, &g, plan, &bindable)
+}
+
+type Bindings = Vec<(Node, ExprId)>;
+
+fn bind(
+    l: &Lifted,
+    g: &Graph,
+    plan: Vec<(usize, Pos, ExprId)>,
+    wanted: &dyn Fn(ExprId) -> bool,
+) -> (Lifted, Bindings) {
+    if plan.is_empty() {
+        return (l.clone(), Vec::new());
+    }
     let mut out = l.clone();
     let mut next_var: u32 = 0;
     for nd in &l.nodes {
@@ -1939,17 +1951,19 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
         }
     }
     let mut inserted: Vec<Vec<usize>> = vec![Vec::new(); l.nodes.len()];
-    let mut bound: Vec<(Node, ExprId)> = Vec::new();
+    let mut bound: Vec<(Node, ExprId, usize)> = Vec::new();
     for (f, pos, e) in plan {
         let mut e = e;
-        for (target, var) in &bound {
+        // A name given in another branch is not known here.
+        for (target, var, _) in bound.iter().filter(|(_, _, at)| g.dominates(*at, f)) {
             e = expr::substitute(
                 e,
                 &|n| if n == target { Some(*var) } else { None },
                 &mut HashMap::new(),
             );
         }
-        if bound.iter().any(|(t, _)| *t == expr::node(e)) || !bindable(e) {
+        let known = |(t, _, at): &(Node, ExprId, usize)| *t == expr::node(e) && g.dominates(*at, f);
+        if bound.iter().any(known) || !wanted(e) {
             continue;
         }
         let var = expr::intern(Node::Var(next_var));
@@ -1965,7 +1979,7 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
             .stmts
             .insert(at, Stmt::Assign { var, value: e });
         let target = expr::node(e);
-        bound.push((target.clone(), var));
+        bound.push((target.clone(), var, f));
         let sub = |x: ExprId| {
             expr::substitute(
                 x,
@@ -1992,7 +2006,109 @@ fn bind_shared(l: &Lifted, names: &Names) -> Lifted {
             }
         }
     }
-    out
+    let bound = bound.into_iter().map(|(target, var, _)| (target, var));
+    (out, bound.collect())
+}
+
+fn ordered(st: &Stmt, names: &Names) -> bool {
+    match st {
+        Stmt::Call { .. }
+        | Stmt::Create { .. }
+        | Stmt::SStore { .. }
+        | Stmt::Log { .. }
+        | Stmt::Internal { .. } => true,
+        Stmt::Require { cond, data, .. } => !emit::is_hidden_require(*cond, data.as_deref(), names),
+        Stmt::Assign { .. } | Stmt::MStore { .. } | Stmt::Copy { .. } | Stmt::Drop(_) => false,
+    }
+}
+
+/* A test the printer leaves out is told by its operator, and an operator prints where its
+value is used. When a step whose order shows lies between the test and the use, the value
+gets a name where the code tests it. */
+pub fn name_tested(l: &Lifted, names: &Names) -> (Lifted, Bindings) {
+    let g = Graph::new(l);
+    let mut uses: HashMap<ExprId, Vec<(usize, Pos)>> = HashMap::new();
+    let mut first_seen: HashMap<ExprId, usize> = HashMap::new();
+    let mut sites: HashMap<ExprId, Vec<emit::Site>> = HashMap::new();
+    let mut note = |roots: Vec<ExprId>, at: (usize, Pos)| {
+        let mut seen = HashSet::new();
+        let mut stack = roots;
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) || seen.len() > 20_000 {
+                continue;
+            }
+            stack.extend(expr::children(x));
+            if !sites.entry(x).or_insert_with(|| names.test_sites(x)).is_empty() {
+                let n = first_seen.len();
+                first_seen.entry(x).or_insert(n);
+                uses.entry(x).or_default().push(at);
+            }
+        }
+    };
+    for nd in l.nodes.iter().filter(|nd| g.reachable[nd.id]) {
+        for (i, st) in nd.stmts.iter().enumerate() {
+            let hidden = matches!(st, Stmt::Require { cond, data, .. }
+                if emit::is_hidden_require(*cond, data.as_deref(), names));
+            if !hidden {
+                note(lift::stmt_exprs(st), (nd.id, Pos::Stmt(i)));
+            }
+        }
+        note(lift::term_exprs(&nd.term), (nd.id, Pos::Term));
+    }
+    let mut edges: Vec<&(usize, usize)> = l.edge_assigns.keys().collect();
+    edges.sort_unstable();
+    for edge in edges.into_iter().filter(|k| g.reachable[k.0]) {
+        let read = l.edge_assigns[edge].iter().map(|(_, v)| *v);
+        note(read.collect(), (edge.0, Pos::Edge));
+    }
+    let assigned = |x: usize, reads: &HashSet<ExprId>| {
+        let by_stmt = l.nodes[x]
+            .stmts
+            .iter()
+            .any(|s| matches!(s, Stmt::Assign { var, .. } if reads.contains(var)));
+        let mut edges = l.edge_assigns.iter().filter(|((from, _), _)| *from == x);
+        by_stmt || edges.any(|(_, a)| a.iter().any(|(v, _)| reads.contains(v)))
+    };
+    let mut plan: Vec<(usize, Pos, ExprId)> = Vec::new();
+    for (e, at) in &uses {
+        let mut tests = sites[e].clone();
+        tests.retain(|(n, _)| g.reachable[*n]);
+        tests.sort_by_key(|(n, i)| (g.rpo_index[*n], *i));
+        for (n, i) in tests {
+            let after = |(u, p): &&(usize, Pos)| {
+                (*u != n && g.dominates(n, *u)) || (*u == n && *p > Pos::Stmt(i))
+            };
+            let later: Vec<&(usize, Pos)> = at.iter().filter(after).collect();
+            let mut reach: HashMap<usize, Pos> = HashMap::new();
+            let (mut node, mut from) = (n, i + 1);
+            loop {
+                let stmts = &l.nodes[node].stmts[from..];
+                if let Some(k) = stmts.iter().position(|s| ordered(s, names)) {
+                    reach.insert(node, Pos::Stmt(from + k));
+                    break;
+                }
+                reach.insert(node, Pos::Edge);
+                match l.nodes[node].term {
+                    Term::Jump(t) if g.preds[t].len() == 1 && !reach.contains_key(&t) => {
+                        (node, from) = (t, 0);
+                    }
+                    _ => break,
+                }
+            }
+            let beside = |(u, p): &(usize, Pos)| reach.get(u).is_some_and(|last| p <= last);
+            if later.is_empty() || later.iter().all(|u| beside(u)) {
+                continue;
+            }
+            let reads = vars_in(*e);
+            let region = (0..l.nodes.len()).filter(|u| g.reachable[*u] && g.dominates(n, *u));
+            if !reads.is_empty() && region.into_iter().any(|u| assigned(u, &reads)) {
+                continue;
+            }
+            plan.push((n, Pos::Stmt(i), *e));
+        }
+    }
+    plan.sort_by_key(|(f, pos, e)| (g.rpo_index[*f], *pos, first_seen[e]));
+    bind(l, &g, plan, &|e| matches!(expr::node(e), Node::Op(..)))
 }
 
 const DUP_LIMIT: usize = 6;
@@ -3416,9 +3532,7 @@ fn drop_empty_once(text: &str) -> String {
 pub fn fmt_structured(l: &Lifted, n: &Names, indent: &str) -> String {
     expr::clear_boolean_marks();
     let depth = indent.len() / 4;
-    let rolled = reroll_peeled_loops(l);
-    let bound = bind_shared(&rolled, n);
-    let text = structure(&bound, n, depth);
+    let text = structure(l, n, depth);
     expr::clear_boolean_marks();
     text
 }

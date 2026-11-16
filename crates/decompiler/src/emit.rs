@@ -128,7 +128,7 @@ pub struct Names {
     pub hide_checked: bool,
     pub checked: Option<Checked>,
     pub gas_named: RefCell<HashSet<ExprId>>,
-    pub offsets: HashSet<ExprId>,
+    pub offsets: Offsets,
     pub bare: RefCell<HashMap<ExprId, (String, u8)>>,
     pub temps: RefCell<Vec<(String, String)>>,
     pub temp_of: RefCell<HashMap<ExprId, String>>,
@@ -142,15 +142,31 @@ pub struct Names {
     pub memo: RefCell<HashMap<ExprId, (String, u8)>>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Checked {
-    ops: HashSet<ExprId>,
-    divisors: HashSet<ExprId>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arithmetic {
+    Tested,
+    Untested,
+    Exempt,
 }
 
-/* What the code tests before it reverts with Panic(0x11) or Panic(0x12) says which of its
-sums, differences, products and quotients are checked. The test either holds the result
-itself or compares the two operands. */
+pub type Site = (usize, usize);
+
+#[derive(Clone, Debug, Default)]
+pub struct Checked {
+    ops: HashMap<ExprId, Vec<Site>>,
+    divisors: HashMap<ExprId, Vec<Site>>,
+}
+
+fn tested(set: &mut HashMap<ExprId, Vec<Site>>, e: ExprId, site: Option<Site>) {
+    let sites = set.entry(e).or_default();
+    if let Some(site) = site.filter(|s| !sites.contains(s)) {
+        sites.push(site);
+    }
+}
+
+/* What the code tests before it reverts with Panic(0x11), Panic(0x12) or Panic(0x31) says
+which of its sums, differences, products and quotients are checked. The test either holds
+the result itself or compares the two operands. */
 pub fn checked_ops(l: &Lifted) -> Checked {
     let code = |data: &Option<Vec<ExprId>>| -> Option<u64> {
         let words = data.as_deref().filter(|w| w.len() >= 2)?;
@@ -159,30 +175,38 @@ pub fn checked_ops(l: &Lifted) -> Checked {
         }
         let len = 4 + 32 * (words.len() - 1);
         let code = expr::as_const(shifted_word_len(words, 0, Some(len)))?.low_u64();
-        [PANIC_OVERFLOW, PANIC_DIV_BY_ZERO]
+        [PANIC_OVERFLOW, PANIC_DIV_BY_ZERO, PANIC_EMPTY_POP]
             .contains(&code)
             .then_some(code)
     };
-    let panics = |node: usize| match &l.nodes[node] {
-        nd if !nd.stmts.is_empty() => None,
-        nd => match &nd.term {
-            Term::Revert { data, .. } => code(data),
-            _ => None,
-        },
+    // The words of a panic are written on the way to a revert that several tests share.
+    let panics = |mut node: usize| {
+        for _ in 0..4 {
+            let nd = &l.nodes[node];
+            if !nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. })) {
+                return None;
+            }
+            match &nd.term {
+                Term::Revert { data, .. } => return code(data),
+                Term::Jump(next) => node = *next,
+                _ => return None,
+            }
+        }
+        None
     };
-    let mut guards: Vec<(ExprId, u64)> = Vec::new();
+    let mut guards: Vec<(ExprId, u64, Option<Site>)> = Vec::new();
     for nd in &l.nodes {
-        for s in &nd.stmts {
+        for (i, s) in nd.stmts.iter().enumerate() {
             if let Stmt::Require { cond, data, .. } = s {
-                guards.extend(code(data).map(|c| (*cond, c)));
+                guards.extend(code(data).map(|c| (*cond, c, Some((nd.id, i)))));
             }
         }
         if let Term::Branch { cond, t, f } = &nd.term {
             guards.extend(
                 t.and_then(panics)
-                    .map(|c| (expr::op1(op::ISZERO, *cond), c)),
+                    .map(|c| (expr::op1(op::ISZERO, *cond), c, None)),
             );
-            guards.extend(panics(*f).map(|c| (*cond, c)));
+            guards.extend(panics(*f).map(|c| (*cond, c, None)));
         }
     }
     let within = |part: ExprId, whole: ExprId| {
@@ -191,29 +215,35 @@ pub fn checked_ops(l: &Lifted) -> Checked {
     };
     let max = konst_max();
     let mut found = Checked::default();
-    for (cond, code) in guards {
+    for (cond, code, site) in guards {
         let mut pending = vec![cond];
         while let Some(e) = pending.pop() {
             match expr::node(e) {
-                Node::Op(op::ISZERO | op::OR | op::AND, v) => pending.extend(v),
-                Node::Op(op::EQ | op::LT | op::GT | op::SLT | op::SGT, v) => {
+                // A word under a constant mask is one value, not two tests.
+                Node::Op(op::ISZERO | op::OR | op::AND, v)
+                    if !v.iter().any(|x| expr::is_const(*x)) =>
+                {
+                    pending.extend(v)
+                }
+                // A difference tested against zero is a test for equality.
+                Node::Op(op::EQ | op::LT | op::GT | op::SLT | op::SGT | op::SUB, v) => {
                     for (x, y) in [(v[0], v[1]), (v[1], v[0])] {
                         match expr::node(x) {
                             _ if within(x, y) => {}
                             Node::Op(op::DIV, d) => match expr::node(d[0]) {
                                 Node::Op(op::MUL, m) if m.contains(&d[1]) => {
-                                    found.ops.insert(d[0]);
+                                    tested(&mut found.ops, d[0], site);
                                 }
                                 _ => {
-                                    found.ops.insert(x);
+                                    tested(&mut found.ops, x, site);
                                 }
                             },
                             Node::Op(..) => {
-                                found.ops.insert(x);
+                                tested(&mut found.ops, x, site);
                             }
                             _ => {}
                         }
-                        found.ops.insert(expr::op2(op::SUB, x, y));
+                        tested(&mut found.ops, expr::op2(op::SUB, x, y), site);
                         /* Solidity up to 0.8.15 tests a sum against max - y and a
                         product against max / y. */
                         let other = match expr::node(y) {
@@ -223,32 +253,46 @@ pub fn checked_ops(l: &Lifted) -> Checked {
                             _ => None,
                         };
                         if let Some((o, z)) = other {
-                            found.ops.extend([expr::op2(o, x, z), expr::op2(o, z, x)]);
+                            tested(&mut found.ops, expr::op2(o, x, z), site);
+                            tested(&mut found.ops, expr::op2(o, z, x), site);
                         }
-                        match expr::as_const(y) {
-                            Some(c) if c == max => {
-                                found.ops.insert(expr::op2(op::ADD, x, expr::konst_u64(1)));
-                            }
-                            Some(c) if c.is_zero() => {
-                                found.ops.insert(expr::op2(op::SUB, x, expr::konst_u64(1)));
-                                found.divisors.insert(x);
-                            }
-                            Some(c) => {
-                                let room = expr::konst(max.wrapping_sub(c));
-                                found.ops.insert(expr::op2(op::ADD, x, room));
-                                found
-                                    .ops
-                                    .insert(expr::op2(op::SUB, expr::konst(U256::ZERO), x));
-                            }
-                            None => {}
+                        let Some(c) = expr::as_const(y) else {
+                            continue;
+                        };
+                        // The largest and the smallest value of a type guard a step by one.
+                        if c.is_low_mask() {
+                            tested(
+                                &mut found.ops,
+                                expr::op2(op::ADD, x, expr::konst_u64(1)),
+                                site,
+                            );
+                        }
+                        if (!c).is_low_mask() {
+                            tested(
+                                &mut found.ops,
+                                expr::op2(op::SUB, x, expr::konst_u64(1)),
+                                site,
+                            );
+                        }
+                        if c.is_zero() {
+                            tested(&mut found.divisors, x, site);
+                        } else if c != max {
+                            let room = expr::konst(max.wrapping_sub(c));
+                            tested(&mut found.ops, expr::op2(op::ADD, x, room), site);
+                            let negated = expr::op2(op::SUB, expr::konst(U256::ZERO), x);
+                            tested(&mut found.ops, negated, site);
                         }
                     }
                 }
                 _ if code == PANIC_DIV_BY_ZERO => {
-                    found.divisors.insert(e);
+                    tested(&mut found.divisors, e, site);
                 }
                 _ => {
-                    found.ops.insert(expr::op2(op::SUB, e, expr::konst_u64(1)));
+                    tested(
+                        &mut found.ops,
+                        expr::op2(op::SUB, e, expr::konst_u64(1)),
+                        site,
+                    );
                 }
             }
         }
@@ -269,20 +313,44 @@ struct Places {
 /* The compiler adds and subtracts places in memory, storage and call data without a test,
 and none of that is arithmetic the source wrote. A value is a place when it is used as
 one: as the offset of a load, a store, a copy, a call or a log, in a bounds test against
-the size of the call data, or by a helper that uses its parameter or its result as one. */
-pub fn offsets(units: &[(usize, &Lifted)]) -> Vec<HashSet<ExprId>> {
+the size of the call data, or by a helper that uses its parameter or its result as one.
+What is added to a hash or to an allocated block is a number counted from it. A sum made
+from that number elsewhere is no place. */
+#[derive(Clone, Debug, Default)]
+pub struct Offsets {
+    places: HashSet<ExprId>,
+    bases: HashSet<ExprId>,
+}
+
+pub fn offsets(units: &[(usize, &Lifted)]) -> Vec<Offsets> {
     let mut places: HashMap<usize, Places> = HashMap::new();
     loop {
         let before = places.clone();
         let found = units.iter().map(|(pc, l)| offsets_in(*pc, l, &mut places));
-        let found: Vec<HashSet<ExprId>> = found.collect();
+        let found: Vec<Offsets> = found.collect();
         if places == before {
             return found;
         }
     }
 }
 
-fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> HashSet<ExprId> {
+type Defs = HashMap<ExprId, Vec<ExprId>>;
+
+fn anchors(e: ExprId, defs: &Defs, depth: u32) -> bool {
+    match expr::node(e) {
+        Node::Keccak(..) | Node::KeccakMem(..) => true,
+        Node::MLoad(at, _) => is_free_pointer(at),
+        Node::Op(op::ADD, v) if depth < 6 => v.iter().any(|x| anchors(*x, defs, depth + 1)),
+        Node::Op(op::SUB, v) if depth < 6 => anchors(v[0], defs, depth + 1),
+        Node::Var(_) if depth < 6 => {
+            let from = defs.get(&e).into_iter().flatten();
+            from.into_iter().any(|x| anchors(*x, defs, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> Offsets {
     let sizes = |e: ExprId| {
         expr::contains(e, &|n| {
             matches!(n, Node::Env(op::CALLDATASIZE | op::RETURNDATASIZE, _))
@@ -347,15 +415,32 @@ fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> Has
     }
     let defs = crate::ssa::phi_defs(l);
     let arity = crate::ssa::arity(l);
-    let mut found: HashSet<ExprId> = HashSet::new();
-    while let Some(e) = pending.pop() {
-        if !found.insert(e) {
+    let anchored = |e: ExprId| anchors(e, &defs, 0);
+    let mut found = Offsets::default();
+    let mut pending: Vec<(ExprId, bool)> = pending.into_iter().map(|e| (e, true)).collect();
+    while let Some((e, base)) = pending.pop() {
+        let new = match base {
+            true => found.bases.insert(e),
+            false => !found.places.contains(&e),
+        };
+        found.places.insert(e);
+        if !new {
             continue;
         }
         match expr::node(e) {
-            Node::Op(op::ADD | op::SUB | op::AND, v) => pending.extend(v),
-            Node::Var(_) => pending.extend(defs.get(&e).into_iter().flatten()),
-            Node::Arg(slot) if (slot as usize) < arity => {
+            Node::Op(op::ADD, v) if base && anchored(v[0]) != anchored(v[1]) => {
+                pending.extend(v.iter().map(|x| (*x, anchored(*x))));
+            }
+            Node::Op(op::SUB, v) if base && anchored(v[0]) => {
+                pending.extend([(v[0], true), (v[1], false)]);
+            }
+            Node::Op(op::ADD | op::SUB | op::AND, v) => {
+                pending.extend(v.iter().map(|x| (*x, base)));
+            }
+            Node::Var(_) if base => {
+                pending.extend(defs.get(&e).into_iter().flatten().map(|x| (*x, true)));
+            }
+            Node::Arg(slot) if base && (slot as usize) < arity => {
                 let own = places.entry(pc).or_default();
                 own.params.insert(arity - 1 - slot as usize);
             }
@@ -368,7 +453,7 @@ fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> Has
                 callee, results, ..
             } = s
             {
-                let used = (0..results.len()).filter(|j| found.contains(&results[*j]));
+                let used = (0..results.len()).filter(|j| found.bases.contains(&results[*j]));
                 places.entry(*callee).or_default().returns.extend(used);
             }
         }
@@ -391,38 +476,115 @@ impl Names {
     /* Solidity from 0.8 on tests by default, so there a bare operator has to mean a
     tested one. A division by a constant that is not zero needs no test, and an address
     in an allocated block is not a sum. */
-    fn unchecked(&self, e: ExprId) -> bool {
-        let Some(checked) = &self.checked else {
-            return false;
-        };
+    fn arithmetic(&self, e: ExprId) -> Option<Arithmetic> {
+        let checked = self.checked.as_ref()?;
         // Multiplying or dividing by a power of two moves bits. It is how a field is packed.
         let shift = |x: ExprId| match expr::node(x) {
             Node::Const(c) => c.is_power_of_two(),
             Node::Op(op::EXP, v) => expr::as_const(v[0]).is_some_and(|c| c.is_power_of_two()),
             _ => false,
         };
-        let free = match expr::node(e) {
-            Node::Op(op::ADD | op::SUB, _) => !checked.ops.contains(&e),
-            Node::Op(op::MUL, v) => !checked.ops.contains(&e) && !v.iter().any(|x| shift(*x)),
-            Node::Op(op::DIV | op::SDIV | op::MOD | op::SMOD, v) => {
-                let safe = expr::as_const(v[1]).is_some_and(|c| !c.is_zero()) || shift(v[1]);
-                !safe && !checked.ops.contains(&e) && !checked.divisors.contains(&v[1])
-            }
-            _ => false,
+        let (tested, safe) = match expr::node(e) {
+            Node::Op(op::ADD | op::SUB, _) => (checked.ops.contains_key(&e), false),
+            Node::Op(op::MUL, v) => (checked.ops.contains_key(&e), v.iter().any(|x| shift(*x))),
+            Node::Op(op::DIV | op::SDIV | op::MOD | op::SMOD, v) => (
+                checked.ops.contains_key(&e) || checked.divisors.contains_key(&v[1]),
+                expr::as_const(v[1]).is_some_and(|c| !c.is_zero()) || shift(v[1]),
+            ),
+            _ => return None,
         };
-        free && block_ref(e, self).is_none() && !self.is_offset(e, 0)
+        Some(match tested {
+            true => Arithmetic::Tested,
+            false if safe || block_ref(e, self).is_some() || self.is_offset(e, 0) => {
+                Arithmetic::Exempt
+            }
+            false => Arithmetic::Untested,
+        })
+    }
+
+    fn unchecked(&self, e: ExprId) -> bool {
+        self.arithmetic(e) == Some(Arithmetic::Untested)
+    }
+
+    #[must_use]
+    pub fn tests(&self, e: ExprId) -> bool {
+        let mut seen = HashSet::new();
+        let mut pending = vec![e];
+        while let Some(x) = pending.pop() {
+            if !seen.insert(x) || seen.len() > 5000 {
+                continue;
+            }
+            if self.arithmetic(x) == Some(Arithmetic::Tested) {
+                return true;
+            }
+            pending.extend(expr::children(x));
+        }
+        false
     }
 
     fn is_offset(&self, e: ExprId, depth: u32) -> bool {
-        self.offsets.contains(&e)
+        self.offsets.places.contains(&e)
             || match expr::node(e) {
-                Node::Op(op::ADD | op::SUB, v) if depth < 8 => {
-                    v.iter().any(|x| self.is_offset(*x, depth + 1))
-                }
-                Node::Env(op::CALLDATASIZE | op::RETURNDATASIZE, _) => true,
-                Node::MLoad(at, _) => is_free_pointer(at),
+                Node::Op(op::ADD | op::SUB, v) => v.iter().any(|x| self.is_base(*x, depth)),
                 _ => false,
             }
+    }
+
+    fn is_base(&self, e: ExprId, depth: u32) -> bool {
+        match expr::node(e) {
+            Node::Const(_) => false,
+            Node::Env(op::CALLDATASIZE | op::RETURNDATASIZE, _) => true,
+            Node::MLoad(at, _) if is_free_pointer(at) => true,
+            Node::Op(op::ADD | op::SUB, v) if depth < 8 => {
+                self.offsets.bases.contains(&e) || v.iter().any(|x| self.is_base(*x, depth + 1))
+            }
+            _ => self.offsets.bases.contains(&e),
+        }
+    }
+
+    #[must_use]
+    pub fn test_sites(&self, e: ExprId) -> Vec<Site> {
+        let Some(checked) = self.checked.as_ref() else {
+            return Vec::new();
+        };
+        let mut sites = checked.ops.get(&e).cloned().unwrap_or_default();
+        if let Node::Op(op::DIV | op::SDIV | op::MOD | op::SMOD, v) = expr::node(e) {
+            sites.extend(checked.divisors.get(&v[1]).into_iter().flatten());
+        }
+        sites
+    }
+
+    /* A shared value printed under a name changes every expression that holds it. What
+    was found about the old expression is true of the new one. */
+    pub fn rebind(&mut self, bindings: &[(Node, ExprId)]) {
+        for (target, var) in bindings {
+            let mut memo = HashMap::new();
+            let named = |n: &Node| (n == target).then_some(*var);
+            for set in [&mut self.offsets.places, &mut self.offsets.bases] {
+                let renamed: Vec<ExprId> = set
+                    .iter()
+                    .map(|e| expr::substitute(*e, &named, &mut memo))
+                    .collect();
+                set.extend(renamed);
+            }
+            let Some(checked) = &mut self.checked else {
+                continue;
+            };
+            for set in [&mut checked.ops, &mut checked.divisors] {
+                let renamed: Vec<(ExprId, Vec<Site>)> = set
+                    .iter()
+                    .map(|(e, sites)| (expr::substitute(*e, &named, &mut memo), sites.clone()))
+                    .collect();
+                for (e, sites) in renamed {
+                    set.entry(e).or_insert(sites);
+                }
+            }
+        }
+        for (target, var) in bindings {
+            if self.is_base(expr::intern(target.clone()), 0) {
+                self.offsets.bases.insert(*var);
+            }
+        }
     }
 
     pub fn take_temps(&self) -> Vec<(String, String)> {
@@ -853,6 +1015,7 @@ pub const SEL_PANIC: u32 = 0x4e487b71;
 pub const SEL_ERROR: u32 = 0x08c379a0;
 const PANIC_OVERFLOW: u64 = 0x11;
 const PANIC_DIV_BY_ZERO: u64 = 0x12;
+const PANIC_EMPTY_POP: u64 = 0x31;
 
 pub fn is_bool(e: ExprId, n: &Names) -> bool {
     expr::is_boolean(e)
@@ -1672,7 +1835,8 @@ fn fmt_bare(e: ExprId, outer: u8, n: &Names) -> String {
     };
     let operand = |x: ExprId, prec: u8| match expr::node(x) {
         Node::Op(op::ADD | op::SUB | op::MUL | op::DIV | op::SDIV | op::MOD | op::SMOD, _)
-            if !n.unchecked(x) && n.temp_of.borrow().get(&x).is_none() =>
+            if n.arithmetic(x) == Some(Arithmetic::Tested)
+                && n.temp_of.borrow().get(&x).is_none() =>
         {
             format!("checked({})", fmt_expr(x, n))
         }

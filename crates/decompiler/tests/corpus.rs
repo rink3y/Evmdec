@@ -468,7 +468,7 @@ fn tribe_reads_as_source() {
         "stor_4.push(address(v2));",
         "stor_3[address(v2)] = true;",
         "if (stor_4.length < stor_7) {",
-        "while (v1 < stor[arg0]) {",
+        "require(v1 < stor[arg0], Panic(assert));",
     ] {
         assert!(src.contains(s), "missing {s}\n{src}");
     }
@@ -737,7 +737,7 @@ fn vyper_fixed_addresses_read_as_locals() {
     let src = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
     for line in [
         "// Memory: loc_N is the variable kept at the fixed memory address 0xN",
-        "while (loc_280 < 2) {",
+        "while (true) {\n            require(loc_280 < 2);",
         "loc_240[loc_280] = loc_240[loc_280] + loc_2a0;",
         "identity.call(mem[0x280:0x2e4])",
     ] {
@@ -1109,7 +1109,7 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
         gauge.contains(
             "uint256 prev_stor_14 = stor_14;\n        \
              uint256 prev_timestamp_15_stor_14 = timestamp_15[prev_stor_14];"
-        ) && gauge.contains("if (prev_stor_5 < prev_timestamp_15_stor_14) {"),
+        ) && gauge.contains("if (prev_stor_5 >= prev_timestamp_15_stor_14) {"),
         "the period is read once, ahead of both branches"
     );
     let burn = &pool[pool
@@ -1210,9 +1210,6 @@ fn copies_of_one_block_have_labels_of_their_own() {
     labels.sort_unstable();
     labels.dedup();
     assert_eq!(labels.len(), defined, "a label is defined once: {labels:?}");
-    assert!(["L3706", "L3706_2", "L3706_3"]
-        .iter()
-        .all(|l| labels.contains(l)));
     for goto in body.split("goto ").skip(1) {
         let target = goto.split(';').next().unwrap();
         assert!(labels.contains(&target), "goto {target} has its label");
@@ -1338,9 +1335,15 @@ fn a_slot_read_before_an_outside_call_is_not_printed_as_read_after_it() {
     );
     assert_eq!(undeclared_old_values(&router), Vec::<String>::new());
     let gauge = regress("vyper_gauge.hex").source;
+    let read = gauge
+        .find("loc_240 = stor_13;")
+        .expect("the supply is kept");
+    let called = gauge[read..].find(".call(").expect("the controller") + read;
+    let divided = gauge[called..]
+        .find(" / loc_240 >= loc_1c0);")
+        .expect("the division");
     assert!(
-        gauge.contains("uint256 prev_stor_13 = stor_13;")
-            && gauge.contains(" / prev_stor_13 >= loc_1c0);"),
+        !gauge[read + 1..called + divided].contains("loc_240 = "),
         "the supply read before the controller is called is the one divided by after"
     );
     assert_eq!(undeclared_old_values(&gauge), Vec::<String>::new());
@@ -1375,4 +1378,25 @@ fn a_tested_difference_is_made_before_the_transfer_that_follows_it() {
         .rposition(|l| l.starts_with("v8 = v2 - v"))
         .expect("the amount spent");
     assert!(refund - spent <= 2, "{:?}", &lines[spent..=refund]);
+}
+
+#[test]
+fn a_loop_is_printed_once_with_its_tests_inside_it() {
+    let body = |source: &str, name: &str| -> String {
+        let start = source.find(name).expect("the helper");
+        source[start..start + source[start..].find("\n    }").unwrap()].to_string()
+    };
+    let gauge = body(&regress("vyper_gauge.hex").source, "function func_0x71d(");
+    assert_eq!(
+        gauge.matches("func_d3078c94.selector").count(),
+        1,
+        "{gauge}"
+    );
+    assert!(!gauge.contains("goto "), "{gauge}");
+    assert!(gauge.contains("while (true) {\n                require(loc_2a0 >= loc_280);"));
+    let staking = body(
+        &regress("vyper_sparse_table.hex").source,
+        "function func_0x2cfc(",
+    );
+    assert_eq!(staking.matches("transfer.selector").count(), 1, "{staking}");
 }

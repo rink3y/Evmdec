@@ -2914,6 +2914,20 @@ impl<'a> Printer<'a> {
         if self.labels.contains(&header) {
             self.line(depth.saturating_sub(1), &format!("{}:", self.label(header)));
         }
+        /* A way out that only reverts is a test inside the loop. Taken as the exit, the
+        code after the loop was printed inside it and reached by a jump into it. */
+        let ends = |e: &&usize| self.revert_reason(header, **e).is_none();
+        let kept: Vec<usize> = exits.iter().filter(ends).copied().collect();
+        let exits = match kept.is_empty() {
+            true => exits,
+            false => &kept[..],
+        };
+        let after = |x: usize, e: usize| {
+            let up = std::iter::successors(Some(x), |n| self.g.ipdom[*n]);
+            up.take(self.l.nodes.len()).any(|n| n == e)
+        };
+        // Ways out that all lead on to one of them leave the loop there.
+        let joined = |e: &&usize| exits.iter().all(|x| after(*x, **e));
         let exit = match exits.len() {
             0 => None,
             1 => Some(exits[0]),
@@ -2921,7 +2935,7 @@ impl<'a> Printer<'a> {
                 let pd = self.g.ipdom[header];
                 match pd {
                     Some(p) if exits.contains(&p) => Some(p),
-                    _ => Some(exits[0]),
+                    _ => exits.iter().find(joined).or(exits.first()).copied(),
                 }
             }
         };
@@ -2957,9 +2971,10 @@ impl<'a> Printer<'a> {
                 {
                     let test =
                         |e: ExprId| self.names.without_temps(|| emit::fmt_expr(e, self.names));
-                    if body.contains(t) && !body.contains(f) {
+                    let ends = |e: &usize| self.revert_reason(cond_node, *e).is_none();
+                    if body.contains(t) && !body.contains(f) && ends(f) {
                         while_cond = test(*cond).map(|text| (text, *t));
-                    } else if body.contains(f) && !body.contains(t) {
+                    } else if body.contains(f) && !body.contains(t) && ends(t) {
                         while_cond = test(expr::op1(op::ISZERO, *cond)).map(|text| (text, *f));
                     }
                     if let Some((_, into)) = &while_cond {

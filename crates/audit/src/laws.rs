@@ -216,7 +216,8 @@ pub fn check(
     let top = U256::ONE << 255;
     /* What fell, in this call, in records kept under the account's own address. A rise
     in one of its records that is no more than that is its own claim moved from one
-    record to another. */
+    record to another. So is a rise no more than what it drew down in earlier calls,
+    put back. */
     let moved = changes
         .iter()
         .filter(|(c, old, new, _, _)| own(c) && actor_keyed(c) && new < old && *old < top)
@@ -234,7 +235,7 @@ pub fn check(
         if actor_keyed(cell)
             && !others
             && new > old
-            && new - old > moved
+            && new - old > moved.wrapping_add(spent)
             && paid_nothing
             && !gave_up
             && !paid_elsewhere
@@ -255,8 +256,12 @@ pub fn check(
                     .any(|a| of_one(after, *a, v) > of_one(before, *a, v))
             };
             let real = !made_up(&tag);
-            if let Some(victim) =
-                victim.filter(|v| real && !actor_keyed(cell) && new < old && !paid_out(*v))
+            // A record that passes to the account for a payment was bought.
+            let bought = kinds
+                .iter()
+                .any(|a| of_party(after, *a) < of_party(before, *a));
+            if let Some(victim) = victim
+                .filter(|v| real && !bought && !actor_keyed(cell) && new < old && !paid_out(*v))
             {
                 found.push(Breach {
                     amount: old - new,

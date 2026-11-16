@@ -1571,6 +1571,7 @@ impl<'a> Explorer<'a> {
             if !self.survives(&breach, steps, run, about_value) {
                 continue;
             }
+            let steps = &self.fewest(&breach, steps);
             let place = breach.cell.as_ref().map(crate::trace::Cell::place);
             let (kind, asset) = (breach.kind, breach.asset);
             let same = |v: &Violation| {
@@ -1654,9 +1655,16 @@ impl<'a> Explorer<'a> {
         for (slot, held) in undo {
             world.seed(subject, slot, held);
         }
-        let Some((Step::Call { msg, .. }, earlier)) =
-            steps.get(prefix..).and_then(|s| s.split_last())
-        else {
+        let kind = breach.kind;
+        steps
+            .get(prefix..)
+            .is_none_or(|steps| self.shows(world, steps, &|b| b.kind == kind))
+    }
+
+    // Whether the same steps, made again from this world, end in the consequence asked for.
+    fn shows(&mut self, mut world: World, steps: &[Step], same: &dyn Fn(&Breach) -> bool) -> bool {
+        let subject = self.subject;
+        let Some((Step::Call { msg, .. }, earlier)) = steps.split_last() else {
             return true;
         };
         let mut base = world.clone();
@@ -1691,7 +1699,34 @@ impl<'a> Explorer<'a> {
         self.runs += 1;
         let again = world.send(msg);
         let found = laws::check(&base, &before, &world, &again, &self.facts, spent);
-        again.ok && found.iter().any(|b| b.kind == breach.kind)
+        again.ok && found.iter().any(same)
+    }
+
+    /* A call the finding shows without is no part of it. Each earlier call is left out
+    in turn and the rest made again, and it stays out when the same consequence shows. */
+    fn fewest(&mut self, breach: &Breach, steps: &[Step]) -> Vec<Step> {
+        let prefix = self.states[0].steps.len().min(steps.len());
+        let place = |b: &Breach| b.cell.as_ref().map(crate::trace::Cell::place);
+        let same = |b: &Breach| {
+            b.kind == breach.kind
+                && b.asset == breach.asset
+                && b.victim == breach.victim
+                && place(b) == place(breach)
+        };
+        let mut kept = steps.to_vec();
+        let mut at = prefix;
+        while at + 1 < kept.len() && !budget::spent() {
+            let mut without = kept.clone();
+            without.remove(at);
+            let world = self.states[0].world.clone();
+            let call = matches!(kept[at], Step::Call { .. });
+            if call && self.shows(world, &without[prefix..], &same) {
+                kept = without;
+            } else {
+                at += 1;
+            }
+        }
+        kept
     }
 
     /* A record that rose is worth something only if more can now be done with it. The

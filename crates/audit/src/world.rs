@@ -1279,7 +1279,9 @@ impl World {
             );
         }
         if to == ACTOR || to == ALLY {
-            if !fixed {
+            // A payment that passes on no gas of its own leaves the receiver the stipend,
+            // which pays for a log and nothing else. It cannot call back in.
+            if !fixed && record.gas > U256::from_u64(2_300) {
                 self.hand_over(f, tx);
             }
             let shaped = selector(&record.input).and_then(|s| self.answers.get(&(to, s)));
@@ -1696,6 +1698,31 @@ mod tests {
         assert_eq!(world.asset_of(asset, ACTOR), U256::from_u64(70));
         assert_eq!(world.asset_of(asset, USER), U256::from_u64(70));
         assert!(world.asset_of(asset, SUBJECT).is_zero());
+    }
+
+    #[test]
+    fn an_account_paid_with_the_stipend_alone_cannot_call_back_in() {
+        // call(gas, caller, 1, 0, 0, 0, 0) with gas 0xffff, then with none of its own
+        for (code, calls_back) in [
+            ("600060006000600060013361fffff100", true),
+            ("60006000600060006001336000f100", false),
+        ] {
+            let mut world = World::new();
+            world.place(SUBJECT, &evmdec::hex::decode(code).expect("hex"));
+            world.enrich(SUBJECT, None);
+            let again = Msg {
+                from: ACTOR,
+                to: SUBJECT,
+                ..Msg::default()
+            };
+            let msg = Msg {
+                hook: Some(Box::new(again.clone())),
+                ..again
+            };
+            let run = world.send(&msg);
+            assert!(run.ok);
+            assert_eq!(run.hooked, calls_back, "{code}");
+        }
     }
 
     #[test]

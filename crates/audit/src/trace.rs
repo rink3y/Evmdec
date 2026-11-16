@@ -244,6 +244,14 @@ pub enum Event {
         tag: Tag,
         pc: usize,
     },
+    // The caller's address less another word, which newer compilers branch on to tell the two apart.
+    Differs {
+        pc: usize,
+        a: U256,
+        b: U256,
+        ta: Tag,
+        tb: Tag,
+    },
     Cmp {
         pc: usize,
         op: u8,

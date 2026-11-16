@@ -1193,16 +1193,17 @@ impl<'a> Explorer<'a> {
     fn compared_with_caller(&self, run: &Run) -> Vec<(Place, U256, Addr)> {
         let mut named = Vec::new();
         for event in &run.events {
-            let Event::Cmp {
-                op: op::EQ,
-                a,
-                b,
-                ta,
-                tb,
-                ..
-            } = event
-            else {
-                continue;
+            let (a, b, ta, tb) = match event {
+                Event::Cmp {
+                    op: op::EQ,
+                    a,
+                    b,
+                    ta,
+                    tb,
+                    ..
+                }
+                | Event::Differs { a, b, ta, tb, .. } => (a, b, ta, tb),
+                _ => continue,
             };
             for (caller, other, holder) in [(ta, tb, b), (tb, ta, a)] {
                 let stored = caller.only(CALLER) && other.has(STORE) && !other.has(DATA);
@@ -1452,16 +1453,17 @@ impl<'a> Explorer<'a> {
         let subject = self.subject;
         let mut empty: Vec<(usize, U256)> = Vec::new();
         for event in &run.events {
-            let Event::Cmp {
-                pc,
-                op: op::EQ,
-                a,
-                b,
-                ta,
-                tb,
-            } = event
-            else {
-                continue;
+            let (pc, a, b, ta, tb) = match event {
+                Event::Cmp {
+                    pc,
+                    op: op::EQ,
+                    a,
+                    b,
+                    ta,
+                    tb,
+                }
+                | Event::Differs { pc, a, b, ta, tb } => (pc, a, b, ta, tb),
+                _ => continue,
             };
             for (caller, value, other, named) in [(ta, a, tb, b), (tb, b, ta, a)] {
                 let stored = other.has(STORE) && !other.has(DATA);
@@ -1482,7 +1484,7 @@ impl<'a> Explorer<'a> {
                 world.seed(subject, slot, named);
                 let (_, again) = self.attempt_in(world, entry, t);
                 let matched = again.events.iter().any(|e| {
-                    matches!(e, Event::Cmp { pc, op: op::EQ, a, b, .. } if *pc == at && a == b && *a == OWNER)
+                    matches!(e, Event::Cmp { pc, op: op::EQ, a, b, .. } | Event::Differs { pc, a, b, .. } if *pc == at && a == b && *a == OWNER)
                 });
                 if !matched {
                     continue;
@@ -1784,7 +1786,8 @@ impl<'a> Explorer<'a> {
         let undo: Vec<(U256, U256)> = self
             .settings
             .iter()
-            .filter(|(place, _, _)| scoped(place))
+            // A lock is one slot for the whole contract. An entry kept per account is no lock.
+            .filter(|(place, _, _)| scoped(place) && place.depth == 0)
             .map(|(_, slot, held)| (*slot, *held))
             .collect();
         let zero_loads = run.events.iter().filter_map(|e| match e {

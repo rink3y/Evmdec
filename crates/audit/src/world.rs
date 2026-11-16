@@ -1102,18 +1102,7 @@ impl World {
                     || (tb.only(CALLER) && !ta.is_none() && !ta.has(MATH));
                 if o == op::SUB && about_caller && tx.cmps < MAX_CMPS {
                     tx.cmps += 1;
-                    let op = op::EQ;
-                    Self::event(
-                        tx,
-                        Event::Cmp {
-                            pc,
-                            op,
-                            a,
-                            b,
-                            ta,
-                            tb,
-                        },
-                    );
+                    Self::event(tx, Event::Differs { pc, a, b, ta, tb });
                 }
                 let wraps = match o {
                     op::ADD => a.overflowing_add(b).1,
@@ -1918,7 +1907,7 @@ mod tests {
     fn the_caller_less_a_stored_account_is_a_comparison_of_the_two() {
         // if (sload(0) - caller) jump
         let (_, run) = run("3360005403600957005b00", Vec::new(), ACTOR);
-        let seen = |e: &Event| matches!(e, Event::Cmp { op: op::EQ, ta, tb, .. } if tb.only(FROM_CALLER) && ta.has(STORE));
+        let seen = |e: &Event| matches!(e, Event::Differs { ta, tb, .. } if tb.only(FROM_CALLER) && ta.has(STORE));
         assert!(run.events.iter().any(seen), "{:?}", run.events);
     }
 

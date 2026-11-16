@@ -160,3 +160,13 @@ fn a_record_in_a_byte_string_is_filled_by_what_its_words_are_used_for() {
     );
     assert_eq!(at(Kind::Loss), ["0xc28e83fd"], "{:?}", report.findings);
 }
+
+#[test]
+fn a_caller_that_has_to_be_a_contract_is_the_accounts_own() {
+    // settle(uint256,bytes). The caller must be the pool its bytes name, have code, and say
+    // which asset to pull from the payer the bytes name.
+    let report = report("Payer.hex");
+    let mut kinds: Vec<Kind> = report.findings.iter().map(|f| f.kind).collect();
+    kinds.sort();
+    assert_eq!(kinds, vec![Kind::Gain, Kind::Loss], "{:?}", report.findings);
+}

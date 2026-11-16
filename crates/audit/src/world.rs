@@ -283,6 +283,16 @@ pub fn transfer_from_call(from: Addr, to: Addr, amount: U256) -> Vec<u8> {
     data
 }
 
+// Which words of a message spoken in the asset interface name accounts.
+#[must_use]
+pub fn accounts_named(input: &[u8]) -> &'static [usize] {
+    match selector(input) {
+        Some(SEL_TRANSFER | SEL_APPROVE | SEL_BALANCE_OF) => &[0],
+        Some(SEL_TRANSFER_FROM | SEL_ALLOWANCE) => &[0, 1],
+        _ => &[],
+    }
+}
+
 fn one_word(value: U256) -> Vec<u8> {
     value.to_be_bytes().to_vec()
 }

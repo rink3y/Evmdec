@@ -3,7 +3,7 @@ use crate::laws::{self, Breach, Kind};
 use crate::model::Facts;
 use crate::shape::{Holds, Laid, Node, Role, Shape};
 use crate::trace::{
-    Answered, Event, Place, Run, Tag, CALLER, CLOCK, DATA, MATH, OUT, SIZE, STORE, VALUE,
+    Answered, Event, Place, Run, Tag, CALLER, CLOCK, DATA, EXT, MATH, OUT, SIZE, STORE, VALUE,
 };
 use crate::world::{self, Addr, Msg, Source, World, ACTOR, ALLY, OWNER, SUBJECT, USER};
 use evmdec::decompile::Contract;
@@ -82,7 +82,7 @@ pub struct Violation {
 }
 
 type Told = (Addr, u32, Vec<u8>);
-type TryKey = (Vec<u8>, U256, Option<U256>, Vec<Told>);
+type TryKey = (Addr, Vec<u8>, U256, Option<U256>, Vec<Told>);
 
 // One call to make, with what the world is taken to be when it is made.
 #[derive(Clone, Debug)]
@@ -425,6 +425,19 @@ impl<'a> Explorer<'a> {
         if !addresses.is_empty() {
             seeds.push(self.seed(entry, ACTOR, ALLY, UNIT, U256::ZERO));
         }
+        // A contract the code is told to call may be the account itself, or one it wrote.
+        for own in [ACTOR, ALLY] {
+            let plain = self.seed(entry, ACTOR, ACTOR, UNIT, U256::ZERO);
+            let called = kinds.contains(&Holds::Callee);
+            seeds.extend(plain.reshaped(&|shape| {
+                shape.each_word(&mut |holds, held| {
+                    if *holds == Holds::Callee {
+                        *held = own;
+                    }
+                });
+                called
+            }));
+        }
         if kinds.contains(&Holds::Amount) {
             seeds.push(self.seed(entry, ACTOR, ACTOR, U256::MAX, U256::ZERO));
             seeds.push(self.seed(entry, ACTOR, ACTOR, U256::ZERO, U256::ZERO));
@@ -521,6 +534,13 @@ impl<'a> Explorer<'a> {
             };
             shown.push((call.to_tag, call.to, holds));
             shown.push((call.value_tag, call.value, Holds::Amount));
+            for named in world::accounts_named(&call.input) {
+                let seen = call.input.get(4 + 32 * named..36 + 32 * named);
+                let tag = call.arg_tags.get(*named);
+                if let (Answered::Books, Some(seen), Some(tag)) = (call.by, seen, tag) {
+                    shown.push((*tag, U256::from_be_bytes(seen), Holds::Address));
+                }
+            }
         }
         for event in &run.events {
             if let Event::Pay {
@@ -578,9 +598,13 @@ impl<'a> Explorer<'a> {
                     world::transfer_from_call(USER, to, UNIT),
                     world::transfer_call(to, UNIT),
                 ];
+                // An asset is told to move with no ether sent along.
+                let value = laid.about(call.value_tag, call.value);
                 for payload in moves {
                     out.extend(t.reshaped(&|shape| {
-                        shape.set(target, outside(0)) && shape.put_bytes(&length.path, &payload)
+                        value.is_none_or(|spot| shape.set(spot, U256::ZERO))
+                            && shape.set(target, outside(0))
+                            && shape.put_bytes(&length.path, &payload)
                     }));
                 }
             }
@@ -598,12 +622,14 @@ impl<'a> Explorer<'a> {
         let mut seen: HashSet<TryKey> = HashSet::new();
         let mut push = |out: &mut Vec<Try>, next: Try| {
             let key = (
+                next.msg.from,
                 next.msg.data.clone(),
                 next.msg.value,
                 next.time,
                 next.answers.clone(),
             );
-            let differs = next.msg.data != t.msg.data
+            let differs = next.msg.from != t.msg.from
+                || next.msg.data != t.msg.data
                 || next.msg.value != t.msg.value
                 || next.time != t.time
                 || next.answers != t.answers;
@@ -637,6 +663,50 @@ impl<'a> Explorer<'a> {
             if let Some(target) = target.filter(|_| unanswered) {
                 let next = t.reshaped(&|shape| shape.set(target, outside(0)));
                 next.into_iter().for_each(|next| push(&mut out, next));
+            }
+        }
+        /* A test of whether an address has code, failed. Whatever named the address is
+        made to name a contract: one that keeps honest books, or one the account wrote. */
+        let hostile = Facts::same_party(t.msg.from, ACTOR);
+        let last = run.events.iter().rev().filter_map(|ev| match ev {
+            Event::Branch { tag, .. } => Some(*tag),
+            _ => None,
+        });
+        for tag in last.take(3).filter(|tag| tag.has(EXT)) {
+            let contracts = [outside(0), ALLY];
+            for contract in contracts.into_iter().take(1 + usize::from(hostile)) {
+                if let Some(spot) = laid.about(tag, U256::MAX) {
+                    let next = t.reshaped(&|shape| shape.set(spot, contract));
+                    next.into_iter().for_each(|next| push(&mut out, next));
+                }
+                let source = tag.call().filter(|_| tag.has(OUT));
+                let source = source.and_then(|k| run.calls.get(k));
+                let source = source.filter(|s| matches!(s.by, Answered::Blank | Answered::Taken));
+                if let Some((source, selector)) =
+                    source.and_then(|s| Some((s, world::selector(&s.input)?)))
+                {
+                    let mut next = t.clone();
+                    next.answers
+                        .retain(|(to, s, _)| !(*to == source.to && *s == selector));
+                    next.answers
+                        .push((source.to, selector, contract.to_be_bytes().to_vec()));
+                    push(&mut out, next);
+                }
+            }
+            // The caller has to be a contract. Where it named itself it names its contract.
+            if tag.has(CALLER) && t.msg.from == ACTOR {
+                let renamed = t.reshaped(&|shape| {
+                    shape.each_word(&mut |_, held| {
+                        if *held == ACTOR {
+                            *held = ALLY;
+                        }
+                    });
+                    true
+                });
+                if let Some(mut next) = renamed {
+                    next.msg.from = ALLY;
+                    push(&mut out, next);
+                }
             }
         }
         let cmps = run.events.iter().rev().filter_map(|ev| match ev {

@@ -80,12 +80,21 @@ pub fn dispatcher_nonpayable(main: &Lifted, dispatcher: &HashSet<usize>) -> bool
     false
 }
 
-pub fn discover(main: &Lifted) -> Dispatch {
+pub fn discover(main: &Lifted, table: &[(u32, usize)]) -> Dispatch {
     let mut functions: Vec<Discovered> = Vec::new();
     let mut entries: HashSet<usize> = HashSet::new();
     let mut sel_nodes: Vec<usize> = Vec::new();
     let reach = lift::reachable(main);
     for &nid in &reach {
+        if let Term::Switch { cases, .. } = &main.nodes[nid].term {
+            for &(selector, pc) in table {
+                if let Some(&entry) = cases.iter().find(|c| main.nodes[**c].pc == pc) {
+                    functions.push(Discovered { selector, entry });
+                    entries.insert(entry);
+                    sel_nodes.push(nid);
+                }
+            }
+        }
         if let Term::Branch { cond, t, f } = &main.nodes[nid].term {
             if let Some((sel, body_true)) = branch_polarity(*cond) {
                 let body = if body_true { *t } else { Some(*f) };
@@ -339,6 +348,7 @@ pub fn is_nonpayable(l: &Lifted) -> bool {
                     is_plain_revert(l, x) || matches!(l.nodes[x].term, Term::Revert { .. })
                 })
             };
+            let value = |e: &ExprId| matches!(expr::node(*e), Node::Env(op::CALLVALUE, _));
             match n {
                 Node::Op(op::ISZERO, v)
                     if matches!(expr::node(v[0]), Node::Env(op::CALLVALUE, _)) =>
@@ -348,6 +358,9 @@ pub fn is_nonpayable(l: &Lifted) -> bool {
                     }
                 }
                 Node::Env(op::CALLVALUE, _) if reverts(*t) => {
+                    return true;
+                }
+                Node::Op(op::OR, v) if v.iter().any(value) && reverts(*t) => {
                     return true;
                 }
                 _ => {}

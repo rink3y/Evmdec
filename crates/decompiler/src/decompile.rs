@@ -3,6 +3,7 @@ use crate::compiler;
 use crate::emit::{self, MappingLayout, Names, SlotSpace};
 use crate::expr::{self, ExprId, Node};
 use crate::function::{self, FnKind, Mutability, Param};
+use crate::interp::{Host, Machine, Outcome};
 use crate::lift::{self, Lifted, Lifter, Stmt, Term};
 use crate::metadata::{self, BytecodeInfo, CodeKind};
 use crate::naming;
@@ -640,6 +641,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     };
     prune_embedded(&mut rec);
+    let mut table_entries: Vec<(u32, usize)> = Vec::new();
     if !rec.unresolved_jumps.is_empty() {
         let oracle = Lifter {
             prog: &prog,
@@ -649,13 +651,19 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             oracle: true,
             copy_loops: Default::default(),
         };
-        let mut computed: HashMap<usize, Vec<usize>> = HashMap::new();
-        for b in &prog.blocks {
-            if !matches!(b.terminator, op::JUMP | op::JUMPI)
-                || !rec.unresolved_jumps.contains(&b.end)
-                || in_embedded(b.start)
-                || b.end > code_end
-            {
+        let open: Vec<&cfg::Block> = prog
+            .blocks
+            .iter()
+            .filter(|b| {
+                matches!(b.terminator, op::JUMP | op::JUMPI)
+                    && rec.unresolved_jumps.contains(&b.end)
+                    && !in_embedded(b.start)
+                    && b.end <= code_end
+            })
+            .collect();
+        let mut computed = table_jumps(&prog, &open, &mut table_entries);
+        for b in open {
+            if computed.contains_key(&b.id) {
                 continue;
             }
             let unit = cfg::Unit {
@@ -784,7 +792,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         copy_loops: Default::default(),
     };
     let main = lifter.lift_summarizing(&rec.main, None);
-    let dispatch = function::discover(&main);
+    let dispatch = function::discover(&main, &table_entries);
     let contract_nonpayable = function::dispatcher_nonpayable(&main, &dispatch.dispatcher);
     tick("lift main", &mut tt);
     let mut orphans: BTreeMap<usize, Lifted> = BTreeMap::new();
@@ -1417,6 +1425,80 @@ pub(crate) fn clone_target(init: &[ExprId], len: ExprId) -> Option<String> {
 
 // A block is read once however many nodes run it, with one running stack.
 // Working the stack out again before every copy was quadratic in a block full of them.
+const TRACE_STEPS: usize = 4_096;
+const TRACE_CALLDATA: usize = 4 + 0x2000;
+
+fn table_jump(prog: &Program, open: &[&cfg::Block], host: &Host) -> Option<(usize, usize)> {
+    let mut m = Machine::new(&prog.code, host);
+    let mut copied: Vec<(usize, usize)> = Vec::new();
+    for _ in 0..TRACE_STEPS {
+        let pc = m.pc;
+        if *prog.code.get(pc)? == op::CODECOPY {
+            let from = |depth: usize| m.stack.iter().rev().nth(depth).and_then(U256::as_usize);
+            copied.push((from(1)?, from(2)?));
+        }
+        let to = match m.step() {
+            Ok(None) => continue,
+            Ok(Some(Outcome::Jump(to))) => to,
+            Ok(Some(Outcome::JumpI(to, cond))) if !cond.is_zero() => to,
+            Ok(Some(Outcome::JumpI(..))) => {
+                m.pc = pc + 1;
+                continue;
+            }
+            _ => return None,
+        };
+        let to = to.as_usize().filter(|to| prog.jumpdests.contains(to))?;
+        let read = |&(src, len): &(usize, usize)| {
+            let bytes = prog
+                .code
+                .get(src..src.saturating_add(len).min(prog.code.len()));
+            let found = |w: &[u8]| usize::from(w[0]) << 8 | usize::from(w[1]) == to;
+            bytes.is_some_and(|bytes| bytes.windows(2).any(found))
+        };
+        match open.iter().find(|b| b.start <= pc && pc < b.end) {
+            // A jump whose target was pushed is a call or a return. A trace follows one path
+            // of it and would stand for all of them.
+            Some(b) if copied.iter().any(read) => return Some((b.id, to)),
+            _ => m.pc = to,
+        }
+    }
+    None
+}
+
+fn table_jumps(
+    prog: &Program,
+    open: &[&cfg::Block],
+    entries: &mut Vec<(u32, usize)>,
+) -> HashMap<usize, Vec<usize>> {
+    let pushed = prog.insns.iter().filter_map(|i| i.imm);
+    let mut selectors: BTreeSet<u32> = pushed
+        .filter(|v| v.bits() <= 32)
+        .map(|v| v.low_u64() as u32)
+        .collect();
+    let words = prog.code.windows(4);
+    selectors.extend(words.map(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]])));
+    let mut host = Host::controlled(U256::ONE, U256::ONE, vec![0; TRACE_CALLDATA], U256::ZERO);
+    let mut jumps: HashMap<usize, Vec<(u32, usize)>> = HashMap::new();
+    for &selector in &selectors {
+        host.calldata[..4].copy_from_slice(&selector.to_be_bytes());
+        if let Some((block, to)) = table_jump(prog, open, &host) {
+            jumps.entry(block).or_default().push((selector, to));
+        }
+    }
+    let mut targets = HashMap::new();
+    for (block, taken) in jumps {
+        // A jump that only some selectors reach was taken after the selector matched the
+        // table. Its target is that selector's function.
+        if taken.len() < selectors.len() {
+            entries.extend(&taken);
+        }
+        let blocks = taken.iter().filter_map(|(_, to)| prog.target_block(*to));
+        let blocks: BTreeSet<usize> = blocks.collect();
+        targets.insert(block, blocks.into_iter().collect());
+    }
+    targets
+}
+
 fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
     let mut out: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut read: HashSet<usize> = HashSet::new();

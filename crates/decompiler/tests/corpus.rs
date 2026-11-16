@@ -969,3 +969,75 @@ fn an_argument_is_bound_to_the_parameter_that_receives_it() {
         "the two factors of the value sent are numbers, whatever sits below them: {head}"
     );
 }
+
+fn regress(name: &str) -> evmdec::decompile::Contract {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress");
+    let text = std::fs::read_to_string(path.join(name)).unwrap();
+    let code = evmdec::hex::decode(text.trim()).unwrap();
+    evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default())
+}
+
+fn selectors(c: &evmdec::decompile::Contract) -> Vec<u32> {
+    let hex = c.functions.iter().filter_map(|f| f.selector.as_deref());
+    hex.map(|s| u32::from_str_radix(&s[2..], 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_selector_table_read_from_the_code_gives_every_function() {
+    const ABI: [u32; 47] = [
+        0x0335_d99f,
+        0x07ee_a7a7,
+        0x099c_0d8e,
+        0x17f7_182a,
+        0x1d27_47d4,
+        0x268c_a11c,
+        0x292b_6f0a,
+        0x2e1a_7d4d,
+        0x33fd_6f74,
+        0x3792_7b6b,
+        0x44a3_ead6,
+        0x4641_257d,
+        0x514e_cd6c,
+        0x53d1_a3b7,
+        0x54c4_9fe9,
+        0x584d_b835,
+        0x69e2_99ed,
+        0x6b44_1a40,
+        0x6e55_3f65,
+        0x70a0_8231,
+        0x72da_cffa,
+        0x7386_1fb3,
+        0x82c6_3066,
+        0x88b7_006e,
+        0x93f7_aa67,
+        0x963c_94b9,
+        0x9ba8_a1b8,
+        0xa491_8944,
+        0xa972_985e,
+        0xaada_d2f7,
+        0xaf75_68dd,
+        0xb5ab_3c1e,
+        0xb6b5_5f25,
+        0xc34d_01a4,
+        0xc481_8351,
+        0xca42_f2cd,
+        0xcab4_d3db,
+        0xcc00_adec,
+        0xdaf1_50f8,
+        0xe152_2536,
+        0xe41a_b771,
+        0xe5ea_47b8,
+        0xe6f1_daf2,
+        0xf05c_c058,
+        0xf106_8454,
+        0xf851_a440,
+        0xfcb5_fbcb,
+    ];
+    let sparse = regress("vyper_sparse_table.hex");
+    assert_eq!(selectors(&sparse), ABI, "one bucket of the table per jump");
+    assert!(!sparse.source.contains("orphan_"));
+    let dense = selectors(&regress("vyper_dense_table.hex"));
+    assert_eq!(dense.len(), 61, "the table holds the selectors themselves");
+    assert!(dense.contains(&0x3df0_2124) && dense.contains(&0x095e_a7b3));
+}

@@ -42,18 +42,20 @@ pub struct Breach {
 }
 
 /* What the account gained in a call somebody else made. A user's own call that pays
-the account does so because of something the account did before. */
+the account does so because of something the account did before. `base` is the world
+before the account first acted. Being handed back what it paid in since is no gain. */
 #[must_use]
-pub fn diverted(before: &World, after: &World) -> Option<Breach> {
+pub fn diverted(base: &World, before: &World, after: &World) -> Option<Breach> {
     let mut kinds: Vec<Option<Addr>> = vec![None];
     kinds.extend(after.assets().into_iter().map(Some));
-    let none_less = kinds
-        .iter()
-        .all(|a| of_party(after, *a) >= of_party(before, *a));
+    let floor = |a: Option<Addr>| of_party(before, a).max(of_party(base, a));
+    let none_less = kinds.iter().all(|a| {
+        of_party(after, *a) >= of_party(before, *a) && of_party(after, *a) >= of_party(base, *a)
+    });
     let most = kinds
         .iter()
-        .filter(|a| of_party(after, **a) > of_party(before, **a))
-        .map(|a| (of_party(after, *a).wrapping_sub(of_party(before, *a)), *a))
+        .filter(|a| of_party(after, **a) > floor(**a))
+        .map(|a| (of_party(after, *a).wrapping_sub(floor(*a)), *a))
         .max();
     let (amount, asset) = most.filter(|_| none_less)?;
     Some(Breach {
@@ -283,4 +285,24 @@ pub fn check(
         found.push(bare(Kind::Destroyed));
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::SUBJECT;
+
+    #[test]
+    fn being_handed_back_what_it_paid_in_is_no_gain_for_the_account() {
+        let base = World::new();
+        let mut paid = base.clone();
+        assert!(paid.give(None, ACTOR, SUBJECT, U256::from_u64(5)));
+        let mut refunded = paid.clone();
+        assert!(refunded.give(None, SUBJECT, ACTOR, U256::from_u64(5)));
+        assert!(diverted(&base, &paid, &refunded).is_none());
+        let mut more = refunded.clone();
+        assert!(more.give(None, USER, ACTOR, U256::from_u64(2)));
+        let gain = diverted(&base, &paid, &more).expect("two more than it started with");
+        assert_eq!(gain.amount, U256::from_u64(2));
+    }
 }

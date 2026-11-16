@@ -1,14 +1,16 @@
 use crate::budget;
 use crate::laws::{self, Breach, Kind};
 use crate::model::Facts;
-use crate::trace::{Answered, Event, Run, Tag, CALLER, CLOCK, DATA, MATH, OUT, SIZE, STORE, VALUE};
+use crate::trace::{
+    Answered, Event, Place, Run, Tag, CALLER, CLOCK, DATA, MATH, OUT, SIZE, STORE, VALUE,
+};
 use crate::world::{self, Addr, Msg, World, ACTOR, ALLY, OWNER, SUBJECT, USER};
 use evmdec::abi;
 use evmdec::decompile::Contract;
 use evmdec::function::{FnKind, Mutability};
 use evmdec::opcode as op;
 use evmdec::U256;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub const UNIT: U256 = U256([1_000_000_000_000_000_000, 0, 0, 0]);
 // What an account is taken to hold in a ledger the contract keeps: a thousand units.
@@ -119,6 +121,9 @@ pub struct Explorer<'a> {
     pub facts: Facts,
     pub found: Vec<Violation>,
     pub assumed: Vec<String>,
+    // Each slot filled as a setting, with the variable it belongs to and what it held.
+    settings: Vec<(Place, U256, U256)>,
+    raised: std::collections::BTreeMap<U256, std::collections::BTreeSet<U256>>,
     pub runs: u64,
     trace: bool,
     edges: HashSet<u32>,
@@ -348,6 +353,8 @@ impl<'a> Explorer<'a> {
             states: vec![start],
             found: Vec::new(),
             assumed: Vec::new(),
+            settings: Vec::new(),
+            raised: crate::model::raised_within_a_call(c),
             runs: 0,
             trace: std::env::var("EVMDEC_AUDIT_TRACE").is_ok(),
             edges: HashSet::new(),
@@ -469,6 +476,20 @@ impl<'a> Explorer<'a> {
         let run = world.send(&t.msg);
         self.runs += 1;
         if run.ok && honest {
+            /* A contract that passes value on to others writes nothing down. Here the
+            others are stand-ins that take nothing, so what was meant to move on stays.
+            Value is kept on purpose when the call wrote a record or spoke to nobody. */
+            let subject = self.subject;
+            let mut ends: HashMap<(U256, U256), (U256, U256)> = HashMap::new();
+            for (cell, old, new, _, _) in run.stores() {
+                ends.entry((cell.account, cell.slot))
+                    .or_insert((old, new))
+                    .1 = new;
+            }
+            let recorded = ends
+                .iter()
+                .any(|((account, _), (old, new))| *account == subject && old != new);
+            let held_on_purpose = recorded || run.calls.is_empty();
             let mut kinds: Vec<Option<Addr>> = vec![None];
             kinds.extend(world.assets().into_iter().map(Some));
             for kind in kinds {
@@ -480,7 +501,7 @@ impl<'a> Explorer<'a> {
                     Some(asset) => world.asset_of(asset, self.subject),
                     None => world.ether_of(self.subject),
                 };
-                if now > was {
+                if now > was && held_on_purpose {
                     self.facts.keeps.insert(kind);
                 }
             }
@@ -505,6 +526,17 @@ impl<'a> Explorer<'a> {
                     .filter(|e| !matches!(e, Event::Load { .. }))
                 {
                     eprintln!("    {event:?}");
+                }
+                for call in &run.calls {
+                    let (input, output) = (&call.input, &call.output);
+                    eprintln!(
+                        "    call to {:.8} in {} out {} by {:?} args {:?}",
+                        call.to.to_hex(),
+                        evmdec::hex::encode(&input[..input.len().min(100)]),
+                        evmdec::hex::encode(&output[..output.len().min(32)]),
+                        call.by,
+                        call.arg_tags.iter().map(|t| t.bits).collect::<Vec<_>>()
+                    );
                 }
             }
         }
@@ -1047,6 +1079,7 @@ impl<'a> Explorer<'a> {
         let subject = self.subject;
         let base = &self.states[0].world;
         let mut options: Vec<(U256, U256, String)> = Vec::new();
+        let mut at: HashMap<U256, Place> = HashMap::new();
         let mut roles: Vec<U256> = Vec::new();
         let tests = run.events.iter().rev().filter_map(|e| match e {
             Event::Branch { tag, .. } if tag.has(STORE) && !tag.has(DATA | VALUE) => Some(*tag),
@@ -1070,6 +1103,7 @@ impl<'a> Explorer<'a> {
                     continue;
                 }
                 let held = base.stored(subject, cell.slot);
+                at.insert(cell.slot, cell.place());
                 let by_caller = cell
                     .keys
                     .iter()
@@ -1110,7 +1144,11 @@ impl<'a> Explorer<'a> {
                 return false;
             }
             let mut world = self.states[0].world.clone();
-            if world.stored(subject, slot) == value {
+            let lowered = self
+                .raised
+                .get(&slot)
+                .is_none_or(|rests| rests.contains(&value));
+            if world.stored(subject, slot) == value || !lowered {
                 continue;
             }
             world.seed(subject, slot, value);
@@ -1118,8 +1156,11 @@ impl<'a> Explorer<'a> {
             // The caller's own entry is as often a balance as a role. Only a role lets the call end.
             let enough = next.ok || !roles.contains(&slot);
             if enough && better(&next, run) && !self.breaks_others(&world, entry) {
+                let held = self.states[0].world.stored(subject, slot);
                 self.states[0].world.seed(subject, slot, value);
                 self.assumed.push(why);
+                self.settings
+                    .extend(at.get(&slot).map(|place| (*place, slot, held)));
                 return true;
             }
         }
@@ -1197,7 +1238,7 @@ impl<'a> Explorer<'a> {
                 breach.kind,
                 Kind::Gain | Kind::Loss | Kind::Credit | Kind::Debit
             );
-            if about_value && !self.survives(&breach, steps, run) {
+            if !self.survives(&breach, steps, run, about_value) {
                 continue;
             }
             let place = breach.cell.as_ref().map(crate::trace::Cell::place);
@@ -1228,8 +1269,17 @@ impl<'a> Explorer<'a> {
     owner writes, read as zero only because this world never saw it set. A price or a
     rate of nothing makes everything free. The same calls are made again with such
     slots holding a plain amount, and a finding has to show then too. */
-    fn survives(&mut self, breach: &Breach, steps: &[Step], run: &Run) -> bool {
+    fn survives(&mut self, breach: &Breach, steps: &[Step], run: &Run, value: bool) -> bool {
         let subject = self.subject;
+        /* A flag some call raises and lowers again within itself is down between
+        calls. Taking it for a setting leaves it up for good. */
+        let scoped = |place: &Place| self.facts.places.get(place).is_some_and(|p| p.scoped);
+        let undo: Vec<(U256, U256)> = self
+            .settings
+            .iter()
+            .filter(|(place, _, _)| scoped(place))
+            .map(|(_, slot, held)| (*slot, *held))
+            .collect();
         let zero_loads = run.events.iter().filter_map(|e| match e {
             Event::Load { cell, value } if value.is_zero() => Some(*cell),
             _ => None,
@@ -1253,18 +1303,26 @@ impl<'a> Explorer<'a> {
         let used = |i: usize| worked.iter().any(|t| t.cell().is_none_or(|c| c == i));
         let mut doubtful: Vec<U256> = unset
             .into_iter()
-            .filter(|(i, _)| used(*i))
+            .filter(|(i, _)| value && used(*i))
             .map(|(_, slot)| slot)
             .collect();
         doubtful.sort();
         doubtful.dedup();
-        if doubtful.is_empty() {
+        let about_caller = |c: &crate::trace::CallOut| {
+            c.by == Answered::Blank && c.arg_tags.iter().any(|a| a.only(CALLER))
+        };
+        let judged = run.calls.iter().any(about_caller);
+        if doubtful.is_empty() && undo.is_empty() && !judged {
             return true;
         }
         let prefix = self.states[0].steps.len();
         let mut world = self.states[0].world.clone();
+        world.contrary = judged;
         for slot in doubtful {
             world.seed(subject, slot, UNIT);
+        }
+        for (slot, held) in undo {
+            world.seed(subject, slot, held);
         }
         let Some((Step::Call { msg, .. }, earlier)) =
             steps.get(prefix..).and_then(|s| s.split_last())
@@ -1596,7 +1654,8 @@ impl<'a> Explorer<'a> {
                     if !run.ok {
                         continue;
                     }
-                    if let Some(breach) = laws::diverted(&before, &world) {
+                    let base = &self.states[0].world;
+                    if let Some(breach) = laws::diverted(base, &before, &world) {
                         let steps = self.history(from, entry, &t.msg);
                         self.report(vec![breach], blamed, &steps, &run, (false, true));
                     }

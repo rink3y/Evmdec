@@ -103,6 +103,10 @@ pub struct World {
     pub subject: Addr,
     pub time: U256,
     pub number: U256,
+    /* An outside contract asked about a caller who is not the owner answers zero. Some
+    contracts say yes with a zero, so a finding is tried again with this set and the
+    answer a one. */
+    pub contrary: bool,
     made: u64,
 }
 
@@ -1261,16 +1265,17 @@ impl World {
             Some(SEL_TOTAL_SUPPLY) => books((true, one_word(PURSE << 3))),
             Some(SEL_DECIMALS) => books((true, one_word(U256::from_u64(18)))),
             other => {
-                /* A contract that asks another whether an account may act is asking about
-                a role. The owner holds every role and nobody else holds any, so the
-                answer is yes for the owner and no for the rest. */
+                /* A contract that asks another about its caller is most often asking
+                whether the caller may act. The account with no role is the one that may
+                not, so it is told no. The owner and a user are known to the other
+                contract and get its usual answer. */
                 let about = (0..pending.args.len())
                     .find(|i| arg_tag(*i).only(CALLER) || arg_tag(*i).only(ORIGIN));
                 let asked_of = about.map(|i| low_address(arg(i)));
-                let refused = asked_of.is_some_and(|who| who != OWNER && self.is_person(who));
+                let refused = asked_of.is_some_and(|who| who == ACTOR || who == ALLY);
                 let shaped = other.and_then(|s| self.answers.get(&(to, s)));
                 let answer = match refused {
-                    true => one_word(U256::ZERO),
+                    true => one_word(U256::from(self.contrary)),
                     false => shaped.cloned().unwrap_or(yes),
                 };
                 ((true, answer), Answered::Blank)
@@ -1351,6 +1356,26 @@ mod tests {
         assert!(!run.ok);
         assert_eq!(run.halt, Halt::Reverted);
         assert!(world.stored(SUBJECT, U256::ZERO).is_zero());
+    }
+
+    #[test]
+    fn an_outside_contract_asked_about_a_stranger_says_no_and_can_be_made_to_say_the_other() {
+        // mstore(4, caller); call(gas, 0x77, 0, 0, 36, 0, 32); return(0, 32)
+        let code = "3360045260206000602460006000607761fffff15060206000f3";
+        let answer = |from: Addr, contrary: bool| {
+            let mut world = World::new();
+            world.place(SUBJECT, &evmdec::hex::decode(code).expect("hex"));
+            world.contrary = contrary;
+            let msg = Msg {
+                from,
+                to: SUBJECT,
+                ..Msg::default()
+            };
+            word(&world.send(&msg).output, 0)
+        };
+        assert_eq!(answer(OWNER, false), U256::ONE);
+        assert_eq!(answer(ACTOR, false), U256::ZERO);
+        assert_eq!(answer(ACTOR, true), U256::ONE);
     }
 
     #[test]

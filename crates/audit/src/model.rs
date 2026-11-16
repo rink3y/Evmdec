@@ -1,5 +1,8 @@
 use crate::trace::{Event, Place, Run, Tag, BAL, CALLER, DATA, MATH, ORIGIN, OUT, STORE, VALUE};
 use crate::world::{Addr, Msg, ALLY, OWNER};
+use evmdec::decompile::Contract;
+use evmdec::expr;
+use evmdec::lift::Stmt;
 use evmdec::opcode as op;
 use evmdec::U256;
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +29,8 @@ pub struct PlaceFacts {
     pub conserved: bool,
     pub target: bool,
     pub assumed: bool,
+    // Some call changed it and put the old value back before it ended.
+    pub scoped: bool,
 }
 
 impl PlaceFacts {
@@ -55,6 +60,57 @@ pub struct Facts {
     pub entries: Vec<EntryFacts>,
     // What the contract was seen to take in and still hold when the call ended. None is ether.
     pub keeps: BTreeSet<Option<Addr>>,
+}
+
+/* The slots some function writes one fixed value to and then another, on one path, with
+the values each is left at. That is a flag raised for the length of a call and lowered
+again, such as a lock. Between calls it holds what it is left at, whatever a failed call
+seemed to need. */
+#[must_use]
+pub fn raised_within_a_call(c: &Contract) -> BTreeMap<U256, BTreeSet<U256>> {
+    let mut rests: BTreeMap<U256, BTreeSet<U256>> = BTreeMap::new();
+    for lifted in c.functions.iter().filter_map(|f| f.lifted.as_ref()) {
+        let mut writes: Vec<(usize, usize, U256, U256)> = Vec::new();
+        for node in &lifted.nodes {
+            for (i, stmt) in node.stmts.iter().enumerate() {
+                let Stmt::SStore {
+                    key,
+                    val,
+                    transient: false,
+                    ..
+                } = stmt
+                else {
+                    continue;
+                };
+                if let (Some(slot), Some(value)) = (expr::as_const(*key), expr::as_const(*val)) {
+                    writes.push((node.id, i, slot, value));
+                }
+            }
+        }
+        let mut raised: BTreeSet<U256> = BTreeSet::new();
+        let mut left: Vec<(U256, U256)> = Vec::new();
+        for (node, i, slot, value) in &writes {
+            let mut ahead = lifted.nodes[*node].succs.clone();
+            let mut seen: BTreeSet<usize> = BTreeSet::new();
+            while let Some(next) = ahead.pop() {
+                if seen.insert(next) {
+                    ahead.extend(lifted.nodes[next].succs.iter().copied());
+                }
+            }
+            let later = |(n, j, s, v): &(usize, usize, U256, U256)| {
+                s == slot && v != value && (seen.contains(n) || (n == node && j > i))
+            };
+            if writes.iter().any(later) {
+                raised.insert(*slot);
+            } else {
+                left.push((*slot, *value));
+            }
+        }
+        for (slot, value) in left.into_iter().filter(|(slot, _)| raised.contains(slot)) {
+            rests.entry(slot).or_default().insert(value);
+        }
+    }
+    rests
 }
 
 fn names_account(value: U256, known: &[Addr]) -> bool {
@@ -141,6 +197,20 @@ impl Facts {
                 self.places.entry(cell.place()).or_default().target = true;
             }
         }
+        let mut ends: BTreeMap<usize, (U256, U256, bool)> = BTreeMap::new();
+        for event in &run.events {
+            if let Event::Store { cell, old, new, .. } = event {
+                let seen = ends.entry(*cell).or_insert((*old, *new, false));
+                seen.2 |= seen.1 != *old || new != old;
+                seen.1 = *new;
+            }
+        }
+        for (cell, (first, last, moved)) in ends {
+            let cell = &run.cells[cell];
+            if cell.account == subject && moved && first == last {
+                self.places.entry(cell.place()).or_default().scoped = true;
+            }
+        }
         if !run.ok {
             return;
         }
@@ -223,5 +293,29 @@ impl Facts {
     #[must_use]
     pub fn same_party(a: Addr, b: Addr) -> bool {
         a == b || (a.0[2] == b.0[2] && a.0[2] == ALLY.0[2])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lock_rests_at_the_value_it_is_put_back_to_and_a_setting_is_not_a_lock() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/source/Locked.hex"
+        );
+        let hex = std::fs::read_to_string(path).expect("fixture");
+        let code = evmdec::hex::decode(hex.trim()).expect("hex");
+        let contract = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+        let raised = raised_within_a_call(&contract);
+        let lock = raised.get(&U256::ONE).expect("slot 1 is the lock");
+        assert_eq!(lock.iter().copied().collect::<Vec<_>>(), vec![U256::ONE]);
+        assert_eq!(
+            raised.len(),
+            1,
+            "the owner's setting in slot 2 is written once"
+        );
     }
 }

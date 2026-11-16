@@ -483,16 +483,6 @@ impl<'a> Explorer<'a> {
             world.number = world.number + U256::from_u64(blocks);
             world.time = time;
         }
-        let honest = t.msg.from == OWNER || t.msg.from == USER;
-        let held_before: Vec<(Option<Addr>, U256)> = match honest {
-            true => {
-                let mut kinds = vec![(None, world.ether_of(self.subject))];
-                let assets = world.assets().into_iter();
-                kinds.extend(assets.map(|a| (Some(a), world.asset_of(a, self.subject))));
-                kinds
-            }
-            false => Vec::new(),
-        };
         let run = world.send(&t.msg);
         self.runs += 1;
         if t.msg.from == OWNER {
@@ -506,37 +496,6 @@ impl<'a> Explorer<'a> {
             let lacked: Vec<Option<Addr>> = lacked.collect();
             self.owed
                 .extend(lacked.into_iter().map(|kind| (entry, kind)));
-        }
-        if run.ok && honest {
-            /* A contract that passes value on to others writes nothing down. Here the
-            others are stand-ins that take nothing, so what was meant to move on stays.
-            Value is kept on purpose when the call wrote a record or spoke to nobody. */
-            let subject = self.subject;
-            let mut ends: HashMap<(U256, U256), (U256, U256)> = HashMap::new();
-            for (cell, old, new, _, _) in run.stores() {
-                ends.entry((cell.account, cell.slot))
-                    .or_insert((old, new))
-                    .1 = new;
-            }
-            let recorded = ends
-                .iter()
-                .any(|((account, _), (old, new))| *account == subject && old != new);
-            let held_on_purpose = recorded || run.calls.is_empty();
-            let mut kinds: Vec<Option<Addr>> = vec![None];
-            kinds.extend(world.assets().into_iter().map(Some));
-            for kind in kinds {
-                let was = held_before
-                    .iter()
-                    .find(|(k, _)| *k == kind)
-                    .map_or(U256::ZERO, |(_, v)| *v);
-                let now = match kind {
-                    Some(asset) => world.asset_of(asset, self.subject),
-                    None => world.ether_of(self.subject),
-                };
-                if now > was && held_on_purpose {
-                    self.facts.keeps.insert(kind);
-                }
-            }
         }
         if self.trace {
             let from = t.msg.from.to_hex();
@@ -1641,13 +1600,14 @@ impl<'a> Explorer<'a> {
         }
     }
 
-    /* A contract in use holds ether and assets: what users paid in, and what was sent
-    to it. A single call by an account that has paid nothing and holds no claim must not
-    take any of it out. Only one call is tried from here. Over several calls an account
-    that staked and waited is paid by design. */
+    /* A contract may hold value no function here takes in: it was funded when it was
+    made, or it is sent what it holds. A door only the owner gets through, that pays an
+    asset out of the contract, says the contract is meant to hold that asset. A single
+    call by an account that has paid nothing must not take any of it out. What users
+    pay in is not added here. The states their calls leave hold it, on the contract's
+    own records, and a made-up surplus beside those records is free for the taking in
+    many sound contracts. */
     fn sweep(&mut self) {
-        /* A door only the owner gets through, that pays an asset out of the contract,
-        says the contract is meant to hold that asset. */
         for (entry, kind) in self.owed.clone() {
             let facts = &self.facts.entries[entry];
             if facts.checks_caller && !facts.ended.contains(&ACTOR) {
@@ -1656,8 +1616,6 @@ impl<'a> Explorer<'a> {
         }
         let starts = self.states.len().min(MAX_STATES / 8);
         for start in 0..starts {
-            // Only what the contract was seen to take in and keep. A contract that passes
-            // everything on holds nothing, and what strays into it is anyone's by design.
             if self.facts.keeps.is_empty() {
                 return;
             }

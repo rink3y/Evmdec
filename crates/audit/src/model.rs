@@ -58,7 +58,7 @@ pub struct EntryFacts {
 pub struct Facts {
     pub places: BTreeMap<Place, PlaceFacts>,
     pub entries: Vec<EntryFacts>,
-    // What the contract was seen to take in and still hold when the call ended. None is ether.
+    // What an owner-only function pays out of the contract, so what it is meant to hold. None is ether.
     pub keeps: BTreeSet<Option<Addr>>,
 }
 

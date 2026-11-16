@@ -555,7 +555,8 @@ impl World {
         if let Some(code) = self.codes.get(&who) {
             return U256::from(code.bytes.len());
         }
-        let bare = who.is_zero() || built_in(who) || [OWNER, USER, ACTOR].contains(&who);
+        // No deployed contract sits at an address that is a small number. An amount read as an address is one.
+        let bare = who.bits() <= 96 || built_in(who) || [OWNER, USER, ACTOR].contains(&who);
         U256::from(!bare)
     }
 
@@ -1174,7 +1175,7 @@ impl World {
             };
             return said((true, answer), Answered::Taken);
         }
-        if to.is_zero() || self.is_person(to) {
+        if to.bits() <= 96 || self.is_person(to) {
             return said((true, Vec::new()), Answered::Blank);
         }
         let (answer, by) = self.asked(record, to, fixed, pending, f, tx);
@@ -1376,8 +1377,8 @@ mod tests {
 
     #[test]
     fn an_outside_contract_asked_about_a_stranger_says_no_and_can_be_made_to_say_the_other() {
-        // mstore(4, caller); call(gas, 0x77, 0, 0, 36, 0, 32); return(0, 32)
-        let code = "3360045260206000602460006000607761fffff15060206000f3";
+        // mstore(4, caller); call(gas, asset, 0, 0, 36, 0, 32); return(0, 32)
+        let code = "336004526020600060246000600073a50000000000000000000000000000000000000161fffff15060206000f3";
         let answer = |from: Addr, contrary: bool| {
             let mut world = World::new();
             world.place(SUBJECT, &evmdec::hex::decode(code).expect("hex"));
@@ -1396,15 +1397,15 @@ mod tests {
 
     #[test]
     fn an_asset_keeps_honest_books() {
-        // call(gas, 0x77, 0, 0, 68, 0, 32) with transfer(ACTOR, 5) in memory
+        // call(gas, asset, 0, 0, 68, 0, 32) with transfer(ACTOR, 5) in memory
         let mut data = SEL_TRANSFER.to_be_bytes().to_vec();
         data.extend_from_slice(&ACTOR.to_be_bytes());
         data.extend_from_slice(&U256::from_u64(5).to_be_bytes());
-        // calldatacopy(0, 0, 68); call(gas, 0x77, 0, 0, 68, 0, 32)
-        let code = "6044600060003760206000604460006000607761fffff100";
+        // calldatacopy(0, 0, 68); call(gas, asset, 0, 0, 68, 0, 32)
+        let code = "604460006000376020600060446000600073a50000000000000000000000000000000000000161fffff100";
         let mut world = World::new();
         world.place(SUBJECT, &evmdec::hex::decode(code).expect("hex"));
-        let asset = U256::from_u64(0x77);
+        let asset = account(0xa5, 1);
         let msg = Msg {
             from: USER,
             to: SUBJECT,

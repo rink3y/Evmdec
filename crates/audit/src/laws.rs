@@ -158,7 +158,11 @@ pub fn check(
     if let (true, true, Some((amount, asset))) = (
         none_less,
         stepped && !rests_on_answer,
-        most.filter(|(amount, _)| *amount > own),
+        /* A payout for a claim the account gave up is measured in other units than the
+        claim, so the two cannot be weighed. Where the claim is one the set-up handed
+        out, the payout shows nothing. Where the account built it by paying in, what it
+        paid is already counted. */
+        most.filter(|_| own.is_zero()),
     ) {
         found.push(Breach {
             asset,
@@ -246,8 +250,9 @@ pub fn check(
                     .iter()
                     .any(|a| of_one(after, *a, v) > of_one(before, *a, v))
             };
+            let real = !made_up(&tag);
             if let Some(victim) =
-                victim.filter(|v| !actor_keyed(cell) && new < old && !paid_out(*v))
+                victim.filter(|v| real && !actor_keyed(cell) && new < old && !paid_out(*v))
             {
                 found.push(Breach {
                     amount: old - new,

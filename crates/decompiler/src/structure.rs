@@ -661,7 +661,7 @@ fn plan_early_reads(l: &Lifted, names: &Names, kept: &mut Kept) {
         if let Some((field, version)) = named_field(e, names) {
             slots.push((e, field.key, version));
         }
-        if let Node::SLoad(key, false, version) = expr::node(e) {
+        if let Node::SLoad(key, _, version) = expr::node(e) {
             slots.push((e, key, version));
         }
         pending.extend(expr::children(e));
@@ -694,13 +694,11 @@ fn plan_early_reads(l: &Lifted, names: &Names, kept: &mut Kept) {
             let Some((Overwritten::Balance, gen)) = overwrites(st, names) else {
                 continue;
             };
-            /* A helper may write any slot, and what it wrote is not seen from here. An
-            outside call is only taken to have changed a slot the code reads again. */
-            let helper = matches!(st, Stmt::Internal { .. });
-            let read_again = |key: ExprId| slots.iter().any(|(_, k, v)| *k == key && *v > gen);
+            /* A helper may write any slot, and so may an outside call that calls back in.
+            A slot read before either and printed after it would read as its new value. */
             let held = slots
                 .iter()
-                .filter(|(_, key, version)| *version <= gen && (helper || read_again(*key)))
+                .filter(|(_, _, version)| *version <= gen)
                 .map(|(e, _, version)| (*e, *version));
             let old: Vec<(ExprId, u32)> = reads
                 .iter()
@@ -732,7 +730,9 @@ fn plan_early_reads(l: &Lifted, names: &Names, kept: &mut Kept) {
             (Some((op::BALANCE, _)), _) => "prev_account_balance".to_string(),
             (Some((op::EXTCODESIZE, _)), _) => "prev_code_size".to_string(),
             (Some(_), _) => "prev_code_hash".to_string(),
-            (None, Node::SLoad(key, ..)) => prev_name(Overwritten::Slot(key, false), names),
+            (None, Node::SLoad(key, transient, _)) => {
+                prev_name(Overwritten::Slot(key, transient), names)
+            }
             (None, Node::MLoad(..)) => "prev_mem".to_string(),
             (None, _) => prev_of(&emit::fmt_expr(read, names)),
         };

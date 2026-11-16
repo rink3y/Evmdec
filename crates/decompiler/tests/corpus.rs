@@ -464,9 +464,9 @@ fn tribe_reads_as_source() {
     for s in [
         "mapping(address => bool) stor_3;",
         "address[] stor_4;",
-        "require(!stor_3[address(v1)]);",
-        "stor_4.push(address(v1));",
-        "stor_3[address(v1)] = true;",
+        "require(!stor_3[address(v2)]);",
+        "stor_4.push(address(v2));",
+        "stor_3[address(v2)] = true;",
         "if (stor_4.length < stor_7) {",
         "while (v1 < stor[arg0]) {",
     ] {
@@ -1107,8 +1107,9 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
     }
     assert!(
         gauge.contains(
-            "uint256 prev_stor_14 = stor_14;\n        if (loc_220 < timestamp_15[prev_stor_14])"
-        ),
+            "uint256 prev_stor_14 = stor_14;\n        \
+             uint256 prev_timestamp_15_stor_14 = timestamp_15[prev_stor_14];"
+        ) && gauge.contains("if (prev_stor_5 < prev_timestamp_15_stor_14) {"),
         "the period is read once, ahead of both branches"
     );
     let burn = &pool[pool
@@ -1318,4 +1319,29 @@ fn a_memory_write_that_is_read_later_is_printed() {
         ),
         "the built-in copies over the word the next test reads"
     );
+}
+
+#[test]
+fn a_slot_read_before_an_outside_call_is_not_printed_as_read_after_it() {
+    let router = regress("via_ir_router.hex").source;
+    let key = "tstor_0xe67bd0676d46b7f9f34e582d927d908e16216dd24bc46c5aab4cb6b3dda7fd31";
+    let kept = router
+        .find(&format!("uint256 prev_{key} = {key};"))
+        .expect("the slot is named when it is read");
+    let called = router[kept..].find(".call(").expect("the swap") + kept;
+    let used = router[kept..]
+        .find(&format!("if (prev_{key} >> 208 & 15 != 3) {{"))
+        .expect("the test made after the calls");
+    assert!(
+        kept + used > called,
+        "the old value is what the later test reads"
+    );
+    assert_eq!(undeclared_old_values(&router), Vec::<String>::new());
+    let gauge = regress("vyper_gauge.hex").source;
+    assert!(
+        gauge.contains("uint256 prev_stor_13 = stor_13;")
+            && gauge.contains(" / prev_stor_13 >= loc_1c0);"),
+        "the supply read before the controller is called is the one divided by after"
+    );
+    assert_eq!(undeclared_old_values(&gauge), Vec::<String>::new());
 }

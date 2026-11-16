@@ -80,6 +80,34 @@ pub fn audit_at(
         "The contract was run on the state of {chain} at block {number}. Its storage, and the code, storage and ether of every account its calls reached, were read from there."
     ));
     report.state.extend(node.trouble());
+    /* The chain's state at one block is one world. A flaw that needs holders, balances
+    or settings that block does not have shows only in a world built for it, so the
+    contract is also run in the world guessed from its code, and what only that run
+    shows is added and marked as such. */
+    let guessed = audit(c);
+    let known: Vec<(laws::Kind, String)> = report
+        .findings
+        .iter()
+        .map(|f| (f.kind, f.function.clone()))
+        .collect();
+    let mut added = 0;
+    for mut finding in guessed.findings {
+        if known.contains(&(finding.kind, finding.function.clone())) {
+            continue;
+        }
+        finding.rests_on.insert(
+            0,
+            "This was shown in a world guessed from the code alone, not on the chain's state at that block.".to_string(),
+        );
+        report.findings.push(finding);
+        added += 1;
+    }
+    if added > 0 {
+        report.assumed.extend(guessed.assumed);
+        report.state.push(format!(
+            "{added} finding(s) come from a second run in a world guessed from the code alone, and say so."
+        ));
+    }
     report
 }
 

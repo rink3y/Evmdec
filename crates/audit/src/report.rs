@@ -50,6 +50,7 @@ pub struct FunctionModel {
     // What stopped the call that got furthest, for a function that never ended.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_by: Option<String>,
+    pub in_code: crate::model::InCode,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -492,6 +493,18 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
     }
 }
 
+/* A function the account with no role never got through, whose code tests no caller
+and can do something that matters. The runs say nothing about it either way. */
+fn unsettled(f: &FunctionModel) -> bool {
+    let c = &f.in_code;
+    let matters = !c.writes.is_empty()
+        || c.writes_under_keys
+        || c.sends_value
+        || c.runs_other_code
+        || c.destroys;
+    !f.ends_for.contains(&who(ACTOR)) && !c.tests_caller && matters
+}
+
 fn capital(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
@@ -564,6 +577,7 @@ fn models(ex: &Explorer) -> (Vec<FunctionModel>, Vec<CellModel>) {
                 true => ex.stopped.get(i).cloned().flatten().map(|(_, why)| why),
                 false => None,
             },
+            in_code: crate::model::in_code(ex.c, e.function),
         }
     });
     let cells = ex.facts.places.iter().map(|(place, facts)| {
@@ -715,6 +729,32 @@ pub fn markdown(report: &Report) -> String {
             mark(f.pays_out),
             mark(f.calls_out || f.runs_other_code)
         ));
+    }
+    out.push_str("\n## What each function's code can do\n\nRead from the code with every helper it calls. This covers the functions no run got to the end of. It says what is possible, not what a run showed.\n\n| Function | Tests caller | Writes slots | Writes under keys | Calls out | Sends value | Runs other code | Destroys |\n|---|---|---|---|---|---|---|---|\n");
+    for f in &report.functions {
+        let c = &f.in_code;
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} |\n",
+            f.name,
+            mark(c.tests_caller),
+            c.writes.join(", "),
+            mark(c.writes_under_keys),
+            mark(c.calls_out),
+            mark(c.sends_value),
+            mark(c.runs_other_code),
+            mark(c.destroys)
+        ));
+    }
+    let open: Vec<&FunctionModel> = report.functions.iter().filter(|f| unsettled(f)).collect();
+    if !open.is_empty() {
+        out.push_str("\n## Not settled by a run\n\nNo call by the account with no role got to the end of these functions, and their code has no test of the caller while it can change state or move value. These are not findings: no run showed anything. They are where a reader should look first.\n\n");
+        for f in open {
+            let stopped = f
+                .stopped_by
+                .as_deref()
+                .unwrap_or("it ended only for other accounts");
+            out.push_str(&format!("- `{}`: {stopped}\n", f.name));
+        }
     }
     out.push_str("\n## Storage as it was used\n\n| Slot | Keys | Used as | Written by | Anyone can write |\n|---|---|---|---|---|\n");
     for c in report.cells.iter().filter(|c| !c.used_as.is_empty()) {

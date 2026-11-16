@@ -2,9 +2,11 @@ use crate::trace::{Event, Place, Run, Tag, BAL, CALLER, DATA, MATH, ORIGIN, OUT,
 use crate::world::{Addr, Msg, ALLY, OWNER};
 use evmdec::decompile::Contract;
 use evmdec::expr;
-use evmdec::lift::Stmt;
+use evmdec::expr::Node;
+use evmdec::lift::{Stmt, Term};
 use evmdec::opcode as op;
 use evmdec::U256;
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 /* What the runs showed a storage variable is used for. Nothing here comes from a
@@ -111,6 +113,106 @@ pub fn raised_within_a_call(c: &Contract) -> BTreeMap<U256, BTreeSet<U256>> {
         }
     }
     rests
+}
+
+/* What the code of one entry function can do, read from the decompiler's lifted form
+together with every helper it calls. The facts from runs say what happened. These say
+what can, and they cover a function no run got to the end of. */
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct InCode {
+    pub tests_caller: bool,
+    pub writes: Vec<String>,
+    pub writes_under_keys: bool,
+    pub calls_out: bool,
+    pub sends_value: bool,
+    pub runs_other_code: bool,
+    pub destroys: bool,
+}
+
+/* A condition tests the caller when it compares the caller's address with something,
+or asks whether an entry kept under the caller is set. A balance kept under the caller
+that is weighed against an amount is a test of the balance, and anyone can have one. */
+fn tests_caller(cond: expr::ExprId) -> bool {
+    let caller = |n: &Node| matches!(n, Node::Env(o, _) if *o == op::CALLER);
+    let mut direct = false;
+    let mut keyed = false;
+    let mut weighed = false;
+    let mut todo = vec![cond];
+    let mut seen: BTreeSet<expr::ExprId> = BTreeSet::new();
+    while let Some(e) = todo.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        match expr::node(e) {
+            Node::SLoad(key, ..) => keyed |= expr::contains(key, &caller),
+            n if caller(&n) => direct = true,
+            Node::Op(op::LT | op::GT | op::SLT | op::SGT, _) => {
+                weighed = true;
+                todo.extend(expr::children(e));
+            }
+            _ => todo.extend(expr::children(e)),
+        }
+    }
+    direct || (keyed && !weighed)
+}
+
+#[must_use]
+pub fn in_code(c: &Contract, function: usize) -> InCode {
+    let mut found = InCode::default();
+    let mut slots: BTreeSet<U256> = BTreeSet::new();
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut todo = vec![function];
+    let names_caller = tests_caller;
+    while let Some(index) = todo.pop() {
+        let Some(lifted) = c.functions.get(index).and_then(|f| f.lifted.as_ref()) else {
+            continue;
+        };
+        if !seen.insert(index) {
+            continue;
+        }
+        for node in &lifted.nodes {
+            for stmt in &node.stmts {
+                match stmt {
+                    Stmt::SStore {
+                        key,
+                        transient: false,
+                        ..
+                    } => match expr::as_const(*key) {
+                        Some(slot) => drop(slots.insert(slot)),
+                        None => found.writes_under_keys = true,
+                    },
+                    Stmt::Call {
+                        kind, addr, value, ..
+                    } => {
+                        // The built-in contracts sit at the lowest addresses and are part of the machine.
+                        let built_in = expr::as_const(*addr).is_some_and(|a| a.bits() <= 8);
+                        if built_in || *kind == op::STATICCALL {
+                            continue;
+                        }
+                        found.calls_out = true;
+                        found.runs_other_code |= matches!(*kind, op::DELEGATECALL | op::CALLCODE);
+                        let nothing = |v: &expr::ExprId| expr::as_const(*v) == Some(U256::ZERO);
+                        found.sends_value |= value.as_ref().is_some_and(|v| !nothing(v));
+                    }
+                    Stmt::Create { .. } => found.calls_out = true,
+                    Stmt::Require { cond, .. } => found.tests_caller |= names_caller(*cond),
+                    Stmt::Internal { callee, .. } => {
+                        todo.extend(c.functions.iter().position(|f| f.pc == *callee));
+                    }
+                    _ => {}
+                }
+            }
+            match &node.term {
+                Term::SelfDestruct(_) => found.destroys = true,
+                Term::Branch { cond, .. } | Term::CondJump { cond, .. } => {
+                    found.tests_caller |= names_caller(*cond);
+                }
+                _ => {}
+            }
+        }
+    }
+    found.writes = slots.iter().map(U256::to_hex).collect();
+    found
 }
 
 fn names_account(value: U256, known: &[Addr]) -> bool {
@@ -299,6 +401,31 @@ impl Facts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_code_says_which_functions_test_their_caller_and_what_each_can_do() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/source/Vault.hex"
+        );
+        let hex = std::fs::read_to_string(path).expect("fixture");
+        let code = evmdec::hex::decode(hex.trim()).expect("hex");
+        let contract = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+        let of = |selector: &str| {
+            let at = |f: &evmdec::decompile::Function| f.selector.as_deref() == Some(selector);
+            in_code(
+                &contract,
+                contract.functions.iter().position(at).expect("function"),
+            )
+        };
+        // rescue(address) is the guarded twin of sweep(address).
+        let (rescue, sweep, set_owner) = (of("0x839006f2"), of("0x01681a62"), of("0x13af4035"));
+        assert!(rescue.tests_caller && rescue.sends_value);
+        assert!(!sweep.tests_caller && sweep.sends_value);
+        assert!(!set_owner.tests_caller && set_owner.writes == vec!["0x0".to_string()]);
+        // deposit() weighs the caller's balance in an overflow check, which tests nobody.
+        assert!(!of("0xd0e30db0").tests_caller);
+    }
 
     #[test]
     fn a_lock_rests_at_the_value_it_is_put_back_to_and_a_setting_is_not_a_lock() {

@@ -128,6 +128,10 @@ pub fn check(
     let subject = after.subject;
     let mut kinds: Vec<Option<Addr>> = vec![None];
     kinds.extend(after.assets().into_iter().map(Some));
+    /* No deployed contract sits at an address that is a small number. Where the code
+    spoke to one as an asset it read an amount as an address, and more of that is no
+    gain. What was paid there still counts as paid. */
+    let real = |asset: &Option<Addr>| asset.is_none_or(|a| a.bits() > 96);
 
     let change = |asset: &Option<Addr>| (of_party(base, *asset), of_party(after, *asset));
     let none_less = kinds.iter().all(|a| change(a).1 >= change(a).0);
@@ -162,7 +166,7 @@ pub fn check(
         claim, so the two cannot be weighed. Where the claim is one the set-up handed
         out, the payout shows nothing. Where the account built it by paying in, what it
         paid is already counted. */
-        most.filter(|_| own.is_zero()),
+        most.filter(|(_, asset)| own.is_zero() && real(asset)),
     ) {
         found.push(Breach {
             asset,

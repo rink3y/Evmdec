@@ -555,8 +555,7 @@ impl World {
         if let Some(code) = self.codes.get(&who) {
             return U256::from(code.bytes.len());
         }
-        // No deployed contract sits at an address that is a small number. An amount read as an address is one.
-        let bare = who.bits() <= 96 || built_in(who) || [OWNER, USER, ACTOR].contains(&who);
+        let bare = who.is_zero() || built_in(who) || [OWNER, USER, ACTOR].contains(&who);
         U256::from(!bare)
     }
 
@@ -1175,7 +1174,7 @@ impl World {
             };
             return said((true, answer), Answered::Taken);
         }
-        if to.bits() <= 96 || self.is_person(to) {
+        if to.is_zero() || self.is_person(to) {
             return said((true, Vec::new()), Answered::Blank);
         }
         let (answer, by) = self.asked(record, to, fixed, pending, f, tx);

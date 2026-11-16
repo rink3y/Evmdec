@@ -159,6 +159,8 @@ fn a_record_in_a_byte_string_is_filled_by_what_its_words_are_used_for() {
         report.findings
     );
     assert_eq!(at(Kind::Loss), ["0xc28e83fd"], "{:?}", report.findings);
+    let stated = |a: &String| a.contains("keep honest books") && a.contains("draw on it");
+    assert!(report.assumed.iter().any(stated), "{:?}", report.assumed);
 }
 
 #[test]

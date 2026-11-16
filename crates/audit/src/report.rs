@@ -1,6 +1,8 @@
 use crate::explore::{Explorer, Step, Violation};
 use crate::laws::Kind;
-use crate::trace::{Cell, Event, Run, Tag, BAL, CALLER, CLOCK, DATA, MATH, OUT, STORE, VALUE};
+use crate::trace::{
+    Answered, Cell, Event, Run, Tag, BAL, CALLER, CLOCK, DATA, MATH, OUT, STORE, VALUE,
+};
 use crate::world::{Addr, ACTOR, ALLY, OWNER, USER};
 use evmdec::hex;
 use evmdec::U256;
@@ -681,7 +683,7 @@ pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
                 .map(|e| (e.function, e.name.clone()))
                 .collect::<Vec<_>>(),
         ),
-        assumed: ex.assumed.clone(),
+        assumed: ex.assumed.iter().cloned().chain(stand_ins(ex)).collect(),
         stats: Stats {
             functions: ex.entries.len(),
             functions_ended: ended,
@@ -692,6 +694,26 @@ pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
             reads: 0,
         },
     }
+}
+
+/* An asset with no code here keeps honest books, and the people in this world hold a
+purse of it and let the contract draw on it. A finding whose run moved such an asset
+rests on that, so the report says it. */
+fn stand_ins(ex: &Explorer) -> Vec<String> {
+    let mut assets: Vec<Addr> = Vec::new();
+    for found in &ex.found {
+        let moved = found.run.calls.iter().filter(|c| c.by == Answered::Books);
+        assets.extend(moved.map(|c| c.to));
+    }
+    assets.sort();
+    assets.dedup();
+    let line = |asset: &Addr| {
+        format!(
+            "the asset at {} has no code here and is taken to keep honest books. The owner, the user and the account with no role each hold a purse of it and let the contract draw on it",
+            asset.to_hex()
+        )
+    };
+    assets.iter().map(line).collect()
 }
 
 #[must_use]

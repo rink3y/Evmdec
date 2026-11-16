@@ -435,3 +435,13 @@ fn the_address_a_helper_that_never_returns_was_to_go_back_to_is_no_function() {
     assert!(own.contains("function orphan_0x7("), "{own}");
     assert!(own.contains("stor_0 = msg.sender;"), "{own}");
 }
+
+#[test]
+fn a_value_tested_against_zero_and_ordered_against_another_is_a_number() {
+    let out = text(
+        "60003560e01c6312345678146100155760006000fd5b6004358015156100255760006000fd5b806000\
+         5410156100355760006000fd5b60005260056020523360406000205500",
+    );
+    assert!(out.contains("function func_12345678(uint256 key)"), "{out}");
+    assert!(out.contains("require(stor_0 >= key);"), "{out}");
+}

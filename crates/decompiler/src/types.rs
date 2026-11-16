@@ -1164,7 +1164,9 @@ fn resolve(c: &Class, evidence: Evidence) -> Ty {
     if t == Ty::Unknown && evidence == Evidence::Final {
         t = c.weak;
     }
-    if t == Ty::Unknown && f.tested && !f.arith && !f.other && !c.storage {
+    // A value the code also orders against another is a number, however often it is tested.
+    let ordered = f.unsigned_cmp || f.signed_cmp;
+    if t == Ty::Unknown && f.tested && !f.arith && !f.other && !c.storage && !ordered {
         t = Ty::Bool;
     }
     if f.word32 && !f.arith && !f.account && matches!(t, Ty::Unknown | Ty::Bytes(_)) {

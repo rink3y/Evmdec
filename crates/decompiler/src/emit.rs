@@ -321,6 +321,8 @@ from that number elsewhere is no place. */
 pub struct Offsets {
     places: HashSet<ExprId>,
     bases: HashSet<ExprId>,
+    // For each helper, the parameters it uses as places in memory.
+    handed: std::sync::Arc<HashMap<usize, BTreeSet<usize>>>,
 }
 
 pub fn offsets(units: &[(usize, &Lifted)]) -> Vec<Offsets> {
@@ -328,8 +330,13 @@ pub fn offsets(units: &[(usize, &Lifted)]) -> Vec<Offsets> {
     loop {
         let before = places.clone();
         let found = units.iter().map(|(pc, l)| offsets_in(*pc, l, &mut places));
-        let found: Vec<Offsets> = found.collect();
+        let mut found: Vec<Offsets> = found.collect();
         if places == before {
+            let params = places.iter().map(|(pc, p)| (*pc, p.params.clone()));
+            let handed = std::sync::Arc::new(params.collect::<HashMap<_, _>>());
+            for own in &mut found {
+                own.handed = handed.clone();
+            }
             return found;
         }
     }
@@ -2937,7 +2944,14 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             results,
             ..
         } => {
-            let a: Vec<String> = args.iter().map(|x| fmt_expr(*x, n)).collect();
+            // A number handed to a helper that uses it as a place is the block that starts there.
+            let places = n.offsets.handed.get(callee);
+            let place = |j: &usize| places.is_some_and(|p| p.contains(j));
+            let shown = |(j, x): (usize, &ExprId)| match place(&j) {
+                true => fmt_stored_word(*x, n),
+                false => fmt_expr(*x, n),
+            };
+            let a: Vec<String> = args.iter().enumerate().map(shown).collect();
             let call = format!("{}({})", n.callee_name(*callee), a.join(", "));
             /* A result every caller knows as a constant has no name here. Its place in
             the list stays empty so the others keep theirs. */

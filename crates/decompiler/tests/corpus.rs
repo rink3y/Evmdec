@@ -1418,3 +1418,12 @@ fn a_store_past_a_length_rounded_down_does_not_hide_the_head_of_call_data() {
         "{token}"
     );
 }
+
+#[test]
+fn a_block_handed_to_a_helper_that_reads_it_is_named_as_the_block() {
+    let router = regress("oneinch_v6.hex").source;
+    assert!(
+        router.contains("= func_0x1ba9(ptr1, calldata["),
+        "the helper is handed the block, not the number where it starts"
+    );
+}

@@ -35,6 +35,16 @@ pub struct Finding {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rests_on: Vec<String>,
     pub reentered: bool,
+    // What else the same run showed. One run is one finding however many laws it breaks.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<Also>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Also {
+    pub kind: Kind,
+    pub title: String,
+    pub shown: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -144,14 +154,19 @@ fn asset_name(asset: Option<Addr>) -> String {
     }
 }
 
-fn cell_name(cell: &Cell) -> String {
-    match cell.keys.len() {
+// A cell another contract keeps is named with that contract, or it reads as the subject's own.
+fn cell_name(cell: &Cell, run: &Run) -> String {
+    let own = match cell.keys.len() {
         0 => format!("slot {}", cell.slot.to_hex()),
         n => format!(
             "the mapping at slot {} ({n} key{})",
             cell.root.to_hex(),
             if n == 1 { "" } else { "s" }
         ),
+    };
+    match cell.account == run.to {
+        true => own,
+        false => format!("{own} of the contract at {}", cell.account.to_hex()),
     }
 }
 
@@ -173,12 +188,15 @@ fn source(tag: Tag, run: &Run) -> String {
     if tag.has(STORE) {
         parts.push(match run.cell_of(tag) {
             Some(cell) if cell.keys.iter().any(|k| k.tag.only(CALLER)) => {
-                format!("the caller's entry in {}", cell_name(cell))
+                format!("the caller's entry in {}", cell_name(cell, run))
             }
             Some(cell) if cell.keys.iter().any(|k| k.tag.has(DATA)) => {
-                format!("an entry of {} chosen by the call data", cell_name(cell))
+                format!(
+                    "an entry of {} chosen by the call data",
+                    cell_name(cell, run)
+                )
             }
-            Some(cell) => cell_name(cell),
+            Some(cell) => cell_name(cell, run),
             None => "storage".into(),
         });
     }
@@ -225,7 +243,7 @@ fn caller_tests(run: &Run) -> String {
                     .cell_of(*tag)
                     .filter(|c| c.keys.iter().any(|k| k.tag.only(CALLER)));
                 if let Some(cell) = own {
-                    let name = cell_name(cell);
+                    let name = cell_name(cell, run);
                     note(match tag.has(DATA) || tag.has(VALUE) || tag.has(MATH) {
                         true => {
                             format!("whether the caller's own entry in {name} covers an amount")
@@ -425,7 +443,7 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
         Kind::Credit | Kind::Debit => {
             let cell = v.breach.cell.as_ref();
             let store = run.stores().find(|(c, ..)| Some(*c) == cell);
-            let name = cell.map_or_else(|| "its records".to_string(), cell_name);
+            let name = cell.map_or_else(|| "its records".to_string(), |c| cell_name(c, run));
             let (tag, pc) = store.map_or((Tag::NONE, None), |s| (s.3, Some(s.4)));
             let key = cell.and_then(|c| {
                 c.keys
@@ -497,7 +515,7 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
         Kind::Takeover | Kind::RoleCleared => {
             let cell = v.breach.cell.as_ref();
             let store = run.stores().find(|(c, ..)| Some(*c) == cell);
-            let name = cell.map_or_else(|| "a slot".to_string(), cell_name);
+            let name = cell.map_or_else(|| "a slot".to_string(), |c| cell_name(c, run));
             let (tag, pc) = store.map_or((Tag::NONE, None), |s| (s.3, Some(s.4)));
             let (title, shown) = match v.breach.kind {
                 Kind::Takeover => (
@@ -604,6 +622,7 @@ fn finding(ex: &Explorer, v: &Violation) -> Finding {
             .collect(),
         rests_on,
         reentered: v.via_hook,
+        also: Vec::new(),
     }
 }
 
@@ -659,7 +678,30 @@ fn models(ex: &Explorer) -> (Vec<FunctionModel>, Vec<CellModel>) {
 
 /* A finding reached only after an earlier call by the same account is one end of a
 path. Where that earlier call is a finding too, the two are one attack. */
-fn chains(ex: &Explorer, findings: &[Finding]) -> Vec<Chain> {
+/* The finding each consequence belongs to. Consequences of one run, reached by the
+same steps, are one finding, and the first kind in the order of the laws leads it. */
+fn grouped(ex: &Explorer) -> (Vec<usize>, Vec<usize>) {
+    let steps =
+        |v: &Violation| -> Vec<String> { v.steps.iter().map(|s| step_text(ex, s)).collect() };
+    let same = |a: &Violation, b: &Violation| {
+        (a.entry, a.via_hook, a.by_user) == (b.entry, b.via_hook, b.by_user) && steps(a) == steps(b)
+    };
+    let (mut leads, mut of): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    for (i, v) in ex.found.iter().enumerate() {
+        let at = leads.iter().position(|l| same(&ex.found[*l], v));
+        let at = at.unwrap_or_else(|| {
+            leads.push(i);
+            leads.len() - 1
+        });
+        if v.breach.kind < ex.found[leads[at]].breach.kind {
+            leads[at] = i;
+        }
+        of.push(at);
+    }
+    (leads, of)
+}
+
+fn chains(ex: &Explorer, findings: &[Finding], of: &[usize]) -> Vec<Chain> {
     let last_call = |v: &Violation| match v.steps.last() {
         Some(Step::Call { entry, msg }) => Some((*entry, msg.data.clone())),
         _ => None,
@@ -673,16 +715,20 @@ fn chains(ex: &Explorer, findings: &[Finding]) -> Vec<Chain> {
         });
         let mut steps: Vec<usize> = by_actor
             .filter_map(|call| {
-                ex.found
-                    .iter()
-                    .position(|w| last_call(w) == Some(call.clone()))
+                let mut found = ex.found.iter();
+                let at = found.position(|w| last_call(w) == Some(call.clone()));
+                at.map(|at| of[at])
             })
             .collect();
         steps.dedup();
+        let i = of[i];
         if steps.is_empty() || steps.contains(&i) {
             continue;
         }
         steps.push(i);
+        if out.iter().any(|c: &Chain| c.steps == steps) {
+            continue;
+        }
         let names: Vec<&str> = steps.iter().map(|s| findings[*s].title.as_str()).collect();
         out.push(Chain {
             summary: names.join(", then "),
@@ -694,8 +740,19 @@ fn chains(ex: &Explorer, findings: &[Finding]) -> Vec<Chain> {
 
 #[must_use]
 pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
-    let findings: Vec<Finding> = ex.found.iter().map(|v| finding(ex, v)).collect();
-    let chains = chains(ex, &findings);
+    let (leads, of) = grouped(ex);
+    let mut findings: Vec<Finding> = leads.iter().map(|l| finding(ex, &ex.found[*l])).collect();
+    for (i, v) in ex
+        .found
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| leads[of[*i]] != *i)
+    {
+        let (kind, f) = (v.breach.kind, finding(ex, v));
+        let (title, shown) = (f.title, f.shown);
+        findings[of[i]].also.push(Also { kind, title, shown });
+    }
+    let chains = chains(ex, &findings, &of);
     let (functions, cells) = models(ex);
     let ended = ex
         .facts
@@ -788,6 +845,12 @@ pub fn markdown(report: &Report) -> String {
         out.push_str(&format!("- **Shown by a run:** {}\n", f.shown));
         if !f.rests_on.is_empty() {
             out.push_str(&format!("- **Rests on:** {}\n", f.rests_on.join("; ")));
+        }
+        for also in &f.also {
+            out.push_str(&format!(
+                "- **The same run also showed:** {}. {}\n",
+                also.title, also.shown
+            ));
         }
         out.push_str("- **Steps:**\n");
         for (n, step) in f.steps.iter().enumerate() {

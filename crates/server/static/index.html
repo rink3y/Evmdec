@@ -441,8 +441,9 @@ function findingItem(n,f,open,p){const k=AT[n-1],id=p+n,body=p+'B'+n;
  const head='<span class="fnum co" aria-hidden="true">'+n+'</span><span class="sev sev-'+f.severity+'">'+SEVL[f.severity]+'</span><span class="ftitle">'+tick(f.title)+'</span><span class="fmeta"><code>'+esc(f.function)+'</code>'+(f.source?' · '+esc(f.source):'')+(f.reentered?' · <span class="tag">re-entered</span>':'')+'</span>';
  const steps='<p><b>Steps.</b></p><ol class="steps">'+f.steps.map(s=>'<li>'+tick(s)+'</li>').join('')+'</ol>';
  const rests=(f.rests_on||[]).length?'<p><b>Rests on.</b></p><ul class="steps">'+f.rests_on.map(s=>'<li>'+tick(s)+'</li>').join('')+'</ul>':'';
+ const also=(f.also||[]).length?'<p><b>The same run also showed.</b></p><ul class="steps">'+f.also.map(a=>'<li>'+tick(a.title)+'. '+tick(a.shown)+'</li>').join('')+'</ul>':'';
  const goto=k>=0?'<p class="goto">Line <a href="#L'+(k+1)+'">'+(k+1)+'</a></p>':'';
- return '<li class="finding" id="'+id+'"><button type="button" aria-expanded="'+(open?'true':'false')+'" aria-controls="'+body+'">'+head+'</button><div class="fbody" id="'+body+'"'+(open?'':' hidden')+'><p><b>Why.</b> '+tick(f.cause)+'</p><p><b>Shown by a run.</b> '+tick(f.shown)+'</p>'+steps+rests+goto+'</div></li>'}
+ return '<li class="finding" id="'+id+'"><button type="button" aria-expanded="'+(open?'true':'false')+'" aria-controls="'+body+'">'+head+'</button><div class="fbody" id="'+body+'"'+(open?'':' hidden')+'><p><b>Why.</b> '+tick(f.cause)+'</p><p><b>Shown by a run.</b> '+tick(f.shown)+'</p>'+also+steps+rests+goto+'</div></li>'}
 function renderFindings(){$('#findings').innerHTML=FINDINGS.length?FINDINGS.map((f,i)=>findingItem(i+1,f,i===0,'F')).join(''):'<li class="none">'+NONE+'</li>';
  document.querySelectorAll('.finding>button').forEach(b=>b.addEventListener('click',()=>{const on=b.getAttribute('aria-expanded')!=='true';b.setAttribute('aria-expanded',on?'true':'false');document.getElementById(b.getAttribute('aria-controls')).hidden=!on}))}
 

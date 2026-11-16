@@ -518,6 +518,7 @@ impl World {
                 edges: Vec::new(),
                 steps: 0,
                 hooked: false,
+                to: msg.to,
                 spent_by_holder: Vec::new(),
             },
             hashes: HashMap::new(),

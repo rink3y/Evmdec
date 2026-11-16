@@ -278,6 +278,8 @@ pub struct Run {
     pub edges: Vec<u32>,
     pub steps: u64,
     pub hooked: bool,
+    // The account the message was sent to.
+    pub to: U256,
     // Cells lowered in a frame whose caller the cell is kept under. That caller spent its own.
     pub spent_by_holder: Vec<usize>,
 }

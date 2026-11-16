@@ -85,11 +85,11 @@ pub fn audit_at(
     contract is also run in the world guessed from its code, and what only that run
     shows is added and marked as such. */
     let guessed = audit(c);
-    let known: Vec<(laws::Kind, String)> = report
-        .findings
-        .iter()
-        .map(|f| (f.kind, f.function.clone()))
-        .collect();
+    let shown = |f: &report::Finding| {
+        let kinds = std::iter::once(f.kind).chain(f.also.iter().map(|a| a.kind));
+        kinds.map(|k| (k, f.function.clone())).collect::<Vec<_>>()
+    };
+    let known: Vec<(laws::Kind, String)> = report.findings.iter().flat_map(shown).collect();
     let mut added = 0;
     for mut finding in guessed.findings {
         if known.contains(&(finding.kind, finding.function.clone())) {

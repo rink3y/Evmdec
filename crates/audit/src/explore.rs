@@ -1809,9 +1809,3 @@ impl<'a> Explorer<'a> {
         budget::within(work / 10, || self.used_after());
     }
 }
-
-// The tag of a call data word, for tests and reports that build their own messages.
-#[must_use]
-pub fn data_word(index: usize) -> Tag {
-    Tag::data(4 + 32 * index)
-}

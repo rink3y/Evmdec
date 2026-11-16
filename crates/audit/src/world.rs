@@ -7,7 +7,7 @@ use evmdec::interp::{CallRecord, CreateRecord, Host, Machine, Outcome};
 use evmdec::keccak::keccak256;
 use evmdec::opcode as op;
 use evmdec::U256;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub type Addr = U256;
@@ -73,12 +73,6 @@ pub struct Msg {
     pub value: U256,
     // What the actor does when the contract hands it control during this message.
     pub hook: Option<Box<Msg>>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Holdings {
-    pub ether: U256,
-    pub assets: BTreeMap<Addr, U256>,
 }
 
 /* A local chain: the code and storage of each contract, who holds how much ether and
@@ -247,11 +241,6 @@ impl World {
         self.codes.insert(address, code_of(code));
     }
 
-    #[must_use]
-    pub fn has_code(&self, address: Addr) -> bool {
-        self.codes.contains_key(&address)
-    }
-
     pub fn seed(&mut self, address: Addr, slot: U256, value: U256) {
         let slots = self.storage.entry(address).or_default();
         Rc::make_mut(slots).insert(slot, value);
@@ -279,10 +268,6 @@ impl World {
 
     pub fn answer_with(&mut self, to: Addr, selector: u32, answer: Vec<u8>) {
         Rc::make_mut(&mut self.answers).insert((to, selector), answer);
-    }
-
-    pub fn sign(&mut self, digest: U256, signer: Addr) {
-        Rc::make_mut(&mut self.signed).insert(digest, signer);
     }
 
     #[must_use]
@@ -325,15 +310,6 @@ impl World {
         all.sort();
         all.dedup();
         all
-    }
-
-    #[must_use]
-    pub fn holdings(&self, who: Addr) -> Holdings {
-        let assets = self.assets().into_iter();
-        Holdings {
-            ether: self.ether_of(who),
-            assets: assets.map(|a| (a, self.asset_of(a, who))).collect(),
-        }
     }
 
     // Puts an asset in an account's hands, as when a person sends it there.

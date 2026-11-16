@@ -85,7 +85,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    #[command(about = "Audit report from running the code (markdown, or JSON with --json)")]
+    #[command(
+        about = "Audit report from running the code (markdown, or JSON with --json). Takes bytecode, a Solidity file, or a compiler's standard JSON input"
+    )]
     Audit {
         file: PathBuf,
         #[arg(long)]
@@ -418,6 +420,26 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Audit { file, json } => {
+            let kind = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if kind == "sol" || kind == "json" {
+                let built = match kind {
+                    "sol" => audit::source::compile_file(&file),
+                    _ => {
+                        let text = std::fs::read_to_string(&file)?;
+                        audit::source::compile_input(serde_json::from_str(&text)?, None)
+                    }
+                };
+                let built = built.map_err(|e| anyhow::anyhow!(e))?;
+                let reports: Vec<audit::Report> = built.iter().map(audit::audit_compiled).collect();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&reports)?);
+                } else {
+                    for report in &reports {
+                        print!("{}", audit::markdown(report));
+                    }
+                }
+                return Ok(());
+            }
             let code = load(&file)?;
             let c = evmdec::decompile::decompile(&code, &Options::default());
             let r = audit::audit(&c);

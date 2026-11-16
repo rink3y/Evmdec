@@ -3,6 +3,7 @@ pub mod explore;
 pub mod laws;
 pub mod model;
 pub mod report;
+pub mod source;
 pub mod trace;
 pub mod world;
 
@@ -31,6 +32,28 @@ pub fn audit_within(c: &Contract, work: u64) -> Report {
         started.elapsed().as_millis(),
         budget::used() - before,
     )
+}
+
+/* The report of a contract compiled from source. The code that is run is the code
+the compiler produced, so a finding is the same as from the bytecode alone. The source
+adds the names of the functions and the line each finding points at. */
+#[must_use]
+pub fn audit_compiled(built: &source::Compiled) -> Report {
+    let options = evmdec::decompile::Options {
+        extra_sigs: built.names.clone(),
+        ..Default::default()
+    };
+    let c = evmdec::decompile::decompile(&built.runtime, &options);
+    let mut report = audit(&c);
+    report.subject = format!(
+        "{} in {} (compiler {})",
+        built.name, built.file, built.compiler
+    );
+    for finding in &mut report.findings {
+        let at_instruction = finding.pc.and_then(|pc| built.line_of(pc));
+        finding.source = at_instruction.or_else(|| built.declared_at(&finding.function));
+    }
+    report
 }
 
 // One report for a contract and the contracts fetched with it.

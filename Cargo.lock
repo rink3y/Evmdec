@@ -264,6 +264,7 @@ dependencies = [
  "evmdec",
  "serde",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]

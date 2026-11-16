@@ -121,6 +121,7 @@ pub struct Explorer<'a> {
     edges: HashSet<u32>,
     outside: Vec<Addr>,
     known: Vec<Addr>,
+    shapes: HashSet<u64>,
     staked: HashSet<crate::trace::Place>,
     unspendable: HashSet<(crate::trace::Place, usize)>,
     // For each entry, how far its furthest failed call got and what stopped it.
@@ -346,6 +347,7 @@ impl<'a> Explorer<'a> {
             edges: HashSet::new(),
             outside: Vec::new(),
             known: vec![OWNER, USER, ACTOR, ALLY, subject],
+            shapes: HashSet::new(),
             staked: HashSet::new(),
             unspendable: HashSet::new(),
             stopped: Vec::new(),
@@ -734,10 +736,22 @@ impl<'a> Explorer<'a> {
         best
     }
 
-    fn novel(&mut self, run: &Run) -> bool {
+    /* A call led somewhere new when it ran code no call ran before, or left the
+    contract with a set of filled cells no kept state has. How much a cell holds is
+    not part of that, or every amount would be a state of its own. */
+    fn novel(&mut self, run: &Run, world: &World) -> bool {
         let before = self.edges.len();
         self.edges.extend(run.edges.iter().copied());
-        self.edges.len() > before
+        let filled = world
+            .slots(self.subject)
+            .into_iter()
+            .filter(|(_, v)| !v.is_zero());
+        let mut shape = self.subject.low_u64() ^ u64::from(!world.ether_of(self.subject).is_zero());
+        for (slot, _) in filled {
+            shape = shape.rotate_left(7) ^ slot.low_u64() ^ slot.0[3];
+        }
+        let reshaped = self.shapes.insert(shape);
+        self.edges.len() > before || reshaped
     }
 
     fn keep(&mut self, from: usize, entry: usize, t: &Try, world: World, actor: bool) -> usize {
@@ -837,7 +851,7 @@ impl<'a> Explorer<'a> {
                 if again.ok {
                     continue;
                 }
-                self.novel(&run);
+                self.novel(&run, &world);
                 self.states[0].world = world;
                 self.states[0].steps.push(Step::Call { entry, msg: t.msg });
                 return true;
@@ -1002,6 +1016,7 @@ impl<'a> Explorer<'a> {
         let subject = self.subject;
         let base = &self.states[0].world;
         let mut options: Vec<(U256, U256, String)> = Vec::new();
+        let mut roles: Vec<U256> = Vec::new();
         let tests = run.events.iter().rev().filter_map(|e| match e {
             Event::Branch { tag, .. } if tag.has(STORE) && !tag.has(DATA | VALUE) => Some(*tag),
             _ => None,
@@ -1033,6 +1048,7 @@ impl<'a> Explorer<'a> {
                         "the owner holds the role kept at slot {}, since the code tests the caller's entry there",
                         cell.root.to_hex()
                     );
+                    roles.push(cell.slot);
                     options.push((cell.slot, U256::ONE, why));
                 }
                 if !cell.keys.is_empty() || tag.has(CALLER) {
@@ -1068,7 +1084,9 @@ impl<'a> Explorer<'a> {
             }
             world.seed(subject, slot, value);
             let (_, next) = self.attempt_in(world.clone(), entry, t);
-            if better(&next, run) && !self.breaks_others(&world, entry) {
+            // The caller's own entry is as often a balance as a role. Only a role lets the call end.
+            let enough = next.ok || !roles.contains(&slot);
+            if enough && better(&next, run) && !self.breaks_others(&world, entry) {
                 self.states[0].world.seed(subject, slot, value);
                 self.assumed.push(why);
                 return true;
@@ -1113,7 +1131,7 @@ impl<'a> Explorer<'a> {
                         // The owner's second way of filling in an address leads somewhere else
                         // even where it runs the same code.
                         let other_way = who == OWNER && kept && run.stores().next().is_some();
-                        if run.ok && (self.novel(&run) || other_way) {
+                        if run.ok && (self.novel(&run, &world) || other_way) {
                             next.push(self.keep(from, entry, &t, world, false));
                             if who != OWNER {
                                 break;
@@ -1238,7 +1256,7 @@ impl<'a> Explorer<'a> {
                         return false;
                     }
                     if Facts::same_party(msg.from, ACTOR) {
-                        spent = spent.wrapping_add(laws::claims_lowered(&made, subject));
+                        spent = spent.wrapping_add(laws::claims_lowered(&made, subject, &base));
                     }
                 }
             }
@@ -1409,6 +1427,9 @@ impl<'a> Explorer<'a> {
         }
     }
 
+    /* The account calls in again while the contract's call to it is still open. What
+    counts is what that nesting adds: a breach the same two calls show when made one
+    after the other is not about re-entry and is reported where it belongs. */
     fn reenter(&mut self, from: usize, entry: usize, t: &Try, plain: &[Breach]) {
         let mut hooks: Vec<(usize, Msg)> = vec![(entry, t.msg.clone())];
         let paying: Vec<usize> = (0..self.entries.len())
@@ -1417,23 +1438,39 @@ impl<'a> Explorer<'a> {
         for other in paying.into_iter().take(MAX_HOOKS - 1) {
             hooks.push((other, self.seed(other, ACTOR, ACTOR, UNIT, U256::ZERO)));
         }
-        for (_, hook) in hooks {
+        let base = self.states[0].world.clone();
+        let spent = self.states[from].spent;
+        let before = self.states[from].world.clone();
+        let (alone, first) = self.attempt(from, entry, t);
+        for (inner, hook) in hooks {
             if budget::spent() {
                 return;
             }
+            let hook = Msg { hook: None, ..hook };
             let mut again = t.clone();
-            again.msg.hook = Some(Box::new(Msg { hook: None, ..hook }));
-            let before = self.states[from].world.clone();
+            again.msg.hook = Some(Box::new(hook.clone()));
             let (after, run) = self.attempt(from, entry, &again);
             if !run.ok || !run.hooked {
                 continue;
             }
-            let base = self.states[0].world.clone();
-            let spent = self.states[from].spent;
+            let mut apart: Vec<Breach> = plain.to_vec();
+            if first.ok {
+                let (then, second) = self.attempt_in(alone.clone(), inner, &Try::of(hook));
+                if second.ok {
+                    apart.extend(laws::check(
+                        &base,
+                        &alone,
+                        &then,
+                        &second,
+                        &self.facts,
+                        spent,
+                    ));
+                }
+            }
             let breaches = laws::check(&base, &before, &after, &run, &self.facts, spent);
             let fresh: Vec<Breach> = breaches
                 .into_iter()
-                .filter(|b| !plain.iter().any(|p| p.kind == b.kind && p.asset == b.asset))
+                .filter(|b| !apart.iter().any(|p| p.kind == b.kind && p.asset == b.asset))
                 .collect();
             let steps = self.history(from, entry, &again.msg);
             self.report(fresh, entry, &steps, &run, (true, false));
@@ -1563,9 +1600,14 @@ impl<'a> Explorer<'a> {
                         if handed {
                             self.reenter(from, entry, &t, &plain);
                         }
-                        if run.ok && self.novel(&run) && !kept && self.states.len() < MAX_STATES {
+                        if run.ok
+                            && self.novel(&run, &world)
+                            && !kept
+                            && self.states.len() < MAX_STATES
+                        {
                             let at = self.keep(from, entry, &t, world, true);
-                            let lowered = laws::claims_lowered(&run, self.subject);
+                            let lowered =
+                                laws::claims_lowered(&run, self.subject, &self.states[0].world);
                             self.states[at].spent = self.states[at].spent.wrapping_add(lowered);
                             next.push(at);
                             kept = true;

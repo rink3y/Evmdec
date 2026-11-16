@@ -23,6 +23,9 @@ pub struct Finding {
     pub selector: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pc: Option<usize>,
+    // File and line, when the contract was given as source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub title: String,
     pub cause: String,
     pub shown: String,
@@ -448,6 +451,7 @@ fn finding(ex: &Explorer, v: &Violation) -> Finding {
         function: e.name.clone(),
         selector: e.selector.map(|s| format!("{s:#010x}")),
         pc,
+        source: None,
         title: format!("`{}`: {title}", e.name),
         cause,
         shown,
@@ -593,6 +597,9 @@ pub fn markdown(report: &Report) -> String {
     for (i, f) in report.findings.iter().enumerate() {
         out.push_str(&format!("### {}. {}\n\n", i + 1, f.title));
         out.push_str(&format!("- **Severity:** {:?}\n", f.severity));
+        if let Some(source) = &f.source {
+            out.push_str(&format!("- **Source:** {source}\n"));
+        }
         out.push_str(&format!("- **Why:** {}\n", f.cause));
         out.push_str(&format!("- **Shown by a run:** {}\n", f.shown));
         if !f.rests_on.is_empty() {

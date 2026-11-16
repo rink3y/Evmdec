@@ -96,14 +96,17 @@ fn bare(kind: Kind) -> Breach {
 
 /* `base` is the world before the account made its first call, `before` and `after`
 are around its latest call, and `run` is that call. */
-// How much of its own recorded claims the account gave up in a call.
+/* How much the account gave up, in a call, of the claims it held before it first
+acted. A record it built by paying in during these calls is already counted as what it
+paid, so only the part of a fall that goes below the starting level counts here. */
 #[must_use]
-pub fn claims_lowered(run: &Run, subject: Addr) -> U256 {
+pub fn claims_lowered(run: &Run, subject: Addr, base: &World) -> U256 {
     let own = run.stores().filter(|(c, old, new, _, _)| {
         c.account == subject && (c.keyed_by(ACTOR) || c.keyed_by(ALLY)) && new < old
     });
-    own.fold(U256::ZERO, |sum, (_, old, new, _, _)| {
-        sum.wrapping_add(old - new)
+    own.fold(U256::ZERO, |sum, (cell, old, new, _, _)| {
+        let started = base.stored(subject, cell.slot);
+        sum.wrapping_add(old.min(started) - new.min(started))
     })
 }
 
@@ -133,7 +136,7 @@ pub fn check(
         .map(|a| (change(a).1.wrapping_sub(change(a).0), *a))
         .filter(|(_, a)| change(a).1 > change(a).0)
         .max();
-    let own = spent.wrapping_add(claims_lowered(run, subject));
+    let own = spent.wrapping_add(claims_lowered(run, subject, base));
     /* What a contract passes on because another contract said it had just sent that
     much is not the contract's own. Here nobody keeps books for such an answer, so a
     payment sized by one shows nothing. */

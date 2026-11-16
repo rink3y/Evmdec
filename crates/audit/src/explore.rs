@@ -2654,14 +2654,12 @@ impl<'a> Explorer<'a> {
     }
 
     /* Only entries that write what the contract read there can change what it does.
-    An asset the account holds comes first, since moving it is the one thing the
-    account can surely do there. */
+    An asset the account holds comes last, since it can send that itself and needs no
+    entry for it. Each contract looked at is decompiled, so only a few are. */
     fn add_outside(&mut self) {
         let world = self.states[0].world.clone();
         let held = world.assets();
         let cells = |at: Addr| self.read_out.iter().filter(|c| c.0 == at).count();
-        /* What the account holds of an asset it can send there itself. The calls worth
-        making are to the contracts whose own cells the contract reads. */
         let mut talked: Vec<(bool, usize, usize, Addr, Option<Addr>)> = self
             .talked
             .iter()

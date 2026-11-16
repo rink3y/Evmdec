@@ -175,14 +175,6 @@ pub struct ClassInfo {
     pub signed_cmp: bool,
     pub unsigned_cmp: bool,
     pub arith_def: bool,
-    cast: u32,
-}
-
-impl ClassInfo {
-    #[must_use]
-    pub fn checked(&self, bits: u32) -> bool {
-        cast_checked(self.cast, bits)
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1150,16 +1142,7 @@ impl TypeEnv {
             signed_cmp: c.flags.signed_cmp,
             unsigned_cmp: c.flags.unsigned_cmp,
             arith_def: c.flags.arith_def,
-            cast: c.flags.cast,
         })
-    }
-
-    #[must_use]
-    pub fn defs(&self, loc: &Loc) -> &[(ExprId, usize)] {
-        match self.ids.get(loc) {
-            Some(i) => &self.classes[*i].defs,
-            None => &[],
-        }
     }
 }
 

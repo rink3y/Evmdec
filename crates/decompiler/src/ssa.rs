@@ -444,17 +444,6 @@ pub fn returns(l: &Lifted) -> Vec<&[ExprId]> {
         .collect()
 }
 
-pub fn stored_address_slot(e: ExprId) -> Option<ExprId> {
-    let inner = match expr::node(e) {
-        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
-        _ => e,
-    };
-    match expr::node(inner) {
-        Node::SLoad(k, false, _) if expr::is_const(k) => Some(k),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

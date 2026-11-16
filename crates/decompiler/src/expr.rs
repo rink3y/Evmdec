@@ -405,20 +405,6 @@ thread_local! {
 
 // The mark belongs to the function being printed. Variable ids repeat from one function
 // to the next, so a mark left behind would change how another function is simplified.
-thread_local! {
-    static HASHED: RefCell<HashMap<U256, Vec<U256>>> = RefCell::new(HashMap::new());
-}
-
-// A hash of constants is folded to a constant, and with that the words it was made of
-// are gone. They are kept here so a folded mapping key can still be traced to its slot.
-pub fn note_hash(hash: U256, words: Vec<U256>) {
-    HASHED.with(|h| h.borrow_mut().insert(hash, words));
-}
-
-pub fn hash_parts(hash: U256) -> Option<Vec<U256>> {
-    HASHED.with(|h| h.borrow().get(&hash).cloned())
-}
-
 pub fn clear_boolean_marks() {
     BOOL_VARS.with(|b| b.borrow_mut().clear());
 }
@@ -779,22 +765,6 @@ pub fn children(e: ExprId) -> Vec<ExprId> {
         Node::KeccakMem(a, b, _) => vec![a, b],
         _ => vec![],
     }
-}
-
-const MAX_PARTS_SEARCHED: usize = 5_000;
-
-pub fn has_part(e: ExprId, target: ExprId) -> bool {
-    let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![e];
-    while let Some(x) = stack.pop() {
-        if x == target {
-            return true;
-        }
-        if seen.insert(x) && seen.len() <= MAX_PARTS_SEARCHED {
-            stack.extend(children(x));
-        }
-    }
-    false
 }
 
 pub fn contains(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {

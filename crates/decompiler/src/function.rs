@@ -364,17 +364,6 @@ pub struct Param {
     pub name: String,
 }
 
-pub fn exprs_with_callees<'a>(
-    l: &Lifted,
-    resolve: &dyn Fn(usize) -> Option<&'a Lifted>,
-    depth: usize,
-) -> Vec<ExprId> {
-    exprs_with_callees_tagged(l, resolve, depth)
-        .into_iter()
-        .map(|r| r.expr)
-        .collect()
-}
-
 pub fn exprs_with_callees_tagged<'a>(
     l: &Lifted,
     resolve: &dyn Fn(usize) -> Option<&'a Lifted>,

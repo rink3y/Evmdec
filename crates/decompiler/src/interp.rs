@@ -61,22 +61,6 @@ const CHAINID: u64 = 1;
 const BASEFEE: u64 = 1_000_000_000;
 const BLOBBASEFEE: u64 = 1;
 
-// The solver works out a branch from these. A value it does not know here is a branch
-// it cannot turn, however simple the comparison.
-pub fn fixed_in_a_run(o: u8) -> Option<U256> {
-    let value = match o {
-        op::GASPRICE => GASPRICE,
-        op::COINBASE => COINBASE,
-        op::PREVRANDAO => PREVRANDAO,
-        op::GASLIMIT => GASLIMIT,
-        op::CHAINID => CHAINID,
-        op::BASEFEE => BASEFEE,
-        op::BLOBBASEFEE => BLOBBASEFEE,
-        _ => return None,
-    };
-    Some(U256::from_u64(value))
-}
-
 #[derive(Clone, Debug)]
 pub struct Host {
     pub address: U256,
@@ -248,8 +232,6 @@ impl Host {
     }
 }
 
-const RECOVER: U256 = U256::ONE;
-
 const CONTROLLED_SEED: u64 = 0x5eed;
 
 // The zero address and the built-in contracts hold no code on chain. An unset slot read
@@ -263,10 +245,6 @@ fn code_size(seed: u64, a: U256) -> U256 {
     U256::from_u64(drawn.low_u64() % 300)
 }
 
-pub fn code_size_in_a_run(a: U256) -> U256 {
-    code_size(CONTROLLED_SEED, a)
-}
-
 const LAST_PRECOMPILE: u64 = 0x11;
 
 // The built-in contracts keep no state and run no code of anyone's. A call to one is
@@ -277,22 +255,6 @@ pub(crate) fn holds_no_code(addr: U256) -> bool {
 
 pub(crate) fn built_in(addr: U256) -> bool {
     addr.fits_u64() && (1..=LAST_PRECOMPILE).contains(&addr.low_u64())
-}
-
-// An answer a check set on purpose is part of what that check measures. Only the answer
-// nothing chose is left for a search to shape.
-pub fn answered_by_default(
-    signed: &Option<(Vec<u8>, U256)>,
-    replies: &[(u32, Vec<u8>)],
-    addr: U256,
-    input: &[u8],
-) -> bool {
-    let selector = input
-        .get(..4)
-        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-    let built_in = built_in(addr);
-    let recovered = addr == RECOVER && signed.is_some();
-    !built_in && !recovered && !replies.iter().any(|(s, _)| Some(*s) == selector)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

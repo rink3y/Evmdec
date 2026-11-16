@@ -253,8 +253,6 @@ pub struct Part {
     pub address: String,
     pub selectors: Vec<String>,
     #[serde(skip)]
-    pub base: usize,
-    #[serde(skip)]
     pub runtime: Vec<u8>,
     pub compiler: String,
     pub storage: Vec<StorageVar>,
@@ -294,24 +292,6 @@ impl Contract {
         selectors
             .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
             .collect()
-    }
-
-    #[must_use]
-    pub fn code_of(&self, f: &Function) -> &[u8] {
-        match self.parts.get(f.part) {
-            Some(p) => &p.runtime,
-            None => &self.info.runtime,
-        }
-    }
-
-    #[must_use]
-    pub fn base_of(&self, f: &Function) -> usize {
-        self.parts.get(f.part).map_or(0, |p| p.base)
-    }
-
-    #[must_use]
-    pub fn local_pc(&self, f: &Function, pc: usize) -> usize {
-        pc.saturating_sub(self.base_of(f))
     }
 }
 
@@ -369,7 +349,6 @@ pub fn compose(
         role: PartRole::Shell,
         address: shell.address.clone().unwrap_or_default(),
         selectors: Vec::new(),
-        base: 0,
         runtime: shell.info.runtime.clone(),
         compiler: shell.language.clone(),
         storage: shell.storage.clone(),
@@ -399,7 +378,6 @@ pub fn compose(
             role,
             address: address.clone(),
             selectors: selectors.clone(),
-            base,
             runtime: std::mem::take(&mut part.info.runtime),
             compiler: part.language.clone(),
             storage: part.storage.clone(),

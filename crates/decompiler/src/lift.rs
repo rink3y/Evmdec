@@ -1,4 +1,4 @@
-use crate::cfg::{AState, AVal, Edge, Program, UNode, Unit};
+use crate::cfg::{AVal, Edge, Program, Unit};
 use crate::expr::{self, kind, konst, konst_u64, op1, op2, op3, ExprId, Node};
 use crate::opcode as op;
 use crate::u256::U256;
@@ -513,7 +513,6 @@ struct Mem {
     written: BTreeSet<(u64, u64)>,
     entry_loads: Rc<RefCell<MemoryReads>>,
     touched: Rc<RefCell<MemoryWrites>>,
-    single_run: bool,
 }
 
 const BIG: u64 = 1 << 40;
@@ -636,7 +635,6 @@ impl Mem {
             written: BTreeSet::new(),
             entry_loads: Rc::default(),
             touched: Rc::default(),
-            single_run: false,
         }
     }
 
@@ -754,10 +752,7 @@ impl Mem {
                 break;
             }
             if w.base != base {
-                // One run cannot tell where an input-sized offset lands.
-                // It is taken to miss a fixed address and the re-run catches a wrong guess.
-                let guessed = self.single_run && base.is_none() && w.base.is_some();
-                if !guessed && may_alias(w.base, w.off, w.len, base, d, n) {
+                if may_alias(w.base, w.off, w.len, base, d, n) {
                     return None;
                 }
                 continue;
@@ -765,14 +760,6 @@ impl Mem {
             let Some(wl) = w.len else {
                 if d + n <= w.off {
                     continue;
-                }
-                // A read past the copied length is a wrong guess here.
-                // Every answer built on it is run again on the bytecode.
-                if let (true, 0, MVal::Copy(k, src, addr)) = (self.single_run, covered, &w.val) {
-                    if d >= w.off {
-                        copy_hit = Some((*k, *src, *addr, d - w.off, w.gen));
-                        break;
-                    }
                 }
                 return None;
             };
@@ -1093,7 +1080,6 @@ pub struct State {
     sgen: u32,
     called: bool,
     returned: u32,
-    answered: Option<u32>,
 }
 
 impl State {
@@ -1415,7 +1401,6 @@ impl<'a> Lifter<'a> {
             sgen: 0,
             called: !fresh,
             returned: 0,
-            answered: None,
         };
         self.lift_from(unit, state)
     }
@@ -1446,50 +1431,6 @@ impl<'a> Lifter<'a> {
                 .insert((unit.entry_block, cl.entry), cl);
         }
         self.lift_from(unit, init)
-    }
-
-    pub fn lift_trace(&self, blocks: &[usize]) -> Vec<LNode> {
-        let unit = Unit {
-            entry_block: blocks.first().copied().unwrap_or(0),
-            nodes: blocks
-                .iter()
-                .enumerate()
-                .map(|(id, block)| UNode {
-                    id,
-                    block: *block,
-                    entry: AState::new(),
-                    succs: vec![],
-                    preds: vec![],
-                    call: None,
-                    returns_via: None,
-                    unresolved: true,
-                    infeasible: false,
-                    computed_cut: false,
-                })
-                .collect(),
-            entry: 0,
-            budget_exhausted: false,
-        };
-        let mut state = State {
-            stack: Vec::new(),
-            args_used: 0,
-            mem: Mem::new(true),
-            storage: Vec::new(),
-            version: 0,
-            sgen: 0,
-            called: false,
-            returned: 0,
-            answered: None,
-        };
-        state.mem.single_run = true;
-        let hidden = Hidden::default();
-        let mut out = Vec::with_capacity(blocks.len());
-        for id in 0..blocks.len() {
-            let (node, next) = self.run_node(&unit, id, &state, &hidden);
-            state = next;
-            out.push(node);
-        }
-        out
     }
 
     pub fn entry_state_of(l: &Lifted, unit_node: usize) -> Option<State> {
@@ -1604,7 +1545,6 @@ impl<'a> Lifter<'a> {
                                 sgen: exit.sgen,
                                 called: exit.called,
                                 returned: exit.returned,
-                                answered: exit.answered,
                             },
                         });
                         true
@@ -1619,7 +1559,6 @@ impl<'a> Lifter<'a> {
                             sgen: exit.sgen,
                             called: exit.called,
                             returned: exit.returned,
-                            answered: exit.answered,
                         };
                         let changed = e.state.stack != new_state.stack
                             || e.state.mem.writes != new_state.mem.writes
@@ -1977,7 +1916,7 @@ impl<'a> Lifter<'a> {
         let mut term: Option<Term> = None;
         let seq_base = (nid as u32) << SEQ_BITS;
         let mut seq_ctr = 0u32;
-        // A trace and the oracle lift one node per step, so there the step is the number.
+        // The oracle lifts one node per step, so there the step is the number.
         let copy = hidden.copies.get(nid).copied().filter(|_| !self.oracle);
         let seq_at = |pc: usize, count: u32| match copy {
             Some(copy) => site_seq(pc, copy),
@@ -2360,12 +2299,7 @@ impl<'a> Lifter<'a> {
                             _ => st.mem.store(dest, l, MVal::Copy(o, src, None)),
                         }
                     } else {
-                        // One run has one call behind each copy of an answer. Naming it lets
-                        // a search value the words read from it, and choose them.
-                        let known = o == op::RETURNDATACOPY && st.mem.single_run;
-                        let answered = st.answered.filter(|_| known);
-                        let from = answered.map(|seq| konst_u64(u64::from(seq)));
-                        st.mem.store(dest, l, MVal::Copy(o, src, from));
+                        st.mem.store(dest, l, MVal::Copy(o, src, None));
                     }
                     next_version(&mut st);
                     stmts.push(Stmt::Copy {
@@ -2487,7 +2421,6 @@ impl<'a> Lifter<'a> {
                     st.stack.push(result);
                     st.called = true;
                     st.returned = call_stamp(nid, stmts.len());
-                    st.answered = Some(seq);
                 }
                 op::CREATE | op::CREATE2 => {
                     let value = pop!();
@@ -2519,7 +2452,6 @@ impl<'a> Lifter<'a> {
                     st.stack.push(result);
                     st.called = true;
                     st.returned = call_stamp(nid, stmts.len());
-                    st.answered = None;
                 }
                 op::RETURN | op::REVERT => {
                     let off = pop!();
@@ -3243,73 +3175,8 @@ fn loop_bound(cond: ExprId) -> Option<ExprId> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct MemView {
-    mem: Mem,
-    version: u32,
-}
-
-impl Default for MemView {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MemView {
-    pub fn new() -> MemView {
-        MemView {
-            mem: Mem::new(false),
-            version: 0,
-        }
-    }
-    pub fn new_fresh() -> MemView {
-        MemView {
-            mem: Mem::new(true),
-            version: 0,
-        }
-    }
-    pub fn unfresh(&mut self) {
-        self.mem.fresh = false;
-    }
-    pub fn unknown(&mut self, off: ExprId, len: Option<u64>) {
-        self.mem.store(off, len, MVal::Unknown);
-        self.mem.tick();
-        self.version = self.mem.gen;
-    }
-    pub fn store(&mut self, off: ExprId, val: ExprId) {
-        self.mem.store(off, Some(32), MVal::Word(val));
-        self.mem.tick();
-        self.version = self.mem.gen;
-    }
-    pub fn copy(&mut self, dest: ExprId, src: ExprId, len: ExprId) {
-        let mut st = State {
-            stack: Vec::new(),
-            args_used: 0,
-            mem: std::mem::replace(&mut self.mem, Mem::new(false)),
-            storage: Vec::new(),
-            version: self.version,
-            sgen: 0,
-            called: false,
-            returned: 0,
-            answered: None,
-        };
-        apply_mcopy(&mut st, dest, src, len);
-        self.mem = st.mem;
-        self.version = st.version;
-    }
-    pub fn load(&self, off: ExprId) -> Option<ExprId> {
-        let w = self.mem.load_bytes(off, 32, self.version)?;
-        if expr::contains(w, &|n| matches!(n, Node::MLoad(..))) {
-            None
-        } else {
-            Some(w)
-        }
-    }
-}
-
 fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
     let mut bytes = Vec::with_capacity(words.len() * 32);
-    let mut parts = Vec::with_capacity(words.len());
     for (i, w) in words.iter().enumerate() {
         let c = expr::as_const(*w)?;
         let b = c.to_be_bytes();
@@ -3318,13 +3185,8 @@ fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
         } else {
             bytes.extend_from_slice(&b);
         }
-        parts.push(c);
     }
-    let hash = U256::from_be_bytes(&crate::keccak::keccak256(&bytes));
-    if tail == 0 {
-        expr::note_hash(hash, parts);
-    }
-    Some(hash)
+    Some(U256::from_be_bytes(&crate::keccak::keccak256(&bytes)))
 }
 
 fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {

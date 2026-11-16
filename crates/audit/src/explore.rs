@@ -34,6 +34,7 @@ pub struct Entry {
     shape: Shape,
     pub view: bool,
     pub payable: bool,
+    pub to: Addr,
 }
 
 #[derive(Clone, Debug)]
@@ -173,7 +174,7 @@ fn outside(n: usize) -> Addr {
     world::account(0xa5, n as u64 + 1)
 }
 
-fn entries(c: &Contract) -> Vec<Entry> {
+fn entries(c: &Contract, to: Addr) -> Vec<Entry> {
     let reached =
         |kind: FnKind| matches!(kind, FnKind::External | FnKind::Fallback | FnKind::Receive);
     let all = c.functions.iter().enumerate();
@@ -194,6 +195,7 @@ fn entries(c: &Contract) -> Vec<Entry> {
             shape,
             view: matches!(f.mutability, Mutability::Pure | Mutability::View),
             payable: f.mutability == Mutability::Payable,
+            to,
         });
     }
     out
@@ -321,7 +323,7 @@ impl<'a> Explorer<'a> {
     }
 
     fn starting_from(c: &'a Contract, subject: Addr, world: World) -> Explorer<'a> {
-        let entries = entries(c);
+        let entries = entries(c, subject);
         let start = State {
             world,
             steps: Vec::new(),
@@ -361,10 +363,25 @@ impl<'a> Explorer<'a> {
     }
 
     fn seed(&self, entry: usize, who: Addr, address: Addr, amount: U256, value: U256) -> Try {
-        self.fill(&self.entries[entry].shape, who, address, amount, value)
+        self.fill(
+            entry,
+            &self.entries[entry].shape,
+            who,
+            address,
+            amount,
+            value,
+        )
     }
 
-    fn fill(&self, shape: &Shape, who: Addr, address: Addr, amount: U256, value: U256) -> Try {
+    fn fill(
+        &self,
+        entry: usize,
+        shape: &Shape,
+        who: Addr,
+        address: Addr,
+        amount: U256,
+        value: U256,
+    ) -> Try {
         let mut shape = shape.clone();
         shape.each_word(&mut |kind, held| {
             *held = match kind {
@@ -376,7 +393,7 @@ impl<'a> Explorer<'a> {
                 Holds::Other => return,
             };
         });
-        Try::of(who, self.subject, shape, value)
+        Try::of(who, self.entries[entry].to, shape, value)
     }
 
     fn honest(&self, entry: usize, who: Addr) -> Vec<Try> {
@@ -406,7 +423,7 @@ impl<'a> Explorer<'a> {
     fn bare_payment(&self, entry: usize, who: Addr) -> Option<Try> {
         let e = &self.entries[entry];
         let catch_all = e.selector.is_none() && e.shape != Shape::default();
-        catch_all.then(|| Try::of(who, self.subject, Shape::default(), UNIT))
+        catch_all.then(|| Try::of(who, e.to, Shape::default(), UNIT))
     }
 
     // What an account with no role tries: itself everywhere, then another account in each place.
@@ -451,8 +468,8 @@ impl<'a> Explorer<'a> {
         // Two items of half the range each add up to nothing where a sum is not checked.
         if let Some(pair) = e.shape.paired() {
             let half = U256::ONE << 255;
-            seeds.push(self.fill(&pair, ACTOR, ACTOR, half, U256::ZERO));
-            seeds.push(self.fill(&pair, ACTOR, ACTOR, UNIT, U256::ZERO));
+            seeds.push(self.fill(entry, &pair, ACTOR, ACTOR, half, U256::ZERO));
+            seeds.push(self.fill(entry, &pair, ACTOR, ACTOR, UNIT, U256::ZERO));
         }
         seeds
     }

@@ -173,34 +173,83 @@ fn source(tag: Tag, run: &Run) -> String {
     }
 }
 
+/* What the run tested its caller against. A comparison with a constant or with the
+call data, and a test that the caller's own balance covers an amount, restrict nobody.
+They are named as what they are so that they are not read as a permission check. */
 fn caller_tests(run: &Run) -> String {
     let mut against: Vec<String> = Vec::new();
+    let mut note = |text: String| {
+        if !against.contains(&text) {
+            against.push(text);
+        }
+    };
     for event in &run.events {
-        let tags = match event {
-            Event::Cmp { ta, tb, .. } if ta.only(CALLER) => vec![*tb],
-            Event::Cmp { ta, tb, .. } if tb.only(CALLER) => vec![*ta],
+        match event {
+            Event::Cmp { ta, tb, .. } if ta.only(CALLER) || tb.only(CALLER) => {
+                let other = if ta.only(CALLER) { *tb } else { *ta };
+                note(match other {
+                    t if t.is_none() => "a comparison with a constant in the code".into(),
+                    t if t.has(DATA) && !t.has(STORE) => {
+                        "a comparison with an address the caller put in the call data".into()
+                    }
+                    t => format!("a comparison with {}", source(t, run)),
+                });
+            }
             Event::Branch { tag, .. } if tag.has(STORE) => {
-                let keyed = run
+                let own = run
                     .cell_of(*tag)
-                    .is_some_and(|c| c.keys.iter().any(|k| k.tag.only(CALLER)));
-                if keyed {
-                    vec![*tag]
-                } else {
-                    Vec::new()
+                    .filter(|c| c.keys.iter().any(|k| k.tag.only(CALLER)));
+                if let Some(cell) = own {
+                    let name = cell_name(cell);
+                    note(match tag.has(DATA) || tag.has(VALUE) || tag.has(MATH) {
+                        true => {
+                            format!("whether the caller's own entry in {name} covers an amount")
+                        }
+                        false => format!("whether the caller's own entry in {name} is set"),
+                    });
                 }
             }
-            _ => Vec::new(),
-        };
-        for tag in tags {
-            let name = source(tag, run);
-            if !against.contains(&name) {
-                against.push(name);
-            }
+            _ => {}
         }
     }
     match against.is_empty() {
         true => "Nothing on the way tests who the caller is.".to_string(),
-        false => format!("The caller is tested only against {}.", against.join(", ")),
+        false => format!(
+            "The only tests that involve the caller are {}.",
+            against.join(", ")
+        ),
+    }
+}
+
+// Whether two words were worked out from the same call data word or storage cell.
+fn related(a: Tag, b: Tag) -> bool {
+    a.words & b.words != 0 || (a.cell != 0 && a.cell == b.cell)
+}
+
+/* An addition, subtraction or multiplication that went past the end of the number
+range in a call that still ended, on the way to the amount the finding is about. */
+fn wrapped(run: &Run, amount: Tag) -> &'static str {
+    let wraps = run.events.iter().find_map(|e| match e {
+        Event::Overflow { tag, op, .. } if related(*tag, amount) => Some(*op),
+        _ => None,
+    });
+    match wraps {
+        Some(evmdec::opcode::SIGNEXTEND) => " On the way to that amount a number was read as a narrower signed one and came out negative, and nothing stopped the call, so a subtraction of it adds and an addition takes away.",
+        Some(_) => " On the way to that amount an addition, subtraction or multiplication went past the end of the number range and nothing stopped the call, so the amount is not what the earlier checks were made on.",
+        None => "",
+    }
+}
+
+/* Moving or lowering what belongs to an account named in the call data is in order
+when that account agreed to it. An agreement is a record kept under both that account
+and the caller, and the run read none. */
+fn consent(run: &Run, victim: Addr) -> &'static str {
+    let read_both = run
+        .loads()
+        .any(|(cell, _)| cell.keyed_by(victim) && cell.keys.iter().any(|k| k.tag.only(CALLER)));
+    match read_both {
+        true => "",
+        false => " The call reads no record kept under both that account and the caller, so nothing shows that the account agreed.",
     }
 }
 
@@ -283,9 +332,10 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
                         asset_name(asset)
                     );
                     let cause = format!(
-                        "The payment goes to {} and its amount is {}. {tests}{again}",
+                        "The payment goes to {} and its amount is {}.{} {tests}{again}",
                         source(*to_tag, run),
-                        source(*amount_tag, run)
+                        source(*amount_tag, run),
+                        wrapped(run, *amount_tag)
                     );
                     (title, cause, shown, None)
                 }
@@ -301,18 +351,26 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
         Kind::Loss => {
             let asset = v.breach.asset;
             let victim = v.breach.victim.unwrap_or(USER);
+            // The call that moved the asset is the one the books recorded, not the first that names the account.
+            let paid = pays
+                .clone()
+                .find(|p| p.0 == asset && p.1 == victim && !p.3.is_zero());
             let moved = run.calls.iter().find(|c| {
-                c.ok && c.input.len() >= 100 && U256::from_be_bytes(&c.input[4..36]) == victim
+                c.ok && c.input.len() >= 100
+                    && U256::from_be_bytes(&c.input[4..36]) == victim
+                    && paid.is_none_or(|p| U256::from_be_bytes(&c.input[68..100]) == p.3)
             });
-            let named = match moved {
-                Some(call) => format!(
-                    "The account whose {} is moved is {}, the receiver is {} and the amount is {}.",
+            let named = match (paid, moved) {
+                (Some((_, _, _, _, to_tag, amount_tag)), Some(call)) => format!(
+                    "The account whose {} is moved is {}, the receiver is {} and the amount is {}.{}{}",
                     asset_name(asset),
                     source(call.arg_tags.first().copied().unwrap_or(Tag::NONE), run),
-                    source(call.arg_tags.get(1).copied().unwrap_or(Tag::NONE), run),
-                    source(call.arg_tags.get(2).copied().unwrap_or(Tag::NONE), run),
+                    source(to_tag, run),
+                    source(amount_tag, run),
+                    wrapped(run, amount_tag),
+                    consent(run, victim),
                 ),
-                None => "The account that pays did not make the call.".to_string(),
+                _ => "The account that pays did not make the call.".to_string(),
             };
             let title = format!(
                 "An account with no role moves {} out of another account",
@@ -363,9 +421,14 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
                     ),
                 ),
             };
+            let agreed = match (v.breach.kind, v.breach.victim) {
+                (Kind::Debit, Some(victim)) => consent(run, victim),
+                _ => "",
+            };
             let cause = format!(
-                "The call writes {keyed} in {name}. What it writes is {}. {tests}{again}",
-                source(tag, run)
+                "The call writes {keyed} in {name}. What it writes is {}.{}{agreed} {tests}{again}",
+                source(tag, run),
+                wrapped(run, tag)
             );
             (title, cause, shown, pc)
         }
@@ -432,6 +495,7 @@ fn capital(text: &str) -> String {
 fn finding(ex: &Explorer, v: &Violation) -> Finding {
     let e = &ex.entries[v.entry];
     let (title, cause, shown, pc) = explain(v, &v.run, ex.subject);
+    let set_up = ex.states[0].steps.len();
     let rests_on: Vec<String> = v
         .steps
         .iter()
@@ -455,7 +519,15 @@ fn finding(ex: &Explorer, v: &Violation) -> Finding {
         title: format!("`{}`: {title}", e.name),
         cause,
         shown,
-        steps: v.steps.iter().map(|s| step_text(ex, s)).collect(),
+        steps: v
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| match i < set_up {
+                true => format!("taken to have been done at set-up: {}", step_text(ex, s)),
+                false => step_text(ex, s),
+            })
+            .collect(),
         rests_on,
         reentered: v.via_hook,
     }

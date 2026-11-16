@@ -943,6 +943,22 @@ impl World {
             op::DIV | op::SDIV | op::MOD | op::SMOD | op::ADDMOD | op::MULMOD | op::EXP => {
                 result = result.with(MATH);
             }
+            // A number read as a narrower signed one that comes out negative is no longer the number it was.
+            op::SIGNEXTEND => {
+                let (width, x) = (val(0), val(1));
+                let sign = width.as_usize().filter(|w| *w < 31).map(|w| 8 * w + 7);
+                let flips = sign.is_some_and(|bit| x.bits() as usize == bit + 1);
+                if flips && !result.is_none() {
+                    Self::event(
+                        tx,
+                        Event::Overflow {
+                            pc,
+                            op: o,
+                            tag: result,
+                        },
+                    );
+                }
+            }
             op::JUMPI => {
                 let cond = tag(sh, 1);
                 let taken = !val(1).is_zero();

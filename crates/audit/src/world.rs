@@ -12,7 +12,8 @@ use std::rc::Rc;
 
 pub type Addr = U256;
 
-const fn account(tag: u64, n: u64) -> Addr {
+#[must_use]
+pub const fn account(tag: u64, n: u64) -> Addr {
     U256([n, 0, tag << 24, 0])
 }
 
@@ -786,8 +787,15 @@ impl World {
             op::EXTCODEHASH => result = result.with(EXT),
             op::CALLDATALOAD => {
                 let at = val(0).as_usize().unwrap_or(usize::MAX);
-                let end = at.saturating_add(32).min(f.data_tags.len());
-                let read = f.data_tags.get(at..end).map_or(Tag::NONE, join_all);
+                // A word read from the very start is read for the four bytes that choose the function.
+                let end = match at {
+                    0 => 4,
+                    _ => at.saturating_add(32),
+                };
+                let read = f
+                    .data_tags
+                    .get(at..end.min(f.data_tags.len()))
+                    .map_or(Tag::NONE, join_all);
                 result = result.join(read);
             }
             op::CALLDATACOPY => {
@@ -939,7 +947,8 @@ impl World {
                 op::PUSH0
                     ..=op::PUSH32 | op::PC | op::MSIZE | op::CODESIZE | op::CHAINID | op::GASPRICE
             );
-            sh.stack.push(if fresh { Tag::NONE } else { result });
+            sh.stack
+                .push(if fresh { Tag::NONE } else { result.settled() });
         }
         pending
     }

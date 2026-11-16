@@ -15,6 +15,10 @@ pub const MATH: u16 = 1 << 11;
 pub const CMP: u16 = 1 << 12;
 pub const SIZE: u16 = 1 << 13;
 pub const EXT: u16 = 1 << 14;
+// The first four bytes of the call data, which choose the function.
+pub const CHOICE: u16 = 1 << 15;
+// What only says how a word was worked on, not where it came from.
+const WORKED: u16 = HASH | MATH | CMP;
 
 const MANY: u16 = u16::MAX;
 pub const DATA_WORDS: usize = 32;
@@ -57,10 +61,21 @@ impl Tag {
 
     #[must_use]
     pub fn data(byte: usize) -> Tag {
-        let word = byte.checked_sub(4).map(|b| b / 32);
-        Tag {
-            words: word.filter(|w| *w < DATA_WORDS).map_or(0, |w| 1 << w),
-            ..Tag::of(DATA)
+        match byte.checked_sub(4).map(|b| b / 32) {
+            None => Tag::of(CHOICE),
+            Some(word) => Tag {
+                words: Some(word).filter(|w| *w < DATA_WORDS).map_or(0, |w| 1 << w),
+                ..Tag::of(DATA)
+            },
+        }
+    }
+
+    // A word worked out from constants alone is a constant.
+    #[must_use]
+    pub fn settled(self) -> Tag {
+        match self.bits & !WORKED {
+            0 => Tag::NONE,
+            _ => self,
         }
     }
 

@@ -63,6 +63,8 @@ enum Cmd {
         embedded: bool,
         #[arg(long, help = "Disable the built-in signature dictionary")]
         no_sigs: bool,
+        #[arg(long, help = "Append the audit report (markdown) after the code")]
+        report: bool,
         #[arg(
             long,
             help = "Resolve unknown selectors online (openchain.xyz, 4byte.directory)"
@@ -80,6 +82,12 @@ enum Cmd {
         seed: u64,
         #[arg(long)]
         verbose: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Audit report from running the code (markdown, or JSON with --json)")]
+    Audit {
+        file: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -266,6 +274,7 @@ fn run(cli: Cli) -> Result<()> {
             json,
             embedded,
             no_sigs,
+            report,
             lookup,
         } => {
             let mut opts = Options {
@@ -316,9 +325,14 @@ fn run(cli: Cli) -> Result<()> {
                 }
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&c)?);
+                let mut v = serde_json::to_value(&c)?;
+                v["report"] = serde_json::to_value(audit::audit_all(&c))?;
+                println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 print!("{}", c.source);
+                if report {
+                    println!("\n/*\n{}*/", audit::markdown(&audit::audit_all(&c)));
+                }
             }
         }
         Cmd::Verify {
@@ -401,6 +415,16 @@ fn run(cli: Cli) -> Result<()> {
                     _ => anyhow::bail!("'{h}' is neither a 4-byte selector nor a 32-byte topic"),
                 };
                 println!("0x{hex} {}", if line.is_empty() { "?" } else { &line });
+            }
+        }
+        Cmd::Audit { file, json } => {
+            let code = load(&file)?;
+            let c = evmdec::decompile::decompile(&code, &Options::default());
+            let r = audit::audit(&c);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                print!("{}", audit::markdown(&r));
             }
         }
         Cmd::Disasm { file } => {

@@ -273,6 +273,7 @@ dependencies = [
  "anyhow",
  "clap",
  "evmdec",
+ "evmdec-audit",
  "serde_json",
 ]
 
@@ -282,6 +283,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "evmdec",
+ "evmdec-audit",
  "serde",
  "serde_json",
  "tokio",

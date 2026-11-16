@@ -51,7 +51,7 @@ fn a_file_with_no_code_is_an_error() {
         ("prefix.hex", "0x"),
     ] {
         let path = file(name, contents);
-        let out = evmdec(&["analyze", path.to_str().unwrap()]);
+        let out = evmdec(&["audit", path.to_str().unwrap()]);
         let _ = std::fs::remove_file(&path);
         assert!(!out.status.success(), "{name} was accepted");
         let said = String::from_utf8_lossy(&out.stderr);
@@ -69,7 +69,7 @@ fn an_empty_hex_argument_is_an_error() {
 #[test]
 fn a_report_names_the_code_it_read() {
     let whole = file("report.hex", &sample());
-    let out = evmdec(&["analyze", whole.to_str().unwrap()]);
+    let out = evmdec(&["audit", whole.to_str().unwrap()]);
     let _ = std::fs::remove_file(&whole);
     assert!(out.status.success());
     let report = String::from_utf8_lossy(&out.stdout);

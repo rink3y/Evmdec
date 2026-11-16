@@ -865,3 +865,26 @@ fn a_field_read_before_its_slot_is_written_keeps_the_old_value() {
         "the event carries the owner read before the store"
     );
 }
+
+#[test]
+fn a_merged_value_is_assigned_on_every_way_in() {
+    let source = |path: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+        let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source
+    };
+    let helper = source("../../testdata/regress/umbrella_batch_helper.hex");
+    assert!(
+        helper.contains("if (!ret_1_0) {\n            v1 = arg2;\n        L1236:"),
+        "the branch that skips the swap still hands its amount to the join"
+    );
+    let token = source("../../testdata/regress/minime_token.hex");
+    assert!(
+        token.contains(
+            "v1 = arg0;\n        v2 = arg1;\n        while (v1 > v2) {\n            \
+             stor[v2] = 0;\n            v2 = v2 + 1;\n        }"
+        ),
+        "a helper that starts on a loop counts from what its caller passed"
+    );
+    assert!(!token.contains("stor[arg1 + 23] = 0;"));
+}

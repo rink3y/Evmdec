@@ -1517,6 +1517,7 @@ impl<'a> Lifter<'a> {
             ..Hidden::default()
         };
         let init_len = init.stack.len();
+        let (init_stack, init_args) = (init.stack.clone(), init.args_used);
         entries[unit.entry] = Some(Entry {
             state: init,
             phis: vec![false; init_len],
@@ -1587,7 +1588,8 @@ impl<'a> Lifter<'a> {
             let exit_all = exit;
             for s in succs {
                 let exit = succ_state.get(&s).unwrap_or(&exit_all).clone();
-                let single_pred = unit.nodes[s].preds.len() <= 1;
+                // The entry is also reached from the caller.
+                let single_pred = unit.nodes[s].preds.len() <= 1 && s != unit.entry;
                 let changed = match &mut entries[s] {
                     None => {
                         entries[s] = Some(Entry {
@@ -1682,6 +1684,28 @@ impl<'a> Lifter<'a> {
                 .collect();
             nd.term = remap_term(&nd.term, &map);
         }
+        /* Below its own values a helper finds what its caller pushed. The main unit starts
+        on an empty stack. A place past every argument the helper takes is only reached
+        where a loop leaves the stack uneven. */
+        let reaching = |entry: &Entry, stack: &[ExprId], args_used: usize| {
+            let (el, xl) = (entry.state.stack.len(), stack.len());
+            let mut assigns = Vec::new();
+            for (k, var) in entry.state.stack.iter().enumerate() {
+                let from_top = el - 1 - k;
+                let below = args_used + from_top.saturating_sub(xl);
+                let val = if from_top < xl {
+                    stack[xl - 1 - from_top]
+                } else if !self.root && below < max_args {
+                    expr::arg(below as u32)
+                } else {
+                    expr::intern(Node::Unknown(expr::next_seq()))
+                };
+                if entry.phis[k] && val != *var {
+                    assigns.push((*var, val));
+                }
+            }
+            assigns
+        };
         let mut edge_assigns: HashMap<(usize, usize), Vec<(ExprId, ExprId)>> = HashMap::new();
         for (i, ln) in lnodes.iter().enumerate() {
             let Some(ln) = ln else { continue };
@@ -1694,28 +1718,32 @@ impl<'a> Lifter<'a> {
                 let entry = entries[*s]
                     .as_ref()
                     .expect("a successor of a lifted node has an entry state");
-                let mut assigns = Vec::new();
-                let el = entry.state.stack.len();
-                let xl = exit.stack.len();
-                for (k, is_phi) in entry.phis.iter().enumerate() {
-                    if !*is_phi {
-                        continue;
-                    }
-                    let from_top = el - 1 - k;
-                    let var = entry.state.stack[k];
-                    let val = if from_top < xl {
-                        exit.stack[xl - 1 - from_top]
-                    } else {
-                        expr::intern(Node::Unknown(expr::next_seq()))
-                    };
-                    if val != var {
-                        assigns.push((var, val));
-                    }
-                }
+                let assigns = reaching(entry, &exit.stack, exit.args_used);
                 if !assigns.is_empty() {
                     edge_assigns.insert((from, to), assigns);
                 }
             }
+        }
+        /* A helper that starts on a loop is entered from its caller and from the end of the
+        loop. What it starts with is assigned on a node of its own, ahead of the loop. */
+        let first = map[&unit.entry];
+        let mut entry = first;
+        let start = entries[unit.entry]
+            .as_ref()
+            .map_or(Vec::new(), |e| reaching(e, &init_stack, init_args));
+        if !start.is_empty() {
+            entry = nodes.len();
+            nodes.push(LNode {
+                id: entry,
+                term: Term::Jump(first),
+                succs: vec![first],
+                stmts: Vec::new(),
+                preds: Vec::new(),
+                entry_stack: Vec::new(),
+                exit_stack: Vec::new(),
+                ..nodes[first]
+            });
+            edge_assigns.insert((entry, first), start);
         }
         loop {
             let mut used: HashSet<ExprId> = HashSet::new();
@@ -1780,7 +1808,7 @@ impl<'a> Lifter<'a> {
             .any(|nd| matches!(nd.term, Term::Unresolved(_) | Term::Switch { .. }));
         Lifted {
             nodes,
-            entry: map[&unit.entry],
+            entry,
             edge_assigns,
             n_args: max_args,
             reprocess_count,
@@ -3159,14 +3187,14 @@ fn merge_into(
     for k in 0..el {
         let from_top = el - 1 - k;
         let exit_val = if from_top < xl {
-            Some(exit.stack[xl - 1 - from_top])
+            exit.stack[xl - 1 - from_top]
         } else {
-            None
+            expr::arg((exit.args_used + from_top - xl) as u32)
         };
         if e.phis[k] {
             continue;
         }
-        if exit_val != Some(e.state.stack[k]) {
+        if exit_val != e.state.stack[k] {
             let var = *phi_ids
                 .entry((node, from_top))
                 .or_insert_with(|| merge_var(node, from_top));

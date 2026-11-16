@@ -2413,7 +2413,10 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
                 && nd.preds.len() == 1
                 && !l.edge_assigns.contains_key(&(p, nid))
         });
-        if !falls {
+        // The node made for a helper that starts on a loop would repeat the loop's label.
+        let made =
+            nd.preds.is_empty() && matches!(nd.term, Term::Jump(t) if l.nodes[t].pc == nd.pc);
+        if !falls && !made {
             needs_label.insert(nid);
         }
     }

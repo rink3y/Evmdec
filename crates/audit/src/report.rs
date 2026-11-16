@@ -201,9 +201,14 @@ fn caller_tests(run: &Run) -> String {
 fn step_text(ex: &Explorer, step: &Step) -> String {
     match step {
         Step::Wait { until } => format!("time passes until {}", until.to_decimal()),
-        Step::Told { to, selector, len } => format!(
-            "the contract at {} is taken to answer {selector:#010x} with {len} bytes",
-            to.to_hex()
+        Step::Told {
+            to,
+            selector,
+            answer,
+        } => format!(
+            "the contract at {} is taken to answer {selector:#010x} with {} bytes",
+            to.to_hex(),
+            answer.len()
         ),
         Step::Call { entry, msg } => {
             let e = &ex.entries[*entry];

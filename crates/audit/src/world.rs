@@ -1015,9 +1015,12 @@ impl World {
         if built_in(to) {
             let answer = match to.low_u64() {
                 1 => {
+                    /* A signature nobody made recovers to some address nobody holds, a
+                    different one for each thing signed, as it does on chain. */
                     let digest = word(&record.input, 0);
-                    let signer = self.signed.get(&digest).copied().unwrap_or(NO_ONE);
-                    one_word(signer)
+                    let nobody =
+                        low_address(U256::from_be_bytes(&keccak256(&record.input))) | NO_ONE;
+                    one_word(self.signed.get(&digest).copied().unwrap_or(nobody))
                 }
                 4 => record.input.clone(),
                 // The other built-in contracts are not run. A digest of the input stands for theirs.

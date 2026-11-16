@@ -1,4 +1,4 @@
-use crate::trace::{Event, Place, Run, CALLER, DATA, MATH, ORIGIN, STORE, VALUE};
+use crate::trace::{Event, Place, Run, Tag, BAL, CALLER, DATA, MATH, ORIGIN, OUT, STORE, VALUE};
 use crate::world::{Addr, Msg, ALLY, OWNER};
 use evmdec::opcode as op;
 use evmdec::U256;
@@ -18,9 +18,12 @@ pub struct PlaceFacts {
     pub keyed_by_account: bool,
     pub identity: bool,
     pub gate: bool,
-    pub arithmetic: bool,
-    pub moved_with_value: bool,
-    pub transfers: bool,
+    // An account's entry rose in a call in which that account paid the contract.
+    pub rose_on_payment: bool,
+    // An account's entry fell in a call in which the contract paid that account.
+    pub fell_on_payout: bool,
+    // One entry fell and another rose by the same amount in one call.
+    pub conserved: bool,
     pub target: bool,
     pub assumed: bool,
 }
@@ -28,7 +31,7 @@ pub struct PlaceFacts {
 impl PlaceFacts {
     #[must_use]
     pub fn ledger(&self) -> bool {
-        self.keyed_by_account && self.arithmetic && (self.moved_with_value || self.transfers)
+        self.keyed_by_account && (self.rose_on_payment || self.fell_on_payout || self.conserved)
     }
 }
 
@@ -136,20 +139,44 @@ impl Facts {
         if !run.ok {
             return;
         }
-        let mut movers: Vec<Addr> = Vec::new();
+        let mut payers: Vec<(Addr, Tag)> = Vec::new();
+        let mut payees: Vec<(Addr, Tag)> = Vec::new();
         if !msg.value.is_zero() {
             facts.takes_in = true;
-            movers.push(who);
+            payers.push((who, Tag::of(VALUE)));
         }
         for event in &run.events {
-            if let Event::Pay { from, to, .. } = event {
+            if let Event::Pay {
+                from,
+                to,
+                amount,
+                amount_tag,
+                ..
+            } = event
+            {
                 facts.pays_out |= *from == subject;
                 facts.takes_in |= *to == subject;
-                movers.extend([*from, *to]);
+                if *to == subject && !amount.is_zero() {
+                    payers.push((*from, *amount_tag));
+                }
+                if *from == subject && !amount.is_zero() {
+                    payees.push((*to, *amount_tag));
+                }
             }
         }
-        let mut moved: BTreeMap<Place, (bool, bool)> = BTreeMap::new();
-        for (cell, old, new, tag, _) in run.stores() {
+        let mut moved: BTreeMap<Place, (Vec<U256>, Vec<U256>)> = BTreeMap::new();
+        for event in &run.events {
+            let Event::Store {
+                cell: index,
+                old,
+                new,
+                tag,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let cell = &run.cells[*index];
             if cell.account != subject {
                 continue;
             }
@@ -160,16 +187,30 @@ impl Facts {
                 place.open_writers.insert(entry);
             }
             facts.writes.insert(cell.place());
-            place.arithmetic |= tag.has(MATH) && tag.has(STORE);
-            let holder = |a: &Addr| *a != subject && cell.keyed_by(*a);
-            place.moved_with_value |= movers.iter().any(holder);
+            /* The entry and the payment have to be about the same amount. An entry that
+            changes in a call that also happens to carry ether is not a record of it. */
+            let this = u16::try_from(index + 1).unwrap_or(u16::MAX);
+            let about = |paid: &Tag| {
+                tag.words & paid.words != 0
+                    || (tag.has(VALUE) && paid.has(VALUE))
+                    || paid.cell == this
+                    || tag.has(OUT | BAL)
+            };
+            let of_holder =
+                |(a, paid): &(Addr, Tag)| *a != subject && cell.keyed_by(*a) && about(paid);
+            place.rose_on_payment |= new > old && payers.iter().any(of_holder);
+            place.fell_on_payout |= new < old && payees.iter().any(of_holder);
             let seen = moved.entry(cell.place()).or_default();
-            seen.0 |= new < old;
-            seen.1 |= new > old;
+            if new < old {
+                seen.0.push(*old - *new);
+            }
+            if new > old {
+                seen.1.push(*new - *old);
+            }
         }
         for (place, (down, up)) in moved {
             let facts = self.places.entry(place).or_default();
-            facts.transfers |= down && up && place.depth > 0;
+            facts.conserved |= place.depth > 0 && down.iter().any(|d| up.contains(d));
         }
     }
 

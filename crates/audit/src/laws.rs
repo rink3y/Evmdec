@@ -160,7 +160,9 @@ pub fn check(base: &World, before: &World, after: &World, run: &Run, facts: &Fac
         }
         if place.is_some_and(|p| p.identity) {
             let (was, now) = (low_address(old), low_address(new));
-            let held_by_other = !was.is_zero() && !Facts::same_party(was, ACTOR);
+            // An entry kept for the account itself is its own to set.
+            let own_entry = cell.keys.iter().any(|k| Facts::same_party(k.value, ACTOR));
+            let held_by_other = (was == OWNER || was == USER) && !own_entry;
             // A place that is bought, such as the highest bid, changes hands by design.
             let free = kinds
                 .iter()

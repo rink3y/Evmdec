@@ -79,22 +79,29 @@ fn what_an_owner_only_door_pays_out_is_held_and_an_open_door_beside_it_is_found(
     assert_eq!(report.findings[0].selector.as_deref(), Some("0x45941ee0"));
 }
 
-#[test]
-fn a_contract_read_from_a_chain_is_run_on_what_the_chain_holds_and_not_on_a_guess() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/source/Vault.hex");
+const DEPLOYED_AT: &str = "0x3333333333333333333333333333333333333333";
+
+fn report_on_chain(name: &str, chain: audit::chain::Table) -> audit::Report {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/source")
+        .join(name);
     let hex = std::fs::read_to_string(path).expect("fixture");
     let code = evmdec::hex::decode(hex.trim()).expect("hex");
     let mut contract = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
-    let at = "0x3333333333333333333333333333333333333333";
-    contract.address = Some(at.to_string());
+    contract.address = Some(DEPLOYED_AT.to_string());
+    audit::audit_read(&contract, Rc::new(chain), 100, 1_700_000_000)
+}
+
+#[test]
+fn a_contract_read_from_a_chain_is_run_on_what_the_chain_holds_and_not_on_a_guess() {
     let (vault, deployer) = (
-        U256::from_hex_str(at).expect("address"),
+        U256::from_hex_str(DEPLOYED_AT).expect("address"),
         U256::from_hex_str("0x4444444444444444444444444444444444444444").expect("address"),
     );
     let mut chain = audit::chain::Table::default();
     chain.storage.insert((vault, U256::ZERO), deployer);
     chain.ether.insert(vault, U256::from_u64(5));
-    let report = audit::audit_read(&contract, Rc::new(chain), 100, 1_700_000_000);
+    let report = report_on_chain("Vault.hex", chain);
     let at = |kind: Kind| report.findings.iter().find(|f| f.kind == kind);
     // The deployer the chain names is the owner an open setOwner(address) replaces.
     assert!(at(Kind::Takeover).is_some(), "{:?}", report.findings);
@@ -106,4 +113,23 @@ fn a_contract_read_from_a_chain_is_run_on_what_the_chain_holds_and_not_on_a_gues
     let sweep = at(Kind::Gain).expect("the open sweep");
     assert_eq!(sweep.steps.len(), 1, "{:?}", sweep.steps);
     assert!(!report.assumed.iter().any(|a| a.contains("ledger at slot")));
+}
+
+#[test]
+fn interest_paid_at_the_rate_the_chain_holds_is_not_a_gain() {
+    let savings = U256::from_hex_str(DEPLOYED_AT).expect("address");
+    let mut chain = audit::chain::Table::default();
+    // ratePerDay. A guessed world leaves it at zero and close() pays back what was paid in.
+    chain
+        .storage
+        .insert((savings, U256::ZERO), U256::from_u64(10));
+    chain.ether.insert(savings, U256::from_u64(1) << 80);
+    let report = report_on_chain("Savings.hex", chain);
+    let close = report
+        .functions
+        .iter()
+        .find(|f| f.selector.as_deref() == Some("0x43d726d6"));
+    let ended = &close.expect("close()").ends_for;
+    assert!(ended.contains(&"an account with no role"), "{ended:?}");
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
 }

@@ -221,8 +221,17 @@ evmdec audit my.hex            # runtime bytecode
 evmdec audit My.sol            # source, compiled with the compiler its pragma asks for
 evmdec audit input.json        # solc standard JSON
 evmdec audit my.hex --json
+evmdec audit 0x... --chain bsc --block 22280853   # a deployed contract, on the state it had at that block
 evmdec decompile 0x... --report
 ```
+
+Given an address, the world is not guessed. The contract's storage, and the code, storage and
+ether of every account its calls reach, are read from the chain at one block as the run asks
+for them, at most 4,000 reads in 240 seconds, and the report says when a read got no answer.
+The owner stands in for the account the code compares its caller with. The owner, a user and
+the account with no role are given a purse of each token the calls move, written into the
+token's own balance cells where those can be found, and the report lists each. A block other
+than the newest needs a node that keeps old state.
 
 From source the compiler is downloaded for the pragma, the same runtime code is analysed as
 from bytecode, and each finding carries the file and line from the source map. The two inputs
@@ -440,6 +449,7 @@ remote nodes in at most 240 seconds, and code over 1 MiB is refused.
 | variable | effect |
 |---|---|
 | `EVMDEC_RPC_URL` | comma-separated JSON-RPC endpoints, used in place of the public list. The chain asked for has to be the chain they serve; a request for another chain is refused |
+| `EVMDEC_STATE_CACHE` | directory that keeps what `audit` reads at a fixed block, by chain, block and account. A second run of the same block reads it from there and asks no node |
 | `EVMDEC_SIGS` | path of the signature index; empty disables it. Default search: `./sigs.idx`, next to the binary, `/var/lib/evmdec/sigs.idx`, `~/.evmdec/sigs.idx` |
 | `EVMDEC_TIMING` | print the time spent in each stage |
 | `EVMDEC_AUDIT_TRACE` | `1` prints one line per run the analyzer tries, `2` adds every comparison, store and outside call |

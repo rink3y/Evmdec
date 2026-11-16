@@ -1947,6 +1947,45 @@ impl<'a> Explorer<'a> {
         })
     }
 
+    /* Real state has real rates in it, and two kinds of payment show there that no
+    guessed world ever made. An account that put its own value in and is paid more
+    once the clock has moved is paid interest. An account paid in a call that also
+    raises what the contract records for people unknown here is paid for work done for
+    them, as a keeper is. Neither is taken from anyone. */
+    fn earned(&self, from: usize, t: &Try, before: &World, run: &Run) -> bool {
+        if !self.on_chain {
+            return false;
+        }
+        let base = &self.states[0].world;
+        let held = |world: &World, asset: Option<Addr>| {
+            let of = |who: Addr| match asset {
+                Some(asset) => world.asset_of(asset, who),
+                None => world.ether_of(who),
+            };
+            of(ACTOR).wrapping_add(of(ALLY))
+        };
+        let mut kinds: Vec<Option<Addr>> = vec![None];
+        kinds.extend(before.assets().into_iter().map(Some));
+        let paid_in = kinds.iter().any(|k| held(before, *k) < held(base, *k));
+        let mut acted = false;
+        let mut waited = t.time.is_some_and(|time| time > before.time);
+        for step in &self.states[from].steps {
+            match step {
+                Step::Call { msg, .. } => acted |= Facts::same_party(msg.from, ACTOR),
+                Step::Wait { .. } => waited |= acted,
+                _ => {}
+            }
+        }
+        let unknown = |k: &crate::trace::Key| {
+            let account = (97..=160).contains(&k.value.bits()) && !self.known.contains(&k.value);
+            account && !before.runs_code(k.value)
+        };
+        let serves = run.stores().any(|(cell, old, new, _, _)| {
+            cell.account == self.subject && new > old && cell.keys.iter().any(unknown)
+        });
+        (paid_in && waited) || serves
+    }
+
     fn attack(&mut self) {
         let mut frontier: Vec<usize> = (0..self.states.len()).collect();
         for _ in 0..ACTOR_DEPTH {
@@ -1977,7 +2016,9 @@ impl<'a> Explorer<'a> {
                             plain.retain(|b| {
                                 b.kind != Kind::Debit || self.withheld(&before, &world, b)
                             });
-                            let stray = self.states[from].stray;
+                            let gains = plain.iter().any(|b| b.kind == Kind::Gain);
+                            let stray = self.states[from].stray
+                                || (gains && self.earned(from, &t, &before, &run));
                             let shown = plain.iter().filter(|b| b.kind != Kind::Gain || !stray);
                             let shown: Vec<Breach> = shown.cloned().collect();
                             let steps = self.history(from, entry, &t.msg);

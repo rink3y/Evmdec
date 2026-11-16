@@ -923,3 +923,16 @@ fn both_ways_into_a_join_keep_their_own_call_after_it() {
         "the pool is asked for the other token whichever one was paid: {after}"
     );
 }
+
+#[test]
+fn a_selector_compared_in_place_is_read_from_the_high_bytes() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/regress/transparent_proxy.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+    let proxy = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
+    assert!(
+        proxy.contains("require(msg.sig == 0x4f1ef286 /* upgradeToAndCall(address,bytes) */"),
+        "the admin may only call the upgrade: {proxy}"
+    );
+    assert!(!proxy.contains("msg.sig == 0x00000000"));
+}

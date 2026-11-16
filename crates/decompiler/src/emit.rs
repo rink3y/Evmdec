@@ -1694,6 +1694,10 @@ fn bool_against_const(a: ExprId, b: ExprId, n: &Names) -> Option<(ExprId, bool)>
 fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
     if is_selector_expr(lhs) {
         if let Some(c) = expr::as_const(rhs) {
+            // Masked where the call data holds it, a selector is the constant's high four bytes.
+            let in_place =
+                matches!(expr::node(lhs), Node::Op(op::AND, v) if !is_selector_expr(v[0]));
+            let c = if in_place { c >> 224 } else { c };
             let sel = c.low_u64() as u32;
             let s = c.to_hex_padded(4).to_string();
             return match sigs::function(sel) {

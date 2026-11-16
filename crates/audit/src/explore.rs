@@ -694,7 +694,9 @@ impl<'a> Explorer<'a> {
                 }
             }
             // The caller has to be a contract. Where it named itself it names its contract.
-            if tag.has(CALLER) && t.msg.from == ACTOR {
+            let spot = laid.about(tag, U256::MAX);
+            let own = tag.has(CALLER) || spot.is_some_and(|spot| laid.held(spot) == ACTOR);
+            if own && t.msg.from == ACTOR {
                 let renamed = t.reshaped(&|shape| {
                     shape.each_word(&mut |_, held| {
                         if *held == ACTOR {

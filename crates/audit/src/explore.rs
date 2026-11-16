@@ -1,7 +1,7 @@
 use crate::budget;
 use crate::laws::{self, Breach, Kind};
 use crate::model::Facts;
-use crate::trace::{Answered, Event, Run, Tag, CALLER, CLOCK, DATA, MATH, SIZE, STORE, VALUE};
+use crate::trace::{Answered, Event, Run, Tag, CALLER, CLOCK, DATA, MATH, OUT, SIZE, STORE, VALUE};
 use crate::world::{self, Addr, Msg, World, ACTOR, ALLY, OWNER, SUBJECT, USER};
 use evmdec::abi;
 use evmdec::decompile::Contract;
@@ -11,6 +11,8 @@ use evmdec::U256;
 use std::collections::HashSet;
 
 pub const UNIT: U256 = U256([1_000_000_000_000_000_000, 0, 0, 0]);
+// What an account is taken to hold in a ledger the contract keeps: a thousand units.
+const STAKE: U256 = U256([0x35c9_adc5_dea0_0000, 0x36, 0, 0]);
 
 const MAX_ENTRIES: usize = 80;
 const MAX_STATES: usize = 96;
@@ -57,6 +59,8 @@ pub enum Step {
         selector: u32,
         answer: Vec<u8>,
     },
+    // The contract holds ether and assets that were sent to it.
+    Funded,
 }
 
 #[derive(Clone)]
@@ -64,6 +68,8 @@ pub struct State {
     pub world: World,
     pub steps: Vec<Step>,
     pub acted: usize,
+    // What the account with no role has given up of its own recorded claims so far.
+    pub spent: U256,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +79,8 @@ pub struct Violation {
     pub steps: Vec<Step>,
     pub run: Run,
     pub via_hook: bool,
+    // The last call was a user's own, made after the account had acted.
+    pub by_user: bool,
 }
 
 // One call to make, with what the world is taken to be when it is made.
@@ -106,6 +114,8 @@ pub struct Explorer<'a> {
     edges: HashSet<u32>,
     outside: Vec<Addr>,
     known: Vec<Addr>,
+    staked: HashSet<crate::trace::Place>,
+    unspendable: HashSet<(crate::trace::Place, usize)>,
 }
 
 fn outside(n: usize) -> Addr {
@@ -245,6 +255,7 @@ impl<'a> Explorer<'a> {
             world,
             steps: Vec::new(),
             acted: 0,
+            spent: U256::ZERO,
         };
         Explorer {
             c,
@@ -259,6 +270,8 @@ impl<'a> Explorer<'a> {
             edges: HashSet::new(),
             outside: Vec::new(),
             known: vec![OWNER, USER, ACTOR, ALLY, subject],
+            staked: HashSet::new(),
+            unspendable: HashSet::new(),
         }
     }
 
@@ -303,10 +316,15 @@ impl<'a> Explorer<'a> {
     fn honest(&self, entry: usize, who: Addr) -> Vec<Msg> {
         let plain = self.seed(entry, who, who, UNIT, U256::ZERO);
         // A function that takes ether is first used the way it is meant to be, with some.
-        match self.entries[entry].payable {
+        let mut seeds = match self.entries[entry].payable {
             true => vec![self.seed(entry, who, who, UNIT, UNIT), plain],
             false => vec![plain],
+        };
+        // What an owner registers under an address is as often a contract as itself.
+        if who == OWNER && self.entries[entry].words.contains(&Word::Address) {
+            seeds.push(self.seed(entry, who, outside(0), UNIT, U256::ZERO));
         }
+        seeds
     }
 
     // What an account with no role tries: itself everywhere, then another account in each place.
@@ -351,8 +369,35 @@ impl<'a> Explorer<'a> {
             world.number = world.number + U256::from_u64(blocks);
             world.time = time;
         }
+        let honest = t.msg.from == OWNER || t.msg.from == USER;
+        let held_before: Vec<(Option<Addr>, U256)> = match honest {
+            true => {
+                let mut kinds = vec![(None, world.ether_of(self.subject))];
+                let assets = world.assets().into_iter();
+                kinds.extend(assets.map(|a| (Some(a), world.asset_of(a, self.subject))));
+                kinds
+            }
+            false => Vec::new(),
+        };
         let run = world.send(&t.msg);
         self.runs += 1;
+        if run.ok && honest {
+            let mut kinds: Vec<Option<Addr>> = vec![None];
+            kinds.extend(world.assets().into_iter().map(Some));
+            for kind in kinds {
+                let was = held_before
+                    .iter()
+                    .find(|(k, _)| *k == kind)
+                    .map_or(U256::ZERO, |(_, v)| *v);
+                let now = match kind {
+                    Some(asset) => world.asset_of(asset, self.subject),
+                    None => world.ether_of(self.subject),
+                };
+                if now > was {
+                    self.facts.keeps.insert(kind);
+                }
+            }
+        }
         if self.trace {
             let from = t.msg.from.to_hex();
             let data = evmdec::hex::encode(&t.msg.data[..t.msg.data.len().min(100)]);
@@ -412,8 +457,49 @@ impl<'a> Explorer<'a> {
             }
         };
         for call in &run.calls {
-            let unanswered =
-                call.by == Answered::Blank && (call.to.is_zero() || self.known.contains(&call.to));
+            /* The contract passes on a call for its caller: the address called and the
+            bytes sent both come from the call data. What such a call can do is what the
+            contract itself may do, so it is tried with the two messages that move an asset. */
+            let passed_on =
+                call.kind == op::CALL && call.to_tag.has(DATA) && call.input_from.has(DATA);
+            let places = (
+                call.to_tag.word(),
+                call.input_from.word().filter(|w| *w >= 1),
+            );
+            if let (true, (Some(target), Some(at))) = (passed_on, places) {
+                let moves = [
+                    world::transfer_from_call(USER, ALLY, UNIT),
+                    world::transfer_call(ALLY, UNIT),
+                ];
+                for payload in moves {
+                    let mut next = t.clone();
+                    set_word(&mut next.msg.data, target, outside(0));
+                    set_word(&mut next.msg.data, at - 1, U256::from(payload.len()));
+                    let start = 4 + 32 * at;
+                    let end = start + payload.len().div_ceil(32) * 32;
+                    if next.msg.data.len() < end {
+                        next.msg.data.resize(end, 0);
+                    }
+                    next.msg.data[start..start + payload.len()].copy_from_slice(&payload);
+                    push(&mut out, next);
+                }
+            }
+            // An answer the contract goes on to call has to be the address of a contract.
+            let asked = call.to_tag.call().filter(|_| call.to_tag.has(OUT));
+            let source = asked.and_then(|k| run.calls.get(k));
+            if let Some(source) =
+                source.filter(|s| matches!(s.by, Answered::Blank | Answered::Taken))
+            {
+                if let Some(selector) = world::selector(&source.input) {
+                    let mut next = t.clone();
+                    next.answers
+                        .push((source.to, selector, outside(0).to_be_bytes().to_vec()));
+                    push(&mut out, next);
+                }
+            }
+            let unanswered = !call.input.is_empty()
+                && call.by == Answered::Blank
+                && (call.to.is_zero() || self.known.contains(&call.to));
             if let Some(word) = call
                 .to_tag
                 .word()
@@ -554,10 +640,12 @@ impl<'a> Explorer<'a> {
             entry,
             msg: t.msg.clone(),
         });
+        let spent = parent.spent;
         self.states.push(State {
             world,
             steps,
             acted: parent.acted + usize::from(actor),
+            spent,
         });
         self.states.len() - 1
     }
@@ -569,6 +657,11 @@ impl<'a> Explorer<'a> {
         for _ in 0..4 {
             let mut changed = false;
             for entry in 0..self.entries.len() {
+                for who in [OWNER, USER, ACTOR] {
+                    let plain = Try::of(self.seed(entry, who, who, UNIT, U256::ZERO));
+                    let (_, run) = self.attempt(0, entry, &plain);
+                    changed |= self.assume_stake(&plain, &run, entry, who);
+                }
                 for seed in self.honest(entry, OWNER) {
                     if budget::spent() {
                         return;
@@ -620,6 +713,64 @@ impl<'a> Explorer<'a> {
             }
         }
         false
+    }
+
+    /* A ledger in use has holders. Where a call is refused because the caller's own
+    entry does not cover the amount asked for, the caller is taken to hold a stake
+    there. All three accounts get one, so none starts ahead of the others. */
+    fn assume_stake(&mut self, t: &Try, run: &Run, entry: usize, who: Addr) -> bool {
+        let subject = self.subject;
+        let mut slots: Vec<(U256, crate::trace::Place)> = Vec::new();
+        for event in &run.events {
+            let Event::Cmp {
+                op: o,
+                a,
+                b,
+                ta,
+                tb,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if !matches!(*o, op::LT | op::GT | op::SLT | op::SGT) {
+                continue;
+            }
+            for (tag, value, other) in [(ta, a, tb), (tb, b, ta)] {
+                let own = tag.has(STORE) && !tag.has(DATA | VALUE);
+                let cell = run.cell_of(*tag).filter(|c| c.account == subject);
+                let (true, true, Some(cell)) =
+                    (own && value.is_zero(), other.has(DATA | VALUE), cell)
+                else {
+                    continue;
+                };
+                let by_caller = cell
+                    .keys
+                    .iter()
+                    .any(|k| k.tag.only(CALLER) && k.value == who);
+                if by_caller && self.states[0].world.stored(subject, cell.slot).is_zero() {
+                    slots.push((cell.slot, cell.place()));
+                }
+            }
+        }
+        let mut changed = false;
+        for (slot, place) in slots {
+            let mut world = self.states[0].world.clone();
+            world.seed(subject, slot, STAKE);
+            let (_, next) = self.attempt_in(world, entry, t);
+            if !better(&next, run) {
+                continue;
+            }
+            self.states[0].world.seed(subject, slot, STAKE);
+            if self.staked.insert(place) {
+                self.assumed.push(format!(
+                    "each account holds a thousand units in the ledger at slot {}, since a call is refused when the caller's entry there does not cover the amount",
+                    place.root.to_hex()
+                ));
+            }
+            changed = true;
+        }
+        changed
     }
 
     fn assume_targets(&mut self, run: &Run) -> bool {
@@ -790,14 +941,21 @@ impl<'a> Explorer<'a> {
                     if self.entries[entry].view {
                         continue;
                     }
+                    let mut kept = false;
                     for seed in self.honest(entry, who) {
                         if budget::spent() || self.states.len() >= MAX_STATES / 2 {
                             return;
                         }
                         let (t, world, run) = self.solve(from, entry, Try::of(seed));
-                        if run.ok && self.novel(&run) {
+                        // The owner's second way of filling in an address leads somewhere else
+                        // even where it runs the same code.
+                        let other_way = who == OWNER && kept && run.stores().next().is_some();
+                        if run.ok && (self.novel(&run) || other_way) {
                             next.push(self.keep(from, entry, &t, world, false));
-                            break;
+                            if who != OWNER {
+                                break;
+                            }
+                            kept = true;
                         }
                     }
                 }
@@ -810,43 +968,39 @@ impl<'a> Explorer<'a> {
         &mut self,
         breaches: Vec<Breach>,
         entry: usize,
-        steps: Vec<Step>,
+        steps: &[Step],
         run: &Run,
-        via_hook: bool,
+        how: (bool, bool),
     ) {
+        let (via_hook, by_user) = how;
         for breach in breaches {
             let about_value = matches!(
                 breach.kind,
                 Kind::Gain | Kind::Loss | Kind::Credit | Kind::Debit
             );
-            if about_value && !self.survives(&breach, &steps, run) {
+            if about_value && !self.survives(&breach, steps, run) {
                 continue;
             }
             let place = breach.cell.as_ref().map(crate::trace::Cell::place);
+            let (kind, asset) = (breach.kind, breach.asset);
             let same = |v: &Violation| {
-                v.breach.kind == breach.kind
+                v.breach.kind == kind
                     && v.entry == entry
-                    && v.breach.asset == breach.asset
+                    && v.breach.asset == asset
                     && v.breach.cell.as_ref().map(crate::trace::Cell::place) == place
+            };
+            let fresh = Violation {
+                breach,
+                entry,
+                steps: steps.to_vec(),
+                run: run.clone(),
+                via_hook,
+                by_user,
             };
             match self.found.iter_mut().find(|v| same(v)) {
                 Some(known) if known.steps.len() <= steps.len() => {}
-                Some(known) => {
-                    *known = Violation {
-                        breach,
-                        entry,
-                        steps: steps.clone(),
-                        run: run.clone(),
-                        via_hook,
-                    };
-                }
-                None => self.found.push(Violation {
-                    breach,
-                    entry,
-                    steps: steps.clone(),
-                    run: run.clone(),
-                    via_hook,
-                }),
+                Some(known) => *known = fresh,
+                None => self.found.push(fresh),
             }
         }
     }
@@ -857,20 +1011,15 @@ impl<'a> Explorer<'a> {
     slots holding a plain amount, and a finding has to show then too. */
     fn survives(&mut self, breach: &Breach, steps: &[Step], run: &Run) -> bool {
         let subject = self.subject;
-        let unset: Vec<(usize, U256)> = run
-            .events
-            .iter()
-            .filter_map(|e| match e {
-                Event::Load { cell, value } if value.is_zero() => Some(*cell),
-                _ => None,
-            })
+        let zero_loads = run.events.iter().filter_map(|e| match e {
+            Event::Load { cell, value } if value.is_zero() => Some(*cell),
+            _ => None,
+        });
+        let unset: Vec<(usize, U256)> = zero_loads
             .filter(|i| {
                 let cell = &run.cells[*i];
-                let open = self
-                    .facts
-                    .places
-                    .get(&cell.place())
-                    .is_some_and(|p| !p.open_writers.is_empty());
+                let place = self.facts.places.get(&cell.place());
+                let open = place.is_some_and(|p| !p.open_writers.is_empty());
                 cell.account == subject && cell.keys.is_empty() && !open
             })
             .map(|i| (i, run.cells[i].slot))
@@ -898,12 +1047,13 @@ impl<'a> Explorer<'a> {
         for slot in doubtful {
             world.seed(subject, slot, UNIT);
         }
-        let base = world.clone();
         let Some((Step::Call { msg, .. }, earlier)) =
             steps.get(prefix..).and_then(|s| s.split_last())
         else {
             return true;
         };
+        let mut base = world.clone();
+        let mut spent = U256::ZERO;
         for step in earlier {
             match step {
                 Step::Wait { until } => world.time = *until,
@@ -912,10 +1062,20 @@ impl<'a> Explorer<'a> {
                     selector,
                     answer,
                 } => world.answer_with(*to, *selector, answer.clone()),
+                Step::Funded => {
+                    for kind in self.facts.keeps.clone() {
+                        world.enrich(subject, kind);
+                    }
+                    base = world.clone();
+                }
                 Step::Call { msg, .. } => {
                     self.runs += 1;
-                    if !world.send(msg).ok {
+                    let made = world.send(msg);
+                    if !made.ok {
                         return false;
+                    }
+                    if Facts::same_party(msg.from, ACTOR) {
+                        spent = spent.wrapping_add(laws::claims_lowered(&made, subject));
                     }
                 }
             }
@@ -923,57 +1083,120 @@ impl<'a> Explorer<'a> {
         let before = world.clone();
         self.runs += 1;
         let again = world.send(msg);
-        let found = laws::check(&base, &before, &world, &again, &self.facts);
+        let found = laws::check(&base, &before, &world, &again, &self.facts, spent);
         again.ok && found.iter().any(|b| b.kind == breach.kind)
     }
 
-    /* A record that rose is worth something only if it can be used. The account tries
-    to pass what it was credited to another account, or to be paid for it. A slot that
-    packs a flag beside an amount rises when the flag is set, and nothing can be done
-    with that. */
-    fn spendable(&mut self, after: &World, breach: &Breach) -> bool {
+    /* A record that rose is worth something only if more can now be done with it. The
+    account tries to pass on, or be paid, all that the record now holds. That has to
+    work after the call and not before it. A slot that packs a flag beside an amount
+    rises when the flag is set, and no more can be spent for that. */
+    fn spendable(
+        &mut self,
+        before: &World,
+        after: &World,
+        breach: &Breach,
+        made_by: usize,
+    ) -> bool {
         let Some(place) = breach.cell.as_ref().map(crate::trace::Cell::place) else {
             return false;
+        };
+        if self.unspendable.contains(&(place, made_by)) {
+            return false;
+        }
+        let spends = |world: &World, run: &Run, from: &World| {
+            let in_place = |c: &crate::trace::Cell| c.place() == place;
+            let passed = run.stores().any(|(c, old, new, _, _)| {
+                in_place(c) && c.keyed_by(USER) && !c.keyed_by(ACTOR) && new > old
+            });
+            let lowered = run
+                .stores()
+                .any(|(c, old, new, _, _)| in_place(c) && c.keyed_by(ACTOR) && new < old);
+            let assets = world.assets();
+            let paid = world.ether_of(ACTOR) > from.ether_of(ACTOR)
+                || assets
+                    .iter()
+                    .any(|a| world.asset_of(*a, ACTOR) > from.asset_of(*a, ACTOR));
+            run.ok && lowered && (passed || paid)
         };
         self.states.push(State {
             world: after.clone(),
             steps: Vec::new(),
             acted: 0,
+            spent: U256::ZERO,
         });
         let at = self.states.len() - 1;
         let mut spent = false;
-        'entries: for entry in 0..self.entries.len() {
-            if self.entries[entry].view {
+        for entry in 0..self.entries.len() {
+            if self.entries[entry].view || budget::spent() {
                 continue;
             }
-            for amount in [breach.amount, UNIT, U256::ONE] {
-                if budget::spent() {
-                    break 'entries;
-                }
-                let seed = self.seed(entry, ACTOR, USER, amount, U256::ZERO);
-                let (_, world, run) = self.solve(at, entry, Try::of(seed));
-                if !run.ok {
-                    continue;
-                }
-                let passed = run.stores().any(|(c, old, new, _, _)| {
-                    c.place() == place && c.keyed_by(USER) && !c.keyed_by(ACTOR) && new > old
-                });
-                let lowered = run.stores().any(|(c, old, new, _, _)| {
-                    c.place() == place && c.keyed_by(ACTOR) && new < old
-                });
-                let paid = world.ether_of(ACTOR) > after.ether_of(ACTOR)
-                    || world
-                        .assets()
-                        .iter()
-                        .any(|a| world.asset_of(*a, ACTOR) > after.asset_of(*a, ACTOR));
-                if lowered && (passed || paid) {
-                    spent = true;
-                    break 'entries;
-                }
+            let seed = self.seed(entry, ACTOR, USER, breach.total, U256::ZERO);
+            let (t, world, run) = self.solve(at, entry, Try::of(seed));
+            let whole = breach.total.to_be_bytes();
+            let asks_all = t.msg.data.len() >= 36 && t.msg.data[4..].chunks(32).any(|w| w == whole);
+            if !asks_all || !spends(&world, &run, after) {
+                continue;
+            }
+            let (earlier, could) = self.attempt_in(before.clone(), entry, &t);
+            if !spends(&earlier, &could, before) {
+                spent = true;
+                break;
             }
         }
         self.states.truncate(at);
+        if !spent {
+            self.unspendable.insert((place, made_by));
+        }
         spent
+    }
+
+    /* The mirror of the test above. An account whose record fell has lost something only
+    if it can now do less: what it could pass on before the call, it no longer can. */
+    fn withheld(&mut self, before: &World, after: &World, breach: &Breach) -> bool {
+        let (Some(place), Some(victim)) = (
+            breach.cell.as_ref().map(crate::trace::Cell::place),
+            breach.victim,
+        ) else {
+            return false;
+        };
+        let spends = |run: &Run| {
+            let lowered = run
+                .stores()
+                .any(|(c, old, new, _, _)| c.place() == place && c.keyed_by(victim) && new < old);
+            run.ok && lowered
+        };
+        self.states.push(State {
+            world: before.clone(),
+            steps: Vec::new(),
+            acted: 0,
+            spent: U256::ZERO,
+        });
+        let at = self.states.len() - 1;
+        let mut lost = false;
+        for entry in 0..self.entries.len() {
+            if self.entries[entry].view || budget::spent() {
+                continue;
+            }
+            for amount in [breach.total, STAKE] {
+                let other = if victim == OWNER { USER } else { OWNER };
+                let seed = self.seed(entry, victim, other, amount, U256::ZERO);
+                let (t, _, run) = self.solve(at, entry, Try::of(seed));
+                let whole = amount.to_be_bytes();
+                let asks_all =
+                    t.msg.data.len() >= 36 && t.msg.data[4..].chunks(32).any(|w| w == whole);
+                if !asks_all || !spends(&run) {
+                    continue;
+                }
+                let (_, now) = self.attempt_in(after.clone(), entry, &t);
+                lost |= !spends(&now);
+            }
+            if lost {
+                break;
+            }
+        }
+        self.states.truncate(at);
+        lost
     }
 
     fn history(&self, from: usize, entry: usize, msg: &Msg) -> Vec<Step> {
@@ -992,18 +1215,12 @@ impl<'a> Explorer<'a> {
         let filled: Vec<U256> = run
             .stores()
             .filter(|(cell, old, new, _, _)| {
-                let identity = self
-                    .facts
-                    .places
-                    .get(&cell.place())
-                    .is_some_and(|p| p.identity);
+                let place = self.facts.places.get(&cell.place());
+                let identity = place.is_some_and(|p| p.identity);
                 // An entry under a key the caller supplies is the caller's own to fill.
                 let plain = cell.keys.iter().all(|k| k.tag.is_none());
-                cell.account == self.subject
-                    && identity
-                    && plain
-                    && low_address(*old).is_zero()
-                    && !new.is_zero()
+                let empty = low_address(*old).is_zero() && !new.is_zero();
+                cell.account == self.subject && identity && plain && empty
             })
             .map(|(cell, ..)| cell.slot)
             .collect();
@@ -1018,13 +1235,14 @@ impl<'a> Explorer<'a> {
                 continue;
             }
             let base = self.states[0].world.clone();
-            let breaches = laws::check(&base, &before, &after, &again, &self.facts);
+            let spent = self.states[from].spent;
+            let breaches = laws::check(&base, &before, &after, &again, &self.facts, spent);
             let takeovers: Vec<Breach> = breaches
                 .into_iter()
                 .filter(|b| matches!(b.kind, Kind::Takeover | Kind::RoleCleared))
                 .collect();
             let steps = self.history(from, entry, &t.msg);
-            self.report(takeovers, entry, steps, &again, false);
+            self.report(takeovers, entry, &steps, &again, (false, false));
         }
     }
 
@@ -1048,13 +1266,102 @@ impl<'a> Explorer<'a> {
                 continue;
             }
             let base = self.states[0].world.clone();
-            let breaches = laws::check(&base, &before, &after, &run, &self.facts);
+            let spent = self.states[from].spent;
+            let breaches = laws::check(&base, &before, &after, &run, &self.facts, spent);
             let fresh: Vec<Breach> = breaches
                 .into_iter()
                 .filter(|b| !plain.iter().any(|p| p.kind == b.kind && p.asset == b.asset))
                 .collect();
             let steps = self.history(from, entry, &again.msg);
-            self.report(fresh, entry, steps, &run, true);
+            self.report(fresh, entry, &steps, &run, (true, false));
+        }
+    }
+
+    /* A contract in use holds ether and assets: what users paid in, and what was sent
+    to it. A single call by an account that has paid nothing and holds no claim must not
+    take any of it out. Only one call is tried from here. Over several calls an account
+    that staked and waited is paid by design. */
+    fn sweep(&mut self) {
+        let starts = self.states.len().min(MAX_STATES / 8);
+        for start in 0..starts {
+            // Only what the contract was seen to take in and keep. A contract that passes
+            // everything on holds nothing, and what strays into it is anyone's by design.
+            if self.facts.keeps.is_empty() {
+                return;
+            }
+            let mut world = self.states[start].world.clone();
+            for kind in self.facts.keeps.clone() {
+                world.enrich(self.subject, kind);
+            }
+            let mut steps = self.states[start].steps.clone();
+            steps.push(Step::Funded);
+            self.states.push(State {
+                world,
+                steps,
+                acted: 0,
+                spent: U256::ZERO,
+            });
+            let at = self.states.len() - 1;
+            for entry in 0..self.entries.len() {
+                if self.entries[entry].view {
+                    continue;
+                }
+                for seed in self.hostile(entry) {
+                    if budget::spent() {
+                        break;
+                    }
+                    let before = self.states[at].world.clone();
+                    let (t, world, run) = self.solve(at, entry, Try::of(seed));
+                    if !run.ok {
+                        continue;
+                    }
+                    let found =
+                        laws::check(&before, &before, &world, &run, &self.facts, U256::ZERO);
+                    let gains: Vec<Breach> =
+                        found.into_iter().filter(|b| b.kind == Kind::Gain).collect();
+                    let steps = self.history(at, entry, &t.msg);
+                    self.report(gains, entry, &steps, &run, (false, false));
+                }
+            }
+            self.states.truncate(at);
+        }
+    }
+
+    /* After the account has acted, a user goes on using the contract as before. A
+    user's own call that now pays the account does so because of what the account
+    changed, and the finding is placed at the call that changed it. */
+    fn used_after(&mut self) {
+        let acted: Vec<usize> = (0..self.states.len())
+            .filter(|s| self.states[*s].acted > 0)
+            .collect();
+        for from in acted.into_iter().take(MAX_STATES / 4) {
+            let blamed = self.states[from].steps.iter().rev().find_map(|s| match s {
+                Step::Call { entry, msg } if msg.from == ACTOR => Some(*entry),
+                _ => None,
+            });
+            let Some(blamed) = blamed else {
+                continue;
+            };
+            for entry in 0..self.entries.len() {
+                if self.entries[entry].view {
+                    continue;
+                }
+                for seed in self.honest(entry, USER) {
+                    if budget::spent() {
+                        return;
+                    }
+                    let before = self.states[from].world.clone();
+                    let (t, world, run) = self.solve(from, entry, Try::of(seed));
+                    if !run.ok {
+                        continue;
+                    }
+                    if let Some(breach) = laws::diverted(&before, &world) {
+                        let steps = self.history(from, entry, &t.msg);
+                        self.report(vec![breach], blamed, &steps, &run, (false, true));
+                    }
+                    break;
+                }
+            }
         }
     }
 
@@ -1078,17 +1385,26 @@ impl<'a> Explorer<'a> {
                         let mut plain = Vec::new();
                         if run.ok {
                             let base = self.states[0].world.clone();
-                            plain = laws::check(&base, &before, &world, &run, &self.facts);
-                            plain.retain(|b| b.kind != Kind::Credit || self.spendable(&world, b));
+                            let spent = self.states[from].spent;
+                            plain = laws::check(&base, &before, &world, &run, &self.facts, spent);
+                            plain.retain(|b| {
+                                b.kind != Kind::Credit || self.spendable(&before, &world, b, entry)
+                            });
+                            plain.retain(|b| {
+                                b.kind != Kind::Debit || self.withheld(&before, &world, b)
+                            });
                             let steps = self.history(from, entry, &t.msg);
-                            self.report(plain.clone(), entry, steps, &run, false);
+                            self.report(plain.clone(), entry, &steps, &run, (false, false));
                             self.takes_from_owner(from, entry, &t, &run);
                         }
                         if handed {
                             self.reenter(from, entry, &t, &plain);
                         }
                         if run.ok && self.novel(&run) && !kept && self.states.len() < MAX_STATES {
-                            next.push(self.keep(from, entry, &t, world, true));
+                            let at = self.keep(from, entry, &t, world, true);
+                            let lowered = laws::claims_lowered(&run, self.subject);
+                            self.states[at].spent = self.states[at].spent.wrapping_add(lowered);
+                            next.push(at);
                             kept = true;
                         }
                     }
@@ -1102,7 +1418,9 @@ impl<'a> Explorer<'a> {
         budget::within(work / 5, || self.settle());
         budget::within(work / 10, || self.used_by(OWNER, 1));
         budget::within(work / 5, || self.used_by(USER, 2));
-        budget::within(work / 2, || self.attack());
+        budget::within(work / 10, || self.sweep());
+        budget::within(work / 3, || self.attack());
+        budget::within(work / 10, || self.used_after());
     }
 }
 

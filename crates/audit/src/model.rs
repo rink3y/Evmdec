@@ -53,6 +53,8 @@ pub struct EntryFacts {
 pub struct Facts {
     pub places: BTreeMap<Place, PlaceFacts>,
     pub entries: Vec<EntryFacts>,
+    // What the contract was seen to take in and still hold when the call ended. None is ether.
+    pub keeps: BTreeSet<Option<Addr>>,
 }
 
 fn names_account(value: U256, known: &[Addr]) -> bool {
@@ -65,6 +67,7 @@ impl Facts {
         Facts {
             places: BTreeMap::new(),
             entries: vec![EntryFacts::default(); entries],
+            keeps: BTreeSet::new(),
         }
     }
 
@@ -128,7 +131,9 @@ impl Facts {
         for call in &run.calls {
             facts.calls_out = true;
             facts.runs_other_code |= matches!(call.kind, op::DELEGATECALL | op::CALLCODE);
-            if let Some(word) = call.to_tag.word().filter(|_| call.to_tag.has(DATA)) {
+            // Ether sent with no message is a payment to an account, not a call to a contract.
+            let spoken_to = call.to_tag.has(DATA) && !call.input.is_empty();
+            if let Some(word) = call.to_tag.word().filter(|_| spoken_to) {
                 facts.target_words.insert(word);
             }
             let cell = run.cell_of(call.to_tag).filter(|c| c.account == subject);

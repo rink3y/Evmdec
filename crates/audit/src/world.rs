@@ -1,7 +1,7 @@
 use crate::budget;
 use crate::trace::{
     join_all, Answered, CallOut, Cell, Event, Halt, Key, Run, Tag, BAL, BLOCK, CALLER, CLOCK, CMP,
-    EXT, HASH, MATH, ORIGIN, OUT, SELF, SIZE, STORE, VALUE,
+    DATA, EXT, HASH, MATH, ORIGIN, OUT, SELF, SIZE, STORE, VALUE,
 };
 use evmdec::interp::{CallRecord, CreateRecord, Host, Machine, Outcome};
 use evmdec::keccak::keccak256;
@@ -98,6 +98,8 @@ pub struct World {
     // Digests the owner or the user is taken to have signed.
     signed: Rc<HashMap<U256, Addr>>,
     people: Vec<Addr>,
+    // Accounts that hold a purse of something without being people. None is ether.
+    rich: Vec<(Addr, Option<Addr>)>,
     pub subject: Addr,
     pub time: U256,
     pub number: U256,
@@ -195,6 +197,24 @@ pub fn selector(data: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
+// The message that moves an asset, as an account or a contract sends it.
+#[must_use]
+pub fn transfer_call(to: Addr, amount: U256) -> Vec<u8> {
+    let mut data = SEL_TRANSFER.to_be_bytes().to_vec();
+    data.extend_from_slice(&to.to_be_bytes());
+    data.extend_from_slice(&amount.to_be_bytes());
+    data
+}
+
+#[must_use]
+pub fn transfer_from_call(from: Addr, to: Addr, amount: U256) -> Vec<u8> {
+    let mut data = SEL_TRANSFER_FROM.to_be_bytes().to_vec();
+    data.extend_from_slice(&from.to_be_bytes());
+    data.extend_from_slice(&to.to_be_bytes());
+    data.extend_from_slice(&amount.to_be_bytes());
+    data
+}
+
 fn one_word(value: U256) -> Vec<u8> {
     value.to_be_bytes().to_vec()
 }
@@ -266,9 +286,20 @@ impl World {
         self.people.contains(&who)
     }
 
+    // A contract in use holds ether and assets that were sent to it.
+    pub fn enrich(&mut self, who: Addr, of: Option<Addr>) {
+        if !self.rich.contains(&(who, of)) {
+            self.rich.push((who, of));
+        }
+        if let Some(asset) = of {
+            let held = self.asset_of(asset, who);
+            Rc::make_mut(&mut self.assets).insert((asset, who), held);
+        }
+    }
+
     #[must_use]
     pub fn ether_of(&self, who: Addr) -> U256 {
-        let start = match self.is_person(who) {
+        let start = match self.is_person(who) || self.rich.contains(&(who, None)) {
             true => PURSE,
             false => U256::ZERO,
         };
@@ -277,7 +308,7 @@ impl World {
 
     #[must_use]
     pub fn asset_of(&self, asset: Addr, who: Addr) -> U256 {
-        let start = match self.is_person(who) {
+        let start = match self.is_person(who) || self.rich.contains(&(who, Some(asset))) {
             true => PURSE,
             false => U256::ZERO,
         };
@@ -864,7 +895,26 @@ impl World {
                 }
                 result = result.with(CMP);
             }
-            op::ISZERO => result = result.with(CMP),
+            op::ISZERO => {
+                // A word of the call data tested against nothing is a comparison with zero.
+                let ta = tag(sh, 0);
+                if tx.cmps < MAX_CMPS && ta.has(DATA) && !ta.has(CMP) && ta.word().is_some() {
+                    tx.cmps += 1;
+                    let (a, b, tb) = (val(0), U256::ZERO, Tag::NONE);
+                    Self::event(
+                        tx,
+                        Event::Cmp {
+                            pc,
+                            op: o,
+                            a,
+                            b,
+                            ta,
+                            tb,
+                        },
+                    );
+                }
+                result = result.with(CMP);
+            }
             op::ADD | op::SUB | op::MUL => {
                 let (a, b) = (val(0), val(1));
                 let wraps = match o {
@@ -974,6 +1024,7 @@ impl World {
             to_tag: pending.to,
             value_tag: pending.value,
             arg_tags: pending.args.clone(),
+            input_from: pending.input.first().copied().unwrap_or(Tag::NONE),
             ok: false,
             by: Answered::Blank,
             checked: false,

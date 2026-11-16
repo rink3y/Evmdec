@@ -201,6 +201,9 @@ fn caller_tests(run: &Run) -> String {
 fn step_text(ex: &Explorer, step: &Step) -> String {
     match step {
         Step::Wait { until } => format!("time passes until {}", until.to_decimal()),
+        Step::Funded => {
+            "the contract already holds ether and assets that were sent to it".to_string()
+        }
         Step::Told {
             to,
             selector,

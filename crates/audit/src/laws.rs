@@ -34,9 +34,33 @@ pub struct Breach {
     // The asset that moved. None is ether.
     pub asset: Option<Addr>,
     pub amount: U256,
+    // What the record holds after the call, where the breach is about a record.
+    pub total: U256,
     pub victim: Option<Addr>,
     pub cell: Option<Cell>,
     pub call: Option<usize>,
+}
+
+/* What the account gained in a call somebody else made. A user's own call that pays
+the account does so because of something the account did before. */
+#[must_use]
+pub fn diverted(before: &World, after: &World) -> Option<Breach> {
+    let mut kinds: Vec<Option<Addr>> = vec![None];
+    kinds.extend(after.assets().into_iter().map(Some));
+    let none_less = kinds
+        .iter()
+        .all(|a| of_party(after, *a) >= of_party(before, *a));
+    let most = kinds
+        .iter()
+        .filter(|a| of_party(after, **a) > of_party(before, **a))
+        .map(|a| (of_party(after, *a).wrapping_sub(of_party(before, *a)), *a))
+        .max();
+    let (amount, asset) = most.filter(|_| none_less)?;
+    Some(Breach {
+        asset,
+        amount,
+        ..bare(Kind::Gain)
+    })
 }
 
 fn of_party(world: &World, asset: Option<Addr>) -> U256 {
@@ -63,6 +87,7 @@ fn bare(kind: Kind) -> Breach {
         kind,
         asset: None,
         amount: U256::ZERO,
+        total: U256::ZERO,
         victim: None,
         cell: None,
         call: None,
@@ -71,8 +96,28 @@ fn bare(kind: Kind) -> Breach {
 
 /* `base` is the world before the account made its first call, `before` and `after`
 are around its latest call, and `run` is that call. */
+// How much of its own recorded claims the account gave up in a call.
 #[must_use]
-pub fn check(base: &World, before: &World, after: &World, run: &Run, facts: &Facts) -> Vec<Breach> {
+pub fn claims_lowered(run: &Run, subject: Addr) -> U256 {
+    let own = run.stores().filter(|(c, old, new, _, _)| {
+        c.account == subject && (c.keyed_by(ACTOR) || c.keyed_by(ALLY)) && new < old
+    });
+    own.fold(U256::ZERO, |sum, (_, old, new, _, _)| {
+        sum.wrapping_add(old - new)
+    })
+}
+
+/* `spent` is what the account gave up of its own recorded claims in earlier calls. An
+account that is paid what its entry was lowered by took out what was its own. */
+#[must_use]
+pub fn check(
+    base: &World,
+    before: &World,
+    after: &World,
+    run: &Run,
+    facts: &Facts,
+    spent: U256,
+) -> Vec<Breach> {
     let mut found = Vec::new();
     let subject = after.subject;
     let mut kinds: Vec<Option<Addr>> = vec![None];
@@ -88,7 +133,27 @@ pub fn check(base: &World, before: &World, after: &World, run: &Run, facts: &Fac
         .map(|a| (change(a).1.wrapping_sub(change(a).0), *a))
         .filter(|(_, a)| change(a).1 > change(a).0)
         .max();
-    if let (true, true, Some((amount, asset))) = (none_less, stepped, most) {
+    let own = spent.wrapping_add(claims_lowered(run, subject));
+    /* What a contract passes on because another contract said it had just sent that
+    much is not the contract's own. Here nobody keeps books for such an answer, so a
+    payment sized by one shows nothing. */
+    let made_up = |tag: &crate::trace::Tag| {
+        let asked = tag.call().and_then(|k| run.calls.get(k));
+        tag.has(crate::trace::OUT) && asked.is_none_or(|c| c.by != crate::trace::Answered::Books)
+    };
+    let to_party = |e: &&Event| match e {
+        Event::Pay { to, amount, .. } => Facts::same_party(*to, ACTOR) && !amount.is_zero(),
+        _ => false,
+    };
+    let sized_by_answer =
+        |e: &Event| matches!(e, Event::Pay { amount_tag, .. } if made_up(amount_tag));
+    let pays: Vec<&Event> = run.events.iter().filter(to_party).collect();
+    let rests_on_answer = !pays.is_empty() && pays.iter().all(|e| sized_by_answer(e));
+    if let (true, true, Some((amount, asset))) = (
+        none_less,
+        stepped && !rests_on_answer,
+        most.filter(|(amount, _)| *amount > own),
+    ) {
         found.push(Breach {
             asset,
             amount,
@@ -132,15 +197,17 @@ pub fn check(base: &World, before: &World, after: &World, run: &Run, facts: &Fac
             continue;
         }
         let place = facts.places.get(&cell.place());
+        // Whether a record that rose is worth anything is for the caller to show by using it.
+        let others = cell.keyed_by(USER) || cell.keyed_by(OWNER);
+        if actor_keyed(cell) && !others && new > old && paid_nothing && !gave_up {
+            found.push(Breach {
+                amount: new - old,
+                total: new,
+                cell: Some(cell.clone()),
+                ..bare(Kind::Credit)
+            });
+        }
         if ledger(cell) {
-            let others = cell.keyed_by(USER) || cell.keyed_by(OWNER);
-            if actor_keyed(cell) && !others && new > old && paid_nothing && !gave_up {
-                found.push(Breach {
-                    amount: new - old,
-                    cell: Some(cell.clone()),
-                    ..bare(Kind::Credit)
-                });
-            }
             let victim = [USER, OWNER].into_iter().find(|v| cell.keyed_by(*v));
             let paid_out = |v: Addr| {
                 kinds
@@ -152,6 +219,7 @@ pub fn check(base: &World, before: &World, after: &World, run: &Run, facts: &Fac
             {
                 found.push(Breach {
                     amount: old - new,
+                    total: old,
                     victim: Some(victim),
                     cell: Some(cell.clone()),
                     ..bare(Kind::Debit)

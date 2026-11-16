@@ -198,6 +198,8 @@ pub struct CallOut {
     pub to_tag: Tag,
     pub value_tag: Tag,
     pub arg_tags: Vec<Tag>,
+    // Where the first byte of what was sent came from.
+    pub input_from: Tag,
     pub ok: bool,
     pub by: Answered,
     // Whether the code looked at how the call went before it ended.

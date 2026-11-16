@@ -120,8 +120,8 @@ fn party(who: Addr) -> bool {
     Facts::same_party(who, ACTOR)
 }
 
-fn own_record(cell: &Cell, subject: Addr) -> bool {
-    cell.account == subject && (cell.keyed_by(ACTOR) || cell.keyed_by(ALLY))
+fn own_record(cell: &Cell) -> bool {
+    cell.keyed_by(ACTOR) || cell.keyed_by(ALLY)
 }
 
 struct Paid {
@@ -172,10 +172,38 @@ fn payments(run: &Run, to_account: bool) -> Vec<Paid> {
     all
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Moved {
+    taken: Vec<Option<Addr>>,
+    given: Vec<Option<Addr>>,
+    raised: bool,
+    lowered: bool,
+}
+
+impl Moved {
+    #[must_use]
+    pub fn nothing(&self) -> bool {
+        *self == Moved::default()
+    }
+}
+
 #[must_use]
-pub fn touched(run: &Run, subject: Addr) -> bool {
-    let recorded = run.changes().iter().any(|(c, ..)| own_record(c, subject));
-    !payments(run, true).is_empty() || !payments(run, false).is_empty() || recorded
+pub fn moved(run: &Run) -> Moved {
+    let assets = |to_account: bool| {
+        let paid = payments(run, to_account);
+        let mut assets: Vec<Option<Addr>> = paid.iter().map(|p| p.asset).collect();
+        assets.sort();
+        assets.dedup();
+        assets
+    };
+    let changes = run.changes();
+    let own = changes.iter().filter(|(c, ..)| own_record(c));
+    Moved {
+        taken: assets(true),
+        given: assets(false),
+        raised: own.clone().any(|(_, old, new, _, _)| new > old),
+        lowered: own.clone().any(|(_, old, new, _, _)| new < old),
+    }
 }
 
 /* `first` and `second` are the same call by the account, before and after its own step
@@ -196,7 +224,7 @@ pub fn swayed(first: &Run, second: &Run, after: &World, acted_on: &[Addr]) -> Ve
         let changes = run.changes();
         let falls = changes
             .iter()
-            .filter(|(c, old, new, _, _)| own_record(c, subject) && new < old);
+            .filter(|(c, old, new, _, _)| own_record(c) && new < old);
         falls.fold(U256::ZERO, |sum, (_, old, new, _, _)| {
             sum.wrapping_add(*old - *new)
         })
@@ -242,23 +270,31 @@ pub fn swayed(first: &Run, second: &Run, after: &World, acted_on: &[Addr]) -> Ve
         }
     }
     let top = U256::ONE << 255;
+    /* What another contract mints the account at this one's word is paid out as much
+    as what this one records. An asset's own books are left out where the move was
+    already seen as a payment. */
     let rises = |run: &Run| -> Vec<(Cell, U256, Tag)> {
+        let paid = payments(run, true);
+        let seen = |c: &Cell| paid.iter().any(|p| p.asset == Some(c.account));
         let changes = run.changes();
-        let up = changes
-            .iter()
-            .filter(|(c, old, new, _, _)| own_record(c, subject) && new > old && *new < top);
+        let up = changes.iter().filter(|(c, old, new, _, _)| {
+            let elsewhere = c.account != subject;
+            let counted = elsewhere && (seen(c) || acted_on.contains(&c.account));
+            own_record(c) && !counted && new > old && *new < top
+        });
         up.map(|(c, old, new, tag, _)| ((*c).clone(), *new - *old, *tag))
             .collect()
     };
     let rose = rises(first);
     for (cell, amount, tag) in rises(second) {
-        let before = rose.iter().find(|r| r.0.slot == cell.slot);
+        let same = |r: &&(Cell, U256, Tag)| (r.0.account, r.0.slot) == (cell.account, cell.slot);
+        let before = rose.iter().find(same);
         let paid_before = before.map_or(U256::ZERO, |r| r.1);
         if amount > paid_before && tag.read_outside() {
             found.push(Breach {
                 amount,
                 paid_before,
-                total: after.stored(subject, cell.slot),
+                total: after.stored(cell.account, cell.slot),
                 cell: Some(cell),
                 ..bare(Kind::PayoutOnReading)
             });

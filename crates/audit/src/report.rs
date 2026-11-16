@@ -556,9 +556,10 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
         Kind::PayoutOnReading => {
             let asset = v.breach.asset;
             let cell = v.breach.cell.as_ref();
+            let at = cell.map(|c| (c.account, c.slot));
             let store = run
                 .stores()
-                .filter(|(c, ..)| Some(c.slot) == cell.map(|c| c.slot));
+                .filter(|(c, ..)| Some((c.account, c.slot)) == at);
             let paid = pays
                 .filter(|p| p.0 == asset && party(p.2) && !party(p.1))
                 .max_by_key(|p| p.3);

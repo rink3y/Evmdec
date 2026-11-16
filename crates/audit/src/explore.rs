@@ -26,7 +26,7 @@ const ACTOR_DEPTH: usize = 3;
 const MAX_OUTSIDE: usize = 3;
 const OUTSIDE_ENTRIES: usize = 6;
 const SWAYED_A_STATE: usize = 3;
-const SWAYED_AN_ENTRY: usize = 2;
+const SWAYED_AN_ENTRY: usize = 3;
 const MAX_SENDS: usize = 4;
 const MAX_READ: usize = 8;
 const UNUSED_SELECTOR: u32 = 0xfeed_c0de;
@@ -187,7 +187,7 @@ pub struct Explorer<'a> {
     named_out: BTreeMap<Addr, usize>,
     aims: Vec<Addr>,
     room: usize,
-    paid: Vec<(usize, usize, Try)>,
+    paid: Vec<(usize, usize, Try, laws::Moved)>,
 }
 
 fn outside(n: usize) -> Addr {
@@ -2375,14 +2375,16 @@ impl<'a> Explorer<'a> {
                 if !granted {
                     self.takes_from_owner(from, entry, &t, &run);
                 }
-                let seen = |p: &&(usize, usize, Try)| p.0 == from && p.1 == entry;
+                let moved = laws::moved(&run);
+                // A call that moves the same things from another state would be weighed the same.
+                let seen = |p: &(usize, usize, Try, laws::Moved)| p.1 == entry && p.3 == moved;
                 let of_state = self.paid.iter().filter(|p| p.0 == from).count();
                 let of_entry = self.paid.iter().filter(|p| p.1 == entry).count();
                 let fresh = of_state < SWAYED_A_STATE
                     && of_entry < SWAYED_AN_ENTRY
-                    && !self.paid.iter().any(|p| seen(&p));
-                if self.on_chain && fresh && laws::touched(&run, self.subject) {
-                    self.paid.push((from, entry, t.clone()));
+                    && !self.paid.iter().any(seen);
+                if self.on_chain && fresh && !moved.nothing() {
+                    self.paid.push((from, entry, t.clone(), moved));
                 }
             }
             let apart = self.states[from].stray || self.states[from].granted;
@@ -2429,7 +2431,7 @@ impl<'a> Explorer<'a> {
         let mut paid = std::mem::take(&mut self.paid);
         // The same call is reported once, from the state fewest steps lead to.
         paid.sort_by_key(|(from, ..)| self.states[*from].steps.len());
-        for (from, entry, t) in paid {
+        for (from, entry, t, _) in paid {
             if budget::spent() {
                 return;
             }
@@ -2444,10 +2446,10 @@ impl<'a> Explorer<'a> {
         let mut start = self.states[from].world.clone();
         start.noting = true;
         let (_, first) = self.attempt_in(start.clone(), entry, t);
-        if !first.ok || first.read.is_empty() {
-            return;
-        }
-        let steps = self.steps_elsewhere(&start, &first);
+        let steps = match first.ok && !first.read.is_empty() {
+            true => self.steps_elsewhere(&start, &first),
+            false => Vec::new(),
+        };
         if self.trace {
             let name = &self.entries[entry].name;
             let (read, steps) = (first.read.len(), steps.len());

@@ -126,6 +126,10 @@ pub struct Names {
     pub vars: RefCell<HashMap<u32, u32>>,
     pub layout: MappingLayout,
     pub hide_checked: bool,
+    pub checked: Option<Checked>,
+    pub gas_named: RefCell<HashSet<ExprId>>,
+    pub offsets: HashSet<ExprId>,
+    pub bare: RefCell<HashMap<ExprId, (String, u8)>>,
     pub temps: RefCell<Vec<(String, String)>>,
     pub temp_of: RefCell<HashMap<ExprId, String>>,
     pub pure_callees: HashSet<usize>,
@@ -136,6 +140,240 @@ pub struct Names {
     pub elem_types: HashMap<U256, String>,
     pub array_resizers: HashSet<usize>,
     pub memo: RefCell<HashMap<ExprId, (String, u8)>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Checked {
+    ops: HashSet<ExprId>,
+    divisors: HashSet<ExprId>,
+}
+
+/* What the code tests before it reverts with Panic(0x11) or Panic(0x12) says which of its
+sums, differences, products and quotients are checked. The test either holds the result
+itself or compares the two operands. */
+pub fn checked_ops(l: &Lifted) -> Checked {
+    let code = |data: &Option<Vec<ExprId>>| -> Option<u64> {
+        let words = data.as_deref().filter(|w| w.len() >= 2)?;
+        if leading_selector(words[0], None) != Some(SEL_PANIC) {
+            return None;
+        }
+        let len = 4 + 32 * (words.len() - 1);
+        let code = expr::as_const(shifted_word_len(words, 0, Some(len)))?.low_u64();
+        [PANIC_OVERFLOW, PANIC_DIV_BY_ZERO]
+            .contains(&code)
+            .then_some(code)
+    };
+    let panics = |node: usize| match &l.nodes[node] {
+        nd if !nd.stmts.is_empty() => None,
+        nd => match &nd.term {
+            Term::Revert { data, .. } => code(data),
+            _ => None,
+        },
+    };
+    let mut guards: Vec<(ExprId, u64)> = Vec::new();
+    for nd in &l.nodes {
+        for s in &nd.stmts {
+            if let Stmt::Require { cond, data, .. } = s {
+                guards.extend(code(data).map(|c| (*cond, c)));
+            }
+        }
+        if let Term::Branch { cond, t, f } = &nd.term {
+            guards.extend(
+                t.and_then(panics)
+                    .map(|c| (expr::op1(op::ISZERO, *cond), c)),
+            );
+            guards.extend(panics(*f).map(|c| (*cond, c)));
+        }
+    }
+    let within = |part: ExprId, whole: ExprId| {
+        let part = expr::node(part);
+        expr::contains(whole, &|n| *n == part)
+    };
+    let max = konst_max();
+    let mut found = Checked::default();
+    for (cond, code) in guards {
+        let mut pending = vec![cond];
+        while let Some(e) = pending.pop() {
+            match expr::node(e) {
+                Node::Op(op::ISZERO | op::OR | op::AND, v) => pending.extend(v),
+                Node::Op(op::EQ | op::LT | op::GT | op::SLT | op::SGT, v) => {
+                    for (x, y) in [(v[0], v[1]), (v[1], v[0])] {
+                        match expr::node(x) {
+                            _ if within(x, y) => {}
+                            Node::Op(op::DIV, d) => match expr::node(d[0]) {
+                                Node::Op(op::MUL, m) if m.contains(&d[1]) => {
+                                    found.ops.insert(d[0]);
+                                }
+                                _ => {
+                                    found.ops.insert(x);
+                                }
+                            },
+                            Node::Op(..) => {
+                                found.ops.insert(x);
+                            }
+                            _ => {}
+                        }
+                        found.ops.insert(expr::op2(op::SUB, x, y));
+                        /* Solidity up to 0.8.15 tests a sum against max - y and a
+                        product against max / y. */
+                        let other = match expr::node(y) {
+                            Node::Op(op::SUB, w) if expr::is_const(w[0]) => Some((op::ADD, w[1])),
+                            Node::Op(op::NOT, w) => Some((op::ADD, w[0])),
+                            Node::Op(op::DIV, w) if expr::is_const(w[0]) => Some((op::MUL, w[1])),
+                            _ => None,
+                        };
+                        if let Some((o, z)) = other {
+                            found.ops.extend([expr::op2(o, x, z), expr::op2(o, z, x)]);
+                        }
+                        match expr::as_const(y) {
+                            Some(c) if c == max => {
+                                found.ops.insert(expr::op2(op::ADD, x, expr::konst_u64(1)));
+                            }
+                            Some(c) if c.is_zero() => {
+                                found.ops.insert(expr::op2(op::SUB, x, expr::konst_u64(1)));
+                                found.divisors.insert(x);
+                            }
+                            Some(c) => {
+                                let room = expr::konst(max.wrapping_sub(c));
+                                found.ops.insert(expr::op2(op::ADD, x, room));
+                                found
+                                    .ops
+                                    .insert(expr::op2(op::SUB, expr::konst(U256::ZERO), x));
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                _ if code == PANIC_DIV_BY_ZERO => {
+                    found.divisors.insert(e);
+                }
+                _ => {
+                    found.ops.insert(expr::op2(op::SUB, e, expr::konst_u64(1)));
+                }
+            }
+        }
+    }
+    found
+}
+
+fn konst_max() -> U256 {
+    !U256::ZERO
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Places {
+    params: BTreeSet<usize>,
+    returns: BTreeSet<usize>,
+}
+
+/* The compiler adds and subtracts places in memory, storage and call data without a test,
+and none of that is arithmetic the source wrote. A value is a place when it is used as
+one: as the offset of a load, a store, a copy, a call or a log, in a bounds test against
+the size of the call data, or by a helper that uses its parameter or its result as one. */
+pub fn offsets(units: &[(usize, &Lifted)]) -> Vec<HashSet<ExprId>> {
+    let mut places: HashMap<usize, Places> = HashMap::new();
+    loop {
+        let before = places.clone();
+        let found = units.iter().map(|(pc, l)| offsets_in(*pc, l, &mut places));
+        let found: Vec<HashSet<ExprId>> = found.collect();
+        if places == before {
+            return found;
+        }
+    }
+}
+
+fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> HashSet<ExprId> {
+    let sizes = |e: ExprId| {
+        expr::contains(e, &|n| {
+            matches!(n, Node::Env(op::CALLDATASIZE | op::RETURNDATASIZE, _))
+        })
+    };
+    let mut pending: Vec<ExprId> = Vec::new();
+    let mut roots: Vec<ExprId> = l.edge_assigns.values().flatten().map(|(_, v)| *v).collect();
+    let own = places.get(&pc).cloned().unwrap_or_default();
+    for nd in &l.nodes {
+        roots.extend(crate::lift::node_exprs(nd));
+        for s in &nd.stmts {
+            match s {
+                Stmt::MStore { off, .. } => pending.push(*off),
+                Stmt::SStore { key, .. } => pending.push(*key),
+                Stmt::Log { off, len, .. } | Stmt::Create { off, len, .. } => {
+                    pending.extend([*off, *len])
+                }
+                Stmt::Copy { dest, src, len, .. } => pending.extend([*dest, *src, *len]),
+                Stmt::Call {
+                    in_off,
+                    in_len,
+                    out_off,
+                    out_len,
+                    ..
+                } => pending.extend([*in_off, *in_len, *out_off, *out_len]),
+                Stmt::Internal { callee, args, .. } => {
+                    let used = places.get(callee).map(|p| p.params.clone());
+                    pending.extend(used.iter().flatten().filter_map(|j| args.get(*j)));
+                }
+                _ => {}
+            }
+        }
+        match &nd.term {
+            Term::Return { off, len, .. } | Term::Revert { off, len, .. } => {
+                pending.extend([*off, *len])
+            }
+            Term::ReturnDyn { ptr } => pending.push(*ptr),
+            Term::InternalReturn(vals) => {
+                pending.extend(own.returns.iter().filter_map(|j| vals.get(*j)))
+            }
+            _ => {}
+        }
+    }
+    let mut seen = HashSet::new();
+    while let Some(e) = roots.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        match expr::node(e) {
+            Node::MLoad(a, _)
+            | Node::SLoad(a, _, _)
+            | Node::CallDataLoad(a)
+            | Node::ReturnData(_, a)
+            | Node::CopiedWord(_, a, _) => pending.push(a),
+            Node::KeccakMem(a, b, _) => pending.extend([a, b]),
+            Node::Op(op::LT | op::GT | op::SLT | op::SGT, v) if v.iter().any(|x| sizes(*x)) => {
+                pending.extend(v)
+            }
+            _ => {}
+        }
+        roots.extend(expr::children(e));
+    }
+    let defs = crate::ssa::phi_defs(l);
+    let arity = crate::ssa::arity(l);
+    let mut found: HashSet<ExprId> = HashSet::new();
+    while let Some(e) = pending.pop() {
+        if !found.insert(e) {
+            continue;
+        }
+        match expr::node(e) {
+            Node::Op(op::ADD | op::SUB | op::AND, v) => pending.extend(v),
+            Node::Var(_) => pending.extend(defs.get(&e).into_iter().flatten()),
+            Node::Arg(slot) if (slot as usize) < arity => {
+                let own = places.entry(pc).or_default();
+                own.params.insert(arity - 1 - slot as usize);
+            }
+            _ => {}
+        }
+    }
+    for nd in &l.nodes {
+        for s in &nd.stmts {
+            if let Stmt::Internal {
+                callee, results, ..
+            } = s
+            {
+                let used = (0..results.len()).filter(|j| found.contains(&results[*j]));
+                places.entry(*callee).or_default().returns.extend(used);
+            }
+        }
+    }
+    found
 }
 
 // Keeps the output linear in size.
@@ -150,6 +388,43 @@ impl Names {
             .unwrap_or_else(|| format!("func_{pc:#x}"))
     }
 
+    /* Solidity from 0.8 on tests by default, so there a bare operator has to mean a
+    tested one. A division by a constant that is not zero needs no test, and an address
+    in an allocated block is not a sum. */
+    fn unchecked(&self, e: ExprId) -> bool {
+        let Some(checked) = &self.checked else {
+            return false;
+        };
+        // Multiplying or dividing by a power of two moves bits. It is how a field is packed.
+        let shift = |x: ExprId| match expr::node(x) {
+            Node::Const(c) => c.is_power_of_two(),
+            Node::Op(op::EXP, v) => expr::as_const(v[0]).is_some_and(|c| c.is_power_of_two()),
+            _ => false,
+        };
+        let free = match expr::node(e) {
+            Node::Op(op::ADD | op::SUB, _) => !checked.ops.contains(&e),
+            Node::Op(op::MUL, v) => !checked.ops.contains(&e) && !v.iter().any(|x| shift(*x)),
+            Node::Op(op::DIV | op::SDIV | op::MOD | op::SMOD, v) => {
+                let safe = expr::as_const(v[1]).is_some_and(|c| !c.is_zero()) || shift(v[1]);
+                !safe && !checked.ops.contains(&e) && !checked.divisors.contains(&v[1])
+            }
+            _ => false,
+        };
+        free && block_ref(e, self).is_none() && !self.is_offset(e, 0)
+    }
+
+    fn is_offset(&self, e: ExprId, depth: u32) -> bool {
+        self.offsets.contains(&e)
+            || match expr::node(e) {
+                Node::Op(op::ADD | op::SUB, v) if depth < 8 => {
+                    v.iter().any(|x| self.is_offset(*x, depth + 1))
+                }
+                Node::Env(op::CALLDATASIZE | op::RETURNDATASIZE, _) => true,
+                Node::MLoad(at, _) => is_free_pointer(at),
+                _ => false,
+            }
+    }
+
     pub fn take_temps(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.temps.borrow_mut())
     }
@@ -159,6 +434,7 @@ impl Names {
     pub fn end_block(&self) {
         self.temp_of.borrow_mut().clear();
         self.memo.borrow_mut().clear();
+        self.bare.borrow_mut().clear();
         let mut stale = self.stale.borrow_mut();
         for e in self.block_stale.borrow_mut().drain(..) {
             stale.remove(&e);
@@ -1260,6 +1536,13 @@ fn env_name(o: u8, seq: u32, n: &Names) -> String {
         op::SELFBALANCE => "address(this).balance".into(),
         op::BASEFEE => "block.basefee".into(),
         op::BLOBBASEFEE => "block.blobbasefee".into(),
+        op::GAS
+            if n.gas_named
+                .borrow()
+                .contains(&expr::intern(Node::Env(o, seq))) =>
+        {
+            format!("gasleft_{}", n.seq(seq))
+        }
         op::GAS => format!("gasleft_{}()", n.seq(seq)),
         op::MSIZE => format!("msize_{}()", n.seq(seq)),
         op::PC => "pc".into(),
@@ -1360,8 +1643,45 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             P_PRIMARY,
         ),
         Node::IntRet(seq, j) => (format!("ret_{}_{}", n.seq(seq), j), P_PRIMARY),
+        Node::Op(..) if n.unchecked(e) => (format!("unchecked({})", fmt_bare(e, 0, n)), P_PRIMARY),
         Node::Op(o, v) => fmt_op(o, &v, n),
     }
+}
+
+/* Inside the marker of an unchecked operator an operand that is unchecked too needs no
+marker of its own. One that is checked has to say so, or it would read as unchecked. */
+fn fmt_bare(e: ExprId, outer: u8, n: &Names) -> String {
+    if !n.unchecked(e) {
+        return fmt_prec(e, outer, n);
+    }
+    if let Some((s, p)) = n.bare.borrow().get(&e) {
+        return paren(s.clone(), *p, outer);
+    }
+    let Node::Op(o, v) = expr::node(e) else {
+        return fmt_prec(e, outer, n);
+    };
+    let operand = |x: ExprId, prec: u8| match expr::node(x) {
+        Node::Op(op::ADD | op::SUB | op::MUL | op::DIV | op::SDIV | op::MOD | op::SMOD, _)
+            if !n.unchecked(x) && n.temp_of.borrow().get(&x).is_none() =>
+        {
+            format!("checked({})", fmt_expr(x, n))
+        }
+        _ => fmt_bare(x, prec, n),
+    };
+    let (sign, p) = match o {
+        op::ADD => ("+", P_ADD),
+        op::SUB => ("-", P_ADD),
+        op::MUL => ("*", P_MUL),
+        op::DIV => ("/", P_MUL),
+        op::MOD => ("%", P_MUL),
+        _ => {
+            let (s, p) = fmt_op(o, &v, n);
+            return paren(s, p, outer);
+        }
+    };
+    let s = format!("{} {sign} {}", operand(v[0], p), operand(v[1], p + 1));
+    n.bare.borrow_mut().insert(e, (s.clone(), p));
+    paren(s, p, outer)
 }
 
 fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
@@ -2048,6 +2368,41 @@ fn fmt_call_head(head: &[ExprId], n: &Names) -> (Option<String>, Vec<String>) {
     (Some(name), args)
 }
 
+fn forwards_all_gas(gas: ExprId) -> bool {
+    let left = |e: ExprId| matches!(expr::node(e), Node::Env(op::GAS, _));
+    left(gas) || matches!(expr::node(gas), Node::Op(op::SUB, v) if left(v[0]))
+}
+
+/* The gas left is state, so a value read at one point is not the value at a later one.
+Passing all gas to a call is the one use that needs no name. */
+pub fn name_gas_reads(l: &Lifted, n: &Names) {
+    let mut roots: Vec<ExprId> = l.edge_assigns.values().flatten().map(|(_, v)| *v).collect();
+    let mut read: HashSet<ExprId> = HashSet::new();
+    for nd in &l.nodes {
+        for s in &nd.stmts {
+            let exprs = crate::lift::stmt_exprs(s);
+            match s {
+                Stmt::Drop(e) if matches!(expr::node(*e), Node::Env(op::GAS, _)) => {
+                    read.insert(*e);
+                }
+                Stmt::Call { gas, .. } if forwards_all_gas(*gas) => {
+                    roots.extend(exprs.into_iter().filter(|e| e != gas))
+                }
+                _ => roots.extend(exprs),
+            }
+        }
+        roots.extend(crate::lift::term_exprs(&nd.term));
+    }
+    let mut used: HashSet<ExprId> = HashSet::new();
+    while let Some(e) = roots.pop() {
+        if used.insert(e) {
+            roots.extend(expr::children(e));
+        }
+    }
+    read.retain(|e| used.contains(e));
+    *n.gas_named.borrow_mut() = read;
+}
+
 pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
     match s {
         Stmt::Assign { var, value } => format!("{} = {};", fmt_expr(*var, n), fmt_expr(*value, n)),
@@ -2149,9 +2504,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     opts.push(format!("value: {}", fmt_expr(*v, n)));
                 }
             }
-            let gas_is_all = matches!(expr::node(*gas), Node::Env(op::GAS, _))
-                || matches!(expr::node(*gas), Node::Op(op::SUB, v) if matches!(expr::node(v[0]), Node::Env(op::GAS, _)));
-            if !gas_is_all {
+            if !forwards_all_gas(*gas) {
                 opts.push(format!("gas: {}", fmt_expr(*gas, n)));
             }
             let opts_s = if opts.is_empty() {
@@ -2323,6 +2676,12 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 all if all.iter().all(String::is_empty) => format!("{};", call),
                 [one] => format!("{} = {};", one, call),
                 _ => format!("({}) = {};", bound.join(", "), call),
+            }
+        }
+        Stmt::Drop(e) if matches!(expr::node(*e), Node::Env(op::GAS, _)) => {
+            match n.gas_named.borrow().contains(e) {
+                true => format!("{} = gasleft();", fmt_expr(*e, n)),
+                false => String::new(),
             }
         }
         Stmt::Drop(e) => format!("// ignored: {}", fmt_expr(*e, n)),
@@ -2517,6 +2876,7 @@ pub fn name_labels(text: &str) -> String {
 }
 
 pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
+    name_gas_reads(l, n);
     let mut out = String::new();
     let reach = crate::lift::reachable(l);
     let order = crate::lift::reverse_postorder(l);
@@ -2555,7 +2915,9 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
             for (name, def) in n.take_temps() {
                 out.push_str(&format!("{}    uint256 {} = {};\n", indent, name, def));
             }
-            out.push_str(&format!("{}    {}\n", indent, txt));
+            if !txt.is_empty() {
+                out.push_str(&format!("{}    {}\n", indent, txt));
+            }
         }
         let goto = |to: usize| -> String {
             let mut s = String::new();

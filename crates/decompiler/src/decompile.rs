@@ -1166,9 +1166,18 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         .filter(|f| f.kind == FnKind::Internal && f.lifted.as_ref().is_some_and(is_array_resizer))
         .map(|f| f.pc)
         .collect();
+    let mut offsets = {
+        let lifted = functions.iter().filter(|_| solc08);
+        let units: Vec<(usize, &Lifted)> = lifted
+            .map(|f| (f.pc, f.lifted.as_ref().expect("functions are lifted")))
+            .collect();
+        emit::offsets(&units).into_iter()
+    };
     for f in functions.iter_mut() {
         let mut names = make_names(f, &storage, layout, &loaders, &callees);
         names.hide_checked = solc08;
+        names.checked = f.lifted.as_ref().filter(|_| solc08).map(emit::checked_ops);
+        names.offsets = offsets.next().unwrap_or_default();
         names.pure_callees = pure_callees.clone();
         names.array_resizers = array_resizers.clone();
         let l = f
@@ -3101,6 +3110,13 @@ pub fn render(c: &Contract, name: &str) -> String {
         out.push_str(
             "// Memory: ptrN is a block allocated at the free memory pointer; \
              ptrN = memory(a, b) writes its words; bytes(p) is the byte string at p.\n",
+        );
+    }
+    if c.functions.iter().any(|f| f.code.contains("unchecked(")) {
+        out.push_str(
+            "// Arithmetic: + - * / % revert on overflow and on division by zero; \
+             unchecked(...) holds what the code computes without that test. \
+             Places in memory, storage and call data are never tested.\n",
         );
     }
     if c.functions.iter().any(|f| f.code.contains("loc_")) {

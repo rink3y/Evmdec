@@ -1250,3 +1250,28 @@ fn call_data_is_the_bytes_the_writes_left_under_one_pointer_name() {
             && dvn.contains(".call(mem[ptr3:ret_7_0]);")
     );
 }
+
+#[test]
+fn untested_arithmetic_is_marked_and_gas_is_named_where_it_is_read() {
+    let router = regress("via_ir_router.hex").source;
+    assert!(
+        router.contains("v17 = ret_1_0 - v12;"),
+        "a difference the code tests before it is printed bare"
+    );
+    assert!(router.contains("unchecked((v13 << 144) - checked(arg7 * v12))"));
+    let read = router.find("gasleft_8 = gasleft();").expect("the read");
+    let used = router[read..]
+        .find("unchecked(gasleft_8 + 33000)")
+        .expect("the use");
+    assert!(
+        router[read..read + used].contains(".call("),
+        "the gas is read before the swap and used after it"
+    );
+    let proxy = regress("swap_proxy.hex").source;
+    assert!(proxy.contains("v5 = unchecked(v5 + 1);"));
+    assert!(
+        !proxy.contains("unchecked(arg"),
+        "an offset into the call data is not arithmetic of the source"
+    );
+    assert!(!regress("minime_token.hex").source.contains("unchecked("));
+}

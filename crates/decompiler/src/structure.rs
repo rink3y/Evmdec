@@ -2394,6 +2394,13 @@ impl<'a> Printer<'a> {
             }
             if let Stmt::Drop(e) = s {
                 let target = expr::node(*e);
+                if matches!(target, Node::Env(op::GAS, _)) {
+                    let txt = emit::fmt_stmt(s, self.names);
+                    if !txt.is_empty() {
+                        self.line(depth, &txt);
+                    }
+                    continue;
+                }
                 if self
                     .used
                     .iter()
@@ -3201,6 +3208,7 @@ fn reason_suffix(reason: &Option<String>) -> String {
 const MAX_NESTING: usize = 400;
 
 pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
+    emit::name_gas_reads(l, names);
     let g = Graph::new(l);
     let loops = find_loops(&g);
     let mut used: Vec<ExprId> = Vec::new();

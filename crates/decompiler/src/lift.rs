@@ -2081,7 +2081,17 @@ impl<'a> Lifter<'a> {
                 }
                 op::JUMPDEST => {}
                 op::PC => st.stack.push(konst_u64(ins.pc as u64)),
-                op::MSIZE | op::GAS => st.stack.push(expr::env_seq(o)),
+                op::MSIZE => st.stack.push(expr::env_seq(o)),
+                op::GAS => {
+                    let left = expr::env_seq(o);
+                    /* The gas left is read here and may be used much later. The mark
+                    lets the text name it where it was read. The oracle counts reads by
+                    the values that are used, so it gets none. */
+                    if !self.oracle {
+                        stmts.push(Stmt::Drop(left));
+                    }
+                    st.stack.push(left);
+                }
                 op::RETURNDATASIZE => {
                     st.stack.push(if st.called {
                         expr::intern(Node::Env(o, st.returned))
@@ -2476,6 +2486,15 @@ impl<'a> Lifter<'a> {
                     let in_len = pop!();
                     let out_off = pop!();
                     let out_len = pop!();
+                    /* Gas read only to be handed to this call needs no name, and the
+                    mark would stand between the call and the writes that built its data. */
+                    if let Some(Stmt::Drop(left)) = stmts.last() {
+                        let read = expr::node(*left);
+                        let kept = st.stack.iter().any(|e| expr::contains(*e, &|n| *n == read));
+                        if matches!(read, Node::Env(op::GAS, _)) && !kept {
+                            stmts.pop();
+                        }
+                    }
                     let seq = seq_at(ins.pc, seq_ctr);
                     seq_ctr += 1;
                     let input = expr::as_const(in_len)

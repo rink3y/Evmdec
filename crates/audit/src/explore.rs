@@ -897,6 +897,19 @@ impl<'a> Explorer<'a> {
                     changed |= self.assume_from(&t, &run, entry, false);
                 }
             }
+            /* A setting only the constructor wrote can stop a user where it does not
+            stop the owner: a sale that is open, a limit on what one call may bring. The
+            user's plain call, with ether where the function takes it, is asked too. */
+            for entry in 0..self.entries.len() {
+                if set_up || self.entries[entry].view || budget::spent() {
+                    continue;
+                }
+                let t = Try::of(self.honest(entry, USER).remove(0));
+                let (_, run) = self.attempt(0, entry, &t);
+                if !run.ok {
+                    changed |= self.assume_from(&t, &run, entry, false);
+                }
+            }
             if !changed {
                 break;
             }

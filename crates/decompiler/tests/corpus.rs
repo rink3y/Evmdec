@@ -888,3 +888,21 @@ fn a_merged_value_is_assigned_on_every_way_in() {
     );
     assert!(!token.contains("stor[arg1 + 23] = 0;"));
 }
+
+#[test]
+fn a_test_settled_on_one_way_in_is_still_made_after_a_join() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/layerzero_dvn.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+    let dvn = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
+    let start = dvn.find("function func_0x176e(").expect("the batch call");
+    let body = &dvn[start..start + dvn[start..].find("\n    }").unwrap()];
+    let cleared = body.split("if (ret_5_0) {\n").skip(1);
+    assert_eq!(
+        cleared
+            .filter(|rest| rest.trim_start().starts_with("stor_8[ret_3_0] = false;"))
+            .count(),
+        2,
+        "a failed call frees its hash again on both ways out: {body}"
+    );
+}

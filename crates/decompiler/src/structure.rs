@@ -294,7 +294,7 @@ struct Printer<'a> {
     active: HashSet<usize>,
     next_tmp: u32,
     used: Vec<ExprId>,
-    facts: Vec<(ExprId, bool)>,
+    facts: Vec<(ExprId, bool, usize)>,
     stale_plan: StalePlan,
     early_reads: StalePlan,
     stored: Vec<(usize, String, ExprId)>,
@@ -1942,7 +1942,7 @@ impl<'a> Printer<'a> {
                 emit::fmt_expr(value, self.names)
             ),
         );
-        self.facts.push((cond, ok == *t));
+        self.facts.push((cond, ok == *t, ok));
         self.transfer(n, ok, stop, depth);
         self.facts.pop();
         true
@@ -2499,9 +2499,12 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn known(&self, cond: ExprId) -> Option<bool> {
+    fn known(&self, cond: ExprId, at: usize) -> Option<bool> {
         let ncond = expr::op1(op::ISZERO, cond);
-        for (c, v) in self.facts.iter().rev() {
+        /* A branch settles its test only for what can be reached through that side alone.
+        A block printed inside the side and also jumped to from elsewhere is not that. */
+        let holds = |side: usize| self.g.preds[side].len() == 1 && self.g.dominates(side, at);
+        for (c, v, _) in self.facts.iter().rev().filter(|(_, _, side)| holds(*side)) {
             if *c == cond {
                 return Some(*v);
             }
@@ -2521,7 +2524,7 @@ impl<'a> Printer<'a> {
         stop: Option<usize>,
         depth: usize,
     ) {
-        if let Some(v) = self.known(cond) {
+        if let Some(v) = self.known(cond, n) {
             match (v, t) {
                 (true, Some(t)) => {
                     self.transfer(n, t, stop, depth);
@@ -2547,7 +2550,7 @@ impl<'a> Printer<'a> {
                         reason_suffix(&reason)
                     ),
                 );
-                self.facts.push((cond, true));
+                self.facts.push((cond, true, t));
                 self.transfer(n, t, stop, depth);
                 self.facts.pop();
                 return;
@@ -2564,7 +2567,7 @@ impl<'a> Printer<'a> {
                         reason_suffix(&reason)
                     ),
                 );
-                self.facts.push((cond, false));
+                self.facts.push((cond, false, f));
                 self.transfer(n, f, stop, depth);
                 self.facts.pop();
                 return;
@@ -2618,12 +2621,12 @@ impl<'a> Printer<'a> {
             &format!("if ({}) {{", emit::fmt_truth(first_cond, self.names)),
         );
         self.active.insert(n);
-        self.facts.push((cond, first_is_true_side));
+        self.facts.push((cond, first_is_true_side, first));
         self.transfer(n, first, join, depth + 1);
         self.facts.pop();
         if first_terminal {
             self.line(depth, "}");
-            self.facts.push((cond, !first_is_true_side));
+            self.facts.push((cond, !first_is_true_side, second));
             self.transfer(n, second, stop, depth);
             self.facts.pop();
         } else if Some(second) == join {
@@ -2635,7 +2638,7 @@ impl<'a> Printer<'a> {
             self.go(second, stop, depth);
         } else {
             self.line(depth, "} else {");
-            self.facts.push((cond, !first_is_true_side));
+            self.facts.push((cond, !first_is_true_side, second));
             self.transfer(n, second, join, depth + 1);
             self.facts.pop();
             self.line(depth, "}");

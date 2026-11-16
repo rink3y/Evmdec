@@ -195,14 +195,23 @@ pub fn check(
     let mut stores = run.stores();
     let gave_up =
         stores.any(|(c, old, new, _, _)| own(c) && ledger(c) && actor_keyed(c) && new < old);
+    /* The contract told another contract to do something with the caller's address in
+    hand, and nobody here keeps books for what that was. It may have been the payment. */
+    let paid_elsewhere = run.calls.iter().any(|c| {
+        let acted = c.kind == op::CALL && c.ok && c.by == crate::trace::Answered::Blank;
+        acted && c.arg_tags.iter().any(|t| t.only(crate::trace::CALLER))
+    });
+    let top = U256::ONE << 255;
     for (cell, old, new, _, _) in run.stores() {
-        if !own(cell) {
+        // A value past half the range is a signed number below zero, not a holding.
+        if !own(cell) || old >= top || new >= top {
             continue;
         }
         let place = facts.places.get(&cell.place());
         // Whether a record that rose is worth anything is for the caller to show by using it.
         let others = cell.keyed_by(USER) || cell.keyed_by(OWNER);
-        if actor_keyed(cell) && !others && new > old && paid_nothing && !gave_up {
+        if actor_keyed(cell) && !others && new > old && paid_nothing && !gave_up && !paid_elsewhere
+        {
             found.push(Breach {
                 amount: new - old,
                 total: new,

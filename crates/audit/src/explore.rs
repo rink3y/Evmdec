@@ -128,6 +128,8 @@ pub struct Explorer<'a> {
     pub stopped: Vec<Option<(usize, String)>>,
     // For each entry, a call of the owner's that ended in the starting world.
     good: Vec<Option<Try>>,
+    // The set-up calls the starting world has been through.
+    setups: Vec<(usize, Try)>,
 }
 
 fn outside(n: usize) -> Addr {
@@ -352,6 +354,7 @@ impl<'a> Explorer<'a> {
             unspendable: HashSet::new(),
             stopped: Vec::new(),
             good: Vec::new(),
+            setups: Vec::new(),
         }
     }
 
@@ -640,7 +643,11 @@ impl<'a> Explorer<'a> {
                     }
                 }
                 // An outside answer the code compares with something is tried as that thing.
-                let asked = tag.call().filter(|_| tag.has(OUT) && !tag.has(DATA));
+                // Only the owner is whoever an outside contract names when asked who may act.
+                let names_caller = values.contains(&t.msg.from) && t.msg.from != OWNER;
+                let asked = tag
+                    .call()
+                    .filter(|_| tag.has(OUT) && !tag.has(DATA) && !names_caller);
                 let source = asked.and_then(|k| run.calls.get(k));
                 if let Some(source) =
                     source.filter(|s| matches!(s.by, Answered::Blank | Answered::Taken))
@@ -786,7 +793,11 @@ impl<'a> Explorer<'a> {
     the owner's own call is refused for the lack of it and goes further with it. */
     fn settle(&mut self) {
         for _ in 0..4 {
+            // Set-up comes before any setting is taken, so that no setting is taken for the lack of it.
             let mut changed = false;
+            while self.setups.len() < 8 && self.set_up() {
+                changed = true;
+            }
             self.good = vec![None; self.entries.len()];
             let mut refused: Vec<(usize, Try, Run)> = Vec::new();
             // What works as things are is found first, so that no setting is taken that shuts it.
@@ -815,7 +826,6 @@ impl<'a> Explorer<'a> {
                     changed |= self.assume_from(&t, &run, entry);
                 }
             }
-            changed |= self.set_up();
             if !changed {
                 break;
             }
@@ -853,6 +863,7 @@ impl<'a> Explorer<'a> {
                 }
                 self.novel(&run, &world);
                 self.states[0].world = world;
+                self.setups.push((entry, t.clone()));
                 self.states[0].steps.push(Step::Call { entry, msg: t.msg });
                 return true;
             }
@@ -1107,6 +1118,13 @@ impl<'a> Explorer<'a> {
         for (entry, t) in worked {
             let (_, run) = self.attempt_in(world.clone(), entry, &t);
             if !run.ok {
+                return true;
+            }
+        }
+        // Nor may it open again a set-up that can be made only once.
+        for (entry, t) in self.setups.clone() {
+            let (_, run) = self.attempt_in(world.clone(), entry, &t);
+            if run.ok {
                 return true;
             }
         }

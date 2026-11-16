@@ -1261,8 +1261,18 @@ impl World {
             Some(SEL_TOTAL_SUPPLY) => books((true, one_word(PURSE << 3))),
             Some(SEL_DECIMALS) => books((true, one_word(U256::from_u64(18)))),
             other => {
+                /* A contract that asks another whether an account may act is asking about
+                a role. The owner holds every role and nobody else holds any, so the
+                answer is yes for the owner and no for the rest. */
+                let about = (0..pending.args.len())
+                    .find(|i| arg_tag(*i).only(CALLER) || arg_tag(*i).only(ORIGIN));
+                let asked_of = about.map(|i| low_address(arg(i)));
+                let refused = asked_of.is_some_and(|who| who != OWNER && self.is_person(who));
                 let shaped = other.and_then(|s| self.answers.get(&(to, s)));
-                let answer = shaped.cloned().unwrap_or(yes);
+                let answer = match refused {
+                    true => one_word(U256::ZERO),
+                    false => shaped.cloned().unwrap_or(yes),
+                };
                 ((true, answer), Answered::Blank)
             }
         }

@@ -81,6 +81,9 @@ pub struct Stats {
 pub struct Report {
     pub subject: String,
     pub code_size: usize,
+    // Why nothing was run, for code this machine cannot run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_run: Option<String>,
     pub findings: Vec<Finding>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub chains: Vec<Chain>,
@@ -640,6 +643,7 @@ pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
             .clone()
             .unwrap_or_else(|| "bytecode".to_string()),
         code_size: ex.c.info.runtime.len(),
+        not_run: crate::not_runnable(&ex.c.info.runtime).map(str::to_string),
         findings,
         chains,
         functions,
@@ -662,6 +666,10 @@ pub fn markdown(report: &Report) -> String {
         "# Audit of {}\n\nCode size: {} bytes\n\n",
         report.subject, report.code_size
     );
+    if let Some(why) = &report.not_run {
+        out.push_str(&format!("## Not analysed\n\n{why}\n\n"));
+        return out;
+    }
     let s = &report.stats;
     out.push_str(&format!(
         "{} of {} functions ended under some input, over {} calls and {} kept states, in {} ms.\n\n",
@@ -736,6 +744,7 @@ pub fn merge(reports: Vec<Report>) -> Report {
         return Report {
             subject: String::new(),
             code_size: 0,
+            not_run: None,
             findings: Vec::new(),
             chains: Vec::new(),
             functions: Vec::new(),

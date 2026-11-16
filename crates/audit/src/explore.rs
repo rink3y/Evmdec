@@ -418,7 +418,22 @@ impl<'a> Explorer<'a> {
         if who == OWNER && self.entries[entry].words.contains(&Word::Address) {
             seeds.push(self.seed(entry, who, outside(0), UNIT, U256::ZERO));
         }
+        seeds.extend(self.bare_payment(entry, who));
         seeds
+    }
+
+    /* Old code has one function for a call it does not know and for ether sent with no
+    message at all. The second is how most ether reaches a contract. */
+    fn bare_payment(&self, entry: usize, who: Addr) -> Option<Msg> {
+        let e = &self.entries[entry];
+        let catch_all = e.selector.is_none() && !e.template.is_empty();
+        catch_all.then(|| Msg {
+            from: who,
+            to: self.subject,
+            data: Vec::new(),
+            value: UNIT,
+            hook: None,
+        })
     }
 
     // What an account with no role tries: itself everywhere, then another account in each place.
@@ -428,6 +443,7 @@ impl<'a> Explorer<'a> {
         if e.payable {
             seeds.insert(0, self.seed(entry, ACTOR, ACTOR, UNIT, UNIT));
         }
+        seeds.extend(self.bare_payment(entry, ACTOR));
         let addresses: Vec<usize> = (0..e.words.len())
             .filter(|i| e.words[*i] == Word::Address)
             .collect();
@@ -838,6 +854,7 @@ impl<'a> Explorer<'a> {
                 for who in [OWNER, USER, ACTOR] {
                     let plain = Try::of(self.seed(entry, who, who, UNIT, U256::ZERO));
                     let (_, run) = self.attempt(0, entry, &plain);
+                    changed |= self.assume_targets(&run);
                     let staked = self.assume_stake(&plain, &run, entry, who);
                     /* A call with a plain amount comes first. The search would get the
                     same function to end by asking for nothing, and a total that was
@@ -1161,7 +1178,14 @@ impl<'a> Explorer<'a> {
                 .raised
                 .get(&slot)
                 .is_none_or(|rests| rests.contains(&value));
-            if world.stored(subject, slot) == value || !lowered {
+            /* A slot with entries under it holds how many there are. A made-up count
+            promises entries that are not there, and every loop over them runs dry. */
+            let counts = self
+                .facts
+                .places
+                .keys()
+                .any(|p| p.root == slot && p.depth > 0);
+            if world.stored(subject, slot) == value || !lowered || counts {
                 continue;
             }
             world.seed(subject, slot, value);

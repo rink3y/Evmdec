@@ -14,6 +14,18 @@ use std::time::Instant;
 // The interpreter steps one contract may cost, whatever machine it runs on.
 pub const WORK: u64 = 40_000_000;
 
+/* No EVM contract starts with 0xef. What does is a program for another machine or a
+pointer to another account's code, and running it as EVM code would report nothing
+found about a program that was never run. */
+#[must_use]
+pub fn not_runnable(code: &[u8]) -> Option<&'static str> {
+    match code {
+        [0xef, 0x01, 0x00, ..] => Some("This account holds no code of its own. It points at another account whose code it runs, and that is the code to audit."),
+        [0xef, ..] => Some("This is not EVM bytecode. It starts with 0xef, which marks a program in another format, and this tool runs EVM code only."),
+        _ => None,
+    }
+}
+
 #[must_use]
 pub fn audit(c: &Contract) -> Report {
     audit_within(c, WORK)
@@ -24,7 +36,7 @@ pub fn audit_within(c: &Contract, work: u64) -> Report {
     let started = Instant::now();
     let before = budget::used();
     let mut explorer = explore::Explorer::new(c);
-    if !c.info.runtime.is_empty() {
+    if !c.info.runtime.is_empty() && not_runnable(&c.info.runtime).is_none() {
         explorer.explore(work);
     }
     report::build(

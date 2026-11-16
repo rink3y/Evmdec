@@ -373,21 +373,26 @@ checks and reverts. A function matches only when all six agree.
 | both, after a third round of fixes | all 22 | 157 of 182, 4 regressions from one cause |
 | both, after a fourth round of fixes | all 22 | 179 of 182, no regressions |
 | third, fresh, as found | 8 (Vyper 0.2.4 and 0.3.10, solc 0.4.24 to 0.8.23, via-IR, optimizer off, a proxy) | 51 of 89 |
+| first and second, after a fifth round of fixes | all 22 | 180 of 182, no regressions |
+| third, after the fifth round | the same 8 | 77 of 89, no regressions |
 
-The 22 contracts the fixes were made against are at 98%. The 8 the decompiler had never been
-checked on are at 57%, and that is the number that says where it stands: 230 of 271 over all
-three batches, 85%, against a target of 95 to 99%. Every function of all 30 contracts is
-found with the right selector, and the block oracle passes every one: it checks lifting, and
-these faults are made after it, in inlining, structuring and printing. Each mismatch is
-traced to a cause in the decompiler, and each cause gets a general fix and a test.
+The number that says where the decompiler stands is the one measured on contracts it had
+never been checked on: 57% in the third batch as found. After the fifth round, made against
+that batch, all 30 contracts are at 257 of 271, 95%, and a fourth fresh batch is the next
+honest measure. Every function of all 30 contracts is found with the right selector, and the
+block oracle passes every one: it checks lifting, and these faults are made after it, in
+inlining, structuring and printing. Each mismatch is traced to a cause in the decompiler,
+and each cause gets a general fix and a test.
 
-Open in the fresh batch. Wrong in 8 functions: a word read from memory printed as the
-expression last stored there although a loop or a helper has since written what the
-expression reads (5), a call's output not printed as a write when another call reads it (2),
-a write to a higher byte of a packed slot printed as a write to its lowest field (1). Right
-but unclear in 30: a call with dynamic arguments printed with only its fixed head words (13),
-a revert text printed as a hex word in raw memory writes (12), bytes written at odd offsets
-printed as halves of aligned words (4), a loop with shared tails printed with gotos (1).
+Still open after the fifth round. Wrong in 4 functions, all in one Vyper 0.2 contract and
+all one fault: the words that compiler saves and puts back around an internal call are not
+modelled, so values are restored from the wrong places and helpers are declared with dozens
+of return values. Right but unclear in 10: a call whose arguments are encoded by a helper
+is printed as a selector write, the helper and a raw call (8), and a call with two string
+tails or a re-encoding loop is printed as raw memory writes (2). One checker also noted a
+packed hash printed with a 32-byte word typed as a narrower number, which reads as fewer
+bytes than the code hashes. It was counted as a match on the six points and is a fault to
+fix.
 
 ## Quick start
 

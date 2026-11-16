@@ -298,26 +298,34 @@ set was split off once, its answer key and reports are never read during develop
 its reviewers return counts only.
 
 The target is 95 to 99% precision and recall. It is not met. Measured on the held-out set,
-234 exploited contracts and 101 with no known flaw:
+234 exploited contracts and 101 with no known flaw, scored twice by separate reviewers:
 
-| | |
-|---|---|
-| known flaws found at the right place for the right reason | 13 of 234, 5.6% |
-| more at the right place with the wrong reason | 6 |
-| findings that are correct | 25 of 49, 51.0% |
-| contracts with no known flaw that got a finding | 1 of 101, 1.0% |
-| time per contract | median 0.7 s, 90% under 2.7 s, slowest 7.5 s |
+| | first score | latest score |
+|---|---|---|
+| known flaws found at the right place for the right reason | 13 of 234, 5.6% | 12 of 234, 5.1% |
+| more at the right place with the wrong reason | 6 | 4 |
+| findings that are correct | 25 of 49, 51.0% | 23 of 48, 47.9% |
+| contracts with no known flaw that got a finding | 1 of 101, 1.0% | 1 of 101, 1.0% |
+| time per contract | median 0.7 s, slowest 7.5 s | median 0.7 s, 90% under 2.6 s, slowest 10.2 s |
 
-By kind of flaw, among those in the analysed contract: initialization 4 of 9, access control
-6 of 47, accounting 2 of 68, input validation 1 of 28, price or reading 0 of 43, re-entry 0
-of 11, signature or replay 0 of 6, arithmetic 0 of 5.
+By kind of flaw in the latest score, among those in the analysed contract: initialization 4
+of 9, access control 6 of 47, accounting 1 of 68, input validation 1 of 28, price or reading 0
+of 43, re-entry 0 of 11, signature or replay 0 of 6, arithmetic 0 of 5.
+
+On the development set, where every false finding was read and its cause fixed, the same
+build finds 17 of 231 known flaws (7.4%), 29 of its 35 findings are correct (83%), and none
+of 55 contracts with no known flaw gets a finding. The held-out set did not follow: what was
+fixed on one set of contracts was general in form and still did not reach the other set's
+flaws. That gap is the honest measure of where the tool stands.
 
 Why recall is where it is: 145 of the 234 flaws only show with a real outside contract in a
 particular state, a pool with reserves or a price source, and the tool runs one contract with
-stand-ins for the rest. Of the 89 that show on the contract alone, most are flaws of logic
-that do not come down to a missing check, and a run shows them only when the right holders,
-balances and sequence are in place. The pull request that introduced this analyzer logs
-every run and what was changed after it.
+stand-ins for the rest. Of the 89 that show on the contract alone, most are never reached:
+a diagnosis of the 82 such misses on the development set put 52 down to a flawed function
+that never ran to its end for the account with no role, because its arguments are nested
+records the tool does not build, because the state a constructor left cannot be rebuilt from
+runtime code, or because it expects a contract of the caller's to answer and call back. The
+pull request that introduced this analyzer logs every run and what was changed after it.
 
 ### Decompiler against verified source
 

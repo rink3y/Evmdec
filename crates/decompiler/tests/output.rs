@@ -208,3 +208,16 @@ fn what_a_call_returns_into_a_fixed_word_is_a_write() {
         "{out}"
     );
 }
+
+#[test]
+fn a_revert_folded_into_a_require_takes_the_values_its_ways_in_give() {
+    let out = text(
+        "6000356020358082116100185790604035811161002357005b606035811161002357005b\
+         63064a4ec660e01b60005260045260245260446000fd",
+    );
+    assert!(
+        out.contains("CustomError_064a4ec6(calldata[32], msg.data[0:32]));")
+            && out.contains("CustomError_064a4ec6(msg.data[0:32], calldata[32]));"),
+        "{out}"
+    );
+}

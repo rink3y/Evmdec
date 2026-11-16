@@ -2232,13 +2232,32 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn revert_reason(&self, mut n: usize) -> Option<Option<String>> {
+    /* A revert folded into a require loses the edges into it. The values those edges give
+    its arguments are put in, or the arguments read names nothing assigned. */
+    fn revert_reason(&self, from: usize, mut n: usize) -> Option<Option<String>> {
         let mut seen = HashSet::new();
         let mut stores: Vec<(ExprId, ExprId)> = Vec::new();
+        let mut edges: Vec<&[(ExprId, ExprId)]> = Vec::new();
+        let mut prev = from;
         loop {
             if !seen.insert(n) {
                 return None;
             }
+            edges.push(
+                self.l
+                    .edge_assigns
+                    .get(&(prev, n))
+                    .map_or(&[], |a| a.as_slice()),
+            );
+            let entering = |e: ExprId| {
+                edges.iter().rev().fold(e, |e, edge| {
+                    let given = |nd: &Node| {
+                        let var = edge.iter().find(|(var, _)| expr::node(*var) == *nd);
+                        var.map(|(_, value)| *value)
+                    };
+                    expr::substitute(e, &given, &mut HashMap::new())
+                })
+            };
             let nd = &self.l.nodes[n];
             if !nd.stmts.iter().all(|s| matches!(s, Stmt::MStore { .. })) {
                 return None;
@@ -2251,16 +2270,20 @@ impl<'a> Printer<'a> {
                     ..
                 } = s
                 {
-                    stores.push((*off, *val));
+                    stores.push((entering(*off), entering(*val)));
                 }
             }
             match &nd.term {
-                Term::Jump(t) => n = *t,
+                Term::Jump(t) => (prev, n) = (n, *t),
                 Term::Revert { data, len, off } => {
+                    let data = data
+                        .as_ref()
+                        .map(|w| w.iter().map(|x| entering(*x)).collect::<Vec<_>>());
+                    let off = &entering(*off);
                     return Some(match data {
                         Some(words) if !words.is_empty() => {
                             let p = emit::fmt_payload(
-                                words,
+                                &words,
                                 expr::as_const(*len),
                                 self.names,
                                 PayloadKind::Revert,
@@ -2343,7 +2366,7 @@ impl<'a> Printer<'a> {
         } else {
             return false;
         };
-        if self.revert_reason(revert) != Some(None) {
+        if self.revert_reason(n, revert) != Some(None) {
             return false;
         }
         let (addr, value, cond) = (*addr, *value, *cond);
@@ -3033,8 +3056,8 @@ impl<'a> Printer<'a> {
                 _ => {}
             }
         }
-        let t_rev = t.map_or(Some(None), |t| self.revert_reason(t));
-        let f_rev = self.revert_reason(f);
+        let t_rev = t.map_or(Some(None), |t| self.revert_reason(n, t));
+        let f_rev = self.revert_reason(n, f);
         let join = self.g.ipdom[n];
         if let Some(reason) = f_rev.clone() {
             if let (Some(t), None) = (t, &t_rev) {

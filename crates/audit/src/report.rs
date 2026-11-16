@@ -44,6 +44,9 @@ pub struct FunctionModel {
     pub calls_out: bool,
     pub runs_other_code: bool,
     pub writes: Vec<String>,
+    // What stopped the call that got furthest, for a function that never ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -473,6 +476,10 @@ fn models(ex: &Explorer) -> (Vec<FunctionModel>, Vec<CellModel>) {
             calls_out: facts.calls_out,
             runs_other_code: facts.runs_other_code,
             writes: facts.writes.iter().map(|p| p.root.to_hex()).collect(),
+            stopped_by: match facts.ended.is_empty() {
+                true => ex.stopped.get(i).cloned().flatten().map(|(_, why)| why),
+                false => None,
+            },
         }
     });
     let cells = ex.facts.places.iter().map(|(place, facts)| {

@@ -29,6 +29,10 @@ enum Word {
     Flag,
     Small,
     Amount,
+    // Points at where a list or a byte string starts. Never changed.
+    Offset,
+    // How many items a list holds.
+    Count,
     Other,
 }
 
@@ -83,6 +87,9 @@ pub struct Violation {
     pub by_user: bool,
 }
 
+type Told = (Addr, u32, Vec<u8>);
+type TryKey = (Vec<u8>, U256, Option<U256>, Vec<Told>);
+
 // One call to make, with what the world is taken to be when it is made.
 #[derive(Clone, Debug)]
 struct Try {
@@ -116,6 +123,10 @@ pub struct Explorer<'a> {
     known: Vec<Addr>,
     staked: HashSet<crate::trace::Place>,
     unspendable: HashSet<(crate::trace::Place, usize)>,
+    // For each entry, how far its furthest failed call got and what stopped it.
+    pub stopped: Vec<Option<(usize, String)>>,
+    // For each entry, a call of the owner's that ended in the starting world.
+    good: Vec<Option<Try>>,
 }
 
 fn outside(n: usize) -> Addr {
@@ -160,6 +171,9 @@ fn entries(c: &Contract) -> Vec<Entry> {
             let mut words = vec![Word::Other; count];
             // Heads sit one word apart only until the first parameter that takes several.
             let plain = |ty: &str| !ty.contains('(') && !(ty.contains('[') && !ty.ends_with("[]"));
+            for fixed in layout.fixed.iter().filter(|i| **i < count) {
+                words[*fixed] = Word::Offset;
+            }
             for (i, ty) in types
                 .iter()
                 .take_while(|t| plain(t))
@@ -170,12 +184,16 @@ fn entries(c: &Contract) -> Vec<Entry> {
                     words[i] = kind_of(ty);
                     continue;
                 }
+                words[i] = Word::Offset;
                 // A list of one-word items sits where its head points: a length, then the items.
                 let item = ty
                     .strip_suffix("[]")
                     .filter(|item| kind_of(item) != Word::Other);
                 let at = U256::from_be_bytes(&template[4 + 32 * i..36 + 32 * i]).as_usize();
                 if let (Some(item), Some(at)) = (item, at.map(|at| at / 32)) {
+                    if let Some(word) = words.get_mut(at) {
+                        *word = Word::Count;
+                    }
                     for k in 1..=elements {
                         if let Some(word) = words.get_mut(at + k) {
                             *word = kind_of(item);
@@ -199,6 +217,64 @@ fn entries(c: &Contract) -> Vec<Entry> {
         });
     }
     out
+}
+
+// What a failed call was refused for, as far as the run shows it.
+fn obstacle(run: &Run) -> String {
+    let said = run
+        .output
+        .get(68..)
+        .filter(|_| run.output.starts_with(&[0x08, 0xc3, 0x79, 0xa0]));
+    if let Some(text) = said {
+        let text: String = text
+            .iter()
+            .filter(|b| b.is_ascii_graphic() || **b == b' ')
+            .map(|b| *b as char)
+            .collect();
+        return format!("refused: {}", text.trim());
+    }
+    if run.output.starts_with(&[0x4e, 0x48, 0x7b, 0x71]) {
+        let code = run.output.get(35).copied().unwrap_or(0);
+        return format!("a built-in check failed (code {code:#04x})");
+    }
+    if run.halt == crate::trace::Halt::Steps {
+        return "ran past the step limit".to_string();
+    }
+    let failed_call = run.calls.iter().rev().find(|c| !c.ok);
+    let last = run.events.iter().rev().find_map(|e| match e {
+        Event::Branch { tag, .. } => Some(*tag),
+        _ => None,
+    });
+    let mut on: Vec<&str> = Vec::new();
+    if let Some(tag) = last {
+        for (bit, name) in [
+            (CALLER, "the caller"),
+            (DATA, "the call data"),
+            (VALUE, "the ether sent"),
+            (STORE, "storage"),
+            (OUT, "an outside answer"),
+            (CLOCK, "the time"),
+            (SIZE, "a length"),
+        ] {
+            if tag.has(bit) {
+                on.push(name);
+            }
+        }
+    }
+    match (failed_call, on.is_empty()) {
+        (Some(call), _)
+            if run
+                .events
+                .iter()
+                .rev()
+                .take(6)
+                .any(|e| matches!(e, Event::Returned(_))) =>
+        {
+            format!("a call out to {} failed", call.to.to_hex())
+        }
+        (_, false) => format!("a test on {} failed", on.join(" and ")),
+        _ => format!("stopped with no test in sight ({:?})", run.halt),
+    }
 }
 
 fn set_word(data: &mut Vec<u8>, index: usize, value: U256) {
@@ -272,6 +348,8 @@ impl<'a> Explorer<'a> {
             known: vec![OWNER, USER, ACTOR, ALLY, subject],
             staked: HashSet::new(),
             unspendable: HashSet::new(),
+            stopped: Vec::new(),
+            good: Vec::new(),
         }
     }
 
@@ -300,7 +378,7 @@ impl<'a> Explorer<'a> {
                 Word::Flag => U256::ONE,
                 Word::Small => U256::ZERO,
                 Word::Amount => amount,
-                Word::Other => continue,
+                Word::Offset | Word::Count | Word::Other => continue,
             };
             set_word(&mut data, i, fill);
         }
@@ -423,6 +501,15 @@ impl<'a> Explorer<'a> {
         }
         self.facts
             .observe(entry, &t.msg, &run, self.subject, &self.known);
+        if self.stopped.len() < self.entries.len() {
+            self.stopped.resize(self.entries.len(), None);
+        }
+        let further = self.stopped[entry]
+            .as_ref()
+            .is_none_or(|(edges, _)| run.edges.len() > *edges);
+        if !run.ok && further && t.msg.from == OWNER {
+            self.stopped[entry] = Some((run.edges.len(), obstacle(&run)));
+        }
         (world, run)
     }
 
@@ -437,21 +524,21 @@ impl<'a> Explorer<'a> {
     #[allow(clippy::too_many_lines)]
     fn mutations(&self, t: &Try, run: &Run, entry: usize, now: U256) -> Vec<Try> {
         let e = &self.entries[entry];
-        let free =
-            |w: usize| e.words.get(w).is_none_or(|k| *k != Word::Other) || w >= e.words.len();
+        let free = |w: usize| e.words.get(w).is_none_or(|k| *k != Word::Offset);
+        let count = |w: usize| e.words.get(w) == Some(&Word::Count);
         let mut out: Vec<Try> = Vec::new();
-        let mut seen: HashSet<(Vec<u8>, U256, Option<U256>, usize)> = HashSet::new();
+        let mut seen: HashSet<TryKey> = HashSet::new();
         let mut push = |out: &mut Vec<Try>, next: Try| {
             let key = (
                 next.msg.data.clone(),
                 next.msg.value,
                 next.time,
-                next.answers.len(),
+                next.answers.clone(),
             );
             let differs = next.msg.data != t.msg.data
                 || next.msg.value != t.msg.value
                 || next.time != t.time
-                || next.answers.len() != t.answers.len();
+                || next.answers != t.answers;
             if differs && out.len() < MAX_TRIES && seen.insert(key) {
                 out.push(next);
             }
@@ -536,7 +623,37 @@ impl<'a> Explorer<'a> {
                     for value in values {
                         let mut next = t.clone();
                         set_word(&mut next.msg.data, word, *value);
+                        // A longer list needs its items: each new one is a copy of the first.
+                        let items = value
+                            .as_usize()
+                            .filter(|n| count(word) && (1..=8).contains(n));
+                        for k in 1..items.unwrap_or(0) {
+                            let first =
+                                U256::from_be_bytes(&next.msg.data[4 + 32 * (word + 1)..][..32]);
+                            if next.msg.data.len() < 4 + 32 * (word + 2 + k) {
+                                set_word(&mut next.msg.data, word + 1 + k, first);
+                            }
+                        }
                         push(&mut out, next);
+                    }
+                }
+                // An outside answer the code compares with something is tried as that thing.
+                let asked = tag.call().filter(|_| tag.has(OUT) && !tag.has(DATA));
+                let source = asked.and_then(|k| run.calls.get(k));
+                if let Some(source) =
+                    source.filter(|s| matches!(s.by, Answered::Blank | Answered::Taken))
+                {
+                    if let Some(selector) = world::selector(&source.input) {
+                        for value in values {
+                            let mut answer = source.output.clone();
+                            answer.resize(answer.len().max(32), 0);
+                            answer[..32].copy_from_slice(&value.to_be_bytes());
+                            let mut next = t.clone();
+                            next.answers
+                                .retain(|(to, s, _)| !(*to == source.to && *s == selector));
+                            next.answers.push((source.to, selector, answer));
+                            push(&mut out, next);
+                        }
                     }
                 }
                 if tag.only(VALUE) || tag.only(VALUE | MATH) {
@@ -656,6 +773,9 @@ impl<'a> Explorer<'a> {
     fn settle(&mut self) {
         for _ in 0..4 {
             let mut changed = false;
+            self.good = vec![None; self.entries.len()];
+            let mut refused: Vec<(usize, Try, Run)> = Vec::new();
+            // What works as things are is found first, so that no setting is taken that shuts it.
             for entry in 0..self.entries.len() {
                 for who in [OWNER, USER, ACTOR] {
                     let plain = Try::of(self.seed(entry, who, who, UNIT, U256::ZERO));
@@ -668,11 +788,17 @@ impl<'a> Explorer<'a> {
                     }
                     let (best, _, run) = self.solve(0, entry, Try::of(seed));
                     changed |= self.assume_targets(&run);
-                    changed |= self.assume_owner(&run);
+                    changed |= self.assume_owner(&best, &run, entry);
                     if run.ok {
+                        self.good[entry] = Some(best);
                         break;
                     }
-                    changed |= self.assume_from(&best, &run, entry);
+                    refused.push((entry, best, run));
+                }
+            }
+            for (entry, t, run) in refused {
+                if self.good[entry].is_none() {
+                    changed |= self.assume_from(&t, &run, entry);
                 }
             }
             changed |= self.set_up();
@@ -690,7 +816,12 @@ impl<'a> Explorer<'a> {
             if self.entries[entry].view {
                 continue;
             }
-            for seed in self.honest(entry, OWNER) {
+            let own = [
+                self.seed(entry, OWNER, OWNER, UNIT, U256::ZERO),
+                self.seed(entry, OWNER, OWNER, UNIT, UNIT),
+            ];
+            let seeds = if self.entries[entry].payable { 2 } else { 1 };
+            for seed in own.into_iter().take(seeds) {
                 if budget::spent() {
                     return false;
                 }
@@ -812,108 +943,122 @@ impl<'a> Explorer<'a> {
     /* Old code does not refuse a caller it does not know. It skips the body and ends.
     So a cell the caller is compared with is taken to name the owner whether or not the
     call failed for the lack of it. */
-    fn assume_owner(&mut self, run: &Run) -> bool {
-        let mut changed = false;
+    fn assume_owner(&mut self, t: &Try, run: &Run, entry: usize) -> bool {
+        let subject = self.subject;
+        let mut empty: Vec<(usize, U256)> = Vec::new();
         for event in &run.events {
             let Event::Cmp {
+                pc,
                 op: op::EQ,
                 a,
                 b,
                 ta,
                 tb,
-                ..
             } = event
             else {
                 continue;
             };
-            for (caller, value, other) in [(ta, a, tb), (tb, b, ta)] {
+            for (caller, value, other, named) in [(ta, a, tb, b), (tb, b, ta, a)] {
                 let stored = other.has(STORE) && !other.has(DATA);
-                let cell = run.cell_of(*other).filter(|c| c.account == self.subject);
-                let (true, true, Some(cell)) =
-                    (caller.only(CALLER) && *value == OWNER, stored, cell)
-                else {
-                    continue;
-                };
-                let held = self.states[0].world.stored(self.subject, cell.slot);
-                if !low_address(held).is_zero() {
+                let cell = run.cell_of(*other).filter(|c| c.account == subject);
+                let by_owner = caller.only(CALLER) && *value == OWNER;
+                if let (true, true, true, Some(cell)) = (by_owner, stored, named.is_zero(), cell) {
+                    empty.push((*pc, cell.slot));
+                }
+            }
+        }
+        let mut changed = false;
+        for (at, slot) in empty {
+            let held = self.states[0].world.stored(subject, slot);
+            // The address may sit above other fields packed into the same slot.
+            for shift in 0..12u32 {
+                let mut world = self.states[0].world.clone();
+                let named = held | (OWNER << (8 * shift));
+                world.seed(subject, slot, named);
+                let (_, again) = self.attempt_in(world, entry, t);
+                let matched = again.events.iter().any(|e| {
+                    matches!(e, Event::Cmp { pc, op: op::EQ, a, b, .. } if *pc == at && a == b && *a == OWNER)
+                });
+                if !matched {
                     continue;
                 }
-                self.states[0]
-                    .world
-                    .seed(self.subject, cell.slot, held | OWNER);
+                self.states[0].world.seed(subject, slot, named);
                 self.assumed.push(format!(
                     "slot {} names the owner, since the code compares the caller with it",
-                    cell.slot.to_hex()
+                    slot.to_hex()
                 ));
-                if let Some(place) = self.facts.places.get_mut(&cell.place()) {
-                    place.assumed = true;
-                }
                 changed = true;
+                break;
             }
         }
         changed
     }
 
+    /* The tests a failed call of the owner's last made on storage. A role the owner
+    lacks is given to it. A plain slot that reads as nothing is tried with what the
+    code compared it with, then with a total that matches the three stakes, then with a
+    plain amount. An entry under a key is left for the calls that fill it. */
     fn assume_from(&mut self, t: &Try, run: &Run, entry: usize) -> bool {
         let subject = self.subject;
         let base = &self.states[0].world;
         let mut options: Vec<(U256, U256, String)> = Vec::new();
-        for event in run.events.iter().rev() {
-            match event {
-                Event::Branch { tag, .. } if tag.has(STORE) && !tag.has(DATA | VALUE | MATH) => {
-                    let Some(cell) = run.cell_of(*tag).filter(|c| c.account == subject) else {
-                        continue;
-                    };
-                    let held = base.stored(subject, cell.slot);
-                    let by_caller = cell
-                        .keys
-                        .iter()
-                        .any(|k| k.tag.only(CALLER) && k.value == OWNER);
-                    if by_caller && held.is_zero() {
-                        let why = format!(
-                            "the owner holds the role kept at slot {}, since the code tests the caller's entry there",
-                            cell.root.to_hex()
-                        );
-                        options.push((cell.slot, U256::ONE, why));
-                        continue;
-                    }
-                    let written = self
-                        .facts
-                        .places
-                        .get(&cell.place())
-                        .is_some_and(|p| !p.writers.is_empty());
-                    if by_caller || written || tag.has(CALLER) || options.len() >= 8 {
-                        continue;
-                    }
-                    let why = format!(
-                        "slot {} is set, since the owner's call needs it",
-                        cell.slot.to_hex()
-                    );
-                    let compared = run.events.iter().filter_map(|ev| match ev {
-                        Event::Cmp { a, b, ta, tb, .. }
-                            if ta.cell == tag.cell && !tb.has(STORE) =>
-                        {
-                            Some(*b)
-                        }
-                        Event::Cmp { a, b, ta, tb, .. }
-                            if tb.cell == tag.cell && !ta.has(STORE) =>
-                        {
-                            Some(*a)
-                        }
-                        _ => None,
-                    });
-                    let mut values: Vec<U256> = compared
-                        .flat_map(|v| [v, v.wrapping_add(U256::ONE), v.wrapping_sub(U256::ONE)])
-                        .collect();
-                    values.push(U256::ONE);
-                    for value in values.into_iter().take(4) {
-                        options.push((cell.slot, value, why.clone()));
-                    }
+        let tests = run.events.iter().rev().filter_map(|e| match e {
+            Event::Branch { tag, .. } if tag.has(STORE) && !tag.has(DATA | VALUE) => Some(*tag),
+            _ => None,
+        });
+        for tag in tests.take(3) {
+            let unset = run.events.iter().filter_map(|e| match e {
+                Event::Load { cell, value } if value.is_zero() => Some(*cell),
+                _ => None,
+            });
+            let cells: Vec<usize> = match tag.cell() {
+                Some(cell) => vec![cell],
+                None => unset
+                    .filter(|c| run.cells[*c].keys.is_empty())
+                    .take(4)
+                    .collect(),
+            };
+            for index in cells {
+                let cell = &run.cells[index];
+                if cell.account != subject {
+                    continue;
                 }
-                _ => {}
+                let held = base.stored(subject, cell.slot);
+                let by_caller = cell
+                    .keys
+                    .iter()
+                    .any(|k| k.tag.only(CALLER) && k.value == OWNER);
+                if by_caller && held.is_zero() && !tag.has(MATH) {
+                    let why = format!(
+                        "the owner holds the role kept at slot {}, since the code tests the caller's entry there",
+                        cell.root.to_hex()
+                    );
+                    options.push((cell.slot, U256::ONE, why));
+                }
+                if !cell.keys.is_empty() || tag.has(CALLER) {
+                    continue;
+                }
+                let this = u16::try_from(index + 1).unwrap_or(u16::MAX);
+                let compared = run.events.iter().filter_map(|ev| match ev {
+                    Event::Cmp { b, ta, tb, .. } if ta.cell == this && !tb.has(STORE) => Some(*b),
+                    Event::Cmp { a, ta, tb, .. } if tb.cell == this && !ta.has(STORE) => Some(*a),
+                    _ => None,
+                });
+                let mut values: Vec<U256> = compared
+                    .flat_map(|v| [v, v.wrapping_add(U256::ONE), v.wrapping_sub(U256::ONE)])
+                    .take(3)
+                    .collect();
+                if held.is_zero() {
+                    values.extend([STAKE + STAKE + STAKE, UNIT, U256::ONE]);
+                }
+                let why = format!(
+                    "slot {} is set, since the owner's call needs it",
+                    cell.slot.to_hex()
+                );
+                options.extend(values.into_iter().map(|v| (cell.slot, v, why.clone())));
             }
         }
-        for (slot, value, why) in options.into_iter().take(10) {
+        for (slot, value, why) in options.into_iter().take(12) {
             if budget::spent() {
                 return false;
             }
@@ -922,10 +1067,28 @@ impl<'a> Explorer<'a> {
                 continue;
             }
             world.seed(subject, slot, value);
-            let (_, next) = self.attempt_in(world, entry, t);
-            if better(&next, run) {
+            let (_, next) = self.attempt_in(world.clone(), entry, t);
+            if better(&next, run) && !self.breaks_others(&world, entry) {
                 self.states[0].world.seed(subject, slot, value);
                 self.assumed.push(why);
+                return true;
+            }
+        }
+        false
+    }
+
+    // A setting one call needs must not shut the calls that worked without it.
+    fn breaks_others(&mut self, world: &World, but: usize) -> bool {
+        let worked: Vec<(usize, Try)> = self
+            .good
+            .iter()
+            .enumerate()
+            .filter(|(entry, _)| *entry != but)
+            .filter_map(|(entry, t)| Some((entry, t.clone()?)))
+            .collect();
+        for (entry, t) in worked {
+            let (_, run) = self.attempt_in(world.clone(), entry, &t);
+            if !run.ok {
                 return true;
             }
         }

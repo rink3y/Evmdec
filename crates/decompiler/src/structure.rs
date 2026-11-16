@@ -321,7 +321,7 @@ struct Printer<'a> {
     early_reads: StalePlan,
     scope: HashMap<usize, Vec<(ExprId, String)>>,
     left: HashMap<usize, HashMap<ExprId, String>>,
-    given: HashSet<(ExprId, String)>,
+    given: HashMap<(ExprId, String), usize>,
     stored: Vec<(usize, String, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
     // Filled while the printer's &self methods run, hence the cell.
@@ -452,7 +452,7 @@ fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) ->
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Overwritten {
-    Slot(ExprId),
+    Slot(ExprId, bool),
     Balance,
     Memory(ExprId),
 }
@@ -477,7 +477,9 @@ fn stale_loads_in(
             _ => {}
         }
         let stale = match (expr::node(x), what) {
-            (Node::SLoad(k, false, g), Overwritten::Slot(key)) => k == key && g <= gen,
+            (Node::SLoad(k, t, g), Overwritten::Slot(key, transient)) => {
+                k == key && t == transient && g <= gen
+            }
             (Node::Env(op::SELFBALANCE, g), Overwritten::Balance) => g <= gen,
             (Node::MLoad(at, g), Overwritten::Memory(addr)) => at == addr && g <= gen,
             _ => false,
@@ -506,10 +508,10 @@ fn overwrites(st: &Stmt, names: &Names) -> Option<(Overwritten, u32)> {
     match st {
         Stmt::SStore {
             key,
-            transient: false,
+            transient,
             gen,
             ..
-        } => Some((Overwritten::Slot(*key), *gen)),
+        } => Some((Overwritten::Slot(*key, *transient), *gen)),
         Stmt::Call { gen: Some(g), .. } => Some((Overwritten::Balance, *g)),
         Stmt::Internal {
             gen: Some(g),
@@ -529,8 +531,8 @@ fn overwrites(st: &Stmt, names: &Names) -> Option<(Overwritten, u32)> {
     }
 }
 
-fn earliest_loads(l: &Lifted) -> HashMap<Overwritten, u32> {
-    let mut earliest: HashMap<Overwritten, u32> = HashMap::new();
+fn loads_of(l: &Lifted) -> HashMap<Overwritten, Vec<(ExprId, u32)>> {
+    let mut loads: HashMap<Overwritten, Vec<(ExprId, u32)>> = HashMap::new();
     let mut seen: HashSet<ExprId> = HashSet::new();
     let mut pending: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
     pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
@@ -540,17 +542,18 @@ fn earliest_loads(l: &Lifted) -> HashMap<Overwritten, u32> {
         }
         let read = match expr::node(e) {
             Node::MLoad(addr, version) => Some((Overwritten::Memory(addr), version)),
-            Node::SLoad(key, false, version) => Some((Overwritten::Slot(key), version)),
+            Node::SLoad(key, transient, version) => {
+                Some((Overwritten::Slot(key, transient), version))
+            }
             Node::Env(op::SELFBALANCE, version) => Some((Overwritten::Balance, version)),
             _ => None,
         };
         if let Some((what, version)) = read {
-            let first = earliest.entry(what).or_insert(version);
-            *first = (*first).min(version);
+            loads.entry(what).or_default().push((e, version));
         }
         pending.extend(expr::children(e));
     }
-    earliest
+    loads
 }
 
 fn memory_forward(stmts: &[Stmt], i: usize) -> Option<ExprId> {
@@ -579,7 +582,9 @@ fn memory_forward(stmts: &[Stmt], i: usize) -> Option<ExprId> {
 
 fn prev_name(what: Overwritten, names: &Names) -> String {
     prev_of(&match what {
-        Overwritten::Slot(key) => emit::fmt_slot(key, names, emit::SlotSpace::Persistent),
+        Overwritten::Slot(key, transient) => {
+            emit::fmt_slot(key, names, emit::SlotSpace::from_transient(transient))
+        }
         Overwritten::Balance => "balance".to_string(),
         Overwritten::Memory(addr) => emit::fmt_mem_word(addr, names),
     })
@@ -727,22 +732,16 @@ fn plan_early_reads(l: &Lifted, names: &Names, kept: &mut Kept) {
             (Some((op::BALANCE, _)), _) => "prev_account_balance".to_string(),
             (Some((op::EXTCODESIZE, _)), _) => "prev_code_size".to_string(),
             (Some(_), _) => "prev_code_hash".to_string(),
-            (None, Node::SLoad(key, ..)) => prev_name(Overwritten::Slot(key), names),
+            (None, Node::SLoad(key, ..)) => prev_name(Overwritten::Slot(key, false), names),
             (None, Node::MLoad(..)) => "prev_mem".to_string(),
             (None, _) => prev_of(&emit::fmt_expr(read, names)),
-        };
-        let n = kept.counts.entry(base.clone()).or_insert(0);
-        *n += 1;
-        let name = match *n {
-            1 => base,
-            n => base.replacen("prev_", &format!("prev{n}_"), 1),
         };
         kept.named.push(Snapshot {
             read,
             version: made.get(&read).copied(),
             gen,
             at: (node, i),
-            name,
+            name: base,
             early: true,
         });
     }
@@ -789,7 +788,7 @@ fn last_at(nd: &lift::LNode, version: u32) -> Option<usize> {
 
 fn read_version(e: ExprId, names: &Names) -> Option<u32> {
     match expr::node(e) {
-        Node::SLoad(_, false, version) | Node::Env(op::SELFBALANCE, version) => Some(version),
+        Node::SLoad(_, _, version) | Node::Env(op::SELFBALANCE, version) => Some(version),
         _ => named_field(e, names).map(|(_, version)| version),
     }
 }
@@ -807,6 +806,7 @@ fn settle(
     early: &mut StalePlan,
 ) -> HashMap<usize, Vec<(ExprId, String)>> {
     let mut scope: HashMap<usize, Vec<(ExprId, String)>> = HashMap::new();
+    let mut names = HashMap::new();
     kept.named.sort_by_key(|s| (s.gen, s.at, s.read.0));
     let mut wanted: HashSet<ExprId> = HashSet::new();
     kept.named.retain(|s| wanted.insert(s.read));
@@ -849,11 +849,12 @@ fn settle(
             uses.extend(used_after(w).then_some(w.0));
             uses
         };
-        let live: Vec<(usize, usize)> = writes
+        let after: Vec<Vec<usize>> = writes.iter().map(uses_after).collect();
+        let used = writes
             .iter()
-            .filter(|w| !uses_after(w).is_empty())
-            .copied()
-            .collect();
+            .zip(&after)
+            .filter(|(_, uses)| !uses.is_empty());
+        let live: Vec<(usize, usize)> = used.map(|(w, _)| *w).collect();
         let under = |a: &(usize, usize), b: &(usize, usize)| match a.0 == b.0 {
             true => a.1 < b.1,
             false => g.dominates(a.0, b.0),
@@ -866,7 +867,7 @@ fn settle(
         let Some(first) = roots.first() else {
             continue;
         };
-        let old: Vec<usize> = live.iter().flat_map(uses_after).collect();
+        let old: Vec<usize> = after.into_iter().flatten().collect();
         let covered = roots.len() == 1 && old.iter().all(|n| g.dominates(first.0, *n));
         let mut above = (!covered).then_some(first.0);
         for n in roots.iter().map(|w| w.0).chain(old.iter().copied()) {
@@ -874,10 +875,10 @@ fn settle(
         }
         let up = std::iter::successors(above, |n| g.idom[*n].filter(|d| d != n));
         let read_at = |n: usize| Some((n, last_at(&l.nodes[n], s.version?)?));
-        let defs = match (up.into_iter().find_map(read_at), s.version) {
-            (Some(def), _) => vec![def],
-            (None, Some(_)) => roots,
-            (None, None) => vec![s.at],
+        let defs = match up.into_iter().find_map(read_at) {
+            Some(def) => vec![def],
+            None if s.early && s.version.is_none() => vec![s.at],
+            None => roots,
         };
         let placed: Vec<usize> = defs.iter().map(|d| d.0).collect();
         let next = live.iter().flat_map(|w| g.succs[w.0].iter().copied());
@@ -895,20 +896,36 @@ fn settle(
                 true => &mut *stale,
                 false => &mut *early,
             };
-            plan.entry(def).or_default().push((s.read, s.name.clone()));
+            // Reads of one slot share a name. A call's reads are of different things.
+            let name = names.entry((def, s.name.clone(), s.early.then_some(s.read)));
+            let name = name.or_insert_with(|| numbered(&mut kept.counts, &s.name));
+            plan.entry(def).or_default().push((s.read, name.clone()));
             for n in within {
-                scope.entry(n).or_default().push((s.read, s.name.clone()));
+                scope.entry(n).or_default().push((s.read, name.clone()));
             }
         }
     }
     scope
 }
 
+fn numbered(counts: &mut HashMap<String, u32>, base: &str) -> String {
+    let n = counts.entry(base.to_string()).or_insert(0);
+    *n += 1;
+    match *n {
+        1 => base.to_string(),
+        n => base.replacen("prev_", &format!("prev{n}_"), 1),
+    }
+}
+
+fn fixed(what: Overwritten) -> bool {
+    matches!(what, Overwritten::Memory(addr) if expr::is_const(addr))
+}
+
 // Printing these loads as the slot name would read the new value.
 fn plan_stale_loads(l: &Lifted, names: &Names, kept: &mut Kept) -> StalePlan {
     let mut plan: HashMap<(usize, usize), Vec<(ExprId, String)>> = HashMap::new();
     let mut found: Vec<(usize, usize, Overwritten, u32, Vec<ExprId>)> = Vec::new();
-    let earliest = earliest_loads(l);
+    let loads = loads_of(l);
     for nd in &l.nodes {
         for (i, st) in nd.stmts.iter().enumerate() {
             let Some((what, gen)) = overwrites(st, names) else {
@@ -916,7 +933,9 @@ fn plan_stale_loads(l: &Lifted, names: &Names, kept: &mut Kept) -> StalePlan {
             };
             // Only a read made before the write can be stale.
             // Without one, looking through everything after the write finds nothing.
-            if earliest.get(&what).is_none_or(|first| *first > gen) {
+            let old = loads.get(&what).into_iter().flatten();
+            let old: Vec<ExprId> = old.filter(|(_, v)| *v <= gen).map(|(e, _)| *e).collect();
+            if old.is_empty() {
                 continue;
             }
             let in_block_only = matches!(what, Overwritten::Memory(_));
@@ -931,7 +950,7 @@ fn plan_stale_loads(l: &Lifted, names: &Names, kept: &mut Kept) -> StalePlan {
                 _ => Vec::new(),
             };
             let field = |x: ExprId| {
-                let Overwritten::Slot(key) = what else {
+                let Overwritten::Slot(key, false) = what else {
                     return None;
                 };
                 let (read, version) = named_field(x, names).filter(|(f, _)| f.key == key)?;
@@ -945,6 +964,12 @@ fn plan_stale_loads(l: &Lifted, names: &Names, kept: &mut Kept) -> StalePlan {
             let mut stale: Vec<ExprId> = Vec::new();
             for e in after {
                 stale_loads_in(e, what, gen, skip, &field, &mut stale);
+            }
+            /* A word at a fixed address is a variable of the code. What was read from it
+            before the store is looked for in every later block, not only in this one. */
+            if fixed(what) {
+                let found: HashSet<ExprId> = stale.iter().copied().collect();
+                stale.extend(old.into_iter().filter(|e| !found.contains(e)));
             }
             if stale.is_empty() {
                 continue;
@@ -961,7 +986,7 @@ fn plan_stale_loads(l: &Lifted, names: &Names, kept: &mut Kept) -> StalePlan {
     }
     for (node, i, what, gen, stale) in found {
         let per_store = matches!(what, Overwritten::Memory(_));
-        for e in stale.iter().filter(|_| !per_store) {
+        for e in stale.iter().filter(|_| !per_store || fixed(what)) {
             kept.overwritten.entry(*e).or_default().push((node, i));
         }
         let mine: Vec<ExprId> = stale
@@ -972,33 +997,26 @@ fn plan_stale_loads(l: &Lifted, names: &Names, kept: &mut Kept) -> StalePlan {
             continue;
         }
         let mut tmps: HashMap<String, String> = HashMap::new();
-        let named = mine.into_iter().map(|e| {
-            let base = match emit::field_name(e, names) {
+        for read in mine {
+            let name = match emit::field_name(read, names) {
                 Some(field) => prev_of(&field),
                 None => prev_name(what, names),
             };
-            let tmp = tmps.entry(base.clone()).or_insert_with(|| {
-                let n = kept.counts.entry(base.clone()).or_insert(0);
-                *n += 1;
-                match *n {
-                    1 => base,
-                    n => base.replacen("prev_", &format!("prev{n}_"), 1),
-                }
-            });
-            (e, tmp.clone())
-        });
-        for (read, name) in named {
-            match read_version(read, names).filter(|_| !per_store) {
-                Some(version) => kept.named.push(Snapshot {
+            let version = read_version(read, names).filter(|_| !per_store);
+            if version.is_some() || fixed(what) {
+                kept.named.push(Snapshot {
                     read,
-                    version: Some(version),
+                    version,
                     gen,
                     at: (node, i),
                     name,
                     early: false,
-                }),
-                None => plan.entry((node, i)).or_default().push((read, name)),
+                });
+                continue;
             }
+            let tmp = tmps.entry(name.clone());
+            let tmp = tmp.or_insert_with(|| numbered(&mut kept.counts, &name));
+            plan.entry((node, i)).or_default().push((read, tmp.clone()));
         }
     }
     plan
@@ -1982,6 +2000,10 @@ impl<'a> Printer<'a> {
         if s.is_empty() {
             return;
         }
+        // A name declared in a block is gone where the block ends. A label is no end.
+        if !s.ends_with(':') {
+            self.given.retain(|_, at| *at <= depth);
+        }
         for (name, def) in self.names.take_temps() {
             for _ in 0..depth {
                 self.out.push_str("    ");
@@ -2234,7 +2256,9 @@ impl<'a> Printer<'a> {
         let left = self.left.get(&n).filter(|_| !entering).cloned();
         let named = left.unwrap_or_else(|| {
             let named = self.scope.get(&n).cloned().unwrap_or_default();
-            let given = named.into_iter().filter(|name| self.given.contains(name));
+            let given = named
+                .into_iter()
+                .filter(|name| self.given.contains_key(name));
             given.rev().collect()
         });
         if *self.names.stale.borrow() != named {
@@ -2244,20 +2268,23 @@ impl<'a> Printer<'a> {
     }
 
     fn early(&mut self, at: (usize, usize), depth: usize) {
-        for (read, name) in self.early_reads.get(&at).cloned().unwrap_or_default() {
-            if self.names.stale.borrow().contains_key(&read) {
+        let named = self.early_reads.get(&at).cloned().unwrap_or_default();
+        for (i, (read, name)) in named.iter().enumerate() {
+            if self.names.stale.borrow().contains_key(read) {
                 continue;
             }
             // A slot whose value was just put in memory would print as that memory word.
-            let current = match (emit::field_name(read, self.names), expr::node(read)) {
-                (None, Node::SLoad(key, false, _)) => {
-                    emit::fmt_slot(key, self.names, emit::SlotSpace::Persistent)
+            let current = match (emit::field_name(*read, self.names), expr::node(*read)) {
+                (None, Node::SLoad(key, transient, _)) => {
+                    emit::fmt_slot(key, self.names, emit::SlotSpace::from_transient(transient))
                 }
-                _ => emit::fmt_expr(read, self.names),
+                _ => emit::fmt_expr(*read, self.names),
             };
-            self.line(depth, &format!("uint256 {name} = {current};"));
-            self.given.insert((read, name.clone()));
-            self.names.replace_stale([(read, name)]);
+            if !named[..i].iter().any(|(_, earlier)| earlier == name) {
+                self.line(depth, &format!("uint256 {name} = {current};"));
+            }
+            self.given.insert((*read, name.clone()), depth);
+            self.names.replace_stale([(*read, name.clone())]);
         }
     }
 
@@ -2308,6 +2335,8 @@ impl<'a> Printer<'a> {
                 let current = emit::fmt_mem_word(*off, self.names);
                 let def = format!("uint256 {} = {};", stale[0].1, current);
                 replaced = stale.clone();
+                self.given
+                    .extend(replaced.iter().cloned().map(|name| (name, depth)));
                 self.line(depth, &def);
             }
             if dead.contains(&i) || self.skipped.borrow().contains(&(n, i)) {
@@ -2333,15 +2362,17 @@ impl<'a> Printer<'a> {
                     }
                     let current = match (emit::field_name(*read, self.names), what) {
                         (Some(field), _) => field,
-                        (None, Overwritten::Slot(key)) => {
-                            emit::fmt_slot(key, self.names, emit::SlotSpace::Persistent)
+                        (None, Overwritten::Slot(key, transient)) => {
+                            let space = emit::SlotSpace::from_transient(transient);
+                            emit::fmt_slot(key, self.names, space)
                         }
                         (None, Overwritten::Balance) => "address(this).balance".to_string(),
                         (None, Overwritten::Memory(addr)) => emit::fmt_mem_word(addr, self.names),
                     };
                     self.line(depth, &format!("uint256 {tmp} = {current};"));
                 }
-                self.given.extend(loads.iter().cloned());
+                self.given
+                    .extend(loads.iter().cloned().map(|name| (name, depth)));
                 self.names.replace_stale(loads);
             }
             self.early((n, i), depth);
@@ -3203,7 +3234,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
         early_reads,
         scope,
         left: HashMap::new(),
-        given: HashSet::new(),
+        given: HashMap::new(),
         stored: Vec::new(),
         dead_stores: stores_dead_until_exit(l)
             .into_iter()
@@ -3256,7 +3287,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
             early_reads: std::mem::take(&mut p.early_reads),
             scope: std::mem::take(&mut p.scope),
             left: HashMap::new(),
-            given: HashSet::new(),
+            given: HashMap::new(),
             stored: Vec::new(),
             dead_stores: std::mem::take(&mut p.dead_stores),
             skipped: Default::default(),

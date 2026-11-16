@@ -1140,3 +1140,28 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
         "the lock is read after the permit ran"
     );
 }
+
+#[test]
+fn a_read_made_before_a_write_is_not_printed_as_one_made_after() {
+    let ramp = regress("vyper_sparse_table.hex").source;
+    assert!(
+        ramp.contains(
+            "uint256 prev_mem_0x180 = mem[0x180];\n        \
+             mem[0x180] = mem[0xe0] * (1320 - mem[0x180]);"
+        ),
+        "a word at a fixed address is kept before it is written: {ramp}"
+    );
+    assert!(ramp.contains("stor_8 = stor_8 + mem[0xe0] * (1320 - prev_mem_0x180);"));
+    let router = regress("via_ir_router.hex").source;
+    let start = router.find("function uniswapV3SwapCallback(").unwrap();
+    let callback = &router[start..start + router[start..].find("\n    }").unwrap()];
+    let cleared = callback.find("tstor_0xd879").expect("the pool slot");
+    let checked = callback.find("require(msg.sender == address(prev_tstor_0xd879");
+    assert!(
+        checked.is_some_and(|at| at > cleared),
+        "the caller is compared with the pool read before the slot was cleared: {callback}"
+    );
+    assert!(router.contains("0 - prev_tstor_0xcf25"));
+    assert_eq!(undeclared_old_values(&ramp), Vec::<String>::new());
+    assert_eq!(undeclared_old_values(&router), Vec::<String>::new());
+}

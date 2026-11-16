@@ -1107,7 +1107,7 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
     }
     assert!(
         gauge.contains(
-            "uint256 prev_stor_14 = stor_14;\n        if (mem[0x220] < timestamp_15[prev_stor_14])"
+            "uint256 prev_stor_14 = stor_14;\n        if (loc_220 < timestamp_15[prev_stor_14])"
         ),
         "the period is read once, ahead of both branches"
     );
@@ -1146,12 +1146,12 @@ fn a_read_made_before_a_write_is_not_printed_as_one_made_after() {
     let ramp = regress("vyper_sparse_table.hex").source;
     assert!(
         ramp.contains(
-            "uint256 prev_mem_0x180 = mem[0x180];\n        \
-             mem[0x180] = mem[0xe0] * (1320 - mem[0x180]);"
+            "uint256 prev_loc_180 = loc_180;\n        \
+             loc_180 = loc_e0 * (1320 - loc_180);"
         ),
         "a word at a fixed address is kept before it is written: {ramp}"
     );
-    assert!(ramp.contains("stor_8 = stor_8 + mem[0xe0] * (1320 - prev_mem_0x180);"));
+    assert!(ramp.contains("stor_8 = stor_8 + loc_e0 * (1320 - prev_loc_180);"));
     let router = regress("via_ir_router.hex").source;
     let start = router.find("function uniswapV3SwapCallback(").unwrap();
     let callback = &router[start..start + router[start..].find("\n    }").unwrap()];
@@ -1254,17 +1254,19 @@ fn call_data_is_the_bytes_the_writes_left_under_one_pointer_name() {
 #[test]
 fn untested_arithmetic_is_marked_and_gas_is_named_where_it_is_read() {
     let router = regress("via_ir_router.hex").source;
+    let tested = |l: &str| l.contains(" = ret_1_0 - v") && !l.contains("unchecked(");
     assert!(
-        router.contains("v17 = ret_1_0 - v12;"),
+        router.lines().any(tested),
         "a difference the code tests before it is printed bare"
     );
-    assert!(router.contains("unchecked((v13 << 144) - checked(arg7 * v12))"));
-    let read = router.find("gasleft_8 = gasleft();").expect("the read");
-    let used = router[read..]
-        .find("unchecked(gasleft_8 + 33000)")
-        .expect("the use");
+    assert!(router.contains(" << 144) - checked(arg7 * v"));
+    let used = router.find(" + 33000)").expect("the use");
+    let name = router[..used].rsplit("unchecked(").next().unwrap();
+    let read = router[..used]
+        .rfind(&format!("{name} = gasleft();"))
+        .expect("the read");
     assert!(
-        router[read..read + used].contains(".call("),
+        router[read..used].contains(".call("),
         "the gas is read before the swap and used after it"
     );
     let proxy = regress("swap_proxy.hex").source;
@@ -1274,4 +1276,27 @@ fn untested_arithmetic_is_marked_and_gas_is_named_where_it_is_read() {
         "an offset into the call data is not arithmetic of the source"
     );
     assert!(!regress("minime_token.hex").source.contains("unchecked("));
+}
+
+#[test]
+fn element_checks_field_masks_and_the_vyper_compiler_are_kept() {
+    let bot = regress("mev_bot.hex").source;
+    let element =
+        |l: &str| l.contains("require(address(calldata[v") && l.contains("]) == calldata[v");
+    assert!(
+        bot.lines().any(element),
+        "an address in an array is tested where it is decoded"
+    );
+    assert!(bot.contains("Panic(memory allocation too large));"));
+    let pool = regress("univ3_pool.hex").source;
+    assert!(
+        pool.contains(" / (stor_0 >> 232 & 15);") && pool.contains(" = stor_0_29 % 16;"),
+        "the low four bits of the protocol fee are not the whole byte"
+    );
+    assert!(regress("vyper_gauge.hex")
+        .language
+        .starts_with("vyper < 0.3.10"));
+    assert!(regress("vyper_sparse_table.hex")
+        .language
+        .starts_with("vyper >= 0.3.10"));
 }

@@ -807,7 +807,12 @@ fn is_abi_validator(cond: ExprId) -> bool {
     let Node::Op(op::EQ, v) = expr::node(cond) else {
         return false;
     };
-    let is_param = |e: ExprId| matches!(expr::node(e), Node::CallDataLoad(_));
+    /* The type in the signature says this of a parameter in the head. For a word found
+    through an offset, an element of an array say, only the test itself says it. */
+    let is_param = |e: ExprId| match expr::node(e) {
+        Node::CallDataLoad(at) => calldata_word_index(at).is_some(),
+        _ => false,
+    };
     let cleaned = |x: ExprId, y: ExprId| -> bool {
         match expr::node(y) {
             Node::Op(op::AND, w) => {
@@ -839,7 +844,7 @@ pub fn is_hidden_require(cond: ExprId, data: Option<&[ExprId]>, n: &Names) -> bo
     let len = 4 + 32 * (words.len() - 1);
     matches!(
         expr::as_const(shifted_word_len(words, 0, Some(len))),
-        Some(c) if [PANIC_OVERFLOW, PANIC_DIV_BY_ZERO, PANIC_ALLOCATION].contains(&c.low_u64())
+        Some(c) if [PANIC_OVERFLOW, PANIC_DIV_BY_ZERO].contains(&c.low_u64())
             && c.fits_u64()
     )
 }
@@ -848,7 +853,6 @@ pub const SEL_PANIC: u32 = 0x4e487b71;
 pub const SEL_ERROR: u32 = 0x08c379a0;
 const PANIC_OVERFLOW: u64 = 0x11;
 const PANIC_DIV_BY_ZERO: u64 = 0x12;
-const PANIC_ALLOCATION: u64 = 0x41;
 
 pub fn is_bool(e: ExprId, n: &Names) -> bool {
     expr::is_boolean(e)
@@ -1209,7 +1213,9 @@ pub fn packed_read(e: ExprId) -> Option<(U256, u32, u32)> {
             }
             let (k, s) = shifted_slot(v[0])?;
             let bits = m.bits();
-            if s + bits <= 256 {
+            /* A field is a whole number of bytes or one flag bit. A mask of any other
+            width takes part of a field, and naming that part would hide the mask. */
+            if s + bits <= 256 && (bits == 1 || bits.is_multiple_of(8)) {
                 Some((k, s / 8, bits))
             } else {
                 None
@@ -1374,10 +1380,15 @@ pub fn element_root(key: ExprId) -> Option<U256> {
     }
 }
 
-fn slot_name(s: U256, n: &Names, prefix: &str) -> String {
-    if let Some(name) = n.storage.get(&s) {
+fn slot_name(s: U256, n: &Names, space: SlotSpace) -> String {
+    // The names belong to storage. A transient slot with the same number is another place.
+    if let Some(name) = n.storage.get(&s).filter(|_| space == SlotSpace::Persistent) {
         return name.clone();
     }
+    let prefix = match space {
+        SlotSpace::Persistent => "stor",
+        SlotSpace::Transient => "tstor",
+    };
     if s.bits() <= 32 {
         format!("{}_{}", prefix, s.to_decimal())
     } else {
@@ -1386,12 +1397,8 @@ fn slot_name(s: U256, n: &Names, prefix: &str) -> String {
 }
 
 fn base_name(e: ExprId, n: &Names, space: SlotSpace) -> String {
-    let prefix = match space {
-        SlotSpace::Persistent => "stor",
-        SlotSpace::Transient => "tstor",
-    };
     match expr::as_const(e) {
-        Some(c) if array_element(c).is_none() => slot_name(c, n, prefix),
+        Some(c) if array_element(c).is_none() => slot_name(c, n, space),
         _ => fmt_slot(e, n, space),
     }
 }
@@ -1446,14 +1453,14 @@ fn fmt_slot_path(e: ExprId, n: &Names, space: SlotSpace) -> String {
         SlotSpace::Transient => "tstor",
     };
     if let Some(c) = expr::as_const(e) {
-        if let Some(name) = n.storage.get(&c) {
+        if let Some(name) = n.storage.get(&c).filter(|_| space == SlotSpace::Persistent) {
             if n.dyn_arrays.contains(&c) {
                 return format!("{}.length", name);
             }
             return name.clone();
         }
         if let Some((s, k)) = array_element(c) {
-            return format!("{}[{}]", slot_name(s, n, prefix), k);
+            return format!("{}[{}]", slot_name(s, n, space), k);
         }
         return if c.bits() <= 32 {
             format!("{}_{}", prefix, c.to_decimal())
@@ -1482,7 +1489,7 @@ fn fmt_slot_path(e: ExprId, n: &Names, space: SlotSpace) -> String {
                 if let Some((s, k)) = expr::as_const(a).and_then(hashed_slot) {
                     return format!(
                         "{}[{}]",
-                        slot_name(s, n, prefix),
+                        slot_name(s, n, space),
                         offset_index(&fmt_expr(b, n), k)
                     );
                 }
@@ -1495,7 +1502,7 @@ fn fmt_slot_path(e: ExprId, n: &Names, space: SlotSpace) -> String {
                         } else {
                             format!("{} + {}", fmt_expr(b, n), off.to_decimal())
                         };
-                        return format!("{}[{}]", slot_name(root, n, prefix), idx_s);
+                        return format!("{}[{}]", slot_name(root, n, space), idx_s);
                     }
                 }
             }
@@ -2690,7 +2697,8 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             data,
             invalid,
         } => {
-            if is_abi_validator(*cond) {
+            // Printing the test first would leave its parts behind as unused temporaries.
+            if !*invalid && is_hidden_require(*cond, data.as_deref(), n) {
                 return String::new();
             }
             let c = fmt_cond(*cond, n);
@@ -2702,13 +2710,6 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     let len = leading_selector(words[0], None)
                         .map(|_| U256::from_u64(4 + 32 * (words.len() as u64 - 1)));
                     let p = fmt_payload(words, len, n, PayloadKind::Revert);
-                    if n.hide_checked
-                        && (p == "Panic(arithmetic overflow)"
-                            || p == "Panic(division by zero)"
-                            || p == "Panic(memory allocation too large)")
-                    {
-                        return String::new();
-                    }
                     if p == "Panic(assert failed)" {
                         format!("assert({});", c)
                     } else if p.starts_with('"') || p.starts_with("Panic(") {

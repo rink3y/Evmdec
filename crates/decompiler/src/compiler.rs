@@ -137,6 +137,8 @@ struct Fingerprints {
     solc_prologue: bool,
     via_ir: bool,
     div_selector: bool,
+    memory_selector: bool,
+    table_dispatch: bool,
 }
 
 const WINDOW: usize = 5;
@@ -154,6 +156,7 @@ fn fingerprint(code: &[u8]) -> Fingerprints {
             op::SHR | op::SHL | op::SAR => p.shifts = true,
             op::SLT | op::LT if is_head_check(window) => p.head_checks = true,
             op::EQ if is_validator(window, mask160) => p.validators = true,
+            op::EQ if compares_stored_selector(window) => p.memory_selector = true,
             op::DIV if window.iter().rev().take(3).any(|x| x.imm == Some(two224)) => {
                 p.div_selector = true;
             }
@@ -204,6 +207,21 @@ fn prologue(insns: &[Instruction], p: &mut Fingerprints) {
     {
         p.vyper_prologue = true;
     }
+    // Vyper from 0.3.10 on takes the selector first and finds the function in a table in the code.
+    let first: Vec<u8> = insns.iter().take(4).map(|x| x.opcode).collect();
+    p.table_dispatch = first == [op::PUSH0, op::CALLDATALOAD, op::PUSH1, op::SHR]
+        && insns[2].imm.is_some_and(|v| v.low_u64() == 224);
+}
+
+// Vyper before 0.3.10 keeps the selector in the first word of memory and loads it for each test.
+fn compares_stored_selector(window: &[Instruction]) -> bool {
+    let [.., sel, at, load] = window else {
+        return false;
+    };
+    sel.opcode == op::PUSH4
+        && at.opcode == op::PUSH1
+        && at.imm.is_some_and(|v| v.is_zero())
+        && load.opcode == op::MLOAD
 }
 
 fn is_head_check(window: &[Instruction]) -> bool {
@@ -258,8 +276,8 @@ fn detect_kind(md: Option<&Metadata>, p: &Fingerprints) -> Kind {
     match md {
         Some(m) if m.compiler == "vyper" => Kind::Vyper,
         Some(m) if m.compiler == "solc" => Kind::Solc,
-        _ if p.vyper_prologue && !p.solc_prologue => Kind::Vyper,
         _ if p.solc_prologue => Kind::Solc,
+        _ if p.vyper_prologue || p.memory_selector || p.table_dispatch => Kind::Vyper,
         _ => Kind::Unknown,
     }
 }
@@ -331,7 +349,7 @@ pub fn profile(code: &[u8], md: Option<&Metadata>) -> Profile {
         ..Default::default()
     };
     if kind == Kind::Vyper && prof.version.is_none() {
-        if md.is_some() {
+        if md.is_some() || p.table_dispatch {
             prof.at_least = Some(Version::new(0, 3, 10));
         } else {
             prof.below = Some(Version::new(0, 3, 10));

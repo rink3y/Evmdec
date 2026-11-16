@@ -1,7 +1,7 @@
 use crate::budget;
 use crate::trace::{
-    join_all, Answered, CallOut, Cell, Event, Halt, Key, Run, Tag, BAL, BLOCK, CALLER, CLOCK, CMP,
-    DATA, EXT, HASH, MATH, ORIGIN, OUT, SELF, SIZE, STORE, VALUE,
+    join_all, Answered, CallOut, Cell, Event, Halt, Key, Read as Reading, Run, Tag, BAL, BLOCK,
+    CALLER, CLOCK, CMP, DATA, EXT, HASH, MATH, ORIGIN, OUT, SELF, SIZE, STORE, VALUE,
 };
 use evmdec::interp::{CallRecord, CreateRecord, Host, Machine, Outcome};
 use evmdec::keccak::keccak256;
@@ -170,6 +170,11 @@ pub struct World {
     contracts say yes with a zero, so a finding is tried again with this set and the
     answer a one. */
     pub contrary: bool,
+    pub noting: bool,
+    /* Given again in the order they were taken. A call that reads a holding before and
+    after it moves something has to get both answers back, not the first one twice. */
+    heard: Rc<Vec<Reading>>,
+    given: Vec<bool>,
     made: u64,
     chain: Option<Chain>,
 }
@@ -342,6 +347,11 @@ impl World {
         self.code_at(who).is_some()
     }
 
+    #[must_use]
+    pub fn code(&self, who: Addr) -> Option<Vec<u8>> {
+        self.code_at(who).map(|code| code.bytes.clone())
+    }
+
     fn code_at(&self, who: Addr) -> Option<Rc<Code>> {
         let placed = self.codes.get(&who).cloned();
         placed.or_else(|| self.on_chain(who)?.code(who))
@@ -387,6 +397,22 @@ impl World {
 
     pub fn answer_with(&mut self, to: Addr, selector: u32, answer: Vec<u8>) {
         Rc::make_mut(&mut self.answers).insert((to, selector), answer);
+    }
+
+    pub fn answer_as_before(&mut self, read: Vec<Reading>) {
+        self.given = vec![false; read.len()];
+        self.heard = Rc::new(read);
+    }
+
+    // A run that asks more often than the first did would otherwise read the new state halfway.
+    fn as_before(&mut self, of: Addr, asked: &[u8]) -> Option<Vec<u8>> {
+        let same = |r: &Reading| r.of == of && r.asked == asked;
+        let fresh = (0..self.heard.len()).find(|i| !self.given[*i] && same(&self.heard[*i]));
+        if let Some(at) = fresh {
+            self.given[at] = true;
+        }
+        let at = fresh.or_else(|| self.heard.iter().rposition(same))?;
+        Some(self.heard[at].said.clone())
     }
 
     #[must_use]
@@ -521,6 +547,7 @@ impl World {
                 to: msg.to,
                 spent_by_holder: Vec::new(),
                 called_back: Vec::new(),
+                read: Vec::new(),
             },
             hashes: HashMap::new(),
             cell_ids: HashMap::new(),
@@ -775,7 +802,17 @@ impl World {
                 }
                 op::BALANCE => {
                     let who = low_address(m.stack[n - 1]);
-                    Some((1, Some((self.ether_of(who), Tag::of(BAL)))))
+                    let outside = f.account == self.subject && who != self.subject;
+                    let before = outside.then(|| self.as_before(who, &[])).flatten();
+                    let held = before.map_or_else(|| self.ether_of(who), |b| word(&b, 0));
+                    if outside && self.noting {
+                        tx.run.read.push(Reading {
+                            of: who,
+                            asked: Vec::new(),
+                            said: one_word(held),
+                        });
+                    }
+                    Some((1, Some((held, Tag::of(BAL)))))
                 }
                 op::SELFBALANCE => Some((0, Some((self.ether_of(f.account), Tag::of(BAL))))),
                 op::EXTCODESIZE => {
@@ -1218,12 +1255,35 @@ impl World {
         });
         Self::event(tx, Event::Call(id));
         let fixed = f.fixed || record.kind == op::STATICCALL;
+        let events = tx.run.events.len();
         let (ok, output, tags, by) = self.dispatch(record, to, id, fixed, pending, f, tx);
+        /* A reading is a call that changed nothing. Old code makes it with the same
+        instruction it acts with, so what the call did is looked at. */
+        let acted = |e: &Event| {
+            matches!(
+                e,
+                Event::Store { .. } | Event::Pay { .. } | Event::Destroy { .. }
+            )
+        };
+        let whole = tx.run.events.len() < MAX_EVENTS;
+        let quiet = fixed || (whole && !tx.run.events[events..].iter().any(acted));
+        if self.noting && self.asks_outside(record, to, f) && ok && quiet && !output.is_empty() {
+            tx.run.read.push(Reading {
+                of: to,
+                asked: record.input.clone(),
+                said: output.clone(),
+            });
+        }
         let made = &mut tx.run.calls[id];
         (made.ok, made.by) = (ok, by);
         made.output = output.iter().copied().take(96).collect();
         Self::event(tx, Event::Returned(id));
         (ok, output, tags, id)
+    }
+
+    fn asks_outside(&self, record: &CallRecord, to: Addr, f: &Frame) -> bool {
+        let own = matches!(record.kind, op::DELEGATECALL | op::CALLCODE);
+        f.account == self.subject && to != self.subject && !own && !built_in(to)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1248,6 +1308,11 @@ impl World {
         let moves_value = record.kind == op::CALL && !record.value.is_zero();
         if moves_value && fixed {
             return said((false, Vec::new()), Answered::Blank);
+        }
+        if !self.heard.is_empty() && !moves_value && self.asks_outside(record, to, f) {
+            if let Some(answer) = self.as_before(to, &record.input) {
+                return said((true, answer), Answered::Blank);
+            }
         }
         if built_in(to) {
             let answer = match to.low_u64() {
@@ -1300,6 +1365,10 @@ impl World {
             }
             let (ok, output, mut tags) = self.nested(&inner, tx, payer);
             tags.resize(output.len().min(MAX_TAGGED), Tag::NONE);
+            if account != f.account {
+                let answer = out.call;
+                tags.iter_mut().for_each(|tag| tag.answer = answer);
+            }
             let by = match self.keeps_books(record, to, ok && !fixed, pending, f, tx) {
                 true => Answered::Books,
                 false => Answered::Code,
@@ -1497,6 +1566,24 @@ impl World {
             }
         }
         found
+    }
+
+    // The books kept here cover only the accounts this world gave a purse to.
+    #[must_use]
+    pub fn holding(&self, asset: Addr, who: Addr) -> U256 {
+        let mut data = SEL_BALANCE_OF.to_be_bytes().to_vec();
+        data.extend_from_slice(&who.to_be_bytes());
+        let ask = Msg {
+            from: ACTOR,
+            to: asset,
+            data,
+            ..Msg::default()
+        };
+        let run = self.clone().send(&ask);
+        match run.ok && run.output.len() >= 32 {
+            true => word(&run.output, 0),
+            false => U256::ZERO,
+        }
     }
 
     /* Writes a holding of the contract's own ledger for one account, in the cell the

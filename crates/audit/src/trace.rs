@@ -25,13 +25,17 @@ const MANY: u16 = u16::MAX;
 pub const DATA_WORDS: usize = 64;
 
 /* Where a word came from. `words` says which words of the call data, `cell` which
-storage cell of the run's table, `call` which call out, each counted from one. */
+storage cell of the run's table, `call` which call out, each counted from one. `answer`
+is kept apart from `call`. A word another account's code hands back keeps the tags that
+code gave it, and the older checks take a word with `call` set for an answer nobody ran
+code for. */
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Tag {
     pub bits: u16,
     pub words: u64,
     pub cell: u16,
     pub call: u16,
+    pub answer: u16,
 }
 
 fn merge(a: u16, b: u16) -> u16 {
@@ -48,6 +52,7 @@ impl Tag {
         words: 0,
         cell: 0,
         call: 0,
+        answer: 0,
     };
 
     #[must_use]
@@ -57,6 +62,7 @@ impl Tag {
             words: 0,
             cell: 0,
             call: 0,
+            answer: 0,
         }
     }
 
@@ -87,6 +93,7 @@ impl Tag {
             words: self.words | other.words,
             cell: merge(self.cell, other.cell),
             call: merge(self.call, other.call),
+            answer: merge(self.answer, other.answer),
         }
     }
 
@@ -133,6 +140,16 @@ impl Tag {
     #[must_use]
     pub fn of_several_calls(self) -> bool {
         self.call == MANY
+    }
+
+    #[must_use]
+    pub fn answer(self) -> Option<usize> {
+        (self.answer != 0 && self.answer != MANY).then(|| self.answer as usize - 1)
+    }
+
+    #[must_use]
+    pub fn read_outside(self) -> bool {
+        self.has(OUT | BAL) || self.answer != 0
     }
 }
 
@@ -290,6 +307,16 @@ pub struct Run {
     pub spent_by_holder: Vec<usize>,
     // Cells written while another contract the call reached was calling back in, and by whom.
     pub called_back: Vec<(usize, U256)>,
+    // Empty unless the world is noting. Every run would carry a copy of each answer otherwise.
+    pub read: Vec<Read>,
+}
+
+// An ether balance is kept as a question with no bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Read {
+    pub of: U256,
+    pub asked: Vec<u8>,
+    pub said: Vec<u8>,
 }
 
 impl Run {

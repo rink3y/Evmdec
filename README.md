@@ -181,7 +181,7 @@ then makes up to a few calls from every state kept, a contract that already hold
 tried, a user goes on using the contract after the account acted, and when the contract hands
 control to the account, the account calls back in.
 
-**Laws.** A finding is one of eight consequences, seen in a run:
+**Laws.** A finding is one of nine consequences, seen in a run:
 
 | consequence | what the run showed |
 |---|---|
@@ -193,6 +193,7 @@ control to the account, the account calls back in.
 | role cleared | the same cell names nobody |
 | foreign code | the contract ran, as itself, code at an address the account chose |
 | destroyed | the contract's code was removed |
+| payout on a reading | on chain state, the same call pays the account more after the account's own step on another contract whose balance or answer sized the payout, and no more once the reading is put back |
 
 **Second tests.** A consequence is re-run under a doubt before it is reported. A gain has to
 show again with unset prices and rates filled. A credit has to be spendable afterwards and

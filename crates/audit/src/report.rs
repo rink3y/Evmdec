@@ -210,8 +210,9 @@ fn source(tag: Tag, run: &Run) -> String {
     if tag.has(BAL) {
         parts.push("a balance read at that moment".into());
     }
-    if tag.has(OUT) {
-        let asked = tag.call().and_then(|k| run.calls.get(k));
+    if tag.has(OUT) || tag.answer != 0 {
+        let asked = tag.answer().or_else(|| tag.call().filter(|_| tag.has(OUT)));
+        let asked = asked.and_then(|k| run.calls.get(k));
         parts.push(match asked {
             Some(call) => {
                 let selector = crate::world::selector(&call.input);
@@ -320,7 +321,19 @@ fn consent(run: &Run, victim: Addr) -> &'static str {
 }
 
 fn step_text(ex: &Explorer, step: &Step) -> String {
+    step_on(ex, step, false)
+}
+
+// A path that leaves the contract and comes back says where each call went.
+fn step_on(ex: &Explorer, step: &Step, name_own: bool) -> String {
     match step {
+        Step::Sent { asset, to, amount } => format!(
+            "{} sends {} of {} straight to the account at {}",
+            who(ACTOR),
+            short(*amount),
+            asset_name(*asset),
+            to.to_hex()
+        ),
         Step::Wait { until } => format!("time passes until {}", until.to_decimal()),
         Step::Funded => {
             "the contract already holds ether and assets that were sent to it".to_string()
@@ -359,8 +372,13 @@ fn step_text(ex: &Explorer, step: &Step) -> String {
                 ),
                 None => String::new(),
             };
+            let at = match (msg.to == ex.subject, name_own) {
+                (true, false) => String::new(),
+                (true, true) => format!(" on the contract under test at {}", msg.to.to_hex()),
+                (false, _) => format!(" on the contract at {}", msg.to.to_hex()),
+            };
             format!(
-                "{} calls `{}`({}){value}{back}",
+                "{} calls `{}`({}){at}{value}{back}",
                 who(msg.from),
                 e.name,
                 args.join(", ")
@@ -542,6 +560,40 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
             );
             (title, cause, shown, pc)
         }
+        Kind::PayoutOnReading => {
+            let asset = v.breach.asset;
+            let cell = v.breach.cell.as_ref();
+            let at = cell.map(|c| (c.account, c.slot));
+            let store = run
+                .stores()
+                .filter(|(c, ..)| Some((c.account, c.slot)) == at);
+            let paid = pays
+                .filter(|p| p.0 == asset && party(p.2) && !party(p.1))
+                .max_by_key(|p| p.3);
+            let (tag, pc) = match (cell, store.last(), paid) {
+                (Some(_), Some(store), _) => (store.3, Some(store.4)),
+                (None, _, Some(paid)) => (paid.5, None),
+                _ => (Tag::NONE, None),
+            };
+            let (was, now) = (short(v.breach.paid_before), short(v.breach.amount));
+            let shown = match cell {
+                Some(cell) => format!(
+                    "The same call raised the account's entry in {} by {was} before its step elsewhere and by {now} after it.",
+                    cell_name(cell, run)
+                ),
+                None => format!(
+                    "The same call paid the account {was} of {} before its step elsewhere and {now} after it.",
+                    asset_name(asset)
+                ),
+            };
+            let cause = format!(
+                "The amount is {}. The account changed what is read there with a step of its own on another contract, gave the same, and was paid more. With every reading put back to what it was before the step, the call paid no more than before, so the reading is what sized the payout. {tests}",
+                source(tag, run)
+            );
+            let title =
+                "what the contract pays out rests on a reading the caller can change".to_string();
+            (title, cause, shown, pc)
+        }
         Kind::Takeover | Kind::RoleCleared => {
             let cell = v.breach.cell.as_ref();
             let store = run.stores().find(|(c, ..)| Some(*c) == cell);
@@ -629,7 +681,8 @@ fn finding(ex: &Explorer, v: &Violation) -> Finding {
         Kind::Gain | Kind::Loss | Kind::Takeover | Kind::ForeignCode | Kind::Destroyed => {
             Severity::Critical
         }
-        Kind::Credit | Kind::Debit => Severity::High,
+        Kind::PayoutOnReading if v.breach.cell.is_none() => Severity::Critical,
+        Kind::Credit | Kind::Debit | Kind::PayoutOnReading => Severity::High,
     };
     Finding {
         kind: v.breach.kind,
@@ -647,7 +700,7 @@ fn finding(ex: &Explorer, v: &Violation) -> Finding {
             .enumerate()
             .map(|(i, s)| match i < set_up {
                 true => format!("taken to have been done at set-up: {}", step_text(ex, s)),
-                false => step_text(ex, s),
+                false => step_on(ex, s, v.breach.kind == Kind::PayoutOnReading),
             })
             .collect(),
         rests_on,
@@ -658,7 +711,8 @@ fn finding(ex: &Explorer, v: &Violation) -> Finding {
 
 fn models(ex: &Explorer) -> (Vec<FunctionModel>, Vec<CellModel>) {
     let name = |i: &usize| ex.entries[*i].name.clone();
-    let functions = ex.entries.iter().enumerate().map(|(i, e)| {
+    let own = &ex.entries[..ex.own];
+    let functions = own.iter().enumerate().map(|(i, e)| {
         let facts = &ex.facts.entries[i];
         let ends_for: Vec<&'static str> = [OWNER, USER, ACTOR]
             .into_iter()
@@ -784,9 +838,7 @@ pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
     }
     let chains = chains(ex, &findings, &of);
     let (functions, cells) = models(ex);
-    let ended = ex
-        .facts
-        .entries
+    let ended = ex.facts.entries[..ex.own]
         .iter()
         .filter(|f| !f.ended.is_empty())
         .count();
@@ -805,14 +857,14 @@ pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
         cells,
         slots_in_code: crate::model::slots_in_code(
             ex.c,
-            &ex.entries
+            &ex.entries[..ex.own]
                 .iter()
                 .map(|e| (e.function, e.name.clone()))
                 .collect::<Vec<_>>(),
         ),
         assumed: ex.assumed.iter().cloned().chain(stand_ins(ex)).collect(),
         stats: Stats {
-            functions: ex.entries.len(),
+            functions: ex.own,
             functions_ended: ended,
             calls_made: ex.runs,
             states_kept: ex.states.len(),

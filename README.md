@@ -342,6 +342,11 @@ of 7. The fifth score is the first with the ninth consequence in the table above
 findings, 2 the known flaw, 1 another real issue and 1 at the right place for another reason.
 The one contract not finished counts as a miss.
 
+A sixth score, on the build that counts memory by its size and takes a wait counted from a
+stored time, gave the same findings in every contract and the same counts: 31 of 234, 52 of
+90, 4 of 101. Time per contract fell to a median of 2.5 s with 90% under 5.8 s. The same one
+contract still does not finish in 600 s, and why is not known.
+
 On the development set, where every false finding was read and its cause fixed, the latest
 reviewed build finds 35 of 231 known flaws (15.2%) by address, 53 of its 66 findings are
 correct (80%), and none of 55 contracts with no known flaw gets a finding. A contract takes

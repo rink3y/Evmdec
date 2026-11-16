@@ -376,24 +376,31 @@ checks and reverts. A function matches only when all six agree.
 | third, fresh, as found | 8 (Vyper 0.2.4 and 0.3.10, solc 0.4.24 to 0.8.23, via-IR, optimizer off, a proxy) | 51 of 89 |
 | first and second, after a fifth round of fixes | all 22 | 180 of 182, no regressions |
 | third, after the fifth round | the same 8 | 77 of 89, no regressions |
+| fourth, fresh, as found | 8 (Vyper 0.3.7, solc 0.4.24, 0.6.12, 0.7.6, 0.8.7 optimizer off, 0.8.24 and 0.8.26 via-IR, a proxy) | 64 of 89 |
 
 The number that says where the decompiler stands is the one measured on contracts it had
-never been checked on: 57% in the third batch as found. After the fifth round, made against
-that batch, all 30 contracts are at 257 of 271, 95%, and a fourth fresh batch is the next
-honest measure. Every function of all 30 contracts is found with the right selector, and the
-block oracle passes every one: it checks lifting, and these faults are made after it, in
-inlining, structuring and printing. Each mismatch is traced to a cause in the decompiler,
-and each cause gets a general fix and a test.
+never been checked on: 57% in the third batch as found and 72% in the fourth. Over all 38
+contracts it is 321 of 360, 89%, against a target of 95 to 99%. Every function of all 38 is
+found with the right selector (285 of 285 in the fourth batch), and the block oracle passes
+every one: it checks lifting, and these faults are made after it, in inlining, structuring
+and printing. Each mismatch is traced to a cause in the decompiler, and each cause gets a
+general fix and a test.
 
-Still open after the fifth round. Wrong in 4 functions, all in one Vyper 0.2 contract and
+Open in the fourth batch, all of it wrong output, in 25 functions from eight causes: a hash
+printed over memory that was written through computed addresses just before (9), the
+advance of an item pointer in an array decoder printed as a second store (8), a packed slot
+declared as one narrow member and then printed shifted under the same name (11), an
+overflow revert lost when a checked add is folded into its caller (2), a value captured on
+the wrong side of a store or a create (3), the stores of v, r, s into the input of ecrecover
+dropped in older code (3), a bitwise AND with 1 printed as a logical one (1), and the hash
+chain of a nested mapping flattened into stores to one place (1). Several functions have
+more than one. A sixth round of fixes is being made against them.
+
+Still open from the third batch. Wrong in 4 functions, all in one Vyper 0.2 contract and
 all one fault: the words that compiler saves and puts back around an internal call are not
-modelled, so values are restored from the wrong places and helpers are declared with dozens
-of return values. Right but unclear in 10: a call whose arguments are encoded by a helper
-is printed as a selector write, the helper and a raw call (8), and a call with two string
-tails or a re-encoding loop is printed as raw memory writes (2). One checker also noted a
-packed hash printed with a 32-byte word typed as a narrower number, which reads as fewer
-bytes than the code hashes. It was counted as a match on the six points and is a fault to
-fix.
+modelled. Right but unclear in 10: a call whose arguments are encoded by a helper is printed
+as a selector write, the helper and a raw call (8), and a call with two string tails or a
+re-encoding loop is printed as raw memory writes (2).
 
 ## Quick start
 

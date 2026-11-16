@@ -313,7 +313,7 @@ of 9, access control 6 of 47, accounting 1 of 68, input validation 1 of 28, pric
 of 43, re-entry 0 of 11, signature or replay 0 of 6, arithmetic 0 of 5.
 
 On the development set, where every false finding was read and its cause fixed, the same
-build finds 17 of 231 known flaws (7.4%), 29 of its 35 findings are correct (83%), and none
+build finds 17 of 231 known flaws (7.4%), 29 of its 36 findings are correct (81%), and none
 of 55 contracts with no known flaw gets a finding. The held-out set did not follow: what was
 fixed on one set of contracts was general in form and still did not reach the other set's
 flaws. That gap is the honest measure of where the tool stands.
@@ -331,10 +331,21 @@ pull request that introduced this analyzer logs every run and what was changed a
 
 Fresh verified contracts are fetched, decompiled from bytecode, and compared with their
 source function by function on six points: storage, control flow, calls, transfers, access
-checks and reverts. On the first batch of 14 contracts (solc 0.4.24 to 0.8.30, optimizer on
-and off, via-IR, five proxies, one diamond) 65 of 99 functions matched. Every mismatch was
-traced to its cause in the decompiler, and each cause gets a general fix and a test. The
-block oracle passed all of them, so it does not see faults made after lifting.
+checks and reverts. A function matches only when all six agree.
+
+| batch | contracts | functions that match |
+|---|---|---|
+| first, as found | 14 (solc 0.4.24 to 0.8.30, via-IR, five proxies, one diamond) | 65 of 99 |
+| first, after ten causes were fixed | the same 14 | 73 of 99 |
+| second, fresh | 8 (Vyper 0.2.8 and 0.4.3, solc 0.4.21 to 0.8.36, a beacon proxy) | 55 of 83 |
+
+That is 128 of 182, 70%, against a target of 95 to 99%. Every mismatch was traced to its
+cause in the decompiler, and each cause gets a general fix and a test. The block oracle
+passed every one of these functions: it checks lifting, and these faults are made after it,
+in inlining, structuring and printing. What is still open: shared code tails printed with the
+caller's stack, old-value snapshots declared where they do not cover every use, call data
+built from overlapping writes, newer Vyper selector tables, and checked arithmetic that
+prints like unchecked.
 
 ## Quick start
 

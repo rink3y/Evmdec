@@ -850,3 +850,18 @@ fn what_a_helper_writes_and_what_was_read_before_it_stay_in_the_text() {
     );
     assert!(!token.contains("require(stor[arg0] < stor[arg0]"));
 }
+
+#[test]
+fn a_field_read_before_its_slot_is_written_keeps_the_old_value() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/regress/umbrella_batch_helper.hex");
+    let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+    let helper = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
+    assert!(
+        helper.contains(
+            "uint256 prev_owner = owner;\n        owner = newOwner;\n        \
+             emit OwnershipTransferred(prev_owner, address(newOwner));"
+        ),
+        "the event carries the owner read before the store"
+    );
+}

@@ -437,6 +437,7 @@ fn stale_loads_in(
     what: Overwritten,
     gen: u32,
     skip: Option<ExprId>,
+    field: &dyn Fn(ExprId) -> Option<bool>,
     out: &mut Vec<ExprId>,
 ) {
     let mut seen = HashSet::new();
@@ -444,6 +445,11 @@ fn stale_loads_in(
     while let Some(x) = stack.pop() {
         if Some(x) == skip || !seen.insert(x) || seen.len() > 20_000 {
             continue;
+        }
+        match field(x) {
+            Some(true) if !out.contains(&x) => out.push(x),
+            Some(false) => continue,
+            _ => {}
         }
         let stale = match (expr::node(x), what) {
             (Node::SLoad(k, false, g), Overwritten::Slot(key)) => k == key && g <= gen,
@@ -456,6 +462,19 @@ fn stale_loads_in(
         }
         stack.extend(expr::children(x));
     }
+}
+
+// A named field prints by its name, so a new name for the load under it is never reached.
+fn named_field(e: ExprId, names: &Names) -> Option<(crate::ssa::FieldRef, u32)> {
+    let field = crate::ssa::field_read(e)?;
+    emit::field_name(e, names)?;
+    let mut inner = expr::children(e);
+    inner.extend(inner.clone().into_iter().flat_map(expr::children));
+    let version = inner.into_iter().find_map(|part| match expr::node(part) {
+        Node::SLoad(key, false, version) if key == field.key => Some(version),
+        _ => None,
+    })?;
+    Some((field, version))
 }
 
 fn overwrites(st: &Stmt, names: &Names) -> Option<(Overwritten, u32)> {
@@ -534,11 +553,14 @@ fn memory_forward(stmts: &[Stmt], i: usize) -> Option<ExprId> {
 }
 
 fn prev_name(what: Overwritten, names: &Names) -> String {
-    let base = match what {
+    prev_of(&match what {
         Overwritten::Slot(key) => emit::fmt_slot(key, names, emit::SlotSpace::Persistent),
         Overwritten::Balance => "balance".to_string(),
         Overwritten::Memory(addr) => emit::fmt_mem_word(addr, names),
-    };
+    })
+}
+
+fn prev_of(base: &str) -> String {
     let mut id = String::new();
     for c in base.chars() {
         if c.is_ascii_alphanumeric() || c == '_' {
@@ -606,6 +628,9 @@ fn plan_early_reads(l: &Lifted, names: &Names) -> StalePlan {
         }
         if let Node::MLoad(at, version) = expr::node(e) {
             loads.push((e, at, version));
+        }
+        if let Some((field, version)) = named_field(e, names) {
+            slots.push((e, field.key, version));
         }
         if let Node::SLoad(key, false, version) = expr::node(e) {
             slots.push((e, key, version));
@@ -676,7 +701,8 @@ fn plan_early_reads(l: &Lifted, names: &Names) -> StalePlan {
             (Some((op::EXTCODESIZE, _)), _) => "prev_code_size".to_string(),
             (Some(_), _) => "prev_code_hash".to_string(),
             (None, Node::SLoad(key, ..)) => prev_name(Overwritten::Slot(key), names),
-            (None, _) => "prev_mem".to_string(),
+            (None, Node::MLoad(..)) => "prev_mem".to_string(),
+            (None, _) => prev_of(&emit::fmt_expr(read, names)),
         };
         let n = counts.entry(base.clone()).or_insert(0);
         *n += 1;
@@ -714,9 +740,25 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
                 _ => None,
             };
             let skip = forwarded.or(memory_forward(&nd.stmts, i));
+            let written = match st {
+                Stmt::SStore { key, val, .. } => crate::ssa::field_writes(*key, *val),
+                _ => Vec::new(),
+            };
+            let field = |x: ExprId| {
+                let Overwritten::Slot(key) = what else {
+                    return None;
+                };
+                let (read, version) = named_field(x, names).filter(|(f, _)| f.key == key)?;
+                let apart = |w: &crate::ssa::FieldWrite| {
+                    w.bit_offset >= read.bit_offset + read.bits
+                        || read.bit_offset >= w.bit_offset + w.bits
+                };
+                let kept = !written.is_empty() && written.iter().all(apart);
+                Some(!kept && version <= gen)
+            };
             let mut stale: Vec<ExprId> = Vec::new();
             for e in after {
-                stale_loads_in(e, what, gen, skip, &mut stale);
+                stale_loads_in(e, what, gen, skip, &field, &mut stale);
             }
             if stale.is_empty() {
                 continue;
@@ -740,18 +782,23 @@ fn plan_stale_loads(l: &Lifted, names: &Names) -> HashMap<(usize, usize), Vec<(E
         if mine.is_empty() {
             continue;
         }
-        let base = prev_name(what, names);
-        let n = counts.entry(base.clone()).or_insert(0);
-        *n += 1;
-        let tmp = if *n == 1 {
-            base
-        } else {
-            base.replacen("prev_", &format!("prev{}_", n), 1)
-        };
-        plan.insert(
-            (node, i),
-            mine.into_iter().map(|e| (e, tmp.clone())).collect(),
-        );
+        let mut tmps: HashMap<String, String> = HashMap::new();
+        let named = mine.into_iter().map(|e| {
+            let base = match emit::field_name(e, names) {
+                Some(field) => prev_of(&field),
+                None => prev_name(what, names),
+            };
+            let tmp = tmps.entry(base.clone()).or_insert_with(|| {
+                let n = counts.entry(base.clone()).or_insert(0);
+                *n += 1;
+                match *n {
+                    1 => base,
+                    n => base.replacen("prev_", &format!("prev{n}_"), 1),
+                }
+            });
+            (e, tmp.clone())
+        });
+        plan.insert((node, i), named.collect());
     }
     plan
 }
@@ -2043,21 +2090,29 @@ impl<'a> Printer<'a> {
             }
             let rewrites_memory = matches!(s, Stmt::MStore { .. });
             if let Some(stale) = self.stale_plan.get(&(n, i)).filter(|_| !rewrites_memory) {
-                let (loads, tmp) = (stale.clone(), stale[0].1.clone());
+                let loads = stale.clone();
                 let (what, _) =
                     overwrites(s, self.names).expect("stale plan entries overwrite something");
-                let current = match what {
-                    Overwritten::Slot(key) => {
-                        emit::fmt_slot(key, self.names, emit::SlotSpace::Persistent)
+                for (at, (read, tmp)) in loads.iter().enumerate() {
+                    if loads[..at].iter().any(|(_, earlier)| earlier == tmp) {
+                        continue;
                     }
-                    Overwritten::Balance => "address(this).balance".to_string(),
-                    Overwritten::Memory(addr) => emit::fmt_mem_word(addr, self.names),
-                };
-                let def = format!("uint256 {} = {};", tmp, current);
-                self.line(depth, &def);
+                    let current = match (emit::field_name(*read, self.names), what) {
+                        (Some(field), _) => field,
+                        (None, Overwritten::Slot(key)) => {
+                            emit::fmt_slot(key, self.names, emit::SlotSpace::Persistent)
+                        }
+                        (None, Overwritten::Balance) => "address(this).balance".to_string(),
+                        (None, Overwritten::Memory(addr)) => emit::fmt_mem_word(addr, self.names),
+                    };
+                    self.line(depth, &format!("uint256 {tmp} = {current};"));
+                }
                 self.names.replace_stale(loads);
             }
             for (read, name) in self.early_reads.get(&(n, i)).cloned().unwrap_or_default() {
+                if self.names.stale.borrow().contains_key(&read) {
+                    continue;
+                }
                 let def = format!("uint256 {} = {};", name, emit::fmt_expr(read, self.names));
                 self.line(depth, &def);
                 self.names.replace_stale([(read, name)]);

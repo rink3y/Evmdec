@@ -1256,8 +1256,15 @@ fn copy_source(kind: u8) -> &'static str {
     }
 }
 
+pub fn field_name(e: ExprId, n: &Names) -> Option<String> {
+    member_field_read(e, n).or_else(|| {
+        let field = packed_read(e).filter(|_| !n.fields.is_empty())?;
+        n.fields.get(&field).cloned()
+    })
+}
+
 fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
-    if let Some(text) = member_field_read(e, n) {
+    if let Some(text) = field_name(e, n) {
         return (text, P_PRIMARY);
     }
     if let Some(load) = element_typed_load(e, n) {
@@ -1267,13 +1274,6 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
         if let Some((number, offset)) = block_ref(e, n) {
             let precedence = if offset.is_zero() { P_PRIMARY } else { P_ADD };
             return (fmt_block_ref(number, offset), precedence);
-        }
-    }
-    if !n.fields.is_empty() {
-        if let Some((k, off, bits)) = packed_read(e) {
-            if let Some(name) = n.fields.get(&(k, off, bits)) {
-                return (name.clone(), P_PRIMARY);
-            }
         }
     }
     match expr::node(e) {

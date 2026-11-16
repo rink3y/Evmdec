@@ -232,3 +232,28 @@ fn a_call_that_cuts_what_a_third_account_holds_is_found_on_the_side_of_a_test_it
         cut.steps
     );
 }
+
+#[test]
+fn a_payout_opened_by_a_call_anyone_may_make_to_another_contract_is_found_with_that_call() {
+    let (drip, gauge) = (
+        U256::from_hex_str(DEPLOYED_AT).expect("address"),
+        U256::from_hex_str("0x6666666666666666666666666666666666666666").expect("address"),
+    );
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/source/Gauge.hex");
+    let hex = std::fs::read_to_string(path).expect("fixture");
+    let mut chain = audit::chain::Table::default();
+    chain
+        .codes
+        .insert(gauge, evmdec::hex::decode(hex.trim()).expect("hex"));
+    chain.storage.insert((drip, U256::ZERO), gauge);
+    chain.ether.insert(drip, U256::from_u64(1) << 80);
+    // claim() pays what the gauge reads above a floor. The gauge reads nothing until raised.
+    let report = report_on_chain("Drip.hex", chain);
+    let [paid] = &report.findings[..] else {
+        panic!("{:?}", report.findings);
+    };
+    assert_eq!(paid.kind, Kind::Gain);
+    assert_eq!(paid.selector.as_deref(), Some("0x4e71d92d"));
+    assert_eq!(paid.steps.len(), 2, "{:?}", paid.steps);
+    assert!(paid.steps[0].contains(&gauge.to_hex()), "{:?}", paid.steps);
+}

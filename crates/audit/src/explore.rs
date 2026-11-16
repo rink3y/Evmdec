@@ -10,7 +10,7 @@ use evmdec::decompile::Contract;
 use evmdec::function::{FnKind, Mutability};
 use evmdec::opcode as op;
 use evmdec::U256;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 pub const UNIT: U256 = U256([1_000_000_000_000_000_000, 0, 0, 0]);
@@ -23,6 +23,8 @@ const ROUNDS: usize = 5;
 const MAX_TRIES: usize = 10;
 const MAX_HOOKS: usize = 4;
 const ACTOR_DEPTH: usize = 3;
+const MAX_OUTSIDE: usize = 3;
+const OUTSIDE_ENTRIES: usize = 6;
 const UNUSED_SELECTOR: u32 = 0xfeed_c0de;
 const TEN_YEARS: u64 = 315_360_000;
 
@@ -168,6 +170,14 @@ pub struct Explorer<'a> {
     // The contracts the chain's state names, and the addresses looked at to find them.
     contracts: Vec<Addr>,
     checked: HashSet<Addr>,
+    // Entries from here on are other contracts'. No finding may end in one.
+    pub own: usize,
+    // A contract behind a proxy is read from the code it delegates to.
+    talked: BTreeMap<Addr, (usize, Option<Addr>)>,
+    read_out: HashSet<(Addr, U256, bool)>,
+    named_out: BTreeMap<Addr, usize>,
+    aims: Vec<Addr>,
+    room: usize,
 }
 
 fn outside(n: usize) -> Addr {
@@ -271,6 +281,15 @@ fn low_address(value: U256) -> Addr {
     value & ((U256::ONE << 160) - U256::ONE)
 }
 
+fn marked(cell: &crate::trace::Cell) -> (Addr, U256, bool) {
+    (cell.account, cell.slot, !cell.keys.is_empty())
+}
+
+fn alike(a: &Breach, b: &Breach) -> bool {
+    let place = |b: &Breach| b.cell.as_ref().map(crate::trace::Cell::place);
+    a.kind == b.kind && a.asset == b.asset && a.victim == b.victim && place(a) == place(b)
+}
+
 impl<'a> Explorer<'a> {
     #[must_use]
     pub fn new(c: &'a Contract) -> Explorer<'a> {
@@ -324,6 +343,7 @@ impl<'a> Explorer<'a> {
 
     fn starting_from(c: &'a Contract, subject: Addr, world: World) -> Explorer<'a> {
         let entries = entries(c, subject);
+        let own = entries.len();
         let start = State {
             world,
             steps: Vec::new(),
@@ -359,6 +379,12 @@ impl<'a> Explorer<'a> {
             on_chain: false,
             contracts: Vec::new(),
             checked: HashSet::new(),
+            own,
+            talked: BTreeMap::new(),
+            read_out: HashSet::new(),
+            named_out: BTreeMap::new(),
+            aims: Vec::new(),
+            room: MAX_STATES,
         }
     }
 
@@ -531,8 +557,19 @@ impl<'a> Explorer<'a> {
                 }
             }
         }
-        self.facts
-            .observe(entry, &t.msg, &run, self.subject, &self.known);
+        if entry < self.own {
+            self.facts
+                .observe(entry, &t.msg, &run, self.subject, &self.known);
+            if self.on_chain {
+                self.note_outside(&run);
+            }
+        } else if run.ok
+            && run
+                .stores()
+                .any(|(c, ..)| self.read_out.contains(&marked(c)))
+        {
+            self.facts.entries[entry].ended.insert(t.msg.from);
+        }
         self.learn(entry, t, &run);
         if self.stopped.len() < self.entries.len() {
             self.stopped.resize(self.entries.len(), None);
@@ -1623,6 +1660,9 @@ impl<'a> Explorer<'a> {
                 continue;
             }
             let steps = &self.fewest(&breach, steps);
+            if self.shown_elsewhere(&breach, steps) {
+                continue;
+            }
             let place = breach.cell.as_ref().map(crate::trace::Cell::place);
             let (kind, asset) = (breach.kind, breach.asset);
             let same = |v: &Violation| {
@@ -1761,13 +1801,7 @@ impl<'a> Explorer<'a> {
     in turn and the rest made again, and it stays out when the same consequence shows. */
     fn fewest(&mut self, breach: &Breach, steps: &[Step]) -> Vec<Step> {
         let prefix = self.states[0].steps.len().min(steps.len());
-        let place = |b: &Breach| b.cell.as_ref().map(crate::trace::Cell::place);
-        let same = |b: &Breach| {
-            b.kind == breach.kind
-                && b.asset == breach.asset
-                && b.victim == breach.victim
-                && place(b) == place(breach)
-        };
+        let same = |b: &Breach| alike(b, breach);
         let mut kept = steps.to_vec();
         let mut at = prefix;
         while at + 1 < kept.len() && !budget::spent() {
@@ -1782,6 +1816,23 @@ impl<'a> Explorer<'a> {
             }
         }
         kept
+    }
+
+    /* A finding is the contract's own only where its calls to the contract are needed.
+    What the calls to other contracts show by themselves is theirs. */
+    fn shown_elsewhere(&mut self, breach: &Breach, steps: &[Step]) -> bool {
+        let prefix = self.states[0].steps.len().min(steps.len());
+        let subject = self.subject;
+        let mut rest: Vec<Step> = steps[prefix..]
+            .iter()
+            .filter(|s| !matches!(s, Step::Call { msg, .. } if msg.to == subject))
+            .cloned()
+            .collect();
+        while rest.last().is_some_and(|s| !matches!(s, Step::Call { .. })) {
+            rest.pop();
+        }
+        let world = self.states[0].world.clone();
+        !rest.is_empty() && self.shows(world, &rest, &|b| alike(b, breach))
     }
 
     /* A record that rose is worth something only if more can now be done with it. The
@@ -1827,7 +1878,7 @@ impl<'a> Explorer<'a> {
         });
         let at = self.states.len() - 1;
         let mut spent = false;
-        for entry in 0..self.entries.len() {
+        for entry in 0..self.own {
             if self.entries[entry].view || budget::spent() {
                 continue;
             }
@@ -1881,7 +1932,7 @@ impl<'a> Explorer<'a> {
         });
         let at = self.states.len() - 1;
         let mut lost = false;
-        for entry in 0..self.entries.len() {
+        for entry in 0..self.own {
             if self.entries[entry].view || budget::spent() {
                 continue;
             }
@@ -2074,8 +2125,11 @@ impl<'a> Explorer<'a> {
     user's own call that now pays the account does so because of what the account
     changed, and the finding is placed at the call that changed it. */
     fn used_after(&mut self) {
+        let subject = self.subject;
+        let elsewhere = |s: &Step| matches!(s, Step::Call { msg, .. } if msg.to != subject);
         let acted: Vec<usize> = (0..self.states.len())
             .filter(|s| self.states[*s].acted > 0 && !self.states[*s].raced)
+            .filter(|s| !self.states[*s].steps.iter().any(elsewhere))
             .collect();
         for from in acted.into_iter().take(MAX_STATES / 4) {
             let blamed = self.states[from].steps.iter().rev().find_map(|s| match s {
@@ -2085,7 +2139,7 @@ impl<'a> Explorer<'a> {
             let Some(blamed) = blamed else {
                 continue;
             };
-            for entry in 0..self.entries.len() {
+            for entry in 0..self.own {
                 if self.entries[entry].view {
                     continue;
                 }
@@ -2213,83 +2267,247 @@ impl<'a> Explorer<'a> {
         for _ in 0..ACTOR_DEPTH {
             let mut next = Vec::new();
             for from in frontier {
-                for entry in 0..self.entries.len() {
-                    if self.entries[entry].view {
-                        continue;
-                    }
-                    let mut kept = false;
-                    let mut seeds: VecDeque<Try> = self.hostile(entry).into();
-                    let mut passed = false;
-                    let mut turned = 0;
-                    while let Some(seed) = seeds.pop_front() {
-                        if budget::spent() {
-                            return;
-                        }
-                        let before = self.states[from].world.clone();
-                        let (t, world, run) = self.solve(from, entry, seed);
-                        // A call that ends says nothing of what else could have been passed on.
-                        if run.ok && !passed {
-                            let more = Self::passed_on(&t, &run, &t.shape.layout());
-                            passed = !more.is_empty();
-                            seeds.extend(more);
-                        }
-                        if run.ok && turned < 2 {
-                            let more = self.other_sides(from, entry, &t, &run);
-                            turned += more.len().max(1);
-                            seeds.extend(more);
-                        }
-                        let handed = run.calls.iter().any(|c| c.by == Answered::Taken);
-                        // What the call shows by itself, whether or not it was worth reporting.
-                        let mut alone = Vec::new();
-                        let race = run.ok && self.once_for_all(&world, entry, &t, &run);
-                        let open = !race && !self.states[from].raced;
-                        if run.ok && open {
-                            let base = self.states[0].world.clone();
-                            let spent = self.states[from].spent;
-                            let mut plain =
-                                laws::check(&base, &before, &world, &run, &self.facts, spent);
-                            alone.clone_from(&plain);
-                            plain.retain(|b| {
-                                b.kind != Kind::Credit || self.spendable(&before, &world, b, entry)
-                            });
-                            plain.retain(|b| {
-                                b.kind != Kind::Debit || self.withheld(&before, &world, b)
-                            });
-                            let gains = plain.iter().any(|b| b.kind == Kind::Gain);
-                            let stray = self.states[from].stray
-                                || (gains && self.earned(from, &t, &before, &run));
-                            let granted = self.states[from].granted;
-                            let own = |b: &&Breach| matches!(b.kind, Kind::Gain | Kind::Credit);
-                            let shown = plain.iter().filter(|b| b.kind != Kind::Gain || !stray);
-                            let shown: Vec<Breach> =
-                                shown.filter(|b| !granted || !own(b)).cloned().collect();
-                            let steps = self.history(from, entry, &t.msg);
-                            self.report(shown, entry, &steps, &run, (false, false));
-                            if !granted {
-                                self.takes_from_owner(from, entry, &t, &run);
-                            }
-                        }
-                        let apart = self.states[from].stray || self.states[from].granted;
-                        if handed && open && !apart {
-                            self.reenter(from, entry, &t, &alone);
-                        }
-                        if run.ok
-                            && self.novel(&run, &world)
-                            && !kept
-                            && self.states.len() < MAX_STATES
-                        {
-                            let at = self.keep(from, entry, &t, world, true);
-                            let lowered =
-                                laws::claims_lowered(&run, self.subject, &self.states[0].world);
-                            self.states[at].spent = self.states[at].spent.wrapping_add(lowered);
-                            self.states[at].raced |= race;
-                            next.push(at);
-                            kept = true;
-                        }
+                for entry in 0..self.own {
+                    if !self.entries[entry].view && !self.act(from, entry, &mut next) {
+                        return;
                     }
                 }
             }
             frontier = next;
+        }
+    }
+
+    // False once the work is used up.
+    fn act(&mut self, from: usize, entry: usize, next: &mut Vec<usize>) -> bool {
+        let mut kept = false;
+        let mut seeds: VecDeque<Try> = match self.entries[entry].to == self.subject {
+            true => self.hostile(entry).into(),
+            false => self.aimed(entry).into(),
+        };
+        let mut passed = false;
+        let mut turned = 0;
+        while let Some(seed) = seeds.pop_front() {
+            if budget::spent() {
+                return false;
+            }
+            let before = self.states[from].world.clone();
+            let (t, world, run) = self.solve(from, entry, seed);
+            // A call that ends says nothing of what else could have been passed on.
+            if run.ok && !passed {
+                let more = Self::passed_on(&t, &run, &t.shape.layout());
+                passed = !more.is_empty();
+                seeds.extend(more);
+            }
+            if run.ok && turned < 2 {
+                let more = self.other_sides(from, entry, &t, &run);
+                turned += more.len().max(1);
+                seeds.extend(more);
+            }
+            let handed = run.calls.iter().any(|c| c.by == Answered::Taken);
+            // What the call shows by itself, whether or not it was worth reporting.
+            let mut alone = Vec::new();
+            let race = run.ok && self.once_for_all(&world, entry, &t, &run);
+            let open = !race && !self.states[from].raced;
+            let own = self.entries[entry].to == self.subject;
+            if run.ok && open && own {
+                let base = self.states[0].world.clone();
+                let spent = self.states[from].spent;
+                let mut plain = laws::check(&base, &before, &world, &run, &self.facts, spent);
+                alone.clone_from(&plain);
+                plain.retain(|b| {
+                    b.kind != Kind::Credit || self.spendable(&before, &world, b, entry)
+                });
+                plain.retain(|b| b.kind != Kind::Debit || self.withheld(&before, &world, b));
+                let gains = plain.iter().any(|b| b.kind == Kind::Gain);
+                let stray =
+                    self.states[from].stray || (gains && self.earned(from, &t, &before, &run));
+                let granted = self.states[from].granted;
+                let claim = |b: &&Breach| matches!(b.kind, Kind::Gain | Kind::Credit);
+                let shown = plain.iter().filter(|b| b.kind != Kind::Gain || !stray);
+                let shown: Vec<Breach> = shown.filter(|b| !granted || !claim(b)).cloned().collect();
+                let steps = self.history(from, entry, &t.msg);
+                self.report(shown, entry, &steps, &run, (false, false));
+                if !granted {
+                    self.takes_from_owner(from, entry, &t, &run);
+                }
+            }
+            let apart = self.states[from].stray || self.states[from].granted;
+            if handed && open && !apart && own {
+                self.reenter(from, entry, &t, &alone);
+            }
+            if run.ok && self.novel(&run, &world) && !kept && self.states.len() < self.room {
+                let at = self.keep(from, entry, &t, world, true);
+                let lowered = laws::claims_lowered(&run, self.subject, &self.states[0].world);
+                self.states[at].spent = self.states[at].spent.wrapping_add(lowered);
+                self.states[at].raced |= race;
+                next.push(at);
+                kept = true;
+            }
+        }
+        true
+    }
+
+    /* On the chain what the contracts it calls hold is part of what the contract does,
+    and anyone may change some of it. Each step stays short so the search stays cheap. */
+    fn reach_out(&mut self) {
+        self.add_outside();
+        if self.entries.len() == self.own {
+            return;
+        }
+        self.room = MAX_STATES + MAX_STATES / 2;
+        let mut frontier: Vec<usize> = (0..self.states.len())
+            .filter(|s| self.states[*s].acted <= 1 && !self.states[*s].raced)
+            .collect();
+        frontier.sort_by_key(|s| self.states[*s].acted);
+        let mut outside: Vec<usize> = (self.own..self.entries.len()).collect();
+        for from in frontier.into_iter().take(MAX_STATES / 8) {
+            if !self.reach(from, &outside, 2) {
+                return;
+            }
+            // An entry that changed nothing the contract reads from the first place is dropped.
+            outside.retain(|e| self.facts.entries[*e].ended.contains(&ACTOR));
+        }
+    }
+
+    // A step elsewhere is followed at once by calls to the contract, so it is not starved of work.
+    fn reach(&mut self, from: usize, outside: &[usize], left: usize) -> bool {
+        for entry in outside.iter().copied() {
+            let mut made = Vec::new();
+            if !self.act(from, entry, &mut made) {
+                return false;
+            }
+            for at in made {
+                for own in 0..self.own {
+                    if !self.entries[own].view && !self.act(at, own, &mut Vec::new()) {
+                        return false;
+                    }
+                }
+                if left > 1 && !self.reach(at, outside, left - 1) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /* Only entries that write what the contract read there can change what it does.
+    An asset the account holds comes first, since moving it is the one thing the
+    account can surely do there. */
+    fn add_outside(&mut self) {
+        let world = self.states[0].world.clone();
+        let held = world.assets();
+        let cells = |at: Addr| self.read_out.iter().filter(|c| c.0 == at).count();
+        let mut talked: Vec<(bool, usize, usize, Addr, Option<Addr>)> = self
+            .talked
+            .iter()
+            .map(|(at, (n, behind))| (held.contains(at), cells(*at), *n, *at, *behind))
+            .collect();
+        talked.sort_by(|a, b| (b.0, b.1, b.2).cmp(&(a.0, a.1, a.2)).then(a.3.cmp(&b.3)));
+        let mut named: Vec<(usize, Addr)> =
+            self.named_out.iter().map(|(at, n)| (*n, *at)).collect();
+        named.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut aims = vec![self.subject];
+        aims.extend(
+            named
+                .into_iter()
+                .map(|(_, at)| at)
+                .filter(|at| world.runs_code(*at)),
+        );
+        let mut chosen = 0;
+        for (_, _, _, to, behind) in talked {
+            if chosen == MAX_OUTSIDE || budget::spent() {
+                break;
+            }
+            let Some(code) = world.code(behind.unwrap_or(to)) else {
+                continue;
+            };
+            let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
+            let keyed = self.read_out.iter().any(|c| c.0 == to && c.2);
+            let mut scored: Vec<(usize, Entry)> = Vec::new();
+            for e in entries(&c, to).into_iter().filter(|e| !e.view) {
+                let done = crate::model::in_code(&c, e.function);
+                let read = done.writes.iter().filter_map(|w| U256::from_hex_str(w));
+                let read = read
+                    .filter(|w| self.read_out.contains(&(to, *w, false)))
+                    .count();
+                let score = read + usize::from(keyed && done.writes_under_keys);
+                if score > 0 && !done.tests_caller {
+                    scored.push((score, e));
+                }
+            }
+            scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+            if scored.is_empty() {
+                continue;
+            }
+            chosen += 1;
+            aims.push(to);
+            let picked = scored.into_iter().take(OUTSIDE_ENTRIES).map(|(_, e)| e);
+            self.entries.extend(picked);
+        }
+        let mut seen = HashSet::new();
+        aims.retain(|at| seen.insert(*at));
+        aims.truncate(4);
+        self.aims = aims;
+        self.facts
+            .entries
+            .resize(self.entries.len(), Default::default());
+        if self.trace {
+            for e in &self.entries[self.own..] {
+                eprintln!(
+                    "outside {:.10} {} {:?}",
+                    e.to.to_hex(),
+                    e.name,
+                    e.shape.kinds()
+                );
+            }
+            let aims: Vec<String> = self.aims.iter().map(U256::to_hex).collect();
+            eprintln!("aims {aims:?} talked {}", self.talked.len());
+        }
+    }
+
+    /* A call to another contract matters to this one through what it changes there,
+    so each account this one reads about there is tried in each place that names one. */
+    fn aimed(&self, entry: usize) -> Vec<Try> {
+        let kinds = self.entries[entry].shape.kinds();
+        let places =
+            (0..kinds.len()).filter(|i| matches!(kinds[*i], Holds::Address | Holds::Callee));
+        let mut out = vec![self.seed(entry, ACTOR, ACTOR, UNIT, U256::ZERO)];
+        for at in places.take(2) {
+            for aim in &self.aims {
+                let plain = self.seed(entry, ACTOR, ACTOR, UNIT, U256::ZERO);
+                out.extend(plain.reshaped(&|shape| shape.put(at, *aim)));
+            }
+        }
+        out
+    }
+
+    fn note_outside(&mut self, run: &Run) {
+        let subject = self.subject;
+        for call in &run.calls {
+            let direct =
+                call.from == subject && !matches!(call.kind, op::DELEGATECALL | op::CALLCODE);
+            if direct && !call.to.is_zero() && !self.known.contains(&call.to) {
+                self.talked.entry(call.to).or_default().0 += 1;
+                let (words, _) = call.input.get(4..).unwrap_or_default().as_chunks::<32>();
+                for word in words.iter().map(|w| U256::from_be_bytes(w)) {
+                    if (97..=160).contains(&word.bits()) && !self.known.contains(&word) {
+                        *self.named_out.entry(word).or_default() += 1;
+                    }
+                }
+            }
+            if call.kind == op::DELEGATECALL {
+                if let Some(talked) = self.talked.get_mut(&call.from) {
+                    talked.1.get_or_insert(call.to);
+                }
+            }
+        }
+        for event in &run.events {
+            if let Event::Load { cell, .. } = event {
+                let cell = &run.cells[*cell];
+                if cell.account != subject {
+                    self.read_out.insert(marked(cell));
+                }
+            }
         }
     }
 
@@ -2309,7 +2527,12 @@ impl<'a> Explorer<'a> {
         // What the earlier parts left unused goes to the account with no role.
         let left = work.saturating_sub(budget::used() - started);
         budget::within(left.saturating_sub(work / 10).max(work / 3), || {
-            self.attack()
+            // The account's own calls to the contract come first and may not take it all.
+            let room = budget::left().saturating_sub(work / 10 * u64::from(self.on_chain));
+            budget::within(room, || self.attack());
+            if self.on_chain {
+                self.reach_out();
+            }
         });
         budget::within(work / 10, || self.used_after());
     }

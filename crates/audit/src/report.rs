@@ -336,8 +336,12 @@ fn step_text(ex: &Explorer, step: &Step) -> String {
                 ),
                 None => String::new(),
             };
+            let at = match msg.to == ex.subject {
+                true => String::new(),
+                false => format!(" on the contract at {}", msg.to.to_hex()),
+            };
             format!(
-                "{} calls `{}`({}){value}{back}",
+                "{} calls `{}`({}){at}{value}{back}",
                 who(msg.from),
                 e.name,
                 args.join(", ")
@@ -635,7 +639,8 @@ fn finding(ex: &Explorer, v: &Violation) -> Finding {
 
 fn models(ex: &Explorer) -> (Vec<FunctionModel>, Vec<CellModel>) {
     let name = |i: &usize| ex.entries[*i].name.clone();
-    let functions = ex.entries.iter().enumerate().map(|(i, e)| {
+    let own = &ex.entries[..ex.own];
+    let functions = own.iter().enumerate().map(|(i, e)| {
         let facts = &ex.facts.entries[i];
         let ends_for: Vec<&'static str> = [OWNER, USER, ACTOR]
             .into_iter()
@@ -761,9 +766,7 @@ pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
     }
     let chains = chains(ex, &findings, &of);
     let (functions, cells) = models(ex);
-    let ended = ex
-        .facts
-        .entries
+    let ended = ex.facts.entries[..ex.own]
         .iter()
         .filter(|f| !f.ended.is_empty())
         .count();
@@ -782,14 +785,14 @@ pub fn build(ex: &Explorer, ms: u128, work: u64) -> Report {
         cells,
         slots_in_code: crate::model::slots_in_code(
             ex.c,
-            &ex.entries
+            &ex.entries[..ex.own]
                 .iter()
                 .map(|e| (e.function, e.name.clone()))
                 .collect::<Vec<_>>(),
         ),
         assumed: ex.assumed.iter().cloned().chain(stand_ins(ex)).collect(),
         stats: Stats {
-            functions: ex.entries.len(),
+            functions: ex.own,
             functions_ended: ended,
             calls_made: ex.runs,
             states_kept: ex.states.len(),

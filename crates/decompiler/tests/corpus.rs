@@ -468,7 +468,7 @@ fn tribe_reads_as_source() {
         "stor_4.push(address(v2));",
         "stor_3[address(v2)] = true;",
         "if (stor_4.length < stor_7) {",
-        "require(v1 < stor[arg0], Panic(assert));",
+        "assert(v1 < stor[arg0]);",
     ] {
         assert!(src.contains(s), "missing {s}\n{src}");
     }

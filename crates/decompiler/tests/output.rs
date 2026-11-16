@@ -401,3 +401,10 @@ fn the_arguments_of_a_call_stop_before_the_first_word_no_write_is_known_for() {
         "{out}"
     );
 }
+
+#[test]
+fn a_test_that_ends_in_the_invalid_opcode_is_an_assert_with_no_panic_data() {
+    let out = text("60003561000857fe5b3360005500");
+    assert!(out.contains("assert(msg.data[0:32] != 0);"), "{out}");
+    assert!(!out.contains("Panic"), "{out}");
+}

@@ -2371,7 +2371,7 @@ impl<'a> Printer<'a> {
                         }
                     });
                 }
-                Term::Invalid => return Some(Some("Panic(assert)".into())),
+                Term::Invalid => return Some(Some(INVALID.into())),
                 Term::Infeasible => return Some(None),
                 _ => return None,
             }
@@ -3167,14 +3167,8 @@ impl<'a> Printer<'a> {
         let join = self.g.ipdom[n];
         if let Some(reason) = f_rev.clone() {
             if let (Some(t), None) = (t, &t_rev) {
-                self.line(
-                    depth,
-                    &format!(
-                        "require({}{});",
-                        emit::fmt_cond(cond, self.names),
-                        reason_suffix(&reason)
-                    ),
-                );
+                let text = emit::fmt_cond(cond, self.names);
+                self.line(depth, &guard(&text, &reason, self.names.hide_checked));
                 self.facts.push((cond, true, t));
                 self.transfer(n, t, stop, depth);
                 self.facts.pop();
@@ -3184,14 +3178,8 @@ impl<'a> Printer<'a> {
         if let Some(reason) = t_rev.clone() {
             if f_rev.is_none() {
                 let ncond = expr::op1(op::ISZERO, cond);
-                self.line(
-                    depth,
-                    &format!(
-                        "require({}{});",
-                        emit::fmt_cond(ncond, self.names),
-                        reason_suffix(&reason)
-                    ),
-                );
+                let text = emit::fmt_cond(ncond, self.names);
+                self.line(depth, &guard(&text, &reason, self.names.hide_checked));
                 self.facts.push((cond, false, f));
                 self.transfer(n, f, stop, depth);
                 self.facts.pop();
@@ -3552,10 +3540,16 @@ fn while_cond_exit_from_header(term: &Term, exit: usize) -> bool {
     matches!(term, Term::Branch { t, f, .. } if *t == Some(exit) || *f == exit)
 }
 
-fn reason_suffix(reason: &Option<String>) -> String {
-    match reason {
-        Some(r) => format!(", {}", r),
-        None => String::new(),
+// Stands for the invalid opcode. It carries no data, so it is no reason to print.
+const INVALID: &str = "INVALID";
+
+// Where a failed assert reverts with a Panic, the opcode is named to tell the two apart.
+fn guard(cond: &str, reason: &Option<String>, panics: bool) -> String {
+    match reason.as_deref() {
+        Some(INVALID) if panics => format!("assert({cond}); // INVALID"),
+        Some(INVALID) => format!("assert({cond});"),
+        Some(r) => format!("require({cond}, {r});"),
+        None => format!("require({cond});"),
     }
 }
 

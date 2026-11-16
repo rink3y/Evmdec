@@ -66,3 +66,13 @@ fn a_record_written_twice_in_one_call_is_judged_by_where_it_ends() {
     assert_eq!(kinds, vec![Kind::Credit], "{:?}", report.findings);
     assert_eq!(report.findings[0].selector.as_deref(), Some("0xa9059cbb"));
 }
+
+#[test]
+fn what_an_owner_only_door_pays_out_is_held_and_an_open_door_beside_it_is_found() {
+    // No function takes ether in. The owner's guarded withdrawal is what says the contract holds some.
+    let report = report("Treasury.hex");
+    let kinds: Vec<Kind> = report.findings.iter().map(|f| f.kind).collect();
+    assert_eq!(kinds, vec![Kind::Gain], "{:?}", report.findings);
+    // emergency(address)
+    assert_eq!(report.findings[0].selector.as_deref(), Some("0x45941ee0"));
+}

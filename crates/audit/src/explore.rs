@@ -124,6 +124,9 @@ pub struct Explorer<'a> {
     // Each slot filled as a setting, with the variable it belongs to and what it held.
     settings: Vec<(Place, U256, U256)>,
     raised: std::collections::BTreeMap<U256, std::collections::BTreeSet<U256>>,
+    /* What an owner's call tried to pay out of the contract and could not, for the lack
+    of it, with the function that tried. */
+    owed: HashSet<(usize, Option<Addr>)>,
     pub runs: u64,
     trace: bool,
     edges: HashSet<u32>,
@@ -355,6 +358,7 @@ impl<'a> Explorer<'a> {
             assumed: Vec::new(),
             settings: Vec::new(),
             raised: crate::model::raised_within_a_call(c),
+            owed: HashSet::new(),
             runs: 0,
             trace: std::env::var("EVMDEC_AUDIT_TRACE").is_ok(),
             edges: HashSet::new(),
@@ -491,6 +495,18 @@ impl<'a> Explorer<'a> {
         };
         let run = world.send(&t.msg);
         self.runs += 1;
+        if t.msg.from == OWNER {
+            let subject = self.subject;
+            let lacked = run.calls.iter().filter(|c| c.from == subject && !c.ok);
+            let lacked = lacked.filter_map(|c| match (c.value.is_zero(), c.by) {
+                (false, _) if c.kind == op::CALL => Some(None),
+                (true, Answered::Books) => Some(Some(c.to)),
+                _ => None,
+            });
+            let lacked: Vec<Option<Addr>> = lacked.collect();
+            self.owed
+                .extend(lacked.into_iter().map(|kind| (entry, kind)));
+        }
         if run.ok && honest {
             /* A contract that passes value on to others writes nothing down. Here the
             others are stand-ins that take nothing, so what was meant to move on stays.
@@ -1630,6 +1646,14 @@ impl<'a> Explorer<'a> {
     take any of it out. Only one call is tried from here. Over several calls an account
     that staked and waited is paid by design. */
     fn sweep(&mut self) {
+        /* A door only the owner gets through, that pays an asset out of the contract,
+        says the contract is meant to hold that asset. */
+        for (entry, kind) in self.owed.clone() {
+            let facts = &self.facts.entries[entry];
+            if facts.checks_caller && !facts.ended.contains(&ACTOR) {
+                self.facts.keeps.insert(kind);
+            }
+        }
         let starts = self.states.len().min(MAX_STATES / 8);
         for start in 0..starts {
             // Only what the contract was seen to take in and keep. A contract that passes

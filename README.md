@@ -322,22 +322,23 @@ set was split off once, its answer key and reports are never read during develop
 its reviewers return counts only.
 
 The target is 95 to 99% precision and recall. It is not met. Measured on the held-out set,
-234 exploited contracts and 101 with no known flaw, scored three times by separate reviewers:
+234 exploited contracts and 101 with no known flaw, scored four times by separate reviewers:
 
-| | first score | second score | third score, by address |
-|---|---|---|---|
-| known flaws found at the right place for the right reason | 13 of 234, 5.6% | 12 of 234, 5.1% | 20 of 234, 8.5% |
-| more at the right place with the wrong reason | 6 | 4 | 10 |
-| findings that are correct | 25 of 49, 51.0% | 23 of 48, 47.9% | 45 of 88, 51.1% |
-| contracts with no known flaw that got a finding | 1 of 101 | 1 of 101 | 4 of 101 |
-| time per contract | median 0.7 s | median 0.7 s, slowest 10.2 s | median 7.9 s, 90% under 29.6 s, with chain reads |
+| | first score | second score | third score, by address | fourth score, by address |
+|---|---|---|---|---|
+| known flaws found at the right place for the right reason | 13 of 234, 5.6% | 12 of 234, 5.1% | 20 of 234, 8.5% | 29 of 234, 12.4% |
+| more at the right place with the wrong reason | 6 | 4 | 10 | 8 |
+| findings that are correct | 25 of 49, 51.0% | 23 of 48, 47.9% | 45 of 88, 51.1% | 49 of 83, 59.0% |
+| contracts with no known flaw that got a finding | 1 of 101 | 1 of 101 | 4 of 101 | 4 of 101 |
+| time per contract | median 0.7 s | median 0.7 s, slowest 10.2 s | median 7.9 s, 90% under 29.6 s, with chain reads | median 10.3 s, 90% under 25.6 s, on a shared machine |
 
-The third score ran each contract by address on the chain's state at the block before its
-incident, plus the guessed world. On chain state 38 of 56 findings were correct, in the
-guessed world 7 of 32. By kind of flaw, among those in the analysed contract: access control
-8 of 47, input validation 5 of 28, initialization 5 of 9, accounting 1 of 68, unchecked
-external call 1 of 1, price or reading 0 of 43, re-entry 0 of 11, signature or replay 0 of 6,
-arithmetic 0 of 5.
+The third and fourth scores ran each contract by address on the chain's state at the block
+before its incident, plus the guessed world, on the same blocks both times. In the fourth, 43
+of 60 findings shown on chain state were correct and 6 of 23 shown only in the guessed world.
+By kind of flaw, among those in the analysed contract: access control 12 of 47, accounting 6
+of 68, input validation 5 of 28, initialization 5 of 9, unchecked external call 1 of 1, price
+or reading 0 of 43, re-entry 0 of 11, signature or replay 0 of 6, arithmetic 0 of 5. The
+fourth score is older than the ninth consequence in the table above.
 
 On the development set, where every false finding was read and its cause fixed, the latest
 reviewed build finds 31 of 231 known flaws (13.4%) by address, 48 of its 60 findings are

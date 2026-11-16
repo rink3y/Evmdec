@@ -207,7 +207,13 @@ the values came from, what the run showed, and the steps to make the run again. 
 follow from one another are linked into paths. The report also holds the model the runs
 built: for each function who it ended for, whether it tests its caller, takes value, pays out
 or calls out, and what stopped it when it never ended; for each storage variable what it is
-used for and who can write it. A report with no finding says what was tried and is not a
+used for and who can write it. Beside it stands a model read from the code alone, with every
+helper followed: whether a function tests its caller, which slots it writes, whether it calls
+out, sends value, runs other code or destroys the contract. That one covers the functions no
+run got through. Functions the account with no role never got through, whose code tests no
+caller and can change state or move value, are listed as not settled. They are where to look,
+not findings: on the development set the list holds 8 in 100 functions of flawed and of
+sound contracts alike, and the flawed function of 72 of 212 missed incidents is on it. A report with no finding says what was tried and is not a
 proof.
 
 ```sh
@@ -338,14 +344,17 @@ checks and reverts. A function matches only when all six agree.
 | first, as found | 14 (solc 0.4.24 to 0.8.30, via-IR, five proxies, one diamond) | 65 of 99 |
 | first, after ten causes were fixed | the same 14 | 73 of 99 |
 | second, fresh | 8 (Vyper 0.2.8 and 0.4.3, solc 0.4.21 to 0.8.36, a beacon proxy) | 55 of 83 |
+| both, after a second round of fixes | all 22 | 136 of 182, no regressions |
 
-That is 128 of 182, 70%, against a target of 95 to 99%. Every mismatch was traced to its
+That is 75% against a target of 95 to 99%. Every mismatch was traced to its
 cause in the decompiler, and each cause gets a general fix and a test. The block oracle
 passed every one of these functions: it checks lifting, and these faults are made after it,
-in inlining, structuring and printing. What is still open: shared code tails printed with the
-caller's stack, old-value snapshots declared where they do not cover every use, call data
-built from overlapping writes, newer Vyper selector tables, and checked arithmetic that
-prints like unchecked.
+in inlining, structuring and printing. What is still open, by how many functions it breaks:
+shared code tails whose call sites do not fit their declarations (8), call data built from
+overlapping writes printed as shifted words (6), checked arithmetic that prints like
+unchecked (5), a memory write not printed (4), a read printed after a call it was made
+before (3), dropped call data validation (2), a packed field mask (1), and 17 functions
+that are right but unclear, most from one cloned region whose labels repeat.
 
 ## Quick start
 

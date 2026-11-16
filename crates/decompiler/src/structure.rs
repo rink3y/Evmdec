@@ -611,8 +611,7 @@ fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<Span>)
     }
 }
 
-/* For each node, the memory each statement reads by its place, with the statement's index.
-What the end of the node and the edges out of it read has the index past the last. */
+// What the end of a node and the edges out of it read has the index past the last.
 fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span)>> {
     let mut all = Vec::with_capacity(l.nodes.len());
     for nd in &l.nodes {

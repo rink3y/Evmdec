@@ -81,7 +81,6 @@ pub enum Stmt {
     },
 }
 
-// One argument of a call, read out of the encoding the code wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Arg {
     Word(ExprId),
@@ -191,7 +190,6 @@ enum MVal {
     Unknown,
 }
 
-// The node and the index of the statement that made a write.
 type Origin = (usize, usize);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,8 +200,8 @@ struct MemWrite {
     val: MVal,
     origin: Option<(usize, usize)>,
     gen: u32,
-    // The length of a copy, kept for one whose length the code works out.
     span: Option<ExprId>,
+    most: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -570,10 +568,9 @@ struct Mem {
     pointer_named: bool,
     // Writes made before this version may be missing from the list.
     wiped: u32,
-    // For the answer with a stamp, a length the code tested it to reach.
     sized: Vec<(u32, u64)>,
-    // A merged value that is at most the length of the answer with the stamp.
     capped: Vec<(ExprId, u32)>,
+    below: Vec<(ExprId, u64)>,
 }
 
 const BIG: u64 = 1 << 40;
@@ -700,7 +697,7 @@ fn may_alias(
     };
     if w_wild {
         let Some(rbase) = rb else {
-            return roff >= 0x80 && roff + rlen > woff;
+            return (!allocates || roff >= 0x80) && roff + rlen > woff;
         };
         if let (false, Some(wbase)) = (r_wild, wb) {
             if let Some(k) = above(wbase, rbase) {
@@ -711,7 +708,7 @@ fn may_alias(
     }
     if r_wild {
         let Some(wbase) = wb else {
-            return woff >= 0x80 && wlen.is_none_or(|l| woff + l > roff);
+            return (!allocates || woff >= 0x80) && wlen.is_none_or(|l| woff + l > roff);
         };
         if let Some(rbase) = rb {
             if let Some(k) = above(rbase, wbase) {
@@ -730,6 +727,7 @@ impl Mem {
             wiped: 0,
             sized: Vec::new(),
             capped: Vec::new(),
+            below: Vec::new(),
             writes: Vec::new(),
             fresh,
             gen: 0,
@@ -761,7 +759,7 @@ impl Mem {
             if w.base != base {
                 // A write through another pointer may land on the same bytes.
                 // Without the new version two reads around it would count as equal.
-                if may_alias(w.base, w.off, w.len, base, d, n, self.pointer_named) {
+                if self.reaches(w, base, d, n) {
                     v = v.max(w.gen);
                 }
                 continue;
@@ -785,11 +783,7 @@ impl Mem {
         let (base, d) = norm_offset(off);
         let over = |w: &MemWrite| match w.base == base {
             true => d.saturating_add(n) > w.off && w.len.is_none_or(|l| d < w.off + l),
-            false => {
-                !self.pointer_named
-                    && base.is_none()
-                    && may_alias(w.base, w.off, w.len, base, d, n, self.pointer_named)
-            }
+            false => !self.pointer_named && base.is_none() && self.reaches(w, base, d, n),
         };
         version < self.wiped || self.writes.iter().any(|w| w.gen > version && over(w))
     }
@@ -830,6 +824,47 @@ impl Mem {
         true
     }
 
+    fn most(&self, base: ExprId) -> Option<u64> {
+        let tested = |e: ExprId| {
+            let known = self.below.iter().filter(|(x, _)| *x == e);
+            known.map(|(_, n)| *n).min().map(|n| n - 1)
+        };
+        let fixed = |e: ExprId| {
+            expr::as_const(e)
+                .filter(|c| c.fits_u64())
+                .map(|c| c.low_u64())
+        };
+        tested(base).or_else(|| match expr::node(base) {
+            Node::Op(op::MUL, v) => [(v[0], v[1]), (v[1], v[0])]
+                .into_iter()
+                .find_map(|(i, by)| tested(i)?.checked_mul(fixed(by)?)),
+            Node::Op(op::SHL, v) => {
+                let by = fixed(v[0]).filter(|by| *by < 32)?;
+                Some(tested(v[1])? << by)
+            }
+            _ => None,
+        })
+    }
+
+    // An address made from an index the code tested stays within what the index can reach.
+    fn reaches(&self, w: &MemWrite, base: Option<ExprId>, d: u64, n: u64) -> bool {
+        if !may_alias(w.base, w.off, w.len, base, d, n, self.pointer_named) {
+            return false;
+        }
+        let write_end = match w.base {
+            None => w.len.map(|l| w.off.saturating_add(l)),
+            Some(_) => {
+                let reach = w.most.zip(w.len);
+                reach.map(|(m, l)| w.off.saturating_add(m).saturating_add(l))
+            }
+        };
+        let read_end = match base {
+            None => Some(d.saturating_add(n)),
+            Some(b) => self.most(b).map(|m| d.saturating_add(m).saturating_add(n)),
+        };
+        !(write_end.is_some_and(|end| end <= d) || read_end.is_some_and(|end| end <= w.off))
+    }
+
     fn at_most_answer(&self, value: ExprId, stamp: u32) -> bool {
         let tested = |c: U256| {
             let reached = |(at, len): &(u32, u64)| *at == stamp && U256::from(*len) >= c;
@@ -846,11 +881,10 @@ impl Mem {
         (!expr::contains(word, &again)).then_some(word)
     }
 
-    /* The arguments of a call whose encoding has parts of a length the head points at.
-    The head is read word by word. A word that is a multiple of 32 past the head may be
-    such a pointer, and it is taken for one only when a length stands there, the bytes
-    that follow it are known, and the parts end where the next one starts or where the
-    call data ends. Anything else leaves the call as the writes that built it. */
+    /* A word of the head that is a multiple of 32 past it may point at a part of dynamic
+    length or may be a number. It is taken for a pointer only when a length stands there,
+    the bytes that follow it are known, and the parts end where the next one starts or
+    where the call data ends. Anything else leaves the call as the writes that built it. */
     fn call_args(&self, in_off: ExprId, in_len: ExprId) -> Option<(Vec<Arg>, Vec<Origin>)> {
         let at = |k: u64| expr::add_const(in_off, U256::from(4 + k));
         let offset = |w: ExprId, past: u64| {
@@ -935,7 +969,6 @@ impl Mem {
         Some((args, built))
     }
 
-    // Bytes copied from memory whose length and words are known where the call is made.
     fn bytes_now(&self, kind: u8, src: ExprId, len: ExprId) -> Option<Arg> {
         let Node::MLoad(at, _) = expr::node(len) else {
             return None;
@@ -947,7 +980,6 @@ impl Mem {
         (kind == op::MCOPY).then_some(Arg::Bytes(count, words?))
     }
 
-    // The copy that wrote a part's bytes, and the zero stored after them to pad the part.
     fn copied_part(&self, data: ExprId, len: ExprId) -> Option<(&MemWrite, Option<Origin>)> {
         let (base, d) = norm_offset(data);
         let end = summed(op2(op::ADD, data, len));
@@ -969,15 +1001,7 @@ impl Mem {
             let reach = u64::MAX / 4;
             let over = match later.base == base {
                 true => later.len.is_none_or(|l| later.off + l > d),
-                false => may_alias(
-                    later.base,
-                    later.off,
-                    later.len,
-                    base,
-                    d,
-                    reach,
-                    self.pointer_named,
-                ),
+                false => self.reaches(later, base, d, reach),
             };
             if place(later) == end && zero {
                 padding = later.origin;
@@ -1029,6 +1053,7 @@ impl Mem {
             origin,
             gen: self.gen + 1,
             span: None,
+            most: base.and_then(|b| self.most(b)),
         });
     }
 
@@ -1089,7 +1114,7 @@ impl Mem {
                 break;
             }
             if w.base != base {
-                if may_alias(w.base, w.off, w.len, base, d, n, self.pointer_named) {
+                if self.reaches(w, base, d, n) {
                     return None;
                 }
                 continue;
@@ -1296,6 +1321,7 @@ impl Mem {
             origin: None,
             gen: self.gen,
             span: None,
+            most: None,
         });
     }
 
@@ -1345,7 +1371,7 @@ impl Mem {
                 break;
             }
             if w.base != base {
-                if may_alias(w.base, w.off, w.len, base, d, len, self.pointer_named) {
+                if self.reaches(w, base, d, len) {
                     return None;
                 }
                 continue;
@@ -1424,11 +1450,13 @@ impl Mem {
                 && a.len == b.len
                 && a.val == b.val
                 && a.span == b.span
+                && a.most == b.most
         };
         let identical = self.gen == other.gen
             && self.wiped == other.wiped
             && self.sized == other.sized
             && self.capped == other.capped
+            && self.below == other.below
             && self.clobber_gen == other.clobber_gen
             && self.fresh == other.fresh
             && self.written == other.written
@@ -1542,6 +1570,12 @@ impl Mem {
         };
         self.sized = self.sized.iter().filter_map(tested).collect();
         self.capped.retain(|c| other.capped.contains(c));
+        let bounds_before = self.below.len();
+        let bounded = |(e, n): &(ExprId, u64)| {
+            let theirs = other.below.iter().filter(|(x, _)| x == e).map(|(_, m)| *m);
+            theirs.min().map(|m| (*e, m.max(*n)))
+        };
+        self.below = self.below.iter().filter_map(bounded).collect();
         let lost = overflow > 0 || other.wiped != self.wiped;
         if lost || other.gen != self.gen || other.clobber_gen != self.clobber_gen {
             self.gen = merged_version(self.gen, other.gen, stable);
@@ -1553,8 +1587,8 @@ impl Mem {
                     w.gen = w.gen.min(self.gen);
                 }
             }
-            // The two sides count apart, so a version one of them lost its writes at
-            // says nothing about the other. The merge is above both.
+            /* The two sides count apart, so a version one of them lost its writes at
+            says nothing about the other. */
             if lost {
                 self.wiped = self.gen;
             }
@@ -1570,7 +1604,33 @@ impl Mem {
             || gen_before != self.gen
             || wiped_before != self.wiped
             || sized_before != self.sized.len()
+            || bounds_before != self.below.len()
     }
+}
+
+fn tested_below(cond: ExprId, holds: bool) -> Option<(ExprId, u64)> {
+    let fixed = |e: ExprId| {
+        expr::as_const(e)
+            .filter(|c| c.fits_u64() && c.low_u64() < 1 << 32)
+            .map(|c| c.low_u64())
+    };
+    let Node::Op(o, v) = expr::node(cond) else {
+        return None;
+    };
+    let (value, below) = match (o, holds) {
+        (op::ISZERO, _) => return tested_below(v[0], !holds),
+        (op::LT, true) => (v[0], fixed(v[1])?),
+        (op::GT, true) => (v[1], fixed(v[0])?),
+        (op::LT, false) => (v[1], fixed(v[0])? + 1),
+        (op::GT, false) => (v[0], fixed(v[1])? + 1),
+        (op::EQ, true) => match (fixed(v[0]), fixed(v[1])) {
+            (Some(c), None) => (v[1], c + 1),
+            (None, Some(c)) => (v[0], c + 1),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (below > 0 && !expr::is_const(value)).then_some((value, below))
 }
 
 fn answer_stamp(e: ExprId) -> Option<u32> {
@@ -1626,6 +1686,11 @@ impl State {
         if let Some((at, len)) = answer_length(cond, holds, &self.mem.capped) {
             if !self.mem.sized.contains(&(at, len)) {
                 self.mem.sized.push((at, len));
+            }
+        }
+        if let Some(bound) = tested_below(cond, holds) {
+            if !self.mem.below.contains(&bound) && self.mem.below.len() < 64 {
+                self.mem.below.push(bound);
             }
         }
     }
@@ -2126,6 +2191,7 @@ impl<'a> Lifter<'a> {
                             || e.state.mem.wiped != new_state.mem.wiped
                             || e.state.mem.sized != new_state.mem.sized
                             || e.state.mem.capped != new_state.mem.capped
+                            || e.state.mem.below != new_state.mem.below
                             || e.state.storage != new_state.storage
                             || e.state.sgen != new_state.sgen
                             || e.state.returned != new_state.returned;
@@ -3409,7 +3475,6 @@ impl<'a> Lifter<'a> {
     }
 }
 
-// A sum as its terms and the number added to them, whatever way the code grouped it.
 // A term taken away again is gone, which is how an end less a start gives a length.
 fn summed(e: ExprId) -> (Vec<(ExprId, i64)>, U256) {
     let mut terms: HashMap<ExprId, i64> = HashMap::new();
@@ -3437,8 +3502,7 @@ struct Entering<'a> {
     sgen: u32,
 }
 
-/* A value of a folded helper, said in its caller's terms. What the helper read from
-memory before it wrote any is what the caller's memory held where it was called. */
+// What a folded helper read from memory before it wrote any is what its caller's held.
 fn entered(e: ExprId, with: &Entering) -> ExprId {
     let free_pointer = konst_u64(FREE_POINTER);
     let marks: RefCell<Vec<(ExprId, ExprId)>> = RefCell::default();

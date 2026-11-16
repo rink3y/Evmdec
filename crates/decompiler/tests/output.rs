@@ -455,3 +455,16 @@ fn the_cut_a_selector_makes_through_an_argument_is_no_field_of_storage() {
     assert!(out.contains("address stor_0; // slot 0x0"), "{out}");
     assert!(!out.contains("uint32"), "{out}");
 }
+
+#[test]
+fn a_write_through_an_index_tested_to_be_small_does_not_reach_the_words_past_its_list() {
+    let tested = text(
+        "33610200526003600035106100145760006000fd5b426000356020026080015261020051600055600035\
+         6020026080015160015500",
+    );
+    assert!(tested.contains("require(msg.data[0:32] < 3);"), "{tested}");
+    assert!(tested.contains("stor_0 = msg.sender;"), "{tested}");
+    let untested =
+        text("33610200524260003560200260800152610200516000556000356020026080015160015500");
+    assert!(untested.contains("stor_0 = mem[0x200];"), "{untested}");
+}

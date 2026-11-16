@@ -817,7 +817,6 @@ pub struct Analysis<'a> {
     pub call_targets: RefCell<HashSet<usize>>,
     pub steps: RefCell<usize>,
     pub budget_exhausted: RefCell<bool>,
-    // Blocks whose address was still on the stack where a walk ended.
     abandoned: RefCell<HashSet<usize>>,
 }
 
@@ -1556,7 +1555,6 @@ pub struct Recovered {
     pub main: Unit,
     pub functions: BTreeMap<usize, Unit>,
     pub orphans: BTreeMap<usize, Unit>,
-    // Orphans entered at an address a walk left on the stack where it ended.
     pub dead_returns: BTreeSet<usize>,
     pub unresolved_jumps: Vec<usize>,
     pub budget_exhausted: bool,

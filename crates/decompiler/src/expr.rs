@@ -56,7 +56,6 @@ struct Arena {
     depth: Vec<u32>,
     kinds: Vec<u16>,
     seq: u32,
-    // For a hash of bytes written at odd places, the values written and their widths.
     pieces: HashMap<ExprId, Vec<(ExprId, u8)>>,
 }
 
@@ -764,7 +763,7 @@ pub fn pieces(hash: ExprId) -> Option<Vec<(ExprId, u8)>> {
     ARENA.with(|a| a.borrow().pieces.get(&hash).cloned())
 }
 
-// The pieces of a hash follow it when its words are rewritten.
+// Without its pieces a rewritten hash would print as halves of words again.
 fn rehashed(
     old: ExprId,
     words: Vec<ExprId>,

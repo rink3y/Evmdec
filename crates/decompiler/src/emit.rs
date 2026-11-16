@@ -322,7 +322,6 @@ from that number elsewhere is no place. */
 pub struct Offsets {
     places: HashSet<ExprId>,
     bases: HashSet<ExprId>,
-    // For each helper, the parameters it uses as places in memory.
     handed: std::sync::Arc<HashMap<usize, BTreeSet<usize>>>,
 }
 

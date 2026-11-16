@@ -164,6 +164,9 @@ pub struct Explorer<'a> {
     // The set-up calls the starting world has been through.
     setups: Vec<(usize, Try)>,
     on_chain: bool,
+    // Set while a call is made in a world that is only being tried. Such a call says
+    // nothing of what the contract does in the world the report is about.
+    trial: bool,
     // The contracts the chain's state names, and the addresses looked at to find them.
     contracts: Vec<Addr>,
     checked: HashSet<Addr>,
@@ -258,10 +261,12 @@ fn obstacle(run: &Run) -> String {
 }
 
 fn better(new: &Run, old: &Run) -> bool {
+    // A call that runs until the step limit got nowhere, however many steps it took.
+    let endless = new.halt == crate::trace::Halt::Steps;
     match (new.ok, old.ok) {
         (true, false) => true,
         (false, true) => false,
-        _ => (new.edges.len(), new.steps) > (old.edges.len(), old.steps),
+        _ => !endless && (new.edges.len(), new.steps) > (old.edges.len(), old.steps),
     }
 }
 
@@ -355,6 +360,7 @@ impl<'a> Explorer<'a> {
             good: Vec::new(),
             setups: Vec::new(),
             on_chain: false,
+            trial: false,
             contracts: Vec::new(),
             checked: HashSet::new(),
         }
@@ -513,6 +519,9 @@ impl<'a> Explorer<'a> {
                     );
                 }
             }
+        }
+        if self.trial {
+            return (world, run);
         }
         self.facts
             .observe(entry, &t.msg, &run, self.subject, &self.known);
@@ -1491,7 +1500,9 @@ impl<'a> Explorer<'a> {
                 continue;
             }
             world.seed(subject, slot, value);
+            self.trial = true;
             let (_, next) = self.attempt_in(world, entry, t);
+            self.trial = false;
             // The caller's own entry is as often a balance as a role. Only a role lets the call end.
             let enough = next.ok || !roles.contains(&slot);
             if enough && better(&next, run) {
@@ -1517,6 +1528,13 @@ impl<'a> Explorer<'a> {
 
     // A setting one call needs must not shut the calls that worked without it.
     fn breaks_others(&mut self, world: &World, but: usize) -> bool {
+        let outer = std::mem::replace(&mut self.trial, true);
+        let breaks = self.shuts(world, but);
+        self.trial = outer;
+        breaks
+    }
+
+    fn shuts(&mut self, world: &World, but: usize) -> bool {
         let worked: Vec<(usize, Try)> = self
             .good
             .iter()
@@ -1535,6 +1553,26 @@ impl<'a> Explorer<'a> {
             let (_, run) = self.attempt_in(world.clone(), entry, &t);
             if run.ok {
                 return true;
+            }
+        }
+        /* A value that lets one call go on can stop every other: a lock taken for a
+        setting, a switch that admits only testers, a count that sends a loop over
+        entries that are not there. No plain call of the owner or of a user may get
+        less far with it than without it. */
+        let now = self.states[0].world.clone();
+        for entry in (0..self.entries.len()).filter(|e| *e != but) {
+            if self.entries[entry].view || budget::spent() {
+                continue;
+            }
+            for who in [OWNER, USER] {
+                let plain = self.seed(entry, who, who, UNIT, U256::ZERO);
+                let (_, before) = self.attempt_in(now.clone(), entry, &plain);
+                let (_, after) = self.attempt_in(world.clone(), entry, &plain);
+                let endless = after.halt == crate::trace::Halt::Steps
+                    && before.halt != crate::trace::Halt::Steps;
+                if endless || (after.ok, after.edges.len()) < (before.ok, before.edges.len()) {
+                    return true;
+                }
             }
         }
         false

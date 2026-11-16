@@ -232,3 +232,20 @@ fn a_call_that_cuts_what_a_third_account_holds_is_found_on_the_side_of_a_test_it
         cut.steps
     );
 }
+
+#[test]
+fn a_setting_one_call_needs_is_not_taken_where_it_stops_another_call_sooner() {
+    // tune(uint256) is refused unless testing is set. draw(uint256) is refused once it is,
+    // and never ends either way, so only how far it gets tells.
+    let report = report("Gate.hex");
+    let set = |a: &String| a.contains("slot 0x1 is set");
+    assert!(!report.assumed.iter().any(set), "{:?}", report.assumed);
+    let tune = report
+        .functions
+        .iter()
+        .find(|f| f.selector.as_deref() == Some("0xbecda0ea"));
+    let tune = tune.expect("tune(uint256)");
+    // A call that only ended in a world that was tried and not kept did not end.
+    assert!(tune.ends_for.is_empty(), "{:?}", tune.ends_for);
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+}

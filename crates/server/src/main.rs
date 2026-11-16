@@ -133,13 +133,6 @@ enum Source<'a> {
 }
 
 impl Source<'_> {
-    fn title(&self) -> &str {
-        match self {
-            Source::Bytecode(_) => "bytecode",
-            Source::Address { address, .. } => address,
-        }
-    }
-
     fn obtain(&self, opts: &Options, cache: &mut CodeCache) -> Result<Contract, String> {
         match self {
             Source::Bytecode(code) => Ok(evmdec::decompile::decompile(code, opts)),
@@ -168,8 +161,6 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
             }
         }
     }
-    let (r, linked_reports) = evmdec::analyze::analyze_all(&c);
-    let md = evmdec::analyze::render_markdown(&c, &r, source.title());
     let disasm: Vec<String> = evmdec::disasm::disassemble(&c.info.runtime)
         .iter()
         .map(evmdec::disasm::format_instruction)
@@ -177,18 +168,12 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
     let linked: Vec<Value> = c
         .linked
         .iter()
-        .zip(linked_reports)
-        .map(|(lc, lr)| {
-            let lmd = evmdec::analyze::render_markdown(
-                lc,
-                &lr,
-                &format!("linked contract {}", lc.address.as_deref().unwrap_or("?")),
-            );
+        .map(|lc| {
             let ldis: Vec<String> = evmdec::disasm::disassemble(&lc.info.runtime)
                 .iter()
                 .map(evmdec::disasm::format_instruction)
                 .collect();
-            json!({"contract": lc, "report": lr, "report_markdown": lmd, "disassembly": ldis})
+            json!({"contract": lc, "disassembly": ldis})
         })
         .collect();
     let parts_disassembly: Vec<Vec<String>> = c
@@ -201,7 +186,7 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
                 .collect()
         })
         .collect();
-    let mut v = json!({"contract": c, "report": r, "report_markdown": md, "disassembly": disasm});
+    let mut v = json!({"contract": c, "disassembly": disasm});
     if !linked.is_empty() {
         v["linked"] = Value::Array(linked);
     }

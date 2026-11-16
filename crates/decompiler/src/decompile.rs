@@ -192,10 +192,6 @@ pub struct Contract {
     pub link: Option<Link>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unfollowed: Vec<Unfollowed>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub admits: Vec<String>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub gates_read: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1386,8 +1382,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         linked: Vec::new(),
         link: None,
         unfollowed: Vec::new(),
-        admits: Vec::new(),
-        gates_read: false,
         address: None,
         chain: None,
         proxy: None,

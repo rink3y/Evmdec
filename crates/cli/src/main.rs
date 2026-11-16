@@ -63,8 +63,6 @@ enum Cmd {
         embedded: bool,
         #[arg(long, help = "Disable the built-in signature dictionary")]
         no_sigs: bool,
-        #[arg(long, help = "Append the security report (markdown) after the code")]
-        report: bool,
         #[arg(
             long,
             help = "Resolve unknown selectors online (openchain.xyz, 4byte.directory)"
@@ -82,12 +80,6 @@ enum Cmd {
         seed: u64,
         #[arg(long)]
         verbose: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    #[command(about = "Security analysis report (markdown, or JSON with --json)")]
-    Analyze {
-        file: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -274,7 +266,6 @@ fn run(cli: Cli) -> Result<()> {
             json,
             embedded,
             no_sigs,
-            report,
             lookup,
         } => {
             let mut opts = Options {
@@ -284,7 +275,6 @@ fn run(cli: Cli) -> Result<()> {
                 no_sigs,
                 extra_sigs: Default::default(),
             };
-            let file = PathBuf::from(&input);
             let is_addr = evmdec::rpc::is_address(&input);
             let code = if is_addr {
                 None
@@ -326,45 +316,9 @@ fn run(cli: Cli) -> Result<()> {
                 }
             };
             if json {
-                let r = evmdec::analyze::analyze(&c);
-                let mut v = serde_json::to_value(&c)?;
-                v["report"] = serde_json::to_value(&r)?;
-                println!("{}", serde_json::to_string_pretty(&v)?);
+                println!("{}", serde_json::to_string_pretty(&c)?);
             } else {
                 print!("{}", c.source);
-                if report {
-                    let (r, linked) = evmdec::analyze::analyze_all(&c);
-                    println!(
-                        "\n/*\n{}*/",
-                        evmdec::analyze::render_markdown(&c, &r, &file.display().to_string())
-                    );
-                    if let Some(p) = &c.proxy {
-                        if let Some(ic) = &p.contract {
-                            let r2 = evmdec::analyze::analyze(ic);
-                            println!(
-                                "\n/*\n{}*/",
-                                evmdec::analyze::render_markdown(
-                                    ic,
-                                    &r2,
-                                    &format!("implementation {}", p.implementation)
-                                )
-                            );
-                        }
-                    }
-                    for (lc, lr) in c.linked.iter().zip(&linked) {
-                        println!(
-                            "\n/*\n{}*/",
-                            evmdec::analyze::render_markdown(
-                                lc,
-                                lr,
-                                &format!(
-                                    "linked contract {}",
-                                    lc.address.as_deref().unwrap_or("?")
-                                )
-                            )
-                        );
-                    }
-                }
             }
         }
         Cmd::Verify {
@@ -447,19 +401,6 @@ fn run(cli: Cli) -> Result<()> {
                     _ => anyhow::bail!("'{h}' is neither a 4-byte selector nor a 32-byte topic"),
                 };
                 println!("0x{hex} {}", if line.is_empty() { "?" } else { &line });
-            }
-        }
-        Cmd::Analyze { file, json } => {
-            let code = load(&file)?;
-            let c = evmdec::decompile::decompile(&code, &Options::default());
-            let r = evmdec::analyze::analyze(&c);
-            if json {
-                println!("{}", serde_json::to_string_pretty(&r)?);
-            } else {
-                print!(
-                    "{}",
-                    evmdec::analyze::render_markdown(&c, &r, &file.display().to_string())
-                );
             }
         }
         Cmd::Disasm { file } => {

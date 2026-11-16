@@ -15,8 +15,7 @@ fn survives(code: Vec<u8>) {
         .stack_size(2 << 20)
         .spawn(move || {
             evmdec::clock::run(Duration::from_secs(120), || {
-                let contract = decompile(&code, &Options::default());
-                evmdec::analyze::analyze(&contract).findings.len()
+                decompile(&code, &Options::default()).functions.len()
             })
         })
         .expect("thread");

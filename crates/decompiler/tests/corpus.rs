@@ -33,7 +33,6 @@ fn every_contract_decompiles_with_full_jump_resolution() {
             c.stats.covered_blocks,
             c.stats.code_blocks
         );
-        let _ = evmdec::analyze::analyze(&c);
     }
 }
 
@@ -418,18 +417,6 @@ fn old_multiowned_wallet_reads_as_source() {
             }
         }
     }
-    let r = evmdec::analyze::analyze(&c);
-    let re: Vec<_> = r.findings.iter().filter(|f| f.id == "reentrancy").collect();
-    assert_eq!(
-        re.len(),
-        2,
-        "{:?}",
-        re.iter().map(|f| &f.function).collect::<Vec<_>>()
-    );
-    assert!(re
-        .iter()
-        .all(|f| f.severity == evmdec::analyze::Severity::Medium && f.sites == 1));
-    assert!(r.findings.iter().any(|f| f.id == "silent-auth-failure"));
 }
 
 #[test]
@@ -463,34 +450,10 @@ fn balancer_bpool_reads_as_source() {
     );
     assert!(src.contains("stor_9[stor_9.length - 1]"), "{src}");
     assert!(!src.contains("0x6e1540171b6c0c960b71a7020d9f60077f6af931a8bbf590da0223dacf75c7ae"));
-    let r = evmdec::analyze::analyze(&c);
-    assert!(r
-        .findings
-        .iter()
-        .filter(|f| f.id == "reentrancy")
-        .all(|f| f.severity == evmdec::analyze::Severity::Info));
-    let rq: Vec<String> = r
-        .findings
-        .iter()
-        .filter(|f| f.id == "reverse-quote-rounding")
-        .map(|f| f.function.clone().unwrap_or_default())
-        .collect();
-    assert!(
-        rq.iter().any(|f| f.starts_with("joinswapPoolAmountOut")),
-        "{rq:?}"
-    );
-    assert!(
-        rq.iter().any(|f| f.starts_with("exitswapExternAmountOut")),
-        "{rq:?}"
-    );
-    assert!(
-        !rq.iter().any(|f| f.starts_with("joinswapExternAmountIn")),
-        "forward-quoted join must not be flagged: {rq:?}"
-    );
 }
 
 #[test]
-fn tribe_reads_as_source_and_is_rated_by_its_logic() {
+fn tribe_reads_as_source() {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/tribe.hex");
     let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
     let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
@@ -507,87 +470,6 @@ fn tribe_reads_as_source_and_is_rated_by_its_logic() {
         assert!(src.contains(s), "missing {s}\n{src}");
     }
     assert_eq!(src.matches("selfdestruct(msg.sender);").count(), 2, "{src}");
-    let r = evmdec::analyze::analyze(&c);
-    assert!(
-        r.findings
-            .iter()
-            .all(|f| f.severity != evmdec::analyze::Severity::Critical),
-        "{:?}",
-        r.findings
-            .iter()
-            .map(|f| (&f.id, f.severity))
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        r.findings
-            .iter()
-            .any(|f| f.id == "blocking-payout-loop"
-                && f.severity == evmdec::analyze::Severity::Medium)
-    );
-    assert!(r
-        .findings
-        .iter()
-        .any(|f| f.id == "selfdestruct" && f.severity == evmdec::analyze::Severity::Low));
-    assert!(
-        !r.findings
-            .iter()
-            .any(|f| f.id == "unprotected-ether-withdrawal"),
-        "waiting[user] is the caller's accounting"
-    );
-}
-
-#[test]
-fn a_rule_stays_silent_where_it_was_once_wrong() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/false_alarms");
-    let text = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
-    let listed: serde_json::Value = serde_json::from_str(&text).unwrap();
-    let cases = listed.as_object().unwrap();
-    let mut checked = 0;
-    for (name, case) in cases.iter().filter(|(name, _)| !name.starts_with('_')) {
-        let hex = std::fs::read_to_string(dir.join(format!("{name}.hex"))).unwrap();
-        let code = evmdec::hex::decode(hex.trim()).unwrap();
-        let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
-        let r = evmdec::analyze::analyze(&c);
-        let within = case["function"].as_str().unwrap_or("");
-        for rule in case["rules"].as_array().unwrap() {
-            let rule = rule.as_str().unwrap();
-            let here = |f: &&evmdec::analyze::Finding| {
-                f.id == rule && f.function.as_deref().unwrap_or("").starts_with(within)
-            };
-            let fired: Vec<_> = r.findings.iter().filter(here).collect();
-            assert!(fired.is_empty(), "{name}: {rule} fired: {fired:?}");
-            checked += 1;
-        }
-    }
-    assert!(checked > 0);
-}
-
-#[test]
-fn a_finding_the_search_withdraws_leaves_the_rest_of_the_report_in_place() {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../testdata/incidents/flawed/2024-01-mimspell2.hex");
-    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
-    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
-    let r = evmdec::analyze::analyze(&c);
-    let tested = r
-        .maps
-        .iter()
-        .find(|s| s.title.starts_with("Tested by running"));
-    assert!(tested.is_some_and(|s| !s.lines.is_empty()), "{:?}", r.maps);
-}
-
-#[test]
-fn a_getter_that_copies_a_string_through_a_built_in_contract_changes_nothing() {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../testdata/false_alarms/classic_f8784090.hex");
-    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
-    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
-    let r = evmdec::analyze::analyze(&c);
-    let open = &r.unauthenticated_state_changers;
-    for getter in ["name", "symbol", "version"] {
-        assert!(!open.iter().any(|f| f.starts_with(getter)), "{open:?}");
-    }
-    assert_eq!(r.external_calls.len(), 1, "{:?}", r.external_calls);
 }
 
 #[test]
@@ -599,12 +481,6 @@ fn lobby_calls_into_its_own_deployment() {
     assert!(src.contains("deployed_2 = create("), "{src}");
     assert!(src.contains("stor_0[stor_1] = deployed_2;"), "{src}");
     assert!(c.strings.is_empty(), "{:?}", c.strings);
-    let r = evmdec::analyze::analyze(&c);
-    assert!(r
-        .findings
-        .iter()
-        .all(|f| f.severity == evmdec::analyze::Severity::Info));
-    assert!(r.findings.iter().any(|f| f.id == "reentrancy-fixed-callee"));
 }
 
 #[test]
@@ -745,36 +621,6 @@ fn defaults_give_way_to_names_the_code_implies() {
         uni.contains("uint256 deadline, uint8 v, bytes32 r, bytes32 s) external"),
         "signature parts and deadline are named"
     );
-}
-
-#[test]
-fn a_shared_helper_site_is_one_finding_under_any_parameter_names() {
-    let code = corpus()
-        .into_iter()
-        .find(|(n, _)| n == "safe_l2_130")
-        .map(|(_, code)| code)
-        .expect("fixture present");
-    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
-    let report = evmdec::analyze::analyze(&c);
-    let shared: Vec<&evmdec::analyze::Finding> = report
-        .findings
-        .iter()
-        .filter(|f| f.id == "arbitrary-delegatecall")
-        .filter(|f| f.function.as_deref().is_some_and(|n| n.contains("(+1)")))
-        .collect();
-    assert_eq!(
-        shared.len(),
-        1,
-        "{:?}",
-        report
-            .findings
-            .iter()
-            .map(|f| (&f.id, &f.function))
-            .collect::<Vec<_>>()
-    );
-    assert!(shared[0]
-        .description
-        .contains("The same code is reached from"));
 }
 
 #[test]
@@ -978,23 +824,4 @@ fn stores_nothing_reads_are_left_out() {
         !old.contains("mem[0x0] = 6;"),
         "the scratch word of a hash the lifter resolved is not printed"
     );
-}
-
-#[test]
-fn a_dynamic_call_is_kept_only_where_a_run_shows_the_caller_chooses_the_selector() {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vuln/smt_token.hex");
-    let code = evmdec::hex::decode(std::fs::read_to_string(p).unwrap().trim()).unwrap();
-    let c = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default());
-    let report = evmdec::analyze::analyze(&c);
-    let dynamic: Vec<_> = report
-        .findings
-        .iter()
-        .filter(|f| f.id == "dynamic-call")
-        .collect();
-    assert_eq!(dynamic.len(), 1, "{dynamic:?}");
-    assert!(dynamic[0].confirmed, "{:?}", dynamic[0]);
-    let function = dynamic[0].function.as_deref().unwrap_or_default();
-    assert!(!function.contains("approveAndCall"), "{function}");
-    let shown = &dynamic[0].description;
-    assert!(shown.contains("The caller decides"), "{shown}");
 }

@@ -15,6 +15,4 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --release -p evmdec-cli
       - run: python3 corpus/bench.py
-      - run: python3 corpus/vuln_bench.py
-      - run: python3 corpus/rule_bench.py
       - run: RUNS=8 ./corpus/verify_all.sh

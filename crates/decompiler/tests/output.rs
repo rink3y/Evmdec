@@ -408,3 +408,16 @@ fn a_test_that_ends_in_the_invalid_opcode_is_an_assert_with_no_panic_data() {
     assert!(out.contains("assert(msg.data[0:32] != 0);"), "{out}");
     assert!(!out.contains("Panic"), "{out}");
 }
+
+#[test]
+fn the_selector_stored_where_the_data_of_a_call_starts_is_named() {
+    let out = text("63a9059cbb60e01b608052366000608437600060003660040160806000335af15000");
+    assert!(
+        out.contains("mem[0x80] = bytes32(transfer.selector);"),
+        "{out}"
+    );
+    assert!(
+        out.contains(".call(abi.encodeWithSelector(transfer.selector, ...));"),
+        "{out}"
+    );
+}

@@ -106,6 +106,7 @@ pub enum PayloadKind {
 pub struct Names {
     pub callee_reads: Option<std::sync::Arc<HashMap<usize, crate::lift::MemoryReads>>>,
     pub code: std::sync::Arc<Vec<u8>>,
+    pub call_starts: HashSet<ExprId>,
     pub params: HashMap<u32, String>,
     pub in_helper: bool,
     pub aliases: HashMap<ExprId, String>,
@@ -568,7 +569,12 @@ impl Names {
         for (target, var) in bindings {
             let mut memo = HashMap::new();
             let named = |n: &Node| (n == target).then_some(*var);
-            for set in [&mut self.offsets.places, &mut self.offsets.bases] {
+            let sets = [
+                &mut self.offsets.places,
+                &mut self.offsets.bases,
+                &mut self.call_starts,
+            ];
+            for set in sets {
                 let renamed: Vec<ExprId> = set
                     .iter()
                     .map(|e| expr::substitute(*e, &named, &mut memo))
@@ -1188,6 +1194,17 @@ fn fmt_block_ref(number: u32, offset: U256) -> String {
     } else {
         format!("ptr{number} + {}", offset.to_decimal())
     }
+}
+
+/* A word whose first four bytes alone are set, stored where the data of a call starts, is
+the selector of that call. The word itself is what the store writes, so the name says
+only which function the four bytes stand for. */
+fn stored_selector(off: ExprId, val: ExprId, n: &Names) -> Option<String> {
+    let word = expr::as_const(val).filter(|_| n.call_starts.contains(&off))?;
+    let selector = (word >> 224).low_u64() as u32;
+    let bare = selector != 0 && (word & expr::mask_bits(224)).is_zero();
+    let sig = sigs::function(selector).filter(|_| bare)?;
+    Some(format!("bytes32({}.selector)", sigs::name_of(&sig)))
 }
 
 fn fmt_stored_word(val: ExprId, n: &Names) -> String {
@@ -2688,6 +2705,8 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
         } => {
             if *width == 1 {
                 format!("mem8[{}] = {};", fmt_mem_off(*off, n), fmt_expr(*val, n))
+            } else if let Some(selector) = stored_selector(*off, *val, n) {
+                format!("{} = {selector};", fmt_mem_word(*off, n))
             } else {
                 format!("{} = {};", fmt_mem_word(*off, n), fmt_stored_word(*val, n))
             }

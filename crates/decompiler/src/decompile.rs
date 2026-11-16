@@ -1952,6 +1952,15 @@ impl Callees {
     }
 }
 
+fn call_starts(l: &Lifted) -> Vec<ExprId> {
+    let stmts = l.nodes.iter().flat_map(|nd| nd.stmts.iter());
+    let start = |s: &Stmt| match s {
+        Stmt::Call { in_off, .. } => Some(*in_off),
+        _ => None,
+    };
+    stmts.filter_map(start).collect()
+}
+
 pub fn make_names(
     f: &Function,
     storage: &[StorageVar],
@@ -1964,6 +1973,7 @@ pub fn make_names(
         callee_names: callees.names.clone(),
         callee_reads: Some(callees.reads.clone()),
         code: callees.code.clone(),
+        call_starts: f.lifted.iter().flat_map(call_starts).collect(),
         blocks: f
             .lifted
             .as_ref()

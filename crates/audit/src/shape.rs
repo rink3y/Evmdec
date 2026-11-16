@@ -390,6 +390,16 @@ impl Shape {
         }
     }
 
+    // How many lists have nothing in them.
+    #[must_use]
+    pub fn hollow(&self) -> usize {
+        fn count(node: &Node) -> usize {
+            let own = usize::from(matches!(node, Node::List(items) if items.is_empty()));
+            own + node.children().iter().map(count).sum::<usize>()
+        }
+        self.args.iter().map(count).sum()
+    }
+
     // The shape with nothing in its words: what is laid out where, and no more.
     #[must_use]
     pub fn frame(&self) -> Shape {
@@ -488,6 +498,9 @@ mod tests {
         let list = spots.iter().rfind(|s| s.role == Role::Length).expect("two");
         assert!(s.set(list, U256::from_u64(3)));
         assert_eq!(words(&s.encode()), [0x40, 0xc0, 0x60, 0, 0, 7, 3, 0, 0, 0]);
+        assert_eq!(s.hollow(), 0);
+        assert!(s.set(list, U256::ZERO));
+        assert_eq!(s.hollow(), 1);
     }
 
     #[test]

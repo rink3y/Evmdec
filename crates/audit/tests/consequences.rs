@@ -187,3 +187,13 @@ fn what_a_call_shows_without_nesting_is_not_found_again_by_nesting_it() {
     let report = report("Allow.hex");
     assert!(report.findings.is_empty(), "{:?}", report.findings);
 }
+
+#[test]
+fn a_list_is_not_emptied_to_end_a_call_its_items_could_end() {
+    // write((uint256,uint256,uint256)[]) pays for each cell whose two places are in range.
+    // With no cells it ends and pays nothing.
+    let report = report("Board.hex");
+    let kinds: Vec<Kind> = report.findings.iter().map(|f| f.kind).collect();
+    assert_eq!(kinds, vec![Kind::Gain], "{:?}", report.findings);
+    assert_eq!(report.findings[0].selector.as_deref(), Some("0xac41fdb5"));
+}

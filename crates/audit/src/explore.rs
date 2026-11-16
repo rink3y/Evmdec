@@ -835,19 +835,26 @@ impl<'a> Explorer<'a> {
             self.reach[entry] = self.reach[entry].max((run.ok, run.edges.len()));
         }
         let mut best = (seed, world, run);
+        /* A call that ends because a list was emptied skips what the list is there for.
+        It is held back while a repair that keeps the list gets further, and is the
+        answer only if none of those ends. */
+        let mut hollow: Option<(Try, World, Run)> = None;
         for _ in 0..ROUNDS {
             if best.2.ok || budget::spent() {
                 break;
             }
             let now = self.states[state].world.time;
             let tries = self.mutations(&best.0, &best.2, now);
+            let emptied = best.0.shape.hollow();
             let mut improved = false;
             for t in tries {
                 if budget::spent() {
                     break;
                 }
                 let (world, run) = self.attempt(state, entry, &t);
-                if better(&run, &best.2) {
+                if run.ok && t.shape.hollow() > emptied {
+                    hollow.get_or_insert((t, world, run));
+                } else if better(&run, &best.2) {
                     let ended = run.ok;
                     best = (t, world, run);
                     improved = true;
@@ -860,12 +867,16 @@ impl<'a> Explorer<'a> {
                 break;
             }
         }
+        if let Some(ended) = hollow.filter(|_| !best.2.ok) {
+            best = ended;
+        }
         /* A call that got further than any before it with more in its call data than
         the entry's own shape has is what every later call starts from. What the account
         with no role sends is no model for anyone else. */
         let reach = (best.2.ok, best.2.edges.len());
         let plain = plain && !Facts::same_party(best.0.msg.from, ACTOR);
-        if plain && best.0.shape.frame() != from && reach > self.reach[entry] {
+        let grown = best.0.shape.hollow() <= self.entries[entry].shape.hollow();
+        if plain && grown && best.0.shape.frame() != from && reach > self.reach[entry] {
             self.reach[entry] = reach;
             self.entries[entry].shape = best.0.shape.clone();
             self.learn(entry, &best.0, &best.2);

@@ -682,6 +682,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                 }],
                 entry: 0,
                 budget_exhausted: false,
+                exits: Vec::new(),
             };
             let l = oracle.lift(&unit, None);
             let target = match &l.nodes[0].term {
@@ -791,7 +792,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         oracle: false,
         copy_loops: Default::default(),
     };
-    let main = lifter.lift_summarizing(&rec.main, None);
+    let mut main = lifter.lift_summarizing(&rec.main, None);
     let dispatch = function::discover(&main, &table_entries);
     let contract_nonpayable = function::dispatcher_nonpayable(&main, &dispatch.dispatcher);
     tick("lift main", &mut tt);
@@ -810,6 +811,11 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     }
     tick("lift orphans", &mut tt);
+    let frames = ssa::frames(internals.iter().chain(&orphans).map(|(pc, l)| (*pc, l)));
+    for (pc, l) in internals.iter_mut().chain(orphans.iter_mut()) {
+        ssa::align(l, &frames, frames.get(pc));
+    }
+    ssa::align(&mut main, &frames, None);
     let mut functions: Vec<Function> = Vec::new();
     let reprocess =
         main.reprocess_count + internals.values().map(|l| l.reprocess_count).sum::<usize>();
@@ -954,7 +960,9 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         if let Some(un) = unit_node_of(entry) {
             if let Some(state) = Lifter::entry_state_of(&main, un) {
                 let (sub, _) = rec.main.slice(un);
-                return lifter.lift_from_summarizing(&sub, state);
+                let mut l = lifter.lift_from_summarizing(&sub, state);
+                ssa::align(&mut l, &frames, None);
+                return l;
             }
         }
         function::slice(&main, entry)
@@ -1002,24 +1010,10 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             0,
         ));
     }
+    let n_rets = |l: &Lifted| ssa::returns(l).iter().map(|v| v.len()).max().unwrap_or(0);
     for (pc, mut l) in internals {
         crate::idiom::fold(&mut l);
-        let n_rets = l
-            .nodes
-            .iter()
-            .filter_map(|n| {
-                if let Term::InternalReturn(v) = &n.term {
-                    Some(v.len())
-                } else {
-                    None
-                }
-            })
-            .max()
-            .unwrap_or(0);
-        let n_args = match l.ret_slot {
-            Some(k) => (k as usize).min(l.n_args),
-            None => l.n_args,
-        };
+        let (n_args, n_rets) = (ssa::arity(&l), n_rets(&l));
         functions.push(make(
             FnKind::Internal,
             None,
@@ -1031,7 +1025,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         ));
     }
     for (pc, l) in orphans {
-        let n_args = l.n_args;
+        let (n_args, n_rets) = (ssa::arity(&l), n_rets(&l));
         functions.push(make(
             FnKind::Orphan,
             None,
@@ -1039,7 +1033,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             pc,
             Some(format!("orphan_{:#x}", pc)),
             n_args,
-            0,
+            n_rets,
         ));
     }
 
@@ -1958,21 +1952,12 @@ pub fn make_names(
         }
     }
     if let Some(l) = &f.lifted {
-        let k = l.ret_slot.map(|k| k as usize).unwrap_or(l.n_args);
-        for i in 0..l.n_args.max(k + 1) {
-            let name = if i < k {
-                let index = k - 1 - i;
-                match f.params.get(index).filter(|_| f.kind == FnKind::Internal) {
-                    Some(p) => p.name.clone(),
-                    None => format!("arg{index}"),
-                }
-            } else if i == k && l.ret_slot.is_some() {
-                "__return_pc".to_string()
-            } else {
-                format!(
-                    "caller_stack{}",
-                    i - k - if l.ret_slot.is_some() { 1 } else { 0 }
-                )
+        let k = ssa::arity(l);
+        for i in 0..k {
+            let index = k - 1 - i;
+            let name = match f.params.get(index).filter(|_| f.kind == FnKind::Internal) {
+                Some(p) => p.name.clone(),
+                None => format!("arg{index}"),
             };
             n.args.insert(i as u32, name);
         }
@@ -2032,7 +2017,7 @@ pub fn make_names(
                     }
                     if let Some(tys) = callees.returns.get(callee) {
                         for (r, ty) in results.iter().zip(tys) {
-                            if ty == "bool" {
+                            if ty == "bool" && !expr::is_const(*r) {
                                 n.bools.insert(*r);
                             }
                         }
@@ -2132,10 +2117,9 @@ fn internal_params(l: &Lifted, pc: usize, n_args: usize, env: &TypeEnv) -> Vec<P
 }
 
 fn refine_results(returns: &mut [String], pc: usize, env: &TypeEnv) {
-    let n = returns.len();
     for (i, ty) in returns.iter_mut().enumerate() {
         if ty == "uint256" {
-            if let Some(t) = env.result_type(pc, (n - 1 - i) as u16) {
+            if let Some(t) = env.result_type(pc, i as u16) {
                 *ty = t;
             }
         }
@@ -3330,11 +3314,16 @@ pub fn fmt_function_header(f: &Function) -> String {
         }
         FnKind::Orphan => {
             let params: Vec<String> = (0..f.n_args).map(|i| format!("uint256 arg{}", i)).collect();
+            let returns = match f.n_rets {
+                0 => String::new(),
+                n => format!(" returns ({})", vec!["uint256"; n].join(", ")),
+            };
             s.push_str(&format!(
-                "    // unreachable code at {:#x}\n    function {}({}) internal {{\n",
+                "    // unreachable code at {:#x}\n    function {}({}) internal{} {{\n",
                 f.pc,
                 f.name,
-                params.join(", ")
+                params.join(", "),
+                returns
             ));
         }
     }

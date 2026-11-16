@@ -446,6 +446,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
             }],
             entry: 0,
             budget_exhausted: false,
+            exits: Vec::new(),
         };
         let lifted = lifter.lift(&unit, None);
         let ln = &lifted.nodes[0];

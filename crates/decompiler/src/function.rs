@@ -931,8 +931,7 @@ pub fn infer_internal_returns(l: &Lifted, n_rets: usize) -> Vec<String> {
     if rets.is_empty() {
         return tys;
     }
-    for (i, ty) in tys.iter_mut().enumerate() {
-        let j = n_rets - 1 - i;
+    for (j, ty) in tys.iter_mut().enumerate() {
         let consts: Vec<Option<U256>> = rets.iter().map(|w| expr::as_const(w[j])).collect();
         let all_flags = consts
             .iter()

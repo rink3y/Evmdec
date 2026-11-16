@@ -965,7 +965,7 @@ fn an_argument_is_bound_to_the_parameter_that_receives_it() {
         .expect("the call helper");
     let head = &router[start..start + router[start..].find('\n').unwrap()];
     assert!(
-        head.contains("address target, uint256 arg5, uint256 arg6,"),
+        head.contains("address target, uint256 arg6, uint256 arg7,"),
         "the two factors of the value sent are numbers, whatever sits below them: {head}"
     );
 }
@@ -1170,4 +1170,25 @@ fn a_read_made_before_a_write_is_not_printed_as_one_made_after() {
 fn the_ir_pipeline_is_told_by_its_call_data_test() {
     assert!(regress("via_ir_router.hex").compiler.via_ir);
     assert!(!regress("layerzero_dvn.hex").compiler.via_ir);
+}
+
+#[test]
+fn a_helper_declares_every_stack_place_it_reads_and_returns_what_it_makes() {
+    let router = regress("oneinch_v6.hex").source;
+    assert!(!router.contains("caller_stack") && !router.contains("__return_pc"));
+    let line = |with: &str| router.lines().find(|l| l.contains(with)).expect("the line");
+    let head = line("function func_0x11e0(");
+    let params = &head[head.find('(').unwrap()..head.find(')').unwrap()];
+    assert_eq!(params.split(", ").count(), 7, "{head}");
+    assert!(head.ends_with("internal returns (uint256, uint256) {"));
+    let call = line("= func_0x11e0(").trim();
+    assert!(
+        call.starts_with("(ret_10_0, ret_10_1) = func_0x11e0(calldata[arg2 + 192], ")
+            && call.ends_with(", arg2, target, arg0, arg1, ret_1_0);"),
+        "the call passes the seven places the helper reads and binds its two results: {call}"
+    );
+    assert!(router.contains("return (calldata[arg2 + 128], returndata_2[0]);"));
+    let gauge = regress("vyper_gauge.hex").source;
+    assert!(gauge.contains("function _transfer(uint256 amount, address to, address from)"));
+    assert!(gauge.contains("_transfer(amount, to, msg.sender);"));
 }

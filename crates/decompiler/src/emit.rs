@@ -2234,18 +2234,19 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
         } => {
             let a: Vec<String> = args.iter().map(|x| fmt_expr(*x, n)).collect();
             let call = format!("{}({})", n.callee_name(*callee), a.join(", "));
-            match results.len() {
-                0 => format!("{};", call),
-                1 => format!("{} = {};", fmt_expr(results[0], n), call),
-                _ => format!(
-                    "({}) = {};",
-                    results
-                        .iter()
-                        .map(|r| fmt_expr(*r, n))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    call
-                ),
+            /* A result every caller knows as a constant has no name here. Its place in
+            the list stays empty so the others keep theirs. */
+            let bound: Vec<String> = results
+                .iter()
+                .map(|r| match expr::is_const(*r) {
+                    true => String::new(),
+                    false => fmt_expr(*r, n),
+                })
+                .collect();
+            match bound.as_slice() {
+                all if all.iter().all(String::is_empty) => format!("{};", call),
+                [one] => format!("{} = {};", one, call),
+                _ => format!("({}) = {};", bound.join(", "), call),
             }
         }
         Stmt::Drop(e) => format!("// ignored: {}", fmt_expr(*e, n)),
@@ -2374,13 +2375,12 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
             if vals.is_empty() {
                 "return;".into()
             } else {
-                let k = vals.len();
                 format!(
                     "return ({});",
                     vals.iter()
                         .enumerate()
                         .map(|(j, v)| {
-                            let is_bool_pos = n.bool_returns.get(k - 1 - j).copied() == Some(true);
+                            let is_bool_pos = n.bool_returns.get(j).copied() == Some(true);
                             match expr::as_const(*v) {
                                 Some(c) if is_bool_pos && c.is_zero() => "false".to_string(),
                                 Some(c) if is_bool_pos && c == U256::ONE => "true".to_string(),

@@ -120,6 +120,9 @@ impl AVal {
     fn is_token(&self) -> bool {
         matches!(self, AVal::Slot(_) | AVal::Mem(_))
     }
+    pub fn passes_through(&self) -> bool {
+        matches!(self, AVal::Slot(_))
+    }
 }
 
 #[derive(Clone)]
@@ -1145,6 +1148,7 @@ pub struct Unit {
     pub nodes: Vec<UNode>,
     pub entry: usize,
     pub budget_exhausted: bool,
+    pub exits: Vec<Exit>,
 }
 
 impl<'a> Analysis<'a> {
@@ -1465,6 +1469,7 @@ impl<'a> Analysis<'a> {
             nodes,
             entry,
             budget_exhausted,
+            exits: Vec::new(),
         };
         // A node that was run again may have left nodes behind that nothing leads to now.
         match rerun.get() {
@@ -1508,6 +1513,7 @@ impl Unit {
                 nodes,
                 entry: 0,
                 budget_exhausted: self.budget_exhausted,
+                exits: self.exits.clone(),
             },
             map,
         )
@@ -1532,6 +1538,7 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
                 nodes: vec![],
                 entry: 0,
                 budget_exhausted: false,
+                exits: Vec::new(),
             },
             functions: BTreeMap::new(),
             orphans: BTreeMap::new(),
@@ -1568,6 +1575,9 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
                 functions.insert(c.callee, unit);
             }
         }
+    }
+    for (f, unit) in functions.iter_mut() {
+        unit.exits = an.summaries.borrow()[*f].exits.clone();
     }
     let mut covered: HashSet<usize> = HashSet::new();
     for n in &main.nodes {

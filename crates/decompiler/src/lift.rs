@@ -1733,10 +1733,15 @@ impl<'a> Lifter<'a> {
         for nd in nodes.iter_mut() {
             nd.preds = preds[nd.id].clone();
         }
-        let ret_slot = unit.nodes.iter().find_map(|n| match n.returns_via {
-            Some(AVal::Slot(k)) => Some(k as u32),
-            _ => None,
-        });
+        /* A call takes the first way out of its helper. The helper's own return address
+        is the one that way out jumps to. */
+        let vias = unit.exits.iter().map(|e| Some(e.via));
+        let ret_slot = vias
+            .chain(unit.nodes.iter().map(|n| n.returns_via))
+            .find_map(|via| match via {
+                Some(AVal::Slot(k)) => Some(k as u32),
+                _ => None,
+            });
         let entry_states: Vec<Option<State>> = entries
             .iter()
             .map(|e| e.as_ref().map(|e| e.state.clone()))
@@ -2196,12 +2201,25 @@ impl<'a> Lifter<'a> {
                             AVal::Slot(k) => Some(expr::arg(k as u32)),
                             _ => None,
                         };
-                        let vals: Vec<ExprId> = st
-                            .stack
+                        let shape = unit
+                            .exits
                             .iter()
-                            .copied()
-                            .filter(|v| Some(*v) != ret_arg)
-                            .collect();
+                            .find(|e| e.via == via && e.pushed.len() == st.stack.len());
+                        let vals: Vec<ExprId> = match shape {
+                            Some(exit) => st
+                                .stack
+                                .iter()
+                                .zip(&exit.pushed)
+                                .filter(|(_, pushed)| !pushed.passes_through())
+                                .map(|(v, _)| *v)
+                                .collect(),
+                            None => st
+                                .stack
+                                .iter()
+                                .copied()
+                                .filter(|v| Some(*v) != ret_arg)
+                                .collect(),
+                        };
                         term = Some(Term::InternalReturn(vals));
                     } else {
                         let targets = succ_by_kind(&[Edge::Jump]);
@@ -2582,11 +2600,7 @@ impl<'a> Lifter<'a> {
                 };
             }
         }
-        let unknown_pushed = call
-            .pushed
-            .iter()
-            .filter(|v| !matches!(v, AVal::Slot(_) | AVal::Const(_) | AVal::Pc(_)))
-            .count();
+        let unknown_pushed = call.pushed.iter().filter(|v| !v.passes_through()).count();
         let by_position = summary.is_some_and(|s| s.returns.len() == call.pushed.len());
         let resolve = |e: ExprId| -> ExprId {
             let mut memo = HashMap::new();
@@ -2625,7 +2639,11 @@ impl<'a> Lifter<'a> {
         for (idx, v) in call.pushed.iter().enumerate() {
             let e = match v {
                 AVal::Slot(i) => at(*i as usize),
-                AVal::Const(c) | AVal::Pc(c) => konst(*c),
+                AVal::Const(c) | AVal::Pc(c) => {
+                    j += 1;
+                    results.push(konst(*c));
+                    konst(*c)
+                }
                 _ => {
                     let r = match &direct_returns {
                         Some(d) => d[if by_position { idx } else { j as usize }],

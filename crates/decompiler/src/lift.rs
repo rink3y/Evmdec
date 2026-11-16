@@ -578,6 +578,9 @@ struct Mem {
 
 const BIG: u64 = 1 << 40;
 
+// Stands where a byte's place in its word goes, for a byte no value is known for.
+const NOT_KNOWN: u64 = u64::MAX;
+
 const MERGED_RETURN: u32 = 1 << 31;
 
 pub const SEQ_BITS: u32 = 14;
@@ -1095,7 +1098,19 @@ impl Mem {
                 if d + n <= w.off {
                     continue;
                 }
-                return None;
+                if w.off <= d {
+                    return None;
+                }
+                /* A write of a length the code works out starts inside the bytes read.
+                From there on they are not known. The bytes before it still are. */
+                for b in w.off..d + n {
+                    let i = (b - d) as usize;
+                    if pieces[i].is_none() {
+                        pieces[i] = Some((konst(U256::ZERO), NOT_KNOWN));
+                        covered += 1;
+                    }
+                }
+                continue;
             };
             let lo = w.off.max(d);
             let hi = (w.off + wl).min(d + n);
@@ -1172,8 +1187,15 @@ impl Mem {
             });
         }
         let mut unknown_mask = U256::ZERO;
+        let cut = pieces.iter().flatten().any(|(_, at)| *at == NOT_KNOWN);
+        for piece in pieces.iter_mut() {
+            if piece.is_some_and(|(_, at)| at == NOT_KNOWN) {
+                *piece = None;
+                covered -= 1;
+            }
+        }
         if covered < n as usize {
-            let zero_ok = self.fresh && !base.is_some_and(wild_base);
+            let zero_ok = self.fresh && !base.is_some_and(wild_base) && !cut;
             if !zero_ok {
                 if covered == 0 {
                     return None;

@@ -2618,7 +2618,10 @@ fn fmt_call_arg(arg: &crate::lift::Arg, n: &Names) -> String {
     }
 }
 
-fn fmt_call_head(head: &[ExprId], n: &Names) -> (Option<String>, Vec<String>) {
+/* The first arguments of a call read off the words at the start of its data. An argument
+made from a word of the data that no write is known for says nothing, so the list stops
+before it. */
+fn fmt_call_head(head: &[ExprId], in_off: ExprId, n: &Names) -> (Option<String>, Vec<String>) {
     let Some(sel) = head.first().and_then(|w| leading_selector(*w, None)) else {
         return (None, vec![]);
     };
@@ -2626,8 +2629,18 @@ fn fmt_call_head(head: &[ExprId], n: &Names) -> (Option<String>, Vec<String>) {
         Some(sig) => sigs::name_of(&sig).to_string(),
         None => format!("func_{sel:08x}"),
     };
+    let (base, start) = expr::split_offset(in_off);
+    let unwritten = |x: &Node| match x {
+        Node::MLoad(at, _) => {
+            let (b, o) = expr::split_offset(*at);
+            b == base && o >= start
+        }
+        _ => false,
+    };
     let args = (0..head.len().saturating_sub(1))
-        .map(|i| fmt_expr(shifted_word_len(head, i, None), n))
+        .map(|i| shifted_word_len(head, i, None))
+        .take_while(|arg| !expr::contains(*arg, &unwritten))
+        .map(|arg| fmt_expr(arg, n))
         .collect();
     (Some(name), args)
 }
@@ -2813,7 +2826,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     (fname, args) => (fname, args, "abi.encode"),
                 },
                 (None, None) if partial => {
-                    let (fname, args) = fmt_call_head(input_head, n);
+                    let (fname, args) = fmt_call_head(input_head, *in_off, n);
                     (fname, args, "abi.encode")
                 }
                 (None, None) => (None, vec![], "abi.encode"),

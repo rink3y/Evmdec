@@ -387,3 +387,17 @@ fn a_hash_of_values_written_at_odd_places_is_printed_as_those_values() {
         "{out}"
     );
 }
+
+#[test]
+fn the_arguments_of_a_call_stop_before_the_first_word_no_write_is_known_for() {
+    let out =
+        text("63aabbccdd60e01b60805260043560845236600060a437600060003660240160806000335af15000");
+    assert!(
+        out.contains(".call(abi.encodeWithSelector(func_aabbccdd.selector, arg0, ...));"),
+        "{out}"
+    );
+    assert!(
+        out.contains("mem[0xa4:+msg.data.length] = msg.data[0:+msg.data.length];"),
+        "{out}"
+    );
+}

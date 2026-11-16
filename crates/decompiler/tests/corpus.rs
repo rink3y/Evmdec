@@ -1400,3 +1400,14 @@ fn a_loop_is_printed_once_with_its_tests_inside_it() {
     );
     assert_eq!(staking.matches("transfer.selector").count(), 1, "{staking}");
 }
+
+#[test]
+fn what_calls_return_into_memory_that_is_hashed_is_printed() {
+    let router = regress("oneinch_v6.hex").source;
+    let start = router.find("function func_0x216b(").expect("the callback");
+    let body = &router[start..start + router[start..].find("\n    }").unwrap()];
+    for at in [21, 53, 85] {
+        let line = format!("mem[ptr1 + {at}:+min(32, returndatasize())] = returndata[0:+");
+        assert!(body.contains(&line), "{line}\n{body}");
+    }
+}

@@ -324,7 +324,7 @@ struct Printer<'a> {
     given: HashMap<(ExprId, String), usize>,
     stored: Vec<(usize, String, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
-    fixed_reads: Vec<u64>,
+    memory_reads: Vec<Span>,
     // Filled while the printer's &self methods run, hence the cell.
     skipped: RefCell<HashSet<(usize, usize)>>,
 }
@@ -584,16 +584,52 @@ fn memory_word(read: ExprId) -> Option<ExprId> {
     }
 }
 
-fn fixed_reads(l: &Lifted) -> Vec<u64> {
-    let mut out: Vec<u64> = loads_of(l)
-        .into_keys()
-        .filter_map(|w| match w {
-            Overwritten::Memory(a) => expr::as_const(a).filter(|c| c.fits_u64()),
+type Span = (Option<ExprId>, u64, u64);
+
+fn span(off: ExprId, len: ExprId) -> Option<Span> {
+    let (base, d) = expr::split_offset(off);
+    let len = expr::as_const(len).filter(|c| c.fits_u64())?.low_u64();
+    let d = Some(d).filter(|d| d.fits_u64())?.low_u64();
+    Some((base, d, d.saturating_add(len)))
+}
+
+// Reads of memory whose place and length the code fixes, each as a base and a range from it.
+fn memory_reads(l: &Lifted) -> Vec<Span> {
+    let word = expr::konst_u64(32);
+    let mut out: Vec<Span> = Vec::new();
+    let mut seen: HashSet<ExprId> = HashSet::new();
+    let mut pending: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
+    pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
+    while let Some(e) = pending.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        out.extend(match expr::node(e) {
+            Node::MLoad(at, _) | Node::CopiedWord(op::MCOPY, at, _) => span(at, word),
+            Node::KeccakMem(off, len, _) => span(off, len),
             _ => None,
-        })
-        .map(|c| c.low_u64())
-        .collect();
-    out.sort_unstable();
+        });
+        pending.extend(expr::children(e));
+    }
+    for nd in &l.nodes {
+        for st in &nd.stmts {
+            out.extend(match st {
+                Stmt::Call { in_off, in_len, .. } => span(*in_off, *in_len),
+                Stmt::Log { off, len, .. } | Stmt::Create { off, len, .. } => span(*off, *len),
+                Stmt::Copy {
+                    kind: op::MCOPY,
+                    src,
+                    len,
+                    ..
+                } => span(*src, *len),
+                _ => None,
+            });
+        }
+        out.extend(match &nd.term {
+            Term::Return { off, len, .. } | Term::Revert { off, len, .. } => span(*off, *len),
+            _ => None,
+        });
+    }
     out
 }
 
@@ -2740,8 +2776,8 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /* A call writes what it returns over its output area. A word there read later by its
-    fixed address would otherwise show only the stores made before the call. */
+    /* A call writes what it returns over its output area. Memory read there later by its
+    place would otherwise show only the stores made before the call. */
     fn call_output(&self, s: &Stmt) -> Option<String> {
         let Stmt::Call {
             addr,
@@ -2752,14 +2788,10 @@ impl<'a> Printer<'a> {
         else {
             return None;
         };
-        let at = |e: ExprId| {
-            expr::as_const(e)
-                .filter(|c| c.fits_u64())
-                .map(|c| c.low_u64())
-        };
-        let (lo, len) = (at(*out_off)?, at(*out_len)?);
-        let read = |a: &u64| a.saturating_add(32) > lo && *a < lo.saturating_add(len);
-        let shown = at(*addr) != Some(4) && len > 0 && self.fixed_reads.iter().any(read);
+        let (base, lo, hi) = span(*out_off, *out_len)?;
+        let read = |(b, from, to): &Span| *b == base && *from < hi && lo < *to;
+        let copy = expr::as_const(*addr) == Some(U256::from_u64(4));
+        let shown = !copy && hi > lo && self.memory_reads.iter().any(read);
         shown.then(|| emit::fmt_call_output(*out_off, *out_len, self.names))
     }
 
@@ -3510,7 +3542,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
             .into_iter()
             .chain(unread_fixed_stores(l, names))
             .collect(),
-        fixed_reads: fixed_reads(l),
+        memory_reads: memory_reads(l),
         skipped: Default::default(),
     };
     names.stale.borrow_mut().clear();
@@ -3561,7 +3593,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
             given: HashMap::new(),
             stored: Vec::new(),
             dead_stores: std::mem::take(&mut p.dead_stores),
-            fixed_reads: std::mem::take(&mut p.fixed_reads),
+            memory_reads: std::mem::take(&mut p.memory_reads),
             skipped: Default::default(),
         };
         names.stale.borrow_mut().clear();

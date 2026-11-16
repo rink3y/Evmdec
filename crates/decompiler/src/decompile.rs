@@ -1199,6 +1199,28 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
         f.code = body;
     }
+    /* A helper is left out when every call to it was folded into its callers. Whether
+    that happened is only known from the text, so one a printed body still calls is
+    shown after all. */
+    loop {
+        let shown: Vec<&str> = functions
+            .iter()
+            .filter(|f| !f.inlined)
+            .map(|f| f.code.as_str())
+            .collect();
+        let called: Vec<usize> = functions
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.inlined && shown.iter().any(|code| calls_by_name(code, &f.name)))
+            .map(|(i, _)| i)
+            .collect();
+        if called.is_empty() {
+            break;
+        }
+        for i in called {
+            functions[i].inlined = false;
+        }
+    }
     tick("render", &mut tt);
 
     let covered: BTreeSet<usize> = std::iter::once(&rec.main)
@@ -1819,7 +1841,11 @@ impl Callees {
         let internal = || functions.iter().filter(|f| f.kind == FnKind::Internal);
         Callees {
             returns: internal().map(|f| (f.pc, f.returns.clone())).collect(),
-            names: internal().map(|f| (f.pc, f.name.clone())).collect(),
+            names: functions
+                .iter()
+                .filter(|f| matches!(f.kind, FnKind::Internal | FnKind::Orphan))
+                .map(|f| (f.pc, f.name.clone()))
+                .collect(),
             free_pointer: compiler == compiler::Kind::Solc,
             reads: std::sync::Arc::new(callee_reads(functions, compiler == compiler::Kind::Vyper)),
         }
@@ -3134,6 +3160,14 @@ pub fn render(c: &Contract, name: &str) -> String {
         }
     }
     out
+}
+
+fn calls_by_name(code: &str, name: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code.match_indices(name).any(|(at, _)| {
+        let before = code[..at].chars().next_back();
+        code[at + name.len()..].starts_with('(') && !before.is_some_and(word)
+    })
 }
 
 fn part_banner(c: &Contract, index: usize) -> String {

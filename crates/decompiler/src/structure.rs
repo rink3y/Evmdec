@@ -593,6 +593,7 @@ fn plan_early_reads(l: &Lifted, names: &Names) -> StalePlan {
     let mut plan = StalePlan::new();
     let mut reads: Vec<(ExprId, u32)> = Vec::new();
     let mut loads: Vec<(ExprId, ExprId, u32)> = Vec::new();
+    let mut slots: Vec<(ExprId, ExprId, u32)> = Vec::new();
     let mut seen: HashSet<ExprId> = HashSet::new();
     let mut pending: Vec<ExprId> = l.nodes.iter().flat_map(lift::node_exprs).collect();
     pending.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
@@ -605,6 +606,9 @@ fn plan_early_reads(l: &Lifted, names: &Names) -> StalePlan {
         }
         if let Node::MLoad(at, version) = expr::node(e) {
             loads.push((e, at, version));
+        }
+        if let Node::SLoad(key, false, version) = expr::node(e) {
+            slots.push((e, key, version));
         }
         pending.extend(expr::children(e));
     }
@@ -634,10 +638,19 @@ fn plan_early_reads(l: &Lifted, names: &Names) -> StalePlan {
             let Some((Overwritten::Balance, gen)) = overwrites(st, names) else {
                 continue;
             };
+            /* A helper may write any slot, and what it wrote is not seen from here. An
+            outside call is only taken to have changed a slot the code reads again. */
+            let helper = matches!(st, Stmt::Internal { .. });
+            let read_again = |key: ExprId| slots.iter().any(|(_, k, v)| *k == key && *v > gen);
+            let kept = slots
+                .iter()
+                .filter(|(_, key, version)| *version <= gen && (helper || read_again(*key)))
+                .map(|(e, _, _)| *e);
             let old: Vec<ExprId> = reads
                 .iter()
                 .filter(|(_, version)| *version <= gen)
                 .map(|(e, _)| *e)
+                .chain(kept)
                 .collect();
             if old.is_empty() {
                 continue;
@@ -656,19 +669,20 @@ fn plan_early_reads(l: &Lifted, names: &Names) -> StalePlan {
     }
     let mut ordered: Vec<(ExprId, (u32, usize, usize))> = first.into_iter().collect();
     ordered.sort_by_key(|(e, at)| (*at, e.0));
-    let mut counts: HashMap<&str, u32> = HashMap::new();
+    let mut counts: HashMap<String, u32> = HashMap::new();
     for (read, (_, node, i)) in ordered {
-        let base = match account_read(read) {
-            Some((op::BALANCE, _)) => "account_balance",
-            Some((op::EXTCODESIZE, _)) => "code_size",
-            Some(_) => "code_hash",
-            None => "mem",
+        let base = match (account_read(read), expr::node(read)) {
+            (Some((op::BALANCE, _)), _) => "prev_account_balance".to_string(),
+            (Some((op::EXTCODESIZE, _)), _) => "prev_code_size".to_string(),
+            (Some(_), _) => "prev_code_hash".to_string(),
+            (None, Node::SLoad(key, ..)) => prev_name(Overwritten::Slot(key), names),
+            (None, _) => "prev_mem".to_string(),
         };
-        let n = counts.entry(base).or_insert(0);
+        let n = counts.entry(base.clone()).or_insert(0);
         *n += 1;
         let name = match *n {
-            1 => format!("prev_{base}"),
-            n => format!("prev{n}_{base}"),
+            1 => base,
+            n => base.replacen("prev_", &format!("prev{n}_"), 1),
         };
         plan.entry((node, i)).or_default().push((read, name));
     }
@@ -1005,7 +1019,11 @@ fn stores_dead_until_exit(l: &Lifted) -> HashSet<(usize, usize)> {
             None => true,
             Some(d) => d.iter().any(|e| mentions_memory(*e)),
         },
-        Term::ReturnDyn { .. } | Term::Unresolved(_) | Term::Switch { .. } => true,
+        // What a helper wrote is the caller's to read after it returns.
+        Term::ReturnDyn { .. }
+        | Term::Unresolved(_)
+        | Term::Switch { .. }
+        | Term::InternalReturn(_) => true,
         _ => lift::term_exprs(t).iter().any(|e| mentions_memory(*e)),
     };
     let mut reads_ahead: Vec<bool> = vec![false; l.nodes.len()];

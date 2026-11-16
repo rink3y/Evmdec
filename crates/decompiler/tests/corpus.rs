@@ -27,6 +27,14 @@ fn every_contract_decompiles_with_full_jump_resolution() {
             "{name}: no functions"
         );
         assert_eq!(c.stats.unresolved_jumps, 0, "{name}: unresolved jumps");
+        for call in c.source.split("func_0x").skip(1) {
+            let digits = call.chars().take_while(char::is_ascii_hexdigit).count();
+            let helper = format!("function func_0x{}(", &call[..digits]);
+            assert!(
+                !call[digits..].starts_with('(') || c.source.contains(&helper),
+                "{name}: {helper} is called and has no body"
+            );
+        }
         assert!(
             c.stats.covered_blocks * 100 >= c.stats.code_blocks * 90,
             "{name}: coverage {}/{}",
@@ -379,16 +387,11 @@ fn old_multiowned_wallet_reads_as_source() {
     );
     assert!(!src.contains("code[4056"), "dead CODECOPY printed");
     assert!(!src.contains("mem[0x0] = mem[0x0]"), "no-op store printed");
-    for h in [
-        "func_0x7be",
-        "func_0x965",
-        "func_0xa05",
-        "func_0xadb",
-        "func_0xbdd",
-    ] {
+    for h in ["func_0x965", "func_0xa05", "func_0xadb", "func_0xbdd"] {
+        assert!(src.contains(&format!("{h}(")), "{h} is no longer called");
         assert!(
-            !src.contains(&format!("function {h}(")),
-            "{h} printed twice"
+            src.contains(&format!("function {h}(")),
+            "{h} is called and has no body"
         );
     }
     for body in src.split("\n    function ").skip(1) {
@@ -824,4 +827,26 @@ fn stores_nothing_reads_are_left_out() {
         !old.contains("mem[0x0] = 6;"),
         "the scratch word of a hash the lifter resolved is not printed"
     );
+}
+
+#[test]
+fn what_a_helper_writes_and_what_was_read_before_it_stay_in_the_text() {
+    let source = |path: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+        let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source
+    };
+    let proxy = source("../../testdata/regress/swap_proxy.hex");
+    let start = proxy.find("function func_0x379(").expect("the copy helper");
+    let body = &proxy[start..start + proxy[start..].find("\n    }").unwrap()];
+    assert!(
+        body.contains("mem[arg0] = arg1;") && body.contains("= msg.data[arg2:+arg1];"),
+        "the helper fills memory its caller sends on: {body}"
+    );
+    let token = source("../../testdata/regress/minime_token.hex");
+    assert!(
+        token.contains("uint256 prev_stor_arg0 = stor[arg0];\n            func_0x1ca7("),
+        "the length read before the resize is named before the helper changes it"
+    );
+    assert!(!token.contains("require(stor[arg0] < stor[arg0]"));
 }

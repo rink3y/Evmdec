@@ -505,8 +505,15 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
                 true => " The call writes this one entry more than once, and the last write is worked out from what the entry held before the first, so the first write is lost. That happens when the call names the same account on both sides.",
                 false => "",
             };
+            let back = run
+                .called_back
+                .iter()
+                .find(|(c, _)| Some(&run.cells[*c]) == cell);
+            let back = back.map_or(String::new(), |(_, by)| {
+                format!(" The write is made while the contract at {} calls back in, during the call the account made.", by.to_hex())
+            });
             let cause = format!(
-                "The call writes {keyed} in {name}. What it writes is {}.{}{twice}{agreed} {tests}{again}",
+                "The call writes {keyed} in {name}. What it writes is {}.{}{twice}{back}{agreed} {tests}{again}",
                 source(tag, run),
                 wrapped(run, tag)
             );

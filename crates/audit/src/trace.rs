@@ -282,6 +282,8 @@ pub struct Run {
     pub to: U256,
     // Cells lowered in a frame whose caller the cell is kept under. That caller spent its own.
     pub spent_by_holder: Vec<usize>,
+    // Cells written while another contract the call reached was calling back in, and by whom.
+    pub called_back: Vec<(usize, U256)>,
 }
 
 impl Run {

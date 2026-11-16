@@ -520,6 +520,7 @@ impl World {
                 hooked: false,
                 to: msg.to,
                 spent_by_holder: Vec::new(),
+                called_back: Vec::new(),
             },
             hashes: HashMap::new(),
             cell_ids: HashMap::new(),
@@ -742,6 +743,9 @@ impl World {
                     let tag = sh.stack[n - 2];
                     if new < old && tx.run.cells[cell].keyed_by(f.caller) {
                         tx.run.spent_by_holder.push(cell);
+                    }
+                    if f.caller != tx.origin && f.caller != f.account {
+                        tx.run.called_back.push((cell, f.caller));
                     }
                     Self::event(
                         tx,

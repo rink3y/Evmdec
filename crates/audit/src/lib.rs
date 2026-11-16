@@ -103,7 +103,10 @@ pub fn audit_at(
         added += 1;
     }
     if added > 0 {
-        report.assumed.extend(guessed.assumed);
+        let guessed_world = |a: String| format!("in the world guessed from the code: {a}");
+        report
+            .assumed
+            .extend(guessed.assumed.into_iter().map(guessed_world));
         report.state.push(format!(
             "{added} finding(s) come from a second run in a world guessed from the code alone, and say so."
         ));

@@ -1041,3 +1041,15 @@ fn a_selector_table_read_from_the_code_gives_every_function() {
     assert_eq!(dense.len(), 61, "the table holds the selectors themselves");
     assert!(dense.contains(&0x3df0_2124) && dense.contains(&0x095e_a7b3));
 }
+
+#[test]
+fn a_function_behind_the_table_is_printed_to_its_end() {
+    let source = regress("vyper_sparse_table.hex").source;
+    let start = source.find("function func_37927b6b(").expect("the import");
+    let body = &source[start..start + source[start..].find("\n    }").unwrap()];
+    assert!(
+        body.contains("func_0x1e68(1728);\n") && body.contains("tstor_0 = 0;\n"),
+        "the rewards are imported and the lock is released: {body}"
+    );
+    assert!(!source.contains("unreachable"));
+}

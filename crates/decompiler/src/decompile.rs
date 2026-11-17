@@ -2021,6 +2021,21 @@ pub fn make_names(
             n.params.insert(p.index, p.name.clone());
         }
     }
+    // A parameter declared narrower than a word packs to fewer bytes than the word it is.
+    let narrow = |ty: &str| match ty {
+        "address" | "bool" => true,
+        "uint256" | "int256" | "bytes32" => false,
+        _ => {
+            let width = |prefix: &str| ty.strip_prefix(prefix).and_then(|w| w.parse::<u32>().ok());
+            width("uint").or(width("int")).or(width("bytes")).is_some()
+        }
+    };
+    n.narrow.extend(
+        f.params
+            .iter()
+            .filter(|p| narrow(&p.ty))
+            .map(|p| p.name.clone()),
+    );
     n.bool_returns = f.returns.iter().map(|t| t == "bool").collect();
     n.bools.extend(f.bool_vars.iter().map(|v| expr::var(*v)));
     if let Some(l) = &f.lifted {

@@ -112,6 +112,7 @@ pub struct Names {
     pub aliases: HashMap<ExprId, String>,
     pub fields: HashMap<(U256, u32, u32), String>,
     pub args: HashMap<u32, String>,
+    pub narrow: HashSet<String>,
     pub callee_names: HashMap<usize, String>,
     pub payload_overrides: RefCell<HashMap<ExprId, String>>,
     pub blocks: Option<Blocks>,
@@ -2872,7 +2873,8 @@ fn fmt_whole_word(e: ExprId, n: &Names) -> String {
     let text = fmt_expr(e, n);
     let cast = text.split_once('(').map_or("", |(cast, _)| cast);
     let width = cast.trim_start_matches(|c: char| c.is_ascii_alphabetic());
-    let named = matches!(text.as_str(), "msg.sender" | "tx.origin" | "block.coinbase");
+    let named = matches!(text.as_str(), "msg.sender" | "tx.origin" | "block.coinbase")
+        || n.narrow.contains(&text);
     let narrow = named
         || match cast.strip_suffix(width) {
             Some("uint" | "int") => width != "256" && !width.is_empty(),

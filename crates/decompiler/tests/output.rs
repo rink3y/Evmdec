@@ -900,3 +900,16 @@ fn a_copy_from_the_end_of_the_call_data_is_printed_as_the_zeros_it_writes() {
     assert!(out.contains("mem[0xa0] = 0; mem[0xc0] = 0;"), "{out}");
     assert!(!out.contains("msg.data[msg.data.length"), "{out}");
 }
+
+#[test]
+fn a_parameter_declared_narrow_is_a_whole_word_in_packed_call_data() {
+    let out = text(
+        "6080604052600d6004356018565b60166024356018565b005b5f5b6001018035601a5750631122334460e01b\
+         6080528060845264313131313160d81b60a4525f5f602960805f855af1505056",
+    );
+    assert!(out.contains("function func_0x18(address target)"), "{out}");
+    assert!(
+        out.contains("abi.encodePacked(bytes4(0x11223344), uint256(target), bytes5(0x3131313131))"),
+        "{out}"
+    );
+}

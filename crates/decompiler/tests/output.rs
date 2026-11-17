@@ -776,3 +776,15 @@ fn a_sum_tested_in_a_type_narrower_than_a_word_is_printed_in_that_type() {
         "{product}"
     );
 }
+
+#[test]
+fn a_folded_helper_stores_and_copies_in_the_order_its_code_does() {
+    let out = text("6080604052601260a06004356024356018565b604060a0f35b8082845e5f8184015250505056");
+    in_order(
+        &out,
+        &[
+            "mem[ptr1 + 32:+arg1] = mem[arg0:+arg1];",
+            "mem[arg1 + 160] = 0;",
+        ],
+    );
+}

@@ -1793,6 +1793,7 @@ pub struct CalleeSummary {
     pub copies: Vec<(ExprId, ExprId, ExprId)>,
     pub maybe_mstores: Vec<ExprId>,
     pub hashes: Vec<(ExprId, usize, usize)>,
+    pub stores_before_copy: Vec<usize>,
 }
 
 pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
@@ -1819,7 +1820,10 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                     src,
                     len,
                     ..
-                } => sum.copies.push((*dest, *src, *len)),
+                } => {
+                    sum.stores_before_copy.push(sum.mstores.len());
+                    sum.copies.push((*dest, *src, *len));
+                }
                 Stmt::Copy { .. }
                 | Stmt::Internal { .. }
                 | Stmt::Call { .. }
@@ -3432,19 +3436,13 @@ impl<'a> Lifter<'a> {
         let gen_before = st.sgen;
         /* A test the helper made before a store reads what memory held before it. The
         tests are stated where the helper made them, or one would read as coming after
-        a store it came before. A test made after a copy is stated after them all. */
-        let tests = |stmts: &mut Vec<Stmt>, stored: Option<usize>| {
+        a store or a copy it came before. */
+        let tests = |stmts: &mut Vec<Stmt>, made: (usize, usize)| {
             let Some(sum) = summary.filter(|_| transparent) else {
                 return;
             };
             for (i, (cond, data, invalid)) in sum.guards.iter().enumerate() {
-                let (stores, copies) = sum
-                    .stores_and_copies_before
-                    .get(i)
-                    .copied()
-                    .unwrap_or((0, 1));
-                let before = (copies == 0 && stores < sum.mstores.len()).then_some(stores);
-                if before != stored {
+                if sum.stores_and_copies_before.get(i) != Some(&made) {
                     continue;
                 }
                 let cond = subst(*cond);
@@ -3462,28 +3460,53 @@ impl<'a> Lifter<'a> {
         /* A hash the helper took reads the memory of the place it took it at. The mark
         stands there among the helper's stores, so the text can name the hash before a
         later store changes what it was taken over. */
-        let mut marks: Vec<(Option<usize>, ExprId)> = Vec::new();
+        let mut marks: Vec<((usize, usize), ExprId)> = Vec::new();
         for (hash, stores, copies) in summary.map_or(&[][..], |s| s.hashes.as_slice()) {
-            let sum = summary.expect("the hashes are the summary's");
-            let before = (*copies == 0 && *stores < sum.mstores.len()).then_some(*stores);
             let hash = match reads_caller {
                 true => resolve(subst(*hash)),
                 false => subst(*hash),
             };
             let taken = matches!(expr::node(hash), Node::KeccakMem(..));
             if taken && transparent && !self.oracle {
-                marks.push((before, hash));
+                marks.push(((*stores, *copies), hash));
             }
         }
-        let hashed = |stmts: &mut Vec<Stmt>, stored: Option<usize>| {
-            let here = marks.iter().filter(|(before, _)| *before == stored);
+        let hashed = |stmts: &mut Vec<Stmt>, made: (usize, usize)| {
+            let here = marks.iter().filter(|(at, _)| *at == made);
             stmts.extend(here.map(|(_, hash)| Stmt::Drop(*hash)));
         };
         match summary {
             Some(sum) => {
-                for (made, (off, val)) in sum.mstores.iter().enumerate() {
-                    tests(stmts, Some(made));
-                    hashed(stmts, Some(made));
+                /* Stores and copies are made in the helper's order. Where two of them
+                overlap, the bytes left are those of the later one. */
+                let mut copied = 0;
+                for stored in 0..=sum.mstores.len() {
+                    while sum.stores_before_copy.get(copied) == Some(&stored) {
+                        tests(stmts, (stored, copied));
+                        hashed(stmts, (stored, copied));
+                        let (dest, src, len) = sum.copies[copied];
+                        let (d, s2, l2) = (subst(dest), subst(src), subst(len));
+                        // A copy of no bytes does nothing.
+                        let stated = transparent && expr::as_const(l2) != Some(U256::ZERO);
+                        if stated {
+                            stmts.push(Stmt::Copy {
+                                kind: op::MCOPY,
+                                dest: d,
+                                src: s2,
+                                len: l2,
+                                addr: None,
+                                gen: st.mem.gen + 1,
+                            });
+                        }
+                        let shown = stated.then(|| (un.id, stmts.len() - 1));
+                        apply_mcopy(st, d, s2, l2, shown);
+                        copied += 1;
+                    }
+                    tests(stmts, (stored, copied));
+                    hashed(stmts, (stored, copied));
+                    let Some((off, val)) = sum.mstores.get(stored) else {
+                        break;
+                    };
                     let (o, v) = (subst(*off), subst(*val));
                     if transparent {
                         let origin = Some((un.id, stmts.len()));
@@ -3498,23 +3521,6 @@ impl<'a> Lifter<'a> {
                     } else {
                         st.mem.store(o, Some(32), MVal::Word(v));
                     }
-                }
-                for (dest, src, len) in &sum.copies {
-                    let (d, s2, l2) = (subst(*dest), subst(*src), subst(*len));
-                    // A copy of no bytes does nothing.
-                    let stated = transparent && expr::as_const(l2) != Some(U256::ZERO);
-                    if stated {
-                        stmts.push(Stmt::Copy {
-                            kind: op::MCOPY,
-                            dest: d,
-                            src: s2,
-                            len: l2,
-                            addr: None,
-                            gen: st.mem.gen + 1,
-                        });
-                    }
-                    let shown = stated.then(|| (un.id, stmts.len() - 1));
-                    apply_mcopy(st, d, s2, l2, shown);
                 }
                 for off in &sum.maybe_mstores {
                     st.mem.store(subst(*off), Some(32), MVal::Unknown);
@@ -3557,10 +3563,7 @@ impl<'a> Lifter<'a> {
                 st.returned = call_stamp(un.id, stmts.len());
             }
         }
-        if transparent {
-            tests(stmts, None);
-            hashed(stmts, None);
-        } else {
+        if !transparent {
             stmts.push(Stmt::Internal {
                 seq,
                 callee: self.prog.blocks[call.callee].start,

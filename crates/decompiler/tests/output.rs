@@ -670,3 +670,27 @@ fn the_sum_a_folded_helper_hands_back_is_the_sum_it_tested() {
     assert!(!out.contains("unchecked("), "{out}");
     assert!(!out.contains("Panic(arithmetic overflow)"), "{out}");
 }
+
+#[test]
+fn a_word_read_before_a_store_keeps_its_old_value_in_the_blocks_after_it() {
+    let branched = text("6004358051600182526024356012575f55005b60015500");
+    in_order(
+        &branched,
+        &[
+            "uint256 prev_mem_arg0 = mem[arg0];",
+            "mem[arg0] = 1;",
+            "stor_1 = prev_mem_arg0;",
+            "stor_0 = prev_mem_arg0;",
+        ],
+    );
+    let stored_twice = text("6004358051602435600f57600182525b600282525f5500");
+    in_order(
+        &stored_twice,
+        &[
+            "uint256 prev_mem_arg0 = mem[arg0];",
+            "mem[arg0] = 1;",
+            "mem[arg0] = 2;",
+            "stor_0 = prev_mem_arg0;",
+        ],
+    );
+}

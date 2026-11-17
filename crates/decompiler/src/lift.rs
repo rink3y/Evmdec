@@ -164,6 +164,7 @@ pub struct LNode {
     pub entry_stack: Vec<ExprId>,
     pub exit_stack: Vec<ExprId>,
     pub sgen: u32,
+    pub mgen: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -2635,6 +2636,7 @@ impl<'a> Lifter<'a> {
                 entry_stack: vec![],
                 exit_stack: vec![],
                 sgen: entry.sgen,
+                mgen: entry.mem.gen,
             };
             return (ln, st);
         }
@@ -3283,6 +3285,7 @@ impl<'a> Lifter<'a> {
             entry_stack: vec![],
             exit_stack: st.stack.clone(),
             sgen: entry.sgen,
+            mgen: entry.mem.gen,
         };
         (ln, st)
     }

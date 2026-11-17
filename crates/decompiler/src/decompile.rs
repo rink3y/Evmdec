@@ -1664,11 +1664,11 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
                     }
                     cut.extend(selector_cut(&root, x));
                     if x == root.expr && root.payload {
-                        stack.extend(expr::children(x));
+                        stack.extend(read_parts(x));
                         continue;
                     }
                     if cut.contains(&x) {
-                        stack.extend(expr::children(x));
+                        stack.extend(read_parts(x));
                         continue;
                     }
                     let above = ssa::field_read(x).filter(|f| f.bit_offset > 0);
@@ -1688,7 +1688,7 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
                             }
                         }
                     }
-                    stack.extend(expr::children(x));
+                    stack.extend(read_parts(x));
                 }
             }
         }
@@ -3001,6 +3001,15 @@ fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>,
 /* The four bytes of a selector shift every argument of a call, so a word of its data starts
 with the last four bytes of one argument. Those four bytes are a cut the encoding makes,
 not a field the code reads. */
+/* A hash of values that do not start on a word has words that cut through them. The
+values as they were written are what the code read, so those are looked at instead. */
+fn read_parts(x: ExprId) -> Vec<ExprId> {
+    match (expr::node(x), expr::pieces(x)) {
+        (Node::Keccak(..), Some(pieces)) => pieces.into_iter().map(|(e, _)| e).collect(),
+        _ => expr::children(x),
+    }
+}
+
 fn selector_cut(root: &lift::Root, x: ExprId) -> Vec<ExprId> {
     if !root.payload {
         return Vec::new();
@@ -3061,7 +3070,7 @@ fn parts_read(functions: &[Function], layout: MappingLayout) -> PartsRead {
                 continue;
             }
             cut.extend(selector_cut(&root, x));
-            stack.extend(expr::children(x));
+            stack.extend(read_parts(x));
             if (x == root.expr && root.payload) || cut.contains(&x) {
                 continue;
             }
@@ -3089,7 +3098,7 @@ fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
         }
         cut.extend(selector_cut(&root, x));
         if x == root.expr && root.payload {
-            stack.extend(expr::children(x));
+            stack.extend(read_parts(x));
             continue;
         }
         if let Some((k, off, bits)) = emit::packed_read(x).filter(|_| !cut.contains(&x)) {
@@ -3100,7 +3109,7 @@ fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
                 }
             }
         }
-        stack.extend(expr::children(x));
+        stack.extend(read_parts(x));
     }
 }
 
@@ -3153,7 +3162,7 @@ fn collect_sloads(
             }
             _ => {}
         }
-        stack.extend(expr::children(x));
+        stack.extend(read_parts(x));
     }
 }
 

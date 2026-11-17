@@ -626,6 +626,22 @@ impl TypeEnv {
         self.flag(loc, |f| f.account = true);
     }
 
+    // The digest of typed data is the two bytes 0x1901 and then two hashes. Where the hash
+    // was read whole its stores are gone, and the values written into it say the same.
+    fn typed_data(&mut self, hash: ExprId, scope: usize) {
+        let Some(pieces) = expr::pieces(hash) else {
+            return;
+        };
+        let [(prefix, 2), (first, 32), (second, 32)] = pieces[..] else {
+            return;
+        };
+        let marker = U256::from_u64(0x1901);
+        if expr::as_const(prefix).is_some_and(|c| c == marker || c == marker << 240) {
+            self.word32(first, scope);
+            self.word32(second, scope);
+        }
+    }
+
     fn word32(&mut self, e: ExprId, scope: usize) {
         let loc = self.location(e, scope);
         self.flag(loc, |f| f.word32 = true);
@@ -658,6 +674,7 @@ impl TypeEnv {
                     }
                 }
                 Node::Op(o, v) => self.op_use(*o, v, parent, scope),
+                Node::Keccak(..) => self.typed_data(x, scope),
                 _ => {}
             }
             let o = match &n {

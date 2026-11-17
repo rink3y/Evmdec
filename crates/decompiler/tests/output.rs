@@ -569,3 +569,26 @@ fn each_part_of_a_packed_slot_the_code_reads_has_a_name_or_the_slot_stays_whole(
         "{value}"
     );
 }
+
+#[test]
+fn the_words_stored_for_a_call_are_its_arguments_or_stay_as_stores() {
+    let counted = text(
+        "6080604052608435600435816020015260243581604001526044358160600152606435816080015260208182\
+         602001806084350360a0019060015afa50602090f3",
+    );
+    let call = "success_1 = ecrecover.staticcall(abi.encode(arg0, arg1, arg2, arg3));";
+    assert!(counted.contains(call), "{counted}");
+    let raw = text(
+        "608060405260843560043581526024358160200152604435816040015260208160a4358360015afa610056\
+         576308c379a060e01b815260208160040152600581602401526468656c6c6f60d81b8160440152606490fd\
+         5b602090f3",
+    );
+    for line in [
+        "mem[arg4] = arg0;",
+        "mem[arg4 + 32] = arg1;",
+        "mem[arg4 + 64] = arg2;",
+        "success_1 = ecrecover.staticcall(mem[arg4:arg4 + arg5]);",
+    ] {
+        assert!(raw.contains(line), "{line} is missing in\n{raw}");
+    }
+}

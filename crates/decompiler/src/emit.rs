@@ -2805,13 +2805,23 @@ fn fmt_call_arg(arg: &crate::lift::Arg, n: &Names) -> String {
 made from a word of the data that no write is known for says nothing, so the list stops
 before it. */
 fn fmt_call_head(head: &[ExprId], in_off: ExprId, n: &Names) -> (Option<String>, Vec<String>) {
-    let Some(sel) = head.first().and_then(|w| leading_selector(*w, None)) else {
+    let Some((sel, args)) = call_head(head, in_off) else {
         return (None, vec![]);
     };
     let name = match sigs::function(sel) {
         Some(sig) => sigs::name_of(&sig).to_string(),
         None => format!("func_{sel:08x}"),
     };
+    (
+        Some(name),
+        args.into_iter().map(|arg| fmt_expr(arg, n)).collect(),
+    )
+}
+
+// Without a selector the call prints as the memory it reads, so none of its head is given.
+#[must_use]
+pub fn call_head(head: &[ExprId], in_off: ExprId) -> Option<(u32, Vec<ExprId>)> {
+    let sel = head.first().and_then(|w| leading_selector(*w, None))?;
     let (base, start) = expr::split_offset(in_off);
     let unwritten = |x: &Node| match x {
         Node::MLoad(at, _) => {
@@ -2823,9 +2833,8 @@ fn fmt_call_head(head: &[ExprId], in_off: ExprId, n: &Names) -> (Option<String>,
     let args = (0..head.len().saturating_sub(1))
         .map(|i| shifted_word_len(head, i, None))
         .take_while(|arg| !expr::contains(*arg, &unwritten))
-        .map(|arg| fmt_expr(arg, n))
         .collect();
-    (Some(name), args)
+    Some((sel, args))
 }
 
 fn forwards_all_gas(gas: ExprId) -> bool {

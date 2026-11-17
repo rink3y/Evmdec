@@ -474,6 +474,11 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             if a == b {
                 return konst(U256::ZERO);
             }
+            // Two places counted from one start are apart by the difference of their counts.
+            let (from, to) = (split_offset(b), split_offset(a));
+            if from.0.is_some() && from.0 == to.0 {
+                return konst(to.1.wrapping_sub(from.1));
+            }
             if let Node::Op(op::ADD, v) = node(a) {
                 if v[0] == b {
                     return v[1];

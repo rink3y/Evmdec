@@ -3689,22 +3689,22 @@ fn raw_reads(stmts: &[Stmt], term: &Term, readers: &HashSet<usize>) -> Vec<RawRe
                     }
                 }
             }
-            // The words in the head were decoded. Only what follows them is read raw.
-            Stmt::Call {
-                in_off,
-                input: None,
-                input_head,
-                ..
-            } if !input_head.is_empty() => {
-                let decoded = U256::from(32 * input_head.len());
-                reads.push((expr::add_const(*in_off, decoded), None, None));
-            }
+            /* The text gives the selector and the arguments it could read off the head.
+            What follows them is read raw, and so is all of it when the head starts with
+            no selector and the call prints as the memory it reads. */
             Stmt::Call {
                 in_off,
                 in_len,
                 input: None,
+                input_head,
                 ..
-            } => reads.push((*in_off, Some(*in_len), None)),
+            } => match crate::emit::call_head(input_head, *in_off) {
+                Some((_, args)) => {
+                    let given = U256::from(4 + 32 * args.len());
+                    reads.push((expr::add_const(*in_off, given), None, None));
+                }
+                None => reads.push((*in_off, Some(*in_len), None)),
+            },
             Stmt::Create {
                 off,
                 len,

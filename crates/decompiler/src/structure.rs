@@ -322,7 +322,7 @@ struct Printer<'a> {
     scope: HashMap<usize, Vec<(ExprId, String)>>,
     left: HashMap<usize, HashMap<ExprId, String>>,
     given: HashMap<(ExprId, String), usize>,
-    stored: Vec<(usize, String, ExprId, ExprId)>,
+    stored: Vec<(usize, usize, String, ExprId, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
     put_back: HashSet<(usize, usize)>,
     memory_reads: Vec<Vec<(usize, Span)>>,
@@ -927,6 +927,83 @@ struct Kept {
     printed_after: HashSet<(ExprId, (usize, usize))>,
 }
 
+/* A stored value prints as its slot only until a call or a helper may write the slot.
+Past that it prints as what it is made of, and an old read inside it shows. */
+fn forward_spans(l: &Lifted, g: &Graph, nd: &lift::LNode, i: usize) -> Vec<(ExprId, bool)> {
+    let rest = &nd.stmts[i + 1..];
+    let upto = rest.iter().position(may_change_storage);
+    let mut out: Vec<(ExprId, bool)> = Vec::new();
+    for (k, st) in rest.iter().enumerate() {
+        let held = upto.is_none_or(|u| k <= u);
+        out.extend(lift::stmt_exprs(st).into_iter().map(|e| (e, held)));
+    }
+    out.extend(
+        lift::term_exprs(&nd.term)
+            .into_iter()
+            .map(|e| (e, upto.is_none())),
+    );
+    let kept = |x: usize| {
+        x == nd.id || (upto.is_none() && g.dominates(nd.id, x) && unchanged_between(l, g, nd.id, x))
+    };
+    let mut seen = HashSet::new();
+    let mut stack = nd.succs.clone();
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 5000 {
+            continue;
+        }
+        let held = kept(x);
+        out.extend(lift::node_exprs(&l.nodes[x]).into_iter().map(|e| (e, held)));
+        stack.extend(l.nodes[x].succs.iter().copied());
+    }
+    for ((from, _), assigns) in &l.edge_assigns {
+        if *from == nd.id || seen.contains(from) {
+            let held = kept(*from) && (*from != nd.id || upto.is_none());
+            out.extend(assigns.iter().map(|(_, v)| (*v, held)));
+        }
+    }
+    out
+}
+
+fn unchanged_between(l: &Lifted, g: &Graph, from: usize, to: usize) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = g.preds[to].clone();
+    while let Some(x) = stack.pop() {
+        if x == from || !seen.insert(x) {
+            continue;
+        }
+        if seen.len() > 5000 || l.nodes[x].stmts.iter().any(may_change_storage) {
+            return false;
+        }
+        stack.extend(&g.preds[x]);
+    }
+    true
+}
+
+fn storage_may_change_after(l: &Lifted, nd: &lift::LNode, i: usize) -> bool {
+    if nd.stmts[i + 1..].iter().any(may_change_storage) {
+        return true;
+    }
+    let mut seen = HashSet::new();
+    let mut stack = nd.succs.clone();
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) {
+            continue;
+        }
+        if seen.len() > 5000 || l.nodes[x].stmts.iter().any(may_change_storage) {
+            return true;
+        }
+        stack.extend(l.nodes[x].succs.iter().copied());
+    }
+    false
+}
+
+fn may_change_storage(st: &Stmt) -> bool {
+    matches!(
+        st,
+        Stmt::Call { gen: Some(_), .. } | Stmt::Internal { gen: Some(_), .. } | Stmt::Create { .. }
+    )
+}
+
 fn version_after(st: &Stmt) -> Option<u32> {
     match st {
         Stmt::SStore { gen, .. } | Stmt::Create { gen, .. } => Some(gen + 1),
@@ -1246,7 +1323,7 @@ fn numbered(counts: &mut HashMap<String, u32>, base: &str) -> String {
 }
 
 // Printing these loads as the slot name would read the new value.
-fn plan_stale_loads(l: &Lifted, names: &Names, kept: &mut Kept) -> StalePlan {
+fn plan_stale_loads(l: &Lifted, g: &Graph, names: &Names, kept: &mut Kept) -> StalePlan {
     let mut plan: HashMap<(usize, usize), Vec<(ExprId, String)>> = HashMap::new();
     let mut found: Vec<(usize, usize, Overwritten, u32, Vec<ExprId>)> = Vec::new();
     let loads = loads_of(l);
@@ -1289,8 +1366,18 @@ fn plan_stale_loads(l: &Lifted, names: &Names, kept: &mut Kept) -> StalePlan {
                     Some(!kept && version <= gen)
                 };
                 let mut stale: Vec<ExprId> = Vec::new();
-                for e in after {
-                    stale_loads_in(e, what, gen, skip, &field, &mut stale);
+                match forwarded.is_some() && storage_may_change_after(l, nd, i) {
+                    true => {
+                        for (e, held) in forward_spans(l, g, nd, i) {
+                            let skip = skip.filter(|_| held);
+                            stale_loads_in(e, what, gen, skip, &field, &mut stale);
+                        }
+                    }
+                    false => {
+                        for e in after {
+                            stale_loads_in(e, what, gen, skip, &field, &mut stale);
+                        }
+                    }
                 }
                 /* The code may hold what it read from a word on the stack past the store,
                 so the read is looked for in every later block, not only in this one. */
@@ -2849,12 +2936,29 @@ impl<'a> Printer<'a> {
         let mut places = self.names.forward_places.borrow_mut();
         fw.clear();
         places.clear();
-        for (node, name, val, key) in &self.stored {
-            if *node != n && self.g.dominates(*node, n) {
+        for (node, at, name, val, key) in &self.stored {
+            if *node != n && self.g.dominates(*node, n) && self.storage_kept(*node, *at, n) {
                 fw.insert(*val, name.clone());
                 places.insert(*val, *key);
             }
         }
+    }
+
+    // A call can call back in and a helper can write any slot. A value stored before one
+    // of them is no longer what the slot holds after it.
+    fn storage_kept(&self, node: usize, at: usize, n: usize) -> bool {
+        let stmts = &self.l.nodes[node].stmts;
+        !stmts[at + 1..].iter().any(may_change_storage)
+            && unchanged_between(self.l, &self.g, node, n)
+    }
+
+    fn forget_stored(&self) {
+        self.names.forwarded.borrow_mut().retain(|v, nm| {
+            !self
+                .stored
+                .iter()
+                .any(|(_, _, name, val, _)| val == v && name == nm)
+        });
     }
 
     fn named_in(&self, n: usize, entering: bool) {
@@ -2956,6 +3060,9 @@ impl<'a> Printer<'a> {
         let mut kept_early: HashSet<usize> = HashSet::new();
         for (i, s) in self.l.nodes[n].stmts.iter().enumerate() {
             self.names.replace_stale_in_block(replaced.drain(..));
+            if i > 0 && may_change_storage(&self.l.nodes[n].stmts[i - 1]) {
+                self.forget_stored();
+            }
             /* Stores gathered into one line are all stated where the first stands. What
             a later one of them overwrites has to be kept before that line, not after. */
             let gathered = literals.iter().find(|lit| lit.first == i);
@@ -3072,17 +3179,20 @@ impl<'a> Printer<'a> {
             } = s
             {
                 let name = emit::fmt_slot(*key, self.names, emit::SlotSpace::Persistent);
-                self.stored.retain(|(_, nm, _, _)| *nm != name);
+                self.stored.retain(|(_, _, nm, _, _)| *nm != name);
                 let mut fw = self.names.forwarded.borrow_mut();
                 fw.retain(|_, nm| *nm != name);
                 if !expr::is_const(*val) && has_operations(*val, 1) {
-                    self.stored.push((n, name.clone(), *val, *key));
+                    self.stored.push((n, i, name.clone(), *val, *key));
                     fw.insert(*val, name);
                     self.names.forward_places.borrow_mut().insert(*val, *key);
                 }
             }
         }
         self.names.replace_stale_in_block(replaced);
+        if self.l.nodes[n].stmts.last().is_some_and(may_change_storage) {
+            self.forget_stored();
+        }
         self.early((n, self.l.nodes[n].stmts.len()), depth);
         self.left.insert(n, self.names.stale.borrow().clone());
     }
@@ -3938,7 +4048,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
     }
     used.extend(l.edge_assigns.values().flatten().map(|(_, v)| *v));
     let mut kept = Kept::default();
-    let mut stale_plan = plan_stale_loads(l, names, &mut kept);
+    let mut stale_plan = plan_stale_loads(l, &g, names, &mut kept);
     plan_early_reads(l, names, &mut kept);
     let mut early_reads = StalePlan::new();
     let scope = settle(l, &g, names, kept, &mut stale_plan, &mut early_reads);

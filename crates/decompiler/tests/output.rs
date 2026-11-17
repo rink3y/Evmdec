@@ -844,3 +844,14 @@ fn a_slot_a_scaled_index_past_a_mapping_value_names_is_a_field_of_one_record_in_
     assert!(out.contains("[arg0].field1 = 42"), "{out}");
     assert!(!out.contains(".fieldarg0"), "{out}");
 }
+
+#[test]
+fn a_value_stored_to_a_slot_is_not_printed_as_the_slot_after_a_call() {
+    let out = text("600c5460010180600c555f5f5f5f5f335af150600c54145f5260205ff3");
+    assert!(!out.contains("stor_12 == stor_12"), "{out}");
+    assert!(out.contains("stor_12 = prev_stor_12 + 1;"), "{out}");
+    assert!(
+        out.contains("return (stor_12 == prev_stor_12 + 1);"),
+        "{out}"
+    );
+}

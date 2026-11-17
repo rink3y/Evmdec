@@ -3085,6 +3085,17 @@ pub fn name_gas_reads(l: &Lifted, n: &Names) {
     *n.gas_named.borrow_mut() = read;
 }
 
+/* A copy from where the call data ends reads zeros. Shown as a copy it reads as if it
+brought data in, so whole words at fixed places are stated as the zeros they get. */
+fn zero_words(kind: u8, dest: ExprId, src: ExprId, len: ExprId) -> Option<Vec<ExprId>> {
+    let past_end = matches!(expr::node(src), Node::Env(op::CALLDATASIZE, _));
+    let at = expr::as_const(dest).filter(|d| d.fits_u64())?.low_u64();
+    let n = expr::as_const(len).filter(|l| l.fits_u64())?.low_u64();
+    let whole = n > 0 && n <= 256 && n.is_multiple_of(32);
+    (kind == op::CALLDATACOPY && past_end && whole)
+        .then(|| (0..n / 32).map(|k| expr::konst_u64(at + 32 * k)).collect())
+}
+
 pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
     match s {
         Stmt::Assign { var, value } => format!("{} = {};", fmt_expr(*var, n), fmt_expr(*value, n)),
@@ -3328,6 +3339,13 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             addr,
             ..
         } => {
+            if let Some(words) = zero_words(*kind, *dest, *src, *len) {
+                let zeroed: Vec<String> = words
+                    .into_iter()
+                    .map(|w| format!("{} = 0;", fmt_mem_word(w, n)))
+                    .collect();
+                return zeroed.join(" ");
+            }
             let src_s = match addr {
                 Some(a) => format!(
                     "{}.code[{}:+{}]",

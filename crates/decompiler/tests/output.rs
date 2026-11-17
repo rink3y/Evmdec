@@ -893,3 +893,10 @@ fn a_helper_parameter_is_a_whole_word_when_a_caller_or_the_body_shows_more_bits(
     );
     assert!(shifted.contains("function func_0x18(uint256 "), "{shifted}");
 }
+
+#[test]
+fn a_copy_from_the_end_of_the_call_data_is_printed_as_the_zeros_it_writes() {
+    let out = text("60403660a0375f3560a0f3");
+    assert!(out.contains("mem[0xa0] = 0; mem[0xc0] = 0;"), "{out}");
+    assert!(!out.contains("msg.data[msg.data.length"), "{out}");
+}

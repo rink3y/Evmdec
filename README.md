@@ -348,9 +348,9 @@ stored time, gave the same findings in every contract and the same counts: 31 of
 contract still does not finish in 600 s, and why is not known.
 
 On the development set, where every false finding was read and its cause fixed, the latest
-reviewed build finds 35 of 231 known flaws (15.2%) by address, 53 of its 66 findings are
-correct (80%), and none of 55 contracts with no known flaw gets a finding. A contract takes
-2.3 s at the median and 8.8 s at most there, with the state cache warm. The held-out set
+reviewed build finds 36 of 231 known flaws (15.6%) by address, 55 of its 67 findings are
+correct (82%), and none of 55 contracts with no known flaw gets a finding. A contract takes
+2.1 s at the median there, with the state cache warm. The held-out set
 does not follow at the same rate: what is fixed on one set of contracts is general in form
 and reaches fewer of the other set's flaws. That gap is the honest measure of where the
 tool stands.

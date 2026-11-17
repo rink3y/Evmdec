@@ -813,3 +813,16 @@ fn a_step_that_wraps_in_a_range_test_is_marked_as_untested() {
         "{out}"
     );
 }
+
+#[test]
+fn a_call_with_two_parts_of_a_length_the_code_works_out_is_printed_with_both() {
+    let out = text(
+        "608060405260405163aabbccdd60e01b815260408160040152600435808260440152806100648360640137\
+         601f01601f191680606001826024015260243580828401606401528061020083850160840137601f01601f\
+         1916016084015f5f82845f6044355af15000",
+    );
+    let call = "abi.encodeWithSelector(func_aabbccdd.selector, msg.data[100:+arg0], \
+                msg.data[512:+arg1])";
+    assert!(out.contains(call), "{out}");
+    assert!(!out.contains("mem[ptr1"), "{out}");
+}

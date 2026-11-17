@@ -880,6 +880,15 @@ impl Mem {
 
     // An address made from an index the code tested stays within what the index can reach.
     fn reaches(&self, w: &MemWrite, base: Option<ExprId>, d: u64, n: u64) -> bool {
+        if self.pointer_named && (w.base.is_some() || base.is_some()) {
+            let (terms, fixed) = base.map(summed).unwrap_or_default();
+            let (read, written) = ((terms, fixed.wrapping_add(U256::from(d))), place(w));
+            let past = ahead(&written, &read).is_some_and(|gap| gap >= n);
+            let short = w.len.zip(ahead(&read, &written));
+            if past || short.is_some_and(|(len, gap)| gap >= len) {
+                return false;
+            }
+        }
         let (w_index, r_index) = (w.base.and_then(scratch_index), base.and_then(scratch_index));
         if w_index.is_some() || r_index.is_some() {
             let unknown = |b: ExprId| !self.pointer_named || wild_base(b);
@@ -972,27 +981,15 @@ impl Mem {
             let data = start + 32;
             let fixed = expr::as_const(len).filter(|c| c.fits_u64());
             let Some(count) = fixed.map(|c| c.low_u64()).filter(|c| *c <= 4096) else {
-                // A part of a length the code works out is the last, and one copy made it.
-                let (copy, padding) = self.copied_part(at(data), len)?;
-                let total =
-                    [len, round_up(len)].map(|l| summed(op2(op::ADD, konst_u64(4 + data), l)));
-                if next.is_some() || !total.contains(&summed(in_len)) {
+                // After a part of a length the code works out none has a fixed place.
+                if next.is_some() {
                     return None;
                 }
-                let MVal::Copy(kind, src, None) = copy.val else {
-                    return None;
-                };
-                // Where the length is known, a store past the bytes copied did not change them.
-                let copied = self.held_length(len).unwrap_or(u64::MAX / 4);
-                if kind == op::MCOPY && self.written_since(src, copied, copy.gen) {
-                    return None;
+                let (parts, made) = self.copied_parts(in_off, in_len, &head, (*i, *start, len))?;
+                built.extend(made);
+                for (at, part) in parts {
+                    args[at] = part;
                 }
-                built.extend(copy.origin);
-                built.extend(padding);
-                args[*i] = match self.bytes_now(kind, src, len) {
-                    Some(known) => known,
-                    None => Arg::Copied { kind, src, len },
-                };
                 continue;
             };
             let words = |n: u64| -> Option<Vec<ExprId>> {
@@ -1045,15 +1042,10 @@ impl Mem {
 
     fn copied_part(&self, data: ExprId, len: ExprId) -> Option<(&MemWrite, Option<Origin>)> {
         let (base, d) = norm_offset(data);
-        let end = summed(op2(op::ADD, data, len));
-        let place = |w: &MemWrite| {
-            let (terms, fixed) = w.base.map(summed).unwrap_or_default();
-            (terms, fixed.wrapping_add(U256::from(w.off)))
-        };
-        let at = self
-            .writes
-            .iter()
-            .rposition(|w| w.base == base && w.off == d && matches!(w.val, MVal::Copy(..)))?;
+        let start = summed(data);
+        let ends = [len, round_up(len)].map(|l| summed(op2(op::ADD, data, l)));
+        let copied = |w: &MemWrite| place(w) == start && matches!(w.val, MVal::Copy(..));
+        let at = self.writes.iter().rposition(copied)?;
         let copy = &self.writes[at];
         if !copy.span.is_some_and(|s| s == len || s == round_up(len)) {
             return None;
@@ -1066,13 +1058,94 @@ impl Mem {
                 true => later.len.is_none_or(|l| later.off + l > d),
                 false => self.reaches(later, base, d, reach),
             };
-            if place(later) == end && zero {
+            /* An address is a sum of terms that are never negative. A store that many
+            bytes below where the copy starts, or at or past where it ends, left the
+            copied bytes alone, whatever the terms are. */
+            let at = place(later);
+            let below = later.len.zip(ahead(&start, &at));
+            let apart = below.is_some_and(|(l, gap)| gap >= l)
+                || ends.iter().any(|end| ahead(&at, end).is_some());
+            if ends.contains(&at) && zero {
                 padding = later.origin;
-            } else if over {
+            } else if over && !apart {
                 return None;
             }
         }
         Some((copy, padding))
+    }
+
+    fn word_at(&self, addr: ExprId) -> Option<(ExprId, Option<Origin>)> {
+        let wanted = summed(addr);
+        let at = self.writes.iter().rposition(|w| place(w) == wanted)?;
+        let (MVal::Word(word), Some(32)) = (&self.writes[at].val, self.writes[at].len) else {
+            return None;
+        };
+        let clear = |later: &MemWrite| {
+            let at = place(later);
+            let below = later.len.zip(ahead(&wanted, &at));
+            below.is_some_and(|(l, gap)| gap >= l)
+                || ahead(&at, &wanted).is_some_and(|gap| gap >= 32)
+        };
+        let kept = self.writes[at + 1..].iter().all(clear) && self.current(*word);
+        kept.then_some((*word, self.writes[at].origin))
+    }
+
+    /* Parts of a length the code works out have no fixed place. Each starts where the one
+    before it ends, and a word of the head says so. The last ends where the call data
+    does. */
+    fn copied_parts(
+        &self,
+        in_off: ExprId,
+        in_len: ExprId,
+        head: &[ExprId],
+        first: (usize, u64, ExprId),
+    ) -> Option<(Vec<(usize, Arg)>, Vec<Origin>)> {
+        let at = |from_head: ExprId| {
+            op2(
+                op::ADD,
+                expr::add_const(in_off, U256::from(4u64)),
+                from_head,
+            )
+        };
+        let (mut index, start, mut len) = first;
+        let mut start = konst_u64(start);
+        let mut parts: Vec<(usize, Arg)> = Vec::new();
+        let mut built: Vec<Origin> = Vec::new();
+        while parts.len() < head.len() {
+            let data = expr::add_const(start, U256::from(32u64));
+            let (copy, padding) = self.copied_part(at(data), len)?;
+            let MVal::Copy(kind, src, None) = copy.val else {
+                return None;
+            };
+            // Where the length is known, a store past the bytes copied did not change them.
+            let copied = self.held_length(len).unwrap_or(u64::MAX / 4);
+            if kind == op::MCOPY && self.written_since(src, copied, copy.gen) {
+                return None;
+            }
+            built.extend(copy.origin);
+            built.extend(padding);
+            let known = self.bytes_now(kind, src, len);
+            parts.push((index, known.unwrap_or(Arg::Copied { kind, src, len })));
+            let ends = [len, round_up(len)].map(|l| op2(op::ADD, data, l));
+            let whole =
+                |end: &ExprId| summed(expr::add_const(*end, U256::from(4u64))) == summed(in_len);
+            if ends.iter().any(whole) {
+                return Some((parts, built));
+            }
+            let taken = |j: &usize| parts.iter().any(|(i, _)| i == j);
+            let next = (0..head.len())
+                .filter(|j| !taken(j) && !expr::is_const(head[*j]))
+                .find_map(|j| {
+                    Some((
+                        j,
+                        *ends.iter().find(|end| summed(**end) == summed(head[j]))?,
+                    ))
+                })?;
+            let (word, origin) = self.word_at(at(next.1))?;
+            built.extend(origin);
+            (index, start, len) = (next.0, next.1, word);
+        }
+        None
     }
 
     fn store(&mut self, off: ExprId, len: Option<u64>, val: MVal) {
@@ -3667,6 +3740,34 @@ fn entered(e: ExprId, with: &Entering) -> ExprId {
         _ => None,
     };
     expr::substitute(restamped, &said, &mut HashMap::new())
+}
+
+type Place = (Vec<(ExprId, i64)>, U256);
+
+fn place(w: &MemWrite) -> Place {
+    let (terms, fixed) = w.base.map(summed).unwrap_or_default();
+    (terms, fixed.wrapping_add(U256::from(w.off)))
+}
+
+/* How far the first place lies past the second, when no term can bring it below. A term
+counts up from zero unless it is made the way code writes a negative number. */
+fn ahead(a: &Place, b: &Place) -> Option<u64> {
+    let mut terms: HashMap<ExprId, i64> = a.0.iter().copied().collect();
+    for (term, times) in &b.0 {
+        *terms.entry(*term).or_insert(0) -= times;
+    }
+    let negative = |term: &ExprId| match expr::node(*term) {
+        Node::Op(op::NOT | op::SIGNEXTEND | op::SDIV | op::SMOD | op::SAR, _) => true,
+        Node::Op(op::MUL, v) => v
+            .iter()
+            .any(|x| expr::as_const(*x).is_some_and(|c| c.bits() > 64)),
+        _ => false,
+    };
+    let up = terms
+        .iter()
+        .all(|(term, times)| *times == 0 || (*times > 0 && !negative(term)));
+    let gap = a.1.wrapping_sub(b.1);
+    (up && gap.fits_u64() && gap.low_u64() < BIG).then(|| gap.low_u64())
 }
 
 fn round_up(len: ExprId) -> ExprId {

@@ -454,6 +454,7 @@ from that number elsewhere is no place. */
 pub struct Offsets {
     places: HashSet<ExprId>,
     bases: HashSet<ExprId>,
+    ranged: HashSet<ExprId>,
     handed: std::sync::Arc<HashMap<usize, BTreeSet<usize>>>,
 }
 
@@ -488,6 +489,22 @@ fn anchors(e: ExprId, defs: &Defs, depth: u32) -> bool {
         }
         _ => false,
     }
+}
+
+/* A number moved by a constant and then found below another constant is a test of the
+range the number lies in. The step is meant to wrap, and no place in memory is tested to
+lie below a constant. A sum tested to lie above one is a size held to a limit. */
+fn range_tested(moved: ExprId, limit: ExprId) -> Option<ExprId> {
+    let fixed = |v: &[ExprId]| v.iter().any(|x| expr::is_const(*x));
+    let step = |e: ExprId| match expr::node(e) {
+        Node::Op(op::ADD | op::SUB, v) if fixed(&v) => Some(e),
+        _ => None,
+    };
+    let under_mask = match expr::node(moved) {
+        Node::Op(op::AND, v) if fixed(&v) => v.iter().find_map(|x| step(*x)),
+        _ => None,
+    };
+    step(moved).or(under_mask).filter(|_| expr::is_const(limit))
 }
 
 fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> Offsets {
@@ -535,6 +552,7 @@ fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> Off
         }
     }
     let mut seen = HashSet::new();
+    let mut ranged: HashSet<ExprId> = HashSet::new();
     while let Some(e) = roots.pop() {
         if !seen.insert(e) {
             continue;
@@ -549,6 +567,8 @@ fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> Off
             Node::Op(op::LT | op::GT | op::SLT | op::SGT, v) if v.iter().any(|x| sizes(*x)) => {
                 pending.extend(v)
             }
+            Node::Op(op::LT, v) => ranged.extend(range_tested(v[0], v[1])),
+            Node::Op(op::GT, v) => ranged.extend(range_tested(v[1], v[0])),
             _ => {}
         }
         roots.extend(expr::children(e));
@@ -556,7 +576,10 @@ fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> Off
     let defs = crate::ssa::phi_defs(l);
     let arity = crate::ssa::arity(l);
     let anchored = |e: ExprId| anchors(e, &defs, 0);
-    let mut found = Offsets::default();
+    let mut found = Offsets {
+        ranged,
+        ..Offsets::default()
+    };
     let mut pending: Vec<(ExprId, bool)> = pending.into_iter().map(|e| (e, true)).collect();
     while let Some((e, base)) = pending.pop() {
         let new = match base {
@@ -636,11 +659,12 @@ impl Names {
             ),
             _ => return None,
         };
+        // A step of a range test is a place only where the code also uses it as one.
+        let used = || block_ref(e, self).is_some() || self.offsets.places.contains(&e);
+        let place = || used() || (!self.offsets.ranged.contains(&e) && self.is_offset(e, 0));
         Some(match tested {
             true => Arithmetic::Tested,
-            false if safe || block_ref(e, self).is_some() || self.is_offset(e, 0) => {
-                Arithmetic::Exempt
-            }
+            false if safe || place() => Arithmetic::Exempt,
             false => Arithmetic::Untested,
         })
     }
@@ -717,6 +741,7 @@ impl Names {
             let sets = [
                 &mut self.offsets.places,
                 &mut self.offsets.bases,
+                &mut self.offsets.ranged,
                 &mut self.call_starts,
             ];
             for set in sets {

@@ -799,3 +799,17 @@ fn a_head_word_a_folded_encoder_stores_after_its_copy_still_gives_the_call_its_a
     let call = "arg2.call(abi.encodeWithSelector(func_aabbccdd.selector, abi.encode(arg0), arg1));";
     assert!(out.contains(call), "{out}");
 }
+
+#[test]
+fn a_step_that_wraps_in_a_range_test_is_marked_as_untested() {
+    let out = text(
+        "60806040526004358051808201515f55606381036102e29010600155602435602357005b634e487b7160e0\
+         1b5f52601160045260245ffd",
+    );
+    // The length is also an offset into memory, which is why its sums print bare elsewhere.
+    assert!(out.contains("stor_0 = mem[arg0 + mem[arg0]];"), "{out}");
+    assert!(
+        out.contains("stor_1 = unchecked(mem[arg0] - 99) < 738;"),
+        "{out}"
+    );
+}

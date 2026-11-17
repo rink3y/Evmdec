@@ -1692,11 +1692,11 @@ fn answer_length(cond: ExprId, holds: bool, capped: &[(ExprId, u32)]) -> Option<
     match (o, holds) {
         (op::ISZERO, _) => answer_length(v[0], !holds, capped),
         (op::LT | op::SLT, false) | (op::GT | op::SGT, true) => {
-            let least = fixed(v[1])? + u64::from(holds);
+            let least = fixed(v[1])?.checked_add(u64::from(holds))?;
             Some((size(v[0])?, least))
         }
         (op::LT | op::SLT, true) | (op::GT | op::SGT, false) => {
-            let least = fixed(v[0])? + u64::from(holds);
+            let least = fixed(v[0])?.checked_add(u64::from(holds))?;
             Some((size(v[1])?, least))
         }
         (op::EQ, true) => {
@@ -4777,6 +4777,14 @@ mod tests {
             _ => None,
         });
         values.collect()
+    }
+
+    #[test]
+    fn an_answer_longer_than_any_length_names_no_length() {
+        let size = expr::intern(Node::Env(op::RETURNDATASIZE, 1));
+        let longer = expr::op2(op::GT, size, expr::konst_u64(u64::MAX));
+        assert_eq!(answer_length(longer, true, &[]), None);
+        assert_eq!(answer_length(longer, false, &[]), None);
     }
 
     #[test]

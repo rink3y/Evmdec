@@ -7,40 +7,31 @@ cargo fmt --all
 cargo clippy --workspace --all-targets --all-features
 cargo test --workspace
 python3 corpus/bench.py
-python3 corpus/vuln_bench.py
-python3 corpus/rule_bench.py
 RUNS=8 ./corpus/verify_all.sh
 ```
 
-Clippy is kept at zero warnings. `bench.py` measures interface recovery on the audited corpus,
-`vuln_bench.py` recall on known exploits and the false-positive budget, and `verify_all.sh`
-runs the block oracle, where every block must agree with the interpreter. The numbers those
-print are the ones in the README. A change that moves them has to say so.
+Clippy is kept at zero warnings. `bench.py` measures interface recovery on the audited corpus
+and `verify_all.sh` runs the block oracle, where every block must agree with the interpreter.
+The numbers those print are the ones in the README. A change that moves them has to say so.
 
-## Rules
+## The analyzer
 
-Analyzer rules are written in bytecode facts: widths, uses, storage shapes, call targets,
-comparisons. A rule never names a contract, a protocol, a token or an address. If a rule needs
-a list of selectors, the list is secondary evidence and the rule must still fire without it.
+The analyzer in `crates/audit` reports consequences a run showed. It has no rules that match
+code, and a change must not add one.
 
-Every rule carries a test on hand-assembled bytecode in `crates/decompiler/tests/analyzer.rs`,
-with a positive case and the nearest legitimate pattern as a negative case.
-
-A rule that works by running the code also gets a row in `cases()` in the same file: a flawed
-fixture and the sound one closest to it. Three tests read that table. One scores it per rule and
-fails on any miss or false alarm. The other rebuilds every fixture with a push and a pop after
-each jump destination and fails if a result changes, so a rule cannot depend on where the code
-happens to sit. `EVMDEC_WRITE_FIXTURES=testdata/rules cargo test the_labelled` rewrites the
-fixtures on disk that `corpus/rule_bench.py` scores.
-
-When the sound fixture differs from the flawed one by a guard, add the rule to
-`SOUND_BY_A_GUARD`. A third test drops one guard at a time from every sound fixture and, for
-those rules, requires at least one removal to make the rule fire.
-
-A check that runs code reports only what a run showed. An input the solver produced is run
-again on the bytecode before a finding is built on it, and a finding that chose storage to get
-a run says so. Standard interfaces are measured, never assumed: a selector says what a function
-is called, not what it does.
+- Nothing in it names a contract, a protocol, a token, a standard or an address. Function
+  selectors appear in one place only, `world.rs`, where the local world speaks the asset
+  interface the same way it moves ether. They never decide a finding.
+- A fix is for a general cause. If it only helps the contract it was found on, it is not a
+  fix. Say in the commit which unrelated contracts it also changes.
+- A finding is built on a run and carries the steps to make that run again. A doubt about a
+  finding becomes a second test that re-runs it, not a filter on its shape.
+- A false finding on a contract with no known flaw is traced to what the world or the law
+  got wrong, and that is corrected. The contract is not exempted.
+- New logic gets one small test: a unit test beside it, or a source fixture in
+  `testdata/source` with the flawed contract and the sound one closest to it.
+- `testdata/heldout` is never read and never tuned on. It is scored by reviewers who return
+  counts only.
 
 ## Style
 

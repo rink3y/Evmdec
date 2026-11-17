@@ -1,9 +1,29 @@
 {
-  "_comment": "Deployed contracts on which a rule once reported something that is not there. Each entry names the rule that must stay silent on that contract and says why the finding was wrong.",
+  "_comment": "Deployed contracts on which a rule once reported something that is not there. Each entry names the rules that must stay silent on that contract, in one function when one is named, and says why each finding was wrong.",
   "classic_85deeaf2": {
     "address": "0x85deeaf2ba09efe9ef236bf43e5347c8cda3af9a",
     "chain": "classic",
-    "rule": "third-party-balance-debit",
-    "why": "the three-word transfer lowers the named account only on the branch where that account is the caller, and leaves without reverting otherwise"
+    "why": "the three-word transfer lowers the named account only on the branch where that account is the caller, and leaves without reverting otherwise",
+    "rules": [
+      "third-party-balance-debit"
+    ]
+  },
+  "classic_f8784090": {
+    "address": "0xf87840900718e5b2b161d16fc06ad55265b57237",
+    "chain": "classic",
+    "why": "transferFrom leaves the allowance as it is and adds what it moved to a second record keyed by holder and caller, and refuses once that record would pass the allowance. Its getters for name, symbol and version copy a stored string in a loop whose bound no function writes",
+    "rules": [
+      "allowance-not-spent",
+      "storage-bounded-loop"
+    ]
+  },
+  "mainnet_1f573d6f": {
+    "address": "0x1f573d6fb3f13d689ff844b4ce37794d79a7ff1c",
+    "chain": "mainnet",
+    "rules": [
+      "third-party-balance-debit"
+    ],
+    "why": "a transfer to the contract itself burns what was just credited: the entry lowered is the named account's only on the branch where that account is the contract",
+    "function": "transfer"
   }
 }

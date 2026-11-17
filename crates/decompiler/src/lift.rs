@@ -1,4 +1,4 @@
-use crate::cfg::{AState, AVal, Edge, Program, UNode, Unit};
+use crate::cfg::{AVal, Edge, Program, Unit};
 use crate::expr::{self, kind, konst, konst_u64, op1, op2, op3, ExprId, Node};
 use crate::opcode as op;
 use crate::u256::U256;
@@ -42,6 +42,8 @@ pub enum Stmt {
         out_len: ExprId,
         input: Option<Vec<ExprId>>,
         input_head: Vec<ExprId>,
+        layout: Option<Vec<(ExprId, u8)>>,
+        args: Option<Vec<Arg>>,
         result: ExprId,
         gen: Option<u32>,
     },
@@ -62,6 +64,7 @@ pub enum Stmt {
         src: ExprId,
         len: ExprId,
         addr: Option<ExprId>,
+        gen: u32,
     },
     Internal {
         seq: u32,
@@ -76,6 +79,40 @@ pub enum Stmt {
         data: Option<Vec<ExprId>>,
         invalid: bool,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Arg {
+    Word(ExprId),
+    Bytes(u64, Vec<ExprId>),
+    List(Vec<ExprId>),
+    Copied { kind: u8, src: ExprId, len: ExprId },
+}
+
+impl Arg {
+    #[must_use]
+    pub fn exprs(&self) -> Vec<ExprId> {
+        match self {
+            Arg::Word(e) => vec![*e],
+            Arg::Bytes(_, words) | Arg::List(words) => words.clone(),
+            Arg::Copied { src, len, .. } => vec![*src, *len],
+        }
+    }
+
+    #[must_use]
+    pub fn map(&self, f: &dyn Fn(ExprId) -> ExprId) -> Arg {
+        let all = |words: &[ExprId]| words.iter().map(|e| f(*e)).collect();
+        match self {
+            Arg::Word(e) => Arg::Word(f(*e)),
+            Arg::Bytes(len, words) => Arg::Bytes(*len, all(words)),
+            Arg::List(words) => Arg::List(all(words)),
+            Arg::Copied { kind, src, len } => Arg::Copied {
+                kind: *kind,
+                src: f(*src),
+                len: f(*len),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +163,8 @@ pub struct LNode {
     pub succs: Vec<usize>,
     pub entry_stack: Vec<ExprId>,
     pub exit_stack: Vec<ExprId>,
+    pub sgen: u32,
+    pub mgen: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -147,9 +186,13 @@ enum MVal {
     Word(ExprId),
     Byte(ExprId),
     Copy(u8, ExprId, Option<ExprId>),
-    CallOut(u32),
+    CallOut(u32, u32),
+    Zero,
     Unknown,
 }
+
+type Origin = (usize, usize);
+type Parts = Vec<(usize, Arg)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MemWrite {
@@ -159,6 +202,8 @@ struct MemWrite {
     val: MVal,
     origin: Option<(usize, usize)>,
     gen: u32,
+    span: Option<ExprId>,
+    most: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -487,6 +532,15 @@ pub struct MemoryWrites {
 
 impl MemoryWrites {
     #[must_use]
+    pub fn leaves_free_pointer(&self) -> bool {
+        let end = FREE_POINTER + 32;
+        !self
+            .ranges
+            .iter()
+            .any(|(lo, hi)| *lo < end && *hi > FREE_POINTER)
+    }
+
+    #[must_use]
     pub fn fixed(&self) -> Option<Vec<(u64, u64)>> {
         if self.anywhere {
             return None;
@@ -513,10 +567,18 @@ struct Mem {
     written: BTreeSet<(u64, u64)>,
     entry_loads: Rc<RefCell<MemoryReads>>,
     touched: Rc<RefCell<MemoryWrites>>,
-    single_run: bool,
+    pointer_named: bool,
+    // Writes made before this version may be missing from the list.
+    wiped: u32,
+    sized: Vec<(u32, u64)>,
+    capped: Vec<(ExprId, u32)>,
+    below: Vec<(ExprId, u64)>,
 }
 
 const BIG: u64 = 1 << 40;
+
+// Stands where a byte's place in its word goes, for a byte no value is known for.
+const NOT_KNOWN: u64 = u64::MAX;
 
 const MERGED_RETURN: u32 = 1 << 31;
 
@@ -552,8 +614,44 @@ fn wild_base(b: ExprId) -> bool {
     expr::holds(b, !(kind::CONST | kind::OP | kind::MLOAD))
 }
 
-// Sound only because an unknown pointer is unsigned and memory never wraps.
-// So p + k lies at or above k. It also never points into the scratch area below 0x80.
+const FIRST_BLOCK: u64 = 0x80;
+
+/* An address that cannot reach the first allocated block is no pointer into one. It picks
+one of the words at fixed places below, so it is held to the range it can take. */
+fn scratch_index(base: ExprId) -> Option<u64> {
+    let most = expr::may_bits(base);
+    (most.fits_u64() && most.low_u64() < FIRST_BLOCK).then(|| most.low_u64())
+}
+
+fn rounded_down(sum: ExprId, low: ExprId) -> Option<Vec<ExprId>> {
+    let Node::Op(op::AND, m) = expr::node(low) else {
+        return None;
+    };
+    let [a, b] = m[..] else {
+        return None;
+    };
+    let term = match (expr::is_const(a), expr::is_const(b)) {
+        (true, false) => b,
+        (false, true) => a,
+        _ => return None,
+    };
+    let mut terms = Vec::new();
+    let mut stack = vec![sum];
+    while let Some(x) = stack.pop() {
+        match expr::node(x) {
+            Node::Op(op::ADD, v) => stack.extend(v),
+            _ => terms.push(x),
+        }
+    }
+    let at = terms.iter().position(|t| *t == term)?;
+    terms.remove(at);
+    Some(terms)
+}
+
+/* Sound only because an unknown pointer is unsigned and memory never wraps.
+So p + k lies at or above k. It also never points into the scratch area below 0x80.
+Code that keeps no free pointer has no blocks of its own to point into. There a computed
+address is an index into the words at fixed places, so it counts as unknown. */
 fn may_alias(
     wb: Option<ExprId>,
     woff: u64,
@@ -561,9 +659,11 @@ fn may_alias(
     rb: Option<ExprId>,
     roff: u64,
     rlen: u64,
+    allocates: bool,
 ) -> bool {
-    let w_wild = wb.is_some_and(wild_base);
-    let r_wild = rb.is_some_and(wild_base);
+    let unknown = |b: ExprId| !allocates || wild_base(b);
+    let w_wild = wb.is_some_and(unknown);
+    let r_wild = rb.is_some_and(unknown);
     let above = |wild: ExprId, fixed: ExprId| -> Option<u64> {
         let mut terms = Vec::new();
         let mut stack = vec![wild];
@@ -573,6 +673,11 @@ fn may_alias(
                     stack.push(v[0]);
                     stack.push(v[1]);
                 }
+                // A sum less the low bits of one of its terms is still at or above the rest.
+                Node::Op(o, v) if o == op::SUB => match rounded_down(v[0], v[1]) {
+                    Some(rest) => stack.extend(rest),
+                    None => terms.push(x),
+                },
                 _ => terms.push(x),
             }
         }
@@ -595,7 +700,7 @@ fn may_alias(
                     return None;
                 }
                 k = k.saturating_add(c.low_u64());
-            } else if !wild_base(t) {
+            } else if !unknown(t) {
                 return None;
             }
         }
@@ -603,7 +708,7 @@ fn may_alias(
     };
     if w_wild {
         let Some(rbase) = rb else {
-            return roff >= 0x80 && roff + rlen > woff;
+            return (!allocates || roff >= 0x80) && roff + rlen > woff;
         };
         if let (false, Some(wbase)) = (r_wild, wb) {
             if let Some(k) = above(wbase, rbase) {
@@ -614,7 +719,7 @@ fn may_alias(
     }
     if r_wild {
         let Some(wbase) = wb else {
-            return woff >= 0x80 && wlen.is_none_or(|l| woff + l > roff);
+            return (!allocates || woff >= 0x80) && wlen.is_none_or(|l| woff + l > roff);
         };
         if let Some(rbase) = rb {
             if let Some(k) = above(rbase, wbase) {
@@ -627,8 +732,13 @@ fn may_alias(
 }
 
 impl Mem {
-    fn new(fresh: bool) -> Mem {
+    fn new(fresh: bool, pointer_named: bool) -> Mem {
         Mem {
+            pointer_named,
+            wiped: 0,
+            sized: Vec::new(),
+            capped: Vec::new(),
+            below: Vec::new(),
             writes: Vec::new(),
             fresh,
             gen: 0,
@@ -636,7 +746,6 @@ impl Mem {
             written: BTreeSet::new(),
             entry_loads: Rc::default(),
             touched: Rc::default(),
-            single_run: false,
         }
     }
 
@@ -661,7 +770,7 @@ impl Mem {
             if w.base != base {
                 // A write through another pointer may land on the same bytes.
                 // Without the new version two reads around it would count as equal.
-                if may_alias(w.base, w.off, w.len, base, d, n) {
+                if self.reaches(w, base, d, n) {
                     v = v.max(w.gen);
                 }
                 continue;
@@ -675,6 +784,369 @@ impl Mem {
             }
         }
         v
+    }
+
+    /* Where the code keeps its variables at fixed places, a write through a computed address
+    may have reached one of them. What a computed address read is taken to be apart from
+    the places written after it, as two blocks the code allocated are. Only a write
+    through that same address counts there. */
+    fn written_since(&self, off: ExprId, n: u64, version: u32) -> bool {
+        let (base, d) = norm_offset(off);
+        let index = |b: Option<ExprId>| b.and_then(scratch_index).is_some();
+        let over = |w: &MemWrite| match w.base == base {
+            true => d.saturating_add(n) > w.off && w.len.is_none_or(|l| d < w.off + l),
+            false => {
+                let fixed = !self.pointer_named && base.is_none();
+                (fixed || index(w.base) || index(base)) && self.reaches(w, base, d, n)
+            }
+        };
+        version < self.wiped || self.writes.iter().any(|w| w.gen > version && over(w))
+    }
+
+    /* A stored value prints the memory it read by where that memory is. Once such a place
+    is written again the value would print as the new word, so it is no longer handed to a
+    read of the place it was stored at. A read of the free pointer has a name of its own. */
+    fn current(&self, value: ExprId) -> bool {
+        let reads = kind::MLOAD | kind::KECCAK_MEM | kind::COPIED_WORD;
+        let mut seen: HashSet<ExprId> = HashSet::new();
+        let mut pending = vec![value];
+        while let Some(e) = pending.pop() {
+            if !expr::holds(e, reads) || !seen.insert(e) {
+                continue;
+            }
+            if seen.len() > 4096 {
+                return false;
+            }
+            // Of a copied word cut down to its first bytes only those bytes have to stand.
+            let cut = match expr::node(e) {
+                Node::Op(op::SHR, v) => match (expr::as_const(v[0]), expr::node(v[1])) {
+                    (Some(by), Node::CopiedWord(op::MCOPY, at, version)) if by.fits_u64() => {
+                        let kept = 32u64.checked_sub(by.low_u64().div_ceil(8));
+                        kept.map(|bytes| (at, bytes, version))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((at, bytes, version)) = cut {
+                if self.written_since(at, bytes, version) {
+                    return false;
+                }
+                pending.push(at);
+                continue;
+            }
+            let unchanged = match expr::node(e) {
+                Node::MLoad(at, _) if self.pointer_named && at == konst_u64(FREE_POINTER) => true,
+                Node::MLoad(at, version) | Node::CopiedWord(op::MCOPY, at, version) => {
+                    !self.written_since(at, 32, version)
+                }
+                Node::KeccakMem(off, len, version) => {
+                    let len = expr::as_const(len).and_then(|l| l.as_usize());
+                    let len = len
+                        .filter(|l| *l <= 8192)
+                        .map_or(u64::MAX / 4, |l| l as u64);
+                    !self.written_since(off, len, version)
+                }
+                _ => true,
+            };
+            if !unchanged {
+                return false;
+            }
+            pending.extend(expr::children(e));
+        }
+        true
+    }
+
+    fn most(&self, base: ExprId) -> Option<u64> {
+        let tested = |e: ExprId| {
+            let known = self.below.iter().filter(|(x, _)| *x == e);
+            known.map(|(_, n)| *n).min().map(|n| n - 1)
+        };
+        let fixed = |e: ExprId| {
+            expr::as_const(e)
+                .filter(|c| c.fits_u64())
+                .map(|c| c.low_u64())
+        };
+        tested(base).or_else(|| match expr::node(base) {
+            Node::Op(op::MUL, v) => [(v[0], v[1]), (v[1], v[0])]
+                .into_iter()
+                .find_map(|(i, by)| tested(i)?.checked_mul(fixed(by)?)),
+            Node::Op(op::SHL, v) => {
+                let by = fixed(v[0]).filter(|by| *by < 32)?;
+                Some(tested(v[1])? << by)
+            }
+            _ => None,
+        })
+    }
+
+    // An address made from an index the code tested stays within what the index can reach.
+    fn reaches(&self, w: &MemWrite, base: Option<ExprId>, d: u64, n: u64) -> bool {
+        if self.pointer_named && (w.base.is_some() || base.is_some()) {
+            let (terms, fixed) = base.map(summed).unwrap_or_default();
+            let (read, written) = ((terms, fixed.wrapping_add(U256::from(d))), place(w));
+            let past = ahead(&written, &read).is_some_and(|gap| gap >= n);
+            let short = w.len.zip(ahead(&read, &written));
+            if past || short.is_some_and(|(len, gap)| gap >= len) {
+                return false;
+            }
+        }
+        let (w_index, r_index) = (w.base.and_then(scratch_index), base.and_then(scratch_index));
+        if w_index.is_some() || r_index.is_some() {
+            let unknown = |b: ExprId| !self.pointer_named || wild_base(b);
+            let span = |b: Option<ExprId>, index: Option<u64>, off: u64, len: Option<u64>| {
+                let reach = match (b, index) {
+                    (None, _) => Some(0),
+                    (Some(_), most) => most,
+                };
+                reach.map(|most| (off, len.map(|l| off.saturating_add(most).saturating_add(l))))
+            };
+            let write = span(w.base, w_index, w.off, w.len);
+            let read = span(base, r_index, d, Some(n));
+            return match (write, read) {
+                (Some((ws, we)), Some((rs, re))) => {
+                    we.is_none_or(|end| rs < end) && re.is_none_or(|end| ws < end)
+                }
+                (Some((_, end)), None) => {
+                    base.is_some_and(unknown) || end.is_none_or(|end| end > FIRST_BLOCK)
+                }
+                (None, Some((_, end))) => {
+                    w.base.is_some_and(unknown) || end.is_none_or(|end| end > FIRST_BLOCK)
+                }
+                (None, None) => true,
+            };
+        }
+        if !may_alias(w.base, w.off, w.len, base, d, n, self.pointer_named) {
+            return false;
+        }
+        let write_end = match w.base {
+            None => w.len.map(|l| w.off.saturating_add(l)),
+            Some(_) => {
+                let reach = w.most.zip(w.len);
+                reach.map(|(m, l)| w.off.saturating_add(m).saturating_add(l))
+            }
+        };
+        let read_end = match base {
+            None => Some(d.saturating_add(n)),
+            Some(b) => self.most(b).map(|m| d.saturating_add(m).saturating_add(n)),
+        };
+        !(write_end.is_some_and(|end| end <= d) || read_end.is_some_and(|end| end <= w.off))
+    }
+
+    fn at_most_answer(&self, value: ExprId, stamp: u32) -> bool {
+        let tested = |c: U256| {
+            let reached = |(at, len): &(u32, u64)| *at == stamp && U256::from(*len) >= c;
+            self.sized.iter().any(reached)
+        };
+        answer_stamp(value) == Some(stamp)
+            || self.capped.contains(&(value, stamp))
+            || expr::as_const(value).is_some_and(tested)
+    }
+
+    fn whole_word(&self, off: ExprId) -> Option<ExprId> {
+        let word = self.load_bytes(off, 32, 0)?;
+        let again = |n: &Node| matches!(n, Node::MLoad(at, _) if *at == off);
+        (!expr::contains(word, &again)).then_some(word)
+    }
+
+    /* A word of the head that is a multiple of 32 past it may point at a part of dynamic
+    length or may be a number. It is taken for a pointer only when a length stands there,
+    the bytes that follow it are known, and the parts end where the next one starts or
+    where the call data ends. Anything else leaves the call as the writes that built it. */
+    fn call_args(&self, in_off: ExprId, in_len: ExprId) -> Option<(Vec<Arg>, Vec<Origin>)> {
+        let at = |k: u64| expr::add_const(in_off, U256::from(4 + k));
+        let offset = |w: ExprId, past: u64| {
+            let c = expr::as_const(w).filter(|c| c.fits_u64())?.low_u64();
+            (c.is_multiple_of(32) && c > past && c <= 32 * 64).then_some(c)
+        };
+        let mut head: Vec<ExprId> = Vec::new();
+        let mut ends: Option<u64> = None;
+        while ends != Some(32 * head.len() as u64) {
+            let k = 32 * head.len() as u64;
+            let word = self.whole_word(at(k)).filter(|_| head.len() < 64)?;
+            if let Some(c) = offset(word, k) {
+                ends = Some(ends.map_or(c, |e| e.min(c)));
+            }
+            head.push(word);
+        }
+        let head_end = ends?;
+        let mut tails: Vec<(usize, u64)> = (0..head.len())
+            .filter_map(|i| Some((i, offset(head[i], head_end - 32)?)))
+            .collect();
+        tails.sort_by_key(|(_, start)| *start);
+        let mut args: Vec<Arg> = head.iter().map(|w| Arg::Word(*w)).collect();
+        let mut built = self.consumers(in_off, 4 + head_end);
+        for (which, (i, start)) in tails.iter().enumerate() {
+            let next = tails.get(which + 1).map(|(_, s)| *s);
+            let len = self.whole_word(at(*start))?;
+            built.extend(self.consumers(at(*start), 32));
+            let data = start + 32;
+            let fixed = expr::as_const(len).filter(|c| c.fits_u64());
+            let Some(count) = fixed.map(|c| c.low_u64()).filter(|c| *c <= 4096) else {
+                // After a part of a length the code works out none has a fixed place.
+                if next.is_some() {
+                    return None;
+                }
+                let (parts, made) = self.copied_parts(in_off, in_len, &head, (*i, *start, len))?;
+                built.extend(made);
+                for (at, part) in parts {
+                    args[at] = part;
+                }
+                continue;
+            };
+            let words = |n: u64| -> Option<Vec<ExprId>> {
+                (0..n).map(|j| self.whole_word(at(data + 32 * j))).collect()
+            };
+            let last = |end: u64| match next {
+                Some(start) => start == end,
+                None => expr::as_const(in_len) == Some(U256::from(4 + end)),
+            };
+            let as_bytes = data + 32 * count.div_ceil(32);
+            let as_list = data + 32 * count;
+            let part = if last(as_bytes) && (count > 32 || !last(as_list)) {
+                Arg::Bytes(count, words(count.div_ceil(32))?)
+            } else if last(as_list) {
+                let words = words(count)?;
+                let text = |w: &ExprId| {
+                    expr::as_const(*w).is_some_and(|c| (c & expr::mask_bits(248)).is_zero())
+                };
+                match count <= 1 && words.iter().all(text) {
+                    true => Arg::Bytes(count, words),
+                    false => Arg::List(words),
+                }
+            } else {
+                return None;
+            };
+            let end = match part {
+                Arg::Bytes(..) => as_bytes,
+                _ => as_list,
+            };
+            built.extend(self.consumers(at(data), end - data));
+            args[*i] = part;
+        }
+        Some((args, built))
+    }
+
+    fn held_length(&self, len: ExprId) -> Option<u64> {
+        let Node::MLoad(at, _) = expr::node(len) else {
+            return None;
+        };
+        let held = self.whole_word(at).and_then(expr::as_const)?;
+        Some(held.low_u64()).filter(|c| held.fits_u64() && *c <= 4096)
+    }
+
+    fn bytes_now(&self, kind: u8, src: ExprId, len: ExprId) -> Option<Arg> {
+        let count = self.held_length(len)?;
+        let word = |j: u64| self.whole_word(expr::add_const(src, U256::from(32 * j)));
+        let words: Option<Vec<ExprId>> = (0..count.div_ceil(32)).map(word).collect();
+        (kind == op::MCOPY).then_some(Arg::Bytes(count, words?))
+    }
+
+    fn copied_part(&self, data: ExprId, len: ExprId) -> Option<(&MemWrite, Option<Origin>)> {
+        let (base, d) = norm_offset(data);
+        let start = summed(data);
+        let ends = [len, round_up(len)].map(|l| summed(op2(op::ADD, data, l)));
+        let copied = |w: &MemWrite| place(w) == start && matches!(w.val, MVal::Copy(..));
+        let at = self.writes.iter().rposition(copied)?;
+        let copy = &self.writes[at];
+        if !copy.span.is_some_and(|s| s == len || s == round_up(len)) {
+            return None;
+        }
+        let mut padding = None;
+        for later in &self.writes[at + 1..] {
+            let zero = later.val == MVal::Word(konst(U256::ZERO));
+            let reach = u64::MAX / 4;
+            let over = match later.base == base {
+                true => later.len.is_none_or(|l| later.off + l > d),
+                false => self.reaches(later, base, d, reach),
+            };
+            /* An address is a sum of terms that are never negative. A store that many
+            bytes below where the copy starts, or at or past where it ends, left the
+            copied bytes alone, whatever the terms are. */
+            let at = place(later);
+            let below = later.len.zip(ahead(&start, &at));
+            let apart = below.is_some_and(|(l, gap)| gap >= l)
+                || ends.iter().any(|end| ahead(&at, end).is_some());
+            if ends.contains(&at) && zero {
+                padding = later.origin;
+            } else if over && !apart {
+                return None;
+            }
+        }
+        Some((copy, padding))
+    }
+
+    fn word_at(&self, addr: ExprId) -> Option<(ExprId, Option<Origin>)> {
+        let wanted = summed(addr);
+        let at = self.writes.iter().rposition(|w| place(w) == wanted)?;
+        let (MVal::Word(word), Some(32)) = (&self.writes[at].val, self.writes[at].len) else {
+            return None;
+        };
+        let clear = |later: &MemWrite| {
+            let at = place(later);
+            let below = later.len.zip(ahead(&wanted, &at));
+            below.is_some_and(|(l, gap)| gap >= l)
+                || ahead(&at, &wanted).is_some_and(|gap| gap >= 32)
+        };
+        let kept = self.writes[at + 1..].iter().all(clear) && self.current(*word);
+        kept.then_some((*word, self.writes[at].origin))
+    }
+
+    /* Parts of a length the code works out have no fixed place. Each starts where the one
+    before it ends, and a word of the head says so. The last ends where the call data
+    does. */
+    fn copied_parts(
+        &self,
+        in_off: ExprId,
+        in_len: ExprId,
+        head: &[ExprId],
+        first: (usize, u64, ExprId),
+    ) -> Option<(Parts, Vec<Origin>)> {
+        let at = |from_head: ExprId| {
+            op2(
+                op::ADD,
+                expr::add_const(in_off, U256::from(4u64)),
+                from_head,
+            )
+        };
+        let (mut index, start, mut len) = first;
+        let mut start = konst_u64(start);
+        let mut parts: Parts = Vec::new();
+        let mut built: Vec<Origin> = Vec::new();
+        while parts.len() < head.len() {
+            let data = expr::add_const(start, U256::from(32u64));
+            let (copy, padding) = self.copied_part(at(data), len)?;
+            let MVal::Copy(kind, src, None) = copy.val else {
+                return None;
+            };
+            // Where the length is known, a store past the bytes copied did not change them.
+            let copied = self.held_length(len).unwrap_or(u64::MAX / 4);
+            if kind == op::MCOPY && self.written_since(src, copied, copy.gen) {
+                return None;
+            }
+            built.extend(copy.origin);
+            built.extend(padding);
+            let known = self.bytes_now(kind, src, len);
+            parts.push((index, known.unwrap_or(Arg::Copied { kind, src, len })));
+            let ends = [len, round_up(len)].map(|l| op2(op::ADD, data, l));
+            let whole =
+                |end: &ExprId| summed(expr::add_const(*end, U256::from(4u64))) == summed(in_len);
+            if ends.iter().any(whole) {
+                return Some((parts, built));
+            }
+            let taken = |j: &usize| parts.iter().any(|(i, _)| i == j);
+            let next = (0..head.len())
+                .filter(|j| !taken(j) && !expr::is_const(head[*j]))
+                .find_map(|j| {
+                    Some((
+                        j,
+                        *ends.iter().find(|end| summed(**end) == summed(head[j]))?,
+                    ))
+                })?;
+            let (word, origin) = self.word_at(at(next.1))?;
+            built.extend(origin);
+            (index, start, len) = (next.0, next.1, word);
+        }
+        None
     }
 
     fn store(&mut self, off: ExprId, len: Option<u64>, val: MVal) {
@@ -708,6 +1180,7 @@ impl Mem {
             self.writes.drain(..64);
             self.fresh = false;
             self.clobber_gen = self.gen + 1;
+            self.wiped = self.clobber_gen;
         }
         self.writes.push(MemWrite {
             base,
@@ -716,7 +1189,16 @@ impl Mem {
             val,
             origin,
             gen: self.gen + 1,
+            span: None,
+            most: base.and_then(|b| self.most(b)),
         });
+    }
+
+    fn store_copy(&mut self, dest: ExprId, len: ExprId, val: MVal, origin: Option<(usize, usize)>) {
+        self.store_from(dest, const_len(len), val, origin);
+        if let Some(copy) = self.writes.last_mut() {
+            copy.span = Some(len);
+        }
     }
 
     fn consumers(&self, off: ExprId, n: u64) -> Vec<(usize, usize)> {
@@ -726,8 +1208,14 @@ impl Mem {
             if w.base != base {
                 continue;
             }
-            let Some(wl) = w.len else { break };
-            if w.off < d + n && d < w.off + wl {
+            let Some(wl) = w.len else {
+                match w.off >= d + n {
+                    true => continue,
+                    false => break,
+                }
+            };
+            // A copy stays a statement unless the call it was made for prints it.
+            if w.off < d + n && d < w.off + wl && !matches!(w.val, MVal::Copy(..)) {
                 if let Some(o) = w.origin {
                     out.push(o);
                 }
@@ -742,9 +1230,18 @@ impl Mem {
         self.fresh = false;
         self.gen += 1;
         self.clobber_gen = self.gen;
+        /* A helper of code that allocates is taken to leave alone what its caller read
+        through a pointer, as a value its caller kept on the stack is. */
+        if !self.pointer_named {
+            self.wiped = self.gen;
+        }
     }
 
-    fn load_bytes(&self, off: ExprId, n: u64, version: u32) -> Option<ExprId> {
+    fn load_bytes(&self, off: ExprId, n: u64, _version: u32) -> Option<ExprId> {
+        self.stored_bytes(off, n).filter(|v| self.current(*v))
+    }
+
+    fn stored_bytes(&self, off: ExprId, n: u64) -> Option<ExprId> {
         let (base, d) = norm_offset(off);
         let mut pieces: Vec<Option<(ExprId, u64)>> = vec![None; n as usize];
         let mut copy_hit: Option<(u8, ExprId, Option<ExprId>, u64, u32)> = None;
@@ -754,10 +1251,7 @@ impl Mem {
                 break;
             }
             if w.base != base {
-                // One run cannot tell where an input-sized offset lands.
-                // It is taken to miss a fixed address and the re-run catches a wrong guess.
-                let guessed = self.single_run && base.is_none() && w.base.is_some();
-                if !guessed && may_alias(w.base, w.off, w.len, base, d, n) {
+                if self.reaches(w, base, d, n) {
                     return None;
                 }
                 continue;
@@ -766,15 +1260,19 @@ impl Mem {
                 if d + n <= w.off {
                     continue;
                 }
-                // A read past the copied length is a wrong guess here.
-                // Every answer built on it is run again on the bytecode.
-                if let (true, 0, MVal::Copy(k, src, addr)) = (self.single_run, covered, &w.val) {
-                    if d >= w.off {
-                        copy_hit = Some((*k, *src, *addr, d - w.off, w.gen));
-                        break;
+                if w.off <= d {
+                    return None;
+                }
+                /* A write of a length the code works out starts inside the bytes read.
+                From there on they are not known. The bytes before it still are. */
+                for b in w.off..d + n {
+                    let i = (b - d) as usize;
+                    if pieces[i].is_none() {
+                        pieces[i] = Some((konst(U256::ZERO), NOT_KNOWN));
+                        covered += 1;
                     }
                 }
-                return None;
+                continue;
             };
             let lo = w.off.max(d);
             let hi = (w.off + wl).min(d + n);
@@ -787,6 +1285,15 @@ impl Mem {
                         let i = (b - d) as usize;
                         if pieces[i].is_none() {
                             pieces[i] = Some((*v, b - w.off));
+                            covered += 1;
+                        }
+                    }
+                }
+                MVal::Zero => {
+                    for b in lo..hi {
+                        let i = (b - d) as usize;
+                        if pieces[i].is_none() {
+                            pieces[i] = Some((konst(U256::ZERO), b - d));
                             covered += 1;
                         }
                     }
@@ -806,8 +1313,13 @@ impl Mem {
                     }
                     return None;
                 }
-                MVal::CallOut(seq) => {
-                    if lo == d && hi == d + n && covered == 0 {
+                /* A call writes no more than it was answered with. Past the end of a short
+                answer the word keeps what it held, so it is the answer only where the
+                code tested the answer to be long enough. */
+                MVal::CallOut(seq, stamp) => {
+                    let reached = |(at, len): &(u32, u64)| at == stamp && *len >= hi - w.off;
+                    let whole = self.sized.iter().any(reached);
+                    if lo == d && hi == d + n && covered == 0 && whole {
                         let seq = *seq;
                         let word = expr::intern(Node::ReturnData(seq, konst_u64(d - w.off)));
                         return Some(if n == 32 {
@@ -821,7 +1333,6 @@ impl Mem {
                 MVal::Unknown => return None,
             }
         }
-        let _ = version;
         if let Some((k, src, addr, delta, wgen)) = copy_hit {
             let at = expr::add_const(src, U256::from(delta));
             let answered = addr
@@ -838,8 +1349,15 @@ impl Mem {
             });
         }
         let mut unknown_mask = U256::ZERO;
+        let cut = pieces.iter().flatten().any(|(_, at)| *at == NOT_KNOWN);
+        for piece in pieces.iter_mut() {
+            if piece.is_some_and(|(_, at)| at == NOT_KNOWN) {
+                *piece = None;
+                covered -= 1;
+            }
+        }
         if covered < n as usize {
-            let zero_ok = self.fresh && !base.is_some_and(wild_base);
+            let zero_ok = self.fresh && !base.is_some_and(wild_base) && !cut;
             if !zero_ok {
                 if covered == 0 {
                     return None;
@@ -917,6 +1435,33 @@ impl Mem {
         ))
     }
 
+    fn free_pointer_now(&self) -> ExprId {
+        let at = konst_u64(FREE_POINTER);
+        self.load_bytes(at, 32, 0)
+            .unwrap_or_else(|| expr::intern(Node::MLoad(at, self.version_for(at, 32))))
+    }
+
+    /* The free pointer is read far more often than it is written. Where its value is
+    known to be the one it had, saying so keeps one name for one buffer. This is not a
+    write the code makes, so it is not counted as one. */
+    fn keep_free_pointer(&mut self, value: ExprId) {
+        if self.free_pointer_now() == value {
+            return;
+        }
+        self.writes
+            .retain(|w| !(w.base.is_none() && w.off == FREE_POINTER && w.len == Some(32)));
+        self.writes.push(MemWrite {
+            base: None,
+            off: FREE_POINTER,
+            len: Some(32),
+            val: MVal::Word(value),
+            origin: None,
+            gen: self.gen,
+            span: None,
+            most: None,
+        });
+    }
+
     fn load_word(&self, off: ExprId, version: u32) -> ExprId {
         match self.load_bytes(off, 32, version) {
             Some(v) => v,
@@ -948,6 +1493,66 @@ impl Mem {
         Some((words, tail))
     }
 
+    /* Words read at every 32 bytes cut across writes that do not start on those bounds.
+    Following the writes gives each stored value whole. A region made of whole words
+    gives nothing, because the words already say it. */
+    fn read_pieces(&self, off: ExprId, len: u64) -> Option<Vec<(ExprId, u8)>> {
+        if len > 8192 {
+            return None;
+        }
+        let (base, d) = norm_offset(off);
+        let mut bytes: Vec<Option<(ExprId, u64)>> = vec![None; len as usize];
+        let mut missing = bytes.len();
+        for w in self.writes.iter().rev() {
+            if missing == 0 {
+                break;
+            }
+            if w.base != base {
+                if self.reaches(w, base, d, len) {
+                    return None;
+                }
+                continue;
+            }
+            let end = w.off.saturating_add(w.len.unwrap_or(u64::MAX));
+            let open =
+                (w.off.max(d)..end.min(d + len)).filter(|b| bytes[(b - d) as usize].is_none());
+            let open: Vec<u64> = open.collect();
+            let stored = match (&w.val, w.len) {
+                (MVal::Word(v), Some(32)) => *v,
+                (MVal::Byte(v), Some(1)) => op2(op::SHL, konst_u64(248), *v),
+                (MVal::Zero, Some(_)) => konst(U256::ZERO),
+                _ if open.is_empty() => continue,
+                _ => return None,
+            };
+            // Zeros have no word of their own, so they are cut where the words read are.
+            let within = |b: u64| match w.val {
+                MVal::Zero => (b - d) % 32,
+                _ => b - w.off,
+            };
+            for b in open {
+                bytes[(b - d) as usize] = Some((stored, within(b)));
+                missing -= 1;
+            }
+        }
+        let bytes: Vec<(ExprId, u64)> = bytes.into_iter().collect::<Option<_>>()?;
+        let mut pieces = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let (v, first) = bytes[at];
+            let run = bytes[at..]
+                .iter()
+                .zip(first..)
+                .take_while(|((v2, i2), i)| *v2 == v && i2 == i)
+                .count();
+            let low = op2(op::SHR, konst_u64(8 * (32 - first - run as u64)), v);
+            let part = op2(op::AND, low, konst(expr::mask_bits(8 * run as u32)));
+            pieces.push((part, run as u8));
+            at += run;
+        }
+        let whole = pieces.iter().all(|(_, width)| *width == 32);
+        (!whole && pieces.iter().all(|(part, _)| self.current(*part))).then_some(pieces)
+    }
+
     fn read_region_lossy(&self, off: ExprId, len: u64, version: u32) -> Option<Vec<ExprId>> {
         if len == 0 || !len.is_multiple_of(32) || len > 8 * 32 {
             return None;
@@ -970,15 +1575,25 @@ impl Mem {
         self.fresh = false;
         self.gen = merged_version(self.gen, self.gen, stable);
         self.clobber_gen = self.gen;
+        self.wiped = self.gen;
     }
 
     fn intersect(&mut self, other: &Mem, stable: u32) -> bool {
         let fresh_before = self.fresh;
         let gen_before = self.gen;
         let same = |a: &MemWrite, b: &MemWrite| {
-            a.base == b.base && a.off == b.off && a.len == b.len && a.val == b.val
+            a.base == b.base
+                && a.off == b.off
+                && a.len == b.len
+                && a.val == b.val
+                && a.span == b.span
+                && a.most == b.most
         };
         let identical = self.gen == other.gen
+            && self.wiped == other.wiped
+            && self.sized == other.sized
+            && self.capped == other.capped
+            && self.below == other.below
             && self.clobber_gen == other.clobber_gen
             && self.fresh == other.fresh
             && self.written == other.written
@@ -991,6 +1606,8 @@ impl Mem {
         if identical {
             return false;
         }
+        let pointer = self.free_pointer_now();
+        let pointer = (pointer == other.free_pointer_now()).then_some(pointer);
         type Place = (Option<ExprId>, u64, Option<u64>);
         let place = |w: &MemWrite| -> Place { (w.base, w.off, w.len) };
         let by_place = |writes: &[MemWrite]| {
@@ -1045,30 +1662,59 @@ impl Mem {
                 merged[i].origin = None;
             }
         }
+        /* A write only the other side made goes where that side made it, counted by the
+        writes both sides share. At the end of the list it would hide a shared write that
+        came after it, from a read of bytes it may or may not have reached. */
+        let ordered = kept.windows(2).all(|pair| pair[0].1 < pair[1].1);
         let mut placed: HashSet<Place> = mine.keys().copied().collect();
-        for o in &other.writes {
+        let mut ahead: HashMap<usize, Vec<MemWrite>> = HashMap::new();
+        let mut last: Vec<MemWrite> = Vec::new();
+        for (theirs_at, o) in other.writes.iter().enumerate() {
             let (agrees, _) = at(&mine, &self.writes, o);
             if !agrees && placed.insert(place(o)) {
-                merged.push(MemWrite {
+                let unknown = MemWrite {
                     val: MVal::Unknown,
                     origin: None,
                     ..o.clone()
-                });
+                };
+                let next = kept.iter().find(|(_, shared)| *shared > theirs_at);
+                match next.filter(|_| ordered) {
+                    Some((at, _)) => ahead.entry(*at).or_default().push(unknown),
+                    None => last.push(unknown),
+                }
             }
         }
+        if !ahead.is_empty() {
+            let mut all = Vec::with_capacity(merged.len() + last.len());
+            for (i, w) in merged.into_iter().enumerate() {
+                all.extend(ahead.remove(&i).unwrap_or_default());
+                all.push(w);
+            }
+            merged = all;
+        }
+        merged.extend(last);
         let overflow = merged.len().saturating_sub(MAX_TRACKED_WRITES);
         merged.drain(..overflow);
-        let changed_writes = merged.len() != self.writes.len()
-            || merged
-                .iter()
-                .zip(self.writes.iter())
-                .any(|(a, b)| !(same(a, b)));
-        self.writes = merged;
+        let before = std::mem::replace(&mut self.writes, merged);
         let written_before = self.written.len();
         self.written.retain(|r| other.written.contains(r));
-        let changed_writes = changed_writes || self.written.len() != written_before;
         self.fresh &= other.fresh && overflow == 0;
-        if overflow > 0 || other.gen != self.gen || other.clobber_gen != self.clobber_gen {
+        let wiped_before = self.wiped;
+        let sized_before = self.sized.len();
+        let tested = |(at, len): &(u32, u64)| {
+            let theirs = other.sized.iter().filter(|(a, _)| a == at).map(|(_, l)| *l);
+            theirs.max().map(|l| (*at, l.min(*len)))
+        };
+        self.sized = self.sized.iter().filter_map(tested).collect();
+        self.capped.retain(|c| other.capped.contains(c));
+        let bounds_before = self.below.len();
+        let bounded = |(e, n): &(ExprId, u64)| {
+            let theirs = other.below.iter().filter(|(x, _)| x == e).map(|(_, m)| *m);
+            theirs.min().map(|m| (*e, m.max(*n)))
+        };
+        self.below = self.below.iter().filter_map(bounded).collect();
+        let lost = overflow > 0 || other.wiped != self.wiped;
+        if lost || other.gen != self.gen || other.clobber_gen != self.clobber_gen {
             self.gen = merged_version(self.gen, other.gen, stable);
             self.clobber_gen = self.gen;
             // A write that is unknown after the merge is unknown as of the merge.
@@ -1078,8 +1724,85 @@ impl Mem {
                     w.gen = w.gen.min(self.gen);
                 }
             }
+            /* The two sides count apart, so a version one of them lost its writes at
+            says nothing about the other. */
+            if lost {
+                self.wiped = self.gen;
+            }
         }
-        changed_writes || fresh_before != self.fresh || gen_before != self.gen
+        if let Some(pointer) = pointer {
+            self.keep_free_pointer(pointer);
+        }
+        let changed_writes = before.len() != self.writes.len()
+            || before.iter().zip(&self.writes).any(|(a, b)| !same(a, b))
+            || self.written.len() != written_before;
+        changed_writes
+            || fresh_before != self.fresh
+            || gen_before != self.gen
+            || wiped_before != self.wiped
+            || sized_before != self.sized.len()
+            || bounds_before != self.below.len()
+    }
+}
+
+fn tested_below(cond: ExprId, holds: bool) -> Option<(ExprId, u64)> {
+    let fixed = |e: ExprId| {
+        expr::as_const(e)
+            .filter(|c| c.fits_u64() && c.low_u64() < 1 << 32)
+            .map(|c| c.low_u64())
+    };
+    let Node::Op(o, v) = expr::node(cond) else {
+        return None;
+    };
+    let (value, below) = match (o, holds) {
+        (op::ISZERO, _) => return tested_below(v[0], !holds),
+        (op::LT, true) => (v[0], fixed(v[1])?),
+        (op::GT, true) => (v[1], fixed(v[0])?),
+        (op::LT, false) => (v[1], fixed(v[0])? + 1),
+        (op::GT, false) => (v[0], fixed(v[1])? + 1),
+        (op::EQ, true) => match (fixed(v[0]), fixed(v[1])) {
+            (Some(c), None) => (v[1], c + 1),
+            (None, Some(c)) => (v[0], c + 1),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (below > 0 && !expr::is_const(value)).then_some((value, below))
+}
+
+fn answer_stamp(e: ExprId) -> Option<u32> {
+    match expr::node(e) {
+        Node::Env(op::RETURNDATASIZE, stamp) => Some(stamp),
+        _ => None,
+    }
+}
+
+fn answer_length(cond: ExprId, holds: bool, capped: &[(ExprId, u32)]) -> Option<(u32, u64)> {
+    let cap = |e: ExprId| capped.iter().find(|(v, _)| *v == e).map(|(_, at)| *at);
+    let size = |e: ExprId| answer_stamp(e).or_else(|| cap(e));
+    let fixed = |e: ExprId| {
+        expr::as_const(e)
+            .filter(|c| c.fits_u64())
+            .map(|c| c.low_u64())
+    };
+    let Node::Op(o, v) = expr::node(cond) else {
+        return None;
+    };
+    match (o, holds) {
+        (op::ISZERO, _) => answer_length(v[0], !holds, capped),
+        (op::LT | op::SLT, false) | (op::GT | op::SGT, true) => {
+            let least = fixed(v[1])?.checked_add(u64::from(holds))?;
+            Some((size(v[0])?, least))
+        }
+        (op::LT | op::SLT, true) | (op::GT | op::SGT, false) => {
+            let least = fixed(v[0])?.checked_add(u64::from(holds))?;
+            Some((size(v[1])?, least))
+        }
+        (op::EQ, true) => {
+            let at = size(v[0]).or(size(v[1]))?;
+            Some((at, fixed(v[0]).or(fixed(v[1]))?))
+        }
+        _ => None,
     }
 }
 
@@ -1093,10 +1816,22 @@ pub struct State {
     sgen: u32,
     called: bool,
     returned: u32,
-    answered: Option<u32>,
 }
 
 impl State {
+    fn learn(&mut self, cond: ExprId, holds: bool) {
+        if let Some((at, len)) = answer_length(cond, holds, &self.mem.capped) {
+            if !self.mem.sized.contains(&(at, len)) {
+                self.mem.sized.push((at, len));
+            }
+        }
+        if let Some(bound) = tested_below(cond, holds) {
+            if !self.mem.below.contains(&bound) && self.mem.below.len() < 64 {
+                self.mem.below.push(bound);
+            }
+        }
+    }
+
     fn pop(&mut self) -> ExprId {
         match self.stack.pop() {
             Some(v) => v,
@@ -1123,6 +1858,9 @@ pub struct Lifter<'a> {
     pub root: bool,
     pub summaries: HashMap<usize, CalleeSummary>,
     pub footprints: HashMap<usize, MemoryWrites>,
+    pub pointer_keepers: HashSet<usize>,
+    pub memory_readers: HashSet<usize>,
+    pub free_pointer: bool,
     pub oracle: bool,
     pub copy_loops: RefCell<HashMap<(usize, usize), CopyLoop>>,
 }
@@ -1149,8 +1887,12 @@ pub struct CalleeSummary {
     pub side_effects: bool,
     pub reverts: Option<(ExprId, ExprId, Option<Vec<ExprId>>)>,
     pub guards: Vec<(ExprId, Option<Vec<ExprId>>, bool)>,
+    pub stores_and_copies_before: Vec<(usize, usize)>,
     pub copies: Vec<(ExprId, ExprId, ExprId)>,
     pub maybe_mstores: Vec<ExprId>,
+    pub hashes: Vec<(ExprId, usize, usize)>,
+    pub stores_before_copy: Vec<usize>,
+    pub store_gens: Vec<u32>,
 }
 
 pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
@@ -1168,8 +1910,11 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                     off,
                     val,
                     width: 32,
-                    ..
-                } => sum.mstores.push((*off, *val)),
+                    gen,
+                } => {
+                    sum.mstores.push((*off, *val));
+                    sum.store_gens.push(*gen);
+                }
                 Stmt::MStore { .. } => return None,
                 Stmt::Copy {
                     kind: op::MCOPY,
@@ -1177,7 +1922,10 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                     src,
                     len,
                     ..
-                } => sum.copies.push((*dest, *src, *len)),
+                } => {
+                    sum.stores_before_copy.push(sum.mstores.len());
+                    sum.copies.push((*dest, *src, *len));
+                }
                 Stmt::Copy { .. }
                 | Stmt::Internal { .. }
                 | Stmt::Call { .. }
@@ -1187,7 +1935,14 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                     cond,
                     data,
                     invalid,
-                } => sum.guards.push((*cond, data.clone(), *invalid)),
+                } => {
+                    sum.stores_and_copies_before
+                        .push((sum.mstores.len(), sum.copies.len()));
+                    sum.guards.push((*cond, data.clone(), *invalid));
+                }
+                Stmt::Drop(e) if matches!(expr::node(*e), Node::KeccakMem(..)) => {
+                    sum.hashes.push((*e, sum.mstores.len(), sum.copies.len()));
+                }
                 Stmt::Assign { .. } | Stmt::Drop(_) => {}
             }
         }
@@ -1325,15 +2080,21 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                 match t {
                     Some(t) if rev(*t) && !rev(*f) => {
                         let (d, inv) = payload(*t);
+                        sum.stores_and_copies_before
+                            .push((sum.mstores.len(), sum.copies.len()));
                         sum.guards.push((op1(op::ISZERO, *cond), d, inv));
                         n = *f;
                     }
                     Some(t) if rev(*f) && !rev(*t) => {
                         let (d, inv) = payload(*f);
+                        sum.stores_and_copies_before
+                            .push((sum.mstores.len(), sum.copies.len()));
                         sum.guards.push((*cond, d, inv));
                         n = *t;
                     }
                     None => {
+                        sum.stores_and_copies_before
+                            .push((sum.mstores.len(), sum.copies.len()));
                         sum.guards.push((op1(op::ISZERO, *cond), None, true));
                         n = *f;
                     }
@@ -1409,13 +2170,12 @@ impl<'a> Lifter<'a> {
         let state = State {
             stack: init_stack,
             args_used: 0,
-            mem: Mem::new(fresh),
+            mem: Mem::new(fresh, self.free_pointer),
             storage: Vec::new(),
             version: 0,
             sgen: 0,
             called: !fresh,
             returned: 0,
-            answered: None,
         };
         self.lift_from(unit, state)
     }
@@ -1448,50 +2208,6 @@ impl<'a> Lifter<'a> {
         self.lift_from(unit, init)
     }
 
-    pub fn lift_trace(&self, blocks: &[usize]) -> Vec<LNode> {
-        let unit = Unit {
-            entry_block: blocks.first().copied().unwrap_or(0),
-            nodes: blocks
-                .iter()
-                .enumerate()
-                .map(|(id, block)| UNode {
-                    id,
-                    block: *block,
-                    entry: AState::new(),
-                    succs: vec![],
-                    preds: vec![],
-                    call: None,
-                    returns_via: None,
-                    unresolved: true,
-                    infeasible: false,
-                    computed_cut: false,
-                })
-                .collect(),
-            entry: 0,
-            budget_exhausted: false,
-        };
-        let mut state = State {
-            stack: Vec::new(),
-            args_used: 0,
-            mem: Mem::new(true),
-            storage: Vec::new(),
-            version: 0,
-            sgen: 0,
-            called: false,
-            returned: 0,
-            answered: None,
-        };
-        state.mem.single_run = true;
-        let hidden = Hidden::default();
-        let mut out = Vec::with_capacity(blocks.len());
-        for id in 0..blocks.len() {
-            let (node, next) = self.run_node(&unit, id, &state, &hidden);
-            state = next;
-            out.push(node);
-        }
-        out
-    }
-
     pub fn entry_state_of(l: &Lifted, unit_node: usize) -> Option<State> {
         l.entry_states.get(unit_node).cloned().flatten()
     }
@@ -1517,6 +2233,7 @@ impl<'a> Lifter<'a> {
             ..Hidden::default()
         };
         let init_len = init.stack.len();
+        let (init_stack, init_args) = (init.stack.clone(), init.args_used);
         entries[unit.entry] = Some(Entry {
             state: init,
             phis: vec![false; init_len],
@@ -1565,9 +2282,9 @@ impl<'a> Lifter<'a> {
             for s in lnode.succs.clone() {
                 if let Some(cl) = loops.get(&(unit.entry_block, s)) {
                     if nid != cl.body && nid != cl.latch {
-                        if let Some((stmt, after)) =
-                            self.summarize_copy_loop(unit, cl, &exit, &hidden)
-                        {
+                        let placed = Some((nid, lnode.stmts.len()));
+                        let summary = self.summarize_copy_loop(unit, cl, &exit, &hidden, placed);
+                        if let Some((stmt, after)) = summary {
                             lnode.stmts.push(stmt);
                             redirect.push((s, cl.exit));
                             succ_state.insert(cl.exit, after);
@@ -1582,12 +2299,22 @@ impl<'a> Lifter<'a> {
                 lnode.term = remap_term(&lnode.term, &m);
             }
             let succs: Vec<usize> = lnode.succs.clone();
+            let tested = match &lnode.term {
+                Term::Branch { cond, t, f } if *t != Some(*f) => Some((*cond, *t, *f)),
+                _ => None,
+            };
             lnodes[nid] = Some(lnode);
             exit_states[nid] = Some(exit.clone());
             let exit_all = exit;
             for s in succs {
-                let exit = succ_state.get(&s).unwrap_or(&exit_all).clone();
-                let single_pred = unit.nodes[s].preds.len() <= 1;
+                let mut exit = succ_state.get(&s).unwrap_or(&exit_all).clone();
+                if let Some((cond, t, f)) = tested {
+                    if t == Some(s) || f == s {
+                        exit.learn(cond, t == Some(s));
+                    }
+                }
+                // The entry is also reached from the caller.
+                let single_pred = unit.nodes[s].preds.len() <= 1 && s != unit.entry;
                 let changed = match &mut entries[s] {
                     None => {
                         entries[s] = Some(Entry {
@@ -1602,7 +2329,6 @@ impl<'a> Lifter<'a> {
                                 sgen: exit.sgen,
                                 called: exit.called,
                                 returned: exit.returned,
-                                answered: exit.answered,
                             },
                         });
                         true
@@ -1617,12 +2343,15 @@ impl<'a> Lifter<'a> {
                             sgen: exit.sgen,
                             called: exit.called,
                             returned: exit.returned,
-                            answered: exit.answered,
                         };
                         let changed = e.state.stack != new_state.stack
                             || e.state.mem.writes != new_state.mem.writes
                             || e.state.mem.fresh != new_state.mem.fresh
                             || e.state.mem.gen != new_state.mem.gen
+                            || e.state.mem.wiped != new_state.mem.wiped
+                            || e.state.mem.sized != new_state.mem.sized
+                            || e.state.mem.capped != new_state.mem.capped
+                            || e.state.mem.below != new_state.mem.below
                             || e.state.storage != new_state.storage
                             || e.state.sgen != new_state.sgen
                             || e.state.returned != new_state.returned;
@@ -1648,7 +2377,7 @@ impl<'a> Lifter<'a> {
             }
         }
 
-        let hidden_set = without_still_read(&lnodes, hidden.all());
+        let hidden_set = without_still_read(&lnodes, hidden.all(), &self.memory_readers);
         let mut nodes: Vec<LNode> = Vec::new();
         let mut map: HashMap<usize, usize> = HashMap::new();
         for (i, ln) in lnodes.iter().enumerate() {
@@ -1663,7 +2392,9 @@ impl<'a> Lifter<'a> {
                     let mut idx = 0usize;
                     ln.stmts.retain(|s| {
                         let keep = match s {
-                            Stmt::MStore { .. } => !hidden_set.contains(&(i, idx)),
+                            Stmt::MStore { .. } | Stmt::Copy { .. } => {
+                                !hidden_set.contains(&(i, idx))
+                            }
                             _ => true,
                         };
                         idx += 1;
@@ -1682,6 +2413,28 @@ impl<'a> Lifter<'a> {
                 .collect();
             nd.term = remap_term(&nd.term, &map);
         }
+        /* Below its own values a helper finds what its caller pushed. The main unit starts
+        on an empty stack. A place past every argument the helper takes is only reached
+        where a loop leaves the stack uneven. */
+        let reaching = |entry: &Entry, stack: &[ExprId], args_used: usize| {
+            let (el, xl) = (entry.state.stack.len(), stack.len());
+            let mut assigns = Vec::new();
+            for (k, var) in entry.state.stack.iter().enumerate() {
+                let from_top = el - 1 - k;
+                let below = args_used + from_top.saturating_sub(xl);
+                let val = if from_top < xl {
+                    stack[xl - 1 - from_top]
+                } else if !self.root && below < max_args {
+                    expr::arg(below as u32)
+                } else {
+                    expr::intern(Node::Unknown(expr::next_seq()))
+                };
+                if entry.phis[k] && val != *var {
+                    assigns.push((*var, val));
+                }
+            }
+            assigns
+        };
         let mut edge_assigns: HashMap<(usize, usize), Vec<(ExprId, ExprId)>> = HashMap::new();
         for (i, ln) in lnodes.iter().enumerate() {
             let Some(ln) = ln else { continue };
@@ -1694,28 +2447,32 @@ impl<'a> Lifter<'a> {
                 let entry = entries[*s]
                     .as_ref()
                     .expect("a successor of a lifted node has an entry state");
-                let mut assigns = Vec::new();
-                let el = entry.state.stack.len();
-                let xl = exit.stack.len();
-                for (k, is_phi) in entry.phis.iter().enumerate() {
-                    if !*is_phi {
-                        continue;
-                    }
-                    let from_top = el - 1 - k;
-                    let var = entry.state.stack[k];
-                    let val = if from_top < xl {
-                        exit.stack[xl - 1 - from_top]
-                    } else {
-                        expr::intern(Node::Unknown(expr::next_seq()))
-                    };
-                    if val != var {
-                        assigns.push((var, val));
-                    }
-                }
+                let assigns = reaching(entry, &exit.stack, exit.args_used);
                 if !assigns.is_empty() {
                     edge_assigns.insert((from, to), assigns);
                 }
             }
+        }
+        /* A helper that starts on a loop is entered from its caller and from the end of the
+        loop. What it starts with is assigned on a node of its own, ahead of the loop. */
+        let first = map[&unit.entry];
+        let mut entry = first;
+        let start = entries[unit.entry]
+            .as_ref()
+            .map_or(Vec::new(), |e| reaching(e, &init_stack, init_args));
+        if !start.is_empty() {
+            entry = nodes.len();
+            nodes.push(LNode {
+                id: entry,
+                term: Term::Jump(first),
+                succs: vec![first],
+                stmts: Vec::new(),
+                preds: Vec::new(),
+                entry_stack: Vec::new(),
+                exit_stack: Vec::new(),
+                ..nodes[first]
+            });
+            edge_assigns.insert((entry, first), start);
         }
         loop {
             let mut used: HashSet<ExprId> = HashSet::new();
@@ -1765,10 +2522,15 @@ impl<'a> Lifter<'a> {
         for nd in nodes.iter_mut() {
             nd.preds = preds[nd.id].clone();
         }
-        let ret_slot = unit.nodes.iter().find_map(|n| match n.returns_via {
-            Some(AVal::Slot(k)) => Some(k as u32),
-            _ => None,
-        });
+        /* A call takes the first way out of its helper. The helper's own return address
+        is the one that way out jumps to. */
+        let vias = unit.exits.iter().map(|e| Some(e.via));
+        let ret_slot = vias
+            .chain(unit.nodes.iter().map(|n| n.returns_via))
+            .find_map(|via| match via {
+                Some(AVal::Slot(k)) => Some(k as u32),
+                _ => None,
+            });
         let entry_states: Vec<Option<State>> = entries
             .iter()
             .map(|e| e.as_ref().map(|e| e.state.clone()))
@@ -1780,7 +2542,7 @@ impl<'a> Lifter<'a> {
             .any(|nd| matches!(nd.term, Term::Unresolved(_) | Term::Switch { .. }));
         Lifted {
             nodes,
-            entry: map[&unit.entry],
+            entry,
             edge_assigns,
             n_args: max_args,
             reprocess_count,
@@ -1798,6 +2560,7 @@ impl<'a> Lifter<'a> {
         cl: &CopyLoop,
         entering: &State,
         hidden: &Hidden,
+        placed: Option<(usize, usize)>,
     ) -> Option<(Stmt, State)> {
         let top = entering.stack.len();
         let at = |st: &State, slot: usize| -> Option<ExprId> {
@@ -1888,13 +2651,14 @@ impl<'a> Lifter<'a> {
                     round_up(op2(op::SUB, len, i0))
                 };
                 let mut st = entering.clone();
-                apply_mcopy(&mut st, dst0, src0, count);
+                apply_mcopy(&mut st, dst0, src0, count, placed);
                 let stmt = Stmt::Copy {
                     kind: op::MCOPY,
                     dest: dst0,
                     src: src0,
                     len: count,
                     addr: None,
+                    gen: st.mem.gen,
                 };
                 let last = op2(op::SUB, op2(op::ADD, i0, count), konst_u64(32));
                 let final_i = if *rotated {
@@ -1919,7 +2683,7 @@ impl<'a> Lifter<'a> {
                 let (len, dst, src) = (at(entering, *n)?, at(entering, *d)?, at(entering, *s)?);
                 let whole = op2(op::AND, len, konst(!U256::from_u64(31)));
                 let mut st = entering.clone();
-                apply_mcopy(&mut st, dst, src, whole);
+                apply_mcopy(&mut st, dst, src, whole, placed);
                 st.stack[top - 1 - *n] = op2(op::AND, len, konst_u64(31));
                 st.stack[top - 1 - *d] = op2(op::ADD, dst, whole);
                 st.stack[top - 1 - *s] = op2(op::ADD, src, whole);
@@ -1931,6 +2695,7 @@ impl<'a> Lifter<'a> {
                         src,
                         len: whole,
                         addr: None,
+                        gen: st.mem.gen,
                     },
                     after,
                 ))
@@ -1949,7 +2714,7 @@ impl<'a> Lifter<'a> {
         let mut term: Option<Term> = None;
         let seq_base = (nid as u32) << SEQ_BITS;
         let mut seq_ctr = 0u32;
-        // A trace and the oracle lift one node per step, so there the step is the number.
+        // The oracle lifts one node per step, so there the step is the number.
         let copy = hidden.copies.get(nid).copied().filter(|_| !self.oracle);
         let seq_at = |pc: usize, count: u32| match copy {
             Some(copy) => site_seq(pc, copy),
@@ -1980,6 +2745,8 @@ impl<'a> Lifter<'a> {
                 succs: vec![],
                 entry_stack: vec![],
                 exit_stack: vec![],
+                sgen: entry.sgen,
+                mgen: entry.mem.gen,
             };
             return (ln, st);
         }
@@ -2013,7 +2780,17 @@ impl<'a> Lifter<'a> {
                 }
                 op::JUMPDEST => {}
                 op::PC => st.stack.push(konst_u64(ins.pc as u64)),
-                op::MSIZE | op::GAS => st.stack.push(expr::env_seq(o)),
+                op::MSIZE => st.stack.push(expr::env_seq(o)),
+                op::GAS => {
+                    let left = expr::env_seq(o);
+                    /* The gas left is read here and may be used much later. The mark
+                    lets the text name it where it was read. The oracle counts reads by
+                    the values that are used, so it gets none. */
+                    if !self.oracle {
+                        stmts.push(Stmt::Drop(left));
+                    }
+                    st.stack.push(left);
+                }
                 op::RETURNDATASIZE => {
                     st.stack.push(if st.called {
                         expr::intern(Node::Env(o, st.returned))
@@ -2106,7 +2883,13 @@ impl<'a> Lifter<'a> {
                                 hidden.add(nid, st.mem.consumers(off, l as u64));
                                 match fold_keccak(&words, tail) {
                                     Some(h) => konst(h),
-                                    None => expr::intern(Node::Keccak(words, tail)),
+                                    None => {
+                                        let hash = expr::intern(Node::Keccak(words, tail));
+                                        if let Some(pieces) = st.mem.read_pieces(off, l as u64) {
+                                            expr::set_pieces(hash, pieces);
+                                        }
+                                        hash
+                                    }
                                 }
                             }
                             None => {
@@ -2127,6 +2910,12 @@ impl<'a> Lifter<'a> {
                             ))
                         }
                     };
+                    /* A hash of memory nothing is known of is taken here and may be used
+                    after that memory is written again. The mark lets the text name it
+                    where it was taken. The oracle reads memory by its version. */
+                    if !self.oracle && matches!(expr::node(v), Node::KeccakMem(..)) {
+                        stmts.push(Stmt::Drop(v));
+                    }
                     st.stack.push(v);
                 }
                 op::MLOAD => {
@@ -2227,12 +3016,25 @@ impl<'a> Lifter<'a> {
                             AVal::Slot(k) => Some(expr::arg(k as u32)),
                             _ => None,
                         };
-                        let vals: Vec<ExprId> = st
-                            .stack
+                        let shape = unit
+                            .exits
                             .iter()
-                            .copied()
-                            .filter(|v| Some(*v) != ret_arg)
-                            .collect();
+                            .find(|e| e.via == via && e.pushed.len() == st.stack.len());
+                        let vals: Vec<ExprId> = match shape {
+                            Some(exit) => st
+                                .stack
+                                .iter()
+                                .zip(&exit.pushed)
+                                .filter(|(_, pushed)| !pushed.passes_through())
+                                .map(|(v, _)| *v)
+                                .collect(),
+                            None => st
+                                .stack
+                                .iter()
+                                .copied()
+                                .filter(|v| Some(*v) != ret_arg)
+                                .collect(),
+                        };
                         term = Some(Term::InternalReturn(vals));
                     } else {
                         let targets = succ_by_kind(&[Edge::Jump]);
@@ -2297,8 +3099,9 @@ impl<'a> Lifter<'a> {
                     let l = expr::as_const(len)
                         .and_then(|v| v.as_usize())
                         .map(|v| v as u64);
+                    let gen = st.mem.gen + 1;
                     if o == op::MCOPY {
-                        apply_mcopy(&mut st, dest, src, len);
+                        apply_mcopy(&mut st, dest, src, len, Some((nid, stmts.len())));
                     } else if o == op::CODECOPY {
                         match (expr::as_const(src).and_then(|v| v.as_usize()), l) {
                             (Some(s), Some(l)) if l <= 4096 => {
@@ -2331,13 +3134,14 @@ impl<'a> Lifter<'a> {
                             }
                             _ => st.mem.store(dest, l, MVal::Copy(o, src, None)),
                         }
+                    } else if let (true, Some(l)) = (past_call_data(o, src), l) {
+                        // Past the end of the call data every byte reads as zero.
+                        let origin = Some((nid, stmts.len()));
+                        st.mem.store_from(dest, Some(l), MVal::Zero, origin);
                     } else {
-                        // One run has one call behind each copy of an answer. Naming it lets
-                        // a search value the words read from it, and choose them.
-                        let known = o == op::RETURNDATACOPY && st.mem.single_run;
-                        let answered = st.answered.filter(|_| known);
-                        let from = answered.map(|seq| konst_u64(u64::from(seq)));
-                        st.mem.store(dest, l, MVal::Copy(o, src, from));
+                        let origin = Some((nid, stmts.len()));
+                        st.mem
+                            .store_copy(dest, len, MVal::Copy(o, src, None), origin);
                     }
                     next_version(&mut st);
                     stmts.push(Stmt::Copy {
@@ -2346,6 +3150,7 @@ impl<'a> Lifter<'a> {
                         src,
                         len,
                         addr: None,
+                        gen,
                     });
                 }
                 op::EXTCODECOPY => {
@@ -2357,13 +3162,14 @@ impl<'a> Lifter<'a> {
                         .and_then(|v| v.as_usize())
                         .map(|v| v as u64);
                     st.mem.store(dest, l, MVal::Copy(o, src, Some(addr)));
-                    next_version(&mut st);
+                    let gen = next_version(&mut st);
                     stmts.push(Stmt::Copy {
                         kind: o,
                         dest,
                         src,
                         len,
                         addr: Some(addr),
+                        gen,
                     });
                 }
                 op::LOG0..=op::LOG4 => {
@@ -2400,6 +3206,15 @@ impl<'a> Lifter<'a> {
                     let in_len = pop!();
                     let out_off = pop!();
                     let out_len = pop!();
+                    /* Gas read only to be handed to this call needs no name, and the
+                    mark would stand between the call and the writes that built its data. */
+                    if let Some(Stmt::Drop(left)) = stmts.last() {
+                        let read = expr::node(*left);
+                        let kept = st.stack.iter().any(|e| expr::contains(*e, &|n| *n == read));
+                        if matches!(read, Node::Env(op::GAS, _)) && !kept {
+                            stmts.pop();
+                        }
+                    }
                     let seq = seq_at(ins.pc, seq_ctr);
                     seq_ctr += 1;
                     let input = expr::as_const(in_len)
@@ -2409,6 +3224,17 @@ impl<'a> Lifter<'a> {
                     if let (Some(_), Some(l)) = (&input, expr::as_const(in_len)) {
                         hidden.add(nid, st.mem.consumers(in_off, l.low_u64()));
                     }
+                    let layout = expr::as_const(in_len)
+                        .and_then(|l| l.as_usize())
+                        .and_then(|l| st.mem.read_pieces(in_off, l as u64));
+                    let decoded = match self.oracle {
+                        false => st.mem.call_args(in_off, in_len),
+                        true => None,
+                    };
+                    let args = decoded.map(|(args, built)| {
+                        hidden.add(nid, built);
+                        args
+                    });
                     let result = expr::intern(Node::CallResult(seq));
                     let input_head: Vec<ExprId> = if expr::as_const(in_len) == Some(U256::ZERO) {
                         Vec::new()
@@ -2430,10 +3256,15 @@ impl<'a> Lifter<'a> {
                         .map(|v| v as u64);
                     let identity = expr::as_const(addr) == Some(U256::from_u64(4))
                         && (o == op::STATICCALL || o == op::CALL);
-                    if identity && matches!((ol, il), (Some(o), Some(i)) if o <= i) {
-                        apply_mcopy(&mut st, out_off, in_off, out_len);
+                    let fits = matches!((ol, il), (Some(o), Some(i)) if 0 < o && o <= i);
+                    let copies = identity && (fits || (ol.is_none() && out_len == in_len));
+                    let copied = st.mem.gen + 1;
+                    let shown = copies && !self.oracle;
+                    let answered = call_stamp(nid, stmts.len() + 1 + usize::from(shown));
+                    if copies || (identity && ol == Some(0)) {
+                        apply_mcopy(&mut st, out_off, in_off, out_len, None);
                     } else if ol != Some(0) {
-                        st.mem.store(out_off, ol, MVal::CallOut(seq));
+                        st.mem.store(out_off, ol, MVal::CallOut(seq, answered));
                     }
                     next_version(&mut st);
                     let gen = (o != op::STATICCALL).then_some(st.sgen);
@@ -2453,13 +3284,26 @@ impl<'a> Lifter<'a> {
                         out_len,
                         input,
                         input_head,
+                        layout,
+                        args,
                         result,
                         gen,
                     });
+                    /* The identity built-in is how code before MCOPY copies memory. The
+                    copy is what later reads of the output see, so it is a statement. */
+                    if shown {
+                        stmts.push(Stmt::Copy {
+                            kind: op::MCOPY,
+                            dest: out_off,
+                            src: in_off,
+                            len: out_len,
+                            addr: None,
+                            gen: copied,
+                        });
+                    }
                     st.stack.push(result);
                     st.called = true;
-                    st.returned = call_stamp(nid, stmts.len());
-                    st.answered = Some(seq);
+                    st.returned = answered;
                 }
                 op::CREATE | op::CREATE2 => {
                     let value = pop!();
@@ -2491,7 +3335,6 @@ impl<'a> Lifter<'a> {
                     st.stack.push(result);
                     st.called = true;
                     st.returned = call_stamp(nid, stmts.len());
-                    st.answered = None;
                 }
                 op::RETURN | op::REVERT => {
                     let off = pop!();
@@ -2551,6 +3394,8 @@ impl<'a> Lifter<'a> {
             succs,
             entry_stack: vec![],
             exit_stack: st.stack.clone(),
+            sgen: entry.sgen,
+            mgen: entry.mem.gen,
         };
         (ln, st)
     }
@@ -2592,20 +3437,18 @@ impl<'a> Lifter<'a> {
         let summary = self.summaries.get(&call.callee);
         let free_pointer = konst(U256::from_u64(FREE_POINTER));
         let free_now = st.mem.load_word(free_pointer, st.version);
-        let entry_gen = st.mem.gen;
-        let subst = |e: ExprId| -> ExprId {
-            let restamped = expr::restamp_memory(e, entry_gen, &mut HashMap::new());
-            let mut memo = HashMap::new();
-            expr::substitute(
-                restamped,
-                &|n| match n {
-                    Node::Arg(i) => Some(at(*i as usize)),
-                    Node::MLoad(a, _) if *a == free_pointer => Some(free_now),
-                    _ => None,
-                },
-                &mut memo,
-            )
+        let entering = Entering {
+            at: &at,
+            free_now,
+            mem: st.mem.clone(),
+            gen: st.mem.gen,
+            sgen: st.sgen,
+            stores: summary.map_or_else(Vec::new, |s| {
+                let offs = s.mstores.iter().map(|(off, _)| *off);
+                offs.zip(s.store_gens.iter().copied()).collect()
+            }),
         };
+        let subst = |e: ExprId| -> ExprId { entered(e, &entering) };
         if let Some(sum) = summary {
             if let Some((off, len, data)) = &sum.reverts {
                 for (o, v) in &sum.mstores {
@@ -2619,22 +3462,46 @@ impl<'a> Lifter<'a> {
                 };
             }
         }
-        let unknown_pushed = call
-            .pushed
-            .iter()
-            .filter(|v| !matches!(v, AVal::Slot(_) | AVal::Const(_) | AVal::Pc(_)))
-            .count();
+        let unknown_pushed = call.pushed.iter().filter(|v| !v.passes_through()).count();
         let by_position = summary.is_some_and(|s| s.returns.len() == call.pushed.len());
+        // What a folded helper tested holds for the values it hands back.
+        let folded = summary
+            .filter(|s| by_position || s.returns.len() == unknown_pushed)
+            .filter(|s| !s.side_effects);
+        for (cond, _, _) in folded.map_or(&[][..], |s| s.guards.as_slice()) {
+            st.learn(subst(*cond), true);
+        }
+        /* What the caller read and handed in was read when the caller read it. Read again
+        here, a word the caller wrote since, such as the free pointer, would stand in. */
+        let mut handed: HashSet<ExprId> = HashSet::new();
+        let mut pending: Vec<ExprId> = (0..consumed).map(&at).collect();
+        while let Some(x) = pending.pop() {
+            if expr::holds(x, kind::MLOAD) && handed.insert(x) {
+                pending.extend(expr::children(x));
+            }
+        }
         let resolve = |e: ExprId| -> ExprId {
             let mut memo = HashMap::new();
             expr::substitute(
                 e,
                 &|n| {
-                    if let Node::MLoad(a, _) = n {
-                        Some(st.mem.load_word(*a, st.version))
-                    } else {
-                        None
+                    let Node::MLoad(a, _) = n else {
+                        return None;
+                    };
+                    let read = expr::intern(n.clone());
+                    if handed.contains(&read) {
+                        return Some(read);
                     }
+                    /* A read that is still a read of the same place has gained
+                    nothing. Its caller made it, and with a new stamp it would be
+                    another value than the one the helper tested. It stays whole. The
+                    place it read is not looked up again either. */
+                    let now = st.mem.load_word(*a, st.version);
+                    let same = matches!(expr::node(now), Node::MLoad(at, _) if at == *a);
+                    Some(match same {
+                        true => expr::intern(n.clone()),
+                        false => now,
+                    })
                 },
                 &mut memo,
             )
@@ -2662,7 +3529,11 @@ impl<'a> Lifter<'a> {
         for (idx, v) in call.pushed.iter().enumerate() {
             let e = match v {
                 AVal::Slot(i) => at(*i as usize),
-                AVal::Const(c) | AVal::Pc(c) => konst(*c),
+                AVal::Const(c) | AVal::Pc(c) => {
+                    j += 1;
+                    results.push(konst(*c));
+                    konst(*c)
+                }
                 _ => {
                     let r = match &direct_returns {
                         Some(d) => d[if by_position { idx } else { j as usize }],
@@ -2682,9 +3553,79 @@ impl<'a> Lifter<'a> {
         let inlined = direct_returns.is_some();
         let transparent = inlined && summary.is_some_and(|s| !s.side_effects);
         let gen_before = st.sgen;
+        /* A test the helper made before a store reads what memory held before it. The
+        tests are stated where the helper made them, or one would read as coming after
+        a store or a copy it came before. */
+        let tests = |stmts: &mut Vec<Stmt>, made: (usize, usize)| {
+            let Some(sum) = summary.filter(|_| transparent) else {
+                return;
+            };
+            for (i, (cond, data, invalid)) in sum.guards.iter().enumerate() {
+                if sum.stores_and_copies_before.get(i) != Some(&made) {
+                    continue;
+                }
+                let cond = subst(*cond);
+                if expr::as_const(cond).is_some_and(|c| !c.is_zero()) {
+                    continue;
+                }
+                let data = data.as_ref().map(|d| d.iter().map(|e| subst(*e)).collect());
+                stmts.push(Stmt::Require {
+                    cond,
+                    data,
+                    invalid: *invalid,
+                });
+            }
+        };
+        /* A hash the helper took reads the memory of the place it took it at. The mark
+        stands there among the helper's stores, so the text can name the hash before a
+        later store changes what it was taken over. */
+        let mut marks: Vec<((usize, usize), ExprId)> = Vec::new();
+        for (hash, stores, copies) in summary.map_or(&[][..], |s| s.hashes.as_slice()) {
+            let hash = match reads_caller {
+                true => resolve(subst(*hash)),
+                false => subst(*hash),
+            };
+            let taken = matches!(expr::node(hash), Node::KeccakMem(..));
+            if taken && transparent && !self.oracle {
+                marks.push(((*stores, *copies), hash));
+            }
+        }
+        let hashed = |stmts: &mut Vec<Stmt>, made: (usize, usize)| {
+            let here = marks.iter().filter(|(at, _)| *at == made);
+            stmts.extend(here.map(|(_, hash)| Stmt::Drop(*hash)));
+        };
         match summary {
             Some(sum) => {
-                for (off, val) in &sum.mstores {
+                /* Stores and copies are made in the helper's order. Where two of them
+                overlap, the bytes left are those of the later one. */
+                let mut copied = 0;
+                for stored in 0..=sum.mstores.len() {
+                    while sum.stores_before_copy.get(copied) == Some(&stored) {
+                        tests(stmts, (stored, copied));
+                        hashed(stmts, (stored, copied));
+                        let (dest, src, len) = sum.copies[copied];
+                        let (d, s2, l2) = (subst(dest), subst(src), subst(len));
+                        // A copy of no bytes does nothing.
+                        let stated = transparent && expr::as_const(l2) != Some(U256::ZERO);
+                        if stated {
+                            stmts.push(Stmt::Copy {
+                                kind: op::MCOPY,
+                                dest: d,
+                                src: s2,
+                                len: l2,
+                                addr: None,
+                                gen: st.mem.gen + 1,
+                            });
+                        }
+                        let shown = stated.then(|| (un.id, stmts.len() - 1));
+                        apply_mcopy(st, d, s2, l2, shown);
+                        copied += 1;
+                    }
+                    tests(stmts, (stored, copied));
+                    hashed(stmts, (stored, copied));
+                    let Some((off, val)) = sum.mstores.get(stored) else {
+                        break;
+                    };
                     let (o, v) = (subst(*off), subst(*val));
                     if transparent {
                         let origin = Some((un.id, stmts.len()));
@@ -2699,19 +3640,6 @@ impl<'a> Lifter<'a> {
                     } else {
                         st.mem.store(o, Some(32), MVal::Word(v));
                     }
-                }
-                for (dest, src, len) in &sum.copies {
-                    let (d, s2, l2) = (subst(*dest), subst(*src), subst(*len));
-                    if transparent {
-                        stmts.push(Stmt::Copy {
-                            kind: op::MCOPY,
-                            dest: d,
-                            src: s2,
-                            len: l2,
-                            addr: None,
-                        });
-                    }
-                    apply_mcopy(st, d, s2, l2);
                 }
                 for off in &sum.maybe_mstores {
                     st.mem.store(subst(*off), Some(32), MVal::Unknown);
@@ -2738,7 +3666,15 @@ impl<'a> Lifter<'a> {
                         st.mem.tick();
                         st.version = st.mem.gen;
                     }
-                    None => st.mem.clobber(),
+                    None => {
+                        st.mem.clobber();
+                        if self.pointer_keepers.contains(&call.callee) {
+                            st.mem.keep_free_pointer(free_now);
+                        } else {
+                            let word = (FREE_POINTER, FREE_POINTER + 32);
+                            st.mem.touched.borrow_mut().ranges.insert(word);
+                        }
+                    }
                 }
                 st.storage.clear();
                 st.sgen += 1;
@@ -2746,20 +3682,7 @@ impl<'a> Lifter<'a> {
                 st.returned = call_stamp(un.id, stmts.len());
             }
         }
-        if transparent {
-            for (cond, data, invalid) in summary.map(|s| s.guards.as_slice()).unwrap_or(&[]) {
-                let cond = subst(*cond);
-                if expr::as_const(cond).is_some_and(|c| !c.is_zero()) {
-                    continue;
-                }
-                let data = data.as_ref().map(|d| d.iter().map(|e| subst(*e)).collect());
-                stmts.push(Stmt::Require {
-                    cond,
-                    data,
-                    invalid: *invalid,
-                });
-            }
-        } else {
+        if !transparent {
             stmts.push(Stmt::Internal {
                 seq,
                 callee: self.prog.blocks[call.callee].start,
@@ -2783,6 +3706,117 @@ impl<'a> Lifter<'a> {
             },
         }
     }
+}
+
+// A term taken away again is gone, which is how an end less a start gives a length.
+fn summed(e: ExprId) -> (Vec<(ExprId, i64)>, U256) {
+    let mut terms: HashMap<ExprId, i64> = HashMap::new();
+    let mut fixed = U256::ZERO;
+    let mut pending = vec![(e, 1i64)];
+    while let Some((x, sign)) = pending.pop() {
+        match expr::node(x) {
+            Node::Op(op::ADD, v) => pending.extend(v.into_iter().map(|t| (t, sign))),
+            Node::Op(op::SUB, v) => pending.extend([(v[0], sign), (v[1], -sign)]),
+            Node::Const(c) if sign > 0 => fixed = fixed.wrapping_add(c),
+            Node::Const(c) => fixed = fixed.wrapping_sub(c),
+            _ => *terms.entry(x).or_insert(0) += sign,
+        }
+    }
+    let mut terms: Vec<(ExprId, i64)> = terms.into_iter().filter(|(_, n)| *n != 0).collect();
+    terms.sort_unstable();
+    (terms, fixed)
+}
+
+struct Entering<'a> {
+    at: &'a dyn Fn(usize) -> ExprId,
+    free_now: ExprId,
+    mem: Mem,
+    gen: u32,
+    sgen: u32,
+    stores: Vec<(ExprId, u32)>,
+}
+
+// What a folded helper read from memory before it wrote any is what its caller's held.
+fn entered(e: ExprId, with: &Entering) -> ExprId {
+    let free_pointer = konst_u64(FREE_POINTER);
+    let marks: RefCell<Vec<(ExprId, ExprId)>> = RefCell::default();
+    let after: RefCell<Vec<(ExprId, ExprId)>> = RefCell::default();
+    /* A read of a word the helper stored itself comes after that store. Stamped as if
+    made on entry it would seem to come before it. The helper's stores all take the
+    version just past entry, so the read takes that one too. */
+    let stored_before = |at: ExprId, v: u32| with.stores.iter().any(|(o, g)| *o == at && *g <= v);
+    let mark = |n: &Node| match n {
+        Node::MLoad(at, 0) if *at != free_pointer => {
+            let mark = expr::intern(Node::Unknown(expr::next_seq()));
+            marks.borrow_mut().push((mark, *at));
+            Some(mark)
+        }
+        Node::MLoad(at, v) if *at != free_pointer && stored_before(*at, *v) => {
+            let mark = expr::intern(Node::Unknown(expr::next_seq()));
+            after.borrow_mut().push((mark, *at));
+            Some(mark)
+        }
+        _ => None,
+    };
+    let marked = expr::substitute(e, &mark, &mut HashMap::new());
+    // Restamping comes first. It would take the caller's own reads for the helper's.
+    let restamped = expr::restamp(marked, with.gen, with.sgen, &mut HashMap::new());
+    let mut reads: HashMap<ExprId, ExprId> = marks
+        .into_inner()
+        .into_iter()
+        .map(|(mark, at)| (mark, with.mem.load_word(entered(at, with), 0)))
+        .collect();
+    for (mark, at) in after.into_inner() {
+        let read = Node::MLoad(entered(at, with), with.gen + 1);
+        reads.insert(mark, expr::intern(read));
+    }
+    let said = |n: &Node| match n {
+        Node::Arg(i) => Some((with.at)(*i as usize)),
+        Node::MLoad(at, _) if *at == free_pointer => Some(with.free_now),
+        Node::Unknown(_) => reads.get(&expr::intern(n.clone())).copied(),
+        _ => None,
+    };
+    expr::substitute(restamped, &said, &mut HashMap::new())
+}
+
+type Place = (Vec<(ExprId, i64)>, U256);
+
+fn place(w: &MemWrite) -> Place {
+    let (terms, fixed) = w.base.map(summed).unwrap_or_default();
+    (terms, fixed.wrapping_add(U256::from(w.off)))
+}
+
+/* How far the first place lies past the second, when no term can bring it below. A term
+counts up from zero unless it is made the way code writes a negative number. */
+fn ahead(a: &Place, b: &Place) -> Option<u64> {
+    let mut terms: HashMap<ExprId, i64> = a.0.iter().copied().collect();
+    for (term, times) in &b.0 {
+        *terms.entry(*term).or_insert(0) -= times;
+    }
+    let negative = |term: &ExprId| match expr::node(*term) {
+        Node::Op(op::NOT | op::SIGNEXTEND | op::SDIV | op::SMOD | op::SAR, _) => true,
+        Node::Op(op::MUL, v) => v
+            .iter()
+            .any(|x| expr::as_const(*x).is_some_and(|c| c.bits() > 64)),
+        _ => false,
+    };
+    let up = terms
+        .iter()
+        .all(|(term, times)| *times == 0 || (*times > 0 && !negative(term)));
+    let gap = a.1.wrapping_sub(b.1);
+    (up && gap.fits_u64() && gap.low_u64() < BIG).then(|| gap.low_u64())
+}
+
+fn round_up(len: ExprId) -> ExprId {
+    op2(
+        op::AND,
+        expr::add_const(len, U256::from_u64(31)),
+        konst(!U256::from_u64(31)),
+    )
+}
+
+fn past_call_data(kind: u8, src: ExprId) -> bool {
+    kind == op::CALLDATACOPY && src == expr::env(op::CALLDATASIZE)
 }
 
 fn term_succs(t: &Term) -> Vec<usize> {
@@ -2844,7 +3878,7 @@ fn const_len(len: ExprId) -> Option<u64> {
         .map(|l| l.low_u64())
 }
 
-fn raw_reads(stmts: &[Stmt], term: &Term) -> Vec<RawRead> {
+fn raw_reads(stmts: &[Stmt], term: &Term, readers: &HashSet<usize>) -> Vec<RawRead> {
     let mut reads = Vec::new();
     let word = Some(konst_u64(32));
     let loads = |e: ExprId, reads: &mut Vec<RawRead>| {
@@ -2873,22 +3907,36 @@ fn raw_reads(stmts: &[Stmt], term: &Term) -> Vec<RawRead> {
                 data: None,
                 ..
             } => reads.push((*off, Some(*len), None)),
-            // The words in the head were decoded. Only what follows them is read raw.
             Stmt::Call {
-                in_off,
-                input: None,
-                input_head,
-                ..
-            } if !input_head.is_empty() => {
-                let decoded = U256::from(32 * input_head.len());
-                reads.push((expr::add_const(*in_off, decoded), None, None));
+                args: Some(args), ..
+            } => {
+                for arg in args {
+                    if let Arg::Copied {
+                        kind: op::MCOPY,
+                        src,
+                        len,
+                    } = arg
+                    {
+                        reads.push((*src, Some(*len), None));
+                    }
+                }
             }
+            /* The text gives the selector and the arguments it could read off the head.
+            What follows them is read raw, and so is all of it when the head starts with
+            no selector and the call prints as the memory it reads. */
             Stmt::Call {
                 in_off,
                 in_len,
                 input: None,
+                input_head,
                 ..
-            } => reads.push((*in_off, Some(*in_len), None)),
+            } => match crate::emit::call_head(input_head, *in_off) {
+                Some((_, args)) => {
+                    let given = U256::from(4 + 32 * args.len());
+                    reads.push((expr::add_const(*in_off, given), None, None));
+                }
+                None => reads.push((*in_off, Some(*in_len), None)),
+            },
             Stmt::Create {
                 off,
                 len,
@@ -2901,6 +3949,12 @@ fn raw_reads(stmts: &[Stmt], term: &Term) -> Vec<RawRead> {
                 len,
                 ..
             } => reads.push((*src, Some(*len), None)),
+            /* A helper that reads memory through a pointer may read from any place it is
+            handed. A small number is a flag or a count, not a place. */
+            Stmt::Internal { callee, args, .. } if readers.contains(callee) => {
+                let place = |a: &&ExprId| expr::as_const(**a).is_none_or(|c| c.bits() > 6);
+                reads.extend(args.iter().filter(place).map(|a| (*a, None, None)))
+            }
             _ => {}
         }
         for e in stmt_exprs(s) {
@@ -2934,11 +3988,12 @@ fn raw_reads(stmts: &[Stmt], term: &Term) -> Vec<RawRead> {
 fn without_still_read(
     lnodes: &[Option<LNode>],
     hidden: HashSet<(usize, usize)>,
+    readers: &HashSet<usize>,
 ) -> HashSet<(usize, usize)> {
     if hidden.is_empty() {
         return hidden;
     }
-    let reads_any = |ln: &LNode| !raw_reads(&ln.stmts, &ln.term).is_empty();
+    let reads_any = |ln: &LNode| !raw_reads(&ln.stmts, &ln.term, readers).is_empty();
     if !lnodes.iter().flatten().any(reads_any) {
         return hidden;
     }
@@ -2971,11 +4026,15 @@ fn without_still_read(
     };
     // The first value says a read of the store's bytes was met. The second says the walk
     // goes on past these statements.
-    let scan = |stmts: &[Stmt],
-                term: &Term,
+    let scan = |(node, from): (usize, usize),
+                gone: &HashSet<(usize, usize)>,
                 (store, made): (Span, u32),
                 over: &mut Vec<Span>|
      -> (bool, bool) {
+        let Some(ln) = &lnodes[node] else {
+            return (false, false);
+        };
+        let (stmts, term) = (&ln.stmts[from..], &ln.term);
         let seen = |reads: Vec<RawRead>, over: &[Span], same: &[Whole]| {
             reads.into_iter().any(|(off, len, version)| {
                 // A read stamped before the store was made does not see it.
@@ -2995,7 +4054,13 @@ fn without_still_read(
         };
         let mut same: Vec<Whole> = Vec::new();
         for (i, s) in stmts.iter().enumerate() {
-            if seen(raw_reads(&stmts[i..=i], &Term::Stop), over, &same) {
+            // A copy that is left out reads nothing. The call that prints it reads for it.
+            let left_out = matches!(s, Stmt::Copy { .. }) && gone.contains(&(node, from + i));
+            let reads = match left_out {
+                true => Vec::new(),
+                false => raw_reads(&stmts[i..=i], &Term::Stop, readers),
+            };
+            if seen(reads, over, &same) {
                 return (true, false);
             }
             over.extend(written(s));
@@ -3010,49 +4075,58 @@ fn without_still_read(
                 return (false, false);
             }
         }
-        (seen(raw_reads(&[], term), over, &same), true)
+        (seen(raw_reads(&[], term, readers), over, &same), true)
     };
-    hidden
-        .into_iter()
-        .filter(|(node, index)| {
-            let Some(ln) = &lnodes[*node] else {
-                return true;
-            };
-            let Some(Stmt::MStore {
+    let stays = |(node, index): &(usize, usize), gone: &HashSet<(usize, usize)>| {
+        let Some(ln) = &lnodes[*node] else {
+            return true;
+        };
+        let (off, width, gen) = match ln.stmts.get(*index) {
+            Some(Stmt::MStore {
                 off, width, gen, ..
-            }) = ln.stmts.get(*index)
-            else {
-                return true;
-            };
-            let Some(store) = span(*off, Some(u64::from(*width))).map(|s| (s, *gen)) else {
-                return true;
-            };
-            let mut over = Vec::new();
-            let (read, on) = scan(&ln.stmts[index + 1..], &ln.term, store, &mut over);
-            if read || !on {
-                return !read;
+            }) => (*off, Some(u64::from(*width)), *gen),
+            Some(Stmt::Copy { dest, len, gen, .. }) => (*dest, const_len(*len), *gen),
+            _ => return true,
+        };
+        let Some(store) = span(off, width) else {
+            return true;
+        };
+        let store = (store, gen);
+        let mut over = Vec::new();
+        let (read, on) = scan((*node, index + 1), gone, store, &mut over);
+        if read || !on {
+            return !read;
+        }
+        let mut seen = HashSet::new();
+        let mut stack: Vec<(usize, Vec<Span>)> =
+            ln.succs.iter().map(|s| (*s, over.clone())).collect();
+        while let Some((x, mut over)) = stack.pop() {
+            if !seen.insert(x) || seen.len() > MAX_NODES_AFTER_STORE {
+                continue;
             }
-            let mut seen = HashSet::new();
-            let mut stack: Vec<(usize, Vec<Span>)> =
-                ln.succs.iter().map(|s| (*s, over.clone())).collect();
-            while let Some((x, mut over)) = stack.pop() {
-                if !seen.insert(x) || seen.len() > MAX_NODES_AFTER_STORE {
-                    continue;
-                }
-                let Some(next) = &lnodes[x] else {
-                    continue;
-                };
-                let (read, on) = scan(&next.stmts, &next.term, store, &mut over);
-                if read {
-                    return false;
-                }
-                if on {
-                    stack.extend(next.succs.iter().map(|s| (*s, over.clone())));
-                }
+            let Some(next) = &lnodes[x] else {
+                continue;
+            };
+            let (read, on) = scan((x, 0), gone, store, &mut over);
+            if read {
+                return false;
             }
-            true
-        })
-        .collect()
+            if on {
+                stack.extend(next.succs.iter().map(|s| (*s, over.clone())));
+            }
+        }
+        true
+    };
+    // A store that stays is read again by what it was thought to be left out for.
+    let mut gone = hidden;
+    loop {
+        let kept: HashSet<(usize, usize)> =
+            gone.iter().filter(|at| stays(at, &gone)).copied().collect();
+        if kept.len() == gone.len() {
+            return kept;
+        }
+        gone = kept;
+    }
 }
 
 const MAX_NODES_AFTER_STORE: usize = 512;
@@ -3156,28 +4230,55 @@ fn merge_into(
         changed = true;
     }
     let el = e.state.stack.len();
+    let mut caps: Vec<(ExprId, u32)> = Vec::new();
+    let mut uncapped: Vec<ExprId> = Vec::new();
     for k in 0..el {
         let from_top = el - 1 - k;
         let exit_val = if from_top < xl {
-            Some(exit.stack[xl - 1 - from_top])
+            exit.stack[xl - 1 - from_top]
         } else {
-            None
+            expr::arg((exit.args_used + from_top - xl) as u32)
         };
+        let old = e.state.stack[k];
         if e.phis[k] {
+            let cap = e.state.mem.capped.iter().find(|(v, _)| *v == old);
+            if let Some((_, stamp)) = cap.copied() {
+                match exit_val == old || exit.mem.at_most_answer(exit_val, stamp) {
+                    true => caps.push((old, stamp)),
+                    false => uncapped.push(old),
+                }
+            }
             continue;
         }
-        if exit_val != Some(e.state.stack[k]) {
+        if exit_val != old {
             let var = *phi_ids
                 .entry((node, from_top))
                 .or_insert_with(|| merge_var(node, from_top));
+            let stamp = answer_stamp(old).or(answer_stamp(exit_val));
+            let below = |stamp: &u32| {
+                e.state.mem.at_most_answer(old, *stamp) && exit.mem.at_most_answer(exit_val, *stamp)
+            };
+            caps.extend(stamp.filter(below).map(|stamp| (var, stamp)));
             e.state.stack[k] = var;
             e.phis[k] = true;
             changed = true;
         }
     }
+    let capped = e.state.mem.capped.clone();
     if !e.widened && e.state.mem.intersect(&exit.mem, stable) {
         changed = true;
     }
+    /* The smaller of a length and a number is how code bounds what it copies of an answer.
+    A value merged here from that length and from numbers the length was tested to reach
+    is no more than the length on every way in. */
+    let merged = &mut e.state.mem.capped;
+    merged.retain(|(var, _)| !uncapped.contains(var));
+    for cap in caps {
+        if !merged.contains(&cap) {
+            merged.push(cap);
+        }
+    }
+    changed |= *merged != capped;
     let before = e.state.storage.len();
     e.state.storage.retain(|w| exit.storage.contains(w));
     if e.state.storage.len() != before {
@@ -3215,73 +4316,8 @@ fn loop_bound(cond: ExprId) -> Option<ExprId> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct MemView {
-    mem: Mem,
-    version: u32,
-}
-
-impl Default for MemView {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MemView {
-    pub fn new() -> MemView {
-        MemView {
-            mem: Mem::new(false),
-            version: 0,
-        }
-    }
-    pub fn new_fresh() -> MemView {
-        MemView {
-            mem: Mem::new(true),
-            version: 0,
-        }
-    }
-    pub fn unfresh(&mut self) {
-        self.mem.fresh = false;
-    }
-    pub fn unknown(&mut self, off: ExprId, len: Option<u64>) {
-        self.mem.store(off, len, MVal::Unknown);
-        self.mem.tick();
-        self.version = self.mem.gen;
-    }
-    pub fn store(&mut self, off: ExprId, val: ExprId) {
-        self.mem.store(off, Some(32), MVal::Word(val));
-        self.mem.tick();
-        self.version = self.mem.gen;
-    }
-    pub fn copy(&mut self, dest: ExprId, src: ExprId, len: ExprId) {
-        let mut st = State {
-            stack: Vec::new(),
-            args_used: 0,
-            mem: std::mem::replace(&mut self.mem, Mem::new(false)),
-            storage: Vec::new(),
-            version: self.version,
-            sgen: 0,
-            called: false,
-            returned: 0,
-            answered: None,
-        };
-        apply_mcopy(&mut st, dest, src, len);
-        self.mem = st.mem;
-        self.version = st.version;
-    }
-    pub fn load(&self, off: ExprId) -> Option<ExprId> {
-        let w = self.mem.load_bytes(off, 32, self.version)?;
-        if expr::contains(w, &|n| matches!(n, Node::MLoad(..))) {
-            None
-        } else {
-            Some(w)
-        }
-    }
-}
-
 fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
     let mut bytes = Vec::with_capacity(words.len() * 32);
-    let mut parts = Vec::with_capacity(words.len());
     for (i, w) in words.iter().enumerate() {
         let c = expr::as_const(*w)?;
         let b = c.to_be_bytes();
@@ -3290,16 +4326,17 @@ fn fold_keccak(words: &[ExprId], tail: u8) -> Option<U256> {
         } else {
             bytes.extend_from_slice(&b);
         }
-        parts.push(c);
     }
-    let hash = U256::from_be_bytes(&crate::keccak::keccak256(&bytes));
-    if tail == 0 {
-        expr::note_hash(hash, parts);
-    }
-    Some(hash)
+    Some(U256::from_be_bytes(&crate::keccak::keccak256(&bytes)))
 }
 
-fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
+fn apply_mcopy(
+    st: &mut State,
+    dest: ExprId,
+    src: ExprId,
+    len: ExprId,
+    origin: Option<(usize, usize)>,
+) {
     let l = expr::as_const(len)
         .and_then(|v| v.as_usize())
         .map(|v| v as u64);
@@ -3326,16 +4363,22 @@ fn apply_mcopy(st: &mut State, dest: ExprId, src: ExprId, len: ExprId) {
             }
         } else {
             st.mem
-                .store(dest, Some(l), MVal::Copy(op::MCOPY, src, None));
+                .store_copy(dest, len, MVal::Copy(op::MCOPY, src, None), origin);
         }
     } else {
-        st.mem.store(dest, None, MVal::Copy(op::MCOPY, src, None));
+        st.mem
+            .store_copy(dest, len, MVal::Copy(op::MCOPY, src, None), origin);
     }
     st.mem.tick();
     st.version = st.mem.gen;
 }
 
 impl Lifted {
+    #[must_use]
+    pub fn reads_through_pointers(&self) -> bool {
+        self.entry_loads.open_from.is_some()
+    }
+
     #[must_use]
     pub fn entry_free_pointer(&self) -> Option<ExprId> {
         let unit_entry = self
@@ -3426,6 +4469,8 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             out_len,
             input,
             input_head,
+            layout,
+            args,
             result,
             gen,
         } => Stmt::Call {
@@ -3440,6 +4485,12 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             out_len: f(*out_len),
             input: fo(input),
             input_head: fv(input_head),
+            layout: layout
+                .as_ref()
+                .map(|l| l.iter().map(|(e, width)| (f(*e), *width)).collect()),
+            args: args
+                .as_ref()
+                .map(|all| all.iter().map(|a| a.map(f)).collect()),
             result: f(*result),
             gen: *gen,
         },
@@ -3470,12 +4521,14 @@ pub fn map_stmt(s: &Stmt, f: &dyn Fn(ExprId) -> ExprId) -> Stmt {
             src,
             len,
             addr,
+            gen,
         } => Stmt::Copy {
             kind: *kind,
             dest: f(*dest),
             src: f(*src),
             len: f(*len),
             addr: addr.map(f),
+            gen: *gen,
         },
         Stmt::Internal {
             seq,
@@ -3569,11 +4622,18 @@ pub fn payload_exprs(n: &LNode) -> Vec<ExprId> {
     for s in &n.stmts {
         match s {
             Stmt::Call {
-                input, input_head, ..
+                input,
+                input_head,
+                layout,
+                args,
+                ..
             } => {
                 v.extend(input_head.iter().copied());
-                if let Some(d) = input {
-                    v.extend(d.iter().copied());
+                v.extend(args.iter().flatten().flat_map(Arg::exprs));
+                match (input, layout) {
+                    (Some(d), _) => v.extend(d.iter().copied()),
+                    (None, Some(pieces)) => v.extend(pieces.iter().map(|(e, _)| *e)),
+                    (None, None) => {}
                 }
             }
             Stmt::Log { data: Some(d), .. }
@@ -3625,16 +4685,22 @@ pub fn stmt_exprs(s: &Stmt) -> Vec<ExprId> {
             out_off,
             out_len,
             input,
+            layout,
+            args,
             ..
         } => {
+            v.extend(args.iter().flatten().flat_map(Arg::exprs));
             v.push(*gas);
             v.push(*addr);
             if let Some(x) = value {
                 v.push(*x);
             }
             v.extend([*in_off, *in_len, *out_off, *out_len]);
-            if let Some(d) = input {
-                v.extend(d.iter().copied());
+            // The pieces say again what the words say, so they are listed only without them.
+            match (input, layout) {
+                (Some(d), _) => v.extend(d.iter().copied()),
+                (None, Some(pieces)) => v.extend(pieces.iter().map(|(e, _)| *e)),
+                (None, None) => {}
             }
         }
         Stmt::Create {
@@ -3905,6 +4971,14 @@ mod tests {
             _ => None,
         });
         values.collect()
+    }
+
+    #[test]
+    fn an_answer_longer_than_any_length_names_no_length() {
+        let size = expr::intern(Node::Env(op::RETURNDATASIZE, 1));
+        let longer = expr::op2(op::GT, size, expr::konst_u64(u64::MAX));
+        assert_eq!(answer_length(longer, true, &[]), None);
+        assert_eq!(answer_length(longer, false, &[]), None);
     }
 
     #[test]

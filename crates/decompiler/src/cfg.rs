@@ -3,7 +3,7 @@ use crate::opcode as op;
 use crate::u256::U256;
 use serde::Serialize;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 #[derive(Clone, Debug, Serialize)]
@@ -119,6 +119,9 @@ impl AVal {
     }
     fn is_token(&self) -> bool {
         matches!(self, AVal::Slot(_) | AVal::Mem(_))
+    }
+    pub fn passes_through(&self) -> bool {
+        matches!(self, AVal::Slot(_))
     }
 }
 
@@ -369,7 +372,7 @@ pub struct Sig {
 }
 
 impl Sig {
-    fn same_code_shape(&self, other: &Sig) -> bool {
+    fn same_code_shape(&self, other: &Sig, loose: bool) -> bool {
         let code = |s: &Sig| -> Vec<(u16, SigVal)> {
             s.items
                 .iter()
@@ -381,6 +384,7 @@ impl Sig {
             s.mem
                 .iter()
                 .filter(|(_, v)| !matches!(v, SigVal::Slot(_)))
+                .filter(|(_, v)| !(loose && matches!(v, SigVal::Mem(_))))
                 .copied()
                 .collect()
         };
@@ -537,7 +541,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         None => {
                             if !st.mem.regions.is_empty() {
                                 AVal::Table
-                            } else if st.root && !st.mem.clobbered && st.mem.forgotten(o) {
+                            } else if !st.mem.clobbered && st.mem.forgotten(o) {
                                 AVal::Unk
                             } else if st.root && !st.mem.clobbered {
                                 AVal::Const(U256::ZERO)
@@ -813,6 +817,7 @@ pub struct Analysis<'a> {
     pub call_targets: RefCell<HashSet<usize>>,
     pub steps: RefCell<usize>,
     pub budget_exhausted: RefCell<bool>,
+    abandoned: RefCell<HashSet<usize>>,
 }
 
 const MAX_EXITS: usize = 24;
@@ -893,6 +898,7 @@ impl<'a> Analysis<'a> {
             call_targets: RefCell::new(HashSet::new()),
             steps: RefCell::new(0),
             budget_exhausted: RefCell::new(false),
+            abandoned: RefCell::default(),
         }
     }
 
@@ -1145,6 +1151,7 @@ pub struct Unit {
     pub nodes: Vec<UNode>,
     pub entry: usize,
     pub budget_exhausted: bool,
+    pub exits: Vec<Exit>,
 }
 
 impl<'a> Analysis<'a> {
@@ -1157,12 +1164,31 @@ impl<'a> Analysis<'a> {
         )
     }
 
+    /* A word read from memory the unit did not write stands for what the caller left there.
+    Where copies of it sit splits a block into one node per layout, though only a return
+    through such a word needs that. Without one, the layouts share a node. */
     pub fn build_unit_opts(
         &self,
         entry_block: usize,
         entry_state: AState,
         computed: ComputedJumps,
         max_nodes: usize,
+    ) -> Unit {
+        let unit = self.build_unit_shaped(entry_block, &entry_state, computed, max_nodes, true);
+        let through = |n: &UNode| matches!(n.returns_via, Some(AVal::Mem(_)));
+        match unit.nodes.iter().any(through) {
+            true => self.build_unit_shaped(entry_block, &entry_state, computed, max_nodes, false),
+            false => unit,
+        }
+    }
+
+    fn build_unit_shaped(
+        &self,
+        entry_block: usize,
+        entry_state: &AState,
+        computed: ComputedJumps,
+        max_nodes: usize,
+        loose: bool,
     ) -> Unit {
         let follow_computed = computed == ComputedJumps::Follow;
         let prog = self.prog;
@@ -1223,7 +1249,7 @@ impl<'a> Analysis<'a> {
             let height = |a: &AState| a.stack.len() as isize - a.consumed as isize;
             if let Some(&id) = list.iter().find(|id| {
                 let existing = &nodes[**id].entry;
-                height(existing) == height(st) && existing.sig(prog).same_code_shape(&key.1)
+                height(existing) == height(st) && existing.sig(prog).same_code_shape(&key.1, loose)
             }) {
                 return join(id, st, nodes, work);
             }
@@ -1248,7 +1274,7 @@ impl<'a> Analysis<'a> {
             work.push_back(id);
             id
         };
-        let entry = intern(entry_block, &entry_state, &mut nodes, &mut index, &mut work);
+        let entry = intern(entry_block, entry_state, &mut nodes, &mut index, &mut work);
         while let Some(n) = work.pop_front() {
             crate::clock::check();
             if nodes.len() > max_nodes {
@@ -1450,7 +1476,15 @@ impl<'a> Analysis<'a> {
                         succs.push((id, Edge::False));
                     }
                 }
-                Flow::Halt => {}
+                /* Where the code stops, the addresses still on the stack are the places it
+                would have gone back to. No jump is left to take them. */
+                Flow::Halt => {
+                    let places = st.stack.iter().filter_map(|v| {
+                        let pc = to_usize(*v).filter(|pc| prog.jumpdests.contains(pc))?;
+                        prog.target_block(pc)
+                    });
+                    self.abandoned.borrow_mut().extend(places);
+                }
             }
             nodes[n].call = call;
             for (s, _) in &succs {
@@ -1465,6 +1499,7 @@ impl<'a> Analysis<'a> {
             nodes,
             entry,
             budget_exhausted,
+            exits: Vec::new(),
         };
         // A node that was run again may have left nodes behind that nothing leads to now.
         match rerun.get() {
@@ -1508,6 +1543,7 @@ impl Unit {
                 nodes,
                 entry: 0,
                 budget_exhausted: self.budget_exhausted,
+                exits: self.exits.clone(),
             },
             map,
         )
@@ -1519,6 +1555,7 @@ pub struct Recovered {
     pub main: Unit,
     pub functions: BTreeMap<usize, Unit>,
     pub orphans: BTreeMap<usize, Unit>,
+    pub dead_returns: BTreeSet<usize>,
     pub unresolved_jumps: Vec<usize>,
     pub budget_exhausted: bool,
 }
@@ -1532,9 +1569,11 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
                 nodes: vec![],
                 entry: 0,
                 budget_exhausted: false,
+                exits: Vec::new(),
             },
             functions: BTreeMap::new(),
             orphans: BTreeMap::new(),
+            dead_returns: BTreeSet::new(),
             unresolved_jumps: vec![],
             budget_exhausted: false,
         };
@@ -1569,6 +1608,9 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
             }
         }
     }
+    for (f, unit) in functions.iter_mut() {
+        unit.exits = an.summaries.borrow()[*f].exits.clone();
+    }
     let mut covered: HashSet<usize> = HashSet::new();
     for n in &main.nodes {
         covered.insert(n.block);
@@ -1579,6 +1621,7 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
         }
     }
     let mut orphans = BTreeMap::new();
+    let mut dead_returns = BTreeSet::new();
     let mut unresolved = Vec::new();
     let mut orphan_nodes = 0usize;
     for b in &prog.blocks {
@@ -1592,6 +1635,32 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
             let unit =
                 an.build_unit_opts(b.id, AState::new(), ComputedJumps::Ignore, MAX_WALK_NODES);
             orphan_nodes += unit.nodes.len();
+            /* A helper that never returns leaves the address it was to return to unused.
+            Where the code only reached from there does nothing that is seen from outside,
+            the rest is code that is reached another way and printed there. */
+            let acts = |n: &UNode| {
+                let seen = |i: &crate::disasm::Instruction| {
+                    matches!(
+                        i.opcode,
+                        op::SSTORE | op::TSTORE | op::LOG0
+                            ..=op::LOG4
+                                | op::CALL
+                                | op::CALLCODE
+                                | op::DELEGATECALL
+                                | op::STATICCALL
+                                | op::CREATE
+                                | op::CREATE2
+                                | op::SELFDESTRUCT
+                                | op::RETURN
+                                | op::REVERT
+                    )
+                };
+                !covered.contains(&n.block)
+                    && prog.block_insns(&prog.blocks[n.block]).iter().any(seen)
+            };
+            if an.abandoned.borrow().contains(&b.id) && !unit.nodes.iter().any(acts) {
+                dead_returns.insert(b.id);
+            }
             for n in &unit.nodes {
                 covered.insert(n.block);
             }
@@ -1617,6 +1686,7 @@ pub fn recover(prog: &Program, code_end: usize) -> Recovered {
         main,
         functions,
         orphans,
+        dead_returns,
         unresolved_jumps: unresolved,
         budget_exhausted: budget,
     }

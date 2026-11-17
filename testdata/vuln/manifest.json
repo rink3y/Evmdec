@@ -1,14 +1,11 @@
 {
-  "_comment": "Known-exploited contracts (runtime bytecode fetched from chain). `expected` lists rule ids any of which must fire at or above `min_severity` for the contract to count as detected. `detectable: false` marks bugs outside what bytecode-level pattern rules can see; they are reported but not counted against recall.",
+  "_comment": "Known-exploited contracts (runtime bytecode fetched from chain). `bug` says what went wrong in each. `min_severity` is the lowest severity a report of that bug should carry. `detectable: false` marks a bug the bytecode alone does not show.",
   "contracts": {
     "thedao": {
       "address": "0xBB9bc244D798123fDe783fCc1C72d3Bb8C189413",
       "chain": "mainnet",
       "year": 2016,
       "bug": "reentrancy in splitDAO/withdrawRewardFor: ETH sent before balances update",
-      "expected": [
-        "reentrancy"
-      ],
       "min_severity": "medium"
     },
     "rubixi": {
@@ -16,9 +13,6 @@
       "chain": "mainnet",
       "year": 2016,
       "bug": "constructor renamed to DynamicPyramid(): anyone can become creator",
-      "expected": [
-        "unprotected-owner-write"
-      ],
       "min_severity": "high"
     },
     "kotet": {
@@ -26,9 +20,6 @@
       "chain": "mainnet",
       "year": 2016,
       "bug": "King of the Ether: send() result ignored, compensation lost",
-      "expected": [
-        "unchecked-call"
-      ],
       "min_severity": "medium"
     },
     "governmental": {
@@ -36,10 +27,6 @@
       "chain": "mainnet",
       "year": 2016,
       "bug": "unbounded storage array iteration / clearing exceeds the block gas limit (DoS)",
-      "expected": [
-        "storage-bounded-loop",
-        "call-in-loop"
-      ],
       "min_severity": "low"
     },
     "fomo3d": {
@@ -47,9 +34,6 @@
       "chain": "mainnet",
       "year": 2018,
       "bug": "airdrop() randomness from block attributes, predictable by contracts",
-      "expected": [
-        "weak-randomness"
-      ],
       "min_severity": "medium"
     },
     "bec_token": {
@@ -57,9 +41,6 @@
       "chain": "mainnet",
       "year": 2018,
       "bug": "batchTransfer: cnt * _value overflows, balance check passes",
-      "expected": [
-        "unchecked-arithmetic"
-      ],
       "min_severity": "medium"
     },
     "smt_token": {
@@ -67,9 +48,6 @@
       "chain": "mainnet",
       "year": 2018,
       "bug": "transferProxy: _value + _feeSmt overflow",
-      "expected": [
-        "unchecked-arithmetic"
-      ],
       "min_severity": "medium"
     },
     "powh": {
@@ -77,9 +55,6 @@
       "chain": "mainnet",
       "year": 2018,
       "bug": "Proof of Weak Hands: underflow in transferFrom allowance handling",
-      "expected": [
-        "unchecked-arithmetic"
-      ],
       "min_severity": "medium"
     },
     "spankchain": {
@@ -87,9 +62,6 @@
       "chain": "mainnet",
       "year": 2018,
       "bug": "payment channel: token transfer (malicious ERC20) before state update, reentrancy",
-      "expected": [
-        "reentrancy"
-      ],
       "min_severity": "medium"
     },
     "lendfme": {
@@ -97,9 +69,6 @@
       "chain": "mainnet",
       "year": 2020,
       "bug": "supply(): imBTC (ERC777) transfer hook re-enters withdraw before balance is written",
-      "expected": [
-        "reentrancy"
-      ],
       "min_severity": "medium"
     },
     "bancor_network": {
@@ -107,9 +76,6 @@
       "chain": "mainnet",
       "year": 2020,
       "bug": "safeTransferFrom(token, from, to, value) left public: anyone can move approved balances",
-      "expected": [
-        "arbitrary-transferfrom"
-      ],
       "min_severity": "high"
     },
     "opyn_options": {
@@ -117,10 +83,6 @@
       "chain": "mainnet",
       "year": 2020,
       "bug": "exercise() checks msg.value once per vault inside a loop: one payment exercises many",
-      "expected": [
-        "msg-value-in-loop",
-        "msg-value-multicall"
-      ],
       "min_severity": "medium"
     },
     "pickle_controller": {
@@ -128,11 +90,6 @@
       "chain": "mainnet",
       "year": 2020,
       "bug": "swapExactJarForJar accepts arbitrary jar/target addresses; delegatecall to attacker code",
-      "expected": [
-        "arbitrary-delegatecall",
-        "delegatecall-user-target",
-        "arbitrary-call"
-      ],
       "min_severity": "high"
     },
     "furucombo_proxy": {
@@ -140,11 +97,6 @@
       "chain": "mainnet",
       "year": 2021,
       "bug": "batchExec delegatecalls to caller-chosen handlers; registry allowed an uninitialised Aave proxy",
-      "expected": [
-        "delegatecall-dynamic-target",
-        "delegatecall-user-target",
-        "arbitrary-delegatecall"
-      ],
       "min_severity": "medium"
     },
     "miso_batch_impl": {
@@ -152,9 +104,6 @@
       "chain": "mainnet",
       "year": 2021,
       "bug": "SushiSwap MISO BatchAuction: payable batch() reuses msg.value in each delegatecall",
-      "expected": [
-        "msg-value-multicall"
-      ],
       "min_severity": "medium"
     },
     "cream_cramp_impl": {
@@ -162,9 +111,6 @@
       "chain": "mainnet",
       "year": 2021,
       "bug": "crAMP borrow(): AMP token hook re-enters before borrow balance is written",
-      "expected": [
-        "reentrancy"
-      ],
       "min_severity": "medium"
     },
     "visor_vvisr": {
@@ -172,9 +118,6 @@
       "chain": "mainnet",
       "year": 2021,
       "bug": "deposit(): trusts owner() and delegatedTransferERC20() answers of a caller-supplied contract, then mints",
-      "expected": [
-        "untrusted-return-data"
-      ],
       "min_severity": "medium"
     },
     "umbrella_staking": {
@@ -182,9 +125,6 @@
       "chain": "mainnet",
       "year": 2022,
       "bug": "withdraw(): balance - amount underflows on solc 0.7 without SafeMath",
-      "expected": [
-        "unchecked-arithmetic"
-      ],
       "min_severity": "medium"
     },
     "revest": {
@@ -192,9 +132,6 @@
       "chain": "mainnet",
       "year": 2022,
       "bug": "ERC1155 mint callback re-enters depositAdditionalToFNFT before supply bookkeeping",
-      "expected": [
-        "reentrancy"
-      ],
       "min_severity": "medium"
     },
     "anyswap_router": {
@@ -202,9 +139,6 @@
       "chain": "mainnet",
       "year": 2022,
       "bug": "anySwapOutUnderlyingWithPermit: transferFrom(from, ...) with caller-chosen token and from",
-      "expected": [
-        "arbitrary-transferfrom"
-      ],
       "min_severity": "high"
     },
     "poly_eccm": {
@@ -212,10 +146,6 @@
       "chain": "mainnet",
       "year": 2021,
       "bug": "verifyHeaderAndExecuteTx executes a call whose target and selector come from the (attacker-forged) cross-chain payload",
-      "expected": [
-        "arbitrary-call",
-        "dynamic-call"
-      ],
       "min_severity": "high"
     },
     "curve_peth_impl": {
@@ -223,9 +153,6 @@
       "chain": "mainnet",
       "year": 2023,
       "bug": "Vyper 0.2.15 codegen gave every @nonreentrant function its own lock slot, so the locks never excluded each other",
-      "expected": [
-        "vyper-reentrancy-lock-bug"
-      ],
       "min_severity": "high"
     },
     "nomad_replica_impl": {
@@ -233,7 +160,6 @@
       "chain": "mainnet",
       "year": 2022,
       "bug": "process(): acceptableRoot(0) became true after an upgrade initialised confirmAt[0]; any message passes",
-      "expected": [],
       "min_severity": "medium",
       "detectable": false
     },
@@ -242,9 +168,6 @@
       "chain": "classic",
       "year": 2023,
       "bug": "BOB_POOL (Ethereum Classic): remove_liqudity sends ETC to msg.sender before the stake bookkeeping; the receive hook re-enters and drains the pool",
-      "expected": [
-        "reentrancy"
-      ],
       "min_severity": "medium"
     },
     "balancer_bpool": {
@@ -252,9 +175,6 @@
       "chain": "mainnet",
       "year": 2026,
       "bug": "Balancer V1 BPool: joinswapPoolAmountOut mints a caller-chosen BPT amount for a reverse-computed token amount that is only required to be nonzero; with the reserve compressed to dust the deposit floors to 1 unit",
-      "expected": [
-        "reverse-quote-rounding"
-      ],
       "min_severity": "medium"
     },
     "fence_usdc_pool": {
@@ -262,9 +182,6 @@
       "chain": "avalanche",
       "year": 2026,
       "bug": "Tranche pool: the borrower draw limit subtracts outstanding principal but not principal that matured unpaid, while the lender withdrawal limit subtracts both; the withdrawal limit is computed from an in-memory copy of the record updated to the current time, which storage-level rules do not read",
-      "expected": [
-        "inconsistent-liability-accounting"
-      ],
       "min_severity": "high"
     },
     "payout_queue": {
@@ -272,9 +189,6 @@
       "chain": "mainnet",
       "year": 2026,
       "bug": "queue that pays each entry 125% from the shared balance: ether held beyond the queue goes to whoever fills the queue",
-      "expected": [
-        "calls-leave-account-with-gain"
-      ],
       "min_severity": "high"
     },
     "unifund_swap_lib": {
@@ -282,9 +196,6 @@
       "chain": "mainnet",
       "year": 2026,
       "bug": "swap with the same asset in and out records the gain twice on one ledger entry",
-      "expected": [
-        "calls-leave-account-with-gain"
-      ],
       "min_severity": "high"
     },
     "gdc_token": {
@@ -292,9 +203,6 @@
       "chain": "bsc",
       "year": 2026,
       "bug": "a contract called during transfer paid user-registered accounts before the pair was settled; needs the second contract as it was then",
-      "expected": [
-        "control-handed-out-mid-update"
-      ],
       "min_severity": "high"
     },
     "block_value_wheel": {
@@ -302,9 +210,6 @@
       "chain": "mainnet",
       "year": 2026,
       "bug": "a wheel whose number is the remainder of a sum of block values and a stored counter: every input is known inside the block the bet is placed in",
-      "expected": [
-        "weak-randomness"
-      ],
       "min_severity": "high"
     }
   }

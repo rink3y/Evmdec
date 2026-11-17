@@ -1,0 +1,15 @@
+[package]
+name = "evmdec-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Security analysis of EVM contracts by running them and following where each value comes from"
+
+[lib]
+name = "audit"
+
+[dependencies]
+evmdec = { path = "../decompiler" }
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true

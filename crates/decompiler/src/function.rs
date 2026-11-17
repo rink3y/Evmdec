@@ -54,6 +54,12 @@ fn branch_polarity(cond: ExprId) -> Option<(u32, bool)> {
         if let Some(sel) = emit::selector_mismatch(v[0]) {
             return Some((sel, true));
         }
+        if emit::is_selector_expr(v[0]) {
+            return Some((0, true));
+        }
+    }
+    if emit::is_selector_expr(cond) {
+        return Some((0, false));
     }
     None
 }
@@ -80,16 +86,21 @@ pub fn dispatcher_nonpayable(main: &Lifted, dispatcher: &HashSet<usize>) -> bool
     false
 }
 
-fn mentions(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
-    expr::contains(e, pred)
-}
-
-pub fn discover(main: &Lifted) -> Dispatch {
+pub fn discover(main: &Lifted, table: &[(u32, usize)]) -> Dispatch {
     let mut functions: Vec<Discovered> = Vec::new();
     let mut entries: HashSet<usize> = HashSet::new();
     let mut sel_nodes: Vec<usize> = Vec::new();
     let reach = lift::reachable(main);
     for &nid in &reach {
+        if let Term::Switch { cases, .. } = &main.nodes[nid].term {
+            for &(selector, pc) in table {
+                if let Some(&entry) = cases.iter().find(|c| main.nodes[**c].pc == pc) {
+                    functions.push(Discovered { selector, entry });
+                    entries.insert(entry);
+                    sel_nodes.push(nid);
+                }
+            }
+        }
         if let Term::Branch { cond, t, f } = &main.nodes[nid].term {
             if let Some((sel, body_true)) = branch_polarity(*cond) {
                 let body = if body_true { *t } else { Some(*f) };
@@ -298,13 +309,14 @@ pub fn effects(l: &Lifted) -> Effects {
             match s {
                 Stmt::SStore { .. } => e.writes_storage = true,
                 Stmt::Log { .. } => e.logs = true,
-                Stmt::Call { kind, .. } => {
-                    if *kind == op::STATICCALL {
+                Stmt::Call { kind, addr, .. } => {
+                    let built_in = expr::as_const(*addr).is_some_and(crate::interp::built_in);
+                    if *kind == op::STATICCALL || built_in {
                         e.static_calls = true;
                     } else {
                         e.calls = true;
                     }
-                    if *kind == op::DELEGATECALL || *kind == op::CALLCODE {
+                    if !built_in && (*kind == op::DELEGATECALL || *kind == op::CALLCODE) {
                         e.delegatecall = true;
                     }
                 }
@@ -319,10 +331,10 @@ pub fn effects(l: &Lifted) -> Effects {
             e.selfdestruct = true;
         }
         for x in lift::node_exprs(nd) {
-            if mentions(x, &|n| matches!(n, Node::SLoad(..))) {
+            if expr::contains(x, &|n| matches!(n, Node::SLoad(..))) {
                 e.reads_storage = true;
             }
-            if mentions(x, &|n| {
+            if expr::contains(x, &|n| {
                 matches!(n, Node::Env(o, _) if matches!(*o, op::CALLER | op::ORIGIN | op::TIMESTAMP | op::NUMBER | op::COINBASE | op::GASLIMIT | op::CHAINID | op::SELFBALANCE | op::BASEFEE | op::ADDRESS | op::PREVRANDAO | op::GASPRICE | op::BLOBBASEFEE))
                     || matches!(n, Node::Op(o, _) if matches!(*o, op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH | op::BLOCKHASH))
             }) {
@@ -342,6 +354,7 @@ pub fn is_nonpayable(l: &Lifted) -> bool {
                     is_plain_revert(l, x) || matches!(l.nodes[x].term, Term::Revert { .. })
                 })
             };
+            let value = |e: &ExprId| matches!(expr::node(*e), Node::Env(op::CALLVALUE, _));
             match n {
                 Node::Op(op::ISZERO, v)
                     if matches!(expr::node(v[0]), Node::Env(op::CALLVALUE, _)) =>
@@ -351,6 +364,9 @@ pub fn is_nonpayable(l: &Lifted) -> bool {
                     }
                 }
                 Node::Env(op::CALLVALUE, _) if reverts(*t) => {
+                    return true;
+                }
+                Node::Op(op::OR, v) if v.iter().any(value) && reverts(*t) => {
                     return true;
                 }
                 _ => {}
@@ -365,17 +381,6 @@ pub struct Param {
     pub index: u32,
     pub ty: String,
     pub name: String,
-}
-
-pub fn exprs_with_callees<'a>(
-    l: &Lifted,
-    resolve: &dyn Fn(usize) -> Option<&'a Lifted>,
-    depth: usize,
-) -> Vec<ExprId> {
-    exprs_with_callees_tagged(l, resolve, depth)
-        .into_iter()
-        .map(|r| r.expr)
-        .collect()
 }
 
 pub fn exprs_with_callees_tagged<'a>(
@@ -926,8 +931,7 @@ pub fn infer_internal_returns(l: &Lifted, n_rets: usize) -> Vec<String> {
     if rets.is_empty() {
         return tys;
     }
-    for (i, ty) in tys.iter_mut().enumerate() {
-        let j = n_rets - 1 - i;
+    for (j, ty) in tys.iter_mut().enumerate() {
         let consts: Vec<Option<U256>> = rets.iter().map(|w| expr::as_const(w[j])).collect();
         let all_flags = consts
             .iter()

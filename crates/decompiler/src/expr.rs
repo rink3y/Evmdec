@@ -56,6 +56,7 @@ struct Arena {
     depth: Vec<u32>,
     kinds: Vec<u16>,
     seq: u32,
+    pieces: HashMap<ExprId, Vec<(ExprId, u8)>>,
 }
 
 thread_local! {
@@ -405,20 +406,6 @@ thread_local! {
 
 // The mark belongs to the function being printed. Variable ids repeat from one function
 // to the next, so a mark left behind would change how another function is simplified.
-thread_local! {
-    static HASHED: RefCell<HashMap<U256, Vec<U256>>> = RefCell::new(HashMap::new());
-}
-
-// A hash of constants is folded to a constant, and with that the words it was made of
-// are gone. They are kept here so a folded mapping key can still be traced to its slot.
-pub fn note_hash(hash: U256, words: Vec<U256>) {
-    HASHED.with(|h| h.borrow_mut().insert(hash, words));
-}
-
-pub fn hash_parts(hash: U256) -> Option<Vec<U256>> {
-    HASHED.with(|h| h.borrow().get(&hash).cloned())
-}
-
 pub fn clear_boolean_marks() {
     BOOL_VARS.with(|b| b.borrow_mut().clear());
 }
@@ -486,6 +473,11 @@ pub fn op2(o: u8, a: ExprId, b: ExprId) -> ExprId {
             }
             if a == b {
                 return konst(U256::ZERO);
+            }
+            // Two places counted from one start are apart by the difference of their counts.
+            let (from, to) = (split_offset(b), split_offset(a));
+            if from.0.is_some() && from.0 == to.0 {
+                return konst(to.1.wrapping_sub(from.1));
             }
             if let Node::Op(op::ADD, v) = node(a) {
                 if v[0] == b {
@@ -768,6 +760,29 @@ pub fn size(e: ExprId) -> usize {
     go(e, &mut budget)
 }
 
+pub fn set_pieces(hash: ExprId, pieces: Vec<(ExprId, u8)>) {
+    ARENA.with(|a| a.borrow_mut().pieces.insert(hash, pieces));
+}
+
+pub fn pieces(hash: ExprId) -> Option<Vec<(ExprId, u8)>> {
+    ARENA.with(|a| a.borrow().pieces.get(&hash).cloned())
+}
+
+// Without its pieces a rewritten hash would print as halves of words again.
+fn rehashed(
+    old: ExprId,
+    words: Vec<ExprId>,
+    tail: u8,
+    again: &mut dyn FnMut(ExprId) -> ExprId,
+) -> ExprId {
+    let new = intern(Node::Keccak(words, tail));
+    if let Some(parts) = pieces(old).filter(|_| new != old) {
+        let parts = parts.into_iter().map(|(e, width)| (again(e), width));
+        set_pieces(new, parts.collect());
+    }
+    new
+}
+
 pub fn children(e: ExprId) -> Vec<ExprId> {
     match node(e) {
         Node::Op(_, v) | Node::Keccak(v, _) => v,
@@ -779,22 +794,6 @@ pub fn children(e: ExprId) -> Vec<ExprId> {
         Node::KeccakMem(a, b, _) => vec![a, b],
         _ => vec![],
     }
-}
-
-const MAX_PARTS_SEARCHED: usize = 5_000;
-
-pub fn has_part(e: ExprId, target: ExprId) -> bool {
-    let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![e];
-    while let Some(x) = stack.pop() {
-        if x == target {
-            return true;
-        }
-        if seen.insert(x) && seen.len() <= MAX_PARTS_SEARCHED {
-            stack.extend(children(x));
-        }
-    }
-    false
 }
 
 pub fn contains(e: ExprId, pred: &dyn Fn(&Node) -> bool) -> bool {
@@ -852,7 +851,7 @@ pub fn substitute(
         }
         Node::Keccak(v, t) => {
             let nv: Vec<ExprId> = v.iter().map(|x| substitute(*x, f, memo)).collect();
-            intern(Node::Keccak(nv, t))
+            rehashed(e, nv, t, &mut |x| substitute(x, f, memo))
         }
         Node::MLoad(a, ver) => intern(Node::MLoad(substitute(a, f, memo), ver)),
         Node::SLoad(a, t, ver) => intern(Node::SLoad(substitute(a, f, memo), t, ver)),
@@ -870,12 +869,29 @@ pub fn substitute(
     r
 }
 
-pub fn restamp_memory(e: ExprId, version: u32, memo: &mut HashMap<ExprId, ExprId>) -> ExprId {
+/* A helper counts its versions from zero. Left as they are, what it read from storage
+would be taken for what its caller read at the start. */
+pub fn restamp(
+    e: ExprId,
+    version: u32,
+    storage: u32,
+    memo: &mut HashMap<ExprId, ExprId>,
+) -> ExprId {
     if let Some(r) = memo.get(&e) {
         return *r;
     }
-    let mut again = |x: ExprId| restamp_memory(x, version, memo);
+    let mut again = |x: ExprId| restamp(x, version, storage, memo);
     let r = match node(e) {
+        // What a helper read of another account it read after all its caller had done.
+        Node::Op(o @ (op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH), v) => {
+            let account = again(v[0]);
+            let own = v.get(1).and_then(|s| as_const(*s));
+            let stamp = storage + own.map_or(0, |c| c.low_u64().min(1) as u32);
+            match stamp {
+                0 => intern(Node::Op(o, vec![account])),
+                _ => intern(Node::Op(o, vec![account, konst_u64(u64::from(stamp))])),
+            }
+        }
         Node::Op(o, v) => {
             let nv: Vec<ExprId> = v.iter().map(|x| again(*x)).collect();
             if nv == v {
@@ -890,10 +906,11 @@ pub fn restamp_memory(e: ExprId, version: u32, memo: &mut HashMap<ExprId, ExprId
         }
         Node::Keccak(v, t) => {
             let nv: Vec<ExprId> = v.iter().map(|x| again(*x)).collect();
-            intern(Node::Keccak(nv, t))
+            rehashed(e, nv, t, &mut again)
         }
         Node::MLoad(a, _) => intern(Node::MLoad(again(a), version)),
-        Node::SLoad(a, t, ver) => intern(Node::SLoad(again(a), t, ver)),
+        Node::SLoad(a, t, ver) => intern(Node::SLoad(again(a), t, storage + ver.min(1))),
+        Node::Env(op::SELFBALANCE, ver) => intern(Node::Env(op::SELFBALANCE, storage + ver.min(1))),
         Node::CallDataLoad(a) => intern(Node::CallDataLoad(again(a))),
         Node::ReturnData(s, a) => intern(Node::ReturnData(s, again(a))),
         Node::CopiedWord(k, a, ver) => intern(Node::CopiedWord(k, again(a), ver)),

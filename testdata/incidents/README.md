@@ -10,9 +10,9 @@ This set is the second third of the same incident index the held-out set in
 `--set incidents` and `--offset 1`. No contract and no incident is in both sets.
 
 The two sets have opposite uses. Here every report may be read, every miss may be studied,
-and a rule may be shaped until it finds what it should on these contracts. The held-out set
-is only scored. A rule built here is worth what it then does there.
+and a general cause may be fixed until the analyzer finds what it should on these contracts.
+The held-out set is only scored. What is built here is worth what it then does there.
 
-Score this set with `python3 corpus/heldout_bench.py --set incidents`. The name of each
-flawed contract is the page name at <https://crypto.training/hacks/>, where the incident is
+This set is scored the same way as the held-out set, by reviewers who read each report against
+the incident's write-up, and here their verdicts may be read. The name of each flawed contract is the page name at <https://crypto.training/hacks/>, where the incident is
 described.

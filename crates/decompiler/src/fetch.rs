@@ -1,4 +1,3 @@
-use crate::analyze;
 use crate::clock;
 use crate::decompile::{self, Contract, Link, Options, PartInput, PartRole, ProxyRef, Unfollowed};
 use crate::expr;
@@ -32,9 +31,6 @@ impl Default for Policy {
         }
     }
 }
-
-const MAX_GATES_READ: usize = 8;
-const MAX_CALLERS_CHECKED: usize = 4;
 
 pub type CodeCache = HashMap<String, Vec<u8>>;
 
@@ -350,7 +346,6 @@ impl Fetcher<'_> {
                 });
             }
         }
-        self.read_gates(&mut all);
         let mut contracts = all.into_iter();
         let mut root = contracts.next().expect("the walk starts from the root");
         for mut lc in contracts {
@@ -359,67 +354,6 @@ impl Fetcher<'_> {
         }
         root.unfollowed = unfollowed;
         root
-    }
-
-    fn read_gates(&mut self, all: &mut [Contract]) {
-        for c in all.iter_mut() {
-            let Some(address) = c.address.clone() else {
-                continue;
-            };
-            let callers: Vec<String> = self
-                .calls
-                .iter()
-                .filter(|(_, to)| to.eq_ignore_ascii_case(&address))
-                .map(|(from, _)| from.clone())
-                .take(MAX_CALLERS_CHECKED)
-                .collect();
-            if callers.is_empty() {
-                continue;
-            }
-            let gates = analyze::gates(c);
-            if gates.slots.is_empty() && gates.keys.is_empty() {
-                continue;
-            }
-            let mut read = true;
-            let admit = |caller: &str, admits: &mut Vec<String>| {
-                if !admits.iter().any(|a| a.eq_ignore_ascii_case(caller)) {
-                    admits.push(caller.to_string());
-                }
-            };
-            for slot in gates.slots.iter().take(MAX_GATES_READ) {
-                match self.client.get_storage(&address, &slot.to_hex_padded(32)) {
-                    Ok(v) => {
-                        let held = rpc::addr_to_string(v & expr::mask_bits(160));
-                        for caller in callers.iter().filter(|a| a.eq_ignore_ascii_case(&held)) {
-                            admit(caller, &mut c.admits);
-                        }
-                    }
-                    Err(_) => read = false,
-                }
-            }
-            for key in gates.keys.iter().take(MAX_GATES_READ) {
-                for caller in &callers {
-                    let slot = U256::from_hex_str(caller).and_then(|a| analyze::key_for(*key, a));
-                    let Some(slot) = slot else {
-                        read = false;
-                        continue;
-                    };
-                    match self.client.get_storage(&address, &slot.to_hex_padded(32)) {
-                        Ok(v) if !v.is_zero() => admit(caller, &mut c.admits),
-                        Ok(_) => {}
-                        Err(_) => read = false,
-                    }
-                }
-            }
-            c.gates_read = read;
-            if !c.admits.is_empty() {
-                (self.log)(&format!(
-                    "{} approves {} as a caller",
-                    address,
-                    c.admits.join(", ")
-                ));
-            }
-        }
     }
 
     fn resolve(&mut self, c: Contract, address: &str, code: &[u8]) -> Contract {

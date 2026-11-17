@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>evmdec: EVM bytecode decompiler and smart contract security analyzer</title>
-<meta name="description" content="Decompile any EVM smart contract from its address on any chain, or from raw bytecode, into readable pseudo-Solidity. Recovered functions, storage layout, events and revert reasons, plus a security report (reentrancy, unchecked calls, delegatecall, access control, proxies) with findings keyed to the exact lines.">
-<meta name="keywords" content="EVM decompiler, bytecode decompiler, smart contract decompiler, Solidity decompiler, smart contract security analyzer, reentrancy detection, Ethereum, bytecode analysis">
+<meta name="description" content="Decompiles any EVM smart contract, from its address on any chain or from raw bytecode, into readable pseudo-Solidity, and reports what a run showed an account with no role can bring about, with the steps.">
+<meta name="keywords" content="EVM decompiler, bytecode decompiler, smart contract decompiler, Solidity decompiler, smart contract security analyzer, what an account with no role can bring about, Ethereum, bytecode analysis">
 <meta name="robots" content="index, follow">
 <link rel="canonical" href="__ORIGIN__/">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -14,7 +14,7 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="evmdec">
 <meta property="og:title" content="evmdec, an EVM bytecode decompiler and security analyzer">
-<meta property="og:description" content="Paste a contract address or its bytecode. Get pseudo-Solidity with functions, storage, events and revert reasons, and a security report with each finding keyed to the line it is about.">
+<meta property="og:description" content="Paste a contract address or its bytecode. evmdec decompiles the contract and reports what a run showed an account with no role can bring about, with the steps.">
 <meta property="og:url" content="__ORIGIN__/">
 <meta property="og:image" content="__ORIGIN__/og.png">
 <meta property="og:image:width" content="1200">
@@ -22,22 +22,22 @@
 <meta property="og:image:alt" content="evmdec, inside a revision cloud on vermilion: decompile, analyze, read the lines that matter">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="evmdec, an EVM bytecode decompiler and security analyzer">
-<meta name="twitter:description" content="Paste a contract address or its bytecode. Get pseudo-Solidity and a security report with each finding keyed to its line.">
+<meta name="twitter:description" content="Decompiles a contract and reports what a run showed an account with no role can bring about, with the steps.">
 <meta name="twitter:image" content="__ORIGIN__/og.png">
 <meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@500;600;700&family=Source+Code+Pro:wght@400;600&display=swap">
 <style>
-:root{--danger:#b3261e;
+:root{
  --bg:#ffffff;--fg:#1a1d21;--muted:#5a6069;--line:#b9bec5;--hair:#dcdfe3;--well:#f4f5f7;--rubric:#b3261e;--on-rubric:#ffffff;--focus:#0b57d0;--sel:#dbe8ff;--lit:#fff1c2;
  --band:#132e4f;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#2a4a74;--band-rubric:#ffd27a;--field:#0e2440;--field-fg:#e6eef8;
- --critical:#8f1a12;--high:#b3261e;--medium:#8a5a00;--low:#1a5fb4;--info:#5a6069;
+ --critical:#8f1a12;--high:#b3261e;--medium:#8a5a00;
  --kw:#1a1d21;--ty:#1a1d21;--str:#365b1e;--num:#1a1d21;--cm:#5a6069;--fn:#1a1d21;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23b3261e' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");
  --sans:"Barlow",ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;--cond:"Barlow Condensed","Barlow",ui-sans-serif,system-ui,sans-serif;--mono:"Source Code Pro",ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
  color-scheme:light}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--danger:#ff8a80;--bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--on-rubric:#0f2340;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--band:#081829;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#27416a;--band-rubric:#ffd27a;--field:#0c1f38;--field-fg:#e6eef8;--critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;--kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");color-scheme:dark}}
-:root[data-theme="dark"]{--danger:#ff8a80;--bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--on-rubric:#0f2340;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--band:#081829;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#27416a;--band-rubric:#ffd27a;--field:#0c1f38;--field-fg:#e6eef8;--critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--low:#8ec5ff;--info:#a9bbd3;--kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");color-scheme:dark}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--on-rubric:#0f2340;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--band:#081829;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#27416a;--band-rubric:#ffd27a;--field:#0c1f38;--field-fg:#e6eef8;--critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0f2340;--fg:#e6eef8;--muted:#a9bbd3;--line:#4f6f99;--hair:#28436a;--well:#153052;--rubric:#ffd27a;--on-rubric:#0f2340;--focus:#ffd27a;--sel:#2d4f7e;--lit:#433c1a;--band:#081829;--band-fg:#e6eef8;--band-muted:#a9bbd3;--band-line:#27416a;--band-rubric:#ffd27a;--field:#0c1f38;--field-fg:#e6eef8;--critical:#ff8e86;--high:#ff9d93;--medium:#ffd27a;--kw:#e6eef8;--ty:#e6eef8;--str:#b7e3a0;--num:#e6eef8;--cm:#a9bbd3;--fn:#e6eef8;--cloud:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cpath d='M6 3a3 3 0 0 1 6 0M15 6a3 3 0 0 1 0 6M12 15a3 3 0 0 1-6 0M3 12a3 3 0 0 1 0-6M3 6a3 3 0 0 1 3-3M12 3a3 3 0 0 1 3 3M15 12a3 3 0 0 1-3 3M6 15a3 3 0 0 1-3-3' fill='none' stroke='%23ffd27a' stroke-width='1'/%3E%3C/svg%3E");--chev:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23e6eef8' stroke-width='1.5'/%3E%3C/svg%3E");color-scheme:dark}
 
 *{box-sizing:border-box}
 [hidden]{display:none!important}
@@ -78,8 +78,8 @@ header{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-ite
 .tb>div{padding:7px 14px 9px;border-right:1px solid var(--band-line);min-width:0}
 .tb>div:last-child{border-right:0}
 .tb b{display:block;font-weight:500;font-size:14px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;min-height:1.45em}
-.tb .risk b{color:var(--band-rubric);font:600 18px/1.2 var(--cond);letter-spacing:.02em}
-.tb .risk b.calm{color:var(--band-fg);font:500 14px/1.45 var(--sans)}
+.tb .found b{color:var(--band-rubric);font:600 18px/1.2 var(--cond);letter-spacing:.02em}
+.tb .found b.calm{color:var(--band-fg);font:500 14px/1.45 var(--sans)}
 
 #landing{display:grid;place-content:start center;padding:48px 24px 64px;overflow:auto}
 .sheet{width:min(100%,760px);border:1px solid var(--line);padding:36px 40px 32px;position:relative}
@@ -155,14 +155,14 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .finding .sev{grid-area:s;font:600 12px/1.5 var(--cond);letter-spacing:.1em;text-transform:uppercase}
 .finding .ftitle{grid-area:t;overflow-wrap:anywhere;font-weight:500}
 .finding .fmeta{grid-area:m;color:var(--muted);font-size:12.5px;overflow-wrap:anywhere}
-.fbody{overflow-wrap:anywhere}
-.finding .fmeta code{font:12px/1.5 var(--mono)}
-.fbody{padding:0 12px 14px 50px}
+.finding code{font:12px/1.5 var(--mono)}
+.finding .tag{font:600 11px/1.5 var(--cond);letter-spacing:.08em;text-transform:uppercase;color:var(--fg);border:1px solid var(--line);border-radius:2px;padding:0 5px;white-space:nowrap}
+.findings .none{padding:12px;max-width:70ch}
+.fbody{padding:0 12px 14px 50px;overflow-wrap:anywhere}
 .fbody p{margin:6px 0;max-width:70ch}
-.fbody .ran{margin:6px 0 6px 18px;font:12px/1.5 var(--mono);overflow-wrap:anywhere}
-.fbody .ev{margin:6px 0;padding:6px 10px;background:var(--well);border:1px solid var(--hair);font:12px/1.5 var(--mono);white-space:pre;overflow-x:auto}
-.fbody .goto{font-size:12px;color:var(--muted)}.fbody .goto a{display:inline-block;min-width:24px;min-height:24px;line-height:24px;text-align:center;padding:0 2px}
-.sev-critical{color:var(--critical)}.sev-high{color:var(--high)}.sev-medium{color:var(--medium)}.sev-low{color:var(--low)}.sev-info{color:var(--info)}
+.fbody .steps{margin:6px 0;padding:0 0 0 22px;max-width:70ch}.fbody ul.steps{list-style:disc}.fbody .steps li{margin:2px 0;padding:0;border:0}
+.goto{font-size:12px;color:var(--muted)}.goto a{display:inline-block;min-width:24px;min-height:24px;line-height:24px;text-align:center;padding:0 2px}
+.sev-critical{color:var(--critical)}.sev-high{color:var(--high)}.sev-medium{color:var(--medium)}
 .report{padding:16px 24px 40px;max-width:90ch}
 .report h2{font:600 13px/1.3 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:24px 0 8px}
 .report h2:first-child{margin-top:0}
@@ -173,23 +173,22 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .deps-scroll{overflow-x:auto;white-space:nowrap;scrollbar-width:thin;padding:6px 16px}
 .deps-inner{display:flex;align-items:center;gap:8px;width:max-content;max-width:100%;margin:0 auto}
 .deps-scroll:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+#deps-list{display:flex;gap:6px}
 .deps-lbl{flex:none;font:600 12px/1 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-right:4px}
 .dep{flex:none;display:inline-flex;align-items:center;gap:6px;min-height:28px;padding:2px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:13px/1 var(--sans);cursor:pointer}
 .dep:hover{border-color:var(--fg)}.dep b{font:600 12px/1 var(--cond);letter-spacing:.06em;text-transform:uppercase}.dep code{font:12px/1 var(--mono);color:var(--muted)}
 .dep .r{font:700 11px/1 var(--cond);padding:3px 5px;border-radius:4px;background:var(--muted);color:var(--bg)}.dep .r.hi{background:var(--rubric);color:var(--on-rubric)}.dep .r.md{background:#8a6d00;color:#fff}
-.dep .tag{font:700 11px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;color:var(--danger)}
-.dep.loop{border-color:var(--danger)}
+.dep .why{max-width:30ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:1.5;color:var(--muted)}
 .dep.back{border-style:dashed}
-.dep.cur{background:var(--fg);color:var(--bg);border-color:var(--fg);cursor:default}.dep.cur code,.dep.cur .tag{color:var(--bg)}
+.dep.cur{background:var(--fg);color:var(--bg);border-color:var(--fg);cursor:default}.dep.cur code,.dep.cur .why{color:var(--bg)}
 .graph{padding:16px;max-width:720px}.graph ol,.graph ul{list-style:none;margin:0;padding:0}
-.graph .node{border:1px solid var(--line);border-radius:6px;padding:8px 12px;background:var(--bg);display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:start}
+.graph .node{border:1px solid var(--line);border-radius:6px;padding:8px 12px;background:var(--bg);display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:start}
 .graph .node.me{background:var(--band);color:var(--band-fg);border-color:var(--band)}.graph .node.me code{color:#a9bbd3}
-.graph .node b{font:600 12px/1.4 var(--cond);letter-spacing:.06em;text-transform:uppercase;display:block}.graph .node code{font:12px var(--mono);color:var(--muted)}
-.graph .node .r{font:700 12px/1 var(--cond);padding:4px 6px;border-radius:4px;background:var(--muted);color:var(--bg);align-self:center}.graph .node .r.hi{background:var(--rubric);color:var(--on-rubric)}.graph .node .r.md{background:#8a6d00;color:#fff}
+.graph .node b{font:600 12px/1.4 var(--cond);letter-spacing:.06em;text-transform:uppercase;display:block}.graph .node code{font:12px var(--mono);color:var(--muted);overflow-wrap:anywhere}
+.graph .node .r{font:700 12px/1 var(--cond);padding:4px 6px;border-radius:4px;background:var(--muted);color:var(--bg);align-self:center;white-space:nowrap}.graph .node .r.hi{background:var(--rubric);color:var(--on-rubric)}.graph .node .r.md{background:#8a6d00;color:#fff}
 .graph .node .why{grid-column:1/-1;font-size:12.5px;color:var(--muted)}.graph .node.me .why{color:#a9bbd3}
 .graph .node .open{grid-column:1/-1;justify-self:start;border:1px solid var(--line);border-radius:4px;background:transparent;color:var(--fg);padding:4px 8px;font:600 12px/1 var(--cond);letter-spacing:.08em;text-transform:uppercase;min-height:24px;cursor:pointer}
-.graph .node.loop{border-color:var(--danger)}
-.graph .edge{margin:6px 0 6px 18px;padding:2px 0 2px 12px;border-left:2px solid var(--line);font-size:12.5px;color:var(--muted)}.graph .edge.red{border-left-color:var(--danger);color:var(--danger);font-weight:600}
+.graph .edge{margin:6px 0 6px 18px;padding:2px 0 2px 12px;border-left:2px solid var(--line);font-size:12.5px;color:var(--muted)}
 .graph h2{font:600 12px/1.4 var(--cond);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 8px}
 @media (max-width:720px){.deps-scroll{padding:6px 12px}}
 .report .tscroll{overflow-x:auto;max-width:100%;margin:8px 0 16px;border:1px solid var(--hair);background:linear-gradient(90deg,var(--bg) 30%,transparent),linear-gradient(90deg,transparent,var(--bg) 70%) 100% 0,radial-gradient(farthest-side at 0 50%,rgba(0,0,0,.18),transparent),radial-gradient(farthest-side at 100% 50%,rgba(0,0,0,.18),transparent) 100% 0;background-repeat:no-repeat;background-size:40px 100%,40px 100%,14px 100%,14px 100%;background-attachment:local,local,scroll,scroll}
@@ -203,6 +202,8 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 .report ul{margin:0;padding:0;list-style:none}
 .report li{margin:0;padding:3px 0;border-bottom:1px solid var(--hair)}
 .report code{font:12.5px/1.5 var(--mono)}
+.report .no{color:var(--muted)}
+.report li .goto{display:block}
 
 @media (prefers-reduced-motion:no-preference){.code li,.finding{transition:background .2s ease-out}}
 @media (max-width:1100px){main{grid-template-columns:240px minmax(0,1fr)}.details{grid-column:1/-1;border-left:0;border-top:1px solid var(--line)}.tb{grid-template-columns:repeat(4,minmax(0,1fr))}}
@@ -228,6 +229,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
  .report .stack td::before{content:attr(data-label);flex:0 0 5.5em;color:var(--muted);font:600 11px/1.7 var(--cond);letter-spacing:.08em;text-transform:uppercase}
  .report .stack td code{white-space:normal;overflow-wrap:anywhere}
  .report .stack td br{display:none}.report .stack td .pt{margin-right:8px}
+ .report .stack td:empty{display:none}
 }
 </style>
 </head>
@@ -247,14 +249,14 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 <section id="landing" aria-label="Start">
   <div class="sheet">
     <h1>Decompile any EVM contract.<br>Then <em>read what it really does.</em></h1>
-    <p>Paste an address and pick its chain, or paste the bytecode of a contract you are about to deploy. You get structured pseudo-Solidity with the functions, storage, events and revert reasons recovered, and a security report whose findings are keyed to the lines they are about.</p>
+    <p>Paste an address and pick its chain, or paste the bytecode of a contract you are about to deploy. You get structured pseudo-Solidity with the functions, storage, events and revert reasons recovered, and a report of what a run showed an account with no role can bring about, with the steps.</p>
     <ul class="examples" aria-label="Examples"><li>Try</li>
       <li><button type="button" data-try="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" data-chain="mainnet">WETH</button></li>
       <li><button type="button" data-try="0xdAC17F958D2ee523a2206206994597C13D831ec7" data-chain="mainnet">USDT</button></li>
       <li><button type="button" data-try="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" data-chain="mainnet">USDC proxy</button></li>
     </ul>
     <div id="landing-err"></div>
-    <div class="foot"><span>Proxies and diamonds assembled with their implementation and facets</span><span>Every block checked against a concrete EVM</span><span>Findings carry a confidence</span></div>
+    <div class="foot"><span>Proxies and diamonds assembled with their implementation and facets</span><span>Every block checked against a concrete EVM</span><span>Each finding comes with the steps of the run that showed it</span></div>
     <div class="foot foot-support"><span>Free to use, built in the open</span><button type="button" class="sup-foot" aria-label="Support evmdec: copy the address notevil.eth, 0x1a8553a290EeD8B9Bd7dD54E1D116FA48d334978" data-addr="0x1a8553a290EeD8B9Bd7dD54E1D116FA48d334978"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 14s-5.5-3.6-5.5-7.6A3.1 3.1 0 0 1 8 4.6a3.1 3.1 0 0 1 5.5 1.8C13.5 10.4 8 14 8 14z" fill="currentColor"/></svg><span class="w">Support it</span><code>notevil.eth</code><code class="a">0x1a85…4978</code><span class="hint">click to copy</span></button></div>
   </div>
 </section>
@@ -265,8 +267,8 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
   <div><span class="lbl">Compiler</span><b id="tb-compiler"></b></div>
   <div><span class="lbl">Code</span><b id="tb-code"></b></div>
   <div><span class="lbl">Coverage</span><b id="tb-coverage"></b></div>
-  <div><span class="lbl">Findings</span><b id="tb-findings"></b></div>
-  <div class="risk"><span class="lbl">Risk</span><b id="tb-risk" class="calm"></b></div>
+  <div><span class="lbl">Runs</span><b id="tb-runs"></b></div>
+  <div class="found"><span class="lbl">Findings</span><b id="tb-findings" class="calm"></b></div>
 </div>
 <nav id="deps" class="deps" aria-label="Trusted contracts" hidden><div class="deps-scroll" role="region" aria-label="Contracts this contract trusts" tabindex="0"><div class="deps-inner"><span class="deps-lbl" id="deps-lbl"></span><span id="deps-list"></span></div></div></nav>
 <main>
@@ -306,8 +308,10 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 'use strict';
 const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let DATA=null,CUR=null,FINDINGS=[],CALLOUTS=new Map(),SRC_LINES=[],SHOWN=[],HELPERS=new Set();
-const SEV={critical:0,high:1,medium:2,low:3,info:4},SEVL={critical:'Critical',high:'High',medium:'Medium',low:'Low',info:'Info'};
+let DATA=null,CUR=null,FINDINGS=[],NUM=new Map(),AT=[],CALLOUTS=new Map(),SRC_LINES=[],SHOWN=[],HELPERS=new Set();
+const SEV={critical:0,high:1,medium:2},SEVL={critical:'Critical',high:'High',medium:'Medium'};
+const NONE='No run showed an account with no role gaining, taking from another account, or taking the contract over. That is what was tried, not a proof that nothing can.';
+const tick=s=>esc(s).replace(/`([^`]+)`/g,'<code>$1</code>'),plain=s=>String(s).replace(/`/g,'');
 const root=document.documentElement,status=$('#status');
 function say(t){status.textContent='';setTimeout(()=>{status.textContent=t},30)}
 
@@ -351,46 +355,47 @@ async function go(){const q=$('#q').value.trim();if(!q)return;const mine=++REQ;c
   const j=await r.json();if(mine!==REQ)return;if(!r.ok)throw new Error(j.error||r.statusText);
   DATA=j;CUR=null;document.body.dataset.state='loaded';$('#landing-err').innerHTML='';
   if(isAddr){history.replaceState(null,'','?chain='+encodeURIComponent(chain)+'&address='+q)}
-  ROOT=j;ENTRIES=buildEntries(j);show(0);
-  document.title=(isAddr?q.slice(0,10)+'…'+q.slice(-4)+' on '+chain:'pasted bytecode')+' · evmdec: risk '+j.report.risk_score+'/100';
-  say('Decompiled: '+j.contract.stats.external_functions+' external functions, '+FINDINGS.length+' findings, risk '+j.report.risk_score+' of 100');
+  ROOT=j;ENTRIES=buildEntries(j);show(0);const found=headline(tally(j.report));
+  document.title=(isAddr?q.slice(0,10)+'…'+q.slice(-4)+' on '+chain:'pasted bytecode')+' · evmdec: '+found;
+  say('Decompiled: '+j.contract.stats.external_functions+' external functions, '+found);
  }catch(e){if(mine!==REQ)return;const msg='<div class="err" role="alert"><b>Could not decompile.</b> '+esc(e.message||e)+' Check the address and chain, or paste the bytecode directly.</div>';if(DATA){$('#panel-code').innerHTML=msg;selectTab($('#tab-code'))}else $('#landing-err').innerHTML=msg;say('Failed: '+(e.message||e))}
  finally{if(mine===REQ){btn.disabled=false;btn.textContent='Decompile';document.body.removeAttribute('aria-busy')}}}
 
-function riskWord(s){return s>=80?'Critical':s>=40?'High':s>=20?'Medium':s>=8?'Low':'Minimal'}
-function summaryText(sum){return ['critical','high','medium','low','info'].filter(k=>sum[k]).map(k=>sum[k]+' '+SEVL[k].toLowerCase()).join(', ')||'no findings'}
+function tally(rep){const f=(rep&&rep.findings)||[];const by={};f.forEach(x=>{by[x.severity]=(by[x.severity]||0)+1});return {n:f.length,by,worst:f.slice().sort((a,b)=>SEV[a.severity]-SEV[b.severity])[0]||null}}
+function nFindings(n){return n?n+' finding'+(n===1?'':'s'):'no findings'}
+function countText(t){return Object.keys(SEV).filter(k=>t.by[k]).map(k=>t.by[k]+' '+k).join(', ')||'no findings'}
+function headline(t){return t.n?nFindings(t.n)+', highest severity '+t.worst.severity:'no findings'}
+function badge(t){return '<span class="r'+(t.worst?(t.worst.severity==='medium'?' md':' hi'):'')+'">'+nFindings(t.n)+'</span>'}
+function worstLine(t){return t.worst?'Most severe, '+t.worst.severity+': '+tick(t.worst.title):''}
 let ROOT=null,ENTRIES=[],CURRENT=0;
 function partOf(f){return f.part||0}
-function findingPart(f,full){const fn=f.function||'';const m=/ @ (0x[0-9a-fA-F]{40})/.exec(fn);if(!m)return fn?0:-1;const i=(full.contract.parts||[]).findIndex(p=>p.address.toLowerCase()===m[1].toLowerCase());return i<0?0:i}
+function findingPart(f,full){const g=full.contract.functions.find(x=>(f.selector&&x.selector===f.selector)||x.name===f.function);return g?partOf(g):-1}
 function partView(full,i){const c=full.contract;const parts=c.parts||[];if(!parts.length||i<0)return full;const p=parts[i];
  const contract=Object.assign({},c,{source:p.source,functions:c.functions.filter(f=>partOf(f)===i),storage:p.storage,stats:p.stats,language:p.compiler,address:p.address,view_part:i});
- const findings=(full.report.findings||[]).filter(f=>{const k=findingPart(f,full);return k===-1||k===i});
- return {contract,report:Object.assign({},full.report,{findings}),report_markdown:full.report_markdown,disassembly:(full.parts_disassembly||[])[i]||[]}}
-function buildEntries(root){const c=root.contract;const out=[{label:c.composite?'whole':'this',address:c.address||'',risk:root.report.risk_score,loop:false,data:root}];
- (c.parts||[]).forEach((p,i)=>out.push({label:i===0?'shell':(p.role==='implementation'?'impl':'facet '+i),address:p.address,risk:null,loop:false,data:partView(root,i)}));
- const linked=root.linked||[];const order=linked.map((e,i)=>i).sort((i,j)=>{const li=loopWithIn(root,linked[i].contract.address),lj=loopWithIn(root,linked[j].contract.address);if(li!==lj)return li?-1:1;return linked[j].report.risk_score-linked[i].report.risk_score});
- order.forEach(i=>{const e=linked[i];out.push({label:kindOf(e),address:e.contract.address||'',risk:e.report.risk_score,loop:loopWithIn(root,e.contract.address),data:{contract:e.contract,report:e.report,report_markdown:e.report_markdown,disassembly:e.disassembly||[]},linked:i})});
+ const all=full.report.findings||[];const findings=all.filter(f=>{const k=findingPart(f,full);return k===-1||k===i});
+ const chains=(full.report.chains||[]).map(ch=>({summary:ch.summary,steps:ch.steps.map(s=>findings.indexOf(all[s]))})).filter(ch=>ch.steps.every(s=>s>=0));
+ return {contract,report:Object.assign({},full.report,{findings,chains}),report_markdown:full.report_markdown,disassembly:(full.parts_disassembly||[])[i]||[]}}
+function buildEntries(root){const c=root.contract;const out=[{label:c.composite?'whole':'this',address:c.address||'',tally:tally(root.report),data:root}];
+ (c.parts||[]).forEach((p,i)=>out.push({label:i===0?'shell':(p.role==='implementation'?'impl':'facet '+i),address:p.address,tally:null,data:partView(root,i)}));
+ const linked=root.linked||[];const ts=linked.map(e=>tally(e.report));const rank=t=>t.worst?SEV[t.worst.severity]:9;
+ const order=linked.map((e,i)=>i).sort((i,j)=>(rank(ts[i])-rank(ts[j]))||(ts[j].n-ts[i].n));
+ order.forEach(i=>{const e=linked[i];out.push({label:'contract',address:e.contract.address||'',tally:ts[i],data:{contract:e.contract,report:e.report,report_markdown:e.report_markdown,disassembly:e.disassembly||[]},linked:i})});
  return out}
 function show(i){CURRENT=i;DATA=ENTRIES[i].data;CUR=null;rerender()}
 function shortA(a){a=a||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
-function riskClass(r){return r>=50?'hi':r>=20?'md':''}
-function kinds(rep){const k=rep&&rep.contract_kind;return (Array.isArray(k)?k:(typeof k==='string'?[k]:[])).map(x=>String(x).trim()).filter(x=>x&&x!=='unclassified')}
-function kindOf(entry){const k=entry.report&&entry.report.contract_kind;const s=Array.isArray(k)?k[0]:(typeof k==='string'?k:'');return s&&s!=='unclassified'?s:'contract'}
-function loopWithIn(root,addr){const a=(addr||'').toLowerCase();return (root.report.findings||[]).some(f=>f.id==='trusted-callee-loop'&&f.severity==='critical'&&(f.description||'').toLowerCase().includes(a))}
 function howLinked(c,addr,lc){const a=(addr||'').toLowerCase();const lk=lc&&lc.link;if(lk){const far=lk.depth>1?' · called by '+shortA(lk.from)+' · '+lk.depth+' calls away':'';const ok=(lc.admits||[]).some(x=>x.toLowerCase()===(lk.from||'').toLowerCase());return lk.how+far+(ok?' · its storage approves that caller':'')}const st=(c.stored_targets||[]).find(([,x])=>x.toLowerCase()===a);if(st)return 'held in storage slot '+(st[0].replace(/^0x0*/,'0x')||'0x0');if((c.call_targets||[]).some(x=>x.toLowerCase()===a))return 'hard-coded in the code';if((c.library_targets||[]).some(x=>x.toLowerCase()===a))return 'library, run in this contract\'s storage';return 'linked'}
-function worstOf(entry){const f=(entry.report&&entry.report.findings||[]).filter(x=>x.severity!=='info')[0];return f?f.title:'no findings'}
 function depsBand(){const el=$('#deps');if(ENTRIES.length<2){el.hidden=true;return}
- let out='';ENTRIES.forEach((e,i)=>{const cur=i===CURRENT;out+='<button type="button" class="dep'+(e.loop?' loop':'')+(cur?' cur':'')+'" data-entry="'+i+'"'+(cur?' aria-current="true"':'')+' aria-label="'+esc(e.label+' '+e.address+(e.risk==null?'':', risk '+e.risk)+(e.loop?', trust loop':'')+(cur?', shown':''))+'"><b>'+esc(e.label)+'</b><code>'+esc(shortA(e.address))+'</code>'+(e.risk==null?'':'<span class="r '+riskClass(e.risk)+'">'+e.risk+'</span>')+(e.loop?'<span class="tag">loop</span>':'')+'</button>'});
+ let out='';ENTRIES.forEach((e,i)=>{const cur=i===CURRENT,t=e.tally;out+='<button type="button" class="dep'+(cur?' cur':'')+'" data-entry="'+i+'"'+(cur?' aria-current="true"':'')+' aria-label="'+esc(e.label+' '+e.address+(t?', '+nFindings(t.n)+(t.worst?', most severe: '+plain(t.worst.title):''):'')+(cur?', shown':''))+'"><b>'+esc(e.label)+'</b><code>'+esc(shortA(e.address))+'</code>'+(t?badge(t)+(t.worst?'<span class="why" title="'+esc(plain(t.worst.title))+'">'+tick(t.worst.title)+'</span>':''):'')+'</button>'});
  $('#deps-lbl').textContent='Contracts';$('#deps-list').innerHTML=out;el.hidden=false;
  el.querySelectorAll('button[data-entry]').forEach(b=>b.addEventListener('click',()=>{const i=+b.dataset.entry;if(i!==CURRENT){show(i);say('Showing '+ENTRIES[i].label+' '+ENTRIES[i].address)}}))}
 function rerender(){titleBlock();prepareFindings();renderFns();renderAll();depsBand();selectTab($('#tab-code'));$('#panel-code').scrollTop=0}
 function graphPanel(){const root=ROOT||DATA;const c=root.contract;const linked=root.linked||[];const parts=(c.parts||[]).slice(1);
  if(!linked.length&&!parts.length)return '<div class="graph"><p>This contract was analysed on its own: no implementation, facets or linked contracts were fetched. Decompile by address to have them fetched.</p></div>';
- const node=(cls,title,addr,risk,why,openIdx)=>'<div class="node '+cls+'"><div><b>'+esc(title)+'</b><code>'+esc(addr)+'</code></div>'+(risk==null?'<span></span>':'<span class="r '+riskClass(risk)+'" aria-label="risk '+risk+' of 100">'+risk+'</span>')+(why?'<div class="why">'+why+'</div>':'')+(openIdx==null?'':'<button type="button" class="open" data-linked="'+openIdx+'">Open</button>')+'</div>';
- let out='<div class="graph"><ol><li>'+node('me','this contract'+(c.composite?' · '+c.composite.kind:''),c.address||'pasted bytecode',root.report.risk_score,'',null)+'</li>';
+ const node=(cls,title,addr,t,why,openIdx)=>'<div class="node '+cls+'"><div><b>'+esc(title)+'</b><code>'+esc(addr)+'</code></div>'+(t?badge(t):'<span></span>')+(why?'<div class="why">'+why+'</div>':'')+(openIdx==null?'':'<button type="button" class="open" data-linked="'+openIdx+'">Open</button>')+'</div>';
+ const mine=tally(root.report);let out='<div class="graph"><ol><li>'+node('me','this contract'+(c.composite?' · '+c.composite.kind:''),c.address||'pasted bytecode',mine,worstLine(mine),null)+'</li>';
  if(parts.length){out+='<li><h2>Runs in this contract\'s storage</h2><ul>';parts.forEach((p,i)=>{out+='<li><div class="edge">delegatecall · '+esc(p.role)+(p.selectors.length?' · '+p.selectors.length+' selectors':'')+'</div>'+node('',p.role,p.address,null,esc(p.compiler||''),null).replace(/<\/div>$/,'<button type="button" class="open" data-part="'+(i+1)+'">Open</button></div>')+'</li>'});out+='</ul></li>'}
- if(linked.length){out+='<li><h2>Contracts it calls</h2><ul>';linked.forEach((e,i)=>{const a=e.contract.address||'';const loop=loopWithIn(root,a);const lf=(root.report.findings||[]).find(f=>f.id==='trusted-callee-loop'&&(f.description||'').toLowerCase().includes(a.toLowerCase()));
-   out+='<li><div class="edge'+(loop?' red':'')+'">'+esc(howLinked(c,a,e.contract))+(lf?' · called on a path anyone can take':'')+'</div>'+node(loop?'loop':'',kindOf(e),a,e.report.risk_score,esc(worstOf(e))+(loop?' · <b style="color:var(--danger)">calls back into a gated function: trust loop</b>':''),i)+'</li>'});out+='</ul></li>'}
+ if(linked.length){out+='<li><h2>Contracts it calls</h2><ul>';linked.forEach((e,i)=>{const a=e.contract.address||'',t=tally(e.report);
+   out+='<li><div class="edge">'+esc(howLinked(c,a,e.contract))+'</div>'+node('','contract',a,t,worstLine(t),i)+'</li>'});out+='</ul></li>'}
  const left=c.unfollowed||[];if(left.length){out+='<li><h2>Call targets not fetched</h2><ul>';left.forEach(u=>{out+='<li><div class="edge">called by '+esc(shortA(u.from))+'</div><div class="node"><div><b>not fetched</b><code>'+esc(u.target)+'</code></div><span></span><div class="why">'+esc(u.reason)+'</div></div></li>'});out+='</ul></li>'}
  out+='</ol></div>';return out}
 function titleBlock(){const c=DATA.contract,s=c.stats,rep=DATA.report;const meta=(c.info&&c.info.metadata)||{};
@@ -400,17 +405,16 @@ function titleBlock(){const c=DATA.contract,s=c.stats,rep=DATA.report;const meta
  $('#tb-compiler').textContent=c.language||(meta.compiler?meta.compiler+' '+(meta.version||''):'unknown');
  $('#tb-code').textContent=s.code_bytes.toLocaleString()+' bytes · '+s.external_functions+' ext / '+s.internal_functions+' int';
  $('#tb-coverage').textContent=s.covered_blocks+'/'+s.code_blocks+' blocks · '+s.unresolved_jumps+' unresolved · '+s.time_ms+' ms';
- $('#tb-findings').textContent=summaryText(rep.summary);
- const r=$('#tb-risk');r.textContent=rep.risk_score+'/100 · '+riskWord(rep.risk_score);r.classList.toggle('calm',rep.risk_score<8);
+ const t=tally(rep),st=rep.stats;$('#tb-runs').textContent=st.functions_ended+'/'+st.functions+' functions ended · '+st.calls_made+' calls · '+st.ms+' ms';
+ const fb=$('#tb-findings');fb.textContent=countText(t);fb.classList.toggle('calm',!t.n);
 }
 
-function prepareFindings(){const f=(DATA.report.findings||[]).slice();f.sort((a,b)=>(SEV[a.severity]-SEV[b.severity])||((a.function?0:1)-(b.function?0:1)));FINDINGS=f;
+function fnLine(f,trimmed){let k=trimmed.findIndex(l=>l.startsWith('function '+f.function+'('));if(k<0)k=trimmed.findIndex(l=>l.startsWith(f.function+'(')&&l.endsWith('{'));
+ if(k<0&&f.selector){const s=trimmed.findIndex(l=>l.startsWith('// selector '+f.selector));if(s>=0&&s+1<trimmed.length)k=s+1}return k}
+function prepareFindings(){const all=DATA.report.findings||[];const order=all.map((f,i)=>i).sort((a,b)=>(SEV[all[a].severity]-SEV[all[b].severity])||(a-b));FINDINGS=order.map(i=>all[i]);NUM=new Map(order.map((i,n)=>[i,n+1]));
  SRC_LINES=DATA.contract.source.split('\n');CALLOUTS=new Map();HELPERS=new Set((DATA.contract.functions||[]).filter(f=>f.kind==='internal').map(f=>f.name));const trimmed=SRC_LINES.map(l=>l.trim());
- const mark=(k,n)=>{if(k<0)return false;if(!CALLOUTS.has(k))CALLOUTS.set(k,[]);const arr=CALLOUTS.get(k);if(!arr.includes(n))arr.push(n);return true};
- const core=t=>{const m=t.match(/(\.(?:call|staticcall|delegatecall|callcode)[({]|selfdestruct\(|emit |stor_\w+(?:\[[^\]]*\])* = |ecrecover\(|block\.(?:timestamp|number|prevrandao)|tx\.origin)/);return m?t.slice(m.index,m.index+40):null};
- f.forEach((fd,i)=>{let any=false;(fd.evidence||[]).forEach(ev=>{const t=ev.replace(/\s*\/\/.*$/,'').trim();if(!t)return;let k=trimmed.findIndex(l=>l.replace(/\s*\/\/.*$/,'')===t);if(k<0){const head=t.slice(0,48);k=trimmed.findIndex(l=>l.startsWith(head))}if(k<0){const c=core(t);if(c)k=trimmed.findIndex(l=>l.includes(c))}any=mark(k,i+1)||any});
-  if(!any&&fd.function){const name=fd.function.split(' [')[0];const k=trimmed.findIndex(l=>l.startsWith('function '+name+'(')||l.startsWith(name+'('));mark(k,i+1)}});
- $('#details-h').textContent='Details · '+f.length+' finding'+(f.length===1?'':'s')}
+ AT=FINDINGS.map(f=>fnLine(f,trimmed));AT.forEach((k,i)=>{if(k<0)return;if(!CALLOUTS.has(k))CALLOUTS.set(k,[]);CALLOUTS.get(k).push(i+1)});
+ $('#details-h').textContent='Details · '+nFindings(FINDINGS.length)}
 
 function hl(src){const KW=/^(function|contract|if|else|while|return|revert|require|assert|emit|event|error|external|internal|view|pure|payable|returns|mapping|fallback|receive|constructor|break|continue|switch|case|goto|true|false|unchecked|delete|new)$/,TY=/^(address|uint\d*|int\d*|bool|bytes\d*|string)$/;
  return esc(src).replace(/(\/\/[^\n]*)|(&quot;(?:[^\\\n]|\\.)*?&quot;)|\b(0x[0-9a-fA-F]+|\d+)\b|\b([A-Za-z_]\w*)\b/g,(m,cm,st,nu,id)=>{if(cm)return '<span class="cm">'+cm+'</span>';if(st)return '<span class="st">'+st+'</span>';if(nu)return '<span class="nu">'+nu+'</span>';if(KW.test(id))return '<span class="kw">'+id+'</span>';if(TY.test(id))return '<span class="ty">'+id+'</span>';return id}).replace(/(<span class="kw">function<\/span>) ([A-Za-z_]\w*)/g,'$1 <span class="fnname">$2</span>').replace(/(<span class="fnname">)?\b([A-Za-z_]\w*)(?=\()/g,(m,def,name)=>(def||!HELPERS.has(name))?m:'<a class="fnref" href="#fn-'+name+'" data-fn="'+name+'" aria-label="Go to the definition of '+name+'">'+name+'</a>')}
@@ -428,24 +432,23 @@ function helpersOf(c,pc){const out=[];const seen=new Set([pc]);const work=[pc];w
 function renderCode(){const c=DATA.contract;let ranges=[];let helpers=[];
  if(CUR!=null){const r=fnRange(c,CUR);if(r){ranges.push(r);helpersOf(c,CUR).forEach(q=>{const h=fnRange(c,q);if(h){ranges.push(h);helpers.push(c.functions.find(x=>x.pc===q).name)}})}}
  if(!ranges.length)ranges=[[0,SRC_LINES.length-1]];SHOWN=ranges;
- const block=([from,to])=>{let rows='';for(let i=from;i<=to;i++){const l=SRC_LINES[i];const co=CALLOUTS.get(i);const cls=co?' flagged':'';let bubbles='';if(co)bubbles='<span class="co-cell">'+co.map(n=>'<a class="co" href="#F'+n+'" aria-label="Finding '+n+': '+esc(FINDINGS[n-1].title)+'">'+n+'</a>').join('')+'</span>';const dm=/^\s*function ([A-Za-z_]\w*)\(/.exec(l);const def=dm&&HELPERS.has(dm[1])?dm:null;rows+='<li id="L'+(i+1)+'" class="ln'+cls+'"'+(def?' data-fn="'+def[1]+'"':'')+'>'+bubbles+'<code>'+(hl(l)||' ')+'</code></li>'}return '<ol class="code" aria-label="Decompiled code, lines '+(from+1)+' to '+(to+1)+'" style="counter-reset:ln '+from+'">'+rows+'</ol>'};
+ const block=([from,to])=>{let rows='';for(let i=from;i<=to;i++){const l=SRC_LINES[i];const co=CALLOUTS.get(i);const cls=co?' flagged':'';let bubbles='';if(co)bubbles='<span class="co-cell">'+co.map(n=>'<a class="co" href="#F'+n+'" aria-label="Finding '+n+': '+esc(plain(FINDINGS[n-1].title))+'">'+n+'</a>').join('')+'</span>';const dm=/^\s*function ([A-Za-z_]\w*)\(/.exec(l);const def=dm&&HELPERS.has(dm[1])?dm:null;rows+='<li id="L'+(i+1)+'" class="ln'+cls+'"'+(def?' data-fn="'+def[1]+'"':'')+'>'+bubbles+'<code>'+(hl(l)||' ')+'</code></li>'}return '<ol class="code" aria-label="Decompiled code, lines '+(from+1)+' to '+(to+1)+'" style="counter-reset:ln '+from+'">'+rows+'</ol>'};
  $('#panel-code').innerHTML=ranges.map(block).join('');
  const range=ranges[0],from=range[0],to=range[1];const f=CUR!=null?c.functions.find(x=>x.pc===CUR):null;const rangeText=ranges.map(([a,b])=>(a+1)+' to '+(b+1)).join(' and ');const scale=$('#scale');scale.hidden=$('#tab-code').getAttribute('aria-selected')!=='true';
  scale.innerHTML='<span>'+(f?'Showing <b>'+esc(f.name)+'</b>'+(helpers.length?' and its helper'+(helpers.length>1?'s ':' ')+helpers.map(h=>'<b>'+esc(h)+'</b>').join(', '):'')+' (lines '+rangeText+' of '+SRC_LINES.length+')':'Showing the <b>whole contract</b>, '+SRC_LINES.length+' lines')+'</span><span><b>'+CALLOUTS.size+'</b> flagged line'+(CALLOUTS.size===1?'':'s')+'</span><span>Callouts key to the details at right</span>';}
 
-function findingItem(n,f,open){const fn=f.function?f.function.split(' [')[0]:'contract';const lines=[];CALLOUTS.forEach((arr,k)=>{if(arr.includes(n))lines.push(k+1)});
- const head='<span class="fnum co" aria-hidden="true">'+n+'</span><span class="sev sev-'+f.severity+'">'+SEVL[f.severity]+'</span><span class="ftitle">'+esc(f.title)+'</span><span class="fmeta"><code>'+esc(fn)+'</code> · '+esc(f.confidence)+' confidence'+(f.sites>1?' · '+f.sites+' sites':'')+'</span>';
- const ev=(f.evidence||[]).map(e=>'<pre class="ev"><code>'+hl(e)+'</code></pre>').join('');
- const calls=(f.setup||[]).map((c,i)=>'<li>Earlier call '+(i+1)+': <code>'+esc(c)+'</code></li>').join('')+(f.witness?'<li>Input: <code>'+esc(f.witness)+'</code></li>':'');
- const seen=(f.observed||[]).map(o=>'<li>'+esc(o)+'</li>').join('');
- const ran=(calls||seen)?'<p><b>Confirmed by running it.</b></p><ul class="ran">'+calls+seen+'</ul>':'';
- const goto=lines.length?'<p class="goto">Lines '+lines.map(l=>'<a href="#L'+l+'">'+l+'</a>').join(', ')+'</p>':'';
- return '<li class="finding" id="F'+n+'"><button type="button" aria-expanded="'+(open?'true':'false')+'" aria-controls="FB'+n+'">'+head+'</button><div class="fbody" id="FB'+n+'"'+(open?'':' hidden')+'><p>'+esc(f.description)+'</p>'+ev+ran+'<p><b>Recommendation.</b> '+esc(f.recommendation)+'</p>'+goto+'</div></li>'}
-function renderFindings(){$('#findings').innerHTML=FINDINGS.length?FINDINGS.map((f,i)=>findingItem(i+1,f,i===0)).join(''):'<li class="finding"><div class="fbody" style="padding:12px">No findings. The analyzer is heuristic: absence of findings is not proof of safety.</div></li>';
+function findingItem(n,f,open,p){const k=AT[n-1],id=p+n,body=p+'B'+n;
+ const head='<span class="fnum co" aria-hidden="true">'+n+'</span><span class="sev sev-'+f.severity+'">'+SEVL[f.severity]+'</span><span class="ftitle">'+tick(f.title)+'</span><span class="fmeta"><code>'+esc(f.function)+'</code>'+(f.source?' · '+esc(f.source):'')+(f.reentered?' · <span class="tag">re-entered</span>':'')+'</span>';
+ const steps='<p><b>Steps.</b></p><ol class="steps">'+f.steps.map(s=>'<li>'+tick(s)+'</li>').join('')+'</ol>';
+ const rests=(f.rests_on||[]).length?'<p><b>Rests on.</b></p><ul class="steps">'+f.rests_on.map(s=>'<li>'+tick(s)+'</li>').join('')+'</ul>':'';
+ const also=(f.also||[]).length?'<p><b>The same run also showed.</b></p><ul class="steps">'+f.also.map(a=>'<li>'+tick(a.title)+'. '+tick(a.shown)+'</li>').join('')+'</ul>':'';
+ const goto=k>=0?'<p class="goto">Line <a href="#L'+(k+1)+'">'+(k+1)+'</a></p>':'';
+ return '<li class="finding" id="'+id+'"><button type="button" aria-expanded="'+(open?'true':'false')+'" aria-controls="'+body+'">'+head+'</button><div class="fbody" id="'+body+'"'+(open?'':' hidden')+'><p><b>Why.</b> '+tick(f.cause)+'</p><p><b>Shown by a run.</b> '+tick(f.shown)+'</p>'+also+steps+rests+goto+'</div></li>'}
+function renderFindings(){$('#findings').innerHTML=FINDINGS.length?FINDINGS.map((f,i)=>findingItem(i+1,f,i===0,'F')).join(''):'<li class="none">'+NONE+'</li>';
  document.querySelectorAll('.finding>button').forEach(b=>b.addEventListener('click',()=>{const on=b.getAttribute('aria-expanded')!=='true';b.setAttribute('aria-expanded',on?'true':'false');document.getElementById(b.getAttribute('aria-controls')).hidden=!on}))}
 
 function light(id,block){document.querySelectorAll('.lit').forEach(x=>x.classList.remove('lit'));const el=document.getElementById(id);if(!el)return;el.classList.add('lit');
- if(/^F\d+$/.test(id)){const n=+id.slice(1);document.querySelectorAll('.co[href="#'+id+'"]').forEach(a=>a.closest('li').classList.add('lit'));const b=el.querySelector('button');if(b&&b.getAttribute('aria-expanded')!=='true')b.click();b&&b.focus({preventScroll:true});say('Finding '+n+': '+FINDINGS[n-1].title)}
+ if(/^F\d+$/.test(id)){const n=+id.slice(1);document.querySelectorAll('.co[href="#'+id+'"]').forEach(a=>a.closest('li').classList.add('lit'));const b=el.querySelector('button');if(b&&b.getAttribute('aria-expanded')!=='true')b.click();b&&b.focus({preventScroll:true});say('Finding '+n+': '+plain(FINDINGS[n-1].title))}
  if(/^L\d+$/.test(id)){const co=el.querySelector('.co');if(co)co.focus({preventScroll:true});say('Line '+id.slice(1))}
 
  if(/^L\d+$/.test(id)){let h=8;const box=el.closest('main>*');if(box){box.querySelectorAll('.tabs,#scale').forEach(x=>{if(!x.hidden&&getComputedStyle(x).position==='sticky')h+=x.offsetHeight})}el.style.scrollMarginTop=h+'px'}
@@ -457,7 +460,7 @@ function gotoHelper(a){const name=a.dataset.fn;const target=document.querySelect
  light(target.id,'start');const code=target.querySelector('code');code.setAttribute('tabindex','-1');code.focus({preventScroll:true});say('Definition of '+name+' at line '+target.id.slice(1))}
 window.addEventListener('popstate',e=>{if(e.state&&e.state.line&&document.getElementById(e.state.line)){document.querySelectorAll('#panel-code .back').forEach(b=>b.remove());light(e.state.line)}});
 document.addEventListener('click',e=>{const ref=e.target.closest('a.fnref');if(ref){e.preventDefault();gotoHelper(ref);return}
- const a=e.target.closest('a[href^="#"]');if(!a)return;const id=a.getAttribute('href').slice(1);if(/^(F|L)\d+$/.test(id)){e.preventDefault();if(a.classList.contains('back'))a.remove();if(/^L/.test(id)&&CUR!=null&&!document.getElementById(id)){CUR=null;renderFns();renderCode()}light(id)}});
+ const a=e.target.closest('a[href^="#"]');if(!a)return;const id=a.getAttribute('href').slice(1);if(/^(F|L)\d+$/.test(id)){e.preventDefault();if(a.classList.contains('back'))a.remove();if(/^L/.test(id))selectTab($('#tab-code'));if(/^L/.test(id)&&CUR!=null&&!document.getElementById(id)){CUR=null;renderFns();renderCode()}light(id)}});
 
 function structName(s){const m=/^stor_(.*)$/.exec(s.name);return m?'Struct_'+m[1]:s.name.charAt(0).toUpperCase()+s.name.slice(1)+'Entry'}
 function memberRows(s,cell){const blank={slot:s.slot,reads:'',writes:''};const owner=structName(s);return (s.members||[]).flatMap(m=>(m.fields&&m.fields.length)?m.fields.map(f=>cell(s.slot+' +'+m.offset+' bytes '+f.offset+'..'+(f.offset+Math.ceil(f.bits/8)),owner+'.'+f.name,f.ty,blank)):[cell(s.slot+' +'+m.offset,owner+'.'+m.name,m.ty,blank)])}
@@ -467,8 +470,22 @@ function storagePanel(c){const comp=!!(c.parts&&c.parts.length);const pcol=s=>co
  const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
  const table=rows?scrollTable('Storage layout','<table class="stack" role="table"><thead role="rowgroup"><tr role="row"><th role="columnheader" scope="col">Slot</th><th role="columnheader" scope="col">Name</th><th role="columnheader" scope="col">Type</th><th role="columnheader" scope="col">Reads</th><th role="columnheader" scope="col">Writes</th>'+(comp?'<th role="columnheader" scope="col">Parts</th>':'')+'</tr></thead><tbody role="rowgroup">'+rows+'</tbody></table>'):'<p>No storage accessed.</p>';
  return '<div class="report">'+partsTable(c)+'<h2>Storage layout</h2>'+table+'<h2>Events</h2>'+list(c.events,'No events emitted.')+'<h2>Custom errors</h2>'+list(c.errors,'None.')+'<h2>Strings</h2>'+(c.strings.length?'<ul>'+c.strings.map(e=>'<li>'+esc(e)+'</li>').join('')+'</ul>':'<p>None.</p>')+'<h2>Selectors called on other contracts</h2>'+list(c.selectors_called,'None.')+'</div>'}
-function reportPanel(rep,c){const list=a=>a&&a.length?'<ul>'+a.map(e=>'<li><code>'+esc(e)+'</code></li>').join('')+'</ul>':'<p>None.</p>';
- return '<div class="report"><h2>Summary</h2><p>Risk score <b class="'+(rep.risk_score>=8?'sev-high':'')+'">'+rep.risk_score+'/100</b> ('+riskWord(rep.risk_score).toLowerCase()+'). '+summaryText(rep.summary)+(kinds(rep).length?'. Kind: '+esc(kinds(rep).join(', ')):'')+'. Findings are leads with a confidence level; coverage and unresolved jumps are in the title block.</p><h2>Privileged functions</h2>'+list(rep.privileged_functions)+'<h2>State-changing functions callable by anyone</h2>'+list(rep.unauthenticated_state_changers)+'<h2>External calls</h2>'+list(rep.external_calls)+(rep.maps||[]).map(m=>'<h2>'+esc(m.title)+'</h2><ul>'+m.lines.map(l=>'<li>'+esc(l)+'</li>').join('')+'</ul>').join('')+'<h2>All findings</h2><ol class="findings">'+FINDINGS.map((f,i)=>findingItem(i+1,f,true).replace(' id="F'+(i+1)+'"',' id="R'+(i+1)+'"').replace('id="FB'+(i+1)+'"','id="RB'+(i+1)+'"').replace('aria-controls="FB'+(i+1)+'"','aria-controls="RB'+(i+1)+'"')).join('')+'</ol></div>'}
+function reportPanel(rep){const st=rep.stats,t=tally(rep);const no=w=>'<span class="no">'+w+'</span>',yn=b=>b?'yes':no('no');
+ const table=(label,heads,rows)=>scrollTable(label,'<table class="stack" role="table"><thead role="rowgroup"><tr role="row">'+heads.map(h=>'<th role="columnheader" scope="col">'+h+'</th>').join('')+'</tr></thead><tbody role="rowgroup">'+rows.map(r=>'<tr role="row">'+r.map((x,i)=>'<td role="cell" data-label="'+heads[i]+'">'+x+'</td>').join('')+'</tr>').join('')+'</tbody></table>');
+ const fns=rep.functions.map(f=>['<code>'+esc(f.name)+'</code>',f.ends_for.length?esc(f.ends_for.join(', ')):no('no one'),yn(f.tests_caller),yn(f.takes_value),yn(f.pays_out),f.runs_other_code?(f.calls_out?'yes, and runs other code':'runs other code'):yn(f.calls_out),esc(f.stopped_by||'')]);
+ const can=rep.functions.map(f=>{const c=f.in_code||{},w=c.writes||[];return ['<code>'+esc(f.name)+'</code>',yn(c.tests_caller),w.length?w.map(x=>'<code>'+esc(x)+'</code>').join(', '):no('none'),yn(c.writes_under_keys),yn(c.calls_out),yn(c.sends_value),yn(c.runs_other_code),yn(c.destroys)]});
+ const open=rep.functions.filter(f=>{const c=f.in_code||{};return !f.ends_for.includes('an account with no role')&&!c.tests_caller&&((c.writes||[]).length||c.writes_under_keys||c.sends_value||c.runs_other_code||c.destroys)}).map(f=>'<li><code>'+esc(f.name)+'</code>: '+esc(f.stopped_by||'it ended only for other accounts')+'</li>').join('');
+ const cells=rep.cells.map(c=>['<code>'+esc(c.slot)+'</code>',String(c.keys),c.used_as.length?esc(c.used_as.join(', ')):no('none'),c.written_by.length?c.written_by.map(x=>'<code>'+esc(x)+'</code>').join(', '):no('none'),yn(c.open_to_anyone)]);
+ const paths=(rep.chains||[]).map(ch=>{const ns=ch.steps.map(s=>NUM.get(s));return '<li>'+tick(ch.summary)+(ns.every(Boolean)?' <span class="goto">Findings '+ns.map(n=>'<a href="#F'+n+'">'+n+'</a>').join(' then ')+'</span>':'')+'</li>'}).join('');
+ const held=[...new Set(rep.assumed||[])].map(a=>'<li>'+tick(a)+'</li>').join('');
+ return '<div class="report"><h2>Summary</h2><p>'+st.functions_ended+' of '+st.functions+' function'+(st.functions===1?'':'s')+' ended under some input, over '+st.calls_made+' calls, in '+st.ms+' ms. '+(t.n?nFindings(t.n)+': '+countText(t)+'.':NONE)+'</p>'
+  +(paths?'<h2>Attack paths</h2><ul>'+paths+'</ul>':'')
+  +(t.n?'<h2>Findings</h2><ol class="findings">'+FINDINGS.map((f,i)=>findingItem(i+1,f,true,'R')).join('')+'</ol>':'')
+  +'<h2>What each function was seen to do</h2>'+(fns.length?table('What each function was seen to do',['Function','Ends for','Tests caller','Takes value','Pays out','Calls out','Stopped by'],fns):'<p>No function was found.</p>')
+  +'<h2>What each function\'s code can do</h2><p>Read from the code with every helper it calls. This covers the functions no run got to the end of. It says what is possible, not what a run showed.</p>'+(can.length?table('What each function\'s code can do',['Function','Tests caller','Writes slots','Writes under keys','Calls out','Sends value','Runs other code','Destroys'],can):'<p>No function was found.</p>')
+  +(open?'<h2>Not settled by a run</h2><p>No call by the account with no role got to the end of these functions, and their code has no test of the caller while it can change state or move value. These are not findings: no run showed anything. They are where a reader should look first.</p><ul>'+open+'</ul>':'')
+  +'<h2>Storage as it was used</h2>'+(cells.length?table('Storage as it was used',['Slot','Keys','Used as','Written by','Anyone can write'],cells):'<p>No storage was used.</p>')
+  +(held?'<h2>Taken to hold</h2><p>Runtime code does not say how the contract was set up. These were taken to hold because the owner\'s own calls are refused without them.</p><ul>'+held+'</ul>':'')+'</div>'}
 function partsTable(c){const parts=c.parts||[];if(!parts.length)return '';const comp=c.composite||{};
  const role=p=>p.role==='shell'?'shell (routes calls)':p.role==='implementation'?'implementation':'facet';
  const sels=p=>p.role==='shell'?'router':(p.selectors.length?p.selectors.length+' selectors':'all unrouted');
@@ -481,7 +498,7 @@ function hashCell(t){if(t.length<=24)return '<code>'+esc(t).split('_').join('_<w
 function partLabel(c,p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.role==='implementation')return 'impl';const i=(c.parts||[]).indexOf(p);return 'facet '+(i<0?'?':i)}
 function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.role==='implementation')return 'impl';const a=p.address||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
 function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(p=>'<span class="pt">'+esc(partLabel(c,p))+'</span>').join('<br>')}
-function renderAll(){const c=DATA.contract;renderCode();renderFindings();$('#panel-report').innerHTML=reportPanel(DATA.report,c);
+function renderAll(){const c=DATA.contract;renderCode();renderFindings();$('#panel-report').innerHTML=reportPanel(DATA.report);
  $('#panel-storage').innerHTML=storagePanel(c);
  $('#panel-graph').innerHTML=graphPanel();$('#panel-graph').querySelectorAll('button[data-linked]').forEach(b=>b.addEventListener('click',()=>{const k=ENTRIES.findIndex(e=>e.linked===+b.dataset.linked);if(k>=0){show(k);say('Showing '+ENTRIES[k].label+' '+ENTRIES[k].address)}}));$('#panel-graph').querySelectorAll('button[data-part]').forEach(b=>b.addEventListener('click',()=>{const k=+b.dataset.part;if(k<ENTRIES.length){show(k);say('Showing '+ENTRIES[k].label+' '+ENTRIES[k].address)}}));
  $('#panel-disasm').innerHTML='<pre>'+esc((DATA.disassembly||[]).join('\n'))+'</pre>';

@@ -421,6 +421,9 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
         root: false,
         summaries: HashMap::new(),
         footprints: HashMap::new(),
+        pointer_keepers: Default::default(),
+        memory_readers: Default::default(),
+        free_pointer: true,
         oracle: true,
         copy_loops: Default::default(),
     };
@@ -446,6 +449,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
             }],
             entry: 0,
             budget_exhausted: false,
+            exits: Vec::new(),
         };
         let lifted = lifter.lift(&unit, None);
         let ln = &lifted.nodes[0];
@@ -659,7 +663,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         let (ok, data) = if a == U256::from_u64(4) {
                             (true, input_bytes)
                         } else {
-                            host.call_result(idx, a, &input_bytes)
+                            host.call_result(idx)
                         };
                         ev.calls.push((ok, data.clone()));
                         if ol > 0 {
@@ -711,6 +715,7 @@ pub fn verify(code: &[u8], opts: &VerifyOptions) -> VerifyStats {
                         src,
                         len,
                         addr,
+                        ..
                     } => {
                         let d = ev.eval(*dest, &mut memo);
                         let sv = ev.eval(*src, &mut memo);

@@ -1,9 +1,9 @@
 use crate::emit::{hashed_slot, MappingLayout, SlotSpace};
 use crate::expr::{self, ExprId, Node};
-use crate::lift::{Lifted, Stmt, Term};
+use crate::lift::{self, Lifted, Stmt, Term};
 use crate::opcode as op;
 use crate::u256::U256;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Step {
@@ -47,14 +47,6 @@ impl SlotPath {
                 .collect(),
             space,
         }
-    }
-}
-
-pub fn space_of(transient: bool) -> SlotSpace {
-    if transient {
-        SlotSpace::Transient
-    } else {
-        SlotSpace::Persistent
     }
 }
 
@@ -325,25 +317,37 @@ pub fn field_write(key: ExprId, val: ExprId) -> Option<FieldWrite> {
     let Node::Op(op::OR, v) = expr::node(val) else {
         return None;
     };
-    let cleared_bits = |e: ExprId| -> Option<u32> {
+    let cleared_mask = |e: ExprId| -> Option<U256> {
         let Node::Op(op::AND, w) = expr::node(e) else {
             return None;
         };
         for (a, b) in [(w[0], w[1]), (w[1], w[0])] {
             if let (Node::SLoad(k, false, _), Some(m)) = (expr::node(a), expr::as_const(b)) {
                 if k == key {
-                    return Some(256 - m.count_ones());
+                    return Some(!m);
                 }
             }
         }
         None
     };
     for (old, new) in [(v[0], v[1]), (v[1], v[0])] {
-        let Some(cleared) = cleared_bits(old) else {
+        let Some(mask) = cleared_mask(old) else {
             continue;
         };
+        let cleared = mask.count_ones();
         if let Some(w) = shifted_then_masked(new) {
             return Some(w);
+        }
+        /* The bits the mask clears say which field is written. A constant put there is
+        already in place, so it is the field's value once moved down. */
+        let at = mask.trailing_zeros();
+        if let (Some(c), true) = (expr::as_const(new), cleared > 0) {
+            let whole = (mask >> at).is_low_mask() && (c & !mask).is_zero();
+            return whole.then(|| FieldWrite {
+                bit_offset: at,
+                bits: cleared,
+                value: expr::konst(c >> at),
+            });
         }
         let (shift, inner) = match expr::node(new) {
             Node::Op(op::SHL, w) if expr::as_const(w[0]).is_some_and(|s| s.fits_u64()) => {
@@ -364,7 +368,8 @@ pub fn field_write(key: ExprId, val: ExprId) -> Option<FieldWrite> {
             },
             _ => (cleared, inner),
         };
-        if bits > 0 && shift + bits <= 256 {
+        // A value left where it is cannot be the value of a field that starts higher.
+        if bits > 0 && shift + bits <= 256 && (shift > 0 || at == 0) {
             return Some(FieldWrite {
                 bit_offset: shift,
                 bits,
@@ -415,16 +420,15 @@ pub fn call_sites(l: &Lifted, arity: impl Fn(usize) -> Option<usize>) -> Vec<Cal
                 continue;
             };
             let Some(k) = arity(*callee) else { continue };
-            let bound = args
-                .iter()
-                .enumerate()
-                .filter(|(j, _)| *j < k)
-                .map(|(j, a)| (j as u32, *a))
-                .collect();
             out.push(CallSite {
                 callee: *callee,
                 seq: *seq,
-                args: bound,
+                args: args
+                    .iter()
+                    .enumerate()
+                    .filter(|_| args.len() == k)
+                    .map(|(j, a)| (j as u32, *a))
+                    .collect(),
                 results: results
                     .iter()
                     .enumerate()
@@ -440,6 +444,180 @@ pub fn arity(l: &Lifted) -> usize {
     l.ret_slot.map_or(l.n_args, |k| k as usize)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    ret: Option<u32>,
+    slots: Vec<u32>,
+}
+
+fn passed(count: usize, ret: Option<u32>) -> impl Iterator<Item = u32> {
+    let total = match ret {
+        Some(r) if r as usize <= count => count + 1,
+        _ => count,
+    };
+    (0..total as u32).rev().filter(move |i| Some(*i) != ret)
+}
+
+fn slots_read(roots: impl IntoIterator<Item = ExprId>, out: &mut BTreeSet<u32>) {
+    let mut pending: Vec<ExprId> = roots.into_iter().collect();
+    let mut seen = HashSet::new();
+    while let Some(e) = pending.pop() {
+        if !seen.insert(e) {
+            continue;
+        }
+        if let Node::Arg(i) = expr::node(e) {
+            out.insert(i);
+        }
+        pending.extend(expr::children(e));
+    }
+}
+
+pub fn frames<'a>(units: impl IntoIterator<Item = (usize, &'a Lifted)>) -> HashMap<usize, Frame> {
+    struct Reads {
+        pc: usize,
+        ret: u32,
+        direct: BTreeSet<u32>,
+        calls: Vec<(usize, Vec<BTreeSet<u32>>)>,
+    }
+    let mut frames: HashMap<usize, Frame> = HashMap::new();
+    let mut reads: Vec<Reads> = Vec::new();
+    for (pc, l) in units {
+        frames.insert(
+            pc,
+            Frame {
+                ret: l.ret_slot,
+                slots: (0..arity(l) as u32).collect(),
+            },
+        );
+        let Some(ret) = l.ret_slot else { continue };
+        let mut direct = BTreeSet::new();
+        let mut calls = Vec::new();
+        for nd in &l.nodes {
+            for s in &nd.stmts {
+                match s {
+                    Stmt::Internal { callee, args, .. } => calls.push((
+                        *callee,
+                        args.iter()
+                            .map(|a| {
+                                let mut slots = BTreeSet::new();
+                                slots_read([*a], &mut slots);
+                                slots
+                            })
+                            .collect(),
+                    )),
+                    _ => slots_read(lift::stmt_exprs(s), &mut direct),
+                }
+            }
+            slots_read(lift::term_exprs(&nd.term), &mut direct);
+        }
+        slots_read(
+            l.edge_assigns.values().flatten().map(|(_, val)| *val),
+            &mut direct,
+        );
+        reads.push(Reads {
+            pc,
+            ret,
+            direct,
+            calls,
+        });
+    }
+    loop {
+        let mut grew = false;
+        for r in &reads {
+            let mut used = r.direct.clone();
+            for (callee, args) in &r.calls {
+                match frames.get(callee) {
+                    Some(f) => {
+                        for (slot, arg) in passed(args.len(), f.ret).zip(args) {
+                            if f.slots.contains(&slot) {
+                                used.extend(arg);
+                            }
+                        }
+                    }
+                    None => used.extend(args.iter().flatten()),
+                }
+            }
+            let slots: Vec<u32> = (0..r.ret)
+                .chain(used.into_iter().filter(|i| *i > r.ret))
+                .collect();
+            let frame = frames.get_mut(&r.pc).expect("every unit has a frame");
+            if frame.slots != slots {
+                frame.slots = slots;
+                grew = true;
+            }
+        }
+        if !grew {
+            return frames;
+        }
+    }
+}
+
+pub fn align(l: &mut Lifted, frames: &HashMap<usize, Frame>, own: Option<&Frame>) {
+    for nd in l.nodes.iter_mut() {
+        for s in nd.stmts.iter_mut() {
+            let Stmt::Internal { callee, args, .. } = s else {
+                continue;
+            };
+            let Some(f) = frames.get(callee) else {
+                continue;
+            };
+            let given: HashMap<u32, ExprId> = passed(args.len(), f.ret)
+                .zip(args.iter().copied())
+                .collect();
+            *args = f
+                .slots
+                .iter()
+                .rev()
+                .map(|slot| match given.get(slot) {
+                    Some(a) => *a,
+                    None => expr::intern(Node::Unknown(expr::next_seq())),
+                })
+                .collect();
+        }
+    }
+    let Some(own) = own else { return };
+    let Some(ret) = own.ret else { return };
+    let moved: HashMap<u32, u32> = own
+        .slots
+        .iter()
+        .enumerate()
+        .map(|(new, old)| (*old, new as u32))
+        .chain([(ret, own.slots.len() as u32)])
+        .collect();
+    let memo = std::cell::RefCell::new(HashMap::new());
+    let renumber = |e: ExprId| -> ExprId {
+        expr::substitute(
+            e,
+            &|n| match n {
+                Node::Arg(i) => moved.get(i).map(|new| expr::arg(*new)),
+                _ => None,
+            },
+            &mut memo.borrow_mut(),
+        )
+    };
+    let return_address = expr::arg(ret);
+    for nd in l.nodes.iter_mut() {
+        /* Old Vyper keeps the return address in memory. That store is the call itself
+        and not something the helper does with a value it was given. */
+        nd.stmts
+            .retain(|s| !matches!(s, Stmt::MStore { val, .. } if *val == return_address));
+        for s in nd.stmts.iter_mut() {
+            *s = lift::map_stmt(s, &renumber);
+        }
+        nd.term = lift::map_term(&nd.term, &renumber);
+        for e in nd.entry_stack.iter_mut().chain(nd.exit_stack.iter_mut()) {
+            *e = renumber(*e);
+        }
+    }
+    for assigns in l.edge_assigns.values_mut() {
+        for (_, val) in assigns.iter_mut() {
+            *val = renumber(*val);
+        }
+    }
+    l.n_args = own.slots.len();
+    l.ret_slot = Some(own.slots.len() as u32);
+}
+
 pub fn returns(l: &Lifted) -> Vec<&[ExprId]> {
     l.nodes
         .iter()
@@ -448,17 +626,6 @@ pub fn returns(l: &Lifted) -> Vec<&[ExprId]> {
             _ => None,
         })
         .collect()
-}
-
-pub fn stored_address_slot(e: ExprId) -> Option<ExprId> {
-    let inner = match expr::node(e) {
-        Node::Op(op::AND, v) if expr::as_const(v[1]).is_some_and(|m| m.is_low_mask()) => v[0],
-        _ => e,
-    };
-    match expr::node(inner) {
-        Node::SLoad(k, false, _) if expr::is_const(k) => Some(k),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

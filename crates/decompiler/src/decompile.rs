@@ -3,6 +3,7 @@ use crate::compiler;
 use crate::emit::{self, MappingLayout, Names, SlotSpace};
 use crate::expr::{self, ExprId, Node};
 use crate::function::{self, FnKind, Mutability, Param};
+use crate::interp::{Host, Machine, Outcome};
 use crate::lift::{self, Lifted, Lifter, Stmt, Term};
 use crate::metadata::{self, BytecodeInfo, CodeKind};
 use crate::naming;
@@ -192,10 +193,6 @@ pub struct Contract {
     pub link: Option<Link>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unfollowed: Vec<Unfollowed>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub admits: Vec<String>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub gates_read: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,8 +254,6 @@ pub struct Part {
     pub address: String,
     pub selectors: Vec<String>,
     #[serde(skip)]
-    pub base: usize,
-    #[serde(skip)]
     pub runtime: Vec<u8>,
     pub compiler: String,
     pub storage: Vec<StorageVar>,
@@ -292,21 +287,12 @@ pub struct StorageCollision {
 
 impl Contract {
     #[must_use]
-    pub fn code_of(&self, f: &Function) -> &[u8] {
-        match self.parts.get(f.part) {
-            Some(p) => &p.runtime,
-            None => &self.info.runtime,
-        }
-    }
-
-    #[must_use]
-    pub fn base_of(&self, f: &Function) -> usize {
-        self.parts.get(f.part).map_or(0, |p| p.base)
-    }
-
-    #[must_use]
-    pub fn local_pc(&self, f: &Function, pc: usize) -> usize {
-        pc.saturating_sub(self.base_of(f))
+    pub fn unknown_selectors(&self) -> Vec<u32> {
+        let unnamed = self.functions.iter().filter(|f| f.signature.is_none());
+        let selectors = unnamed.filter_map(|f| f.selector.as_ref());
+        selectors
+            .filter_map(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .collect()
     }
 }
 
@@ -364,7 +350,6 @@ pub fn compose(
         role: PartRole::Shell,
         address: shell.address.clone().unwrap_or_default(),
         selectors: Vec::new(),
-        base: 0,
         runtime: shell.info.runtime.clone(),
         compiler: shell.language.clone(),
         storage: shell.storage.clone(),
@@ -394,7 +379,6 @@ pub fn compose(
             role,
             address: address.clone(),
             selectors: selectors.clone(),
-            base,
             runtime: std::mem::take(&mut part.info.runtime),
             compiler: part.language.clone(),
             storage: part.storage.clone(),
@@ -657,22 +641,33 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     };
     prune_embedded(&mut rec);
+    let mut table_entries: Vec<(u32, usize)> = Vec::new();
+    let mut refuse_value: HashSet<u32> = HashSet::new();
     if !rec.unresolved_jumps.is_empty() {
         let oracle = Lifter {
             prog: &prog,
             root: false,
             summaries: HashMap::new(),
             footprints: HashMap::new(),
+            pointer_keepers: HashSet::new(),
+            memory_readers: HashSet::new(),
+            free_pointer: true,
             oracle: true,
             copy_loops: Default::default(),
         };
-        let mut computed: HashMap<usize, Vec<usize>> = HashMap::new();
-        for b in &prog.blocks {
-            if !matches!(b.terminator, op::JUMP | op::JUMPI)
-                || !rec.unresolved_jumps.contains(&b.end)
-                || in_embedded(b.start)
-                || b.end > code_end
-            {
+        let open: Vec<&cfg::Block> = prog
+            .blocks
+            .iter()
+            .filter(|b| {
+                matches!(b.terminator, op::JUMP | op::JUMPI)
+                    && rec.unresolved_jumps.contains(&b.end)
+                    && !in_embedded(b.start)
+                    && b.end <= code_end
+            })
+            .collect();
+        let mut computed = table_jumps(&prog, &open, &mut table_entries, &mut refuse_value);
+        for b in open {
+            if computed.contains_key(&b.id) {
                 continue;
             }
             let unit = cfg::Unit {
@@ -691,6 +686,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                 }],
                 entry: 0,
                 budget_exhausted: false,
+                exits: Vec::new(),
             };
             let l = oracle.lift(&unit, None);
             let target = match &l.nodes[0].term {
@@ -753,6 +749,9 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         root: false,
         summaries: HashMap::new(),
         footprints: HashMap::new(),
+        pointer_keepers: HashSet::new(),
+        memory_readers: HashSet::new(),
+        free_pointer: profile.kind == compiler::Kind::Solc,
         oracle: false,
         copy_loops: Default::default(),
     };
@@ -775,11 +774,28 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             .filter(|_| profile.kind != compiler::Kind::Solc)
             .map(|(b, l)| (*b, l.mem_writes.clone()))
             .collect();
+        /* Solidity writes through pointers only at and above the free pointer's start,
+        so a helper that never stores to the pointer's own word leaves it as it was. */
+        let pointer_keepers: HashSet<usize> = by_block
+            .iter()
+            .filter(|_| profile.kind == compiler::Kind::Solc)
+            .filter(|(_, l)| l.mem_writes.leaves_free_pointer())
+            .map(|(b, _)| *b)
+            .collect();
+        let memory_readers: HashSet<usize> = by_block
+            .iter()
+            .filter(|(_, l)| l.reads_through_pointers())
+            .map(|(b, _)| prog.blocks[*b].start)
+            .collect();
         let same = sums.len() == int_lifter.summaries.len()
             && sums.keys().all(|k| int_lifter.summaries.contains_key(k))
-            && footprints == int_lifter.footprints;
+            && footprints == int_lifter.footprints
+            && pointer_keepers == int_lifter.pointer_keepers
+            && memory_readers == int_lifter.memory_readers;
         int_lifter.summaries = sums;
         int_lifter.footprints = footprints;
+        int_lifter.pointer_keepers = pointer_keepers;
+        int_lifter.memory_readers = memory_readers;
         if same {
             break;
         }
@@ -797,15 +813,24 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         root: true,
         summaries: int_lifter.summaries.clone(),
         footprints: int_lifter.footprints.clone(),
+        pointer_keepers: int_lifter.pointer_keepers.clone(),
+        memory_readers: int_lifter.memory_readers.clone(),
+        free_pointer: profile.kind == compiler::Kind::Solc,
         oracle: false,
         copy_loops: Default::default(),
     };
-    let main = lifter.lift_summarizing(&rec.main, None);
-    let dispatch = function::discover(&main);
+    let mut main = lifter.lift_summarizing(&rec.main, None);
+    let dispatch = function::discover(&main, &table_entries);
     let contract_nonpayable = function::dispatcher_nonpayable(&main, &dispatch.dispatcher);
     tick("lift main", &mut tt);
     let mut orphans: BTreeMap<usize, Lifted> = BTreeMap::new();
-    for (b, unit) in &rec.orphans {
+    /* A helper that never returns leaves the address it was to return to unused. The code
+    there is reached by no jump, and what follows it is printed where it is reached. */
+    let reached = rec
+        .orphans
+        .iter()
+        .filter(|(b, _)| !rec.dead_returns.contains(b));
+    for (b, unit) in reached {
         crate::clock::check();
         let t1 = std::time::Instant::now();
         orphans.insert(prog.blocks[*b].start, int_lifter.lift(unit, None));
@@ -819,6 +844,11 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
     }
     tick("lift orphans", &mut tt);
+    let frames = ssa::frames(internals.iter().chain(&orphans).map(|(pc, l)| (*pc, l)));
+    for (pc, l) in internals.iter_mut().chain(orphans.iter_mut()) {
+        ssa::align(l, &frames, frames.get(pc));
+    }
+    ssa::align(&mut main, &frames, None);
     let mut functions: Vec<Function> = Vec::new();
     let reprocess =
         main.reprocess_count + internals.values().map(|l| l.reprocess_count).sum::<usize>();
@@ -908,7 +938,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                     .collect();
             }
         }
-        let nonpayable = contract_nonpayable || function::is_nonpayable(&l);
+        let refused = selector.is_some_and(|s| refuse_value.contains(&s));
+        let nonpayable = contract_nonpayable || refused || function::is_nonpayable(&l);
         let state_changing =
             eff.writes_storage || eff.logs || eff.calls || eff.creates || eff.selfdestruct;
         let mutability = if state_changing || kind == FnKind::Fallback || kind == FnKind::Receive {
@@ -963,7 +994,9 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         if let Some(un) = unit_node_of(entry) {
             if let Some(state) = Lifter::entry_state_of(&main, un) {
                 let (sub, _) = rec.main.slice(un);
-                return lifter.lift_from_summarizing(&sub, state);
+                let mut l = lifter.lift_from_summarizing(&sub, state);
+                ssa::align(&mut l, &frames, None);
+                return l;
             }
         }
         function::slice(&main, entry)
@@ -1011,24 +1044,10 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             0,
         ));
     }
+    let n_rets = |l: &Lifted| ssa::returns(l).iter().map(|v| v.len()).max().unwrap_or(0);
     for (pc, mut l) in internals {
         crate::idiom::fold(&mut l);
-        let n_rets = l
-            .nodes
-            .iter()
-            .filter_map(|n| {
-                if let Term::InternalReturn(v) = &n.term {
-                    Some(v.len())
-                } else {
-                    None
-                }
-            })
-            .max()
-            .unwrap_or(0);
-        let n_args = match l.ret_slot {
-            Some(k) => (k as usize).min(l.n_args),
-            None => l.n_args,
-        };
+        let (n_args, n_rets) = (ssa::arity(&l), n_rets(&l));
         functions.push(make(
             FnKind::Internal,
             None,
@@ -1040,7 +1059,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         ));
     }
     for (pc, l) in orphans {
-        let n_args = l.n_args;
+        let (n_args, n_rets) = (ssa::arity(&l), n_rets(&l));
         functions.push(make(
             FnKind::Orphan,
             None,
@@ -1048,7 +1067,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             pc,
             Some(format!("orphan_{:#x}", pc)),
             n_args,
-            0,
+            n_rets,
         ));
     }
 
@@ -1127,8 +1146,14 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         mut strings,
         selectors: selectors_called,
     } = inventories(&functions, layout, &string_slots);
-    refine_storage_types(&mut storage, &env);
-    struct_members(&mut storage, &env, &hashed_slots(&functions, layout));
+    let parts = parts_read(&functions, layout);
+    refine_storage_types(&mut storage, &env, &parts);
+    struct_members(
+        &mut storage,
+        &env,
+        &hashed_slots(&functions, layout),
+        &parts,
+    );
     name_storage_from_getters(&functions, &mut storage, layout);
     naming::name_storage(&functions, &mut storage, layout, !opts.no_sigs);
     naming::name_helpers(&mut functions, &storage, layout, !opts.no_sigs);
@@ -1162,27 +1187,47 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         })
         .map(|f| f.pc)
         .collect();
-    let callees = Callees::of(&functions, profile.kind);
+    let mut callees = Callees::of(&functions, profile.kind);
+    callees.code = std::sync::Arc::new(code.to_vec());
     let array_resizers: HashSet<usize> = functions
         .iter()
         .filter(|f| f.kind == FnKind::Internal && f.lifted.as_ref().is_some_and(is_array_resizer))
         .map(|f| f.pc)
         .collect();
-    for f in functions.iter_mut() {
+    let printed: Vec<Lifted> = functions
+        .iter()
+        .map(|f| {
+            let l = f.lifted.as_ref().expect("functions are lifted");
+            match opts.flat {
+                true => l.clone(),
+                false => crate::structure::reroll_peeled_loops(l),
+            }
+        })
+        .collect();
+    let mut offsets = {
+        let units = functions.iter().zip(&printed).filter(|_| solc08);
+        let units: Vec<(usize, &Lifted)> = units.map(|(f, l)| (f.pc, l)).collect();
+        emit::offsets(&units).into_iter()
+    };
+    for (f, l) in functions.iter_mut().zip(printed) {
         let mut names = make_names(f, &storage, layout, &loaders, &callees);
+        let (l, hashes) = crate::structure::name_hashes(&l);
         names.hide_checked = solc08;
+        names.checked = solc08.then(|| emit::checked_ops(&l));
+        names.offsets = offsets.next().unwrap_or_default();
+        names.rebind(&hashes);
         names.pure_callees = pure_callees.clone();
         names.array_resizers = array_resizers.clone();
-        let l = f
-            .lifted
-            .as_ref()
-            .expect("functions are lifted before they are printed");
         crate::clock::check();
         let t1 = std::time::Instant::now();
         let body = if opts.flat {
-            emit::fmt_flat(l, &names, "        ")
+            emit::fmt_flat(&l, &names, "        ")
         } else {
-            crate::structure::fmt_structured(l, &names, "        ")
+            let (tested, bindings) = crate::structure::name_tested(&l, &names);
+            names.rebind(&bindings);
+            let (bound, bindings) = crate::structure::bind_shared(&tested, &names);
+            names.rebind(&bindings);
+            crate::structure::fmt_structured(&bound, &names, "        ")
         };
         if timing && t1.elapsed().as_millis() > 200 {
             eprintln!(
@@ -1193,6 +1238,28 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             );
         }
         f.code = body;
+    }
+    /* A helper is left out when every call to it was folded into its callers. Whether
+    that happened is only known from the text, so one a printed body still calls is
+    shown after all. */
+    loop {
+        let shown: Vec<&str> = functions
+            .iter()
+            .filter(|f| !f.inlined)
+            .map(|f| f.code.as_str())
+            .collect();
+        let called: Vec<usize> = functions
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.inlined && shown.iter().any(|code| calls_by_name(code, &f.name)))
+            .map(|(i, _)| i)
+            .collect();
+        if called.is_empty() {
+            break;
+        }
+        for i in called {
+            functions[i].inlined = false;
+        }
     }
     tick("render", &mut tt);
 
@@ -1333,9 +1400,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                             if matches!(*kind, op::CALL | op::STATICCALL | op::CALLCODE) =>
                         {
                             let low = c & expr::mask_bits(160);
-                            let is_precompile =
-                                low.fits_u64() && (1..=0x11).contains(&low.low_u64());
-                            if !low.is_zero() && !is_precompile {
+                            if !low.is_zero() && !crate::interp::built_in(low) {
                                 let h = low.to_hex_padded(20);
                                 if *kind != op::STATICCALL && !written_targets.contains(&h) {
                                     written_targets.push(h.clone());
@@ -1379,8 +1444,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         linked: Vec::new(),
         link: None,
         unfollowed: Vec::new(),
-        admits: Vec::new(),
-        gates_read: false,
         address: None,
         chain: None,
         proxy: None,
@@ -1416,6 +1479,88 @@ pub(crate) fn clone_target(init: &[ExprId], len: ExprId) -> Option<String> {
 
 // A block is read once however many nodes run it, with one running stack.
 // Working the stack out again before every copy was quadratic in a block full of them.
+const TRACE_STEPS: usize = 4_096;
+const TRACE_CALLDATA: usize = 4 + 0x2000;
+
+fn table_jump(prog: &Program, open: &[&cfg::Block], host: &Host) -> Option<(usize, usize)> {
+    let mut m = Machine::new(&prog.code, host);
+    let mut copied: Vec<(usize, usize)> = Vec::new();
+    for _ in 0..TRACE_STEPS {
+        let pc = m.pc;
+        if *prog.code.get(pc)? == op::CODECOPY {
+            let from = |depth: usize| m.stack.iter().rev().nth(depth).and_then(U256::as_usize);
+            copied.push((from(1)?, from(2)?));
+        }
+        let to = match m.step() {
+            Ok(None) => continue,
+            Ok(Some(Outcome::Jump(to))) => to,
+            Ok(Some(Outcome::JumpI(to, cond))) if !cond.is_zero() => to,
+            Ok(Some(Outcome::JumpI(..))) => {
+                m.pc = pc + 1;
+                continue;
+            }
+            _ => return None,
+        };
+        let to = to.as_usize().filter(|to| prog.jumpdests.contains(to))?;
+        let read = |&(src, len): &(usize, usize)| {
+            let bytes = prog
+                .code
+                .get(src..src.saturating_add(len).min(prog.code.len()));
+            let found = |w: &[u8]| usize::from(w[0]) << 8 | usize::from(w[1]) == to;
+            bytes.is_some_and(|bytes| bytes.windows(2).any(found))
+        };
+        match open.iter().find(|b| b.start <= pc && pc < b.end) {
+            // A jump whose target was pushed is a call or a return. A trace follows one path
+            // of it and would stand for all of them.
+            Some(b) if copied.iter().any(read) => return Some((b.id, to)),
+            _ => m.pc = to,
+        }
+    }
+    None
+}
+
+fn table_jumps(
+    prog: &Program,
+    open: &[&cfg::Block],
+    entries: &mut Vec<(u32, usize)>,
+    refuse_value: &mut HashSet<u32>,
+) -> HashMap<usize, Vec<usize>> {
+    let pushed = prog.insns.iter().filter_map(|i| i.imm);
+    let mut selectors: BTreeSet<u32> = pushed
+        .filter(|v| v.bits() <= 32)
+        .map(|v| v.low_u64() as u32)
+        .collect();
+    let words = prog.code.windows(4);
+    selectors.extend(words.map(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]])));
+    let mut host = Host::controlled(U256::ONE, U256::ONE, vec![0; TRACE_CALLDATA], U256::ZERO);
+    let mut jumps: HashMap<usize, Vec<(u32, usize)>> = HashMap::new();
+    let mut paid = host.clone();
+    paid.callvalue = U256::ONE;
+    for &selector in &selectors {
+        host.calldata[..4].copy_from_slice(&selector.to_be_bytes());
+        paid.calldata[..4].copy_from_slice(&selector.to_be_bytes());
+        if let Some((block, to)) = table_jump(prog, open, &host) {
+            jumps.entry(block).or_default().push((selector, to));
+            // A function the table sends nowhere once a wei comes with the call refuses value.
+            if table_jump(prog, open, &paid) != Some((block, to)) {
+                refuse_value.insert(selector);
+            }
+        }
+    }
+    let mut targets = HashMap::new();
+    for (block, taken) in jumps {
+        // A jump that only some selectors reach was taken after the selector matched the
+        // table. Its target is that selector's function.
+        if taken.len() < selectors.len() {
+            entries.extend(&taken);
+        }
+        let blocks = taken.iter().filter_map(|(_, to)| prog.target_block(*to));
+        let blocks: BTreeSet<usize> = blocks.collect();
+        targets.insert(block, blocks.into_iter().collect());
+    }
+    targets
+}
+
 fn embedded_regions(prog: &Program, rec: &Recovered) -> Vec<(usize, usize)> {
     let mut out: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut read: HashSet<usize> = HashSet::new();
@@ -1456,6 +1601,7 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
         flags: Vec<U256>,
         other_write: bool,
         read_widths: BTreeSet<u32>,
+        packed: bool,
     }
     let mut seen: HashMap<U256, Accesses> = HashMap::new();
     let width_of = |mask: U256| -> Option<u32> {
@@ -1478,6 +1624,12 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
                 let Some(root) = emit::element_root(*key) else {
                     continue;
                 };
+                if ssa::field_writes(*key, *val)
+                    .iter()
+                    .any(|w| w.bit_offset > 0)
+                {
+                    seen.entry(root).or_default().packed = true;
+                }
                 let keeps = |e: ExprId| -> Option<u32> {
                     let Node::Op(op::AND, w) = expr::node(e) else {
                         return None;
@@ -1515,13 +1667,23 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
             for root in lift::roots(nd) {
                 let mut stack = vec![root.expr];
                 let mut visited = HashSet::new();
+                let mut cut: HashSet<ExprId> = HashSet::new();
                 while let Some(x) = stack.pop() {
                     if !visited.insert(x) || visited.len() > 20_000 {
                         continue;
                     }
+                    cut.extend(selector_cut(&root, x));
                     if x == root.expr && root.payload {
-                        stack.extend(expr::children(x));
+                        stack.extend(read_parts(x));
                         continue;
+                    }
+                    if cut.contains(&x) {
+                        stack.extend(read_parts(x));
+                        continue;
+                    }
+                    let above = ssa::field_read(x).filter(|f| f.bit_offset > 0);
+                    if let Some(root) = above.and_then(|f| emit::element_root(f.key)) {
+                        seen.entry(root).or_default().packed = true;
                     }
                     if let Node::Op(op::AND, v) = expr::node(x) {
                         for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
@@ -1536,7 +1698,7 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
                             }
                         }
                     }
-                    stack.extend(expr::children(x));
+                    stack.extend(read_parts(x));
                 }
             }
         }
@@ -1548,6 +1710,9 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
             } else {
                 a.write_widths
             };
+            if a.packed {
+                return Some((root, "uint256".to_string()));
+            }
             let w = *widths.iter().next()?;
             if widths.len() != 1 {
                 return None;
@@ -1781,6 +1946,7 @@ pub struct Callees {
     pub names: HashMap<usize, String>,
     pub free_pointer: bool,
     pub reads: std::sync::Arc<HashMap<usize, lift::MemoryReads>>,
+    pub code: std::sync::Arc<Vec<u8>>,
 }
 
 fn callee_reads(
@@ -1818,11 +1984,25 @@ impl Callees {
         let internal = || functions.iter().filter(|f| f.kind == FnKind::Internal);
         Callees {
             returns: internal().map(|f| (f.pc, f.returns.clone())).collect(),
-            names: internal().map(|f| (f.pc, f.name.clone())).collect(),
+            names: functions
+                .iter()
+                .filter(|f| matches!(f.kind, FnKind::Internal | FnKind::Orphan))
+                .map(|f| (f.pc, f.name.clone()))
+                .collect(),
             free_pointer: compiler == compiler::Kind::Solc,
             reads: std::sync::Arc::new(callee_reads(functions, compiler == compiler::Kind::Vyper)),
+            code: std::sync::Arc::default(),
         }
     }
+}
+
+fn call_starts(l: &Lifted) -> Vec<ExprId> {
+    let stmts = l.nodes.iter().flat_map(|nd| nd.stmts.iter());
+    let start = |s: &Stmt| match s {
+        Stmt::Call { in_off, .. } => Some(*in_off),
+        _ => None,
+    };
+    stmts.filter_map(start).collect()
 }
 
 pub fn make_names(
@@ -1836,11 +2016,14 @@ pub fn make_names(
         layout,
         callee_names: callees.names.clone(),
         callee_reads: Some(callees.reads.clone()),
+        code: callees.code.clone(),
+        call_starts: f.lifted.iter().flat_map(call_starts).collect(),
         blocks: f
             .lifted
             .as_ref()
             .filter(|_| callees.free_pointer)
             .map(emit::number_blocks),
+        in_helper: matches!(f.kind, FnKind::Internal | FnKind::Orphan),
         ..Default::default()
     };
     if f.kind != FnKind::Internal {
@@ -1848,6 +2031,21 @@ pub fn make_names(
             n.params.insert(p.index, p.name.clone());
         }
     }
+    // A parameter declared narrower than a word packs to fewer bytes than the word it is.
+    let narrow = |ty: &str| match ty {
+        "address" | "bool" => true,
+        "uint256" | "int256" | "bytes32" => false,
+        _ => {
+            let width = |prefix: &str| ty.strip_prefix(prefix).and_then(|w| w.parse::<u32>().ok());
+            width("uint").or(width("int")).or(width("bytes")).is_some()
+        }
+    };
+    n.narrow.extend(
+        f.params
+            .iter()
+            .filter(|p| narrow(&p.ty))
+            .map(|p| p.name.clone()),
+    );
     n.bool_returns = f.returns.iter().map(|t| t == "bool").collect();
     n.bools.extend(f.bool_vars.iter().map(|v| expr::var(*v)));
     if let Some(l) = &f.lifted {
@@ -1870,21 +2068,12 @@ pub fn make_names(
         }
     }
     if let Some(l) = &f.lifted {
-        let k = l.ret_slot.map(|k| k as usize).unwrap_or(l.n_args);
-        for i in 0..l.n_args.max(k + 1) {
-            let name = if i < k {
-                let index = k - 1 - i;
-                match f.params.get(index).filter(|_| f.kind == FnKind::Internal) {
-                    Some(p) => p.name.clone(),
-                    None => format!("arg{index}"),
-                }
-            } else if i == k && l.ret_slot.is_some() {
-                "__return_pc".to_string()
-            } else {
-                format!(
-                    "caller_stack{}",
-                    i - k - if l.ret_slot.is_some() { 1 } else { 0 }
-                )
+        let k = ssa::arity(l);
+        for i in 0..k {
+            let index = k - 1 - i;
+            let name = match f.params.get(index).filter(|_| f.kind == FnKind::Internal) {
+                Some(p) => p.name.clone(),
+                None => format!("arg{index}"),
             };
             n.args.insert(i as u32, name);
         }
@@ -1944,7 +2133,7 @@ pub fn make_names(
                     }
                     if let Some(tys) = callees.returns.get(callee) {
                         for (r, ty) in results.iter().zip(tys) {
-                            if ty == "bool" {
+                            if ty == "bool" && !expr::is_const(*r) {
                                 n.bools.insert(*r);
                             }
                         }
@@ -2028,8 +2217,10 @@ fn internal_params(l: &Lifted, pc: usize, n_args: usize, env: &TypeEnv) -> Vec<P
     let direct = function::internal_param_types(l, n_args);
     (0..n_args)
         .map(|i| {
+            // An address the helper also takes bits above 160 from is a whole word.
+            let wide = env.arg_bits(pc, arity, i) > 160;
             let ty = match direct.get(i) {
-                Some(t) if t != "uint256" => t.clone(),
+                Some(t) if t != "uint256" && !(t == "address" && wide) => t.clone(),
                 _ => env
                     .arg_type(pc, arity, i)
                     .unwrap_or_else(|| "uint256".to_string()),
@@ -2044,10 +2235,9 @@ fn internal_params(l: &Lifted, pc: usize, n_args: usize, env: &TypeEnv) -> Vec<P
 }
 
 fn refine_results(returns: &mut [String], pc: usize, env: &TypeEnv) {
-    let n = returns.len();
     for (i, ty) in returns.iter_mut().enumerate() {
         if ty == "uint256" {
-            if let Some(t) = env.result_type(pc, (n - 1 - i) as u16) {
+            if let Some(t) = env.result_type(pc, i as u16) {
                 *ty = t;
             }
         }
@@ -2066,8 +2256,14 @@ fn bool_vars(pc: usize, l: &Lifted, env: &TypeEnv) -> Vec<u32> {
     vars
 }
 
-fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv) {
-    fn refine(ty: &str, root: U256, steps: &mut Vec<ShapeStep>, env: &TypeEnv) -> String {
+fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv, parts: &PartsRead) {
+    fn refine(
+        ty: &str,
+        root: U256,
+        steps: &mut Vec<ShapeStep>,
+        env: &TypeEnv,
+        parts: &PartsRead,
+    ) -> String {
         if let Some(inner) = ty
             .strip_prefix("mapping(")
             .and_then(|r| r.strip_suffix(')'))
@@ -2081,17 +2277,28 @@ fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv) {
             } else {
                 k.to_string()
             };
-            let vt = refine(v, root, steps, env);
+            let vt = refine(v, root, steps, env, parts);
             steps.pop();
             return format!("mapping({} => {})", kt, vt);
         }
         if let Some(elem) = ty.strip_suffix("[]") {
             steps.push(ShapeStep::Index);
-            let et = refine(elem, root, steps, env);
+            let et = refine(elem, root, steps, env, parts);
             steps.pop();
             return format!("{}[]", et);
         }
-        if ty == "uint256" {
+        // A word of which a part above the first is read holds more than one value.
+        let shape = Shape {
+            root,
+            steps: steps.clone(),
+            space: SlotSpace::Persistent,
+        };
+        let above = |fields: &BTreeSet<(u32, u32)>| fields.iter().any(|(at, _)| *at > 0);
+        let packed = parts.get(&shape).is_some_and(above);
+        if packed && types::Ty::declared(ty).is_some_and(|t| t != types::Ty::Uint(256)) {
+            return "uint256".to_string();
+        }
+        if ty == "uint256" && !packed {
             if let Some(t) = env.slot_type(root, steps) {
                 return t;
             }
@@ -2105,7 +2312,7 @@ fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv) {
         let Some(root) = U256::from_hex_str(&var.slot) else {
             continue;
         };
-        var.ty = refine(&var.ty, root, &mut Vec::new(), env);
+        var.ty = refine(&var.ty, root, &mut Vec::new(), env, parts);
     }
 }
 
@@ -2184,7 +2391,12 @@ fn nested_type(
 
 type Located<'a> = (&'a Shape, Option<(u32, u32)>);
 
-fn struct_members(storage: &mut [StorageVar], env: &TypeEnv, hashed: &BTreeSet<Shape>) {
+fn struct_members(
+    storage: &mut [StorageVar],
+    env: &TypeEnv,
+    hashed: &BTreeSet<Shape>,
+    parts: &PartsRead,
+) {
     #[derive(Default)]
     struct Member {
         fields: BTreeSet<(u32, u32)>,
@@ -2204,6 +2416,10 @@ fn struct_members(storage: &mut [StorageVar], env: &TypeEnv, hashed: &BTreeSet<S
         if shape.space == SlotSpace::Persistent {
             shapes.entry(shape.root).or_default().push((shape, field));
         }
+    }
+    for (shape, fields) in parts {
+        let read = fields.iter().map(|field| (shape, Some(*field)));
+        shapes.entry(shape.root).or_default().extend(read);
     }
     let is_offset = |s: &ShapeStep| matches!(s, ShapeStep::Offset(_));
     for var in storage.iter_mut() {
@@ -2466,7 +2682,7 @@ fn inventories(
                 .flatten()
                 .collect();
             for root in lift::roots(nd) {
-                collect_sloads(root.expr, &mut slots, vyper, &bases);
+                collect_sloads(root, &mut slots, vyper, &bases);
                 if !init_words.contains(&root.expr) {
                     collect_strings(root.expr, &mut strings);
                 }
@@ -2476,7 +2692,11 @@ fn inventories(
         // The right side of an `||` is carried on the edge into the join and read
         // nowhere else.
         for (_, value) in l.edge_assigns.values().flatten() {
-            collect_sloads(*value, &mut slots, vyper, &bases);
+            let root = lift::Root {
+                expr: *value,
+                payload: false,
+            };
+            collect_sloads(root, &mut slots, vyper, &bases);
         }
     }
     let _ = names;
@@ -2752,6 +2972,20 @@ fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
     bases
 }
 
+fn nested_value(ty: &str, key: &str) -> String {
+    if let Some((k, v)) = ty
+        .strip_prefix("mapping(")
+        .and_then(|r| r.strip_suffix(')'))
+        .and_then(|inner| inner.split_once(" => "))
+    {
+        return format!("mapping({k} => {})", nested_value(v, key));
+    }
+    match ty.strip_suffix("[]") {
+        Some(elem) => format!("{}[]", nested_value(elem, key)),
+        None => format!("mapping({key} => uint256)"),
+    }
+}
+
 // A key that happens to be zero or one where it is used says nothing about the key type.
 fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>, Option<String>) {
     if let Some(c) = expr::as_const(key) {
@@ -2772,8 +3006,9 @@ fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>,
                 "bool" => "uint256".to_string(),
                 kt => kt.to_string(),
             };
+            // The slot hashed with this key is a value of what the inner key reached.
             let ty = match inner {
-                Some(t) => format!("mapping({} => {})", kt, t),
+                Some(t) => nested_value(&t, &kt),
                 None => format!("mapping({} => uint256)", kt),
             };
             (root, Some(ty))
@@ -2809,18 +3044,110 @@ fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>,
     }
 }
 
+/* The four bytes of a selector shift every argument of a call, so a word of its data starts
+with the last four bytes of one argument. Those four bytes are a cut the encoding makes,
+not a field the code reads. */
+/* A hash of values that do not start on a word has words that cut through them. The
+values as they were written are what the code read, so those are looked at instead. */
+fn read_parts(x: ExprId) -> Vec<ExprId> {
+    match (expr::node(x), expr::pieces(x)) {
+        (Node::Keccak(..), Some(pieces)) => pieces.into_iter().map(|(e, _)| e).collect(),
+        _ => expr::children(x),
+    }
+}
+
+fn selector_cut(root: &lift::Root, x: ExprId) -> Vec<ExprId> {
+    if !root.payload {
+        return Vec::new();
+    }
+    let mut cut = Vec::new();
+    match expr::node(x) {
+        Node::Op(op::SHL, v) if expr::as_const(v[0]) == Some(U256::from_u64(224)) => {
+            cut.push(v[1]);
+        }
+        /* The rest of the argument stands shifted down by those four bytes. Where the
+        argument is itself a shift of a slot the two shifts are one, so any shift that
+        is a part of the word is taken for the cut. */
+        Node::Op(op::OR, v) if x == root.expr => {
+            let shifted = |part: &&ExprId| matches!(expr::node(**part), Node::Op(op::SHR, w) if expr::is_const(w[0]));
+            cut.extend(v.iter().filter(shifted));
+        }
+        _ => {}
+    }
+    cut
+}
+
+/* The types of a function only know the parts of a slot some use gave a type to. A part
+that is only handed on is a field as well, and without it the slot would be declared by
+its other part alone. */
+type PartsRead = BTreeMap<Shape, BTreeSet<(u32, u32)>>;
+
+fn parts_read(functions: &[Function], layout: MappingLayout) -> PartsRead {
+    let mut found = PartsRead::new();
+    let nodes = functions
+        .iter()
+        .filter_map(|f| f.lifted.as_ref())
+        .flat_map(|l| l.nodes.iter());
+    // An argument the call was read into is a value of the code, not a word of its data.
+    let decoded = |nd: &lift::LNode| -> HashSet<ExprId> {
+        let calls = nd.stmts.iter().filter_map(|s| match s {
+            Stmt::Call { args, .. } => args.as_ref(),
+            _ => None,
+        });
+        let words = calls.flatten().filter_map(|arg| match arg {
+            lift::Arg::Word(e) => Some(*e),
+            _ => None,
+        });
+        words.collect()
+    };
+    let roots = nodes.flat_map(|nd| {
+        let values = decoded(nd);
+        lift::roots(nd).into_iter().map(move |root| lift::Root {
+            payload: root.payload && !values.contains(&root.expr),
+            ..root
+        })
+    });
+    for root in roots {
+        let mut seen = HashSet::new();
+        let mut cut: HashSet<ExprId> = HashSet::new();
+        let mut stack = vec![root.expr];
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) || seen.len() > 50_000 {
+                continue;
+            }
+            cut.extend(selector_cut(&root, x));
+            stack.extend(read_parts(x));
+            if (x == root.expr && root.payload) || cut.contains(&x) {
+                continue;
+            }
+            let whole_bytes = |f: &ssa::FieldRef| f.bits == 1 || f.bits.is_multiple_of(8);
+            let Some(field) = ssa::field_read(x).filter(whole_bytes) else {
+                continue;
+            };
+            let path = ssa::slot_path(field.key, layout).filter(|p| !p.steps.is_empty());
+            if let Some(path) = path {
+                let parts = found.entry(path.shape(SlotSpace::Persistent)).or_default();
+                parts.insert((field.bit_offset, field.bits));
+            }
+        }
+    }
+    found
+}
+
 fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
     let mut seen = HashSet::new();
+    let mut cut: HashSet<ExprId> = HashSet::new();
     let mut stack = vec![root.expr];
     while let Some(x) = stack.pop() {
         if !seen.insert(x) || seen.len() > 50_000 {
             continue;
         }
+        cut.extend(selector_cut(&root, x));
         if x == root.expr && root.payload {
-            stack.extend(expr::children(x));
+            stack.extend(read_parts(x));
             continue;
         }
-        if let Some((k, off, bits)) = emit::packed_read(x) {
+        if let Some((k, off, bits)) = emit::packed_read(x).filter(|_| !cut.contains(&x)) {
             if off > 0 || bits < 256 {
                 let entry = fields.entry(k).or_default().entry((off, bits)).or_default();
                 if matches!(expr::node(x), Node::Op(op::SIGNEXTEND, _)) {
@@ -2828,26 +3155,30 @@ fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
                 }
             }
         }
-        stack.extend(expr::children(x));
+        stack.extend(read_parts(x));
     }
 }
 
 fn collect_sloads(
-    e: ExprId,
+    root: lift::Root,
     slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>,
     vyper: bool,
     bases: &BTreeSet<U256>,
 ) {
     let mut seen = HashSet::new();
-    let mut stack = vec![e];
+    let mut cut: HashSet<ExprId> = HashSet::new();
+    let mut stack = vec![root.expr];
     while let Some(x) = stack.pop() {
         if !seen.insert(x) || seen.len() > 50_000 {
             continue;
         }
+        cut.extend(selector_cut(&root, x));
+        // A piece of a word of call data is cut where the encoding cuts it.
+        let piece = x == root.expr && root.payload;
         let n = expr::node(x);
         match &n {
             Node::SLoad(key, false, _) => note_slot(*key, slots, true, None, vyper, bases),
-            Node::Op(op::AND, v) => {
+            Node::Op(op::AND, v) if !piece && !cut.contains(&x) => {
                 if let (Node::SLoad(key, false, _), Some(m)) =
                     (expr::node(v[0]), expr::as_const(v[1]))
                 {
@@ -2857,8 +3188,6 @@ fn collect_sloads(
                             let bits = m.bits();
                             let t = if bits == 160 {
                                 "address".to_string()
-                            } else if bits == 1 {
-                                "bool".to_string()
                             } else if bits % 8 == 0 {
                                 format!("uint{}", bits)
                             } else {
@@ -2879,7 +3208,7 @@ fn collect_sloads(
             }
             _ => {}
         }
-        stack.extend(expr::children(x));
+        stack.extend(read_parts(x));
     }
 }
 
@@ -3018,6 +3347,13 @@ pub fn render(c: &Contract, name: &str) -> String {
              ptrN = memory(a, b) writes its words; bytes(p) is the byte string at p.\n",
         );
     }
+    if c.functions.iter().any(|f| f.code.contains("unchecked(")) {
+        out.push_str(
+            "// Arithmetic: + - * / % revert on overflow and on division by zero; \
+             unchecked(...) holds what the code computes without that test. \
+             Places in memory, storage and call data are never tested.\n",
+        );
+    }
     if c.functions.iter().any(|f| f.code.contains("loc_")) {
         out.push_str(
             "// Memory: loc_N is the variable kept at the fixed memory address 0xN; \
@@ -3135,6 +3471,14 @@ pub fn render(c: &Contract, name: &str) -> String {
     out
 }
 
+fn calls_by_name(code: &str, name: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code.match_indices(name).any(|(at, _)| {
+        let before = code[..at].chars().next_back();
+        code[at + name.len()..].starts_with('(') && !before.is_some_and(word)
+    })
+}
+
 fn part_banner(c: &Contract, index: usize) -> String {
     let Some(p) = c.parts.get(index) else {
         return String::new();
@@ -3234,11 +3578,16 @@ pub fn fmt_function_header(f: &Function) -> String {
         }
         FnKind::Orphan => {
             let params: Vec<String> = (0..f.n_args).map(|i| format!("uint256 arg{}", i)).collect();
+            let returns = match f.n_rets {
+                0 => String::new(),
+                n => format!(" returns ({})", vec!["uint256"; n].join(", ")),
+            };
             s.push_str(&format!(
-                "    // unreachable code at {:#x}\n    function {}({}) internal {{\n",
+                "    // unreachable code at {:#x}\n    function {}({}) internal{} {{\n",
                 f.pc,
                 f.name,
-                params.join(", ")
+                params.join(", "),
+                returns
             ));
         }
     }

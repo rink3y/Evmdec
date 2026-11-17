@@ -69,6 +69,8 @@ impl Ty {
             "address" | "address payable" => Some(Ty::Address),
             "bool" => Some(Ty::Bool),
             "int" => Some(Ty::Int(256)),
+            // A whole word named by the signature holds against a narrower use of it.
+            "uint" | "uint256" => Some(Ty::Uint(256)),
             _ => {
                 if let Some(n) = width("uint") {
                     (n.is_multiple_of(8) && n > 0 && n < 256).then_some(Ty::Uint(n))
@@ -144,6 +146,8 @@ struct Flags {
     unsigned_cmp: bool,
     arith_def: bool,
     word32: bool,
+    wide: u32,
+    modular: bool,
 }
 
 fn cast_checked(cast: u32, bits: u32) -> bool {
@@ -164,6 +168,8 @@ impl Flags {
         self.signed_cmp |= other.signed_cmp;
         self.unsigned_cmp |= other.unsigned_cmp;
         self.word32 |= other.word32;
+        self.wide = self.wide.max(other.wide);
+        self.modular |= other.modular;
     }
 }
 
@@ -175,18 +181,13 @@ pub struct ClassInfo {
     pub signed_cmp: bool,
     pub unsigned_cmp: bool,
     pub arith_def: bool,
-    cast: u32,
-}
-
-impl ClassInfo {
-    #[must_use]
-    pub fn checked(&self, bits: u32) -> bool {
-        cast_checked(self.cast, bits)
-    }
 }
 
 #[derive(Clone, Debug, Default)]
 struct Class {
+    // A helper's parameter or result takes whatever every caller or return hands it.
+    interface: bool,
+    def_wide: u32,
     hints: Ty,
     // A signed comparison with zero says the value is treated as signed here.
     // It does not say everything stored into it is signed.
@@ -195,6 +196,8 @@ struct Class {
     storage: bool,
     defs: Vec<(ExprId, usize)>,
     sources: Vec<usize>,
+    // How wide a masked value is says nothing of the word it was cut from.
+    masked: Vec<usize>,
     from_defs: Ty,
     resolved: Ty,
 }
@@ -227,16 +230,63 @@ pub type Declared = (usize, u32, Ty);
 #[must_use]
 pub fn declared_words(params: &[String]) -> Vec<(u32, Ty)> {
     let mut out = Vec::new();
-    for (i, p) in params.iter().enumerate() {
-        let dynamic = p == "bytes" || p == "string" || p.ends_with("[]");
-        if p.starts_with('(') || (p.ends_with(']') && !dynamic) {
-            break;
-        }
-        if let Some(t) = Ty::declared(p) {
-            out.push((i as u32, t));
+    let mut word = 0u32;
+    for p in params {
+        match head_words(p) {
+            Some(leaves) => {
+                for t in leaves {
+                    if let Some(t) = t {
+                        out.push((word, t));
+                    }
+                    word += 1;
+                }
+            }
+            // A dynamic value takes one head word, the offset of its tail.
+            None => word += 1,
         }
     }
     out
+}
+
+/* The head words a static ABI type takes, in order, each with the type of the value it
+holds. A struct or a fixed array of static parts lies flat in the head. None for a type
+whose head is only an offset. */
+fn head_words(ty: &str) -> Option<Vec<Option<Ty>>> {
+    let ty = ty.trim();
+    if let Some(open) = ty.strip_suffix(']').and_then(|_| ty.rfind('[')) {
+        let (elem, count) = (&ty[..open], &ty[open + 1..ty.len() - 1]);
+        let n: usize = count.parse().ok()?;
+        let one = head_words(elem)?;
+        return Some((0..n).flat_map(|_| one.clone()).collect());
+    }
+    if let Some(inner) = ty.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+        let mut out = Vec::new();
+        for part in top_level_parts(inner) {
+            out.extend(head_words(part)?);
+        }
+        return Some(out);
+    }
+    match ty {
+        "bytes" | "string" => None,
+        _ => Some(vec![Ty::declared(ty)]),
+    }
+}
+
+fn top_level_parts(list: &str) -> Vec<&str> {
+    let (mut parts, mut depth, mut start) = (Vec::new(), 0usize, 0);
+    for (i, ch) in list.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&list[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&list[start..]);
+    parts
 }
 
 pub fn solve(
@@ -306,6 +356,7 @@ impl TypeEnv {
         };
         self.classes.push(Class {
             storage: loc.is_storage(),
+            interface: matches!(loc, Loc::Arg { .. } | Loc::Ret { .. }),
             hints,
             ..Class::default()
         });
@@ -348,10 +399,14 @@ impl TypeEnv {
 
     fn def(&mut self, loc: Loc, val: ExprId, scope: usize) {
         let i = self.intern(loc);
+        let whole = self.location(val, scope).is_some();
         if let Some(src) = self.copy_source(val, scope) {
             let j = self.intern(src);
             if i != j && !self.classes[i].sources.contains(&j) {
                 self.classes[i].sources.push(j);
+                if !whole {
+                    self.classes[i].masked.push(j);
+                }
             }
         }
         self.classes[i].defs.push((val, scope));
@@ -366,6 +421,7 @@ impl TypeEnv {
                 self.classes[i].flags,
             );
             let sources = self.classes[i].sources.clone();
+            let masked = self.classes[i].masked.clone();
             for j in sources {
                 let c = &mut self.classes[j];
                 let before = (c.hints, c.weak, c.flags);
@@ -373,7 +429,12 @@ impl TypeEnv {
                 if !c.storage {
                     c.weak = c.weak.join(weak);
                 }
+                let (wide, modular) = (c.flags.wide, c.flags.modular);
                 c.flags.absorb(flags);
+                if masked.contains(&j) {
+                    c.flags.wide = wide;
+                    c.flags.modular = modular;
+                }
                 if (c.hints, c.weak, c.flags) != before {
                     work.push(j);
                 }
@@ -417,7 +478,7 @@ impl TypeEnv {
             }
             Node::SLoad(key, transient, _) => {
                 let path = ssa::slot_path(key, self.layout)?;
-                Some(Loc::Slot(path.shape(ssa::space_of(transient))))
+                Some(Loc::Slot(path.shape(SlotSpace::from_transient(transient))))
             }
             Node::IntRet(seq, index) => self
                 .callee_of
@@ -529,7 +590,7 @@ impl TypeEnv {
                 let Some(path) = ssa::slot_path(*key, self.layout) else {
                     return;
                 };
-                let space = ssa::space_of(*transient);
+                let space = SlotSpace::from_transient(*transient);
                 let shape = path.shape(space);
                 self.note_keys(&path, space, pc);
                 let fields = match self.vyper {
@@ -634,6 +695,22 @@ impl TypeEnv {
         self.flag(loc, |f| f.account = true);
     }
 
+    // The digest of typed data is the two bytes 0x1901 and then two hashes. Where the hash
+    // was read whole its stores are gone, and the values written into it say the same.
+    fn typed_data(&mut self, hash: ExprId, scope: usize) {
+        let Some(pieces) = expr::pieces(hash) else {
+            return;
+        };
+        let [(prefix, 2), (first, 32), (second, 32)] = pieces[..] else {
+            return;
+        };
+        let marker = U256::from_u64(0x1901);
+        if expr::as_const(prefix).is_some_and(|c| c == marker || c == marker << 240) {
+            self.word32(first, scope);
+            self.word32(second, scope);
+        }
+    }
+
     fn word32(&mut self, e: ExprId, scope: usize) {
         let loc = self.location(e, scope);
         self.flag(loc, |f| f.word32 = true);
@@ -662,10 +739,11 @@ impl TypeEnv {
             match &n {
                 Node::SLoad(key, transient, _) => {
                     if let Some(path) = ssa::slot_path(*key, self.layout) {
-                        self.note_keys(&path, ssa::space_of(*transient), scope);
+                        self.note_keys(&path, SlotSpace::from_transient(*transient), scope);
                     }
                 }
                 Node::Op(o, v) => self.op_use(*o, v, parent, scope),
+                Node::Keccak(..) => self.typed_data(x, scope),
                 _ => {}
             }
             let o = match &n {
@@ -764,12 +842,31 @@ impl TypeEnv {
                 for x in v {
                     self.arith(*x, scope, o);
                 }
+                // These work on whole words with no narrower form, so what they take is one.
+                if matches!(o, op::ADDMOD | op::MULMOD) {
+                    for x in v {
+                        let loc = self.location(*x, scope);
+                        self.flag(loc, |f| {
+                            f.wide = 256;
+                            f.modular = true;
+                        });
+                    }
+                }
             }
             op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH => self.account(v[0], scope),
             op::SHL
                 if konst(v[0]).is_some_and(|k| k.fits_u64() && (1..8).contains(&k.low_u64())) =>
             {
                 self.arith(v[1], scope, o);
+            }
+            // What is shifted down past its top bits was more than those bits. A test that
+            // nothing is left up there says the opposite and is no evidence.
+            op::SHR if !self.vyper && !matches!(parent, Some(op::ISZERO) | Some(op::EQ)) => {
+                if let Some(k) = konst(v[0]).filter(|k| k.fits_u64() && k.low_u64() < 256) {
+                    let loc = self.location(v[1], scope);
+                    let top = k.low_u64() as u32 + 1;
+                    self.flag(loc, |f| f.wide = f.wide.max(top));
+                }
             }
             _ => {}
         }
@@ -876,6 +973,7 @@ impl TypeEnv {
                 let mut flags = self.classes[i].flags;
                 flags.one = false;
                 flags.other = false;
+                let mut wide = 0;
                 for (val, scope) in &defs {
                     match expr::as_const(*val) {
                         Some(c) if c.is_zero() => {}
@@ -883,9 +981,19 @@ impl TypeEnv {
                         Some(c) => {
                             flags.other = true;
                             t = t.join(const_type(c));
+                            wide = wide.max(c.bits());
                         }
                         None => {
                             let vt = self.type_of(*val, *scope);
+                            // A word read whole may still hold a narrow value. A word worked
+                            // out by arithmetic shows how many bits it can carry.
+                            wide = wide.max(match (vt, expr::node(*val)) {
+                                (Ty::Bool, _) => 1,
+                                (Ty::Address, _) => 160,
+                                (Ty::Uint(n) | Ty::Int(n), _) => n,
+                                (_, Node::Op(..)) => expr::value_bits(*val),
+                                _ => 0,
+                            });
                             if vt != Ty::Bool && !expr::is_boolean(*val) {
                                 flags.other = true;
                             }
@@ -899,6 +1007,7 @@ impl TypeEnv {
                 let c = &mut self.classes[i];
                 c.defs = defs;
                 c.flags = flags;
+                c.def_wide = wide;
                 c.from_defs = t;
                 let resolved = resolve(c, Evidence::Flowing);
                 if resolved != c.resolved {
@@ -1027,6 +1136,21 @@ impl TypeEnv {
         })
     }
 
+    #[must_use]
+    pub fn arg_bits(&self, pc: usize, arity: usize, i: usize) -> u32 {
+        if i >= arity {
+            return 0;
+        }
+        let loc = Loc::Arg {
+            unit: pc,
+            slot: (arity - 1 - i) as u32,
+        };
+        self.ids.get(&loc).map_or(0, |c| {
+            let c = &self.classes[*c];
+            c.flags.wide.max(c.def_wide)
+        })
+    }
+
     pub fn result_type(&self, pc: usize, index: u16) -> Option<String> {
         self.solidity(&Loc::Ret { unit: pc, index })
     }
@@ -1096,7 +1220,7 @@ impl TypeEnv {
     pub fn absorb(&mut self, other: TypeEnv) {
         let offset = self.classes.len();
         for mut c in other.classes {
-            for s in &mut c.sources {
+            for s in c.sources.iter_mut().chain(c.masked.iter_mut()) {
                 *s += offset;
             }
             self.classes.push(c);
@@ -1121,6 +1245,7 @@ impl TypeEnv {
                     into.flags.absorb(from.flags);
                     into.defs.extend(from.defs);
                     into.sources.extend(from.sources);
+                    into.masked.extend(from.masked);
                     shared = true;
                 }
             }
@@ -1150,16 +1275,7 @@ impl TypeEnv {
             signed_cmp: c.flags.signed_cmp,
             unsigned_cmp: c.flags.unsigned_cmp,
             arith_def: c.flags.arith_def,
-            cast: c.flags.cast,
         })
-    }
-
-    #[must_use]
-    pub fn defs(&self, loc: &Loc) -> &[(ExprId, usize)] {
-        match self.ids.get(loc) {
-            Some(i) => &self.classes[*i].defs,
-            None => &[],
-        }
     }
 }
 
@@ -1181,11 +1297,36 @@ fn resolve(c: &Class, evidence: Evidence) -> Ty {
     if t == Ty::Unknown && evidence == Evidence::Final {
         t = c.weak;
     }
-    if t == Ty::Unknown && f.tested && !f.arith && !f.other && !c.storage {
+    // A value the code also orders against another is a number, however often it is tested.
+    let ordered = f.unsigned_cmp || f.signed_cmp;
+    if t == Ty::Unknown && f.tested && !f.arith && !f.other && !c.storage && !ordered {
         t = Ty::Bool;
     }
     if f.word32 && !f.arith && !f.account && matches!(t, Ty::Unknown | Ty::Bytes(_)) {
         t = Ty::Bytes(32);
+    }
+    // A stored number read or written past its top bits packs more than that number.
+    if c.storage && !c.interface {
+        let width = match t {
+            Ty::Uint(n) if n > 1 => n,
+            Ty::Bool | Ty::Uint(1) => 1,
+            _ => 256,
+        };
+        if f.wide.max(c.def_wide) > width {
+            return Ty::Unknown;
+        }
+    }
+    if c.interface {
+        let wide = f.wide.max(c.def_wide);
+        match t {
+            Ty::Uint(n) if n > 1 && wide > n => return Ty::Unknown,
+            Ty::Address if wide > 160 => return Ty::Unknown,
+            // Signed arithmetic fills the top bits of every negative result. Only a use
+            // inside the helper tells a wider signed value from a narrow one.
+            Ty::Int(_) if f.modular => return Ty::Unknown,
+            Ty::Int(n) if n < 256 && f.wide > n => return Ty::Int(256),
+            _ => {}
+        }
     }
     match t {
         Ty::Uint(n) if n <= 8 && f.one && !f.other && !f.arith => Ty::Bool,

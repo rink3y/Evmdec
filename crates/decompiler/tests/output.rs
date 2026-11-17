@@ -496,11 +496,21 @@ fn a_value_under_the_mask_one_is_a_bit_test_and_no_logical_and() {
 #[test]
 fn the_overflow_test_of_a_folded_helper_is_told_by_its_sum_or_printed() {
     let sum = text(
-        "60806040526100116004356001610025565b5f556100206024356003610025565b600155005b8067ffff\
+        "60806040526100114280506001610025565b5f556100206024356003610025565b600155005b8067ffff\
          ffffffffffff03821161003a570190565b634e487b7160e01b5f52601160045260245ffd",
     );
-    assert!(sum.contains("stor_0 = arg0 + 1;"), "{sum}");
-    assert!(!sum.contains("unchecked("), "{sum}");
+    assert!(
+        sum.contains("stor_0 = uint64(block.timestamp) + 1;"),
+        "{sum}"
+    );
+    // A whole word is no 64-bit number, so a sum of it does not tell the 64-bit test.
+    in_order(
+        &sum,
+        &[
+            "require(arg1 <= 0xfffffffffffffffc, Panic(arithmetic overflow));",
+            "stor_1 = unchecked(arg1 + 3);",
+        ],
+    );
     let product = text(
         "60806040526100116004356001610025565b5f556100206024356003610025565b600155005b8067ffff\
          ffffffffffff03821161003a570290565b634e487b7160e01b5f52601160045260245ffd",
@@ -666,9 +676,14 @@ fn the_sum_a_folded_helper_hands_back_is_the_sum_it_tested() {
          60015561003561004c565b005b8067ffffffffffffffff038211610057570190565b5f5f5f5f5f335af150\
          565b634e487b7160e01b5f52601160045260245ffd",
     );
-    assert!(out.contains("stor_0 = mem[arg0] + 1;"), "{out}");
-    assert!(!out.contains("unchecked("), "{out}");
-    assert!(!out.contains("Panic(arithmetic overflow)"), "{out}");
+    in_order(
+        &out,
+        &[
+            "require(mem[arg0] <= 0xfffffffffffffffe, Panic(arithmetic overflow));",
+            "stor_0 = unchecked(mem[arg0] + 1);",
+        ],
+    );
+    assert!(!out.contains("prev_"), "{out}");
 }
 
 #[test]
@@ -728,4 +743,36 @@ fn a_store_that_puts_an_old_word_back_is_printed_after_the_hash_taken_before_it(
     // Stored back with nothing stored to it in between, a word is unchanged.
     let unchanged = text("6004358051815200");
     assert!(!unchanged.contains("mem[arg0] ="), "{unchanged}");
+}
+
+#[test]
+fn a_sum_tested_in_a_type_narrower_than_a_word_is_printed_in_that_type() {
+    let narrow = text(
+        "6080604052438067fffffffffffffffe10601a576001015f55005b634e487b7160e01b5f52601160045260\
+         245ffd",
+    );
+    assert!(
+        narrow.contains("stor_0 = uint64(block.number) + 1;"),
+        "{narrow}"
+    );
+    // A whole word held to the same limit is no 64-bit number, so its test stays.
+    let wide = text(
+        "60806040526004358067fffffffffffffffe10601c576001015f55005b634e487b7160e01b5f5260116004\
+         5260245ffd",
+    );
+    in_order(
+        &wide,
+        &[
+            "require(0xfffffffffffffffe >= arg0, Panic(arithmetic overflow));",
+            "stor_0 = unchecked(arg0 + 1);",
+        ],
+    );
+    let product = text(
+        "6080604052438067555555555555555510601a576003025f55005b634e487b7160e01b5f52601160045260\
+         245ffd",
+    );
+    assert!(
+        product.contains("stor_0 = uint64(block.number) * 3;"),
+        "{product}"
+    );
 }

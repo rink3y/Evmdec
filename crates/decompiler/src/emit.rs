@@ -161,6 +161,7 @@ pub struct Checked {
     divisors: HashMap<ExprId, Vec<Site>>,
     untold: HashSet<ExprId>,
     limits: HashMap<ExprId, Limits>,
+    narrow: HashMap<ExprId, u32>,
 }
 
 type Limits = Vec<(U256, Option<Site>)>;
@@ -170,23 +171,38 @@ impl Checked {
     value of a type divided by that constant. The division is done when the code is
     compiled, so only the quotient is left to compare with. */
     fn product_limit(&self, e: ExprId) -> Option<Vec<Site>> {
+        self.product_limit_in(e).map(|(sites, _)| sites)
+    }
+
+    /* The sites of the tests, and the width of the type when it is narrower than a word.
+    A factor that may be wider than the type is no number of that type, so its product
+    does not say what was tested. */
+    fn product_limit_in(&self, e: ExprId) -> Option<(Vec<Site>, Option<u32>)> {
         let Node::Op(op::MUL, v) = expr::node(e) else {
             return None;
         };
-        let mut sites: Option<Vec<Site>> = None;
+        let mut found: Option<(Vec<Site>, Option<u32>)> = None;
         for (x, k) in [(v[0], v[1]), (v[1], v[0])] {
             let Some(k) = expr::as_const(k).filter(|k| !k.is_zero()) else {
                 continue;
             };
-            let fits =
-                |limit: &U256| (1..=32u32).any(|bytes| expr::mask_bits(8 * bytes) / k == *limit);
+            let width = |limit: &U256| {
+                let fits = |bytes: &u32| {
+                    expr::mask_bits(8 * bytes) / k == *limit
+                        && (*bytes == 32 || expr::value_bits(x) <= 8 * bytes)
+                };
+                (1..=32u32).rev().find(fits).map(|bytes| 8 * bytes)
+            };
             for (limit, site) in self.limits.get(&x).into_iter().flatten() {
-                if fits(limit) {
-                    sites.get_or_insert_with(Vec::new).extend(site);
-                }
+                let Some(bits) = width(limit) else {
+                    continue;
+                };
+                let (sites, narrow) = found.get_or_insert_with(|| (Vec::new(), Some(bits)));
+                sites.extend(site);
+                *narrow = narrow.filter(|_| bits < 256).map(|n| n.min(bits));
             }
         }
-        sites
+        found
     }
 }
 
@@ -316,14 +332,20 @@ pub fn checked_ops(l: &Lifted) -> Checked {
                         } else if c != max {
                             found.limits.entry(x).or_default().push((c, site));
                             /* The limit is the largest value of a type less what is
-                            added. The type is not known, so each width stands. */
+                            added. The type is not known, so each width stands. A sum in a
+                            type narrower than a word says what was tested only when its
+                            operand is of that type, so one that may be wider is left to
+                            its test. */
                             for bytes in (c.byte_len().max(1) as u32)..=32 {
                                 let top = expr::mask_bits(8 * bytes);
-                                if top == c {
+                                if top == c || (bytes < 32 && expr::value_bits(x) > 8 * bytes) {
                                     continue;
                                 }
-                                let room = expr::konst(top.wrapping_sub(c));
-                                tested(&mut found.ops, expr::op2(op::ADD, x, room), site);
+                                let sum = expr::op2(op::ADD, x, expr::konst(top.wrapping_sub(c)));
+                                tested(&mut found.ops, sum, site);
+                                if bytes < 32 {
+                                    found.narrow.entry(sum).or_insert(8 * bytes);
+                                }
                             }
                             let negated = expr::op2(op::SUB, expr::konst(U256::ZERO), x);
                             tested(&mut found.ops, negated, site);
@@ -627,6 +649,15 @@ impl Names {
         self.arithmetic(e) == Some(Arithmetic::Untested)
     }
 
+    /* A sum or a product tested against the largest value of a type narrower than a word
+    overflows in that type. Printed on bare operands it would read as one of whole words,
+    which the test lets through far longer. */
+    fn narrow_type(&self, e: ExprId) -> Option<u32> {
+        let checked = self.checked.as_ref()?;
+        let product = || checked.product_limit_in(e).and_then(|(_, bits)| bits);
+        checked.narrow.get(&e).copied().or_else(product)
+    }
+
     #[must_use]
     pub fn tests(&self, e: ExprId) -> bool {
         let mut seen = HashSet::new();
@@ -714,6 +745,14 @@ impl Names {
                 .collect();
             for (e, limits) in renamed {
                 checked.limits.entry(e).or_insert(limits);
+            }
+            let renamed: Vec<(ExprId, u32)> = checked
+                .narrow
+                .iter()
+                .map(|(e, bits)| (expr::substitute(*e, &named, &mut memo), *bits))
+                .collect();
+            for (e, bits) in renamed {
+                checked.narrow.entry(e).or_insert(bits);
             }
             let renamed: Vec<ExprId> = checked
                 .untold
@@ -2085,6 +2124,24 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
         ),
         Node::IntRet(seq, j) => (format!("ret_{}_{}", n.seq(seq), j), P_PRIMARY),
         Node::Op(..) if n.unchecked(e) => (format!("unchecked({})", fmt_bare(e, 0, n)), P_PRIMARY),
+        Node::Op(o @ (op::ADD | op::MUL), v) if n.narrow_type(e).is_some() => {
+            let bits = n.narrow_type(e).unwrap_or(256);
+            let (number, fixed) = match expr::is_const(v[0]) {
+                true => (v[1], v[0]),
+                false => (v[0], v[1]),
+            };
+            let cast = format!("uint{bits}(");
+            let number = match fmt_expr(number, n) {
+                typed if typed.starts_with(&cast) => typed,
+                plain => format!("{cast}{plain})"),
+            };
+            let (sign, prec) = match o {
+                op::ADD => ("+", P_ADD),
+                _ => ("*", P_MUL),
+            };
+            let fixed = fmt_prec(fixed, prec + 1, n);
+            (format!("{number} {sign} {fixed}"), prec)
+        }
         Node::Op(o, v) => fmt_op(o, &v, n),
     }
 }

@@ -855,3 +855,17 @@ fn a_value_stored_to_a_slot_is_not_printed_as_the_slot_after_a_call() {
         "{out}"
     );
 }
+
+#[test]
+fn a_word_read_before_a_store_a_few_bytes_off_it_is_named_before_that_store() {
+    let out = text("6004358060040151601182526022826004015260005260205ff3");
+    in_order(
+        &out,
+        &[
+            "uint256 prev_mem_arg0_4 = mem[arg0 + 4];",
+            "mem[arg0] = 17;",
+            "mem[arg0 + 4] = 34;",
+            "mem[0x0] = prev_mem_arg0_4;",
+        ],
+    );
+}

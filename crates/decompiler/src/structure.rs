@@ -559,15 +559,15 @@ fn overlapped(
                 .then(|| (0, most.low_u64()))
         })
     };
-    let (place, len, gen) = match st {
+    let (start, place, len, gen) = match st {
         Stmt::MStore {
             off, width, gen, ..
-        } => (places(*off), Some(u64::from(*width)), *gen),
-        Stmt::Copy { dest, len, gen, .. } => (places(*dest), at(*len), *gen),
+        } => (*off, places(*off), Some(u64::from(*width)), *gen),
+        Stmt::Copy { dest, len, gen, .. } => (*dest, places(*dest), at(*len), *gen),
         _ => return Vec::new(),
     };
     let Some((lo, last)) = place.filter(|_| gen > 0) else {
-        return Vec::new();
+        return beside(start, len, gen, loads, exact, names);
     };
     let hi = len.map(|n| last.saturating_add(n));
     let pointer = |a: ExprId| names.blocks.is_some() && emit::is_free_pointer(a);
@@ -585,6 +585,45 @@ fn overlapped(
     out.sort_by_key(|(w, _)| match w {
         Overwritten::Memory(a) => (at(*a), *a),
         _ => (None, ExprId(0)),
+    });
+    out
+}
+
+/* Two words a few bytes apart through the same pointer share bytes. A read of one made
+before a store to the other no longer holds once the store is made. */
+fn beside(
+    start: ExprId,
+    len: Option<u64>,
+    gen: u32,
+    loads: &HashMap<Overwritten, Vec<(ExprId, u32)>>,
+    exact: Option<Overwritten>,
+    names: &Names,
+) -> Vec<(Overwritten, u32)> {
+    let Some(len) = len.filter(|l| *l > 0 && gen > 0) else {
+        return Vec::new();
+    };
+    let (base, from) = expr::split_offset(start);
+    if base.is_none() {
+        return Vec::new();
+    }
+    let pointer = |a: ExprId| names.blocks.is_some() && emit::is_free_pointer(a);
+    let within = |d: U256, n: u64| d.fits_u64() && d.low_u64() < n;
+    let mut out: Vec<(Overwritten, u32)> = loads
+        .keys()
+        .filter(|w| Some(**w) != exact)
+        .filter_map(|w| match w {
+            Overwritten::Memory(a) if !pointer(*a) => {
+                let (b, d) = expr::split_offset(*a);
+                let hit = b == base
+                    && (within(d.wrapping_sub(from), len) || within(from.wrapping_sub(d), 32));
+                hit.then_some((*w, gen - 1))
+            }
+            _ => None,
+        })
+        .collect();
+    out.sort_by_key(|(w, _)| match w {
+        Overwritten::Memory(a) => *a,
+        _ => ExprId(0),
     });
     out
 }

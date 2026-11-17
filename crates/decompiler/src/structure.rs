@@ -701,9 +701,9 @@ fn memory_forward(stmts: &[Stmt], i: usize) -> Option<ExprId> {
                 | Stmt::Internal { .. }
         )
     };
-    // A variable has a name of its own, and the word would be printed where the variable
-    // is assigned again.
-    let named = matches!(expr::node(*val), Node::Var(_));
+    // A variable or a parameter has a name of its own, and the word would be printed where
+    // the variable is assigned again.
+    let named = matches!(expr::node(*val), Node::Var(_) | Node::Arg(_));
     let plain =
         *gen > 0 && !expr::is_const(*val) && !named && !stmts[i + 1..].iter().any(writes_memory);
     plain.then_some(*val)
@@ -2246,6 +2246,120 @@ pub fn name_tested(l: &Lifted, names: &Names) -> (Lifted, Bindings) {
     }
     plan.sort_by_key(|(f, pos, e)| (g.rpo_index[*f], *pos, first_seen[e]));
     bind(l, &g, plan, &|e| matches!(expr::node(e), Node::Op(..)))
+}
+
+fn writes_memory(st: &Stmt) -> bool {
+    match st {
+        Stmt::MStore { .. } | Stmt::Copy { .. } | Stmt::Internal { .. } => true,
+        Stmt::Call { out_len, .. } => expr::as_const(*out_len) != Some(U256::ZERO),
+        _ => false,
+    }
+}
+
+fn hash_mark(st: &Stmt) -> Option<ExprId> {
+    match st {
+        Stmt::Drop(e) if matches!(expr::node(*e), Node::KeccakMem(..)) => Some(*e),
+        _ => None,
+    }
+}
+
+/* A hash of memory prints as the range it was taken over, which reads as the memory of
+the place it is printed at. Where memory may be written between the hash and a use of it,
+the hash gets a name at the mark the lifter left where the code took it. */
+pub fn name_hashes(l: &Lifted) -> (Lifted, Bindings) {
+    let marked = |nd: &lift::LNode| nd.stmts.iter().any(|s| hash_mark(s).is_some());
+    if !l.nodes.iter().any(marked) {
+        return (l.clone(), Vec::new());
+    }
+    let g = Graph::new(l);
+    let writes: Vec<Vec<usize>> = l
+        .nodes
+        .iter()
+        .map(|nd| {
+            let at = nd.stmts.iter().enumerate();
+            at.filter(|(_, s)| writes_memory(s))
+                .map(|(i, _)| i)
+                .collect()
+        })
+        .collect();
+    let holds = |e: ExprId, hash: ExprId| {
+        let target = expr::node(hash);
+        expr::holds(e, kind::KECCAK_MEM) && expr::contains(e, &|n| *n == target)
+    };
+    let uses_of = |nd: &lift::LNode, hash: ExprId| -> Vec<usize> {
+        let mut at: Vec<usize> = Vec::new();
+        for (i, st) in nd.stmts.iter().enumerate() {
+            let used =
+                hash_mark(st).is_none() && lift::stmt_exprs(st).into_iter().any(|e| holds(e, hash));
+            if used {
+                at.push(i);
+            }
+        }
+        let leaving = l
+            .edge_assigns
+            .iter()
+            .filter(|((from, _), _)| *from == nd.id);
+        let mut last = lift::term_exprs(&nd.term);
+        last.extend(leaving.flat_map(|(_, a)| a.iter().map(|(_, v)| *v)));
+        if last.into_iter().any(|e| holds(e, hash)) {
+            at.push(nd.stmts.len());
+        }
+        at
+    };
+    let mut plan: Vec<(usize, Pos, ExprId)> = Vec::new();
+    for nd in l.nodes.iter().filter(|nd| g.reachable[nd.id]) {
+        for (i, st) in nd.stmts.iter().enumerate() {
+            let Some(hash) = hash_mark(st) else { continue };
+            let written_before = |node: usize, end: usize, from: usize| {
+                writes[node].iter().any(|w| *w >= from && *w < end)
+            };
+            let here = uses_of(nd, hash);
+            let mut late = here.iter().any(|u| *u > i && written_before(nd.id, *u, i));
+            if !late {
+                let after = g.reached(nd.succs.iter().copied(), &[]);
+                let tail = written_before(nd.id, nd.stmts.len(), i);
+                for other in l.nodes.iter().filter(|o| after.contains(&o.id)) {
+                    let Some(first) = uses_of(other, hash).into_iter().next() else {
+                        continue;
+                    };
+                    let again = other.id == nd.id;
+                    let head = match again {
+                        true => !writes[other.id].is_empty(),
+                        false => written_before(other.id, first, 0),
+                    };
+                    let between = || {
+                        let mut before: HashSet<usize> = HashSet::new();
+                        let mut pending: Vec<usize> = g.preds[other.id].clone();
+                        while let Some(m) = pending.pop() {
+                            if after.contains(&m) && before.insert(m) {
+                                pending.extend(&g.preds[m]);
+                            }
+                        }
+                        let ends = [nd.id, other.id];
+                        let mut on_way = before.iter().filter(|m| !ends.contains(m));
+                        on_way.any(|m| !writes[*m].is_empty())
+                    };
+                    if tail || head || between() {
+                        late = true;
+                        break;
+                    }
+                }
+            }
+            if late {
+                plan.push((nd.id, Pos::Stmt(i), hash));
+            }
+        }
+    }
+    let wanted = |e: ExprId| matches!(expr::node(e), Node::KeccakMem(..));
+    let (mut out, bindings) = bind(l, &g, plan, &wanted);
+    let named: HashSet<ExprId> = bindings.iter().map(|(_, var)| *var).collect();
+    for nd in out.nodes.iter_mut() {
+        nd.stmts.retain(|s| match s {
+            Stmt::Drop(e) => hash_mark(s).is_none() && !named.contains(e),
+            _ => true,
+        });
+    }
+    (out, bindings)
 }
 
 const DUP_LIMIT: usize = 6;

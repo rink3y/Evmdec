@@ -1203,9 +1203,11 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     };
     for (f, l) in functions.iter_mut().zip(printed) {
         let mut names = make_names(f, &storage, layout, &loaders, &callees);
+        let (l, hashes) = crate::structure::name_hashes(&l);
         names.hide_checked = solc08;
         names.checked = solc08.then(|| emit::checked_ops(&l));
         names.offsets = offsets.next().unwrap_or_default();
+        names.rebind(&hashes);
         names.pure_callees = pure_callees.clone();
         names.array_resizers = array_resizers.clone();
         crate::clock::check();

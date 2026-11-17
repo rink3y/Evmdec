@@ -510,3 +510,21 @@ fn a_variable_stored_in_a_loop_is_advanced_under_its_own_name() {
     assert!(out.contains("v1 = v1 + 160;"), "{out}");
     assert!(!out.contains("mem[v2] = mem[v2] + 160;"), "{out}");
 }
+
+#[test]
+fn a_hash_of_memory_written_again_before_its_use_is_named_where_it_was_taken() {
+    let out = text("600435806024359052600560205260408120604435825260205260409020545f5260205ff3");
+    let chain = [
+        "mem[arg0] = arg1;",
+        "mem[0x20] = 5;",
+        "v1 = keccak256(mem[arg0:arg0 + 64]);",
+        "mem[arg0] = arg2;",
+        "mem[0x20] = v1;",
+        "return (stor[keccak256(mem[arg0:arg0 + 64])]);",
+    ];
+    let mut from = 0;
+    for line in chain {
+        let at = out[from..].find(line);
+        from += at.unwrap_or_else(|| panic!("{line} is missing or out of order in\n{out}"));
+    }
+}

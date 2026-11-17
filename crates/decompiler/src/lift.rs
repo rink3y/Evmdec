@@ -2749,6 +2749,12 @@ impl<'a> Lifter<'a> {
                             ))
                         }
                     };
+                    /* A hash of memory nothing is known of is taken here and may be used
+                    after that memory is written again. The mark lets the text name it
+                    where it was taken. The oracle reads memory by its version. */
+                    if !self.oracle && matches!(expr::node(v), Node::KeccakMem(..)) {
+                        stmts.push(Stmt::Drop(v));
+                    }
                     st.stack.push(v);
                 }
                 op::MLOAD => {

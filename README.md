@@ -407,28 +407,35 @@ checks and reverts. A function matches only when all six agree.
 | first and second, after a sixth round of fixes | all 22 | 180 of 182, 2 regressions found by the check and fixed |
 | third, after the sixth round | the same 8 | 77 of 89, no regressions |
 | fourth, after the sixth round | the same 8 | 78 of 89 |
+| first and second, after a seventh round of fixes | all 22 | 179 of 182, one verdict made stricter |
+| third, after the seventh round | the same 8 | 77 of 89, no change |
+| fourth, after the seventh round | the same 8 | 80 of 89, no regressions |
+| fifth, fresh, as found | 8 (Vyper 0.4.3 and 0.3.7, solc 0.5.7, 0.7.6, 0.8.19 optimizer off, 0.8.21 and 0.8.17 via-IR, a diamond) | 51 of 86 |
 
 The number that says where the decompiler stands is the one measured on contracts it had
-never been checked on: 57% in the third batch as found and 72% in the fourth. Over all 38
-contracts after the sixth round it is 335 of 360, 93.1%, against a target of 95 to 99%.
-Every function of all 38 is found with the right selector (285 of 285 in the fourth batch),
-and the block oracle passes every one: it checks lifting, and these faults are made after
-it, in inlining, structuring and printing. Each mismatch is traced to a cause in the
-decompiler, and each cause gets a general fix and a test.
+never been checked on: 57% in the third batch as found, 72% in the fourth and 59% in the
+fifth. Over the 38 contracts it was fixed against it is 336 of 360, 93.3%, after the seventh
+round. The target is 95 to 99% on both, and neither is met. Every function of every contract
+is found with the right selector, and the block oracle passes every one: it checks lifting,
+and these faults are made after it, in inlining, typing and printing. Each mismatch is traced
+to a cause in the decompiler, and each cause gets a general fix and a test.
 
-The sixth round was made against the eight causes found in the fourth batch and closed 14
-of its 25 wrong functions. The re-check found that one of its fixes had made two functions
-of an older contract wrong, by printing a hash of whole words as a packed one. That was
-fixed and the contract checked again by a separate checker, 12 of 12.
+One contract of the fifth batch, a Uniswap V3 pool, runs the same code as a pool in the
+second batch apart from a few fixed values, so it is not fresh. Without it the fifth batch
+is 43 of 74, 58.1%. The fifth batch was also judged more strictly on one point: a helper
+parameter declared narrower than the full word it is passed, which read as Solidity would cut
+the value, counts as wrong there. The earlier batches let that pass where the body used the
+full value, so their numbers would be lower on that reading.
 
-Still open, 25 functions. Wrong output in 15: one heavy-assembly contract of the fourth
-batch has 10, from memory that a hash helper restores and the output does not, and from a
-length read again after the store that changed it. One function of another contract
-there prints a checked 64-bit add as a plain one. One Vyper 0.2 contract of the third batch has 4, all one fault:
-the words that compiler saves and puts back around an internal call are not modelled.
-Right but unclear in 10: a call whose arguments are encoded by a helper is printed as a
-selector write, the helper and a raw call, or as raw memory writes where there are two
-string tails or a re-encoding loop. A seventh round of fixes is being made against these.
+Open after the seventh round, wrong output in 15 functions of the 38 and 35 of the fifth
+batch, from these causes: a word saved before a store that partly overlaps it printed after
+that store (Seaport 9, and one function elsewhere), helper parameters typed narrower than the
+words they are passed (about 10), a value kept on the stack and a fresh read of the same slot
+after a call given one name, so a re-entry check prints as always true (9), a memory store
+printed at the wrong free-memory offset (7), Vyper 0.4 zero-fills of memory dropped (2), an
+address argument in packed call data printed 20 bytes wide (1), and the Vyper 0.2 save and
+restore around internal calls (4). Unclear in 10: calls whose arguments a helper encodes. An
+eighth round of fixes is being made against these.
 
 ## Quick start
 

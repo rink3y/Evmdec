@@ -411,10 +411,11 @@ checks and reverts. A function matches only when all six agree.
 | third, after the seventh round | the same 8 | 77 of 89, no change |
 | fourth, after the seventh round | the same 8 | 80 of 89, no regressions |
 | fifth, fresh, as found | 8 (Vyper 0.4.3 and 0.3.7, solc 0.5.7, 0.7.6, 0.8.19 optimizer off, 0.8.21 and 0.8.17 via-IR, a diamond) | 51 of 86 |
+| sixth, fresh, as found | 8 (Vyper 0.3.10, solc 0.4.14 optimizer off, 0.6.11, 0.7.1, 0.8.19, 0.8.21, 0.8.26 via-IR, a deployer) | 38 of 96 |
 
 The number that says where the decompiler stands is the one measured on contracts it had
-never been checked on: 57% in the third batch as found, 72% in the fourth and 59% in the
-fifth. Over the 38 contracts it was fixed against it is 336 of 360, 93.3%, after the seventh
+never been checked on: 57% in the third batch as found, 72% in the fourth, 59% in the
+fifth and 40% in the sixth. Over the 38 contracts it was fixed against it is 336 of 360, 93.3%, after the seventh
 round. The target is 95 to 99% on both, and neither is met. Every function of every contract
 is found with the right selector, and the block oracle passes every one: it checks lifting,
 and these faults are made after it, in inlining, typing and printing. Each mismatch is traced

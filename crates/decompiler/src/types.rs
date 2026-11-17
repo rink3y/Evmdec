@@ -1258,6 +1258,14 @@ fn resolve(c: &Class, evidence: Evidence) -> Ty {
     if f.word32 && !f.arith && !f.account && matches!(t, Ty::Unknown | Ty::Bytes(_)) {
         t = Ty::Bytes(32);
     }
+    // A stored number read or written past its top bits packs more than that number.
+    if c.storage && !c.interface {
+        if let Ty::Uint(n) = t {
+            if n > 1 && f.wide.max(c.def_wide) > n {
+                return Ty::Unknown;
+            }
+        }
+    }
     if c.interface {
         let wide = f.wide.max(c.def_wide);
         match t {

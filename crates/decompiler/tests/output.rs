@@ -959,3 +959,27 @@ fn a_temporary_made_on_one_arm_is_not_used_on_the_other() {
     let used = last.contains("v1 = t");
     assert!(!used || last.contains("uint256 t"), "{out}");
 }
+
+fn fixture(name: &str) -> String {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/source");
+    let hex = std::fs::read_to_string(path.join(name)).expect("fixture");
+    text(hex.trim())
+}
+
+#[test]
+fn a_word_read_above_its_first_field_is_declared_as_the_whole_word() {
+    // allowed[a][b] packs an amount, an expiry and a nonce. The code reads all three.
+    let out = fixture("Packed.hex");
+    assert!(
+        out.contains("mapping(address => mapping(address => uint256)) stor_0"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_stored_number_written_past_its_top_bits_is_declared_as_the_whole_word() {
+    // receipts[voter] packs a flag, a small number and a vote count into one word.
+    let out = fixture("Ballot.hex");
+    assert!(out.contains("mapping(address => uint256) field2"), "{out}");
+    assert!(!out.contains("mapping(address => uint8)"), "{out}");
+}

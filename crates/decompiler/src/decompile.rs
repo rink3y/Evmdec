@@ -2284,7 +2284,11 @@ fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv, parts: &Parts
             space: SlotSpace::Persistent,
         };
         let above = |fields: &BTreeSet<(u32, u32)>| fields.iter().any(|(at, _)| *at > 0);
-        if ty == "uint256" && !parts.get(&shape).is_some_and(above) {
+        let packed = parts.get(&shape).is_some_and(above);
+        if packed && types::Ty::declared(ty).is_some_and(|t| t != types::Ty::Uint(256)) {
+            return "uint256".to_string();
+        }
+        if ty == "uint256" && !packed {
             if let Some(t) = env.slot_type(root, steps) {
                 return t;
             }

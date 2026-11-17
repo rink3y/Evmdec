@@ -612,6 +612,15 @@ fn wild_base(b: ExprId) -> bool {
     expr::holds(b, !(kind::CONST | kind::OP | kind::MLOAD))
 }
 
+const FIRST_BLOCK: u64 = 0x80;
+
+/* An address that cannot reach the first allocated block is no pointer into one. It picks
+one of the words at fixed places below, so it is held to the range it can take. */
+fn scratch_index(base: ExprId) -> Option<u64> {
+    let most = expr::may_bits(base);
+    (most.fits_u64() && most.low_u64() < FIRST_BLOCK).then(|| most.low_u64())
+}
+
 fn rounded_down(sum: ExprId, low: ExprId) -> Option<Vec<ExprId>> {
     let Node::Op(op::AND, m) = expr::node(low) else {
         return None;
@@ -781,9 +790,13 @@ impl Mem {
     through that same address counts there. */
     fn written_since(&self, off: ExprId, n: u64, version: u32) -> bool {
         let (base, d) = norm_offset(off);
+        let index = |b: Option<ExprId>| b.and_then(scratch_index).is_some();
         let over = |w: &MemWrite| match w.base == base {
             true => d.saturating_add(n) > w.off && w.len.is_none_or(|l| d < w.off + l),
-            false => !self.pointer_named && base.is_none() && self.reaches(w, base, d, n),
+            false => {
+                let fixed = !self.pointer_named && base.is_none();
+                (fixed || index(w.base) || index(base)) && self.reaches(w, base, d, n)
+            }
         };
         version < self.wiped || self.writes.iter().any(|w| w.gen > version && over(w))
     }
@@ -848,6 +861,31 @@ impl Mem {
 
     // An address made from an index the code tested stays within what the index can reach.
     fn reaches(&self, w: &MemWrite, base: Option<ExprId>, d: u64, n: u64) -> bool {
+        let (w_index, r_index) = (w.base.and_then(scratch_index), base.and_then(scratch_index));
+        if w_index.is_some() || r_index.is_some() {
+            let unknown = |b: ExprId| !self.pointer_named || wild_base(b);
+            let span = |b: Option<ExprId>, index: Option<u64>, off: u64, len: Option<u64>| {
+                let reach = match (b, index) {
+                    (None, _) => Some(0),
+                    (Some(_), most) => most,
+                };
+                reach.map(|most| (off, len.map(|l| off.saturating_add(most).saturating_add(l))))
+            };
+            let write = span(w.base, w_index, w.off, w.len);
+            let read = span(base, r_index, d, Some(n));
+            return match (write, read) {
+                (Some((ws, we)), Some((rs, re))) => {
+                    we.is_none_or(|end| rs < end) && re.is_none_or(|end| ws < end)
+                }
+                (Some((_, end)), None) => {
+                    base.is_some_and(unknown) || end.is_none_or(|end| end > FIRST_BLOCK)
+                }
+                (None, Some((_, end))) => {
+                    w.base.is_some_and(unknown) || end.is_none_or(|end| end > FIRST_BLOCK)
+                }
+                (None, None) => true,
+            };
+        }
         if !may_alias(w.base, w.off, w.len, base, d, n, self.pointer_named) {
             return false;
         }

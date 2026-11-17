@@ -548,31 +548,41 @@ fn overlapped(
             .filter(|c| c.fits_u64())
             .map(|c| c.low_u64())
     };
-    let (lo, len, gen) = match st {
+    // An address that stays below the first block the code allocates picks a word among
+    // those at fixed places.
+    let places = |e: ExprId| {
+        at(e).map(|c| (c, c)).or_else(|| {
+            let most = names.may_bits(e);
+            (most.fits_u64() && most.low_u64() < lift::FREE_POINTER * 2)
+                .then(|| (0, most.low_u64()))
+        })
+    };
+    let (place, len, gen) = match st {
         Stmt::MStore {
             off, width, gen, ..
-        } => (at(*off), Some(u64::from(*width)), *gen),
-        Stmt::Copy { dest, len, gen, .. } => (at(*dest), at(*len), *gen),
+        } => (places(*off), Some(u64::from(*width)), *gen),
+        Stmt::Copy { dest, len, gen, .. } => (places(*dest), at(*len), *gen),
         _ => return Vec::new(),
     };
-    let Some(lo) = lo.filter(|_| gen > 0) else {
+    let Some((lo, last)) = place.filter(|_| gen > 0) else {
         return Vec::new();
     };
-    let hi = len.map(|n| lo.saturating_add(n));
+    let hi = len.map(|n| last.saturating_add(n));
     let pointer = |a: ExprId| names.blocks.is_some() && emit::is_free_pointer(a);
-    let hit = |a: u64| a.saturating_add(32) > lo && hi.is_none_or(|h| a < h);
+    let hit =
+        |(first, last): (u64, u64)| last.saturating_add(32) > lo && hi.is_none_or(|h| first < h);
     let mut out: Vec<(Overwritten, u32)> = loads
         .keys()
         .filter(|w| Some(**w) != exact)
         .filter_map(|w| match w {
-            Overwritten::Memory(a) if !pointer(*a) => at(*a).filter(|a| hit(*a)).map(|_| *w),
+            Overwritten::Memory(a) if !pointer(*a) => places(*a).filter(|p| hit(*p)).map(|_| *w),
             _ => None,
         })
         .map(|w| (w, gen - 1))
         .collect();
     out.sort_by_key(|(w, _)| match w {
-        Overwritten::Memory(a) => at(*a),
-        _ => None,
+        Overwritten::Memory(a) => (at(*a), *a),
+        _ => (None, ExprId(0)),
     });
     out
 }

@@ -124,6 +124,7 @@ pub struct Names {
     pub block_stale: RefCell<Vec<ExprId>>,
     pub forwarded: RefCell<HashMap<ExprId, String>>,
     pub forward_places: RefCell<HashMap<ExprId, ExprId>>,
+    pub bound: HashMap<ExprId, ExprId>,
     pub temp_seq: RefCell<u32>,
     pub seqs: RefCell<HashMap<u32, u32>>,
     pub vars: RefCell<HashMap<u32, u32>>,
@@ -677,6 +678,7 @@ impl Names {
     was found about the old expression is true of the new one. */
     pub fn rebind(&mut self, bindings: &[(Node, ExprId)]) {
         for (target, var) in bindings {
+            self.bound.insert(*var, expr::intern(target.clone()));
             let mut memo = HashMap::new();
             let named = |n: &Node| (n == target).then_some(*var);
             let sets = [
@@ -723,6 +725,19 @@ impl Names {
                 self.offsets.bases.insert(*var);
             }
         }
+    }
+
+    // A name given to a value has the bits of the value.
+    #[must_use]
+    pub fn may_bits(&self, e: ExprId) -> U256 {
+        let mut value = e;
+        for _ in 0..8 {
+            match self.bound.get(&value) {
+                Some(named) => value = *named,
+                None => break,
+            }
+        }
+        expr::may_bits(value)
     }
 
     pub fn take_temps(&self) -> Vec<(String, String)> {

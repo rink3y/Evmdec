@@ -528,3 +528,15 @@ fn a_hash_of_memory_written_again_before_its_use_is_named_where_it_was_taken() {
         from += at.unwrap_or_else(|| panic!("{line} is missing or out of order in\n{out}"));
     }
 }
+
+#[test]
+fn a_store_through_an_index_into_the_fixed_words_reaches_a_later_hash_of_them() {
+    let out =
+        text("60806040526119015f52602435602052600435602016604435905260405f205f55604051602090f3");
+    assert!(out.contains("mem[arg0 & 32] = arg2;"), "{out}");
+    assert!(out.contains("stor_0 = keccak256(mem[0:0x40]);"), "{out}");
+    assert!(
+        !out.contains("keccak256(abi.encodePacked(6401, arg1))"),
+        "{out}"
+    );
+}

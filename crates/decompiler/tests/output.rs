@@ -945,3 +945,17 @@ fn a_mapping_of_mappings_is_declared_with_its_keys_in_the_order_they_are_used() 
         "{out}"
     );
 }
+
+#[test]
+fn a_temporary_made_on_one_arm_is_not_used_on_the_other() {
+    let out = text(
+        "5f35608c5760043560243502604435016000526064356084350260a4350160205260c43560e43502\
+         60043501604052602435604435026064350160605260843560a4350260c4350160805260e4356004\
+         35026024350160a052604435606435026084350160c05260a43560c4350260e4350160e052610100\
+         5f2060016020356085575b55005b5060026082565b5f6003608256",
+    );
+    let arms: Vec<&str> = out.split("} else {").collect();
+    let last = arms.last().expect("an else arm");
+    let used = last.contains("v1 = t");
+    assert!(!used || last.contains("uint256 t"), "{out}");
+}

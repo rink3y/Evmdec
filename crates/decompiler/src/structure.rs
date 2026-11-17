@@ -2831,11 +2831,15 @@ impl<'a> Printer<'a> {
         }
     }
 
+    // A temporary made for one edge is declared in that arm only. The next arm makes its own.
     fn edge_assigns(&mut self, from: usize, to: usize, depth: usize) {
         self.named_in(from, false);
         if let Some(assigns) = self.l.edge_assigns.get(&(from, to)) {
             let assigns = assigns.clone();
+            let temps = self.names.temp_of.borrow().clone();
             self.assign_lines(&assigns, depth);
+            *self.names.temp_of.borrow_mut() = temps;
+            self.names.memo.borrow_mut().clear();
         }
     }
 

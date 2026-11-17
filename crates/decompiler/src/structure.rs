@@ -1015,8 +1015,8 @@ impl<'a> Words<'a> {
     }
 
     fn printable_after(&self, word: ExprId, n: usize) -> bool {
-        let slots_now = self.l.nodes[n].stmts.iter().filter_map(version_after);
-        let slots_now = slots_now.last().unwrap_or(self.l.nodes[n].sgen);
+        let mut slots_now = self.l.nodes[n].stmts.iter().filter_map(version_after);
+        let slots_now = slots_now.next_back().unwrap_or(self.l.nodes[n].sgen);
         let memory_now = self.version_left(n);
         let above = |at: &usize| self.g.dominates(*at, n);
         let mut seen = HashSet::new();

@@ -192,6 +192,7 @@ enum MVal {
 }
 
 type Origin = (usize, usize);
+type Parts = Vec<(usize, Arg)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MemWrite {
@@ -1099,7 +1100,7 @@ impl Mem {
         in_len: ExprId,
         head: &[ExprId],
         first: (usize, u64, ExprId),
-    ) -> Option<(Vec<(usize, Arg)>, Vec<Origin>)> {
+    ) -> Option<(Parts, Vec<Origin>)> {
         let at = |from_head: ExprId| {
             op2(
                 op::ADD,
@@ -1109,7 +1110,7 @@ impl Mem {
         };
         let (mut index, start, mut len) = first;
         let mut start = konst_u64(start);
-        let mut parts: Vec<(usize, Arg)> = Vec::new();
+        let mut parts: Parts = Vec::new();
         let mut built: Vec<Origin> = Vec::new();
         while parts.len() < head.len() {
             let data = expr::add_const(start, U256::from(32u64));

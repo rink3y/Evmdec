@@ -836,3 +836,11 @@ fn a_whole_word_in_packed_call_data_is_not_printed_as_a_narrower_type() {
     let data = "abi.encodePacked(bytes4(0x27a9b424), uint256(address(arg0)), bytes5(0x31494e4348))";
     assert!(out.contains(data), "{out}");
 }
+
+#[test]
+fn a_slot_a_scaled_index_past_a_mapping_value_names_is_a_field_of_one_record_in_a_list() {
+    // mstore(0, 5); mstore(0x20, caller); sstore(keccak256(0, 64) + calldataload(4) * 3 + 1, 42)
+    let out = text("600560005233602052604060002060043560030201600101602a905500");
+    assert!(out.contains("[arg0].field1 = 42"), "{out}");
+    assert!(!out.contains(".fieldarg0"), "{out}");
+}

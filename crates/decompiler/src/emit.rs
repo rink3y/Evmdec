@@ -1873,6 +1873,38 @@ fn base_name(e: ExprId, n: &Names, space: SlotSpace) -> String {
     }
 }
 
+/* A slot that is a mapping's value slot plus i * k plus c, with c below k, is field c of
+element i in a list of records k slots long. The sum may come in any order and nesting. */
+fn record_field(e: ExprId) -> Option<(ExprId, ExprId, U256)> {
+    fn terms(e: ExprId, out: &mut Vec<ExprId>) {
+        match expr::node(e) {
+            Node::Op(op::ADD, v) => v.iter().for_each(|t| terms(*t, out)),
+            _ => out.push(e),
+        }
+    }
+    let mut all = Vec::new();
+    terms(e, &mut all);
+    let hashed = |t: &ExprId| matches!(expr::node(*t), Node::Keccak(w, 0) if w.len() == 2);
+    let [record] = all.iter().copied().filter(hashed).collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let mut field = U256::ZERO;
+    let mut scaled = None;
+    for t in all.into_iter().filter(|t| *t != record) {
+        match (expr::as_const(t), expr::node(t)) {
+            (Some(c), _) => field = field.wrapping_add(c),
+            (None, Node::Op(op::MUL, v)) if scaled.is_none() => {
+                let pairs = [(v[0], v[1]), (v[1], v[0])].into_iter();
+                let mut found = pairs.filter_map(|(i, k)| Some((i, expr::as_const(k)?)));
+                scaled = Some(found.find(|(_, k)| k > &U256::ONE)?);
+            }
+            _ => return None,
+        }
+    }
+    let (i, k) = scaled?;
+    (field < k).then_some((record, i, field))
+}
+
 fn struct_member(e: ExprId, n: &Names) -> Option<(U256, u64, &String)> {
     if n.struct_depth.is_empty() {
         return None;
@@ -1955,6 +1987,12 @@ fn fmt_slot_path(e: ExprId, n: &Names, space: SlotSpace) -> String {
         }
         Node::Op(op::ADD, v) => {
             let (base, idx) = (v[0], v[1]);
+            if let Some((record, i, field)) = record_field(e) {
+                if struct_member(e, n).is_none() {
+                    let path = fmt_slot_path(record, n, space);
+                    return format!("{path}[{}].field{}", fmt_expr(i, n), field.to_decimal());
+                }
+            }
             for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                 if let Some((s, k)) = expr::as_const(a).and_then(hashed_slot) {
                     return format!(
@@ -1981,11 +2019,12 @@ fn fmt_slot_path(e: ExprId, n: &Names, space: SlotSpace) -> String {
                     format!("{}[{}]", base_name(words[0], n, space), fmt_expr(idx, n))
                 }
                 Node::Keccak(words, 0) if words.len() == 2 => {
-                    let member = match struct_member(e, n) {
-                        Some((_, _, name)) => name.clone(),
-                        None => format!("field{}", fmt_expr(idx, n)),
-                    };
-                    format!("{}.{}", fmt_slot_path(base, n, space), member)
+                    let path = fmt_slot_path(base, n, space);
+                    match (struct_member(e, n), expr::as_const(idx)) {
+                        (Some((_, _, name)), _) => format!("{path}.{name}"),
+                        (None, Some(field)) => format!("{path}.field{}", field.to_decimal()),
+                        (None, None) => format!("{path}[{}]", fmt_expr(idx, n)),
+                    }
                 }
                 _ => format!("{}[{}]", prefix, fmt_expr(e, n)),
             }

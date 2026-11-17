@@ -879,3 +879,17 @@ fn a_pointer_handed_to_a_helper_is_the_one_read_before_the_free_pointer_moved() 
     assert!(out.contains("mem[ptr1 + 32] = msg.data[0:32];"), "{out}");
     assert!(!out.contains("ptr2"), "{out}");
 }
+
+#[test]
+fn a_helper_parameter_is_a_whole_word_when_a_caller_or_the_body_shows_more_bits() {
+    let negated = text(
+        "6080604052601f6004356fffffffffffffffffffffffffffffffff16602c565b602a6004355f03602c56\
+         5b005b5f5b6001018035602e57506fffffffffffffffffffffffffffffffff165f5556",
+    );
+    assert!(negated.contains("function func_0x2c(uint256 "), "{negated}");
+    let shifted = text(
+        "6080604052600d6004356018565b60166024356018565b005b5f5b6001018035601a5750\
+         8073ffffffffffffffffffffffffffffffffffffffff165f5560a01c60015556",
+    );
+    assert!(shifted.contains("function func_0x18(uint256 "), "{shifted}");
+}

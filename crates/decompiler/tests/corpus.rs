@@ -573,6 +573,7 @@ fn declared_types_flow_into_storage() {
         vec![
             (0, Ty::Bytes(32)),
             (1, Ty::Address),
+            (2, Ty::Uint(256)),
             (3, Ty::Uint(64)),
             (5, Ty::Bool)
         ]

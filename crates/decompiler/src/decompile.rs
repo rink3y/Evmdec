@@ -2192,8 +2192,10 @@ fn internal_params(l: &Lifted, pc: usize, n_args: usize, env: &TypeEnv) -> Vec<P
     let direct = function::internal_param_types(l, n_args);
     (0..n_args)
         .map(|i| {
+            // An address the helper also takes bits above 160 from is a whole word.
+            let wide = env.arg_bits(pc, arity, i) > 160;
             let ty = match direct.get(i) {
-                Some(t) if t != "uint256" => t.clone(),
+                Some(t) if t != "uint256" && !(t == "address" && wide) => t.clone(),
                 _ => env
                     .arg_type(pc, arity, i)
                     .unwrap_or_else(|| "uint256".to_string()),

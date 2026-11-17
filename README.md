@@ -347,6 +347,11 @@ stored time, gave the same findings in every contract and the same counts: 31 of
 90, 4 of 101. Time per contract fell to a median of 2.5 s with 90% under 5.8 s. The same one
 contract still does not finish in 600 s, and why is not known.
 
+A seventh score, on the build that searches first the state in which the account holds
+some of the contract's own ledger: 31 of 234 found, 53 of 90 findings correct (58.9%), 3 of
+101 contracts with no known flaw flagged. One more finding is the known flaw and one false
+alarm on a safe contract is gone. The count of known flaws found did not move.
+
 On the development set, where every false finding was read and its cause fixed, the latest
 reviewed build finds 36 of 231 known flaws (15.6%) by address, 55 of its 67 findings are
 correct (82%), and none of 55 contracts with no known flaw gets a finding. A contract takes

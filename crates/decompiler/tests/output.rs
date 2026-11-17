@@ -929,3 +929,19 @@ fn a_folded_helper_that_reads_a_word_it_stored_reads_it_after_the_store() {
         ],
     );
 }
+
+#[test]
+fn a_mapping_of_mappings_is_declared_with_its_keys_in_the_order_they_are_used() {
+    let out = text(
+        "335f52600160205260405f2060205260043577ffffffffffffffffffffffffffffffffffffffffffffffff\
+         165f5260405f206001905500",
+    );
+    assert!(
+        out.contains("mapping(address => mapping(uint192 => uint256)) stor_1;"),
+        "{out}"
+    );
+    assert!(
+        out.contains("stor_1[msg.sender][uint192(arg0)] = 1;"),
+        "{out}"
+    );
+}

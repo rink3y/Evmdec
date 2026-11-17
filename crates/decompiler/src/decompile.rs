@@ -2958,6 +2958,20 @@ fn fixed_array_bases(functions: &[Function]) -> BTreeSet<U256> {
     bases
 }
 
+fn nested_value(ty: &str, key: &str) -> String {
+    if let Some((k, v)) = ty
+        .strip_prefix("mapping(")
+        .and_then(|r| r.strip_suffix(')'))
+        .and_then(|inner| inner.split_once(" => "))
+    {
+        return format!("mapping({k} => {})", nested_value(v, key));
+    }
+    match ty.strip_suffix("[]") {
+        Some(elem) => format!("{}[]", nested_value(elem, key)),
+        None => format!("mapping({key} => uint256)"),
+    }
+}
+
 // A key that happens to be zero or one where it is used says nothing about the key type.
 fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>, Option<String>) {
     if let Some(c) = expr::as_const(key) {
@@ -2978,8 +2992,9 @@ fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>,
                 "bool" => "uint256".to_string(),
                 kt => kt.to_string(),
             };
+            // The slot hashed with this key is a value of what the inner key reached.
             let ty = match inner {
-                Some(t) => format!("mapping({} => {})", kt, t),
+                Some(t) => nested_value(&t, &kt),
                 None => format!("mapping({} => uint256)", kt),
             };
             (root, Some(ty))

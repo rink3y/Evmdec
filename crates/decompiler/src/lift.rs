@@ -3463,6 +3463,15 @@ impl<'a> Lifter<'a> {
         for (cond, _, _) in folded.map_or(&[][..], |s| s.guards.as_slice()) {
             st.learn(subst(*cond), true);
         }
+        /* What the caller read and handed in was read when the caller read it. Read again
+        here, a word the caller wrote since, such as the free pointer, would stand in. */
+        let mut handed: HashSet<ExprId> = HashSet::new();
+        let mut pending: Vec<ExprId> = (0..consumed).map(|i| at(i)).collect();
+        while let Some(x) = pending.pop() {
+            if expr::holds(x, kind::MLOAD) && handed.insert(x) {
+                pending.extend(expr::children(x));
+            }
+        }
         let resolve = |e: ExprId| -> ExprId {
             let mut memo = HashMap::new();
             expr::substitute(
@@ -3471,6 +3480,10 @@ impl<'a> Lifter<'a> {
                     let Node::MLoad(a, _) = n else {
                         return None;
                     };
+                    let read = expr::intern(n.clone());
+                    if handed.contains(&read) {
+                        return Some(read);
+                    }
                     /* A read that is still a read of the same place has gained
                     nothing. Its caller made it, and with a new stamp it would be
                     another value than the one the helper tested. It stays whole. The

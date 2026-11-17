@@ -869,3 +869,13 @@ fn a_word_read_before_a_store_a_few_bytes_off_it_is_named_before_that_store() {
         ],
     );
 }
+
+#[test]
+fn a_pointer_handed_to_a_helper_is_the_one_read_before_the_free_pointer_moved() {
+    let out = text(
+        "6080604052600a6015565b60106015565b60205ff35b5f5b600101803560175750\
+         604051806040016040526031816038565b5f35905250565b6020019056",
+    );
+    assert!(out.contains("mem[ptr1 + 32] = msg.data[0:32];"), "{out}");
+    assert!(!out.contains("ptr2"), "{out}");
+}

@@ -324,6 +324,7 @@ struct Printer<'a> {
     given: HashMap<(ExprId, String), usize>,
     stored: Vec<(usize, String, ExprId, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
+    put_back: HashSet<(usize, usize)>,
     memory_reads: Vec<Vec<(usize, Span)>>,
     // Filled while the printer's &self methods run, hence the cell.
     skipped: RefCell<HashSet<(usize, usize)>>,
@@ -2914,7 +2915,8 @@ impl<'a> Printer<'a> {
         self.named_in(n, true);
         self.names.replace_stale_in_block(held);
         self.refresh_forwarded(n);
-        let mut dead = emit::dead_memory_stores(&self.l.nodes[n].stmts);
+        let put_back = emit::on_node(&self.put_back, n);
+        let mut dead = emit::dead_memory_stores(&self.l.nodes[n].stmts, &put_back);
         dead.extend(
             self.dead_stores
                 .iter()
@@ -3633,7 +3635,8 @@ impl<'a> Printer<'a> {
     }
 
     fn visible_stmts(&self, n: usize) -> Vec<&Stmt> {
-        let dead = emit::dead_memory_stores(&self.l.nodes[n].stmts);
+        let put_back = emit::on_node(&self.put_back, n);
+        let dead = emit::dead_memory_stores(&self.l.nodes[n].stmts, &put_back);
         self.l.nodes[n]
             .stmts
             .iter()
@@ -3963,6 +3966,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
             .into_iter()
             .chain(unread_fixed_stores(l, names))
             .collect(),
+        put_back: emit::stores_put_back(l),
         memory_reads: memory_reads(l),
         skipped: Default::default(),
         printed_last: None,
@@ -4015,6 +4019,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
             given: HashMap::new(),
             stored: Vec::new(),
             dead_stores: std::mem::take(&mut p.dead_stores),
+            put_back: std::mem::take(&mut p.put_back),
             memory_reads: std::mem::take(&mut p.memory_reads),
             skipped: Default::default(),
             printed_last: None,

@@ -1086,20 +1086,79 @@ fn reads_memory(s: &Stmt) -> bool {
 // Looking further made a long run of stores quadratic.
 const DEAD_STORE_WINDOW: usize = 256;
 
-pub fn dead_memory_stores(stmts: &[Stmt]) -> HashSet<usize> {
+fn own_word(s: &Stmt) -> Option<(ExprId, u32, u32)> {
+    let Stmt::MStore {
+        off,
+        val,
+        width: 32,
+        gen,
+    } = s
+    else {
+        return None;
+    };
+    match expr::node(*val) {
+        Node::MLoad(at, read) if at == *off => Some((at, read, *gen)),
+        _ => None,
+    }
+}
+
+/* A word stored to itself changes nothing, unless it was read before another store to it.
+Then the store puts the old word back, and with it left out the other store would stand
+for good. */
+pub fn stores_put_back(l: &Lifted) -> HashSet<(usize, usize)> {
+    let mut at: HashMap<ExprId, Vec<(u32, usize, usize)>> = HashMap::new();
+    for nd in &l.nodes {
+        for (i, s) in nd.stmts.iter().enumerate() {
+            let word = match s {
+                Stmt::MStore { off, gen, .. } => Some((*off, *gen)),
+                Stmt::Copy { dest, gen, .. } => Some((*dest, *gen)),
+                _ => None,
+            };
+            if let Some((word, gen)) = word.filter(|_| own_word(s).is_none()) {
+                at.entry(word).or_default().push((gen, nd.id, i));
+            }
+        }
+    }
+    let mut put_back = HashSet::new();
+    for nd in &l.nodes {
+        for (i, s) in nd.stmts.iter().enumerate() {
+            let Some((word, read, gen)) = own_word(s) else {
+                continue;
+            };
+            // The stores of a folded helper share one version, so their order tells.
+            let between = |(stored, node, j): &(u32, usize, usize)| {
+                *stored > read && (*stored < gen || (*stored == gen && *node == nd.id && *j < i))
+            };
+            if at
+                .get(&word)
+                .is_some_and(|stores| stores.iter().any(between))
+            {
+                put_back.insert((nd.id, i));
+            }
+        }
+    }
+    put_back
+}
+
+pub fn on_node(places: &HashSet<(usize, usize)>, node: usize) -> HashSet<usize> {
+    let here = places.iter().filter(|(n, _)| *n == node);
+    here.map(|(_, i)| *i).collect()
+}
+
+pub fn dead_memory_stores(stmts: &[Stmt], put_back: &HashSet<usize>) -> HashSet<usize> {
     let mut dead = HashSet::new();
     let reads: Vec<bool> = stmts.iter().map(reads_memory).collect();
     let ranges: Vec<Option<(u64, u64)>> = stmts.iter().map(written_range).collect();
     for (i, s) in stmts.iter().enumerate() {
-        if let Stmt::MStore {
-            off,
-            val,
-            width: 32,
-            ..
-        } = s
-        {
-            if matches!(expr::node(*val), Node::MLoad(a, _) if a == *off) {
-                dead.insert(i);
+        if let Some((word, _, _)) = own_word(s) {
+            // With no read between the two, the store it undoes was never seen either.
+            let stored = |j: &usize| match &stmts[*j] {
+                Stmt::MStore { off: at, .. } | Stmt::Copy { dest: at, .. } => *at == word,
+                _ => false,
+            };
+            let unread = (0..i).rev().take_while(|j| !reads[*j]).find(stored);
+            if !put_back.contains(&i) || unread.is_some() {
+                dead.extend(unread.into_iter().chain([i]));
                 continue;
             }
         }
@@ -3397,6 +3456,7 @@ pub fn name_labels(text: &str) -> String {
 
 pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
     name_gas_reads(l, n);
+    let put_back = stores_put_back(l);
     let mut out = String::new();
     let reach = crate::lift::reachable(l);
     let order = crate::lift::reverse_postorder(l);
@@ -3425,7 +3485,7 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
             out.push_str(&format!("{}{}:\n", indent, label(l, nid)));
         }
         n.end_block();
-        let mut dead = dead_memory_stores(&nd.stmts);
+        let mut dead = dead_memory_stores(&nd.stmts, &on_node(&put_back, nid));
         dead.extend(free_pointer_updates(&nd.stmts, n));
         for (i, s) in nd.stmts.iter().enumerate() {
             if dead.contains(&i) {

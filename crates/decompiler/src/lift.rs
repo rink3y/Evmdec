@@ -1792,6 +1792,7 @@ pub struct CalleeSummary {
     pub stores_and_copies_before: Vec<(usize, usize)>,
     pub copies: Vec<(ExprId, ExprId, ExprId)>,
     pub maybe_mstores: Vec<ExprId>,
+    pub hashes: Vec<(ExprId, usize, usize)>,
 }
 
 pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
@@ -1832,6 +1833,9 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                     sum.stores_and_copies_before
                         .push((sum.mstores.len(), sum.copies.len()));
                     sum.guards.push((*cond, data.clone(), *invalid));
+                }
+                Stmt::Drop(e) if matches!(expr::node(*e), Node::KeccakMem(..)) => {
+                    sum.hashes.push((*e, sum.mstores.len(), sum.copies.len()));
                 }
                 Stmt::Assign { .. } | Stmt::Drop(_) => {}
             }
@@ -3455,10 +3459,31 @@ impl<'a> Lifter<'a> {
                 });
             }
         };
+        /* A hash the helper took reads the memory of the place it took it at. The mark
+        stands there among the helper's stores, so the text can name the hash before a
+        later store changes what it was taken over. */
+        let mut marks: Vec<(Option<usize>, ExprId)> = Vec::new();
+        for (hash, stores, copies) in summary.map_or(&[][..], |s| s.hashes.as_slice()) {
+            let sum = summary.expect("the hashes are the summary's");
+            let before = (*copies == 0 && *stores < sum.mstores.len()).then_some(*stores);
+            let hash = match reads_caller {
+                true => resolve(subst(*hash)),
+                false => subst(*hash),
+            };
+            let taken = matches!(expr::node(hash), Node::KeccakMem(..));
+            if taken && transparent && !self.oracle {
+                marks.push((before, hash));
+            }
+        }
+        let hashed = |stmts: &mut Vec<Stmt>, stored: Option<usize>| {
+            let here = marks.iter().filter(|(before, _)| *before == stored);
+            stmts.extend(here.map(|(_, hash)| Stmt::Drop(*hash)));
+        };
         match summary {
             Some(sum) => {
                 for (made, (off, val)) in sum.mstores.iter().enumerate() {
                     tests(stmts, Some(made));
+                    hashed(stmts, Some(made));
                     let (o, v) = (subst(*off), subst(*val));
                     if transparent {
                         let origin = Some((un.id, stmts.len()));
@@ -3534,6 +3559,7 @@ impl<'a> Lifter<'a> {
         }
         if transparent {
             tests(stmts, None);
+            hashed(stmts, None);
         } else {
             stmts.push(Stmt::Internal {
                 seq,

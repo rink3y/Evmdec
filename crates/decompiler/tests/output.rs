@@ -694,3 +694,38 @@ fn a_word_read_before_a_store_keeps_its_old_value_in_the_blocks_after_it() {
         ],
     );
 }
+
+#[test]
+fn a_store_that_puts_an_old_word_back_is_printed_after_the_hash_taken_before_it() {
+    let plain = text("600435805160078252604082209082525f5500");
+    in_order(
+        &plain,
+        &[
+            "uint256 prev_mem_arg0 = mem[arg0];",
+            "mem[arg0] = 7;",
+            "v1 = keccak256(mem[arg0:arg0 + 64]);",
+            "mem[arg0] = prev_mem_arg0;",
+            "stor_0 = v1;",
+        ],
+    );
+    let folded = text(
+        "6080604052600d600435601d565b5f556018602435601d565b600155005b80516007825260408220908252\
+         90509056",
+    );
+    in_order(
+        &folded,
+        &[
+            "mem[arg0] = 7;",
+            "v1 = keccak256(mem[arg0:arg0 + 64]);",
+            "mem[arg0] = prev_mem_arg0;",
+            "stor_0 = v1;",
+            "mem[arg1] = 7;",
+            "v2 = keccak256(mem[arg1:arg1 + 64]);",
+            "mem[arg1] = prev_mem_arg1;",
+            "stor_1 = v2;",
+        ],
+    );
+    // Stored back with nothing stored to it in between, a word is unchanged.
+    let unchanged = text("6004358051815200");
+    assert!(!unchanged.contains("mem[arg0] ="), "{unchanged}");
+}

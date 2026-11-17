@@ -383,3 +383,22 @@ fn a_contract_that_hands_every_call_to_an_address_in_a_slot_of_its_own_is_a_prox
     let found = audit::handed_to(&contract, Rc::new(chain), 100, 1_700_000_000);
     assert_eq!(found, Some(behind));
 }
+
+#[test]
+fn a_finding_that_needed_a_wait_says_so_in_its_steps() {
+    let (late, deployer) = (
+        U256::from_hex_str(DEPLOYED_AT).expect("address"),
+        U256::from_hex_str("0x4444444444444444444444444444444444444444").expect("address"),
+    );
+    let mut chain = audit::chain::Table::default();
+    chain.storage.insert((late, U256::ZERO), deployer);
+    // claim() makes its caller the owner a day after anyone called open().
+    let report = report_on_chain("Late.hex", chain);
+    let taken = report.findings.iter().find(|f| f.kind == Kind::Takeover);
+    let taken = taken.unwrap_or_else(|| panic!("{:?}", report.findings));
+    assert!(
+        taken.steps.iter().any(|s| s.contains("time passes")),
+        "{:?}",
+        taken.steps
+    );
+}

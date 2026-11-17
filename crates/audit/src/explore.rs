@@ -2078,12 +2078,11 @@ impl<'a> Explorer<'a> {
         lost
     }
 
-    fn history(&self, from: usize, entry: usize, msg: &Msg) -> Vec<Step> {
-        let mut steps = self.states[from].steps.clone();
-        steps.push(Step::Call {
-            entry,
-            msg: msg.clone(),
-        });
+    // The last call is given with the wait and the outside answers it was made under.
+    fn history(&self, from: usize, entry: usize, t: &Try) -> Vec<Step> {
+        let state = &self.states[from];
+        let mut steps = state.steps.clone();
+        steps.extend(Self::called(state.world.time, entry, t));
         steps
     }
 
@@ -2120,7 +2119,7 @@ impl<'a> Explorer<'a> {
                 .into_iter()
                 .filter(|b| matches!(b.kind, Kind::Takeover | Kind::RoleCleared))
                 .collect();
-            let steps = self.history(from, entry, &t.msg);
+            let steps = self.history(from, entry, &t);
             self.report(takeovers, entry, &steps, &again, (false, false));
         }
     }
@@ -2170,7 +2169,7 @@ impl<'a> Explorer<'a> {
                 .into_iter()
                 .filter(|b| !apart.iter().any(|p| p.kind == b.kind && p.asset == b.asset))
                 .collect();
-            let steps = self.history(from, entry, &again.msg);
+            let steps = self.history(from, entry, &again);
             self.report(fresh, entry, &steps, &run, (true, false));
         }
     }
@@ -2234,7 +2233,7 @@ impl<'a> Explorer<'a> {
                         laws::check(&before, &before, &world, &run, &self.facts, U256::ZERO);
                     let gains: Vec<Breach> =
                         found.into_iter().filter(|b| b.kind == Kind::Gain).collect();
-                    let steps = self.history(at, entry, &t.msg);
+                    let steps = self.history(at, entry, &t);
                     self.report(gains, entry, &steps, &run, (false, false));
                 }
             }
@@ -2275,7 +2274,7 @@ impl<'a> Explorer<'a> {
                     }
                     let base = &self.states[0].world;
                     if let Some(breach) = laws::diverted(base, &before, &world) {
-                        let steps = self.history(from, entry, &t.msg);
+                        let steps = self.history(from, entry, &t);
                         self.report(vec![breach], blamed, &steps, &run, (false, true));
                     }
                     break;
@@ -2471,7 +2470,7 @@ impl<'a> Explorer<'a> {
                 let claim = |b: &&Breach| matches!(b.kind, Kind::Gain | Kind::Credit);
                 let shown = plain.iter().filter(|b| b.kind != Kind::Gain || !stray);
                 let shown: Vec<Breach> = shown.filter(|b| !granted || !claim(b)).cloned().collect();
-                let steps = self.history(from, entry, &t.msg);
+                let steps = self.history(from, entry, &t);
                 self.report(shown, entry, &steps, &run, (false, false));
                 if !granted {
                     self.takes_from_owner(from, entry, &t, &run);

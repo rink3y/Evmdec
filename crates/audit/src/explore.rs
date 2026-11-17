@@ -2307,8 +2307,19 @@ impl<'a> Explorer<'a> {
     raises what the contract records for people unknown here is paid for work done for
     them, as a keeper is. Neither is taken from anyone. */
     fn earned(&self, from: usize, t: &Try, before: &World, run: &Run) -> bool {
+        let mut acted = false;
+        let mut waited = t.time.is_some_and(|time| time > before.time);
+        for step in &self.states[from].steps {
+            match step {
+                Step::Call { msg, .. } => acted |= Facts::same_party(msg.from, ACTOR),
+                Step::Wait { .. } => waited |= acted,
+                _ => {}
+            }
+        }
+        /* In a guessed world what the account holds was handed to it. What that pays once
+        the clock has moved is the contract's own yield on a holding nobody paid for. */
         if !self.on_chain {
-            return false;
+            return waited;
         }
         let base = &self.states[0].world;
         let held = |world: &World, asset: Option<Addr>| {
@@ -2321,15 +2332,6 @@ impl<'a> Explorer<'a> {
         let mut kinds: Vec<Option<Addr>> = vec![None];
         kinds.extend(before.assets().into_iter().map(Some));
         let paid_in = kinds.iter().any(|k| held(before, *k) < held(base, *k));
-        let mut acted = false;
-        let mut waited = t.time.is_some_and(|time| time > before.time);
-        for step in &self.states[from].steps {
-            match step {
-                Step::Call { msg, .. } => acted |= Facts::same_party(msg.from, ACTOR),
-                Step::Wait { .. } => waited |= acted,
-                _ => {}
-            }
-        }
         let unknown = |k: &crate::trace::Key| {
             let account = (97..=160).contains(&k.value.bits()) && !self.known.contains(&k.value);
             account && !before.runs_code(k.value)

@@ -2874,8 +2874,12 @@ fn fmt_call_pieces(
     pieces: &[(ExprId, u8)],
     n: &Names,
 ) -> (Option<String>, Vec<String>, &'static str) {
-    let piece = |p: &(ExprId, u8)| fmt_piece(p, n);
     let usual = pieces[0].1 == 4 && pieces[1..].iter().all(|(_, width)| *width == 32);
+    // Packed, a whole word cast to a narrower type would read as fewer bytes than are sent.
+    let piece = |p: &(ExprId, u8)| match (usual, p.1) {
+        (false, 32) => fmt_whole_word(p.0, n),
+        _ => fmt_piece(p, n),
+    };
     let encoder = match usual && pieces.len() > 1 {
         true => "abi.encodeWithSelector",
         false => "abi.encodePacked",

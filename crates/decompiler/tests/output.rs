@@ -826,3 +826,13 @@ fn a_call_with_two_parts_of_a_length_the_code_works_out_is_printed_with_both() {
     assert!(out.contains(call), "{out}");
     assert!(!out.contains("mem[ptr1"), "{out}");
 }
+
+#[test]
+fn a_whole_word_in_packed_call_data_is_not_printed_as_a_narrower_type() {
+    let out = text(
+        "60806040526040516327a9b42460e01b815260043573ffffffffffffffffffffffffffffffffffffffff16\
+         81600401526431494e434860d81b81602401525f5f6029835f6024355af15000",
+    );
+    let data = "abi.encodePacked(bytes4(0x27a9b424), uint256(address(arg0)), bytes5(0x31494e4348))";
+    assert!(out.contains(data), "{out}");
+}

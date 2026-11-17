@@ -1001,3 +1001,11 @@ fn the_fields_of_a_struct_parameter_take_the_types_the_signature_gives_them() {
         "{out}"
     );
 }
+
+#[test]
+fn a_function_the_selector_table_marks_as_refusing_value_is_not_payable() {
+    // Runtime code of a Vyper 0.3.10 pool. Its table gives each entry a flag that rejects value.
+    let out = fixture("StableSwapNG.hex");
+    assert!(!out.contains("external payable"), "{out}");
+    assert!(out.contains("function exchange(int128 arg0, int128 arg1, uint256 arg2, uint256 arg3) external returns"), "{out}");
+}

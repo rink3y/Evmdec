@@ -642,6 +642,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
     };
     prune_embedded(&mut rec);
     let mut table_entries: Vec<(u32, usize)> = Vec::new();
+    let mut refuse_value: HashSet<u32> = HashSet::new();
     if !rec.unresolved_jumps.is_empty() {
         let oracle = Lifter {
             prog: &prog,
@@ -664,7 +665,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                     && b.end <= code_end
             })
             .collect();
-        let mut computed = table_jumps(&prog, &open, &mut table_entries);
+        let mut computed = table_jumps(&prog, &open, &mut table_entries, &mut refuse_value);
         for b in open {
             if computed.contains_key(&b.id) {
                 continue;
@@ -937,7 +938,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                     .collect();
             }
         }
-        let nonpayable = contract_nonpayable || function::is_nonpayable(&l);
+        let refused = selector.is_some_and(|s| refuse_value.contains(&s));
+        let nonpayable = contract_nonpayable || refused || function::is_nonpayable(&l);
         let state_changing =
             eff.writes_storage || eff.logs || eff.calls || eff.creates || eff.selfdestruct;
         let mutability = if state_changing || kind == FnKind::Fallback || kind == FnKind::Receive {
@@ -1521,6 +1523,7 @@ fn table_jumps(
     prog: &Program,
     open: &[&cfg::Block],
     entries: &mut Vec<(u32, usize)>,
+    refuse_value: &mut HashSet<u32>,
 ) -> HashMap<usize, Vec<usize>> {
     let pushed = prog.insns.iter().filter_map(|i| i.imm);
     let mut selectors: BTreeSet<u32> = pushed
@@ -1531,10 +1534,17 @@ fn table_jumps(
     selectors.extend(words.map(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]])));
     let mut host = Host::controlled(U256::ONE, U256::ONE, vec![0; TRACE_CALLDATA], U256::ZERO);
     let mut jumps: HashMap<usize, Vec<(u32, usize)>> = HashMap::new();
+    let mut paid = host.clone();
+    paid.callvalue = U256::ONE;
     for &selector in &selectors {
         host.calldata[..4].copy_from_slice(&selector.to_be_bytes());
+        paid.calldata[..4].copy_from_slice(&selector.to_be_bytes());
         if let Some((block, to)) = table_jump(prog, open, &host) {
             jumps.entry(block).or_default().push((selector, to));
+            // A function the table sends nowhere once a wei comes with the call refuses value.
+            if table_jump(prog, open, &paid) != Some((block, to)) {
+                refuse_value.insert(selector);
+            }
         }
     }
     let mut targets = HashMap::new();

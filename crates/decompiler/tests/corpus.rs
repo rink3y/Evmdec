@@ -1218,7 +1218,7 @@ fn copies_of_one_block_have_labels_of_their_own() {
 fn call_data_is_the_bytes_the_writes_left_under_one_pointer_name() {
     let router = regress("oneinch_v6.hex").source;
     assert!(
-        router.contains("(abi.encodePacked(bytes4(0x27a9b424), arg5, arg4, ")
+        router.contains("(abi.encodePacked(bytes4(0x27a9b424), uint256(arg5), arg4, ")
             && router.contains(", 288, 5, bytes5(0x31494e4348)));"),
         "a selector, ten words and the five bytes of the tag"
     );

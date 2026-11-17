@@ -2028,6 +2028,28 @@ impl<'a> Explorer<'a> {
         spent
     }
 
+    /* A fall the same call does not make again at once, but makes again once the clock
+    has moved, is the contract's own schedule. The caller only happened to be the one
+    whose call it fell on. */
+    fn due_once(&mut self, after: &World, entry: usize, t: &Try, breach: &Breach) -> bool {
+        let Some(cell) = breach.cell.as_ref() else {
+            return false;
+        };
+        let at = |c: &crate::trace::Cell| (c.account, c.slot) == (cell.account, cell.slot);
+        let falls = |run: &Run| {
+            let changes = run.changes();
+            run.ok && changes.iter().any(|(c, old, new, _, _)| at(c) && new < old)
+        };
+        let (_, now) = self.attempt_in(after.clone(), entry, t);
+        if falls(&now) {
+            return false;
+        }
+        let mut later = t.clone();
+        later.time = Some(after.time.wrapping_add(U256::from_u64(86_400)));
+        let (_, then) = self.attempt_in(after.clone(), entry, &later);
+        falls(&then)
+    }
+
     /* The mirror of the test above. An account whose record fell has lost something only
     if it can now do less: what it could pass on before the call, it no longer can. */
     fn withheld(&mut self, before: &World, after: &World, breach: &Breach) -> bool {
@@ -2480,6 +2502,7 @@ impl<'a> Explorer<'a> {
                     b.kind != Kind::Credit || self.spendable(&before, &world, b, entry)
                 });
                 plain.retain(|b| b.kind != Kind::Debit || self.withheld(&before, &world, b));
+                plain.retain(|b| b.kind != Kind::Debit || !self.due_once(&world, entry, &t, b));
                 // A record that falls once time has passed falls by the contract's own schedule.
                 plain.retain(|b| b.kind != Kind::Debit || !self.late);
                 let gains = plain.iter().any(|b| b.kind == Kind::Gain);

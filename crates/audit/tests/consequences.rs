@@ -445,3 +445,23 @@ fn a_payout_that_grows_with_time_is_claimed_a_day_on_and_its_fall_with_a_pool_is
     );
     assert!(paid.cause.contains("was paid less"), "{}", paid.cause);
 }
+
+#[test]
+fn a_cut_the_clock_brings_round_again_is_the_contracts_schedule_and_not_the_callers() {
+    let (token, pool) = (
+        U256::from_hex_str(DEPLOYED_AT).expect("address"),
+        U256::from_hex_str("0x5555555555555555555555555555555555555555").expect("address"),
+    );
+    let mut key = pool.to_be_bytes().to_vec();
+    key.extend_from_slice(&U256::ZERO.to_be_bytes());
+    let held_at = U256::from_be_bytes(&evmdec::keccak::keccak256(&key));
+    let held = U256::from_u64(1) << 70;
+    let mut chain = audit::chain::Table::default();
+    chain.storage.insert((token, held_at), held);
+    chain.storage.insert((token, U256::from_u64(1)), pool);
+    chain.storage.insert((token, U256::from_u64(2)), held);
+    // poke() takes a hundredth out of the pool's record, once a day, for anyone who calls it.
+    let report = report_on_chain("Tithe.hex", chain);
+    let cut = report.findings.iter().find(|f| f.kind == Kind::Debit);
+    assert!(cut.is_none(), "{:?}", report.findings);
+}

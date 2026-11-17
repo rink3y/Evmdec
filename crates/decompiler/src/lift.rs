@@ -1892,6 +1892,7 @@ pub struct CalleeSummary {
     pub maybe_mstores: Vec<ExprId>,
     pub hashes: Vec<(ExprId, usize, usize)>,
     pub stores_before_copy: Vec<usize>,
+    pub store_gens: Vec<u32>,
 }
 
 pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
@@ -1909,8 +1910,11 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                     off,
                     val,
                     width: 32,
-                    ..
-                } => sum.mstores.push((*off, *val)),
+                    gen,
+                } => {
+                    sum.mstores.push((*off, *val));
+                    sum.store_gens.push(*gen);
+                }
                 Stmt::MStore { .. } => return None,
                 Stmt::Copy {
                     kind: op::MCOPY,
@@ -3439,6 +3443,10 @@ impl<'a> Lifter<'a> {
             mem: st.mem.clone(),
             gen: st.mem.gen,
             sgen: st.sgen,
+            stores: summary.map_or_else(Vec::new, |s| {
+                let offs = s.mstores.iter().map(|(off, _)| *off);
+                offs.zip(s.store_gens.iter().copied()).collect()
+            }),
         };
         let subst = |e: ExprId| -> ExprId { entered(e, &entering) };
         if let Some(sum) = summary {
@@ -3725,16 +3733,27 @@ struct Entering<'a> {
     mem: Mem,
     gen: u32,
     sgen: u32,
+    stores: Vec<(ExprId, u32)>,
 }
 
 // What a folded helper read from memory before it wrote any is what its caller's held.
 fn entered(e: ExprId, with: &Entering) -> ExprId {
     let free_pointer = konst_u64(FREE_POINTER);
     let marks: RefCell<Vec<(ExprId, ExprId)>> = RefCell::default();
+    let after: RefCell<Vec<(ExprId, ExprId)>> = RefCell::default();
+    /* A read of a word the helper stored itself comes after that store. Stamped as if
+    made on entry it would seem to come before it. The helper's stores all take the
+    version just past entry, so the read takes that one too. */
+    let stored_before = |at: ExprId, v: u32| with.stores.iter().any(|(o, g)| *o == at && *g <= v);
     let mark = |n: &Node| match n {
         Node::MLoad(at, 0) if *at != free_pointer => {
             let mark = expr::intern(Node::Unknown(expr::next_seq()));
             marks.borrow_mut().push((mark, *at));
+            Some(mark)
+        }
+        Node::MLoad(at, v) if *at != free_pointer && stored_before(*at, *v) => {
+            let mark = expr::intern(Node::Unknown(expr::next_seq()));
+            after.borrow_mut().push((mark, *at));
             Some(mark)
         }
         _ => None,
@@ -3742,11 +3761,15 @@ fn entered(e: ExprId, with: &Entering) -> ExprId {
     let marked = expr::substitute(e, &mark, &mut HashMap::new());
     // Restamping comes first. It would take the caller's own reads for the helper's.
     let restamped = expr::restamp(marked, with.gen, with.sgen, &mut HashMap::new());
-    let reads: HashMap<ExprId, ExprId> = marks
+    let mut reads: HashMap<ExprId, ExprId> = marks
         .into_inner()
         .into_iter()
         .map(|(mark, at)| (mark, with.mem.load_word(entered(at, with), 0)))
         .collect();
+    for (mark, at) in after.into_inner() {
+        let read = Node::MLoad(entered(at, with), with.gen + 1);
+        reads.insert(mark, expr::intern(read));
+    }
     let said = |n: &Node| match n {
         Node::Arg(i) => Some((with.at)(*i as usize)),
         Node::MLoad(at, _) if *at == free_pointer => Some(with.free_now),

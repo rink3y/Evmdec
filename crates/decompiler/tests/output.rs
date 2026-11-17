@@ -913,3 +913,19 @@ fn a_parameter_declared_narrow_is_a_whole_word_in_packed_call_data() {
         "{out}"
     );
 }
+
+#[test]
+fn a_folded_helper_that_reads_a_word_it_stored_reads_it_after_the_store() {
+    let out = text(
+        "6080604052600c5f356013565b6020355f35f35b8051816020015260058152806020015181604001525056",
+    );
+    assert!(!out.contains("prev_mem"), "{out}");
+    in_order(
+        &out,
+        &[
+            "mem[msg.data[0:32] + 32] = mem[msg.data[0:32]];",
+            "mem[msg.data[0:32]] = 5;",
+            "mem[msg.data[0:32] + 64] = mem[msg.data[0:32] + 32];",
+        ],
+    );
+}

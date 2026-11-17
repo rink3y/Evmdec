@@ -816,6 +816,24 @@ impl Mem {
             if seen.len() > 4096 {
                 return false;
             }
+            // Of a copied word cut down to its first bytes only those bytes have to stand.
+            let cut = match expr::node(e) {
+                Node::Op(op::SHR, v) => match (expr::as_const(v[0]), expr::node(v[1])) {
+                    (Some(by), Node::CopiedWord(op::MCOPY, at, version)) if by.fits_u64() => {
+                        let kept = 32u64.checked_sub(by.low_u64().div_ceil(8));
+                        kept.map(|bytes| (at, bytes, version))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((at, bytes, version)) = cut {
+                if self.written_since(at, bytes, version) {
+                    return false;
+                }
+                pending.push(at);
+                continue;
+            }
             let unchanged = match expr::node(e) {
                 Node::MLoad(at, _) if self.pointer_named && at == konst_u64(FREE_POINTER) => true,
                 Node::MLoad(at, version) | Node::CopiedWord(op::MCOPY, at, version) => {
@@ -964,7 +982,9 @@ impl Mem {
                 let MVal::Copy(kind, src, None) = copy.val else {
                     return None;
                 };
-                if kind == op::MCOPY && self.written_since(src, u64::MAX / 4, copy.gen) {
+                // Where the length is known, a store past the bytes copied did not change them.
+                let copied = self.held_length(len).unwrap_or(u64::MAX / 4);
+                if kind == op::MCOPY && self.written_since(src, copied, copy.gen) {
                     return None;
                 }
                 built.extend(copy.origin);
@@ -1008,12 +1028,16 @@ impl Mem {
         Some((args, built))
     }
 
-    fn bytes_now(&self, kind: u8, src: ExprId, len: ExprId) -> Option<Arg> {
+    fn held_length(&self, len: ExprId) -> Option<u64> {
         let Node::MLoad(at, _) = expr::node(len) else {
             return None;
         };
         let held = self.whole_word(at).and_then(expr::as_const)?;
-        let count = Some(held.low_u64()).filter(|c| held.fits_u64() && *c <= 4096)?;
+        Some(held.low_u64()).filter(|c| held.fits_u64() && *c <= 4096)
+    }
+
+    fn bytes_now(&self, kind: u8, src: ExprId, len: ExprId) -> Option<Arg> {
+        let count = self.held_length(len)?;
         let word = |j: u64| self.whole_word(expr::add_const(src, U256::from(32 * j)));
         let words: Option<Vec<ExprId>> = (0..count.div_ceil(32)).map(word).collect();
         (kind == op::MCOPY).then_some(Arg::Bytes(count, words?))

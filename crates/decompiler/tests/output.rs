@@ -788,3 +788,14 @@ fn a_folded_helper_stores_and_copies_in_the_order_its_code_does() {
         ],
     );
 }
+
+#[test]
+fn a_head_word_a_folded_encoder_stores_after_its_copy_still_gives_the_call_its_arguments() {
+    let out = text(
+        "60806040526040516020815260043581602001528060400163aabbccdd60e01b8152604081600401526036\
+         81604401836024356044565b5f5f6084835f6044355af150005b81518084528083602001856020015e8184\
+         60209003525050505056",
+    );
+    let call = "arg2.call(abi.encodeWithSelector(func_aabbccdd.selector, abi.encode(arg0), arg1));";
+    assert!(out.contains(call), "{out}");
+}

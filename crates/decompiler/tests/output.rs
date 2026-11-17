@@ -389,6 +389,16 @@ fn a_hash_of_values_written_at_odd_places_is_printed_as_those_values() {
 }
 
 #[test]
+fn a_hash_of_whole_words_is_printed_as_an_encoding_that_pads_each_value() {
+    // mstore(0, caller); mstore(0x20, 4); sstore(0, keccak256(0, 64))
+    let out = text("336000526004602052604060002060005500");
+    assert!(
+        out.contains("keccak256(abi.encode(msg.sender, 4))"),
+        "{out}"
+    );
+}
+
+#[test]
 fn a_whole_word_in_a_packed_hash_is_not_printed_as_a_narrower_type() {
     // mstore8(0x80, 0xff); mstore(0x81, calldataload(4) & 0xffffffffffffffff); sstore(0, keccak256(0x80, 33))
     let out = text("60ff60805360043567ffffffffffffffff16608152602160802060005500");

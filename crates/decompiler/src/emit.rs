@@ -1970,13 +1970,21 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
         ),
         Node::Keccak(..) if expr::pieces(e).is_some() => {
             let pieces = expr::pieces(e).unwrap_or_default();
-            let part = |p: &(ExprId, u8)| match p.1 {
-                32 => fmt_whole_word(p.0, n),
-                _ => fmt_piece(p, n),
+            /* Where every piece is a whole word, abi.encode says so whatever the type of
+            each value. Packed, an address or a short number would read as fewer bytes. */
+            let whole = pieces.iter().all(|p| p.1 == 32);
+            let part = |p: &(ExprId, u8)| match (whole, p.1) {
+                (true, _) => fmt_expr(p.0, n),
+                (false, 32) => fmt_whole_word(p.0, n),
+                (false, _) => fmt_piece(p, n),
             };
             let parts: Vec<String> = pieces.iter().map(part).collect();
+            let encoder = match whole {
+                true => "abi.encode",
+                false => "abi.encodePacked",
+            };
             (
-                format!("keccak256(abi.encodePacked({}))", parts.join(", ")),
+                format!("keccak256({encoder}({}))", parts.join(", ")),
                 P_PRIMARY,
             )
         }
@@ -1985,12 +1993,18 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             for (i, w) in words.iter().enumerate() {
                 if tail > 0 && i == words.len() - 1 {
                     parts.push(format!("bytes{}({})", tail, fmt_expr(*w, n)));
-                } else {
+                } else if tail > 0 {
                     parts.push(fmt_whole_word(*w, n));
+                } else {
+                    parts.push(fmt_expr(*w, n));
                 }
             }
+            let encoder = match tail {
+                0 => "abi.encode",
+                _ => "abi.encodePacked",
+            };
             (
-                format!("keccak256(abi.encodePacked({}))", parts.join(", ")),
+                format!("keccak256({encoder}({}))", parts.join(", ")),
                 P_PRIMARY,
             )
         }
@@ -2678,12 +2692,14 @@ fn fmt_whole_word(e: ExprId, n: &Names) -> String {
     let text = fmt_expr(e, n);
     let cast = text.split_once('(').map_or("", |(cast, _)| cast);
     let width = cast.trim_start_matches(|c: char| c.is_ascii_alphabetic());
-    let narrow = match cast.strip_suffix(width) {
-        Some("uint" | "int") => width != "256" && !width.is_empty(),
-        Some("bytes") => width != "32" && !width.is_empty(),
-        Some("address" | "bool") => width.is_empty(),
-        _ => false,
-    };
+    let named = matches!(text.as_str(), "msg.sender" | "tx.origin" | "block.coinbase");
+    let narrow = named
+        || match cast.strip_suffix(width) {
+            Some("uint" | "int") => width != "256" && !width.is_empty(),
+            Some("bytes") => width != "32" && !width.is_empty(),
+            Some("address" | "bool") => width.is_empty(),
+            _ => false,
+        };
     match narrow {
         true => format!("uint256({text})"),
         false => text,

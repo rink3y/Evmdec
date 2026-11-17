@@ -402,3 +402,46 @@ fn a_finding_that_needed_a_wait_says_so_in_its_steps() {
         taken.steps
     );
 }
+
+#[test]
+fn a_payout_that_grows_with_time_is_claimed_a_day_on_and_its_fall_with_a_pool_is_found() {
+    let at = |hex: &str| U256::from_hex_str(hex).expect("address");
+    let (meter, coin, pool) = (
+        at(DEPLOYED_AT),
+        at("0x7777777777777777777777777777777777777777"),
+        at("0x8888888888888888888888888888888888888888"),
+    );
+    let code = |name: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/source");
+        let hex = std::fs::read_to_string(path.join(name)).expect("fixture");
+        evmdec::hex::decode(hex.trim()).expect("hex")
+    };
+    let held_by = |who: U256| {
+        let key = [who.to_be_bytes(), U256::ZERO.to_be_bytes()].concat();
+        U256::from_be_bytes(&evmdec::keccak::keccak256(&key))
+    };
+    let mut chain = audit::chain::Table::default();
+    chain.codes.insert(coin, code("Coin.hex"));
+    chain.codes.insert(pool, code("Pool.hex"));
+    chain
+        .storage
+        .insert((coin, held_by(meter)), U256::ONE << 60);
+    chain.storage.insert((coin, held_by(pool)), U256::ONE << 70);
+    chain.storage.insert((pool, U256::ZERO), coin);
+    chain.storage.insert((pool, U256::ONE), U256::ONE << 70);
+    chain.storage.insert((meter, U256::ZERO), coin);
+    chain.storage.insert((meter, U256::ONE), pool);
+    /* claim() pays for the time since join(), divided by what the pool last counted.
+    With no join() it asks for more than the meter holds. */
+    let report = report_on_chain("Meter.hex", chain);
+    let mut read = report.findings.iter();
+    let paid = read.find(|f| f.kind == Kind::PayoutOnReading);
+    let paid = paid.unwrap_or_else(|| panic!("{:?}", report.findings));
+    assert_eq!(paid.selector.as_deref(), Some("0x4e71d92d"));
+    assert!(
+        paid.steps.iter().any(|s| s.contains("time passes")),
+        "{:?}",
+        paid.steps
+    );
+    assert!(paid.cause.contains("was paid less"), "{}", paid.cause);
+}

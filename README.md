@@ -179,7 +179,9 @@ built from them: a call data word, the value sent, the length of the call data, 
 answer of an outside contract. The owner and the user build state. The account with no role
 then makes up to a few calls from every state kept, a contract that already holds value is
 tried, a user goes on using the contract after the account acted, and when the contract hands
-control to the account, the account calls back in.
+control to the account, the account calls back in. Last, on chain state and on work of its
+own, a call whose payment or record was sized by the clock is made again a day and a year
+on. What is tried there can take nothing from what the search before it finds.
 
 **Laws.** A finding is one of nine consequences, seen in a run:
 
@@ -193,7 +195,7 @@ control to the account, the account calls back in.
 | role cleared | the same cell names nobody |
 | foreign code | the contract ran, as itself, code at an address the account chose |
 | destroyed | the contract's code was removed |
-| payout on a reading | on chain state, the same call pays the account more after the account's own step on another contract whose balance or answer sized the payout, and no more once the reading is put back |
+| payout on a reading | on chain state, the same call pays the account more after the account's own step on another contract whose balance or answer sized the payout, and no more once the reading is put back. Where no step made it pay more, one that made it pay less is reported as such, at a lower severity |
 
 **Second tests.** A consequence is re-run under a doubt before it is reported. A gain has to
 show again with unset prices and rates filled. A credit has to be spendable afterwards and
@@ -352,10 +354,15 @@ some of the contract's own ledger: 31 of 234 found, 53 of 90 findings correct (5
 101 contracts with no known flaw flagged. One more finding is the known flaw and one false
 alarm on a safe contract is gone. The count of known flaws found did not move.
 
+An eighth score, on the build whose steps name the wait and the outside answers a call
+was made under: 31 of 234 found, 52 of 91 findings correct (57.1%), 3 of 101 flagged. One
+more finding came, shown only in the guessed world, and it is not correct. The same one
+contract does not finish.
+
 On the development set, where every false finding was read and its cause fixed, the latest
-reviewed build finds 36 of 231 known flaws (15.6%) by address, 55 of its 67 findings are
-correct (82%), and none of 55 contracts with no known flaw gets a finding. A contract takes
-2.1 s at the median there, with the state cache warm. The held-out set
+reviewed build finds 37 of 231 known flaws (16.0%) by address, 56 of its 69 findings are
+correct (81.2%), and none of 55 contracts with no known flaw gets a finding. A contract takes
+1.8 s at the median there, with the state cache warm. The held-out set
 does not follow at the same rate: what is fixed on one set of contracts is general in form
 and reaches fewer of the other set's flaws. That gap is the honest measure of where the
 tool stands.
@@ -387,30 +394,31 @@ checks and reverts. A function matches only when all six agree.
 | first and second, after a fifth round of fixes | all 22 | 180 of 182, no regressions |
 | third, after the fifth round | the same 8 | 77 of 89, no regressions |
 | fourth, fresh, as found | 8 (Vyper 0.3.7, solc 0.4.24, 0.6.12, 0.7.6, 0.8.7 optimizer off, 0.8.24 and 0.8.26 via-IR, a proxy) | 64 of 89 |
+| first and second, after a sixth round of fixes | all 22 | 180 of 182, 2 regressions found by the check and fixed |
+| third, after the sixth round | the same 8 | 77 of 89, no regressions |
+| fourth, after the sixth round | the same 8 | 78 of 89 |
 
 The number that says where the decompiler stands is the one measured on contracts it had
 never been checked on: 57% in the third batch as found and 72% in the fourth. Over all 38
-contracts it is 321 of 360, 89%, against a target of 95 to 99%. Every function of all 38 is
-found with the right selector (285 of 285 in the fourth batch), and the block oracle passes
-every one: it checks lifting, and these faults are made after it, in inlining, structuring
-and printing. Each mismatch is traced to a cause in the decompiler, and each cause gets a
-general fix and a test.
+contracts after the sixth round it is 335 of 360, 93.1%, against a target of 95 to 99%.
+Every function of all 38 is found with the right selector (285 of 285 in the fourth batch),
+and the block oracle passes every one: it checks lifting, and these faults are made after
+it, in inlining, structuring and printing. Each mismatch is traced to a cause in the
+decompiler, and each cause gets a general fix and a test.
 
-Open in the fourth batch, all of it wrong output, in 25 functions from eight causes: a hash
-printed over memory that was written through computed addresses just before (9), the
-advance of an item pointer in an array decoder printed as a second store (8), a packed slot
-declared as one narrow member and then printed shifted under the same name (11), an
-overflow revert lost when a checked add is folded into its caller (2), a value captured on
-the wrong side of a store or a create (3), the stores of v, r, s into the input of ecrecover
-dropped in older code (3), a bitwise AND with 1 printed as a logical one (1), and the hash
-chain of a nested mapping flattened into stores to one place (1). Several functions have
-more than one. A sixth round of fixes is being made against them.
+The sixth round was made against the eight causes found in the fourth batch and closed 14
+of its 25 wrong functions. The re-check found that one of its fixes had made two functions
+of an older contract wrong, by printing a hash of whole words as a packed one. That was
+fixed and the contract checked again by a separate checker, 12 of 12.
 
-Still open from the third batch. Wrong in 4 functions, all in one Vyper 0.2 contract and
-all one fault: the words that compiler saves and puts back around an internal call are not
-modelled. Right but unclear in 10: a call whose arguments are encoded by a helper is printed
-as a selector write, the helper and a raw call (8), and a call with two string tails or a
-re-encoding loop is printed as raw memory writes (2).
+Still open, 25 functions. Wrong output in 15: one heavy-assembly contract of the fourth
+batch has 10, from memory that a hash helper restores and the output does not, and from a
+length read again after the store that changed it. One function of another contract
+there prints a checked 64-bit add as a plain one. One Vyper 0.2 contract of the third batch has 4, all one fault:
+the words that compiler saves and puts back around an internal call are not modelled.
+Right but unclear in 10: a call whose arguments are encoded by a helper is printed as a
+selector write, the helper and a raw call, or as raw memory writes where there are two
+string tails or a re-encoding loop. A seventh round of fixes is being made against these.
 
 ## Quick start
 

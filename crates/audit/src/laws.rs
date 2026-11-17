@@ -253,6 +253,12 @@ pub fn swayed(first: &Run, second: &Run, after: &World, acted_on: &[Addr]) -> Ve
     if !first.ok || !second.ok || !same_given || from_there {
         return Vec::new();
     }
+    /* A payout that falls is sized by the reading as much as one that rises. It is told
+    apart from an account acted on handing on less by asking that those pay the same. */
+    let same_there = kinds
+        .iter()
+        .all(|k| paid_by(second, *k) == paid_by(first, *k));
+    let moved = |now: U256, before: U256| now > before || (same_there && now < before);
     let mut found = Vec::new();
     for paid in takes {
         let (asset, payer, amount) = (paid.asset, paid.other, paid.sum);
@@ -260,7 +266,7 @@ pub fn swayed(first: &Run, second: &Run, after: &World, acted_on: &[Addr]) -> Ve
         let before = took.iter().find(|t| (t.asset, t.other) == (asset, payer));
         let paid_before = before.map_or(U256::ZERO, |t| t.sum);
         let sized = paid.tag_of_largest.read_outside();
-        if theirs && !acted_on.contains(&payer) && amount > paid_before && sized {
+        if theirs && !acted_on.contains(&payer) && moved(amount, paid_before) && sized {
             found.push(Breach {
                 asset,
                 amount,

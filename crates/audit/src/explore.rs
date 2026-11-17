@@ -27,6 +27,7 @@ const MAX_OUTSIDE: usize = 3;
 const OUTSIDE_ENTRIES: usize = 6;
 const SWAYED_A_STATE: usize = 3;
 const SWAYED_AN_ENTRY: usize = 3;
+const TIMED_AN_ENTRY: usize = 3;
 const MAX_SENDS: usize = 4;
 const MAX_READ: usize = 8;
 const UNUSED_SELECTOR: u32 = 0xfeed_c0de;
@@ -183,6 +184,7 @@ pub struct Explorer<'a> {
     trial: bool,
     // Set while every function of a state is given one short try before any gets a long one.
     shallow: bool,
+    late: bool,
     // The contracts the chain's state names, and the addresses looked at to find them.
     contracts: Vec<Addr>,
     checked: HashSet<Addr>,
@@ -195,6 +197,7 @@ pub struct Explorer<'a> {
     aims: Vec<Addr>,
     room: usize,
     paid: Vec<(usize, usize, Try, laws::Moved)>,
+    timed: Vec<(usize, usize, Try)>,
 }
 
 fn outside(n: usize) -> Addr {
@@ -416,6 +419,7 @@ impl<'a> Explorer<'a> {
             on_chain: false,
             trial: false,
             shallow: false,
+            late: false,
             contracts: Vec::new(),
             checked: HashSet::new(),
             own,
@@ -425,6 +429,7 @@ impl<'a> Explorer<'a> {
             aims: Vec::new(),
             room: MAX_STATES,
             paid: Vec::new(),
+            timed: Vec::new(),
         }
     }
 
@@ -2426,11 +2431,21 @@ impl<'a> Explorer<'a> {
 
     // False once the work is used up.
     fn act(&mut self, from: usize, entry: usize, next: &mut Vec<usize>) -> bool {
-        let mut kept = false;
-        let mut seeds: VecDeque<Try> = match self.entries[entry].to == self.subject {
-            true => self.hostile(entry).into(),
-            false => self.aimed(entry).into(),
+        let seeds = match self.entries[entry].to == self.subject {
+            true => self.hostile(entry),
+            false => self.aimed(entry),
         };
+        self.act_on(from, entry, seeds.into(), next)
+    }
+
+    fn act_on(
+        &mut self,
+        from: usize,
+        entry: usize,
+        mut seeds: VecDeque<Try>,
+        next: &mut Vec<usize>,
+    ) -> bool {
+        let mut kept = false;
         let mut passed = false;
         let mut turned = 0;
         while let Some(seed) = seeds.pop_front() {
@@ -2465,6 +2480,8 @@ impl<'a> Explorer<'a> {
                     b.kind != Kind::Credit || self.spendable(&before, &world, b, entry)
                 });
                 plain.retain(|b| b.kind != Kind::Debit || self.withheld(&before, &world, b));
+                // A record that falls once time has passed falls by the contract's own schedule.
+                plain.retain(|b| b.kind != Kind::Debit || !self.late);
                 let gains = plain.iter().any(|b| b.kind == Kind::Gain);
                 let stray =
                     self.states[from].stray || (gains && self.earned(from, &t, &before, &run));
@@ -2488,6 +2505,15 @@ impl<'a> Explorer<'a> {
                 if self.on_chain && fresh && !moved.nothing() {
                     self.paid.push((from, entry, t.clone(), moved));
                 }
+                let by_time = |e: &Event| match e {
+                    Event::Pay { amount_tag, .. } => amount_tag.has(CLOCK),
+                    Event::Store { tag, .. } => tag.has(CLOCK) && tag.has(MATH),
+                    _ => false,
+                };
+                let of_entry = self.timed.iter().filter(|p| p.1 == entry).count();
+                if self.on_chain && of_entry < TIMED_AN_ENTRY && run.events.iter().any(by_time) {
+                    self.timed.push((from, entry, t.clone()));
+                }
             }
             let apart = self.states[from].stray || self.states[from].granted;
             if handed && open && !apart && own {
@@ -2510,6 +2536,40 @@ impl<'a> Explorer<'a> {
             }
         }
         true
+    }
+
+    /* A payout sized by the time gone by is nothing in a call made at once, and no test
+    fails to say so. Such a call is made again a day and a year on. This comes last and
+    on work of its own, so it can take nothing from what the search before it finds. */
+    fn later(&mut self) {
+        let timed = std::mem::take(&mut self.timed);
+        self.late = true;
+        // A payout noted after the readings were weighed has its finding. Weighing it here gave a second.
+        self.paid.clear();
+        if self.trace {
+            for (from, entry, _) in &timed {
+                eprintln!("later {} from state {from}", self.entries[*entry].name);
+            }
+        }
+        let mut next = Vec::new();
+        for (from, entry, t) in timed {
+            let now = self.states[from].world.time;
+            for wait in [86_400, 365 * 86_400] {
+                let mut seed = t.clone();
+                seed.time = Some(now.wrapping_add(U256::from_u64(wait)));
+                if !self.act_on(from, entry, VecDeque::from([seed]), &mut next) {
+                    return;
+                }
+            }
+        }
+        for at in next {
+            for own in 0..self.own {
+                if !self.entries[own].view && !self.act(at, own, &mut Vec::new()) {
+                    return;
+                }
+            }
+        }
+        self.readings();
     }
 
     /* On the chain what the contracts it calls hold is part of what the contract does,
@@ -2542,10 +2602,21 @@ impl<'a> Explorer<'a> {
         paid.sort_by_key(|(from, ..)| self.states[*from].steps.len());
         for (from, entry, t, _) in paid {
             if budget::spent() {
-                return;
+                break;
             }
             self.sway(from, entry, &t);
         }
+        // Where a function was shown to pay more, that it can also pay less says nothing new.
+        let read = |v: &Violation| v.breach.kind == Kind::PayoutOnReading;
+        let rose = |v: &Violation| read(v) && v.breach.amount > v.breach.paid_before;
+        let risen: HashSet<usize> = self
+            .found
+            .iter()
+            .filter(|v| rose(v))
+            .map(|v| v.entry)
+            .collect();
+        self.found
+            .retain(|v| !read(v) || rose(v) || !risen.contains(&v.entry));
     }
 
     /* A larger payout after the step is tried once more with every reading put back to
@@ -2905,5 +2976,8 @@ impl<'a> Explorer<'a> {
             }
         });
         budget::within(work / 10, || self.used_after());
+        if self.on_chain {
+            budget::within(work / 10, || self.later());
+        }
     }
 }

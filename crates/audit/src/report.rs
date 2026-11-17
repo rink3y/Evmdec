@@ -590,8 +590,17 @@ fn explain(v: &Violation, run: &Run, subject: Addr) -> (String, String, String, 
                     asset_name(asset)
                 ),
             };
+            let fell = v.breach.amount < v.breach.paid_before;
+            let (paid, put_back, other_way) = match fell {
+                true => (
+                    "less",
+                    "the call paid what it paid before",
+                    " The step shown adds to what is read, and the payout fell. A step that takes value out of what is read, by a trade or with borrowed value, was not made here, so a rise is not shown.",
+                ),
+                false => ("more", "the call paid no more than before", ""),
+            };
             let cause = format!(
-                "The amount is {}. The account changed what is read there with a step of its own on another contract, gave the same, and was paid more. With every reading put back to what it was before the step, the call paid no more than before, so the reading is what sized the payout. {tests}",
+                "The amount is {}. The account changed what is read there with a step of its own on another contract, gave the same, and was paid {paid}. With every reading put back to what it was before the step, {put_back}, so the reading is what sized the payout.{other_way} {tests}",
                 source(tag, run)
             );
             let title =
@@ -685,6 +694,7 @@ fn finding(ex: &Explorer, v: &Violation) -> Finding {
         Kind::Gain | Kind::Loss | Kind::Takeover | Kind::ForeignCode | Kind::Destroyed => {
             Severity::Critical
         }
+        Kind::PayoutOnReading if v.breach.amount < v.breach.paid_before => Severity::High,
         Kind::PayoutOnReading if v.breach.cell.is_none() => Severity::Critical,
         Kind::Credit | Kind::Debit | Kind::PayoutOnReading => Severity::High,
     };

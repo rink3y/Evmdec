@@ -990,3 +990,14 @@ fn a_stored_word_tested_at_its_lowest_bit_and_also_shifted_down_is_no_flag() {
     let out = fixture("Calls.hex");
     assert!(!out.contains("bool[] field1"), "{out}");
 }
+
+#[test]
+fn the_fields_of_a_struct_parameter_take_the_types_the_signature_gives_them() {
+    // exactInputSingle takes one static struct of eight fields, the last a uint160.
+    let out = fixture("Swap.hex");
+    assert!(out.contains("uint256 arg6, uint160 arg7)"), "{out}");
+    assert!(
+        out.contains("(address arg0, address arg1, uint24 arg2"),
+        "{out}"
+    );
+}

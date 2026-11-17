@@ -580,10 +580,29 @@ fn declared_types_flow_into_storage() {
     );
     assert_eq!(
         declared_words(&params(&["address", "(uint256,address)", "bool"])),
-        vec![(0, Ty::Address)],
-        "a static tuple takes several words and ends the count"
+        vec![
+            (0, Ty::Address),
+            (1, Ty::Uint(256)),
+            (2, Ty::Address),
+            (3, Ty::Bool)
+        ],
+        "a static tuple lies flat in the head"
     );
-    assert_eq!(declared_words(&params(&["uint256[3]", "address"])), vec![]);
+    assert_eq!(
+        declared_words(&params(&["uint8[2]", "(uint256,string)", "address"])),
+        vec![(0, Ty::Uint(8)), (1, Ty::Uint(8)), (3, Ty::Address)],
+        "a fixed array lies flat and a dynamic tuple takes one word"
+    );
+    assert_eq!(
+        declared_words(&params(&["(uint256[2],address)", "bool"])),
+        vec![
+            (0, Ty::Uint(256)),
+            (1, Ty::Uint(256)),
+            (2, Ty::Address),
+            (3, Ty::Bool)
+        ],
+        "a fixed array inside a tuple lies flat in it"
+    );
 }
 
 #[test]

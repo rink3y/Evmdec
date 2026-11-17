@@ -230,16 +230,63 @@ pub type Declared = (usize, u32, Ty);
 #[must_use]
 pub fn declared_words(params: &[String]) -> Vec<(u32, Ty)> {
     let mut out = Vec::new();
-    for (i, p) in params.iter().enumerate() {
-        let dynamic = p == "bytes" || p == "string" || p.ends_with("[]");
-        if p.starts_with('(') || (p.ends_with(']') && !dynamic) {
-            break;
-        }
-        if let Some(t) = Ty::declared(p) {
-            out.push((i as u32, t));
+    let mut word = 0u32;
+    for p in params {
+        match head_words(p) {
+            Some(leaves) => {
+                for t in leaves {
+                    if let Some(t) = t {
+                        out.push((word, t));
+                    }
+                    word += 1;
+                }
+            }
+            // A dynamic value takes one head word, the offset of its tail.
+            None => word += 1,
         }
     }
     out
+}
+
+/* The head words a static ABI type takes, in order, each with the type of the value it
+holds. A struct or a fixed array of static parts lies flat in the head. None for a type
+whose head is only an offset. */
+fn head_words(ty: &str) -> Option<Vec<Option<Ty>>> {
+    let ty = ty.trim();
+    if let Some(open) = ty.strip_suffix(']').and_then(|_| ty.rfind('[')) {
+        let (elem, count) = (&ty[..open], &ty[open + 1..ty.len() - 1]);
+        let n: usize = count.parse().ok()?;
+        let one = head_words(elem)?;
+        return Some((0..n).flat_map(|_| one.clone()).collect());
+    }
+    if let Some(inner) = ty.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+        let mut out = Vec::new();
+        for part in top_level_parts(inner) {
+            out.extend(head_words(part)?);
+        }
+        return Some(out);
+    }
+    match ty {
+        "bytes" | "string" => None,
+        _ => Some(vec![Ty::declared(ty)]),
+    }
+}
+
+fn top_level_parts(list: &str) -> Vec<&str> {
+    let (mut parts, mut depth, mut start) = (Vec::new(), 0usize, 0);
+    for (i, ch) in list.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&list[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&list[start..]);
+    parts
 }
 
 pub fn solve(

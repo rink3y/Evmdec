@@ -540,3 +540,32 @@ fn a_store_through_an_index_into_the_fixed_words_reaches_a_later_hash_of_them() 
         "{out}"
     );
 }
+
+#[test]
+fn each_part_of_a_packed_slot_the_code_reads_has_a_name_or_the_slot_stays_whole() {
+    let member = text(
+        "335f52603560205260405f2060010180546fffffffffffffffffffffffffffffffff166080525460801c\
+         60a05260406080f3",
+    );
+    assert!(
+        member.contains("uint128 field1_0; // slot +1 bytes 0..16"),
+        "{member}"
+    );
+    assert!(
+        member.contains("uint128 field1_16; // slot +1 bytes 16..32"),
+        "{member}"
+    );
+    assert!(
+        member.contains("return (stor_53[msg.sender].field1_0, stor_53[msg.sender].field1_16);"),
+        "{member}"
+    );
+    let value = text("335f52600160205260405f20805460ff166080525460881c60a05260406080f3");
+    assert!(
+        value.contains("mapping(address => uint256) stor_1;"),
+        "{value}"
+    );
+    assert!(
+        value.contains("return (uint8(stor_1[msg.sender]), stor_1[msg.sender] >> 136);"),
+        "{value}"
+    );
+}

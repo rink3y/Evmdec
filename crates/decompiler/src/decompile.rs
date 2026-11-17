@@ -1144,8 +1144,14 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         mut strings,
         selectors: selectors_called,
     } = inventories(&functions, layout, &string_slots);
-    refine_storage_types(&mut storage, &env);
-    struct_members(&mut storage, &env, &hashed_slots(&functions, layout));
+    let parts = parts_read(&functions, layout);
+    refine_storage_types(&mut storage, &env, &parts);
+    struct_members(
+        &mut storage,
+        &env,
+        &hashed_slots(&functions, layout),
+        &parts,
+    );
     name_storage_from_getters(&functions, &mut storage, layout);
     naming::name_storage(&functions, &mut storage, layout, !opts.no_sigs);
     naming::name_helpers(&mut functions, &storage, layout, !opts.no_sigs);
@@ -1585,6 +1591,7 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
         flags: Vec<U256>,
         other_write: bool,
         read_widths: BTreeSet<u32>,
+        packed: bool,
     }
     let mut seen: HashMap<U256, Accesses> = HashMap::new();
     let width_of = |mask: U256| -> Option<u32> {
@@ -1607,6 +1614,12 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
                 let Some(root) = emit::element_root(*key) else {
                     continue;
                 };
+                if ssa::field_writes(*key, *val)
+                    .iter()
+                    .any(|w| w.bit_offset > 0)
+                {
+                    seen.entry(root).or_default().packed = true;
+                }
                 let keeps = |e: ExprId| -> Option<u32> {
                     let Node::Op(op::AND, w) = expr::node(e) else {
                         return None;
@@ -1658,6 +1671,10 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
                         stack.extend(expr::children(x));
                         continue;
                     }
+                    let above = ssa::field_read(x).filter(|f| f.bit_offset > 0);
+                    if let Some(root) = above.and_then(|f| emit::element_root(f.key)) {
+                        seen.entry(root).or_default().packed = true;
+                    }
                     if let Node::Op(op::AND, v) = expr::node(x) {
                         for (a, b) in [(v[0], v[1]), (v[1], v[0])] {
                             if let (Node::SLoad(k, false, _), Some(m)) =
@@ -1683,6 +1700,9 @@ fn element_types(functions: &[Function]) -> HashMap<U256, String> {
             } else {
                 a.write_widths
             };
+            if a.packed {
+                return Some((root, "uint256".to_string()));
+            }
             let w = *widths.iter().next()?;
             if widths.len() != 1 {
                 return None;
@@ -2209,8 +2229,14 @@ fn bool_vars(pc: usize, l: &Lifted, env: &TypeEnv) -> Vec<u32> {
     vars
 }
 
-fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv) {
-    fn refine(ty: &str, root: U256, steps: &mut Vec<ShapeStep>, env: &TypeEnv) -> String {
+fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv, parts: &PartsRead) {
+    fn refine(
+        ty: &str,
+        root: U256,
+        steps: &mut Vec<ShapeStep>,
+        env: &TypeEnv,
+        parts: &PartsRead,
+    ) -> String {
         if let Some(inner) = ty
             .strip_prefix("mapping(")
             .and_then(|r| r.strip_suffix(')'))
@@ -2224,17 +2250,24 @@ fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv) {
             } else {
                 k.to_string()
             };
-            let vt = refine(v, root, steps, env);
+            let vt = refine(v, root, steps, env, parts);
             steps.pop();
             return format!("mapping({} => {})", kt, vt);
         }
         if let Some(elem) = ty.strip_suffix("[]") {
             steps.push(ShapeStep::Index);
-            let et = refine(elem, root, steps, env);
+            let et = refine(elem, root, steps, env, parts);
             steps.pop();
             return format!("{}[]", et);
         }
-        if ty == "uint256" {
+        // A word of which a part above the first is read holds more than one value.
+        let shape = Shape {
+            root,
+            steps: steps.clone(),
+            space: SlotSpace::Persistent,
+        };
+        let above = |fields: &BTreeSet<(u32, u32)>| fields.iter().any(|(at, _)| *at > 0);
+        if ty == "uint256" && !parts.get(&shape).is_some_and(above) {
             if let Some(t) = env.slot_type(root, steps) {
                 return t;
             }
@@ -2248,7 +2281,7 @@ fn refine_storage_types(storage: &mut [StorageVar], env: &TypeEnv) {
         let Some(root) = U256::from_hex_str(&var.slot) else {
             continue;
         };
-        var.ty = refine(&var.ty, root, &mut Vec::new(), env);
+        var.ty = refine(&var.ty, root, &mut Vec::new(), env, parts);
     }
 }
 
@@ -2327,7 +2360,12 @@ fn nested_type(
 
 type Located<'a> = (&'a Shape, Option<(u32, u32)>);
 
-fn struct_members(storage: &mut [StorageVar], env: &TypeEnv, hashed: &BTreeSet<Shape>) {
+fn struct_members(
+    storage: &mut [StorageVar],
+    env: &TypeEnv,
+    hashed: &BTreeSet<Shape>,
+    parts: &PartsRead,
+) {
     #[derive(Default)]
     struct Member {
         fields: BTreeSet<(u32, u32)>,
@@ -2347,6 +2385,10 @@ fn struct_members(storage: &mut [StorageVar], env: &TypeEnv, hashed: &BTreeSet<S
         if shape.space == SlotSpace::Persistent {
             shapes.entry(shape.root).or_default().push((shape, field));
         }
+    }
+    for (shape, fields) in parts {
+        let read = fields.iter().map(|field| (shape, Some(*field)));
+        shapes.entry(shape.root).or_default().extend(read);
     }
     let is_offset = |s: &ShapeStep| matches!(s, ShapeStep::Offset(_));
     for var in storage.iter_mut() {
@@ -2609,7 +2651,7 @@ fn inventories(
                 .flatten()
                 .collect();
             for root in lift::roots(nd) {
-                collect_sloads(root.expr, &mut slots, vyper, &bases);
+                collect_sloads(root, &mut slots, vyper, &bases);
                 if !init_words.contains(&root.expr) {
                     collect_strings(root.expr, &mut strings);
                 }
@@ -2619,7 +2661,11 @@ fn inventories(
         // The right side of an `||` is carried on the edge into the join and read
         // nowhere else.
         for (_, value) in l.edge_assigns.values().flatten() {
-            collect_sloads(*value, &mut slots, vyper, &bases);
+            let root = lift::Root {
+                expr: *value,
+                payload: false,
+            };
+            collect_sloads(root, &mut slots, vyper, &bases);
         }
     }
     let _ = names;
@@ -2955,12 +3001,82 @@ fn slot_root(key: ExprId, vyper: bool, bases: &BTreeSet<U256>) -> (Option<U256>,
 /* The four bytes of a selector shift every argument of a call, so a word of its data starts
 with the last four bytes of one argument. Those four bytes are a cut the encoding makes,
 not a field the code reads. */
-fn selector_cut(root: &lift::Root, x: ExprId) -> Option<ExprId> {
-    let Node::Op(op::SHL, v) = expr::node(x) else {
-        return None;
+fn selector_cut(root: &lift::Root, x: ExprId) -> Vec<ExprId> {
+    if !root.payload {
+        return Vec::new();
+    }
+    let mut cut = Vec::new();
+    match expr::node(x) {
+        Node::Op(op::SHL, v) if expr::as_const(v[0]) == Some(U256::from_u64(224)) => {
+            cut.push(v[1]);
+        }
+        /* The rest of the argument stands shifted down by those four bytes. Where the
+        argument is itself a shift of a slot the two shifts are one, so any shift that
+        is a part of the word is taken for the cut. */
+        Node::Op(op::OR, v) if x == root.expr => {
+            let shifted = |part: &&ExprId| matches!(expr::node(**part), Node::Op(op::SHR, w) if expr::is_const(w[0]));
+            cut.extend(v.iter().filter(shifted));
+        }
+        _ => {}
+    }
+    cut
+}
+
+/* The types of a function only know the parts of a slot some use gave a type to. A part
+that is only handed on is a field as well, and without it the slot would be declared by
+its other part alone. */
+type PartsRead = BTreeMap<Shape, BTreeSet<(u32, u32)>>;
+
+fn parts_read(functions: &[Function], layout: MappingLayout) -> PartsRead {
+    let mut found = PartsRead::new();
+    let nodes = functions
+        .iter()
+        .filter_map(|f| f.lifted.as_ref())
+        .flat_map(|l| l.nodes.iter());
+    // An argument the call was read into is a value of the code, not a word of its data.
+    let decoded = |nd: &lift::LNode| -> HashSet<ExprId> {
+        let calls = nd.stmts.iter().filter_map(|s| match s {
+            Stmt::Call { args, .. } => args.as_ref(),
+            _ => None,
+        });
+        let words = calls.flatten().filter_map(|arg| match arg {
+            lift::Arg::Word(e) => Some(*e),
+            _ => None,
+        });
+        words.collect()
     };
-    let last_four = expr::as_const(v[0]) == Some(U256::from_u64(224));
-    (root.payload && last_four).then_some(v[1])
+    let roots = nodes.flat_map(|nd| {
+        let values = decoded(nd);
+        lift::roots(nd).into_iter().map(move |root| lift::Root {
+            payload: root.payload && !values.contains(&root.expr),
+            ..root
+        })
+    });
+    for root in roots {
+        let mut seen = HashSet::new();
+        let mut cut: HashSet<ExprId> = HashSet::new();
+        let mut stack = vec![root.expr];
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) || seen.len() > 50_000 {
+                continue;
+            }
+            cut.extend(selector_cut(&root, x));
+            stack.extend(expr::children(x));
+            if (x == root.expr && root.payload) || cut.contains(&x) {
+                continue;
+            }
+            let whole_bytes = |f: &ssa::FieldRef| f.bits == 1 || f.bits.is_multiple_of(8);
+            let Some(field) = ssa::field_read(x).filter(whole_bytes) else {
+                continue;
+            };
+            let path = ssa::slot_path(field.key, layout).filter(|p| !p.steps.is_empty());
+            if let Some(path) = path {
+                let parts = found.entry(path.shape(SlotSpace::Persistent)).or_default();
+                parts.insert((field.bit_offset, field.bits));
+            }
+        }
+    }
+    found
 }
 
 fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
@@ -2989,21 +3105,25 @@ fn collect_fields(root: lift::Root, fields: &mut PackedFields) {
 }
 
 fn collect_sloads(
-    e: ExprId,
+    root: lift::Root,
     slots: &mut BTreeMap<U256, (usize, usize, BTreeSet<String>)>,
     vyper: bool,
     bases: &BTreeSet<U256>,
 ) {
     let mut seen = HashSet::new();
-    let mut stack = vec![e];
+    let mut cut: HashSet<ExprId> = HashSet::new();
+    let mut stack = vec![root.expr];
     while let Some(x) = stack.pop() {
         if !seen.insert(x) || seen.len() > 50_000 {
             continue;
         }
+        cut.extend(selector_cut(&root, x));
+        // A piece of a word of call data is cut where the encoding cuts it.
+        let piece = x == root.expr && root.payload;
         let n = expr::node(x);
         match &n {
             Node::SLoad(key, false, _) => note_slot(*key, slots, true, None, vyper, bases),
-            Node::Op(op::AND, v) => {
+            Node::Op(op::AND, v) if !piece && !cut.contains(&x) => {
                 if let (Node::SLoad(key, false, _), Some(m)) =
                     (expr::node(v[0]), expr::as_const(v[1]))
                 {

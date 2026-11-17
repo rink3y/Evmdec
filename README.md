@@ -324,7 +324,8 @@ set was split off once, its answer key and reports are never read during develop
 its reviewers return counts only.
 
 The target is 95 to 99% precision and recall. It is not met. Measured on the held-out set,
-234 exploited contracts and 101 with no known flaw, scored five times by separate reviewers:
+234 exploited contracts and 101 with no known flaw, scored nine times by separate reviewers.
+The first five:
 
 | | first score | second score | third score, by address | fourth score, by address | fifth score, by address |
 |---|---|---|---|---|---|
@@ -358,6 +359,15 @@ An eighth score, on the build whose steps name the wait and the outside answers 
 was made under: 31 of 234 found, 52 of 91 findings correct (57.1%), 3 of 101 flagged. One
 more finding came, shown only in the guessed world, and it is not correct. The same one
 contract does not finish.
+
+A ninth score, on the build with the last phase described under Explore: 32 of 234 found
+(13.7%), 53 of 92 findings correct (57.6%), 3 of 101 flagged. The one more flaw found is a
+payout priced from a reading on another contract, 2 of 43 of that kind now. The run shows
+that payout falling when the account adds to what is read, not rising, and the finding says
+so. A reviewer who does not take a shown fall for the flaw would count 31. With an empty
+cache six contracts took over 30 s in that run, three of them over 100 s, where the build
+before took under 6 s: the last phase reads cells no earlier run asked for, and each is
+waited for.
 
 On the development set, where every false finding was read and its cause fixed, the latest
 reviewed build finds 37 of 231 known flaws (16.0%) by address, 56 of its 69 findings are

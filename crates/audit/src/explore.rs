@@ -181,6 +181,8 @@ pub struct Explorer<'a> {
     // Set while a call is made in a world that is only being tried. Such a call says
     // nothing of what the contract does in the world the report is about.
     trial: bool,
+    // Set while every function of a state is given one short try before any gets a long one.
+    shallow: bool,
     // The contracts the chain's state names, and the addresses looked at to find them.
     contracts: Vec<Addr>,
     checked: HashSet<Addr>,
@@ -413,6 +415,7 @@ impl<'a> Explorer<'a> {
             setups: Vec::new(),
             on_chain: false,
             trial: false,
+            shallow: false,
             contracts: Vec::new(),
             checked: HashSet::new(),
             own,
@@ -969,7 +972,11 @@ impl<'a> Explorer<'a> {
         It is held back while a repair that keeps the list gets further, and is the
         answer only if none of those ends. */
         let mut hollow: Option<(Try, World, Run)> = None;
-        for _ in 0..ROUNDS {
+        let rounds = match self.shallow {
+            true => 1,
+            false => ROUNDS,
+        };
+        for _ in 0..rounds {
             if best.2.ok || budget::spent() {
                 break;
             }
@@ -2392,12 +2399,23 @@ impl<'a> Explorer<'a> {
                 .any(|step| matches!(step, Step::Holds { .. }))
         };
         frontier.sort_by_key(|s| !holds(s));
+        let holding: Vec<usize> = frontier.iter().copied().filter(holds).collect();
         for _ in 0..ACTOR_DEPTH {
             let mut next = Vec::new();
             for from in frontier {
-                for entry in 0..self.own {
-                    if !self.entries[entry].view && !self.act(from, entry, &mut next) {
-                        return;
+                /* In the state where the account holds some, every function gets one
+                short try before any gets a long one. With long tries only, the first
+                functions used the work up and the later ones were never tried. */
+                for shallow in [true, false] {
+                    if shallow && !holding.contains(&from) {
+                        continue;
+                    }
+                    self.shallow = shallow;
+                    for entry in 0..self.own {
+                        if !self.entries[entry].view && !self.act(from, entry, &mut next) {
+                            self.shallow = false;
+                            return;
+                        }
                     }
                 }
             }

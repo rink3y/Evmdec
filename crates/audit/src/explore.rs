@@ -2119,7 +2119,7 @@ impl<'a> Explorer<'a> {
                 .into_iter()
                 .filter(|b| matches!(b.kind, Kind::Takeover | Kind::RoleCleared))
                 .collect();
-            let steps = self.history(from, entry, &t);
+            let steps = self.history(from, entry, t);
             self.report(takeovers, entry, &steps, &again, (false, false));
         }
     }

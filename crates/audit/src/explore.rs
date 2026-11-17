@@ -2383,6 +2383,15 @@ impl<'a> Explorer<'a> {
 
     fn attack(&mut self) {
         let mut frontier: Vec<usize> = (0..self.states.len()).collect();
+        /* The state in which the account holds some comes first. It is made last, and
+        taken last it is reached only when the states before it leave work over. */
+        let holds = |s: &usize| {
+            self.states[*s]
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::Holds { .. }))
+        };
+        frontier.sort_by_key(|s| !holds(s));
         for _ in 0..ACTOR_DEPTH {
             let mut next = Vec::new();
             for from in frontier {

@@ -3474,7 +3474,7 @@ impl<'a> Lifter<'a> {
         /* What the caller read and handed in was read when the caller read it. Read again
         here, a word the caller wrote since, such as the free pointer, would stand in. */
         let mut handed: HashSet<ExprId> = HashSet::new();
-        let mut pending: Vec<ExprId> = (0..consumed).map(|i| at(i)).collect();
+        let mut pending: Vec<ExprId> = (0..consumed).map(&at).collect();
         while let Some(x) = pending.pop() {
             if expr::holds(x, kind::MLOAD) && handed.insert(x) {
                 pending.extend(expr::children(x));

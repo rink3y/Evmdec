@@ -983,3 +983,10 @@ fn a_stored_number_written_past_its_top_bits_is_declared_as_the_whole_word() {
     assert!(out.contains("mapping(address => uint256) field2"), "{out}");
     assert!(!out.contains("mapping(address => uint8)"), "{out}");
 }
+
+#[test]
+fn a_stored_word_tested_at_its_lowest_bit_and_also_shifted_down_is_no_flag() {
+    // signatures is a list of strings, and each string's head word keeps its length above bit 0.
+    let out = fixture("Calls.hex");
+    assert!(!out.contains("bool[] field1"), "{out}");
+}

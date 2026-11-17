@@ -1260,10 +1260,13 @@ fn resolve(c: &Class, evidence: Evidence) -> Ty {
     }
     // A stored number read or written past its top bits packs more than that number.
     if c.storage && !c.interface {
-        if let Ty::Uint(n) = t {
-            if n > 1 && f.wide.max(c.def_wide) > n {
-                return Ty::Unknown;
-            }
+        let width = match t {
+            Ty::Uint(n) if n > 1 => n,
+            Ty::Bool | Ty::Uint(1) => 1,
+            _ => 256,
+        };
+        if f.wide.max(c.def_wide) > width {
+            return Ty::Unknown;
         }
     }
     if c.interface {

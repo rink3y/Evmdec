@@ -3359,11 +3359,19 @@ impl<'a> Lifter<'a> {
             expr::substitute(
                 e,
                 &|n| {
-                    if let Node::MLoad(a, _) = n {
-                        Some(st.mem.load_word(*a, st.version))
-                    } else {
-                        None
-                    }
+                    let Node::MLoad(a, _) = n else {
+                        return None;
+                    };
+                    /* A read that is still a read of the same place has gained
+                    nothing. Its caller made it, and with a new stamp it would be
+                    another value than the one the helper tested. It stays whole. The
+                    place it read is not looked up again either. */
+                    let now = st.mem.load_word(*a, st.version);
+                    let same = matches!(expr::node(now), Node::MLoad(at, _) if at == *a);
+                    Some(match same {
+                        true => expr::intern(n.clone()),
+                        false => now,
+                    })
                 },
                 &mut memo,
             )

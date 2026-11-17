@@ -160,8 +160,10 @@ pub struct Checked {
     ops: HashMap<ExprId, Vec<Site>>,
     divisors: HashMap<ExprId, Vec<Site>>,
     untold: HashSet<ExprId>,
-    limits: HashMap<ExprId, Vec<(U256, Option<Site>)>>,
+    limits: HashMap<ExprId, Limits>,
 }
+
+type Limits = Vec<(U256, Option<Site>)>;
 
 impl Checked {
     /* A product with a constant is tested by holding the other factor to the largest
@@ -705,7 +707,7 @@ impl Names {
                     set.entry(e).or_insert(sites);
                 }
             }
-            let renamed: Vec<(ExprId, Vec<(U256, Option<Site>)>)> = checked
+            let renamed: Vec<(ExprId, Limits)> = checked
                 .limits
                 .iter()
                 .map(|(e, l)| (expr::substitute(*e, &named, &mut memo), l.clone()))

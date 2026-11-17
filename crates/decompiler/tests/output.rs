@@ -648,3 +648,15 @@ fn a_read_is_printed_on_the_side_of_a_store_or_a_create_the_code_made_it_on() {
         ],
     );
 }
+
+#[test]
+fn the_sum_a_folded_helper_hands_back_is_the_sum_it_tested() {
+    let out = text(
+        "60806040526004355161001061004c565b61001b906001610037565b5f5561002a6024356003610037565b\
+         60015561003561004c565b005b8067ffffffffffffffff038211610057570190565b5f5f5f5f5f335af150\
+         565b634e487b7160e01b5f52601160045260245ffd",
+    );
+    assert!(out.contains("stor_0 = mem[arg0] + 1;"), "{out}");
+    assert!(!out.contains("unchecked("), "{out}");
+    assert!(!out.contains("Panic(arithmetic overflow)"), "{out}");
+}

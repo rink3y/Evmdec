@@ -882,6 +882,16 @@ pub fn restamp(
     }
     let mut again = |x: ExprId| restamp(x, version, storage, memo);
     let r = match node(e) {
+        // What a helper read of another account it read after all its caller had done.
+        Node::Op(o @ (op::BALANCE | op::EXTCODESIZE | op::EXTCODEHASH), v) => {
+            let account = again(v[0]);
+            let own = v.get(1).and_then(|s| as_const(*s));
+            let stamp = storage + own.map_or(0, |c| c.low_u64().min(1) as u32);
+            match stamp {
+                0 => intern(Node::Op(o, vec![account])),
+                _ => intern(Node::Op(o, vec![account, konst_u64(u64::from(stamp))])),
+            }
+        }
         Node::Op(o, v) => {
             let nv: Vec<ExprId> = v.iter().map(|x| again(*x)).collect();
             if nv == v {

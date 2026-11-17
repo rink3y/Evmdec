@@ -1398,18 +1398,29 @@ pub fn block_literals(stmts: &[Stmt], hidden: &HashSet<usize>, n: &Names) -> Vec
         let reads_memory = expr::contains(*val, &|x| matches!(x, Node::MLoad(..)));
         (aligned && !reads_memory).then(|| (number, offset.low_u64() / 32, *val))
     };
+    /* A test that reads no memory says the same before a store as after it, and when it
+    fails the store is undone with all else. The stores on its two sides are one run. */
+    let reads = kind::MLOAD | kind::KECCAK_MEM | kind::COPIED_WORD;
+    let passed = |s: &Stmt| {
+        matches!(s, Stmt::Require { .. })
+            && !crate::lift::stmt_exprs(s)
+                .iter()
+                .any(|e| expr::holds(*e, reads))
+    };
     let live: Vec<usize> = (0..stmts.len()).filter(|i| !hidden.contains(i)).collect();
     let mut out = Vec::new();
     let mut at = 0;
     while at < live.len() {
         let mut end = at;
-        while end < live.len() && word_of(&stmts[live[end]]).is_some() {
+        let stored = |i: usize| word_of(&stmts[live[i]]).is_some();
+        while end < live.len() && (stored(end) || (end > at && passed(&stmts[live[end]]))) {
             end += 1;
         }
         let mut by_block: BTreeMap<u32, Vec<(usize, u64, ExprId)>> = BTreeMap::new();
         for i in &live[at..end] {
-            let (number, index, val) = word_of(&stmts[*i]).expect("the run holds word stores");
-            by_block.entry(number).or_default().push((*i, index, val));
+            if let Some((number, index, val)) = word_of(&stmts[*i]) {
+                by_block.entry(number).or_default().push((*i, index, val));
+            }
         }
         for (number, words) in by_block {
             let mut sorted = words.clone();

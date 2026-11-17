@@ -327,6 +327,7 @@ struct Printer<'a> {
     memory_reads: Vec<Vec<(usize, Span)>>,
     // Filled while the printer's &self methods run, hence the cell.
     skipped: RefCell<HashSet<(usize, usize)>>,
+    printed_last: Option<usize>,
 }
 
 struct FoldedLog {
@@ -748,6 +749,16 @@ fn exprs_after(l: &Lifted, nd: &lift::LNode, i: usize, in_block_only: bool) -> V
     }
     after.extend(lift::term_exprs(&nd.term));
     let mut seen = HashSet::new();
+    /* A block that only jumps on to one reached from nowhere else is cut in two by the
+    code, a folded helper being one way. What follows the jump is still the same run. */
+    let mut last = nd.id;
+    while let (true, Some(next)) = (in_block_only, run_on(l, last)) {
+        if !seen.insert(next) || next == nd.id {
+            break;
+        }
+        after.extend(lift::node_exprs(&l.nodes[next]));
+        last = next;
+    }
     let mut stack: Vec<usize> = match in_block_only {
         true => Vec::new(),
         false => nd.succs.clone(),
@@ -765,6 +776,14 @@ fn exprs_after(l: &Lifted, nd: &lift::LNode, i: usize, in_block_only: bool) -> V
         }
     }
     after
+}
+
+fn run_on(l: &Lifted, from: usize) -> Option<usize> {
+    let Term::Jump(next) = l.nodes[from].term else {
+        return None;
+    };
+    let alone = l.nodes[next].preds == [from] && !l.edge_assigns.contains_key(&(from, next));
+    alone.then_some(next)
 }
 
 fn account_read(e: ExprId) -> Option<(u8, u32)> {
@@ -2694,8 +2713,23 @@ impl<'a> Printer<'a> {
     }
 
     fn stmts(&mut self, n: usize, depth: usize) {
+        // A name given in a block holds on in the block its run goes on in.
+        let run = self.printed_last.filter(|p| run_on(self.l, *p) == Some(n));
+        let held: Vec<(ExprId, String)> = match run {
+            Some(_) => {
+                let stale = self.names.stale.borrow();
+                let given = self.names.block_stale.borrow();
+                let named = given
+                    .iter()
+                    .filter_map(|e| Some((*e, stale.get(e)?.clone())));
+                named.collect()
+            }
+            None => Vec::new(),
+        };
+        self.printed_last = Some(n);
         self.names.end_block();
         self.named_in(n, true);
+        self.names.replace_stale_in_block(held);
         self.refresh_forwarded(n);
         let mut dead = emit::dead_memory_stores(&self.l.nodes[n].stmts);
         dead.extend(
@@ -2734,10 +2768,22 @@ impl<'a> Printer<'a> {
             dead.extend(lit.rest.iter().copied());
         }
         let mut replaced: Vec<(ExprId, String)> = Vec::new();
+        let mut kept_early: HashSet<usize> = HashSet::new();
         for (i, s) in self.l.nodes[n].stmts.iter().enumerate() {
             self.names.replace_stale_in_block(replaced.drain(..));
-            let planned = self.stale_plan.get(&(n, i)).cloned();
-            if let (Stmt::MStore { off, .. }, Some(stale)) = (s, planned) {
+            /* Stores gathered into one line are all stated where the first stands. What
+            a later one of them overwrites has to be kept before that line, not after. */
+            let gathered = literals.iter().find(|lit| lit.first == i);
+            let stores = std::iter::once(i).chain(gathered.iter().flat_map(|lit| lit.rest.clone()));
+            for j in stores
+                .filter(|j| !kept_early.contains(j))
+                .collect::<Vec<_>>()
+            {
+                let planned = self.stale_plan.get(&(n, j)).cloned();
+                let (Stmt::MStore { off, .. }, Some(stale)) = (&self.l.nodes[n].stmts[j], planned)
+                else {
+                    continue;
+                };
                 for (at, (read, name)) in stale.iter().enumerate() {
                     if stale[..at].iter().any(|(_, earlier)| earlier == name) {
                         continue;
@@ -2746,9 +2792,12 @@ impl<'a> Printer<'a> {
                     let current = emit::fmt_mem_word(word, self.names);
                     self.line(depth, &format!("uint256 {name} = {current};"));
                 }
-                replaced = stale;
                 self.given
-                    .extend(replaced.iter().cloned().map(|name| (name, depth)));
+                    .extend(stale.iter().cloned().map(|name| (name, depth)));
+                replaced.extend(stale);
+                if j != i {
+                    kept_early.insert(j);
+                }
             }
             if dead.contains(&i) || self.skipped.borrow().contains(&(n, i)) {
                 continue;
@@ -3733,6 +3782,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
             .collect(),
         memory_reads: memory_reads(l),
         skipped: Default::default(),
+        printed_last: None,
     };
     names.stale.borrow_mut().clear();
     p.go(l.entry, None, base_depth);
@@ -3784,6 +3834,7 @@ pub fn structure(l: &Lifted, names: &Names, base_depth: usize) -> String {
             dead_stores: std::mem::take(&mut p.dead_stores),
             memory_reads: std::mem::take(&mut p.memory_reads),
             skipped: Default::default(),
+            printed_last: None,
         };
         names.stale.borrow_mut().clear();
         p2.go(l.entry, None, base_depth);

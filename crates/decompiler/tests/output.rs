@@ -592,3 +592,59 @@ fn the_words_stored_for_a_call_are_its_arguments_or_stay_as_stores() {
         assert!(raw.contains(line), "{line} is missing in\n{raw}");
     }
 }
+
+fn in_order(out: &str, lines: &[&str]) {
+    let mut from = 0;
+    for line in lines {
+        let at = out[from..].find(line);
+        from += at.unwrap_or_else(|| panic!("{line} is missing or out of order in\n{out}"));
+    }
+}
+
+#[test]
+fn a_read_is_printed_on_the_side_of_a_store_or_a_create_the_code_made_it_on() {
+    let created =
+        text("60806040525f5f5ff061001190610021565b5f5561001c33610021565b600155005b3f9056");
+    in_order(
+        &created,
+        &["deployed_1 = create(", "stor_0 = deployed_1.codehash;"],
+    );
+    assert!(!created.contains("prev_code_hash"), "{created}");
+    let tested = text(
+        "6080604052610012600435602435610027565b610020604435606435610027565b6020600435f35b8151\
+         610031575f5ffd5b905256",
+    );
+    in_order(
+        &tested,
+        &[
+            "require(mem[arg0] != 0);",
+            "mem[arg0] = arg1;",
+            "require(mem[arg2] != 0);",
+            "mem[arg2] = arg3;",
+        ],
+    );
+    let shortened = text(
+        "6080604052600435806001815103602001015160f81c61002382600181510361003e565b61002b575f5f\
+         fd5b61003960443560243561003e565b602090f35b905256",
+    );
+    in_order(
+        &shortened,
+        &[
+            "uint256 prev_mem_arg0 = mem[arg0];",
+            "mem[arg0] = mem[arg0] - 1;",
+            "require(mem[prev_mem_arg0 + 31 + arg0] >> 248 != 0);",
+        ],
+    );
+    let gathered = text(
+        "608060405261000c61002d565b6040518051600435826020015260243582525f5561002861002d565b60\
+         4090f35b5f5f5f5f5f335af15056",
+    );
+    in_order(
+        &gathered,
+        &[
+            "uint256 prev_mem_ptr1 = mem[ptr1];",
+            "ptr1 = memory(arg1, arg0);",
+            "stor_0 = prev_mem_ptr1;",
+        ],
+    );
+}

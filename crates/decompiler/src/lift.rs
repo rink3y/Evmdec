@@ -1788,6 +1788,7 @@ pub struct CalleeSummary {
     pub side_effects: bool,
     pub reverts: Option<(ExprId, ExprId, Option<Vec<ExprId>>)>,
     pub guards: Vec<(ExprId, Option<Vec<ExprId>>, bool)>,
+    pub stores_and_copies_before: Vec<(usize, usize)>,
     pub copies: Vec<(ExprId, ExprId, ExprId)>,
     pub maybe_mstores: Vec<ExprId>,
 }
@@ -1826,7 +1827,11 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                     cond,
                     data,
                     invalid,
-                } => sum.guards.push((*cond, data.clone(), *invalid)),
+                } => {
+                    sum.stores_and_copies_before
+                        .push((sum.mstores.len(), sum.copies.len()));
+                    sum.guards.push((*cond, data.clone(), *invalid));
+                }
                 Stmt::Assign { .. } | Stmt::Drop(_) => {}
             }
         }
@@ -1964,15 +1969,21 @@ pub fn summarize(l: &Lifted) -> Option<CalleeSummary> {
                 match t {
                     Some(t) if rev(*t) && !rev(*f) => {
                         let (d, inv) = payload(*t);
+                        sum.stores_and_copies_before
+                            .push((sum.mstores.len(), sum.copies.len()));
                         sum.guards.push((op1(op::ISZERO, *cond), d, inv));
                         n = *f;
                     }
                     Some(t) if rev(*f) && !rev(*t) => {
                         let (d, inv) = payload(*f);
+                        sum.stores_and_copies_before
+                            .push((sum.mstores.len(), sum.copies.len()));
                         sum.guards.push((*cond, d, inv));
                         n = *t;
                     }
                     None => {
+                        sum.stores_and_copies_before
+                            .push((sum.mstores.len(), sum.copies.len()));
                         sum.guards.push((op1(op::ISZERO, *cond), None, true));
                         n = *f;
                     }
@@ -3404,9 +3415,39 @@ impl<'a> Lifter<'a> {
         let inlined = direct_returns.is_some();
         let transparent = inlined && summary.is_some_and(|s| !s.side_effects);
         let gen_before = st.sgen;
+        /* A test the helper made before a store reads what memory held before it. The
+        tests are stated where the helper made them, or one would read as coming after
+        a store it came before. A test made after a copy is stated after them all. */
+        let tests = |stmts: &mut Vec<Stmt>, stored: Option<usize>| {
+            let Some(sum) = summary.filter(|_| transparent) else {
+                return;
+            };
+            for (i, (cond, data, invalid)) in sum.guards.iter().enumerate() {
+                let (stores, copies) = sum
+                    .stores_and_copies_before
+                    .get(i)
+                    .copied()
+                    .unwrap_or((0, 1));
+                let before = (copies == 0 && stores < sum.mstores.len()).then_some(stores);
+                if before != stored {
+                    continue;
+                }
+                let cond = subst(*cond);
+                if expr::as_const(cond).is_some_and(|c| !c.is_zero()) {
+                    continue;
+                }
+                let data = data.as_ref().map(|d| d.iter().map(|e| subst(*e)).collect());
+                stmts.push(Stmt::Require {
+                    cond,
+                    data,
+                    invalid: *invalid,
+                });
+            }
+        };
         match summary {
             Some(sum) => {
-                for (off, val) in &sum.mstores {
+                for (made, (off, val)) in sum.mstores.iter().enumerate() {
+                    tests(stmts, Some(made));
                     let (o, v) = (subst(*off), subst(*val));
                     if transparent {
                         let origin = Some((un.id, stmts.len()));
@@ -3481,18 +3522,7 @@ impl<'a> Lifter<'a> {
             }
         }
         if transparent {
-            for (cond, data, invalid) in summary.map(|s| s.guards.as_slice()).unwrap_or(&[]) {
-                let cond = subst(*cond);
-                if expr::as_const(cond).is_some_and(|c| !c.is_zero()) {
-                    continue;
-                }
-                let data = data.as_ref().map(|d| d.iter().map(|e| subst(*e)).collect());
-                stmts.push(Stmt::Require {
-                    cond,
-                    data,
-                    invalid: *invalid,
-                });
-            }
+            tests(stmts, None);
         } else {
             stmts.push(Stmt::Internal {
                 seq,

@@ -251,6 +251,12 @@ refuses, or that does not do what the bytecode does, goes back to the exact form
 does everything that calls it. What is printed is the file that survives, after one longer
 comparison.
 
+A function that only returns one variable is not written at all: the variable is declared
+`public` under the function's name, as an author would have, and the compiler writes the
+function. When every function of a contract is plain, its fallback is written out too and
+the exact block is dropped, which leaves a file with no assembly in it. The WETH contract
+comes out that way, in 89 lines.
+
 A function that keeps its exact form but whose arguments the compiler would decode
 differently from the original, as code from before solc 0.8 does, is left out of the named
 functions and answers through `fallback`.
@@ -265,11 +271,11 @@ comparison. A contract built with solc 0.8 is compared with no such allowance.
 `./corpus/exact_all.sh` runs this over a directory. All 22 corpus contracts compile and
 compare equal on every function, solc 0.4 to 0.8 and Vyper, and so do the 17 regression, 30
 vulnerable and 5 source fixtures in `testdata`: 74 of 74. Of the 840 functions those files
-name, 419 are plain Solidity: all 11 of WETH, 21 of 22 in USDT, 19 of 22 in the Uniswap V2
+name, 420 are plain Solidity: all 11 of WETH, 21 of 22 in USDT, 19 of 22 in the Uniswap V2
 pair, 19 of 28 in USDC. Most of the rest wait on memory: an event that carries a string or a
 call whose arguments are encoded by hand is still printed in a notation no compiler reads.
-On the WETH file, 61 of 64 single changes to an operator, a check or an event in the plain
-functions are caught, and the other three change a value nothing reads.
+On the WETH file, 51 of 54 single changes to an operator, a check or an event are caught, and
+the other three change a value nothing reads.
 
 ### Decompiler against verified source
 

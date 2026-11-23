@@ -2547,6 +2547,9 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             if let Some(m) = expr::as_const(v[1]) {
                 if m.is_low_mask() {
                     let bits = m.bits();
+                    if bits == 160 && n.strict && is_address(v[0], n) {
+                        return (fmt_prec(v[0], P_PRIMARY, n), P_PRIMARY);
+                    }
                     if bits == 160 {
                         return (format!("address({})", fmt_expr(v[0], n)), P_PRIMARY);
                     }

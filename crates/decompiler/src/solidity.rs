@@ -322,7 +322,7 @@ fn place(
 /* A variable this cannot express is left undeclared, and so is one at a slot too far to
 count to. The next one is padded out to its own slot all the same. A function that
 names an undeclared variable will not build, and stays in its exact form. */
-fn layout(c: &Contract, taken: &BTreeSet<&str>) -> Layout {
+fn layout(c: &Contract, taken: &BTreeSet<&str>, public: &[(usize, String)]) -> Layout {
     let slot = |text: &str| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok();
     let placed = c.storage.iter().filter_map(|v| Some((slot(&v.slot)?, v)));
     let mut vars: Vec<(u64, &crate::decompile::StorageVar)> = placed.collect();
@@ -330,9 +330,11 @@ fn layout(c: &Contract, taken: &BTreeSet<&str>) -> Layout {
     let mut renamed = Vec::new();
     let mut used = BTreeSet::new();
     let mut name = |n: &str| {
-        let fresh = match taken.contains(n) {
-            true => format!("_{n}"),
-            false => n.to_string(),
+        let read_by = public.iter().find(|(_, var)| var == n);
+        let fresh = match (read_by, taken.contains(n)) {
+            (Some((getter, _)), _) => c.functions[*getter].name.clone(),
+            (None, true) => format!("_{n}"),
+            (None, false) => n.to_string(),
         };
         if !identifier(&fresh) || taken.contains(fresh.as_str()) || !used.insert(fresh.clone()) {
             return Err(format!("{n} cannot be named"));
@@ -340,7 +342,10 @@ fn layout(c: &Contract, taken: &BTreeSet<&str>) -> Layout {
         if fresh != n {
             renamed.push((n.to_string(), fresh.clone()));
         }
-        Ok(fresh)
+        Ok(match read_by {
+            Some(_) => format!("public {fresh}"),
+            None => fresh,
+        })
     };
     let mut structs = String::new();
     let mut packer = Packer {
@@ -403,10 +408,15 @@ fn renamed(text: &str, names: &[(String, String)]) -> String {
 pub struct Plain<'a> {
     functions: &'a BTreeSet<usize>,
     layout: &'a Layout,
+    // Functions that only read one variable. The variable is declared public under the
+    // function's name and the compiler writes the function.
+    public: &'a BTreeSet<usize>,
+    // Nothing is left in its exact form, so the translation of the bytecode can go.
+    clean: bool,
 }
 
 fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
-    let payable = f.kind != FnKind::External || f.mutability == Mutability::Payable;
+    let payable = f.kind == FnKind::Internal || f.mutability == Mutability::Payable;
     // The compiler makes this test itself for a function that takes no ether, and
     // does not let such a function read the value.
     let own = |l: &&str| payable || l.trim() != "require(msg.value == 0);";
@@ -512,14 +522,18 @@ fn declarations(f: &Function, text: &str) -> String {
     out
 }
 
-fn helpers(c: &Contract, plain: &BTreeSet<usize>) -> BTreeSet<usize> {
+fn helpers(c: &Contract, plain: &BTreeSet<usize>, clean: bool) -> BTreeSet<usize> {
     let at = |pc: usize| {
         c.functions
             .iter()
             .position(|f| f.pc == pc && f.kind == FnKind::Internal)
     };
     let mut found = BTreeSet::new();
-    let external = |i: &&usize| c.functions[**i].kind == FnKind::External;
+    let external = |i: &&usize| match c.functions[**i].kind {
+        FnKind::External => true,
+        FnKind::Fallback | FnKind::Receive => clean,
+        _ => false,
+    };
     let mut work: Vec<usize> = plain.iter().filter(external).copied().collect();
     while let Some(i) = work.pop() {
         for callee in c.functions[i].calls.iter().filter_map(|pc| at(*pc)) {
@@ -560,6 +574,9 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
     }
     let mut written = BTreeSet::new();
     for (i, f) in c.functions.iter().enumerate() {
+        if plain.is_some_and(|p| p.public.contains(&i)) {
+            continue;
+        }
         let whole = plain.filter(|p| p.functions.contains(&i) && f.kind == FnKind::External);
         if let Some((plain, head)) = whole.and_then(|p| Some((p, header(f, shape, true)?))) {
             if written.insert(head.clone()) {
@@ -577,15 +594,28 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
             out.push_str(&format!("    {head} {{\n        _original();\n    }}\n\n"));
         }
     }
-    out.push_str("    fallback() external payable {\n        _original();\n    }\n\n");
+    let clean = plain.is_some_and(|p| p.clean);
+    if !clean {
+        out.push_str("    fallback() external payable {\n        _original();\n    }\n\n");
+    }
     if let Some(plain) = plain {
-        for i in helpers(c, plain.functions) {
+        let unnamed = |f: &Function| matches!(f.kind, FnKind::Fallback | FnKind::Receive);
+        let all = c.functions.iter().enumerate();
+        let own = all.filter(|(i, f)| clean && unnamed(f) && plain.functions.contains(i));
+        let mut printed: Vec<usize> = own.map(|(i, _)| i).collect();
+        printed.extend(helpers(c, plain.functions, clean));
+        for i in printed {
             let f = &c.functions[i];
             let start = out.len();
             let head = crate::decompile::fmt_function_header(f);
             out.push_str(&format!("{head}{}    }}\n\n", body(c, f, plain)));
             spans.push((start, out.len(), i));
         }
+    }
+    if clean {
+        out.truncate(out.trim_end().len());
+        out.push_str("\n}\n");
+        return Draft { text: out, spans };
     }
     out.push_str("    function _original() private {\n        assembly {\n");
     let code = &c.info.runtime;
@@ -692,6 +722,53 @@ pub fn exact_file(c: &Contract, runs: usize) -> Result<Output, String> {
     Err(refused.pop().unwrap_or_default())
 }
 
+fn uncast(text: &str) -> &str {
+    let inner = text.split_once('(').filter(|(ty, _)| elementary(ty));
+    let inner = inner.and_then(|(_, rest)| rest.strip_suffix(')'));
+    let whole = |i: &&str| {
+        let mut depth = 0i32;
+        i.chars().all(|c| {
+            depth += i32::from(c == '(') - i32::from(c == ')');
+            depth >= 0
+        })
+    };
+    inner.filter(whole).unwrap_or(text)
+}
+
+// The variable a function returns and does nothing else, read under the function's own
+// arguments in their order.
+fn getter<'a>(c: &'a Contract, f: &Function) -> Option<&'a str> {
+    // The compiler names the function it writes after the variable, so only a function
+    // whose own name gives its selector can be handed over.
+    let named = header(f, &Shape::default(), true).is_some();
+    if !named || f.inlined || f.mutability != Mutability::View {
+        return None;
+    }
+    let code = f.code.lines().map(str::trim);
+    let lines: Vec<&str> = code
+        .filter(|l| !l.is_empty() && *l != "require(msg.value == 0);")
+        .collect();
+    let [line] = lines.as_slice() else {
+        return None;
+    };
+    let shown = one_value(line);
+    let value = uncast(shown.strip_prefix("return ")?.strip_suffix(';')?);
+    let (name, mut rest) = value.split_at(value.find('[').unwrap_or(value.len()));
+    for p in &f.params {
+        let (index, after) = rest.strip_prefix('[')?.split_once(']')?;
+        if uncast(index) != p.name {
+            return None;
+        }
+        rest = after;
+    }
+    let plain = c.storage.iter().filter(|v| v.members.is_empty());
+    let mut names = plain.flat_map(|v| {
+        let fields = v.fields.iter().map(|f| f.name.as_str());
+        fields.chain(v.fields.is_empty().then_some(v.name.as_str()))
+    });
+    names.find(|n| rest.is_empty() && *n == name)
+}
+
 /* The exact file with every function the printer's own text can stand in for written
 out as plain Solidity. A function is written out only while the file still builds and
 the function still does what the bytecode does. Whatever fails either test goes back
@@ -700,14 +777,26 @@ to the exact translation, and so does everything that calls it. */
 pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
     use crate::check;
     let floor = exact_file(c, runs)?;
-    let names = c.functions.iter().map(|f| f.name.as_str());
-    let events = c.events.iter().filter_map(|e| e.split('(').next());
-    let taken: BTreeSet<&str> = names.chain(events).chain(["_original"]).collect();
     let trace = std::env::var_os("EVMDEC_RAISE_TRACE").is_some();
-    let layout = layout(c, &taken);
+    let read = |(i, f): (usize, &Function)| Some((i, getter(c, f)?.to_string()));
+    let mut public: Vec<(usize, String)> =
+        c.functions.iter().enumerate().filter_map(read).collect();
+    // Two functions can read one variable, as `owner` and `getOwner` do. The variable
+    // takes the name an author is more likely to have given it.
+    let plainness = |i: usize| {
+        let name = &c.functions[i].name;
+        (name.starts_with("get"), name.len())
+    };
+    public.sort_by_key(|(i, var)| (var.clone(), plainness(*i)));
+    public.dedup_by(|later, first| later.1 == first.1);
     let mut shape = floor.shape.clone();
-    let printable =
-        |f: &&Function| !f.inlined && matches!(f.kind, FnKind::External | FnKind::Internal);
+    let kinds = [
+        FnKind::External,
+        FnKind::Internal,
+        FnKind::Fallback,
+        FnKind::Receive,
+    ];
+    let printable = |f: &&Function| !f.inlined && kinds.contains(&f.kind);
     let all = c.functions.iter().enumerate();
     let mut plain: BTreeSet<usize> = all.filter(|(_, f)| printable(f)).map(|(i, _)| i).collect();
     let callers = |of: usize| {
@@ -721,16 +810,28 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
     };
     let mut depth = runs;
     for _ in 0..32 {
+        let read: BTreeSet<usize> = public.iter().map(|(i, _)| *i).collect();
+        let written = c
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !read.contains(i));
+        let names = written.map(|(_, f)| f.name.as_str());
+        let events = c.events.iter().filter_map(|e| e.split('(').next());
+        let taken: BTreeSet<&str> = names.chain(events).chain(["_original"]).collect();
+        let layout = layout(c, &taken, &public);
         let written = Plain {
             functions: &plain,
             layout: &layout,
+            public: &read,
+            clean: false,
         };
         let draft = compose(c, &shape, Some(&written));
-        if draft.spans.is_empty() {
+        if draft.spans.is_empty() && read.is_empty() {
             break;
         }
         let mut failed: Vec<usize> = Vec::new();
-        let report = match crate::solc::compile_with(&draft.text, false) {
+        match crate::solc::compile_with(&draft.text, false) {
             Err(refusal) => {
                 let within = |at: &usize| {
                     let span = draft
@@ -747,20 +848,24 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                         .collect();
                     eprintln!("refused in {named:?}: {}", refusal.message);
                 }
-                // An error outside every function is in what they all share.
-                if failed.is_empty() {
+                // An error outside every function is in what they all share. The public
+                // variables are the part of that which can be taken back.
+                if failed.is_empty() && public.is_empty() {
                     break;
                 }
-                None
+                if failed.is_empty() {
+                    public.clear();
+                    continue;
+                }
             }
             Ok(built) => {
                 let built = built.into_iter().next().ok_or("nothing was built")?;
                 let mut named: Vec<(u32, String)> = built.signatures.clone().into_iter().collect();
                 named.sort();
-                let whole: BTreeSet<u32> = draft
-                    .spans
-                    .iter()
-                    .filter_map(|(_, _, i)| selector(&c.functions[*i]))
+                let spans = draft.spans.iter().map(|(_, _, i)| *i);
+                let whole: BTreeSet<u32> = spans
+                    .chain(read.iter().copied())
+                    .filter_map(|i| selector(&c.functions[i]))
                     .collect();
                 let mut entries = check::entries(c, &named);
                 for e in &mut entries {
@@ -781,6 +886,18 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                         let why = differing.differs.as_deref().unwrap_or("");
                         eprintln!("{} differs: {why}", differing.signature);
                     }
+                    if index.is_some_and(|i| read.contains(&i)) {
+                        public.retain(|(i, _)| Some(*i) != index);
+                        failed.push(usize::MAX);
+                        continue;
+                    }
+                    // A selector no function of the original has was made by the compiler
+                    // for a public variable.
+                    if index.is_none() && !public.is_empty() {
+                        public.clear();
+                        failed.push(usize::MAX);
+                        continue;
+                    }
                     match index.filter(|i| plain.contains(i)) {
                         Some(i) => failed.push(i),
                         None if built.signatures.contains_key(&s) => {
@@ -798,21 +915,42 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                 }
                 if failed.is_empty() {
                     let externals = draft.spans.iter().map(|(_, _, i)| &c.functions[*i]);
-                    let plain = externals.filter(|f| f.kind == FnKind::External);
+                    let named = externals.filter(|f| f.kind == FnKind::External);
+                    let getters = read.iter().map(|i| &c.functions[*i]);
+                    let names: Vec<String> = named.chain(getters).map(|f| f.name.clone()).collect();
+                    let within = |i: usize| {
+                        read.contains(&i) || draft.spans.iter().any(|(_, _, at)| *at == i)
+                    };
+                    let external = |f: &Function| f.kind == FnKind::External && !f.inlined;
+                    let all = c.functions.iter().enumerate();
+                    let every = all.filter(|(_, f)| external(f)).all(|(i, _)| within(i));
+                    let whole = Plain {
+                        functions: &plain,
+                        layout: &layout,
+                        public: &read,
+                        clean: true,
+                    };
+                    let clean = every.then(|| compose(c, &shape, Some(&whole)));
+                    let tried = clean.and_then(|draft| {
+                        let built = crate::solc::compile_with(&draft.text, false).ok()?;
+                        let built = built.into_iter().next()?;
+                        let report =
+                            check::compare(&c.info.runtime, &built.runtime, &entries, depth);
+                        report.equal().then_some((draft, built, report))
+                    });
+                    let (draft, built, report) = tried.unwrap_or((draft, built, report));
                     return Ok(Output {
                         source: draft.text,
                         compiler: built.compiler,
                         report,
                         headers: built.signatures.len(),
                         refused: floor.refused,
-                        plain: plain.map(|f| f.name.clone()).collect(),
+                        plain: names,
                         shape,
                     });
                 }
-                Some(report)
             }
-        };
-        drop(report);
+        }
         while let Some(i) = failed.pop() {
             if i != usize::MAX && plain.remove(&i) {
                 failed.extend(callers(i));
@@ -839,6 +977,13 @@ mod tests {
         let lower = "x = 0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 + 0xff;";
         let mixed = "x = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 + 0xff;";
         assert_eq!(checksummed(lower), mixed);
+    }
+
+    #[test]
+    fn a_cast_comes_off_only_when_it_wraps_the_whole_value() {
+        assert_eq!(uncast("address(account)"), "account");
+        assert_eq!(uncast("uint8(a) + uint8(b)"), "uint8(a) + uint8(b)");
+        assert_eq!(uncast("balanceOf(account)"), "balanceOf(account)");
     }
 
     #[test]

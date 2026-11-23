@@ -169,13 +169,11 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
         .linked
         .iter()
         .map(|lc| {
-            let lr = audit::audit_within(lc, audit::WORK / 4);
-            let lmd = audit::markdown(&lr);
             let ldis: Vec<String> = evmdec::disasm::disassemble(&lc.info.runtime)
                 .iter()
                 .map(evmdec::disasm::format_instruction)
                 .collect();
-            json!({"contract": lc, "report": lr, "report_markdown": lmd, "disassembly": ldis})
+            json!({"contract": lc, "disassembly": ldis})
         })
         .collect();
     let parts_disassembly: Vec<Vec<String>> = c
@@ -188,9 +186,7 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
                 .collect()
         })
         .collect();
-    let r = audit::audit(&c);
-    let md = audit::markdown(&r);
-    let mut v = json!({"contract": c, "report": r, "report_markdown": md, "disassembly": disasm});
+    let mut v = json!({"contract": c, "disassembly": disasm});
     if !linked.is_empty() {
         v["linked"] = Value::Array(linked);
     }
@@ -321,7 +317,7 @@ async fn api_decompile(
         }
         None => error(
             StatusCode::GATEWAY_TIMEOUT,
-            "the analysis took longer than the server allows",
+            "decompiling took longer than the server allows",
         ),
     }
 }

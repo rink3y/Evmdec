@@ -10,7 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 evmdec = { path = "../decompiler" }
-evmdec-audit = { path = "../audit" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

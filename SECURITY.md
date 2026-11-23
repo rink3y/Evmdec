@@ -1,12 +1,11 @@
 # Security
 
-evmdec is an analysis tool. It makes no transactions and holds no keys.
+evmdec is a decompiler. It makes no transactions and holds no keys.
 
-## A missed or wrong finding
+## Wrong output
 
-Open an issue with the chain, the address or the bytecode, and what the analyzer said. A
-contract that was exploited through something the analyzer did not report is the most useful
-kind of issue: the TENDRIL case in the README came from one.
+Open an issue with the chain, the address or the bytecode, and the lines that are wrong.
+Code that reads differently from what the bytecode does is the most useful kind of issue.
 
 ## A problem in the server
 

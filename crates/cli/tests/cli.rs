@@ -51,12 +51,12 @@ fn a_file_with_no_code_is_an_error() {
         ("prefix.hex", "0x"),
     ] {
         let path = file(name, contents);
-        let out = evmdec(&["audit", path.to_str().unwrap()]);
+        let out = evmdec(&["disasm", path.to_str().unwrap()]);
         let _ = std::fs::remove_file(&path);
         assert!(!out.status.success(), "{name} was accepted");
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(said.contains("holds no code"), "{name}: {said}");
-        assert!(out.stdout.is_empty(), "{name} still printed a report");
+        assert!(out.stdout.is_empty(), "{name} still printed a listing");
     }
 }
 
@@ -64,14 +64,4 @@ fn a_file_with_no_code_is_an_error() {
 fn an_empty_hex_argument_is_an_error() {
     let out = evmdec(&["decompile", "0x"]);
     assert!(!out.status.success());
-}
-
-#[test]
-fn a_report_names_the_code_it_read() {
-    let whole = file("report.hex", &sample());
-    let out = evmdec(&["audit", whole.to_str().unwrap()]);
-    let _ = std::fs::remove_file(&whole);
-    assert!(out.status.success());
-    let report = String::from_utf8_lossy(&out.stdout);
-    assert!(report.contains("Code size: 3124 bytes"), "{report}");
 }

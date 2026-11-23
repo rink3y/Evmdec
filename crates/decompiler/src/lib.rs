@@ -15,6 +15,7 @@ pub mod clock;
 pub mod compiler;
 pub mod decompile;
 pub mod emit;
+pub mod exact;
 pub mod expr;
 #[cfg(feature = "rpc")]
 pub mod fetch;
@@ -28,6 +29,7 @@ pub mod sigs;
 pub mod slots;
 #[cfg(feature = "rpc")]
 pub mod solc;
+pub mod solidity;
 pub mod ssa;
 pub mod structure;
 pub mod types;

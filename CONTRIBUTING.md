@@ -8,6 +8,7 @@ cargo clippy --workspace --all-targets --all-features
 cargo test --workspace
 python3 corpus/bench.py
 RUNS=8 ./corpus/verify_all.sh
+./corpus/exact_all.sh
 ```
 
 Clippy is kept at zero warnings. `bench.py` measures interface recovery on the audited corpus

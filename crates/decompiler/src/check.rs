@@ -6,6 +6,10 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 
 const STEPS: usize = 300_000;
+// A source that walks the bytecode instruction by instruction takes many steps for one.
+const SLOWER: usize = 96;
+const GAS_AT_START: u64 = 30_000_000;
+const GAS_STEP: u64 = 1_000;
 const THIS: u64 = 0xc0de_c0de;
 const ACTORS: [u64; 3] = [0xa11ce, 0xb0b0, 0xca401];
 const IDENTITY: u64 = 4;
@@ -141,6 +145,7 @@ struct Called {
 struct Ran {
     effect: Option<Effect>,
     wanted: Vec<Change>,
+    steps: usize,
 }
 
 fn jump_targets(code: &[u8]) -> Vec<bool> {
@@ -223,7 +228,12 @@ fn settled(m: &Machine<'_>, input: &Input, ok: bool, data: Vec<u8>, calls: Vec<C
     }
 }
 
-fn run(code: &[u8], input: &Input, mut reached: Option<&mut HashSet<(usize, bool)>>) -> Ran {
+fn run(
+    code: &[u8],
+    input: &Input,
+    steps: usize,
+    mut reached: Option<&mut HashSet<(usize, bool)>>,
+) -> Ran {
     let targets = jump_targets(code);
     let this = U256::from_u64(THIS);
     let mut host = Host::controlled(this, input.caller, input.calldata.clone(), input.value);
@@ -238,8 +248,11 @@ fn run(code: &[u8], input: &Input, mut reached: Option<&mut HashSet<(usize, bool
     let mut calls: Vec<Called> = Vec::new();
     let mut loads: Vec<(U256, U256)> = Vec::new();
     let mut wanted: Vec<Change> = Vec::new();
+    let mut gas_read = 0u64;
+    let mut taken = 0;
     let effect = 'ran: {
-        for _ in 0..STEPS {
+        for _ in 0..steps {
+            taken += 1;
             if m.pc >= code.len() {
                 let effect = settled(&m, input, true, Vec::new(), calls);
                 break 'ran Some(effect);
@@ -266,6 +279,16 @@ fn run(code: &[u8], input: &Input, mut reached: Option<&mut HashSet<(usize, bool
             }
             let at = m.pc;
             let outcome = match m.step() {
+                Ok(None) if code[at] == op::GAS => {
+                    // Two builds of one source never have the same gas left. Each reading
+                    // is a fixed step below the one before, so gas a function reports as
+                    // spent between two readings comes out the same in both.
+                    gas_read += 1;
+                    if let Some(top) = m.stack.last_mut() {
+                        *top = U256::from_u64(GAS_AT_START - GAS_STEP * gas_read);
+                    }
+                    continue;
+                }
                 Ok(None) => continue,
                 Ok(Some(outcome)) => outcome,
                 // Running out of stack is a real halt. Every other error is a limit of this
@@ -340,7 +363,11 @@ fn run(code: &[u8], input: &Input, mut reached: Option<&mut HashSet<(usize, bool
         }
         None
     };
-    Ran { effect, wanted }
+    Ran {
+        effect,
+        wanted,
+        steps: taken,
+    }
 }
 
 fn pick<T: Copy>(rng: &mut Rng, from: &[T]) -> T {
@@ -596,15 +623,22 @@ pub fn compare(original: &[u8], candidate: &[u8], entries: &[Entry], runs: usize
                 drawn += 1;
                 (draw(entry, &mut rng), 0)
             });
-            let a = run(original, &input, Some(&mut reached));
+            let a = run(original, &input, STEPS, Some(&mut reached));
             // The last comparisons of a run are the ones that decided how it ended.
             if depth < DEPTH {
                 let latest = a.wanted.iter().rev().take(FOLLOWED);
                 queue.extend(latest.map(|change| (input.with(change), depth + 1)));
             }
-            let b = run(candidate, &input, None);
             checked.runs += 1;
-            let (Some(a), Some(b)) = (a.effect, b.effect) else {
+            // A run the original did not finish has nothing to compare with. The budget
+            // of the source follows what the original needed, so a source that loops
+            // forever is stopped soon.
+            let budget = SLOWER * (a.steps + 1000);
+            let b = a
+                .effect
+                .as_ref()
+                .map(|_| run(candidate, &input, budget, None));
+            let (Some(a), Some(b)) = (a.effect, b.and_then(|b| b.effect)) else {
                 checked.unsettled += 1;
                 continue;
             };

@@ -158,13 +158,19 @@ fn run(solc: &Path, input: &Value) -> Result<Value, String> {
         .map_err(|e| format!("the compiler's answer was not read: {e}"))
 }
 
+// The optimizer refuses a source that reads the size of memory, so a refusal is tried
+// again without it.
 pub fn compile(source: &str) -> Result<Vec<Built>, String> {
+    compile_with(source, true).or_else(|_| compile_with(source, false))
+}
+
+pub fn compile_with(source: &str, optimize: bool) -> Result<Vec<Built>, String> {
     let (solc, compiler) = compiler(&pragmas(source))?;
     let input = json!({
         "language": "Solidity",
         "sources": {"contract.sol": {"content": source}},
         "settings": {
-            "optimizer": {"enabled": true, "runs": 200},
+            "optimizer": {"enabled": optimize, "runs": 200},
             "outputSelection": {"*": {"*": [
                 "evm.deployedBytecode.object", "evm.methodIdentifiers"
             ]}}

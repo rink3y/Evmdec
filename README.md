@@ -44,6 +44,7 @@ The decompiler is `crates/decompiler`, the command-line tool `crates/cli` and th
 | `compiler` | compiler version and feature fingerprints when the metadata is missing |
 | `interp`, `verify` | reference EVM interpreter and the block oracle |
 | `check`, `solc` | runs the original bytecode beside a compiled Solidity source and compares what they do; fetches the compiler a pragma asks for |
+| `exact`, `solidity` | bytecode as an assembly block, instruction by instruction; the Solidity file around it |
 | `rpc`, `fetch`, `decompile`, `slots`, `clock` | chain access, proxy and diamond resolution, the walk over call targets, composition, well-known storage slots, the time limit one dependency is given |
 
 ## What it recovers
@@ -224,15 +225,34 @@ the four source fixtures every one of 20 single changes to an operator or a chec
 The WETH contract on mainnet, built with solc 0.4.19, compares equal to its published source
 built with 0.4.26 on all 12 functions with every branch reached.
 
-This is the test the decompiler's own output has to pass. Today it does not: none of the 22
-corpus contracts decompiles to text a compiler accepts. The work in progress is output that
-is a real Solidity file, where every function either passes this check as plain Solidity or
-is printed as an exact assembly block.
+This is the test the decompiler's own output has to pass. The pseudo-Solidity it prints by
+default does not: none of the 22 corpus contracts decompiles to text a compiler accepts. The
+Solidity file below does.
 
 It is evidence and not a proof. The last line of the output says how many branch outcomes of
 the original the calls reached, and a function no call got to the end of is marked. With no
 source, `evmdec check original.hex` reports that reach alone: 76 of 76 on WETH, 252 of 268 on
 USDT, 424 of 984 on Compound cETH, whose paths depend on what other contracts answer.
+
+### Solidity file
+
+`evmdec decompile my.hex --sol` prints a Solidity file a compiler accepts, with a licence
+line, a `pragma` (the contract's own compiler version when it was built with solc 0.8, a
+current one otherwise), the events, and every function whose signature is known declared by
+name. It is compiled and put through the source check before it is printed, and the result
+is reported beside it.
+
+At this stage no function body is readable yet. Every function calls one private function
+that holds the bytecode translated instruction by instruction into an assembly block, with
+no analysis in between, so it cannot be wrong in the way a decompiled body can. A function
+whose arguments the compiler would decode differently from the original, as code from before
+solc 0.8 does, is left out of the named functions and answers through `fallback`. This is
+the floor: the work in progress replaces these bodies with plain Solidity one function at a
+time, and a body is only kept when the check finds it equal.
+
+`./corpus/exact_all.sh` runs this over a directory. All 22 corpus contracts compile and
+compare equal on every function, solc 0.4 to 0.8 and Vyper, and so do the 17 regression, 30
+vulnerable and 5 source fixtures in `testdata`: 74 of 74.
 
 ### Decompiler against verified source
 
@@ -303,6 +323,7 @@ solc --bin MyContract.sol | tail -1 > my.hex
 ./target/release/evmdec disasm my.hex
 ./target/release/evmdec verify my.hex --runs 8
 ./target/release/evmdec check my.hex MyContract.sol
+./target/release/evmdec decompile my.hex --sol > My.sol
 
 PORT=8080 ./target/release/evmdec-server
 ```
@@ -380,6 +401,7 @@ cargo clippy --workspace --all-targets --all-features
 cargo test --workspace
 python3 corpus/bench.py
 RUNS=8 ./corpus/verify_all.sh
+./corpus/exact_all.sh
 ```
 
 The Rust crates follow Google's Rust style guide with `rustfmt.toml` as committed, and clippy

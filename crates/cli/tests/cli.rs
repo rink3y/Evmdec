@@ -89,3 +89,15 @@ fn a_source_is_equal_to_its_own_code_and_a_changed_one_is_not() {
         "{lines}"
     );
 }
+
+#[test]
+fn the_solidity_file_compiles_and_does_what_the_code_does() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/source");
+    let out = evmdec(&["decompile", &format!("{dir}/Packed.hex"), "--sol"]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("5 of 5 equal"), "{said}");
+    let file = String::from_utf8_lossy(&out.stdout);
+    assert!(file.starts_with("// SPDX-License-Identifier: UNLICENSED\npragma solidity 0.8."));
+    assert!(file.contains("fallback() external payable {"));
+}

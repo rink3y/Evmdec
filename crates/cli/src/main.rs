@@ -64,6 +64,11 @@ enum Cmd {
             help = "Resolve unknown selectors online (openchain.xyz, 4byte.directory)"
         )]
         lookup: bool,
+        #[arg(
+            long,
+            help = "Print a Solidity file that compiles and does what the bytecode does, and say how it compared"
+        )]
+        sol: bool,
     },
     #[command(
         about = "Block-level oracle: execute every basic block concretely and through the lifted IR"
@@ -302,6 +307,7 @@ fn run(cli: Cli) -> Result<()> {
             embedded,
             no_sigs,
             lookup,
+            sol,
         } => {
             let mut opts = Options {
                 flat,
@@ -350,7 +356,33 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
             };
-            if json {
+            if sol {
+                let out = evmdec::solidity::exact_file(&c, 16).map_err(|e| anyhow::anyhow!(e))?;
+                print!("{}", out.source);
+                for why in &out.refused {
+                    let first = why.lines().take(3).collect::<Vec<_>>().join(" ");
+                    eprintln!("a fuller form was refused: {first}");
+                }
+                eprintln!(
+                    "built with solc {}, {} functions by name",
+                    out.compiler, out.headers
+                );
+                let equal = out.report.functions.iter().filter(|f| f.differs.is_none());
+                eprintln!(
+                    "{} of {} equal, branch outcomes reached in the original: {} of {}",
+                    equal.count(),
+                    out.report.functions.len(),
+                    out.report.branches_reached,
+                    out.report.branches
+                );
+                for f in out.report.functions.iter().filter(|f| f.differs.is_some()) {
+                    let why = f.differs.as_deref().unwrap_or("");
+                    eprintln!("{} DIFFERS: {why}", f.signature);
+                }
+                if !out.report.equal() {
+                    std::process::exit(1);
+                }
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&c)?);
             } else {
                 print!("{}", c.source);

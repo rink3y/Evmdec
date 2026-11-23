@@ -49,6 +49,8 @@ pub struct Function {
     pub inlined: bool,
     #[serde(skip)]
     pub bool_vars: Vec<u32>,
+    #[serde(skip)]
+    pub locals: Vec<(String, String)>,
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub part: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -979,6 +981,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             n_rets,
             inlined: false,
             bool_vars: Vec::new(),
+            locals: Vec::new(),
             part: 0,
             origin: None,
         }
@@ -1238,6 +1241,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             );
         }
         f.code = body;
+        f.locals = names.merged();
     }
     /* A helper is left out when every call to it was folded into its callers. Whether
     that happened is only known from the text, so one a printed body still calls is

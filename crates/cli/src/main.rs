@@ -94,6 +94,11 @@ enum Cmd {
         source: Option<PathBuf>,
         #[arg(long, default_value_t = 64, help = "Calls drawn per function")]
         runs: usize,
+        #[arg(
+            long,
+            help = "For a source in a newer Solidity than the original: compare on well-formed calls only, and take any two built-in failures as the same"
+        )]
+        loose: bool,
         #[arg(long)]
         json: bool,
     },
@@ -357,15 +362,19 @@ fn run(cli: Cli) -> Result<()> {
                 }
             };
             if sol {
-                let out = evmdec::solidity::exact_file(&c, 16).map_err(|e| anyhow::anyhow!(e))?;
+                let out = evmdec::solidity::raised_file(&c, 16).map_err(|e| anyhow::anyhow!(e))?;
                 print!("{}", out.source);
                 for why in &out.refused {
                     let first = why.lines().take(3).collect::<Vec<_>>().join(" ");
                     eprintln!("a fuller form was refused: {first}");
                 }
                 eprintln!(
-                    "built with solc {}, {} functions by name",
-                    out.compiler, out.headers
+                    "built with solc {}, {} functions by name, {} as plain Solidity{}{}",
+                    out.compiler,
+                    out.headers,
+                    out.plain.len(),
+                    if out.plain.is_empty() { "" } else { ": " },
+                    out.plain.join(", ")
                 );
                 let equal = out.report.functions.iter().filter(|f| f.differs.is_none());
                 eprintln!(
@@ -474,6 +483,7 @@ fn run(cli: Cli) -> Result<()> {
             original,
             source,
             runs,
+            loose,
             json,
         } => {
             let code = load(&original)?;
@@ -481,7 +491,7 @@ fn run(cli: Cli) -> Result<()> {
                 Some(path) => {
                     let text = std::fs::read_to_string(&path)
                         .with_context(|| format!("reading {}", path.display()))?;
-                    let (built, report) = evmdec::check::against_source(&code, &text, runs)
+                    let (built, report) = evmdec::check::against_source(&code, &text, runs, loose)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     eprintln!("contract {} built with solc {}", built.name, built.compiler);
                     report

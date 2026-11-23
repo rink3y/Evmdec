@@ -875,6 +875,22 @@ impl Names {
         let n = m.len() as u32 + 1;
         *m.entry(v).or_insert(n)
     }
+    #[must_use]
+    pub fn merged(&self) -> Vec<(String, String)> {
+        let vars = self.vars.borrow();
+        let mut found: Vec<(u32, &str)> = vars
+            .iter()
+            .map(|(raw, shown)| match self.bools.contains(&expr::var(*raw)) {
+                true => (*shown, "bool"),
+                false => (*shown, "uint256"),
+            })
+            .collect();
+        found.sort_unstable();
+        let named = found
+            .into_iter()
+            .map(|(n, ty)| (format!("v{n}"), ty.to_string()));
+        named.collect()
+    }
 }
 
 // Solidity's order, not C's. In Solidity the bitwise operators bind tighter than the
@@ -3472,9 +3488,26 @@ fn strip_outer_parens(s: &str) -> &str {
     &s[1..s.len() - 1]
 }
 
+fn flag_or(j: usize, v: ExprId, n: &Names) -> String {
+    let flag = n.bool_returns.get(j).copied() == Some(true);
+    match expr::as_const(v) {
+        Some(c) if flag && c.is_zero() => "false".to_string(),
+        Some(c) if flag && c == U256::ONE => "true".to_string(),
+        _ => fmt_expr(v, n),
+    }
+}
+
 pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
     Some(match t {
         Term::Return { off, len, data } => match data {
+            Some(words)
+                if words.len() == n.bool_returns.len()
+                    && n.bool_returns.contains(&true)
+                    && expr::as_const(*len) == Some(U256::from(32 * words.len())) =>
+            {
+                let listed = words.iter().enumerate().map(|(j, v)| flag_or(j, *v, n));
+                format!("return ({});", listed.collect::<Vec<_>>().join(", "))
+            }
             Some(words) if !words.is_empty() => format!(
                 "return ({});",
                 strip_outer_parens(&fmt_payload(
@@ -3530,14 +3563,7 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
                     "return ({});",
                     vals.iter()
                         .enumerate()
-                        .map(|(j, v)| {
-                            let is_bool_pos = n.bool_returns.get(j).copied() == Some(true);
-                            match expr::as_const(*v) {
-                                Some(c) if is_bool_pos && c.is_zero() => "false".to_string(),
-                                Some(c) if is_bool_pos && c == U256::ONE => "true".to_string(),
-                                _ => fmt_expr(*v, n),
-                            }
-                        })
+                        .map(|(j, v)| flag_or(j, *v, n))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )

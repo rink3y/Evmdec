@@ -23,6 +23,12 @@ const DEPTH: usize = 2;
 pub struct Entry {
     pub selector: Option<u32>,
     pub signature: String,
+    /* For a function written out in a newer Solidity than the original was built with.
+    The newer compiler refuses arguments wider than their types, where the old one cut
+    them, and names its own failures with a panic code, where the old one gave no data.
+    Neither can be written away, so such a function is compared on well-formed calls
+    and any two built-in failures count as the same failure. */
+    pub loose: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -60,6 +66,7 @@ struct Input {
     timestamp: U256,
     stored: BTreeMap<U256, U256>,
     unset: bool,
+    well_formed: bool,
     seed: u64,
 }
 
@@ -370,8 +377,14 @@ fn run(
     }
 }
 
+// The low bits of this generator repeat in step with each other. Two choices made
+// from them one after the other would not be independent.
+fn below(rng: &mut Rng, n: u64) -> u64 {
+    (rng.next_u64() >> 32) % n.max(1)
+}
+
 fn pick<T: Copy>(rng: &mut Rng, from: &[T]) -> T {
-    from[rng.below(from.len() as u64) as usize]
+    from[below(rng, from.len() as u64) as usize]
 }
 
 fn low_bits(bits: u32) -> U256 {
@@ -385,11 +398,11 @@ fn low_bits(bits: u32) -> U256 {
 fn number(rng: &mut Rng, bits: u32, signed: bool) -> U256 {
     let mask = low_bits(bits);
     let ether = U256::from_u64(1_000_000_000_000_000_000);
-    let unsigned = match rng.below(8) {
+    let unsigned = match below(rng, 8) {
         0 => U256::ZERO,
         1 => U256::ONE,
-        2 | 3 => U256::from_u64(rng.below(1000)),
-        4 => ether.wrapping_mul(U256::from_u64(rng.below(1000))) & mask,
+        2 | 3 => U256::from_u64(below(rng, 1000)),
+        4 => ether.wrapping_mul(U256::from_u64(below(rng, 1000))) & mask,
         5 => mask,
         6 => U256::from_u64(rng.next_u64()) & mask,
         _ => rng.word() & mask,
@@ -398,7 +411,7 @@ fn number(rng: &mut Rng, bits: u32, signed: bool) -> U256 {
         return unsigned;
     }
     let positive = unsigned & low_bits(bits - 1);
-    match rng.below(3) {
+    match below(rng, 3) {
         0 => positive,
         1 => U256::ZERO.wrapping_sub(positive),
         _ => U256::ZERO.wrapping_sub(U256::ONE << (bits - 1)),
@@ -406,7 +419,7 @@ fn number(rng: &mut Rng, bits: u32, signed: bool) -> U256 {
 }
 
 fn address(rng: &mut Rng) -> U256 {
-    match rng.below(6) {
+    match below(rng, 6) {
         0 => U256::ZERO,
         1 => U256::from_u64(THIS),
         2 => U256::from_be_bytes(&rng.bytes(20)),
@@ -422,17 +435,36 @@ fn width(ty: &str, prefix: &str) -> Option<u32> {
     rest.parse::<u32>().ok().filter(|n| (1..=256).contains(n))
 }
 
-fn single(ty: &str, rng: &mut Rng) -> U256 {
+fn fits(ty: &str, v: U256) -> Option<bool> {
+    if ty.starts_with("address") {
+        return Some(v.bits() <= 160);
+    }
+    if ty == "bool" {
+        return Some(v.bits() <= 1);
+    }
+    if let Some(bits) = width(ty, "uint") {
+        return Some(v.bits() <= bits);
+    }
+    if let Some(bits) = width(ty, "int") {
+        return Some(U256::signextend(U256::from(bits / 8 - 1), v) == v);
+    }
+    let n = width(ty, "bytes").filter(|n| *n <= 32)?;
+    Some((v & low_bits(256 - 8 * n)).is_zero())
+}
+
+fn single(ty: &str, rng: &mut Rng, well_formed: &mut bool) -> U256 {
     // A decoder has to refuse a word wider than its type. Some words are drawn too wide
     // on purpose so that refusal is compared too.
-    if rng.below(16) == 0 {
-        return rng.value();
+    if below(rng, 16) == 0 {
+        let v = rng.value();
+        *well_formed &= fits(ty, v).unwrap_or(false);
+        return v;
     }
     if ty.starts_with("address") {
         return address(rng);
     }
     if ty == "bool" {
-        return U256::from_u64(rng.below(2));
+        return U256::from_u64(below(rng, 2));
     }
     if let Some(bits) = width(ty, "uint") {
         return number(rng, bits, false);
@@ -472,59 +504,70 @@ fn tuple(parts: Vec<(Vec<u8>, bool)>) -> (Vec<u8>, bool) {
 
 const MAX_FIXED: usize = 64;
 
-fn encode(ty: &str, rng: &mut Rng) -> (Vec<u8>, bool) {
+fn encode(ty: &str, rng: &mut Rng, well: &mut bool) -> (Vec<u8>, bool) {
     let ty = ty.trim();
     if let Some(open) = ty.rfind('[').filter(|_| ty.ends_with(']')) {
         let inner = &ty[..open];
         return match ty[open + 1..ty.len() - 1].parse::<usize>() {
-            Ok(n) => tuple((0..n.min(MAX_FIXED)).map(|_| encode(inner, rng)).collect()),
+            Ok(n) => tuple(
+                (0..n.min(MAX_FIXED))
+                    .map(|_| encode(inner, rng, well))
+                    .collect(),
+            ),
             Err(_) => {
-                let n = rng.below(4) as usize;
-                let (items, _) = tuple((0..n).map(|_| encode(inner, rng)).collect());
+                let n = below(rng, 4) as usize;
+                let (items, _) = tuple((0..n).map(|_| encode(inner, rng, well)).collect());
                 ([word(U256::from(n)), items].concat(), true)
             }
         };
     }
     if let Some(inner) = ty.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
         let parts = crate::abi::split_top(inner);
-        return tuple(parts.into_iter().map(|p| encode(p, rng)).collect());
+        return tuple(parts.into_iter().map(|p| encode(p, rng, well)).collect());
     }
     if ty == "bytes" || ty == "string" {
         let n = pick(rng, &[0usize, 1, 31, 32, 33, 68]);
         return ([word(U256::from(n)), padded(rng.bytes(n))].concat(), true);
     }
-    (word(single(ty, rng)), false)
+    (word(single(ty, rng, well)), false)
 }
 
-fn arguments(signature: &str, rng: &mut Rng) -> Vec<u8> {
+fn types_of(signature: &str) -> Vec<&str> {
     let inner = signature
         .split_once('(')
         .and_then(|(_, rest)| rest.strip_suffix(')'));
-    let types = crate::abi::split_top(inner.unwrap_or(""));
+    crate::abi::split_top(inner.unwrap_or(""))
+}
+
+fn arguments(signature: &str, rng: &mut Rng) -> (Vec<u8>, bool) {
+    let types = types_of(signature);
     // Both codes have to refuse malformed input the same way, so some calls ignore the types.
-    if rng.below(8) == 0 {
-        let n = rng.below(types.len() as u64 + 3) as usize;
+    if below(rng, 8) == 0 {
+        let n = below(rng, types.len() as u64 + 3) as usize;
         let mut bytes: Vec<u8> = (0..n).flat_map(|_| word(rng.value())).collect();
-        bytes.truncate(bytes.len().saturating_sub(rng.below(3) as usize * 5));
-        return bytes;
+        bytes.truncate(bytes.len().saturating_sub(below(rng, 3) as usize * 5));
+        return (bytes, false);
     }
-    tuple(types.into_iter().map(|t| encode(t, rng)).collect()).0
+    let mut well = true;
+    let parts = types.into_iter().map(|t| encode(t, rng, &mut well));
+    (tuple(parts.collect()).0, well)
 }
 
 fn draw(entry: &Entry, rng: &mut Rng) -> Input {
-    let calldata = match entry.selector {
+    let (calldata, well_formed) = match entry.selector {
         Some(selector) => {
             let mut bytes = selector.to_be_bytes().to_vec();
-            bytes.extend(arguments(&entry.signature, rng));
-            bytes
+            let (drawn, well) = arguments(&entry.signature, rng);
+            bytes.extend(drawn);
+            (bytes, well)
         }
         None => {
             let n = pick(rng, &[0usize, 0, 1, 3, 4, 36]);
-            rng.bytes(n)
+            (rng.bytes(n), true)
         }
     };
-    let value = match rng.below(4) {
-        0 => U256::from_u64(1 + rng.below(1_000_000_000)),
+    let value = match below(rng, 4) {
+        0 => U256::from_u64(1 + below(rng, 1_000_000_000)),
         _ => U256::ZERO,
     };
     let caller = U256::from_u64(pick(rng, &ACTORS));
@@ -533,7 +576,7 @@ fn draw(entry: &Entry, rng: &mut Rng) -> Input {
         calldata,
         caller,
         // Mostly the caller itself, as for a call made straight from a wallet.
-        origin: match rng.below(4) {
+        origin: match below(rng, 4) {
             0 => U256::from_u64(ORIGIN),
             _ => caller,
         },
@@ -542,7 +585,8 @@ fn draw(entry: &Entry, rng: &mut Rng) -> Input {
         stored: BTreeMap::new(),
         // A contract nobody has used yet. Flags are down and every balance is nothing,
         // which drawn storage almost never gives.
-        unset: rng.below(4) == 0,
+        unset: below(rng, 4) == 0,
+        well_formed,
         seed,
     }
 }
@@ -603,6 +647,24 @@ fn described(input: &Input, said: &str) -> String {
     )
 }
 
+fn built_in(failure: &[u8]) -> bool {
+    failure.is_empty() || (failure.len() == 36 && failure[..4] == [0x4e, 0x48, 0x7b, 0x71])
+}
+
+fn same(a: &Effect, b: &Effect, loose: bool) -> bool {
+    a == b || (loose && !a.ok && !b.ok && built_in(&a.data) && built_in(&b.data))
+}
+
+// An argument set to the far side of a comparison can stop fitting its type.
+fn still_well_formed(entry: &Entry, change: &Change) -> bool {
+    let Change::Argument(i, v) = change else {
+        return true;
+    };
+    let types = types_of(&entry.signature);
+    let plain = types.iter().all(|t| fits(t, U256::ZERO).is_some());
+    plain && types.get(*i).and_then(|t| fits(t, *v)) == Some(true)
+}
+
 pub fn compare(original: &[u8], candidate: &[u8], entries: &[Entry], runs: usize) -> Report {
     let mut reached = HashSet::new();
     let mut functions = Vec::new();
@@ -623,11 +685,17 @@ pub fn compare(original: &[u8], candidate: &[u8], entries: &[Entry], runs: usize
                 drawn += 1;
                 (draw(entry, &mut rng), 0)
             });
+            if entry.loose && !input.well_formed {
+                continue;
+            }
             let a = run(original, &input, STEPS, Some(&mut reached));
             // The last comparisons of a run are the ones that decided how it ended.
             if depth < DEPTH {
-                let latest = a.wanted.iter().rev().take(FOLLOWED);
-                queue.extend(latest.map(|change| (input.with(change), depth + 1)));
+                for change in a.wanted.iter().rev().take(FOLLOWED) {
+                    let mut next = input.with(change);
+                    next.well_formed &= still_well_formed(entry, change);
+                    queue.push((next, depth + 1));
+                }
             }
             checked.runs += 1;
             // A run the original did not finish has nothing to compare with. The budget
@@ -642,8 +710,15 @@ pub fn compare(original: &[u8], candidate: &[u8], entries: &[Entry], runs: usize
                 checked.unsettled += 1;
                 continue;
             };
+            // Storage no compiler would have written, such as a string whose length and
+            // flag disagree, is refused by a newer build and read as it lies by an old one.
+            if entry.loose && !b.ok && b.data.len() == 36 && b.data[35] == 0x22 && built_in(&b.data)
+            {
+                checked.unsettled += 1;
+                continue;
+            }
             checked.returned += usize::from(a.ok);
-            if a != b && checked.differs.is_none() {
+            if !same(&a, &b, entry.loose) && checked.differs.is_none() {
                 checked.differs = Some(described(&input, &difference(&a, &b)));
             }
         }
@@ -674,6 +749,7 @@ pub fn entries(original: &Contract, named: &[(u32, String)]) -> Vec<Entry> {
             found.push(Entry {
                 selector: Some(selector),
                 signature,
+                loose: false,
             });
         }
     }
@@ -682,12 +758,14 @@ pub fn entries(original: &Contract, named: &[(u32, String)]) -> Vec<Entry> {
             found.push(Entry {
                 selector: Some(*selector),
                 signature: signature.clone(),
+                loose: false,
             });
         }
     }
     found.push(Entry {
         selector: None,
         signature: "no selector".to_string(),
+        loose: false,
     });
     found
 }
@@ -697,6 +775,7 @@ pub fn against_source(
     original: &[u8],
     source: &str,
     runs: usize,
+    loose: bool,
 ) -> Result<(crate::solc::Built, Report), String> {
     let decompiled = crate::decompile::decompile(original, &crate::decompile::Options::default());
     let own: HashSet<u32> = entries(&decompiled, &[])
@@ -711,12 +790,11 @@ pub fn against_source(
         .ok_or("the source holds no contract")?;
     let mut named: Vec<(u32, String)> = best.signatures.clone().into_iter().collect();
     named.sort();
-    let report = compare(
-        &decompiled.info.runtime,
-        &best.runtime,
-        &entries(&decompiled, &named),
-        runs,
-    );
+    let mut entries = entries(&decompiled, &named);
+    for e in &mut entries {
+        e.loose = loose && e.selector.is_some_and(|s| best.signatures.contains_key(&s));
+    }
+    let report = compare(&decompiled.info.runtime, &best.runtime, &entries, runs);
     Ok((best, report))
 }
 
@@ -728,6 +806,7 @@ mod tests {
         vec![Entry {
             selector: None,
             signature: String::new(),
+            loose: false,
         }]
     }
 
@@ -755,10 +834,11 @@ mod tests {
     #[test]
     fn arguments_follow_the_types_of_the_signature() {
         let mut rng = Rng::new(7);
-        let (bytes, dynamic) = encode("(uint8,bytes)[2]", &mut rng);
+        let mut well = true;
+        let (bytes, dynamic) = encode("(uint8,bytes)[2]", &mut rng, &mut well);
         assert!(dynamic);
         assert_eq!(bytes.len() % 32, 0);
         assert_eq!(U256::from_be_bytes(&bytes[..32]), U256::from_u64(64));
-        assert_eq!(encode("uint256[3]", &mut rng).0.len(), 96);
+        assert_eq!(encode("uint256[3]", &mut rng, &mut well).0.len(), 96);
     }
 }

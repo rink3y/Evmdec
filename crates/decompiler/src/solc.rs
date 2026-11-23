@@ -161,10 +161,26 @@ fn run(solc: &Path, input: &Value) -> Result<Value, String> {
 // The optimizer refuses a source that reads the size of memory, so a refusal is tried
 // again without it.
 pub fn compile(source: &str) -> Result<Vec<Built>, String> {
-    compile_with(source, true).or_else(|_| compile_with(source, false))
+    let built = compile_with(source, true).or_else(|_| compile_with(source, false));
+    built.map_err(|refused| refused.message)
 }
 
-pub fn compile_with(source: &str, optimize: bool) -> Result<Vec<Built>, String> {
+#[derive(Clone, Debug, Default)]
+pub struct Refusal {
+    pub message: String,
+    pub places: Vec<usize>,
+}
+
+impl From<String> for Refusal {
+    fn from(message: String) -> Refusal {
+        Refusal {
+            message,
+            places: Vec::new(),
+        }
+    }
+}
+
+pub fn compile_with(source: &str, optimize: bool) -> Result<Vec<Built>, Refusal> {
     let (solc, compiler) = compiler(&pragmas(source))?;
     let input = json!({
         "language": "Solidity",
@@ -178,14 +194,26 @@ pub fn compile_with(source: &str, optimize: bool) -> Result<Vec<Built>, String> 
     });
     let out = run(&solc, &input)?;
     let failed = |e: &&Value| e["severity"] == "error";
-    if let Some(error) = out["errors"].as_array().into_iter().flatten().find(failed) {
+    let errors: Vec<&Value> = out["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(failed)
+        .collect();
+    if let Some(error) = errors.first() {
         let said = error["formattedMessage"]
             .as_str()
             .or(error["message"].as_str());
-        return Err(said
-            .unwrap_or("the compiler reported an error")
-            .trim()
-            .to_string());
+        let starts = errors
+            .iter()
+            .filter_map(|e| e["sourceLocation"]["start"].as_u64());
+        return Err(Refusal {
+            message: said
+                .unwrap_or("the compiler reported an error")
+                .trim()
+                .to_string(),
+            places: starts.map(|at| at as usize).collect(),
+        });
     }
     let mut found = Vec::new();
     let files = out["contracts"].as_object().into_iter().flatten();
@@ -216,7 +244,9 @@ pub fn compile_with(source: &str, optimize: bool) -> Result<Vec<Built>, String> 
         });
     }
     match found.is_empty() {
-        true => Err("the source holds no contract that can be deployed".to_string()),
+        true => Err("the source holds no contract that can be deployed"
+            .to_string()
+            .into()),
         false => Ok(found),
     }
 }

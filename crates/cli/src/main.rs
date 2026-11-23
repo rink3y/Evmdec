@@ -319,6 +319,7 @@ fn run(cli: Cli) -> Result<()> {
                 pcs: false,
                 embedded,
                 no_sigs,
+                solidity: sol,
                 extra_sigs: Default::default(),
             };
             let is_addr = evmdec::rpc::is_address(&input);

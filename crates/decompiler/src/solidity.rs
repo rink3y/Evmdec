@@ -173,86 +173,201 @@ pub struct Layout {
     renamed: Vec<(String, String)>,
 }
 
-const WIDEST_GAP: u64 = 16;
+const WIDEST_GAP: u64 = 1 << 16;
 
-/* State variables declared so that each lands on the slot and the bytes the code uses.
-The compiler packs neighbours that fit into one slot, so a variable that sits alone in
-the original gets padding before it wherever the compiler would pull it back. A layout
-this cannot express gives none, and no function is written out. */
-fn layout(c: &Contract, taken: &BTreeSet<&str>) -> Option<Layout> {
-    let slot = |text: &str| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok();
-    let mut vars: Vec<(u64, &crate::decompile::StorageVar)> = Vec::new();
-    for v in &c.storage {
-        if v.fixed_array || !v.members.is_empty() {
-            return None;
-        }
-        vars.push((slot(&v.slot)?, v));
+/* Variables written down one after another so that each lands on the slot and the bytes
+the code uses, for a contract's state and for the inside of a struct alike. The compiler
+packs neighbours that fit into one slot, so a variable that sits alone in the original
+gets padding before it wherever the compiler would pull it back. */
+struct Packer {
+    text: String,
+    indent: &'static str,
+    private: &'static str,
+    next: u64,
+    free: usize,
+    pads: usize,
+}
+
+impl Packer {
+    fn pad(&mut self, ty: &str) {
+        self.pads += 1;
+        let line = format!("{}{ty}{} _gap{};\n", self.indent, self.private, self.pads);
+        self.text.push_str(&line);
     }
-    vars.sort_by_key(|(at, _)| *at);
-    let mut out = Layout {
-        text: String::new(),
-        renamed: Vec::new(),
-    };
-    let mut used = BTreeSet::new();
-    let (mut next, mut free, mut pads) = (0u64, 0usize, 0usize);
-    let mut pad = |out: &mut Layout, ty: String| {
-        pads += 1;
-        out.text
-            .push_str(&format!("    {ty} private _gap{pads};\n"));
-    };
-    let mut declare = |out: &mut Layout, ty: &str, name: &str| {
-        let fresh = match taken.contains(name) {
-            true => format!("_{name}"),
-            false => name.to_string(),
-        };
-        let fine =
-            identifier(&fresh) && !taken.contains(fresh.as_str()) && used.insert(fresh.clone());
-        if fresh != name {
-            out.renamed.push((name.to_string(), fresh.clone()));
+
+    fn reach(&mut self, at: u64, leading: usize, name: &str) -> Result<(), String> {
+        if at < self.next || at - self.next > WIDEST_GAP {
+            return Err(format!(
+                "{name} is at slot {at:#x} after slot {:#x}",
+                self.next
+            ));
         }
-        out.text.push_str(&format!("    {ty} {fresh};\n"));
-        fine
-    };
-    for (at, v) in vars {
-        if at < next || at - next > WIDEST_GAP {
-            return None;
+        match at - self.next {
+            0 if leading <= self.free => self.pad(&format!("bytes{}", self.free)),
+            0 => {}
+            1 => self.pad("uint256"),
+            gap => self.pad(&format!("uint256[{gap}]")),
         }
-        for _ in next..at {
-            pad(&mut out, "uint256".to_string());
-            free = 0;
-        }
-        next = at + 1;
-        let first = v.fields.iter().map(|f| bytes_of(&f.ty)).next();
-        let leading = first.unwrap_or_else(|| bytes_of(&v.ty));
-        if leading <= free {
-            pad(&mut out, format!("bytes{free}"));
-        }
-        if v.fields.is_empty() {
-            if !declare(&mut out, &v.declared_type(), &v.name) {
-                return None;
-            }
-            free = 32 - bytes_of(&v.ty);
-            continue;
-        }
-        let mut fields: Vec<_> = v.fields.iter().collect();
-        fields.sort_by_key(|f| f.offset);
+        Ok(())
+    }
+
+    fn whole(&mut self, at: u64, ty: &str, name: &str, slots: u64) -> Result<(), String> {
+        let size = bytes_of(ty);
+        self.reach(at, size, name)?;
+        self.text
+            .push_str(&format!("{}{ty} {name};\n", self.indent));
+        self.next = at + slots;
+        self.free = 32 - size;
+        Ok(())
+    }
+
+    fn fields(&mut self, at: u64, fields: &[(usize, usize, &str, String)]) -> Result<(), String> {
+        let mut sorted: Vec<_> = fields.iter().collect();
+        sorted.sort_by_key(|f| f.0);
+        let first = sorted.first().map_or(32, |f| f.1);
+        self.reach(at, first, sorted.first().map_or("", |f| f.3.as_str()))?;
         let mut cursor = 0usize;
-        for f in fields {
-            let (offset, size) = (usize::try_from(f.offset).ok()?, bytes_of(&f.ty));
-            if offset < cursor || !usize::try_from(f.bits).is_ok_and(|bits| bits == 8 * size) {
-                return None;
+        for (offset, size, ty, name) in sorted {
+            if *offset < cursor || offset + size > 32 {
+                return Err(format!("{name} does not fit its bytes of slot {at:#x}"));
             }
-            if offset > cursor {
-                pad(&mut out, format!("bytes{}", offset - cursor));
+            if *offset > cursor {
+                self.pad(&format!("bytes{}", offset - cursor));
             }
-            if !declare(&mut out, &f.ty, &f.name) {
-                return None;
-            }
+            self.text
+                .push_str(&format!("{}{ty} {name};\n", self.indent));
             cursor = offset + size;
         }
-        free = 32usize.checked_sub(cursor)?;
+        self.next = at + 1;
+        self.free = 32 - cursor;
+        Ok(())
     }
-    Some(out)
+}
+
+fn field_list<'a>(
+    fields: &'a [crate::decompile::StorageField],
+    name: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<Vec<(usize, usize, &'a str, String)>, String> {
+    let mut listed = Vec::new();
+    for f in fields {
+        let size = bytes_of(&f.ty);
+        if f.bits as usize != 8 * size || !elementary(&f.ty) {
+            return Err(format!("{} is {} bits of type {}", f.name, f.bits, f.ty));
+        }
+        listed.push((f.offset as usize, size, f.ty.as_str(), name(&f.name)?));
+    }
+    Ok(listed)
+}
+
+fn structure(v: &crate::decompile::StorageVar) -> Result<(String, u64), String> {
+    let mut packer = Packer {
+        text: String::new(),
+        indent: "        ",
+        private: "",
+        next: 0,
+        free: 0,
+        pads: 0,
+    };
+    let mut used = BTreeSet::new();
+    let mut name = |n: &str| match identifier(n) && used.insert(n.to_string()) {
+        true => Ok(n.to_string()),
+        false => Err(format!("{n} cannot be named in a struct")),
+    };
+    let mut members: Vec<_> = v.members.iter().collect();
+    members.sort_by_key(|m| m.offset);
+    for m in members {
+        match m.fields.is_empty() {
+            true => packer.whole(m.offset, &m.ty, &name(&m.name)?, 1)?,
+            false => packer.fields(m.offset, &field_list(&m.fields, &mut name)?)?,
+        }
+    }
+    let text = format!("    struct {} {{\n{}    }}\n", v.struct_name(), packer.text);
+    Ok((text, packer.next))
+}
+
+fn place(
+    packer: &mut Packer,
+    structs: &mut String,
+    at: u64,
+    v: &crate::decompile::StorageVar,
+    name: &mut dyn FnMut(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    if !v.fields.is_empty() {
+        return packer.fields(at, &field_list(&v.fields, name)?);
+    }
+    let mut slots = 1;
+    let mut declared = String::new();
+    if !v.members.is_empty() {
+        let (text, span) = structure(v)?;
+        declared = text;
+        // Held directly, a struct takes all its slots. Behind a mapping or a list
+        // it takes one.
+        if !v.ty.contains("=>") && !v.ty.contains('[') {
+            slots = span;
+        }
+    }
+    if v.fixed_array {
+        let (element, count) = v.ty.rsplit_once('[').unwrap_or((&v.ty, ""));
+        let count = count.trim_end_matches(']').parse().ok();
+        let whole_words = bytes_of(element) == 32 && v.members.is_empty();
+        slots = count
+            .filter(|_| whole_words)
+            .ok_or_else(|| format!("{} is a fixed array of {}", v.name, v.ty))?;
+    }
+    packer.whole(at, &v.declared_type(), &name(&v.name)?, slots)?;
+    structs.push_str(&declared);
+    Ok(())
+}
+
+/* A variable this cannot express is left undeclared, and so is one at a slot too far to
+count to. The next one is padded out to its own slot all the same. A function that
+names an undeclared variable will not build, and stays in its exact form. */
+fn layout(c: &Contract, taken: &BTreeSet<&str>) -> Layout {
+    let slot = |text: &str| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok();
+    let placed = c.storage.iter().filter_map(|v| Some((slot(&v.slot)?, v)));
+    let mut vars: Vec<(u64, &crate::decompile::StorageVar)> = placed.collect();
+    vars.sort_by_key(|(at, _)| *at);
+    let mut renamed = Vec::new();
+    let mut used = BTreeSet::new();
+    let mut name = |n: &str| {
+        let fresh = match taken.contains(n) {
+            true => format!("_{n}"),
+            false => n.to_string(),
+        };
+        if !identifier(&fresh) || taken.contains(fresh.as_str()) || !used.insert(fresh.clone()) {
+            return Err(format!("{n} cannot be named"));
+        }
+        if fresh != n {
+            renamed.push((n.to_string(), fresh.clone()));
+        }
+        Ok(fresh)
+    };
+    let mut structs = String::new();
+    let mut packer = Packer {
+        text: String::new(),
+        indent: "    ",
+        private: " private",
+        next: 0,
+        free: 0,
+        pads: 0,
+    };
+    let trace = std::env::var_os("EVMDEC_RAISE_TRACE").is_some();
+    for (at, v) in vars {
+        let before = packer.text.len();
+        if let Err(why) = place(&mut packer, &mut structs, at, v, &mut name) {
+            packer.text.truncate(before);
+            if trace {
+                eprintln!("left undeclared: {why}");
+            }
+        }
+    }
+    if !structs.is_empty() {
+        structs.push('\n');
+    }
+    Layout {
+        text: format!("{structs}{}", packer.text),
+        renamed,
+    }
 }
 
 fn renamed(text: &str, names: &[(String, String)]) -> String {
@@ -300,6 +415,11 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
         lines.pop();
     }
     let text = renamed(&lines.join("\n"), &plain.layout.renamed);
+    let text = checksummed(&text);
+    let text = match version(c).is_some_and(|v| v < RENAMED) {
+        true => text.replace("block.prevrandao", "block.difficulty"),
+        false => text,
+    };
     let text = format!("{}{text}", declarations(f, &text));
     // Arithmetic before 0.8 wraps. In a current file only an unchecked block does.
     let wraps = ["+", "*", " - ", "-=", "(-"]
@@ -310,6 +430,41 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     }
     let inner: String = text.lines().map(|l| format!("    {l}\n")).collect();
     format!("        unchecked {{\n{inner}        }}\n")
+}
+
+// The compiler takes forty hex digits for an address and refuses one whose letters are
+// not in the case the address's own hash gives them.
+fn checksummed(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("0x") {
+        let digits = &rest[at + 2..];
+        let end = digits
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(digits.len());
+        let joined = rest[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        out.push_str(&rest[..at + 2]);
+        if end == 40 && !joined {
+            let lower = digits[..40].to_ascii_lowercase();
+            let hash = keccak::keccak256(lower.as_bytes());
+            for (i, c) in lower.chars().enumerate() {
+                let nibble = (hash[i / 2] >> (4 * (1 - i % 2))) & 0xf;
+                out.push(if nibble >= 8 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                });
+            }
+        } else {
+            out.push_str(&digits[..end]);
+        }
+        rest = &digits[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn one_value(line: &str) -> String {
@@ -548,9 +703,8 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
     let names = c.functions.iter().map(|f| f.name.as_str());
     let events = c.events.iter().filter_map(|e| e.split('(').next());
     let taken: BTreeSet<&str> = names.chain(events).chain(["_original"]).collect();
-    let Some(layout) = layout(c, &taken) else {
-        return Ok(floor);
-    };
+    let trace = std::env::var_os("EVMDEC_RAISE_TRACE").is_some();
+    let layout = layout(c, &taken);
     let mut shape = floor.shape.clone();
     let printable =
         |f: &&Function| !f.inlined && matches!(f.kind, FnKind::External | FnKind::Internal);
@@ -565,7 +719,6 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
             .filter(move |(_, f)| f.calls.contains(&pc));
         calling.map(|(i, _)| i)
     };
-    let trace = std::env::var_os("EVMDEC_RAISE_TRACE").is_some();
     let mut depth = runs;
     for _ in 0..32 {
         let written = Plain {
@@ -679,6 +832,13 @@ mod tests {
         let text = "balanceOf[a] = token.balanceOf(b) + balanceOf (c); require(x, \"balanceOf\");";
         let want = "_balanceOf[a] = token.balanceOf(b) + balanceOf (c); require(x, \"balanceOf\");";
         assert_eq!(renamed(text, &names), want);
+    }
+
+    #[test]
+    fn an_address_gets_the_case_its_hash_gives() {
+        let lower = "x = 0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 + 0xff;";
+        let mixed = "x = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 + 0xff;";
+        assert_eq!(checksummed(lower), mixed);
     }
 
     #[test]

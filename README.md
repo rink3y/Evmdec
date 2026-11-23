@@ -242,17 +242,34 @@ current one otherwise), the events, and every function whose signature is known 
 name. It is compiled and put through the source check before it is printed, and the result
 is reported beside it.
 
-At this stage no function body is readable yet. Every function calls one private function
-that holds the bytecode translated instruction by instruction into an assembly block, with
-no analysis in between, so it cannot be wrong in the way a decompiled body can. A function
-whose arguments the compiler would decode differently from the original, as code from before
-solc 0.8 does, is left out of the named functions and answers through `fallback`. This is
-the floor: the work in progress replaces these bodies with plain Solidity one function at a
-time, and a body is only kept when the check finds it equal.
+Every function starts as a call to one private function that holds the bytecode translated
+instruction by instruction into an assembly block, with no analysis in between, so it cannot
+be wrong in the way a decompiled body can. That is the floor. From there each function is
+written out as plain Solidity, with the state variables declared on the slots and bytes the
+code uses, and the file is built and checked again. A function whose text the compiler
+refuses, or that does not do what the bytecode does, goes back to the exact form, and so
+does everything that calls it. What is printed is the file that survives, after one longer
+comparison.
+
+A function that keeps its exact form but whose arguments the compiler would decode
+differently from the original, as code from before solc 0.8 does, is left out of the named
+functions and answers through `fallback`.
+
+A plain function from a contract built before solc 0.8 cannot match the original on every
+input, because the file is written for a current compiler: that compiler refuses an argument
+wider than its type where the old one cut it, and names its own failures with a panic code
+where the old one gave no data. Such a function is compared on well-formed calls, and two
+built-in failures count as the same failure. `evmdec check --loose` makes the same
+comparison. A contract built with solc 0.8 is compared with no such allowance.
 
 `./corpus/exact_all.sh` runs this over a directory. All 22 corpus contracts compile and
 compare equal on every function, solc 0.4 to 0.8 and Vyper, and so do the 17 regression, 30
-vulnerable and 5 source fixtures in `testdata`: 74 of 74.
+vulnerable and 5 source fixtures in `testdata`: 74 of 74. Of the 840 functions those files
+name, 419 are plain Solidity: all 11 of WETH, 21 of 22 in USDT, 19 of 22 in the Uniswap V2
+pair, 19 of 28 in USDC. Most of the rest wait on memory: an event that carries a string or a
+call whose arguments are encoded by hand is still printed in a notation no compiler reads.
+On the WETH file, 61 of 64 single changes to an operator, a check or an event in the plain
+functions are caught, and the other three change a value nothing reads.
 
 ### Decompiler against verified source
 

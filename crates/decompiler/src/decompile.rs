@@ -22,6 +22,7 @@ pub struct Options {
     pub pcs: bool,
     pub embedded: bool,
     pub no_sigs: bool,
+    pub solidity: bool,
     pub extra_sigs: HashMap<u32, String>,
 }
 
@@ -1216,6 +1217,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let mut names = make_names(f, &storage, layout, &loaders, &callees);
         let (l, hashes) = crate::structure::name_hashes(&l);
         names.hide_checked = solc08;
+        names.strict = opts.solidity;
         names.checked = solc08.then(|| emit::checked_ops(&l));
         names.offsets = offsets.next().unwrap_or_default();
         names.rebind(&hashes);
@@ -2033,6 +2035,7 @@ pub fn make_names(
     if f.kind != FnKind::Internal {
         for p in &f.params {
             n.params.insert(p.index, p.name.clone());
+            n.param_types.insert(p.index, p.ty.clone());
         }
     }
     // A parameter declared narrower than a word packs to fewer bytes than the word it is.
@@ -2075,16 +2078,23 @@ pub fn make_names(
         let k = ssa::arity(l);
         for i in 0..k {
             let index = k - 1 - i;
-            let name = match f.params.get(index).filter(|_| f.kind == FnKind::Internal) {
+            let own = f.params.get(index).filter(|_| f.kind == FnKind::Internal);
+            let name = match own {
                 Some(p) => p.name.clone(),
                 None => format!("arg{index}"),
             };
             n.args.insert(i as u32, name);
+            if let Some(p) = own {
+                n.arg_types.insert(i as u32, p.ty.clone());
+            }
         }
     }
     for s in storage {
         if let Some(slot) = U256::from_hex_str(&s.slot).or_else(|| U256::from_dec_str(&s.slot)) {
             n.storage.insert(slot, s.name.clone());
+            if s.fields.is_empty() && s.members.is_empty() {
+                n.storage_types.insert(slot, s.ty.clone());
+            }
             if s.ty.ends_with("[]") && s.fixed_array {
                 n.array_bases.insert(slot);
             }

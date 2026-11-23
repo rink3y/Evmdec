@@ -141,6 +141,10 @@ pub struct Names {
     pub bools: HashSet<ExprId>,
     pub bool_fields: HashSet<(U256, u32, u32)>,
     pub bool_returns: Vec<bool>,
+    pub strict: bool,
+    pub storage_types: HashMap<U256, String>,
+    pub param_types: HashMap<u32, String>,
+    pub arg_types: HashMap<u32, String>,
     pub dyn_arrays: HashSet<U256>,
     pub elem_types: HashMap<U256, String>,
     pub array_resizers: HashSet<usize>,
@@ -1335,6 +1339,58 @@ fn bool_element(e: ExprId, n: &Names) -> bool {
     }
 }
 
+/* What follows is only for output a compiler has to accept. There an address is not a
+number: it is compared with `address(0)`, and a number becomes one through a cast. */
+fn is_address(e: ExprId, n: &Names) -> bool {
+    let typed = |ty: Option<&String>| ty.is_some_and(|t| t == "address");
+    match expr::node(e) {
+        Node::Op(op::AND, v) => expr::as_const(v[1]) == Some(expr::mask_bits(160)),
+        Node::Env(o, _) => matches!(o, op::CALLER | op::ORIGIN | op::ADDRESS | op::COINBASE),
+        Node::SLoad(key, false, _) => match expr::as_const(key) {
+            Some(slot) => typed(n.storage_types.get(&slot)),
+            None => typed(element_root(key).and_then(|r| n.elem_types.get(&r))),
+        },
+        Node::CallDataLoad(off) => {
+            typed(calldata_word_index(off).and_then(|i| n.param_types.get(&i)))
+        }
+        Node::Arg(i) => typed(n.arg_types.get(&i)),
+        _ => false,
+    }
+}
+
+fn zero_of(e: ExprId, n: &Names) -> &'static str {
+    match n.strict && is_address(e, n) {
+        true => "address(0)",
+        false => "0",
+    }
+}
+
+fn as_address(e: ExprId, n: &Names) -> String {
+    match expr::as_const(e) {
+        Some(c) if c.is_zero() => "address(0)".to_string(),
+        Some(c) => format!("address({})", c.to_hex_padded(20)),
+        None if is_address(e, n) => fmt_expr(e, n),
+        None => format!("address(uint160({}))", fmt_expr(e, n)),
+    }
+}
+
+fn width_of(ty: &str) -> Option<u32> {
+    match ty {
+        "address" => Some(160),
+        "bool" => Some(8),
+        _ => ty.strip_prefix("uint").and_then(|d| d.parse().ok()),
+    }
+}
+
+fn as_type(ty: &str, e: ExprId, n: &Names) -> String {
+    match ty {
+        "address" => as_address(e, n),
+        "bool" if is_bool(e, n) => fmt_expr(e, n),
+        "bool" => format!("{} != 0", fmt_prec(e, P_EQ + 1, n)),
+        _ => format!("{ty}({})", fmt_expr(e, n)),
+    }
+}
+
 pub fn fmt_cond(cond: ExprId, n: &Names) -> String {
     if let Some(text) = difference_test(cond, n) {
         return text;
@@ -1342,11 +1398,14 @@ pub fn fmt_cond(cond: ExprId, n: &Names) -> String {
     if is_bool(cond, n) {
         fmt_expr(cond, n)
     } else {
-        format!("{} != 0", fmt_prec(cond, P_EQ + 1, n))
+        format!("{} != {}", fmt_prec(cond, P_EQ + 1, n), zero_of(cond, n))
     }
 }
 
 pub fn fmt_truth(cond: ExprId, n: &Names) -> String {
+    if n.strict {
+        return fmt_cond(cond, n);
+    }
     difference_test(cond, n).unwrap_or_else(|| fmt_expr(cond, n))
 }
 
@@ -2337,14 +2396,16 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             }
             if let Node::Op(op::ISZERO, iv) = expr::node(a) {
                 if !is_bool(iv[0], n) {
-                    return (format!("{} != 0", fmt_prec(iv[0], P_EQ + 1, n)), P_EQ);
+                    let zero = zero_of(iv[0], n);
+                    return (format!("{} != {zero}", fmt_prec(iv[0], P_EQ + 1, n)), P_EQ);
                 }
                 return (fmt_prec(iv[0], P_PRIMARY, n), P_PRIMARY);
             }
             if is_bool(a, n) {
                 (format!("!{}", fmt_prec(a, P_UNARY, n)), P_UNARY)
             } else {
-                (format!("{} == 0", fmt_prec(a, P_EQ + 1, n)), P_EQ)
+                let zero = zero_of(a, n);
+                (format!("{} == {zero}", fmt_prec(a, P_EQ + 1, n)), P_EQ)
             }
         }
         (op::NOT, 1) => (format!("~{}", fmt_prec(v[0], P_UNARY, n)), P_UNARY),
@@ -2624,6 +2685,9 @@ fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
                 None => s,
             };
         }
+    }
+    if n.strict && is_address(lhs, n) && !is_address(rhs, n) {
+        return as_address(rhs, n);
     }
     fmt_prec(rhs, prec, n)
 }
@@ -3152,6 +3216,17 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     }
                 }
             }
+            if n.strict && !*transient {
+                // A variable narrower than its slot is stored by keeping the other bytes.
+                // In source that is a plain assignment.
+                if let Some((k, 0, bits, value)) = packed_write(*key, *val) {
+                    let ty = n.storage_types.get(&k);
+                    if let Some(ty) = ty.filter(|t| width_of(t) == Some(bits)) {
+                        let name = fmt_slot(*key, n, SlotSpace::Persistent);
+                        return format!("{name} = {};", as_type(ty, value, n));
+                    }
+                }
+            }
             if !*transient && !n.member_fields.is_empty() {
                 if let Some(w) = crate::ssa::field_write(*key, *val) {
                     if let Some(field) = member_field(*key, w.bit_offset, w.bits, n) {
@@ -3554,6 +3629,9 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
         Term::Stop => "return;".into(),
         Term::ReturnDyn { ptr } => format!("return {};", fmt_expr(*ptr, n)),
         Term::Invalid => "assert(false); // INVALID".into(),
+        Term::SelfDestruct(a) if n.strict => {
+            format!("selfdestruct(payable({}));", as_address(*a, n))
+        }
         Term::SelfDestruct(a) => format!("selfdestruct({});", fmt_expr(*a, n)),
         Term::InternalReturn(vals) => {
             if vals.is_empty() {

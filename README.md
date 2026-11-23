@@ -43,6 +43,7 @@ The decompiler is `crates/decompiler`, the command-line tool `crates/cli` and th
 | `structure`, `emit`, `function`, `sigs`, `sigdb`, `naming` | loops, conditionals and short-circuits; printing; signature dictionary and local index; names inferred from roles |
 | `compiler` | compiler version and feature fingerprints when the metadata is missing |
 | `interp`, `verify` | reference EVM interpreter and the block oracle |
+| `check`, `solc` | runs the original bytecode beside a compiled Solidity source and compares what they do; fetches the compiler a pragma asks for |
 | `rpc`, `fetch`, `decompile`, `slots`, `clock` | chain access, proxy and diamond resolution, the walk over call targets, composition, well-known storage slots, the time limit one dependency is given |
 
 ## What it recovers
@@ -207,6 +208,32 @@ storage, logs, calls and the control decision are compared.
 A mismatch is a decompiler bug by definition. An inconclusive run is one the reference cannot
 execute from the drawn state, or one that makes two differently based memory accesses alias.
 
+### Source check
+
+`evmdec check original.hex source.sol` compiles a Solidity file with the compiler its pragma
+asks for and runs the result beside the original bytecode. Both get the same calls on the same
+state: every function with arguments drawn for its types, as several callers, with and
+without ether, on drawn storage and on storage nobody has used. Each run must agree on what
+another account can see: whether it returned, the data, every storage slot written, events,
+outside calls in order, and contracts created. Gas and the layout of memory are left out,
+since two builds of one source differ in both.
+
+Where a run compared two values, the call is made again with the two made equal, so the edge
+between `<` and `<=` is tried and a function open to one account is run as that account. On
+the four source fixtures every one of 20 single changes to an operator or a check is caught.
+The WETH contract on mainnet, built with solc 0.4.19, compares equal to its published source
+built with 0.4.26 on all 12 functions with every branch reached.
+
+This is the test the decompiler's own output has to pass. Today it does not: none of the 22
+corpus contracts decompiles to text a compiler accepts. The work in progress is output that
+is a real Solidity file, where every function either passes this check as plain Solidity or
+is printed as an exact assembly block.
+
+It is evidence and not a proof. The last line of the output says how many branch outcomes of
+the original the calls reached, and a function no call got to the end of is marked. With no
+source, `evmdec check original.hex` reports that reach alone: 76 of 76 on WETH, 252 of 268 on
+USDT, 424 of 984 on Compound cETH, whose paths depend on what other contracts answer.
+
 ### Decompiler against verified source
 
 Fresh verified contracts are fetched, decompiled from bytecode, and compared with their
@@ -275,6 +302,7 @@ solc --bin MyContract.sol | tail -1 > my.hex
 ./target/release/evmdec sigs 0xa9059cbb
 ./target/release/evmdec disasm my.hex
 ./target/release/evmdec verify my.hex --runs 8
+./target/release/evmdec check my.hex MyContract.sol
 
 PORT=8080 ./target/release/evmdec-server
 ```
@@ -341,6 +369,7 @@ remote nodes in at most 240 seconds, and code over 1 MiB is refused.
 | `EVMDEC_RPC_URL` | comma-separated JSON-RPC endpoints, used in place of the public list. The chain asked for has to be the chain they serve; a request for another chain is refused |
 | `EVMDEC_SIGS` | path of the signature index; empty disables it. Default search: `./sigs.idx`, next to the binary, `/var/lib/evmdec/sigs.idx`, `~/.evmdec/sigs.idx` |
 | `EVMDEC_TIMING` | print the time spent in each stage |
+| `SOLC`, `EVMDEC_SOLC_DIR` | a compiler binary for `check` to use as it is, and where downloaded compilers are kept (default `~/.cache/evmdec/solc`) |
 | `PORT` | listening port of the server, default 8080 |
 
 ## Development

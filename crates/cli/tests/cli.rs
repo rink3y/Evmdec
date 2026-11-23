@@ -65,3 +65,27 @@ fn an_empty_hex_argument_is_an_error() {
     let out = evmdec(&["decompile", "0x"]);
     assert!(!out.status.success());
 }
+
+#[test]
+fn a_source_is_equal_to_its_own_code_and_a_changed_one_is_not() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/source");
+    let code = format!("{dir}/Packed.hex");
+    let source = format!("{dir}/Packed.sol");
+    let same = evmdec(&["check", &code, &source]);
+    let said = String::from_utf8_lossy(&same.stderr);
+    assert!(same.status.success(), "{said}");
+    let text = std::fs::read_to_string(&source).expect("the fixture is in the repository");
+    assert!(text.contains("amount <= a.amount"));
+    let changed = file(
+        "changed.sol",
+        &text.replace("amount <= a.amount", "amount < a.amount"),
+    );
+    let other = evmdec(&["check", &code, changed.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&changed);
+    assert!(!other.status.success());
+    let lines = String::from_utf8_lossy(&other.stdout);
+    assert!(
+        lines.contains("spend(address,uint160)") && lines.contains("DIFFERS"),
+        "{lines}"
+    );
+}

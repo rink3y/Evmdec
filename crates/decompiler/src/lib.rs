@@ -10,6 +10,7 @@ pub mod u256;
 pub use u256::U256;
 pub mod abi;
 pub mod cfg;
+pub mod check;
 pub mod clock;
 pub mod compiler;
 pub mod decompile;
@@ -25,6 +26,8 @@ pub mod rpc;
 pub mod sigdb;
 pub mod sigs;
 pub mod slots;
+#[cfg(feature = "rpc")]
+pub mod solc;
 pub mod ssa;
 pub mod structure;
 pub mod types;

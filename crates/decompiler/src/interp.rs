@@ -80,6 +80,7 @@ pub struct Host {
     pub blobbasefee: U256,
     pub seed: u64,
     pub intercept_calls: bool,
+    pub unset_storage: bool,
 }
 
 impl Host {
@@ -109,6 +110,7 @@ impl Host {
             blobbasefee: U256::from_u64(rng.below(1 << 20)),
             seed: rng.next_u64(),
             intercept_calls: false,
+            unset_storage: false,
         }
     }
 
@@ -132,6 +134,7 @@ impl Host {
             blobbasefee: U256::from_u64(BLOBBASEFEE),
             seed: CONTROLLED_SEED,
             intercept_calls: false,
+            unset_storage: false,
         }
     }
     pub fn balance(&self, a: U256) -> U256 {
@@ -181,6 +184,9 @@ impl Host {
         }
     }
     pub fn storage(&self, k: U256) -> U256 {
+        if self.unset_storage {
+            return U256::ZERO;
+        }
         let r = h(&[&self.seed.to_be_bytes()[..], b"stor", &k.to_be_bytes()].concat());
         if r.low_u64().is_multiple_of(3) {
             U256::ZERO

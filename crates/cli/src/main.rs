@@ -7,11 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(
-    name = "evmdec",
-    version,
-    about = "EVM bytecode decompiler and security analyzer"
-)]
+#[command(name = "evmdec", version, about = "EVM bytecode decompiler")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -63,8 +59,6 @@ enum Cmd {
         embedded: bool,
         #[arg(long, help = "Disable the built-in signature dictionary")]
         no_sigs: bool,
-        #[arg(long, help = "Append the audit report (markdown) after the code")]
-        report: bool,
         #[arg(
             long,
             help = "Resolve unknown selectors online (openchain.xyz, 4byte.directory)"
@@ -86,26 +80,6 @@ enum Cmd {
         json: bool,
     },
     #[command(
-        about = "Audit report from running the code (markdown, or JSON with --json). Takes bytecode, a Solidity file, or a compiler's standard JSON input"
-    )]
-    Audit {
-        #[arg(help = "A file, or a 0x address to run on the state its chain holds for it")]
-        file: PathBuf,
-        #[arg(long)]
-        json: bool,
-        #[arg(
-            long,
-            default_value = "mainnet",
-            help = "Chain name or id, for an address"
-        )]
-        chain: String,
-        #[arg(
-            long,
-            help = "Block whose state an address is run on. The newest when left out"
-        )]
-        block: Option<u64>,
-    },
-    #[command(
         about = "Look up selectors (8 hex digits) or event topics (64 hex digits) in the signature dictionary and the local index; with no argument, report which index is in use"
     )]
     Sigs {
@@ -117,7 +91,7 @@ enum Cmd {
 fn load(file: &PathBuf) -> Result<Vec<u8>> {
     let raw = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     // Hex is often folded into lines. Read as raw bytes, the line ends and digits would
-    // decompile into a report about code that is not there.
+    // decompile as code that is not there.
     let text: Option<String> = raw.is_ascii().then(|| {
         let text = String::from_utf8_lossy(&raw);
         text.split_ascii_whitespace().collect()
@@ -198,60 +172,6 @@ fn fetch_and_decompile(
         return Ok(c);
     }
     fetch(opts)
-}
-
-fn audit_address(address: &str, chain: &str, block: Option<u64>) -> Result<audit::Report> {
-    let fetch = |client: &Client| {
-        let mut log = |line: &str| eprintln!("{line}");
-        let policy = Policy {
-            depth: 0,
-            ..Policy::default()
-        };
-        let options = Options::default();
-        let mut cache = CodeCache::new();
-        evmdec::fetch::fetch(
-            client, address, chain, &options, policy, &mut cache, &mut log,
-        )
-        .map_err(|e| anyhow::anyhow!(e))
-    };
-    let connect = || Client::new(None, chain);
-    let fixed = connect().and_then(|client| {
-        let (client, number, time) = client.at(block)?;
-        client.get_code(address)?;
-        Ok((client, number, time))
-    });
-    match fixed {
-        Ok((client, number, time)) => {
-            let mut c = fetch(&client)?;
-            // Decompiling took time out of what one client may spend on the network.
-            let fresh = || {
-                let at = connect().and_then(|client| client.at(Some(number)));
-                at.map(|(client, ..)| client)
-                    .map_err(|e| anyhow::anyhow!(e))
-            };
-            let node = std::rc::Rc::new(audit::chain::Node::new(fresh()?));
-            if let Some(behind) = audit::handed_to(&c, node, number, time) {
-                let behind = evmdec::rpc::addr_to_string(behind);
-                eprintln!("every call is handed to the code at {behind}: auditing that code on this contract's state");
-                let code = fresh()?.get_code(&behind).map_err(|e| anyhow::anyhow!(e))?;
-                let mut inner = evmdec::decompile::decompile(&code, &Options::default());
-                inner.address.clone_from(&c.address);
-                inner.chain.clone_from(&c.chain);
-                c = inner;
-            }
-            Ok(audit::audit_at(&c, fresh()?, chain, number, time))
-        }
-        Err(why) => {
-            let client = connect().map_err(|e| anyhow::anyhow!(e))?;
-            let c = fetch(&client)?;
-            let mut report = audit::audit(&c);
-            let at = block.map_or("its newest block".to_string(), |n| format!("block {n}"));
-            report.state.push(format!(
-                "The state of {chain} at {at} could not be read: {why}. The contract was run in a world guessed from its code alone."
-            ));
-            Ok(report)
-        }
-    }
 }
 
 fn main() -> Result<()> {
@@ -342,7 +262,6 @@ fn run(cli: Cli) -> Result<()> {
             json,
             embedded,
             no_sigs,
-            report,
             lookup,
         } => {
             let mut opts = Options {
@@ -393,14 +312,9 @@ fn run(cli: Cli) -> Result<()> {
                 }
             };
             if json {
-                let mut v = serde_json::to_value(&c)?;
-                v["report"] = serde_json::to_value(audit::audit_all(&c))?;
-                println!("{}", serde_json::to_string_pretty(&v)?);
+                println!("{}", serde_json::to_string_pretty(&c)?);
             } else {
                 print!("{}", c.source);
-                if report {
-                    println!("\n/*\n{}*/", audit::markdown(&audit::audit_all(&c)));
-                }
             }
         }
         Cmd::Verify {
@@ -483,51 +397,6 @@ fn run(cli: Cli) -> Result<()> {
                     _ => anyhow::bail!("'{h}' is neither a 4-byte selector nor a 32-byte topic"),
                 };
                 println!("0x{hex} {}", if line.is_empty() { "?" } else { &line });
-            }
-        }
-        Cmd::Audit {
-            file,
-            json,
-            chain,
-            block,
-        } => {
-            let address = file.to_str().filter(|s| evmdec::rpc::is_address(s));
-            if let Some(address) = address {
-                let report = audit_address(address, &chain, block)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                } else {
-                    print!("{}", audit::markdown(&report));
-                }
-                return Ok(());
-            }
-            let kind = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if kind == "sol" || kind == "json" {
-                let built = match kind {
-                    "sol" => audit::source::compile_file(&file),
-                    _ => {
-                        let text = std::fs::read_to_string(&file)?;
-                        audit::source::compile_input(serde_json::from_str(&text)?, None)
-                    }
-                };
-                let built = built.map_err(|e| anyhow::anyhow!(e))?;
-                let reports: Vec<audit::Report> = built.iter().map(audit::audit_compiled).collect();
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&reports)?);
-                } else {
-                    for report in &reports {
-                        print!("{}", audit::markdown(report));
-                    }
-                }
-                return Ok(());
-            }
-            let code = load(&file)?;
-            let c = evmdec::decompile::decompile(&code, &Options::default());
-            let r = audit::audit(&c);
-            if json {
-                println!("{}", serde_json::to_string_pretty(&r)?);
-            } else {
-                print!("{}", audit::markdown(&r));
             }
         }
         Cmd::Disasm { file } => {

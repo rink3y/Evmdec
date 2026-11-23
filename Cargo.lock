@@ -258,23 +258,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "evmdec-audit"
-version = "0.1.0"
-dependencies = [
- "evmdec",
- "serde",
- "serde_json",
- "ureq",
-]
-
-[[package]]
 name = "evmdec-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "evmdec",
- "evmdec-audit",
  "serde_json",
 ]
 
@@ -284,7 +273,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "evmdec",
- "evmdec-audit",
  "serde",
  "serde_json",
  "tokio",

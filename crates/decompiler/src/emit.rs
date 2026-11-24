@@ -2430,6 +2430,17 @@ fn env_name(o: u8, seq: u32, n: &Names) -> String {
     }
 }
 
+fn dynamic_type(ty: &str) -> bool {
+    ty == "bytes" || ty == "string" || ty.ends_with(']') || ty.starts_with('(')
+}
+
+// A word of the call data a function header declares by name with a type of one word.
+fn named_word(off: ExprId, n: &Names) -> bool {
+    let index = calldata_word_index(off).filter(|_| !n.in_helper);
+    let declared = index.and_then(|i| n.param_types.get(&i));
+    declared.is_some_and(|ty| !dynamic_type(ty))
+}
+
 fn copy_source(kind: u8) -> &'static str {
     match kind {
         op::CALLDATACOPY => "msg.data",
@@ -2474,6 +2485,12 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             P_PRIMARY,
         ),
         Node::Unknown(u) => (format!("unknown_{}", n.seq(u)), P_PRIMARY),
+        /* For a compiler an argument of a dynamic type is the data itself, where the
+        code has the place the data lies at. The place is read from the call data, as is
+        any word of the call data that is not an argument of its own. */
+        Node::CallDataLoad(off) if n.strict && !named_word(off, n) => {
+            (format!("_calldata({})", fmt_expr(off, n)), P_PRIMARY)
+        }
         Node::CallDataLoad(off) => {
             // Inside a helper the name argN is taken by what the caller passed.
             if let Some(i) = calldata_word_index(off).filter(|_| !n.in_helper) {
@@ -2558,6 +2575,9 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
         ),
         // A word copied from memory is spelled like the store that wrote it.
         Node::CopiedWord(op::MCOPY, src, _) => (fmt_mem_word(src, n), P_PRIMARY),
+        Node::CopiedWord(op::CALLDATACOPY, src, _) if n.strict => {
+            (format!("_calldata({})", fmt_expr(src, n)), P_PRIMARY)
+        }
         Node::CopiedWord(kind, src, _) => (
             format!("{}[{}]", copy_source(kind), fmt_expr(src, n)),
             P_PRIMARY,
@@ -3435,6 +3455,12 @@ fn fmt_call_arg(arg: &crate::lift::Arg, n: &Names) -> String {
             },
             _ => match code_text(*kind, *src, *len, n) {
                 Some(text) => format!("\"{text}\""),
+                // A stretch of the call data is a value a compiler knows, written from
+                // its first byte to the one after its last.
+                None if n.strict && *kind == op::CALLDATACOPY => {
+                    let from = fmt_expr(*src, n);
+                    format!("msg.data[{from}:{from} + {}]", fmt_prec(*len, P_ADD + 1, n))
+                }
                 None => format!(
                     "{}[{}:+{}]",
                     copy_source(*kind),

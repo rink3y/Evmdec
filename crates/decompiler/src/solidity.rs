@@ -462,6 +462,26 @@ fn reach_asked(message: &str) -> Option<Reach> {
     }
 }
 
+/* A test a decoder makes on where a dynamic argument lies and how long it is. The
+compiler makes these itself for a header that declares the argument. Such a test weighs
+places in the call data against its length or the most a decoder allows, and nothing the
+author named. */
+fn decoder_test(code: &str) -> bool {
+    let test = code
+        .strip_prefix("require(")
+        .and_then(|c| c.strip_suffix(");"));
+    let Some(test) = test else {
+        return false;
+    };
+    let bounds = ["msg.data.length", "type(uint64).max", "2**32"];
+    let mut rest = test.to_string();
+    for known in bounds.iter().chain(&["_calldata(", "int256("]) {
+        rest = rest.replace(known, "");
+    }
+    let plain = |c: char| c.is_ascii_digit() || " ()+-*<>=!&|".contains(c);
+    bounds.iter().any(|b| test.contains(b)) && rest.chars().all(plain)
+}
+
 fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     let payable = f.kind == FnKind::Internal || f.mutability == Mutability::Payable;
     // The compiler makes this test itself for a function that takes no ether, and
@@ -473,7 +493,8 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
         let long_enough = code.strip_prefix("require(msg.data.length - 4 >= ");
         let counted = long_enough.and_then(|rest| rest.strip_suffix(");"));
         let sized = counted.is_some_and(|n| n.parse::<usize>().is_ok());
-        (payable || code != "require(msg.value == 0);") && !(external && sized)
+        let made = external && (sized || decoder_test(code));
+        (payable || code != "require(msg.value == 0);") && !made
     };
     let lines: Vec<String> = f.code.lines().filter(own).map(one_value).collect();
     let mut lines = without_dead_stores(held_strings(lines));
@@ -979,7 +1000,17 @@ fn helpers(c: &Contract, plain: &BTreeSet<usize>, clean: bool) -> BTreeSet<usize
 /* What plain Solidity has no word for, written once and called by name: a string taken
 as the place it lies at and back, a word of the data a call gave back, and how much it
 gave. */
-const HELPERS: [(&str, &str); 6] = [
+const HELPERS: [(&str, &str); 7] = [
+    (
+        "_calldata(",
+        "    function _calldata(uint256 at) private pure returns (uint256 word) {
+        assembly {
+            word := calldataload(at)
+        }
+    }
+
+",
+    ),
     (
         "_panic(",
         "    function _panic(uint256 code) private pure {
@@ -1643,6 +1674,16 @@ mod tests {
         let read_after = "        if (a) {\n            x = 1;\n        }\n        f(x);";
         let top = format!("        uint256 x;\n{read_after}");
         assert_eq!(placed(read_after, "        uint256 x;\n"), top);
+    }
+
+    #[test]
+    fn a_decoder_test_is_told_from_a_test_the_author_wrote() {
+        assert!(decoder_test("require(_calldata(4) <= type(uint64).max);"));
+        let fits = "require(_calldata(4) + 4 + (_calldata(_calldata(4) + 4) << 5) + 32 <= msg.data.length);";
+        assert!(decoder_test(fits));
+        assert!(decoder_test("require(msg.data.length >= 36);"));
+        assert!(!decoder_test("require(_calldata(_calldata(4) + 4) <= 8);"));
+        assert!(!decoder_test("require(amount <= msg.data.length);"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 EVM bytecode decompiler, written from scratch in Rust.
 
 Give it an address on any EVM chain, or the compiled bytecode of a contract that is not
-deployed yet, and it returns readable pseudo-Solidity with a recovered interface and storage
+deployed yet, and it returns a readable Solidity file with a recovered interface and storage
 layout. Proxies and diamonds are fetched and assembled with their implementation or facets
 and decompiled as one contract, and the contracts they call are fetched and decompiled too,
 so a token whose sender check trusts a hook contract is read together with that hook.
@@ -27,7 +27,7 @@ flowchart LR
     D --> E[type solver]
     E --> N[names from roles]
     N --> F[structurer and printer]
-    F --> G[pseudo-Solidity]
+    F --> G[Solidity file]
     D -. every block, random states .-> K[block oracle]
 ```
 
@@ -227,9 +227,9 @@ the four source fixtures every one of 20 single changes to an operator or a chec
 The WETH contract on mainnet, built with solc 0.4.19, compares equal to its published source
 built with 0.4.26 on all 12 functions with every branch reached.
 
-This is the test the decompiler's own output has to pass. The pseudo-Solidity it prints by
-default does not: none of the 22 corpus contracts decompiles to text a compiler accepts. The
-Solidity file below does.
+This is the test the decompiler's own output has to pass. What `evmdec decompile` prints by
+default has not taken it: it is the Solidity file as it is first written, with no compiler
+asked. The file `--sol` prints, described below, has.
 
 A source still running at many times the steps the original took to end is a difference,
 not a run left unsettled. A run of the original longer than 50,000 steps is left out: it is
@@ -246,7 +246,14 @@ USDT, 414 of 984 on Compound cETH, whose paths depend on what other contracts an
 line, a `pragma` (the contract's own compiler version when it was built with solc 0.8, a
 current one otherwise), the events, and every function whose signature is known declared by
 name. It is compiled and put through the source check before it is printed, and the result
-is reported beside it.
+is reported beside it. Where the pragma is not the contract's own, a comment under it names
+the compiler the contract was built with.
+
+Without `--sol` the command prints the same file as it is first written: every function in
+its plain form, a function no signature names under the name of its selector, no compiler
+asked and nothing run beside the bytecode. That takes no longer than decompiling does. What
+a compiler would refuse, or the check would find different, is still in that text.
+`--flat` prints the older, looser text with labels and jumps.
 
 Every function starts as a call to one private function that holds the bytecode translated
 instruction by instruction into an assembly block, with no analysis in between, so it cannot
@@ -299,7 +306,7 @@ A function that only returns one variable is not written at all: the variable is
 `public` under the function's name, as an author would have, and the compiler writes the
 function. When every function of a contract is plain, its fallback is written out too and
 the exact block is dropped, which leaves a file with no assembly in it. The WETH contract
-comes out that way, in 93 lines.
+comes out that way, in 94 lines.
 
 A function that keeps its exact form but whose arguments the compiler would decode
 differently from the original, as code from before solc 0.8 does, is left out of the named

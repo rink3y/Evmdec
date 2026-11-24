@@ -1331,19 +1331,15 @@ fn declarations(c: &Contract, f: &Function, text: &str) -> String {
     out
 }
 
-fn helpers(c: &Contract, plain: &BTreeSet<usize>, clean: bool) -> BTreeSet<usize> {
+// The helpers the functions written out reach. A helper only a function in its exact
+// form calls is text nothing runs, and the check would never try it.
+fn helpers(c: &Contract, plain: &BTreeSet<usize>, mut work: Vec<usize>) -> BTreeSet<usize> {
     let at = |pc: usize| {
         c.functions
             .iter()
             .position(|f| f.pc == pc && f.kind == FnKind::Internal)
     };
     let mut found = BTreeSet::new();
-    let external = |i: &&usize| match c.functions[**i].kind {
-        FnKind::External => true,
-        FnKind::Fallback | FnKind::Receive => clean,
-        _ => false,
-    };
-    let mut work: Vec<usize> = plain.iter().filter(external).copied().collect();
     while let Some(i) = work.pop() {
         for callee in c.functions[i].calls.iter().filter_map(|pc| at(*pc)) {
             if plain.contains(&callee) && found.insert(callee) {
@@ -1692,7 +1688,8 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
         let all = c.functions.iter().enumerate();
         let own = all.filter(|(i, f)| clean && unnamed(f) && plain.functions.contains(i));
         let mut printed: Vec<usize> = own.map(|(i, _)| i).collect();
-        printed.extend(helpers(c, plain.functions, clean));
+        let callers = printed.iter().chain(spans.iter().map(|(_, _, i)| i));
+        printed.extend(helpers(c, plain.functions, callers.copied().collect()));
         for i in printed {
             let f = &c.functions[i];
             let start = out.len();

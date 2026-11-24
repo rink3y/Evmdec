@@ -1234,6 +1234,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let (bound, bindings) = crate::structure::bind_shared(&tested, &names);
         names.rebind(&bindings);
         if names.strict {
+            emit::note_block_lengths(&bound, &mut names);
             emit::note_address_vars(&bound, &mut names);
         }
         ready.push((names, bound));

@@ -440,6 +440,12 @@ fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) ->
             && matches!(expr::node(*len), Node::Env(op::CALLDATASIZE, _));
         let text = if whole {
             "msg.data".to_string()
+        } else if names.strict {
+            let from = emit::fmt_expr(*src, names);
+            format!(
+                "msg.data[{from}:{from} + ({})]",
+                emit::fmt_expr(*len, names)
+            )
         } else {
             format!(
                 "msg.data[{}:+{}]",
@@ -766,7 +772,7 @@ fn prev_name(what: Overwritten, names: &Names) -> String {
             emit::fmt_slot(key, names, emit::SlotSpace::from_transient(transient))
         }
         Overwritten::Balance => "balance".to_string(),
-        Overwritten::Memory(addr) => emit::fmt_mem_word(addr, names),
+        Overwritten::Memory(addr) => emit::fmt_mem_read(addr, names),
     })
 }
 
@@ -3032,7 +3038,7 @@ impl<'a> Printer<'a> {
                     emit::fmt_slot(key, self.names, emit::SlotSpace::from_transient(transient))
                 }
                 // Stored on to another word, the read would print as that word.
-                (None, Node::MLoad(at, _)) if stored_on => emit::fmt_mem_word(at, self.names),
+                (None, Node::MLoad(at, _)) if stored_on => emit::fmt_mem_read(at, self.names),
                 _ => emit::fmt_expr(*read, self.names),
             };
             if !named[..i].iter().any(|(_, earlier)| earlier == name) {
@@ -3173,7 +3179,7 @@ impl<'a> Printer<'a> {
                         continue;
                     }
                     let word = memory_word(*read).unwrap_or(*off);
-                    let current = emit::fmt_mem_word(word, self.names);
+                    let current = emit::fmt_mem_read(word, self.names);
                     self.line(depth, &format!("uint256 {name} = {current};"));
                 }
                 self.given
@@ -3183,8 +3189,15 @@ impl<'a> Printer<'a> {
                     kept_early.insert(j);
                 }
             }
-            if dead.contains(&i) || self.skipped.borrow().contains(&(n, i)) {
+            // Nothing reads the start of free memory after the last block is taken, which
+            // makes the taking look dead. In a file it is what makes the block a block.
+            let takes = self.names.strict
+                && matches!(s, Stmt::MStore { off, .. } if emit::is_free_pointer(*off));
+            if (dead.contains(&i) && !takes) || self.skipped.borrow().contains(&(n, i)) {
                 continue;
+            }
+            if let Some(early) = emit::taking_ahead(&self.l.nodes[n].stmts, i, self.names) {
+                self.line(depth, &early);
             }
             if let Some(lit) = literals.iter().find(|lit| lit.first == i) {
                 self.line(depth, &lit.text);
@@ -3212,7 +3225,7 @@ impl<'a> Printer<'a> {
                             emit::fmt_slot(key, self.names, space)
                         }
                         (None, Overwritten::Balance) => "address(this).balance".to_string(),
-                        (None, Overwritten::Memory(addr)) => emit::fmt_mem_word(addr, self.names),
+                        (None, Overwritten::Memory(addr)) => emit::fmt_mem_read(addr, self.names),
                     };
                     self.line(depth, &format!("uint256 {tmp} = {current};"));
                 }
@@ -3260,7 +3273,7 @@ impl<'a> Printer<'a> {
             if let (Stmt::MStore { off, .. }, Some(val)) =
                 (s, memory_forward(&self.l.nodes[n].stmts, i))
             {
-                let word = emit::fmt_mem_word(*off, self.names);
+                let word = emit::fmt_mem_read(*off, self.names);
                 self.names.forward(val, word, *off);
             }
             if let Stmt::SStore {

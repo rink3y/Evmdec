@@ -149,6 +149,9 @@ pub struct Names {
     // Blocks of memory the function keeps to itself, shown as local values, with the
     // number of words each holds.
     pub scalars: HashMap<u32, u64>,
+    pub lengths: HashMap<u32, u64>,
+    // Blocks the text has taken from free memory so far, which it may then write to.
+    pub taken: RefCell<HashSet<u32>>,
     // Addresses of one-word blocks that are handed on as the word.
     pub handed: HashMap<ExprId, u32>,
     pub bool_fields: HashSet<(U256, u32, u32)>,
@@ -1810,7 +1813,8 @@ fn fmt_stored_word(val: ExprId, n: &Names) -> String {
 
 #[must_use]
 pub fn free_pointer_updates(stmts: &[Stmt], n: &Names) -> HashSet<usize> {
-    if n.blocks.is_none() {
+    // A file states each one, as the taking of a block.
+    if n.blocks.is_none() || n.strict {
         return HashSet::new();
     }
     stmts
@@ -1889,6 +1893,10 @@ pub fn block_literals(stmts: &[Stmt], hidden: &HashSet<usize>, n: &Names) -> Vec
                         .is_some_and(|l| l.div_ceil(32) == raw.len() - 1)
                 })
                 .map(|t| format!("\"{t}\""));
+            // In a file a block is written a word at a time, into memory it has taken.
+            if n.strict && text.is_none() {
+                continue;
+            }
             let values: Vec<String> = match text {
                 Some(t) => vec![t],
                 None => raw.iter().map(|v| fmt_stored_word(*v, n)).collect(),
@@ -1969,6 +1977,149 @@ pub fn fmt_mem_range(off: ExprId, len: ExprId, n: &Names) -> String {
             format!("mem[{start}:{start} + {}]", fmt_prec(past, P_ADD, n))
         }
         _ => format!("mem[{start}:{}]", fmt_mem_at(end, n)),
+    }
+}
+
+/* Memory the file may write to: a block it has taken, or whatever an address that was
+handed to it points at. A block not taken yet is free memory, where a compiler puts
+values of its own between two lines of the text, and a fixed address is scratch space it
+uses as well. A write to either is left in the notation no compiler reads. */
+fn owned_memory(off: ExprId, n: &Names) -> bool {
+    if !n.strict || n.layout == MappingLayout::Vyper {
+        return false;
+    }
+    let within = block_ref(off, n).map(|(number, _)| number);
+    match (
+        within.or_else(|| block_started(off, n)),
+        expr::split_offset(off).0,
+    ) {
+        (Some(number), _) => n.taken.borrow().contains(&number),
+        (None, base) => base.is_some(),
+    }
+}
+
+fn block_started(e: ExprId, n: &Names) -> Option<u32> {
+    match (block_ref(e, n), expr::node(e)) {
+        (Some((number, at)), _) if at.is_zero() => Some(number),
+        (_, Node::Op(op::ADD, v)) => v.iter().find_map(|x| block_started(*x, n)),
+        _ => None,
+    }
+}
+
+/* The code takes a block by moving the start of free memory past it. A file does the
+same, so the block is memory nothing else is put in, and names the block by a value of
+its own. A block the function keeps as local values needs no memory. */
+fn fmt_taken(val: ExprId, n: &Names) -> Option<String> {
+    let (number, end) = taking(val, n)?;
+    let fresh = !n.scalars.contains_key(&number) && n.taken.borrow_mut().insert(number);
+    fresh.then(|| format!("ptr{number} = _free(); _take({end});"))
+}
+
+fn taking(val: ExprId, n: &Names) -> Option<(u32, String)> {
+    let blocks = n.blocks.as_ref()?;
+    let (base, to) = expr::split_offset(val);
+    let before = blocks.get(&base).into_iter().flatten();
+    let fixed = before
+        .filter(|(start, _)| *start < to)
+        .max_by_key(|(start, _)| *start);
+    match (fixed, expr::node(val)) {
+        (Some((start, number)), _) => {
+            let size = to.wrapping_sub(*start).to_decimal();
+            Some((*number, format!("ptr{number} + {size}")))
+        }
+        // The size is worked out as the code runs: the new start is the block plus it.
+        (None, Node::Op(op::ADD, v)) => {
+            let number = v.iter().find_map(|x| block_started(*x, n))?;
+            Some((number, fmt_op(op::ADD, &v, n).0))
+        }
+        _ => None,
+    }
+}
+
+/* A new array has its length written a step before its block is taken. The writes
+between the two touch that block alone, so a file can state the taking first. */
+pub fn taking_ahead(stmts: &[Stmt], i: usize, n: &Names) -> Option<String> {
+    let target = |s: &Stmt| match s {
+        Stmt::MStore { off, .. } if !is_free_pointer(*off) => Some(*off),
+        Stmt::Copy { dest, .. } => Some(*dest),
+        _ => None,
+    };
+    let block = |at: ExprId| {
+        let within = block_ref(at, n).map(|(number, _)| number);
+        within.or_else(|| block_started(at, n))
+    };
+    let number = block(target(&stmts[i])?)?;
+    if !n.strict || n.taken.borrow().contains(&number) {
+        return None;
+    }
+    let writes = stmts[i..].iter();
+    let writes = writes.take_while(|s| target(s).and_then(block) == Some(number));
+    match stmts.get(i + writes.count())? {
+        Stmt::MStore { off, val, .. } if is_free_pointer(*off) => {
+            let found = taking(*val, n).filter(|(taken, _)| *taken == number);
+            found.and_then(|_| fmt_taken(*val, n))
+        }
+        _ => None,
+    }
+}
+
+/* Code that builds a value in free memory and takes the block when it is done writes
+before it takes. A file takes the block first, where its length is fixed, so that
+nothing a compiler makes between two lines can land in it. This is the taking, stated
+ahead of the first write, or nothing where the block is taken already. */
+fn taken_ahead(off: ExprId, n: &Names) -> String {
+    let known = block_ref(off, n).and_then(|(number, _)| Some((number, *n.lengths.get(&number)?)));
+    match known.filter(|(number, _)| n.strict && !n.scalars.contains_key(number)) {
+        Some((number, length)) if n.taken.borrow_mut().insert(number) => {
+            format!("ptr{number} = _free(); _take(ptr{number} + {length}); ")
+        }
+        _ => String::new(),
+    }
+}
+
+pub fn note_block_lengths(l: &Lifted, n: &mut Names) {
+    let Some(blocks) = n.blocks.as_ref() else {
+        return;
+    };
+    let mut lengths: HashMap<u32, Option<u64>> = HashMap::new();
+    for s in l.nodes.iter().flat_map(|nd| &nd.stmts) {
+        let Stmt::MStore { off, val, .. } = s else {
+            continue;
+        };
+        if !is_free_pointer(*off) {
+            continue;
+        }
+        let (base, to) = expr::split_offset(*val);
+        let before = blocks.get(&base).into_iter().flatten();
+        let taken = before
+            .filter(|(start, _)| *start < to)
+            .max_by_key(|(start, _)| *start);
+        if let Some((start, number)) = taken {
+            let length = to.wrapping_sub(*start);
+            let fixed = length.fits_u64().then(|| length.low_u64());
+            let known = lengths.entry(*number).or_insert(fixed);
+            *known = known.filter(|k| Some(*k) == fixed);
+        }
+    }
+    n.lengths = lengths
+        .into_iter()
+        .filter_map(|(number, length)| Some((number, length?)))
+        .collect();
+}
+
+pub fn fmt_mem_read(off: ExprId, n: &Names) -> String {
+    let raw = n.layout != MappingLayout::Vyper && scalar_word(off, n).is_none();
+    match n.strict && raw {
+        true => format!("_memory({})", fmt_mem_off(off, n)),
+        false => fmt_mem_word(off, n),
+    }
+}
+
+fn fmt_bytes_range(off: ExprId, len: ExprId, n: &Names) -> String {
+    match (n.strict, bytes_value(off, len)) {
+        (false, _) => fmt_mem_range(off, len, n),
+        (true, Some(pointer)) => format!("_bytes({})", fmt_mem_off(pointer, n)),
+        (true, None) => format!("_range({}, {})", fmt_mem_off(off, n), fmt_expr(len, n)),
     }
 }
 
@@ -2515,7 +2666,10 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             let (seq, at) = n.answers.borrow()[&off];
             (format!("_word(returned_{}, {at})", n.seq(seq)), P_PRIMARY)
         }
-        Node::MLoad(off, _) => (fmt_mem_word(off, n), P_PRIMARY),
+        /* A read of memory through an address is written as one. It reads what the file
+        itself put there, so it only gives the word the code read where the memory was
+        laid out the same way, as it is for a value a compiler made. */
+        Node::MLoad(off, _) => (fmt_mem_read(off, n), P_PRIMARY),
         Node::SLoad(key, false, _) if n.strict && whole_packed(key, n).is_some() => {
             (whole_packed(key, n).unwrap_or_default(), P_PRIMARY)
         }
@@ -2564,7 +2718,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             )
         }
         Node::KeccakMem(off, len, _) => (
-            hash_word(format!("keccak256({})", fmt_mem_range(off, len, n)), n),
+            hash_word(format!("keccak256({})", fmt_bytes_range(off, len, n)), n),
             P_PRIMARY,
         ),
         Node::CallResult(seq) => (format!("success_{}", n.seq(seq)), P_PRIMARY),
@@ -2578,7 +2732,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             P_PRIMARY,
         ),
         // A word copied from memory is spelled like the store that wrote it.
-        Node::CopiedWord(op::MCOPY, src, _) => (fmt_mem_word(src, n), P_PRIMARY),
+        Node::CopiedWord(op::MCOPY, src, _) => (fmt_mem_read(src, n), P_PRIMARY),
         Node::CopiedWord(op::CALLDATACOPY, src, _) if n.strict => {
             (format!("_calldata({})", fmt_expr(src, n)), P_PRIMARY)
         }
@@ -3364,7 +3518,8 @@ fn fmt_whole_word(e: ExprId, n: &Names) -> String {
             Some("address" | "bool") => width.is_empty(),
             _ => false,
         };
-    match narrow {
+    // The compiler packs a bare literal into the fewest bytes that hold it.
+    match narrow || (n.strict && expr::as_const(e).is_some()) {
         true => format!("uint256({text})"),
         false => text,
     }
@@ -3481,6 +3636,7 @@ fn fmt_call_arg(arg: &crate::lift::Arg, n: &Names) -> String {
             }
         }
         Arg::Copied { kind, src, len } => match *kind {
+            op::MCOPY if n.strict => fmt_bytes_range(*src, *len, n),
             op::MCOPY => match bytes_value(*src, *len) {
                 Some(pointer) => format!("bytes({})", fmt_mem_off(pointer, n)),
                 None => format!("mem[{}:+{}]", fmt_mem_at(*src, n), fmt_expr(*len, n)),
@@ -3595,6 +3751,21 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             off, val, width, ..
         } => {
             n.answers.borrow_mut().remove(off);
+            if n.strict && is_free_pointer(*off) {
+                return fmt_taken(*val, n).unwrap_or_default();
+            }
+            let ahead = match scalar_word(*off, n) {
+                Some(_) => String::new(),
+                None => taken_ahead(*off, n),
+            };
+            if owned_memory(*off, n) && scalar_word(*off, n).is_none() {
+                let store = match width {
+                    1 => "_store8",
+                    _ => "_store",
+                };
+                let (at, word) = (fmt_mem_off(*off, n), as_word(*val, n));
+                return format!("{ahead}{store}({at}, {word});");
+            }
             if *width == 1 {
                 format!("mem8[{}] = {};", fmt_mem_off(*off, n), fmt_expr(*val, n))
             } else if let Some(selector) = stored_selector(*off, *val, n) {
@@ -3804,10 +3975,12 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                         n.payload_overrides.borrow().get(in_off).filter(|_| !copy)
                     {
                         text.clone()
-                    } else if let Some(pointer) = bytes_value(*in_off, *in_len) {
+                    } else if let Some(pointer) =
+                        bytes_value(*in_off, *in_len).filter(|_| !n.strict)
+                    {
                         format!("bytes({})", fmt_mem_off(pointer, n))
                     } else {
-                        fmt_mem_range(*in_off, *in_len, n)
+                        fmt_bytes_range(*in_off, *in_len, n)
                     }
                 }
             };
@@ -3887,9 +4060,26 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             if let Some(words) = zero_words(*kind, *dest, *src, *len) {
                 let zeroed: Vec<String> = words
                     .into_iter()
-                    .map(|w| format!("{} = 0;", fmt_mem_word(w, n)))
+                    .map(|w| match owned_memory(w, n) {
+                        true => format!("_store({}, 0);", fmt_mem_off(w, n)),
+                        false => format!("{} = 0;", fmt_mem_word(w, n)),
+                    })
                     .collect();
                 return zeroed.join(" ");
+            }
+            let copier = match (*kind, addr) {
+                (op::CALLDATACOPY, None) => Some("_copy_calldata"),
+                (op::RETURNDATACOPY, None) => Some("_copy_returned"),
+                (op::MCOPY, None) => Some("_copy"),
+                _ => None,
+            };
+            let ahead = match copier {
+                Some(_) => taken_ahead(*dest, n),
+                None => String::new(),
+            };
+            if let Some(copier) = copier.filter(|_| owned_memory(*dest, n)) {
+                let (to, from) = (fmt_mem_off(*dest, n), fmt_mem_off(*src, n));
+                return format!("{ahead}{copier}({to}, {from}, {});", fmt_expr(*len, n));
             }
             let src_s = match addr {
                 Some(a) => format!(
@@ -4202,7 +4392,12 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
                 if expr::as_const(*len) == Some(U256::ZERO) {
                     "return;".into()
                 } else {
-                    format!("return {};", fmt_mem_range(*off, *len, n))
+                    match n.strict {
+                        true => {
+                            format!("_return({}, {});", fmt_mem_off(*off, n), fmt_expr(*len, n))
+                        }
+                        false => format!("return {};", fmt_mem_range(*off, *len, n)),
+                    }
                 }
             }
         },
@@ -4229,7 +4424,12 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
                 if expr::as_const(*len) == Some(U256::ZERO) {
                     "revert();".into()
                 } else {
-                    format!("revert({});", fmt_mem_range(*off, *len, n))
+                    match n.strict {
+                        true => {
+                            format!("_revert({}, {});", fmt_mem_off(*off, n), fmt_expr(*len, n))
+                        }
+                        false => format!("revert({});", fmt_mem_range(*off, *len, n)),
+                    }
                 }
             }
         },

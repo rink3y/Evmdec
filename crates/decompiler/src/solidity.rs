@@ -499,8 +499,9 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
         (payable || code != "require(msg.value == 0);") && !made
     };
     let lines: Vec<String> = f.code.lines().filter(own).map(one_value).collect();
-    let lines = answers_kept(held_strings(lines));
-    let mut lines = without_dead_stores(without_writes_before_failure(lines));
+    let lines = without_scratch_before_taking(answers_kept(held_strings(lines)));
+    let lines = without_dead_stores(without_writes_before_failure(lines));
+    let mut lines = without_unread_blocks(lines);
     if lines.last().is_some_and(|l| l == "        return;") {
         lines.pop();
     }
@@ -513,7 +514,7 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     let text = unused_answers(&text);
     let text = saved_as_stored(c, &plain.layout.renamed, &text);
     let declared = declarations(c, f, &text);
-    let text = returned_as_declared(f, &declared, &text);
+    let text = returned_as_declared(&f.returns, &declared, &text);
     let marked: Vec<String> = text.lines().map(unchecked_statement).collect();
     let text = placed(&marked.join("\n"), &declared);
     // Arithmetic before 0.8 wraps. In a current file only an unchecked block does.
@@ -605,8 +606,11 @@ fn held_strings(mut lines: Vec<String>) -> Vec<String> {
             lines[i] = format!("{}{block} = _pointer({text});", " ".repeat(indent));
             continue;
         }
-        let length = code.strip_prefix(&format!("mem[{block}] = "));
-        let length = length.and_then(|l| l.strip_suffix(';')?.parse::<usize>().ok());
+        let raw = code.strip_prefix(&format!("mem[{block}] = "));
+        let stored = code.strip_prefix(&format!("_store({block}, "));
+        let stored = stored.and_then(|l| l.strip_suffix(");"));
+        let length = raw.and_then(|l| l.strip_suffix(';')).or(stored);
+        let length = length.and_then(|l| l.parse::<usize>().ok());
         let bytes = format!("mem[{block} + 32:+{}] = \"", length.unwrap_or(0));
         let next = lines.get(i + 1).map(|l| l.trim_start().to_string());
         let text = next
@@ -618,6 +622,12 @@ fn held_strings(mut lines: Vec<String>) -> Vec<String> {
         };
         lines[i] = format!("{}{block} = _pointer(\"{text}\");", " ".repeat(indent));
         lines[i + 1] = String::new();
+        // The string is its own block, so the taking of one for it goes too.
+        let whole = 32 + text.len().div_ceil(32) * 32;
+        let taking = format!("{block} = _free(); _take({block} + {whole});");
+        if i > 0 && lines[i - 1].trim_start() == taking {
+            lines[i - 1] = String::new();
+        }
     }
     lines.retain(|l| !l.is_empty());
     lines
@@ -637,61 +647,89 @@ read through the address is a read of the data. */
 fn answers_kept(lines: Vec<String>) -> Vec<String> {
     const EMPTY: &str = "96";
     let code: Vec<&str> = lines.iter().map(|l| l.trim()).collect();
-    let copied = |at: usize, held: &str| -> bool {
-        let Some(block) = code.get(at + 2).and_then(|l| l.strip_prefix(held)) else {
-            return false;
-        };
-        let block = block.trim_start_matches(" = ").trim_end_matches(';');
-        code[at] == format!("mem[{block}] = _returndatasize();")
-            && code[at + 1]
-                == format!(
-                    "mem[{block} + 32:+_returndatasize()] = returndata[0:+_returndatasize()];"
-                )
-            && numbered_name(block, "ptr") == Some(block)
+    let copied = |at: usize, held: &str| -> Option<usize> {
+        let taken = code.get(at)?.contains(" = _free(); _take(");
+        let first = at + usize::from(taken);
+        let kept = code.get(first + 2)?.strip_prefix(held)?;
+        let block = kept.strip_prefix(" = ")?.strip_suffix(';')?;
+        let size = "_returndatasize()";
+        let stored = [
+            format!("_store({block}, {size});"),
+            format!("mem[{block}] = {size};"),
+        ];
+        let moved = [
+            format!("_copy_returned({block} + 32, 0x0, {size});"),
+            format!("mem[{block} + 32:+{size}] = returndata[0:+{size}];"),
+        ];
+        let shaped = numbered_name(block, "ptr") == Some(block)
+            && stored.iter().any(|l| l == code[first])
+            && moved.iter().any(|l| l == code[first + 1])
+            && (!taken || code[at].starts_with(&format!("{block} = _free();")));
+        shaped.then_some(3 + usize::from(taken))
     };
-    let found = (0..code.len().saturating_sub(6)).find_map(|i| {
-        let (none, some, other) = match code[i] {
-            "if (_returndatasize() == 0) {" => (i + 1, i + 3, i + 2),
-            "if (_returndatasize() != 0) {" => (i + 5, i + 1, i + 4),
+    let found = (0..code.len()).find_map(|i| {
+        let empty_first = match code[i] {
+            "if (_returndatasize() == 0) {" => true,
+            "if (_returndatasize() != 0) {" => false,
             _ => return None,
         };
-        let held = numbered_name(code[none], "v")?;
+        let (none, some) = match empty_first {
+            true => (i + 1, i + 3),
+            false => (
+                i + 1 + copied(i + 1, numbered_name(code.get(i + 2)?, "v")?)? + 1,
+                i + 1,
+            ),
+        };
+        let held = numbered_name(code.get(none)?, "v")?;
+        let lines = copied(some, held)?;
+        let other = match empty_first {
+            true => i + 2,
+            false => some + lines,
+        };
+        let end = i + 3 + lines;
         let shaped = code[none] == format!("{held} = {EMPTY};")
-            && copied(some, held)
-            && code[other] == "} else {"
-            && code[i + 6] == "}";
+            && code.get(other) == Some(&"} else {")
+            && code.get(end) == Some(&"}");
         let call = code[..i].iter().rev().find_map(|l| {
             let rest = &l[l.find("(success_")? + 1..];
             let flag = numbered_name(rest, "success_")?;
             Some(flag.trim_start_matches("success_"))
         })?;
-        shaped.then(|| (i, held.to_string(), call.to_string()))
+        shaped.then(|| (i, end + 1 - i, held.to_string(), call.to_string()))
     });
-    let Some((at, held, call)) = found else {
+    let Some((at, count, held, call)) = found else {
         return lines;
     };
     let data = format!("returned_{call}");
     let mut out: Vec<String> = Vec::new();
+    let mut handed_on = false;
     for (i, line) in lines.iter().enumerate() {
-        if (at..at + 7).contains(&i) {
+        if i == at {
+            out.push(String::new());
+        }
+        if (at..at + count).contains(&i) {
             continue;
         }
-        let mut text = line.replace(&format!("mem[{held}]"), &format!("{data}.length"));
-        let word = format!("mem[{held} + ");
+        let mut text = line.replace(&format!("_memory({held})"), &format!("{data}.length"));
+        let word = format!("_memory({held} + ");
         while let Some(start) = text.find(&word) {
             let rest = &text[start + word.len()..];
             let digits = rest.chars().take_while(char::is_ascii_digit).count();
             let place = rest[..digits].parse::<u64>().ok().filter(|p| *p >= 32);
-            let Some(place) = place.filter(|_| rest[digits..].starts_with(']')) else {
-                return lines;
+            let Some(place) = place.filter(|_| rest[digits..].starts_with(')')) else {
+                break;
             };
             let read = format!("_word({data}, {})", place - 32);
             text.replace_range(start..start + word.len() + digits + 1, &read);
         }
-        if mentions(&text, &held) {
-            return lines;
-        }
+        handed_on |= mentions(&text, &held);
         out.push(text);
+    }
+    // Where the code hands the address on, it is the address of the data the call gave.
+    let pad = &lines[at][..lines[at].len() - lines[at].trim_start().len()];
+    match handed_on {
+        true => out[at] = format!("{pad}{held} = _place({data});"),
+        false => drop(out.remove(at)),
     }
     answers_kept(out)
 }
@@ -715,8 +753,13 @@ fn blocks_named(text: &str) -> Vec<&str> {
 const FIXED: &str = "fixed";
 
 fn fixed_read(text: &str) -> bool {
-    let mut reads = text.match_indices("mem[");
-    reads.any(|(at, _)| text[at + 4..].starts_with(|c: char| c.is_ascii_digit()))
+    let readers = [
+        "mem[", "_memory(", "_range(", "_bytes(", "_return(", "_revert(",
+    ];
+    readers.iter().any(|reader| {
+        let mut reads = text.match_indices(reader);
+        reads.any(|(at, held)| text[at + held.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    })
 }
 
 /* The block a line writes to, when the line is a write to memory and the block is one
@@ -788,7 +831,9 @@ for on another path. */
 fn without_writes_before_failure(lines: Vec<String>) -> Vec<String> {
     let fails = |l: &str| {
         let code = l.trim_start();
-        code.starts_with("revert(\"") || code.starts_with("revert(_string(")
+        let handed_on =
+            code.starts_with("assembly { returndatacopy(0, 0, returndatasize()) revert(");
+        handed_on || code.starts_with("revert(\"") || code.starts_with("revert(_string(")
     };
     let mut kept = vec![true; lines.len()];
     for end in (0..lines.len()).filter(|i| fails(&lines[*i])) {
@@ -801,6 +846,93 @@ fn without_writes_before_failure(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
         .filter(|_| keep.next() == Some(true))
+        .collect()
+}
+
+/* A block the text takes and writes to but never reads, because what the block fed is
+shown by its values, does nothing. Its taking and its writes are left out. */
+fn without_unread_blocks(lines: Vec<String>) -> Vec<String> {
+    const WRITERS: [&str; 5] = [
+        "_store(",
+        "_store8(",
+        "_copy_calldata(",
+        "_copy_returned(",
+        "_copy(",
+    ];
+    let taken = lines.iter().filter_map(|l| {
+        let name = numbered_name(l.trim_start(), "ptr")?;
+        l.trim_start()[name.len()..]
+            .starts_with(" = _free();")
+            .then(|| name.to_string())
+    });
+    let taken: Vec<String> = taken.collect();
+    let only_writes = |block: &str, line: &str| {
+        let code = line.trim_start();
+        let writer = WRITERS.iter().find(|w| {
+            let to = code.strip_prefix(**w);
+            to.is_some_and(|to| to.starts_with(block))
+        });
+        let to = writer.map(|w| &code[w.len() + block.len()..]);
+        // The block may be named again only as the place written to, never as a value.
+        code.starts_with(&format!("{block} = _free();"))
+            || to.is_some_and(|rest| {
+                !rest.starts_with(|c: char| c.is_ascii_digit()) && !mentions(rest, block)
+            })
+    };
+    let unread = taken.iter().find(|block| {
+        let named = lines.iter().filter(|l| mentions(l, block));
+        named.clone().count() > 0 && named.clone().all(|l| only_writes(block, l))
+    });
+    match unread {
+        Some(block) => {
+            let rest = lines.into_iter().filter(|l| !mentions(l, block)).collect();
+            without_unread_blocks(rest)
+        }
+        None => lines,
+    }
+}
+
+/* Before a block is taken its place is free memory, where the code lays out the data
+of a call. The call shows that data by its values, so the writes are left out. That
+holds where the taking comes first on every way to a line that names the block. Where
+it does not, the taking is put back as raw memory. The function then fails to build
+and stays exact. */
+fn without_scratch_before_taking(mut lines: Vec<String>) -> Vec<String> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let calls = |l: &String| l.contains("call(") || l.contains("call{");
+    let takings = lines.iter().enumerate().filter_map(|(i, l)| {
+        let name = numbered_name(l.trim_start(), "ptr")?;
+        let taken = l.trim_start()[name.len()..].starts_with(" = _free();");
+        taken.then(|| (i, name.to_string()))
+    });
+    let takings: Vec<(usize, String)> = takings.collect();
+    let mut dropped = vec![false; lines.len()];
+    for (taking, block) in takings {
+        let scratch = |i: usize| {
+            let value = lines[i].split_once(" = ").map_or("", |(_, value)| value);
+            lines[i].trim_start().starts_with("mem[")
+                && written_block(&lines[i]) == Some(block.as_str())
+                && !mentions(value, &block)
+                && lines[i..taking].iter().any(calls)
+        };
+        let before: Vec<usize> = (0..taking)
+            .filter(|i| mentions(&lines[*i], &block))
+            .collect();
+        let named = |i: &usize| mentions(&lines[*i], &block);
+        let last = (taking..lines.len()).rev().find(named).unwrap_or(taking);
+        let within = lines[taking..=last]
+            .iter()
+            .all(|l| indent(l) >= indent(&lines[taking]));
+        if within && before.iter().all(|i| scratch(*i)) {
+            before.into_iter().for_each(|i| dropped[i] = true);
+        } else {
+            lines[taking] = lines[taking].replacen(" = _free();", " = mem[64];", 1);
+        }
+    }
+    let mut drop = dropped.into_iter();
+    lines
+        .into_iter()
+        .filter(|_| drop.next() == Some(false))
         .collect()
 }
 
@@ -933,6 +1065,32 @@ fn close_of(text: &str) -> Option<usize> {
     })
 }
 
+// A sum on an address in memory is the compiler's own, which it never tests.
+fn past_addresses(code: &str) -> &str {
+    if let Some((_, rest)) = code.split_once(" = _free(); _take(") {
+        return past_addresses(rest.split_once("); ").map_or("", |(_, after)| after));
+    }
+    let helpers = [
+        ("_store(", 1),
+        ("_store8(", 1),
+        ("_copy(", 2),
+        ("_copy_calldata(", 2),
+        ("_copy_returned(", 2),
+    ];
+    let Some((name, addresses)) = helpers.iter().find(|(name, _)| code.starts_with(name)) else {
+        return code;
+    };
+    let (mut depth, mut left) = (0i32, *addresses);
+    for (i, c) in code[name.len()..].char_indices() {
+        depth += i32::from(c == '(') - i32::from(c == ')');
+        left -= usize::from(c == ',' && depth == 0);
+        if left == 0 {
+            return &code[name.len() + i..];
+        }
+    }
+    code
+}
+
 /* The printer marks arithmetic the code does not test for overflow. A file can say so
 only for a whole statement. A statement goes in an unchecked block when every sum in it
 is marked, as a block around one that is tested would stop the test. */
@@ -958,7 +1116,7 @@ fn unchecked_statement(line: &str) -> String {
     }
     outside.push_str(rest);
     bare.push_str(rest);
-    if outside.contains(['+', '-', '*', '/', '%']) || bare.contains("checked(") {
+    if past_addresses(&outside).contains(['+', '-', '*', '/', '%']) || bare.contains("checked(") {
         return line.to_string();
     }
     let indent = &line[..line.len() - code.len()];
@@ -976,8 +1134,8 @@ fn unchecked_statement(line: &str) -> String {
 
 /* A value a helper gave back can be a flag where this function returns a number, or a
 number where it returns a flag. The types were worked out one function at a time. */
-fn returned_as_declared(f: &Function, declared: &str, text: &str) -> String {
-    let [wanted] = f.returns.as_slice() else {
+fn returned_as_declared(returns: &[String], declared: &str, text: &str) -> String {
+    let [wanted] = returns else {
         return text.to_string();
     };
     let is = |ty: &str, name: &str| declared.contains(&format!("        {ty} {name};\n"));
@@ -987,6 +1145,14 @@ fn returned_as_declared(f: &Function, declared: &str, text: &str) -> String {
         let value = code
             .strip_prefix("return ")
             .and_then(|c| c.strip_suffix(';'));
+        // What the code returns from memory is held at an address, a number to the text.
+        let held = value.filter(|v| is("uint256", v));
+        match (value, wanted.as_str(), held) {
+            (_, "uint256[]", Some(at)) => return format!("{indent}return _words({at});"),
+            (_, "bytes", Some(at)) => return format!("{indent}return _bytes({at});"),
+            (_, "string", Some(at)) => return format!("{indent}return string(_bytes({at}));"),
+            _ => {}
+        }
         match value {
             Some(v) if wanted.starts_with("uint") && is("bool", v) => {
                 format!("{indent}return {v} ? 1 : 0;")
@@ -1036,7 +1202,8 @@ fn declarations(c: &Contract, f: &Function, text: &str) -> String {
     // A block is a variable only where a string was put in it by name. Any other use of
     // one is memory this text does not account for, and has to fail to build.
     for name in words.iter().filter(|w| numbered(w, "ptr")) {
-        if text.contains(&format!("{name} = _pointer(")) {
+        let given = [format!("{name} = _pointer("), format!("{name} = _free()")];
+        if given.iter().any(|g| text.contains(g)) {
             out.push_str(&format!("        uint256 {name};\n"));
         }
     }
@@ -1098,7 +1265,160 @@ fn helpers(c: &Contract, plain: &BTreeSet<usize>, clean: bool) -> BTreeSet<usize
 /* What plain Solidity has no word for, written once and called by name: a string taken
 as the place it lies at and back, a word of the data a call gave back, and how much it
 gave. */
-const HELPERS: [(&str, &str); 7] = [
+const HELPERS: [(&str, &str); 21] = [
+    (
+        "_free(",
+        "    function _free() private pure returns (uint256 at) {
+        assembly {
+            at := mload(0x40)
+        }
+    }
+
+",
+    ),
+    (
+        "_take(",
+        "    function _take(uint256 end) private pure {
+        assembly {
+            if gt(end, mload(0x40)) {
+                mstore(0x40, end)
+            }
+        }
+    }
+
+",
+    ),
+    (
+        "_store(",
+        "    function _store(uint256 at, uint256 word) private pure {
+        assembly {
+            mstore(at, word)
+        }
+    }
+
+",
+    ),
+    (
+        "_store8(",
+        "    function _store8(uint256 at, uint256 word) private pure {
+        assembly {
+            mstore8(at, word)
+        }
+    }
+
+",
+    ),
+    (
+        "_copy_calldata(",
+        "    function _copy_calldata(uint256 to, uint256 from, uint256 size) private pure {
+        assembly {
+            calldatacopy(to, from, size)
+        }
+    }
+
+",
+    ),
+    (
+        "_copy_returned(",
+        "    function _copy_returned(uint256 to, uint256 from, uint256 size) private pure {
+        assembly {
+            returndatacopy(to, from, size)
+        }
+    }
+
+",
+    ),
+    (
+        "_copy(",
+        "    function _copy(uint256 to, uint256 from, uint256 size) private pure {
+        assembly {
+            let i := 0
+            for { } lt(add(i, 31), size) { i := add(i, 32) } {
+                mstore(add(to, i), mload(add(from, i)))
+            }
+            if lt(i, size) {
+                let kept := shr(mul(8, sub(size, i)), not(0))
+                let last := and(mload(add(from, i)), not(kept))
+                mstore(add(to, i), or(last, and(mload(add(to, i)), kept)))
+            }
+        }
+    }
+
+",
+    ),
+    (
+        "_memory(",
+        "    function _memory(uint256 at) private pure returns (uint256 word) {
+        assembly {
+            word := mload(at)
+        }
+    }
+
+",
+    ),
+    (
+        "_place(",
+        "    function _place(bytes memory data) private pure returns (uint256 at) {
+        assembly {
+            at := data
+        }
+    }
+
+",
+    ),
+    (
+        "_words(",
+        "    function _words(uint256 at) private pure returns (uint256[] memory held) {
+        assembly {
+            held := at
+        }
+    }
+
+",
+    ),
+    (
+        "_bytes(",
+        "    function _bytes(uint256 at) private pure returns (bytes memory data) {
+        assembly {
+            data := at
+        }
+    }
+
+",
+    ),
+    (
+        "_range(",
+        "    function _range(uint256 at, uint256 size) private pure returns (bytes memory data) {
+        data = new bytes(size);
+        assembly {
+            for { let i := 0 } lt(i, size) { i := add(i, 32) } {
+                mstore(add(add(data, 32), i), mload(add(at, i)))
+            }
+        }
+    }
+
+",
+    ),
+    (
+        "_return(",
+        "    function _return(uint256 at, uint256 size) private pure {
+        assembly {
+            return(at, size)
+        }
+    }
+
+",
+    ),
+    (
+        "_revert(",
+        "    function _revert(uint256 at, uint256 size) private pure {
+        assembly {
+            revert(at, size)
+        }
+    }
+
+",
+    ),
     (
         "_calldata(",
         "    function _calldata(uint256 at) private pure returns (uint256 word) {
@@ -1738,6 +2058,12 @@ mod tests {
             line("mem[ptr3 + 32:+5] = \"short\";"),
         ];
         assert_eq!(held_strings(longer.clone()), longer);
+        let taken = vec![
+            line("ptr4 = _free(); _take(ptr4 + 64);"),
+            line("_store(ptr4, 5);"),
+            line("mem[ptr4 + 32:+5] = \"short\";"),
+        ];
+        assert_eq!(held_strings(taken), [line("ptr4 = _pointer(\"short\");")]);
     }
 
     #[test]
@@ -1771,6 +2097,32 @@ mod tests {
         assert_eq!(declared, "    uint256 t1;\n    unchecked { t1 = (a - 1); }");
         let mixed = "    x = unchecked(a + b) + c;";
         assert_eq!(unchecked_statement(mixed), mixed);
+        let placed = unchecked_statement("    _store(ptr1 + 32, unchecked(a + b));");
+        assert_eq!(placed, "    unchecked { _store(ptr1 + 32, (a + b)); }");
+        let tested = "    _store(ptr1 + 32, unchecked(a + b) + c);";
+        assert_eq!(unchecked_statement(tested), tested);
+    }
+
+    #[test]
+    fn data_laid_out_for_a_call_before_its_block_is_taken_is_left_out() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let scratch = "mem[ptr2 + 4] = a;\nok = t.call(abi.encode(a));\nptr2 = _free(); _take(ptr2 + 64);\n_store(ptr2, b);\nf(ptr2);";
+        let want = "ok = t.call(abi.encode(a));\nptr2 = _free(); _take(ptr2 + 64);\n_store(ptr2, b);\nf(ptr2);";
+        assert_eq!(
+            without_scratch_before_taking(lines(scratch)).join("\n"),
+            want
+        );
+        let outside = "if (c) {\n    ptr2 = _free(); _take(ptr2 + 64);\n}\nf(ptr2);";
+        let kept = without_scratch_before_taking(lines(outside)).join("\n");
+        assert!(kept.contains("ptr2 = mem[64];"), "{kept}");
+    }
+
+    #[test]
+    fn an_address_returned_as_an_array_is_handed_back_as_one() {
+        let returns = ["uint256[]".to_string()];
+        let declared = "        uint256 ptr1;\n";
+        let text = returned_as_declared(&returns, declared, "        return ptr1;");
+        assert_eq!(text, "        return _words(ptr1);");
     }
 
     #[test]
@@ -1795,16 +2147,29 @@ if (_returndatasize() == 0) {
     mem[ptr3 + 32:+_returndatasize()] = returndata[0:+_returndatasize()];
     v1 = ptr3;
 }
-require(mem[v1] >= 32);
-v2 = mem[v1 + 32] != 0;";
+require(_memory(v1) >= 32);
+v2 = _memory(v1 + 32) != 0;";
         let lines: Vec<String> = text.lines().map(str::to_string).collect();
         let want = "(success_1, returned_1) = t.call(x);
 require(returned_1.length >= 32);
 v2 = _word(returned_1, 0) != 0;";
         assert_eq!(answers_kept(lines.clone()).join("\n"), want);
+        let taken = text
+            .replace(
+                "    mem[ptr3] = _returndatasize();",
+                "    ptr3 = _free(); _take(ptr3 + 64);\n    _store(ptr3, _returndatasize());",
+            )
+            .replace(
+                "    mem[ptr3 + 32:+_returndatasize()] = returndata[0:+_returndatasize()];",
+                "    _copy_returned(ptr3 + 32, 0x0, _returndatasize());",
+            );
+        let lines_taken: Vec<String> = taken.lines().map(str::to_string).collect();
+        assert_eq!(answers_kept(lines_taken).join("\n"), want);
         let mut handed = lines.clone();
         handed.push("f(v1);".to_string());
-        assert_eq!(answers_kept(handed.clone()), handed);
+        let kept = answers_kept(handed).join("\n");
+        assert!(kept.contains("\nv1 = _place(returned_1);\n"), "{kept}");
+        assert!(kept.ends_with("f(v1);"), "{kept}");
     }
 
     #[test]
@@ -1813,6 +2178,14 @@ v2 = _word(returned_1, 0) != 0;";
         let lines: Vec<String> = text.lines().map(str::to_string).collect();
         let want = "mem[ptr1] = a;\nx = 1;\nrevert(\"no\");";
         assert_eq!(without_writes_before_failure(lines).join("\n"), want);
+    }
+
+    #[test]
+    fn a_block_taken_and_written_but_never_read_is_left_out() {
+        let text = "ptr1 = _free(); _take(ptr1 + 96);\n_store(ptr1, 3);\n_store(ptr1 + 32, a);\nptr2 = _free(); _take(ptr2 + 32);\n_store(ptr2, b);\nf(ptr2);";
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let want = "ptr2 = _free(); _take(ptr2 + 32);\n_store(ptr2, b);\nf(ptr2);";
+        assert_eq!(without_unread_blocks(lines).join("\n"), want);
     }
 
     #[test]

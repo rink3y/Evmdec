@@ -154,6 +154,8 @@ struct Called {
 
 struct Ran {
     effect: Option<Effect>,
+    // A call was answered with less than the memory the code gave it to answer into.
+    short: bool,
     wanted: Vec<Change>,
     steps: usize,
 }
@@ -258,6 +260,7 @@ fn run(
     let mut calls: Vec<Called> = Vec::new();
     let mut loads: Vec<(U256, U256)> = Vec::new();
     let mut wanted: Vec<Change> = Vec::new();
+    let mut short = false;
     let mut gas_read = 0u64;
     let mut taken = 0;
     let effect = 'ran: {
@@ -337,6 +340,8 @@ fn run(
                         (true, call.input)
                     } else {
                         let said = answer(input.seed, calls.len());
+                        let room = call.out_len.as_usize();
+                        short |= said.0 && room.is_none_or(|n| said.1.len() < n);
                         calls.push(Called {
                             kind: call.kind,
                             to: call.addr,
@@ -375,6 +380,7 @@ fn run(
     };
     Ran {
         effect,
+        short,
         wanted,
         steps: taken,
     }
@@ -705,7 +711,10 @@ pub fn compare(original: &[u8], candidate: &[u8], entries: &[Entry], runs: usize
             // of the source follows what the original needed, so a source that loops
             // forever is stopped soon.
             let budget = SLOWER * (a.steps + 1000);
-            let Some(a) = a.effect else {
+            // Past the end of a short answer old code reads what the memory held before,
+            // which was laid out by its compiler and is not a thing a source says.
+            let stale = entry.loose && a.short;
+            let Some(a) = a.effect.filter(|_| !stale) else {
                 checked.unsettled += 1;
                 continue;
             };

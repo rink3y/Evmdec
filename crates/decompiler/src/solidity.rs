@@ -478,7 +478,9 @@ fn decoder_test(code: &str) -> bool {
     for known in bounds.iter().chain(&["_calldata(", "int256("]) {
         rest = rest.replace(known, "");
     }
-    let plain = |c: char| c.is_ascii_digit() || " ()+-*<>=!&|".contains(c);
+    // A test against the end of the call data may go through a length worked out before.
+    let local = test.contains("msg.data.length");
+    let plain = |c: char| c.is_ascii_digit() || " ()+-*<>=!&|".contains(c) || (local && c == 'v');
     bounds.iter().any(|b| test.contains(b)) && rest.chars().all(plain)
 }
 
@@ -1805,6 +1807,10 @@ v2 = _word(returned_1, 0) != 0;";
     #[test]
     fn a_decoder_test_is_told_from_a_test_the_author_wrote() {
         assert!(decoder_test("require(_calldata(4) <= type(uint64).max);"));
+        assert!(decoder_test(
+            "require(!(_calldata(36) + 36 + v1 > msg.data.length));"
+        ));
+        assert!(!decoder_test("require(v1 <= type(uint64).max);"));
         let fits = "require(_calldata(4) + 4 + (_calldata(_calldata(4) + 4) << 5) + 32 <= msg.data.length);";
         assert!(decoder_test(fits));
         assert!(decoder_test("require(msg.data.length >= 36);"));

@@ -1238,6 +1238,14 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         }
         ready.push((names, bound));
     }
+    if opts.solidity && !opts.flat {
+        let units = functions.iter().zip(&ready);
+        let units: Vec<(usize, &Lifted, &Names)> = units.map(|(f, (n, l))| (f.pc, l, n)).collect();
+        let found = crate::boxes::find(&units);
+        for ((names, _), found) in ready.iter_mut().zip(found) {
+            names.unbox(found);
+        }
+    }
     for (f, (names, l)) in functions.iter_mut().zip(ready) {
         crate::clock::check();
         let t1 = std::time::Instant::now();

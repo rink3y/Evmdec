@@ -857,6 +857,31 @@ fn declarations(c: &Contract, f: &Function, text: &str) -> String {
             out.push_str(&format!("        uint256 {name};\n"));
         }
     }
+    // A word the function kept in memory for itself is a local value, and a run of them
+    // a struct in memory.
+    for name in words
+        .iter()
+        .filter(|w| numbered(w, "s") && w.ends_with("_0"))
+    {
+        out.push_str(&format!("        uint256 {name};\n"));
+    }
+    for name in words
+        .iter()
+        .filter(|w| numbered(w, "s") && !w.contains('_'))
+    {
+        let field = format!("{name}.w");
+        let fields = text.match_indices(&field).filter_map(|(at, held)| {
+            let apart = !text[..at].ends_with(word);
+            let digits = text[at + held.len()..].split(|c: char| !c.is_ascii_digit());
+            digits
+                .take(1)
+                .find_map(|d| d.parse::<u64>().ok())
+                .filter(|_| apart)
+        });
+        if let Some(last) = fields.max() {
+            out.push_str(&format!("        Words{} memory {name};\n", last + 1));
+        }
+    }
     for name in words.iter().filter(|w| numbered(w, "ret_")) {
         let ty = result_type(c, text, name).unwrap_or_else(|| "uint256".to_string());
         out.push_str(&format!("        {ty} {name};\n"));
@@ -964,6 +989,28 @@ pub struct Draft {
     spans: Vec<(usize, usize, usize)>,
 }
 
+// A struct of plain words, for each length of one a function keeps in memory.
+fn structs_declared(text: &str) -> String {
+    let named = text.match_indices("Words").filter_map(|(at, held)| {
+        let rest = &text[at + held.len()..];
+        let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+        let words = digits.parse::<u64>().ok()?;
+        rest[digits.len()..]
+            .starts_with(" memory ")
+            .then_some(words)
+    });
+    let lengths: BTreeSet<u64> = named.collect();
+    let mut out = String::new();
+    for words in lengths {
+        let fields: String = (0..words).map(|i| format!(" uint256 w{i};")).collect();
+        out.push_str(&format!("    struct Words{words} {{{fields} }}\n"));
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 // An error the text fails with by name is one the printer knew by its whole signature.
 fn errors_declared(text: &str) -> String {
     let mut found = BTreeSet::new();
@@ -1053,7 +1100,11 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
             out.push_str(helper);
         }
     }
-    let errors = errors_declared(&out[errors_at..]);
+    let errors = format!(
+        "{}{}",
+        structs_declared(&out[errors_at..]),
+        errors_declared(&out[errors_at..])
+    );
     for span in &mut spans {
         *span = (span.0 + errors.len(), span.1 + errors.len(), span.2);
     }

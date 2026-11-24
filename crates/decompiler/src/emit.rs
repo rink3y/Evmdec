@@ -144,6 +144,11 @@ pub struct Names {
     pub bools: HashSet<ExprId>,
     pub addresses: HashSet<ExprId>,
     pub return_types: Vec<String>,
+    // Blocks of memory the function keeps to itself, shown as local values, with the
+    // number of words each holds.
+    pub scalars: HashMap<u32, u64>,
+    // Addresses of one-word blocks that are handed on as the word.
+    pub handed: HashMap<ExprId, u32>,
     pub bool_fields: HashSet<(U256, u32, u32)>,
     pub bool_returns: Vec<bool>,
     pub strict: bool,
@@ -638,6 +643,24 @@ fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> Off
 const TEMP_THRESHOLD: usize = 160;
 
 impl Names {
+    /* Takes what was found about the blocks of memory this function keeps. A block it
+    keeps to itself is shown as local values, and an address that stood for one word is
+    shown as the word. */
+    pub fn unbox(&mut self, found: crate::boxes::Found) {
+        use crate::boxes::Shown;
+        self.scalars = found.scalars;
+        let mut named: Vec<(ExprId, String)> = Vec::new();
+        for (e, shown) in &found.shown {
+            match shown {
+                Shown::Word(number) => {
+                    self.handed.insert(*e, *number);
+                }
+                Shown::As(at) => named.push((*e, fmt_expr(*at, self))),
+            }
+        }
+        self.aliases.extend(named);
+    }
+
     #[must_use]
     pub fn callee_name(&self, pc: usize) -> String {
         self.callee_names
@@ -1433,6 +1456,10 @@ fn hash_word(text: String, n: &Names) -> String {
     }
 }
 
+fn handed_word(e: ExprId, n: &Names) -> Option<String> {
+    n.handed.get(&e).map(|number| format!("s{number}_0"))
+}
+
 fn declared_as(var: ExprId, n: &Names) -> &'static str {
     match (n.bools.contains(&var), n.addresses.contains(&var)) {
         (true, _) => "bool",
@@ -1444,6 +1471,9 @@ fn declared_as(var: ExprId, n: &Names) -> &'static str {
 /* A value two paths give is declared once, with one type. In a file for a compiler
 every path gives it as that type. */
 pub fn fmt_assigned(var: ExprId, val: ExprId, n: &Names) -> String {
+    if let Some(word) = handed_word(val, n) {
+        return word;
+    }
     if !n.strict || !matches!(expr::node(var), Node::Var(_)) {
         return fmt_expr(val, n);
     }
@@ -1731,7 +1761,7 @@ pub fn block_literals(stmts: &[Stmt], hidden: &HashSet<usize>, n: &Names) -> Vec
         else {
             return None;
         };
-        let (number, offset) = block_ref(*off, n)?;
+        let (number, offset) = block_ref(*off, n).filter(|(k, _)| !n.scalars.contains_key(k))?;
         let aligned =
             offset.fits_u64() && offset.low_u64().is_multiple_of(32) && offset.low_u64() < 32 * 64;
         let reads_memory = expr::contains(*val, &|x| matches!(x, Node::MLoad(..)));
@@ -1798,7 +1828,25 @@ pub fn block_literals(stmts: &[Stmt], hidden: &HashSet<usize>, n: &Names) -> Vec
 
 const WORD: u64 = 32;
 
+/* One word of a block the function keeps to itself. A block of one word is a local
+value. A longer one is a struct in memory, as it was for the author, which keeps the
+function within the few values a compiler can reach at once. */
+fn scalar_word(off: ExprId, n: &Names) -> Option<String> {
+    let (number, offset) = block_ref(off, n)?;
+    let words = *n.scalars.get(&number)?;
+    let index = offset.low_u64() / WORD;
+    let whole = offset.fits_u64() && offset.low_u64().is_multiple_of(WORD) && index < words;
+    match (whole, words) {
+        (false, _) => None,
+        (true, 1) => Some(format!("s{number}_0")),
+        (true, _) => Some(format!("s{number}.w{index}")),
+    }
+}
+
 pub fn fmt_mem_word(off: ExprId, n: &Names) -> String {
+    if let Some(name) = scalar_word(off, n) {
+        return name;
+    }
     if n.layout != MappingLayout::Vyper {
         return format!("mem[{}]", fmt_mem_off(off, n));
     }
@@ -3408,6 +3456,9 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 format!("mem8[{}] = {};", fmt_mem_off(*off, n), fmt_expr(*val, n))
             } else if let Some(selector) = stored_selector(*off, *val, n) {
                 format!("{} = {selector};", fmt_mem_word(*off, n))
+            } else if let Some(name) = scalar_word(*off, n) {
+                let value = handed_word(*val, n).unwrap_or_else(|| as_word(*val, n));
+                format!("{name} = {value};")
             } else {
                 format!("{} = {};", fmt_mem_word(*off, n), fmt_stored_word(*val, n))
             }
@@ -3733,9 +3784,10 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             // A number handed to a helper that uses it as a place is the block that starts there.
             let places = n.offsets.handed.get(callee);
             let place = |j: &usize| places.is_some_and(|p| p.contains(j));
-            let shown = |(j, x): (usize, &ExprId)| match place(&j) {
-                true => fmt_stored_word(*x, n),
-                false => fmt_expr(*x, n),
+            let shown = |(j, x): (usize, &ExprId)| match (handed_word(*x, n), place(&j)) {
+                (Some(word), _) => word,
+                (None, true) => fmt_stored_word(*x, n),
+                (None, false) => fmt_expr(*x, n),
             };
             let a: Vec<String> = args.iter().enumerate().map(shown).collect();
             let call = format!("{}({})", n.callee_name(*callee), a.join(", "));
@@ -3956,6 +4008,9 @@ pub fn error_string(stmts: &[Stmt], off: ExprId, n: &Names) -> Option<String> {
 }
 
 fn flag_or(j: usize, v: ExprId, n: &Names) -> String {
+    if let Some(word) = handed_word(v, n) {
+        return word;
+    }
     if let Some(ty) = n.return_types.get(j).filter(|_| n.strict) {
         return as_declared(ty, v, n);
     }

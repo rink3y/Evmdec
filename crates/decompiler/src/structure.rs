@@ -3254,7 +3254,7 @@ impl<'a> Printer<'a> {
             }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
-            if let Some(out) = self.call_output(n, i, s) {
+            if let Some(out) = self.call_output(n, i, s).filter(|_| !self.answer_kept(s)) {
                 self.line(depth, &out);
             }
             if let (Stmt::MStore { off, .. }, Some(val)) =
@@ -3340,7 +3340,7 @@ impl<'a> Printer<'a> {
                 let s = format!(
                     "{} = {};",
                     emit::fmt_expr(var, self.names),
-                    emit::fmt_expr(val, self.names)
+                    emit::fmt_assigned(var, val, self.names)
                 );
                 self.line(depth, &s);
             }
@@ -3374,6 +3374,40 @@ impl<'a> Printer<'a> {
     otherwise show only the stores made before the call. The read may be a load, a hash, a
     copy, a log, the data of another call or what the function hands back, and it may reach
     the area through an address the code works out. */
+    /* Old code hands a call a few words of memory to answer into. A file keeps the
+    answer the call gave, and a later read of one of those words is a read of the answer. */
+    fn answer_kept(&self, s: &Stmt) -> bool {
+        const MOST_WORDS: u64 = 8;
+        let Stmt::Call {
+            out_off,
+            out_len,
+            result,
+            ..
+        } = s
+        else {
+            return false;
+        };
+        let mut answers = self.names.answers.borrow_mut();
+        let size = expr::as_const(*out_len).filter(|l| l.fits_u64());
+        let words = size.map(|l| l.low_u64()).filter(|l| l % 32 == 0);
+        let words = words
+            .map(|l| l / 32)
+            .filter(|w| (1..=MOST_WORDS).contains(w));
+        match (expr::node(*result), words) {
+            (Node::CallResult(seq), Some(words)) if self.names.strict => {
+                for i in 0..words {
+                    let word = expr::add_const(*out_off, U256::from_u64(32 * i));
+                    answers.insert(word, (seq, 32 * i));
+                }
+                true
+            }
+            _ => {
+                answers.remove(out_off);
+                false
+            }
+        }
+    }
+
     fn call_output(&self, n: usize, i: usize, s: &Stmt) -> Option<String> {
         let Stmt::Call {
             addr,
@@ -3750,8 +3784,7 @@ impl<'a> Printer<'a> {
         let join = self.g.ipdom[n];
         if let Some(reason) = f_rev.clone() {
             if let (Some(t), None) = (t, &t_rev) {
-                let text = emit::fmt_cond(cond, self.names);
-                self.line(depth, &guard(&text, &reason, self.names.hide_checked));
+                self.line(depth, &guard(cond, &reason, self.names));
                 self.facts.push((cond, true, t));
                 self.transfer(n, t, stop, depth);
                 self.facts.pop();
@@ -3761,8 +3794,7 @@ impl<'a> Printer<'a> {
         if let Some(reason) = t_rev.clone() {
             if f_rev.is_none() {
                 let ncond = expr::op1(op::ISZERO, cond);
-                let text = emit::fmt_cond(ncond, self.names);
-                self.line(depth, &guard(&text, &reason, self.names.hide_checked));
+                self.line(depth, &guard(ncond, &reason, self.names));
                 self.facts.push((cond, false, f));
                 self.transfer(n, f, stop, depth);
                 self.facts.pop();
@@ -4064,7 +4096,15 @@ impl<'a> Printer<'a> {
             format!("{var_s} = {a} || {b};")
         };
         let c_s = emit::fmt_or_operand(cond, self.names);
-        let txt = if y == cond {
+        let txt = if self.names.strict {
+            // Both values of a choice have to be of one type, and the test a flag.
+            let test = emit::fmt_cond(cond, self.names);
+            let (x, y) = (
+                emit::fmt_assigned(var, x, self.names),
+                emit::fmt_assigned(var, y, self.names),
+            );
+            format!("{var_s} = ({test}) ? {x} : {y};")
+        } else if y == cond {
             both(cond, x)
         } else if x == cond {
             either(cond, y)
@@ -4127,13 +4167,23 @@ fn while_cond_exit_from_header(term: &Term, exit: usize) -> bool {
 // Stands for the invalid opcode. It carries no data, so it is no reason to print.
 const INVALID: &str = "INVALID";
 
-// Where a failed assert reverts with a Panic, the opcode is named to tell the two apart.
-fn guard(cond: &str, reason: &Option<String>, panics: bool) -> String {
+/* Where a failed assert reverts with a Panic, the opcode is named to tell the two apart.
+A file for a compiler names it by the statement that runs it. */
+fn guard(cond: ExprId, reason: &Option<String>, names: &Names) -> String {
+    let text = emit::fmt_cond(cond, names);
+    let failed = || emit::fmt_cond(expr::op1(op::ISZERO, cond), names);
     match reason.as_deref() {
-        Some(INVALID) if panics => format!("assert({cond}); // INVALID"),
-        Some(INVALID) => format!("assert({cond});"),
-        Some(r) => format!("require({cond}, {r});"),
-        None => format!("require({cond});"),
+        Some(INVALID) if names.strict && names.hide_checked => {
+            format!("if ({}) {{ assembly {{ invalid() }} }}", failed())
+        }
+        Some(INVALID) if names.hide_checked => format!("assert({text}); // INVALID"),
+        Some(INVALID) => format!("assert({text});"),
+        Some("Panic(assert failed)") if names.strict => format!("assert({text});"),
+        Some(r) if names.strict && !r.starts_with('"') => {
+            format!("if ({}) {}", failed(), emit::failure(r))
+        }
+        Some(r) => format!("require({text}, {r});"),
+        None => format!("require({text});"),
     }
 }
 

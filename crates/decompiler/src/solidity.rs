@@ -1,7 +1,7 @@
 use crate::decompile::{Contract, Function};
 use crate::function::{FnKind, Mutability};
 use crate::{abi, exact, keccak};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 // The oldest release whose assembly knows every instruction in use today.
 const MODERN: &str = "^0.8.24";
@@ -431,6 +431,35 @@ pub struct Plain<'a> {
     public: &'a BTreeSet<usize>,
     // Nothing is left in its exact form, so the translation of the bytecode can go.
     clean: bool,
+    // Functions the compiler found to read or write more than their header said.
+    relaxed: &'a BTreeMap<usize, Reach>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Reach {
+    Reads,
+    Writes,
+}
+
+/* What a function may touch was worked out before its helpers were folded into it. The
+compiler says where a header promises too little, and the header is then widened. */
+fn widened(head: String, reach: Option<&Reach>) -> String {
+    match reach {
+        Some(Reach::Reads) => head.replacen(" pure", " view", 1),
+        Some(Reach::Writes) => head.replacen(" pure", "", 1).replacen(" view", "", 1),
+        None => head,
+    }
+}
+
+fn reach_asked(message: &str) -> Option<Reach> {
+    let declared = message.contains("Function declared as");
+    let reads = message.contains("requires \"view\"");
+    let writes = message.contains("requires non-payable");
+    match (declared, reads, writes) {
+        (true, true, _) => Some(Reach::Reads),
+        (true, _, true) => Some(Reach::Writes),
+        _ => None,
+    }
 }
 
 fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
@@ -460,7 +489,9 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     let text = unused_answers(&text);
     let text = saved_as_stored(c, &plain.layout.renamed, &text);
     let declared = declarations(c, f, &text);
-    let text = format!("{declared}{}", returned_as_declared(f, &declared, &text));
+    let text = returned_as_declared(f, &declared, &text);
+    let marked: Vec<String> = text.lines().map(unchecked_statement).collect();
+    let text = format!("{declared}{}", marked.join("\n"));
     // Arithmetic before 0.8 wraps. In a current file only an unchecked block does.
     let wraps = ["+", "*", " - ", "-=", "(-"]
         .iter()
@@ -711,6 +742,55 @@ fn saved_as_stored(c: &Contract, renamed: &[(String, String)], text: &str) -> St
     fixed.collect::<Vec<_>>().join("\n")
 }
 
+fn close_of(text: &str) -> Option<usize> {
+    let mut depth = 1i32;
+    text.char_indices().find_map(|(i, c)| {
+        depth += i32::from(c == '(') - i32::from(c == ')');
+        (depth == 0).then_some(i)
+    })
+}
+
+/* The printer marks arithmetic the code does not test for overflow. A file can say so
+only for a whole statement. A statement goes in an unchecked block when every sum in it
+is marked, as a block around one that is tested would stop the test. */
+fn unchecked_statement(line: &str) -> String {
+    const MARK: &str = "unchecked(";
+    let code = line.trim_start();
+    if !code.contains(MARK) || !code.ends_with(';') || code.contains('"') {
+        return line.to_string();
+    }
+    let (mut bare, mut outside, mut rest) = (String::new(), String::new(), code);
+    while let Some(at) = rest.find(MARK) {
+        let inner = &rest[at + MARK.len()..];
+        let Some(end) = close_of(inner) else {
+            return line.to_string();
+        };
+        outside.push_str(&rest[..at]);
+        bare.push_str(&format!(
+            "{}({})",
+            &rest[..at],
+            inner[..end].replace(MARK, "(")
+        ));
+        rest = &inner[end + 1..];
+    }
+    outside.push_str(rest);
+    bare.push_str(rest);
+    if outside.contains(['+', '-', '*', '/', '%']) || bare.contains("checked(") {
+        return line.to_string();
+    }
+    let indent = &line[..line.len() - code.len()];
+    let declared = bare.split_once(" = ").and_then(|(left, value)| {
+        let (ty, name) = left.split_once(' ')?;
+        (elementary(ty) && identifier(name)).then_some((ty, name, value))
+    });
+    match declared {
+        Some((ty, name, value)) => {
+            format!("{indent}{ty} {name};\n{indent}unchecked {{ {name} = {value} }}")
+        }
+        None => format!("{indent}unchecked {{ {bare} }}"),
+    }
+}
+
 /* A value a helper gave back can be a flag where this function returns a number, or a
 number where it returns a flag. The types were worked out one function at a time. */
 fn returned_as_declared(f: &Function, declared: &str, text: &str) -> String {
@@ -810,7 +890,29 @@ fn helpers(c: &Contract, plain: &BTreeSet<usize>, clean: bool) -> BTreeSet<usize
 /* What plain Solidity has no word for, written once and called by name: a string taken
 as the place it lies at and back, a word of the data a call gave back, and how much it
 gave. */
-const HELPERS: [(&str, &str); 4] = [
+const HELPERS: [(&str, &str); 6] = [
+    (
+        "_panic(",
+        "    function _panic(uint256 code) private pure {
+        assembly {
+            mstore(0, 0x4e487b7100000000000000000000000000000000000000000000000000000000)
+            mstore(4, code)
+            revert(0, 36)
+        }
+    }
+
+",
+    ),
+    (
+        "_fail(",
+        "    function _fail(bytes memory data) private pure {
+        assembly {
+            revert(add(data, 32), mload(data))
+        }
+    }
+
+",
+    ),
     (
         "_pointer(",
         "    function _pointer(string memory text) private pure returns (uint256 at) {
@@ -836,6 +938,10 @@ const HELPERS: [(&str, &str); 4] = [
         "    function _word(bytes memory data, uint256 at) private pure returns (uint256 word) {
         assembly {
             word := mload(add(add(data, 32), at))
+            let missing := sub(add(at, 32), mload(data))
+            if slt(0, missing) {
+                word := mul(lt(missing, 32), and(word, not(sub(shl(mul(8, missing), 1), 1))))
+            }
         }
     }
 
@@ -856,6 +962,25 @@ const HELPERS: [(&str, &str); 4] = [
 pub struct Draft {
     pub text: String,
     spans: Vec<(usize, usize, usize)>,
+}
+
+// An error the text fails with by name is one the printer knew by its whole signature.
+fn errors_declared(text: &str) -> String {
+    let mut found = BTreeSet::new();
+    for (at, _) in text.match_indices("revert ") {
+        let rest = &text[at + "revert ".len()..];
+        let Some((name, given)) = rest.split_once('(') else {
+            continue;
+        };
+        let values = close_of(given).map(|end| abi::split_top(&given[..end]).len());
+        let known = values.and_then(|n| crate::sigs::error_named(name, n));
+        found.extend(known.filter(|_| identifier(name)));
+    }
+    let mut out: String = found.iter().map(|e| format!("    error {e};\n")).collect();
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
@@ -880,6 +1005,7 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
             out.push('\n');
         }
     }
+    let errors_at = out.len();
     let mut written = BTreeSet::new();
     for (i, f) in c.functions.iter().enumerate() {
         if plain.is_some_and(|p| p.public.contains(&i)) {
@@ -887,6 +1013,7 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
         }
         let whole = plain.filter(|p| p.functions.contains(&i) && f.kind == FnKind::External);
         if let Some((plain, head)) = whole.and_then(|p| Some((p, header(f, shape, true)?))) {
+            let head = widened(head, plain.relaxed.get(&i));
             if written.insert(head.clone()) {
                 let start = out.len();
                 out.push_str(&format!("    {head} {{\n{}    }}\n\n", body(c, f, plain)));
@@ -916,6 +1043,7 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
             let f = &c.functions[i];
             let start = out.len();
             let head = crate::decompile::fmt_function_header(f);
+            let head = widened(head, plain.relaxed.get(&i));
             out.push_str(&format!("{head}{}    }}\n\n", body(c, f, plain)));
             spans.push((start, out.len(), i));
         }
@@ -925,6 +1053,11 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
             out.push_str(helper);
         }
     }
+    let errors = errors_declared(&out[errors_at..]);
+    for span in &mut spans {
+        *span = (span.0 + errors.len(), span.1 + errors.len(), span.2);
+    }
+    out.insert_str(errors_at, &errors);
     if clean {
         out.truncate(out.trim_end().len());
         out.push_str("\n}\n");
@@ -1123,7 +1256,8 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
         calling.map(|(i, _)| i)
     };
     let mut depth = runs;
-    for _ in 0..32 {
+    let mut relaxed: BTreeMap<usize, Reach> = BTreeMap::new();
+    for _ in 0..48 {
         let read: BTreeSet<usize> = public.iter().map(|(i, _)| *i).collect();
         let written = c
             .functions
@@ -1139,6 +1273,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
             layout: &layout,
             public: &read,
             clean: false,
+            relaxed: &relaxed,
         };
         let draft = compose(c, &shape, Some(&written));
         if draft.spans.is_empty() && read.is_empty() {
@@ -1168,6 +1303,11 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                     if let Some((from, to, _)) = shown.filter(|_| trace_text) {
                         eprintln!("{}", &draft.text[*from..*to]);
                     }
+                }
+                let asked = reach_asked(&refusal.message).zip(failed.first().copied());
+                if let Some((reach, i)) = asked.filter(|(r, i)| relaxed.get(i) < Some(r)) {
+                    relaxed.insert(i, reach);
+                    continue;
                 }
                 // An error outside every function is in what they all share. The public
                 // variables are the part of that which can be taken back.
@@ -1254,6 +1394,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                         layout: &layout,
                         public: &read,
                         clean: true,
+                        relaxed: &relaxed,
                     };
                     let clean = every.then(|| compose(c, &shape, Some(&whole)));
                     let tried = clean.and_then(|draft| {
@@ -1365,6 +1506,22 @@ mod tests {
         assert_eq!(uncast("address(account)"), "account");
         assert_eq!(uncast("uint8(a) + uint8(b)"), "uint8(a) + uint8(b)");
         assert_eq!(uncast("balanceOf(account)"), "balanceOf(account)");
+    }
+
+    #[test]
+    fn a_statement_is_unchecked_only_when_all_its_sums_are() {
+        let all = unchecked_statement("    x = unchecked(a + b);");
+        assert_eq!(all, "    unchecked { x = (a + b); }");
+        let declared = unchecked_statement("    uint256 t1 = unchecked(a - 1);");
+        assert_eq!(declared, "    uint256 t1;\n    unchecked { t1 = (a - 1); }");
+        let mixed = "    x = unchecked(a + b) + c;";
+        assert_eq!(unchecked_statement(mixed), mixed);
+    }
+
+    #[test]
+    fn a_named_error_is_declared_and_an_unnamed_one_is_not() {
+        let text = "revert Unauthorized();\n_fail(abi.encodeWithSelector(bytes4(0x12345678)));";
+        assert_eq!(errors_declared(text), "    error Unauthorized();\n\n");
     }
 
     #[test]

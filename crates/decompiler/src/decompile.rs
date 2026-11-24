@@ -1213,7 +1213,8 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let units: Vec<(usize, &Lifted)> = units.map(|(f, l)| (f.pc, l)).collect();
         emit::offsets(&units).into_iter()
     };
-    for (f, l) in functions.iter_mut().zip(printed) {
+    let mut ready: Vec<(Names, Lifted)> = Vec::new();
+    for (f, l) in functions.iter().zip(printed) {
         let mut names = make_names(f, &storage, layout, &loaders, &callees);
         let (l, hashes) = crate::structure::name_hashes(&l);
         names.hide_checked = solc08;
@@ -1223,16 +1224,26 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         names.rebind(&hashes);
         names.pure_callees = pure_callees.clone();
         names.array_resizers = array_resizers.clone();
+        if opts.flat {
+            ready.push((names, l));
+            continue;
+        }
+        crate::clock::check();
+        let (tested, bindings) = crate::structure::name_tested(&l, &names);
+        names.rebind(&bindings);
+        let (bound, bindings) = crate::structure::bind_shared(&tested, &names);
+        names.rebind(&bindings);
+        if names.strict {
+            emit::note_address_vars(&bound, &mut names);
+        }
+        ready.push((names, bound));
+    }
+    for (f, (names, l)) in functions.iter_mut().zip(ready) {
         crate::clock::check();
         let t1 = std::time::Instant::now();
-        let body = if opts.flat {
-            emit::fmt_flat(&l, &names, "        ")
-        } else {
-            let (tested, bindings) = crate::structure::name_tested(&l, &names);
-            names.rebind(&bindings);
-            let (bound, bindings) = crate::structure::bind_shared(&tested, &names);
-            names.rebind(&bindings);
-            crate::structure::fmt_structured(&bound, &names, "        ")
+        let body = match opts.flat {
+            true => emit::fmt_flat(&l, &names, "        "),
+            false => crate::structure::fmt_structured(&l, &names, "        "),
         };
         if timing && t1.elapsed().as_millis() > 200 {
             eprintln!(
@@ -2054,6 +2065,7 @@ pub fn make_names(
             .map(|p| p.name.clone()),
     );
     n.bool_returns = f.returns.iter().map(|t| t == "bool").collect();
+    n.return_types = f.returns.clone();
     n.bools.extend(f.bool_vars.iter().map(|v| expr::var(*v)));
     if let Some(l) = &f.lifted {
         let mut seqs: Vec<u32> = l

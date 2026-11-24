@@ -133,12 +133,17 @@ pub struct Names {
     pub hide_checked: bool,
     pub checked: Option<Checked>,
     pub gas_named: RefCell<HashSet<ExprId>>,
+    // Each word old code had its last call write the answer to, with the call and the
+    // place of the word in the answer.
+    pub answers: RefCell<HashMap<ExprId, (u32, u64)>>,
     pub offsets: Offsets,
     pub bare: RefCell<HashMap<ExprId, (String, u8)>>,
     pub temps: RefCell<Vec<(String, String)>>,
     pub temp_of: RefCell<HashMap<ExprId, String>>,
     pub pure_callees: HashSet<usize>,
     pub bools: HashSet<ExprId>,
+    pub addresses: HashSet<ExprId>,
+    pub return_types: Vec<String>,
     pub bool_fields: HashSet<(U256, u32, u32)>,
     pub bool_returns: Vec<bool>,
     pub strict: bool,
@@ -884,10 +889,7 @@ impl Names {
         let vars = self.vars.borrow();
         let mut found: Vec<(u32, &str)> = vars
             .iter()
-            .map(|(raw, shown)| match self.bools.contains(&expr::var(*raw)) {
-                true => (*shown, "bool"),
-                false => (*shown, "uint256"),
-            })
+            .map(|(raw, shown)| (*shown, declared_as(expr::var(*raw), self)))
             .collect();
         found.sort_unstable();
         let named = found
@@ -1100,6 +1102,25 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
     paren(s, p, outer)
 }
 
+// The declared types of an event a file can name, for a file a compiler has to take.
+fn known_event_types(topics: &[ExprId], n: &Names) -> Vec<String> {
+    let first = topics.first().and_then(|t| expr::as_const(*t));
+    let known = first.and_then(|t0| sigs::event(&t0.to_be_bytes()));
+    match known.filter(|_| n.strict) {
+        Some(sig) => sigs::params_of(&sig),
+        None => Vec::new(),
+    }
+}
+
+fn as_declared(ty: &str, e: ExprId, n: &Names) -> String {
+    match ty {
+        "uint256" => as_word(e, n),
+        "address" | "bool" => as_type(ty, e, n),
+        _ if width_of(ty).is_some() || ty.starts_with("bytes") && ty.len() > 5 => as_type(ty, e, n),
+        _ => fmt_expr(e, n),
+    }
+}
+
 pub fn fmt_log_parts(topics: &[ExprId], data_args: Vec<String>, n: &Names) -> String {
     let mut args: Vec<String> = Vec::new();
     let mut name = None;
@@ -1109,8 +1130,12 @@ pub fn fmt_log_parts(topics: &[ExprId], data_args: Vec<String>, n: &Names) -> St
         }
     }
     let start = if name.is_some() { 1 } else { 0 };
-    for t in &topics[start..] {
-        args.push(fmt_expr(*t, n));
+    let types = known_event_types(topics, n);
+    for (i, t) in topics[start..].iter().enumerate() {
+        args.push(match types.get(i) {
+            Some(ty) => as_declared(ty, *t, n),
+            None => fmt_expr(*t, n),
+        });
     }
     args.extend(data_args);
     match name {
@@ -1376,7 +1401,87 @@ fn is_address(e: ExprId, n: &Names) -> bool {
             typed(calldata_word_index(off).and_then(|i| n.param_types.get(&i)))
         }
         Node::Arg(i) => typed(n.arg_types.get(&i)),
+        Node::Var(_) => n.addresses.contains(&e),
         _ => false,
+    }
+}
+
+// A compiler does no sums on a flag or an address, which the bytecode does freely.
+fn fmt_number(e: ExprId, outer: u8, n: &Names) -> String {
+    let odd = n.strict && !expr::is_const(e) && (is_bool(e, n) || is_address(e, n));
+    match odd {
+        true => as_word(e, n),
+        false => fmt_prec(e, outer, n),
+    }
+}
+
+// A flag is not ordered for a compiler, nor is an address against a number.
+fn fmt_ordered(e: ExprId, other: ExprId, n: &Names) -> String {
+    let flag = is_bool(e, n) && !expr::is_const(e);
+    let lone = is_address(e, n) && !is_address(other, n);
+    match n.strict && (flag || lone) {
+        true => as_word(e, n),
+        false => fmt_prec(e, P_CMP + 1, n),
+    }
+}
+
+// A hash is thirty-two bytes to a compiler, and a number wherever this text uses it.
+fn hash_word(text: String, n: &Names) -> String {
+    match n.strict {
+        true => format!("uint256({text})"),
+        false => text,
+    }
+}
+
+fn declared_as(var: ExprId, n: &Names) -> &'static str {
+    match (n.bools.contains(&var), n.addresses.contains(&var)) {
+        (true, _) => "bool",
+        (false, true) => "address",
+        (false, false) => "uint256",
+    }
+}
+
+/* A value two paths give is declared once, with one type. In a file for a compiler
+every path gives it as that type. */
+pub fn fmt_assigned(var: ExprId, val: ExprId, n: &Names) -> String {
+    if !n.strict || !matches!(expr::node(var), Node::Var(_)) {
+        return fmt_expr(val, n);
+    }
+    match (declared_as(var, n), expr::as_const(val)) {
+        ("bool", Some(c)) => (!c.is_zero()).to_string(),
+        ("bool", None) => fmt_cond(val, n),
+        ("address", _) => as_address(val, n),
+        _ => as_word(val, n),
+    }
+}
+
+// A merged value is an address when every path gives it one, or gives it nothing.
+pub fn note_address_vars(l: &Lifted, n: &mut Names) {
+    let mut given: HashMap<ExprId, Vec<ExprId>> = HashMap::new();
+    for (var, val) in l.edge_assigns.values().flatten() {
+        given.entry(*var).or_default().push(*val);
+    }
+    for s in l.nodes.iter().flat_map(|nd| &nd.stmts) {
+        if let Stmt::Assign { var, value } = s {
+            given.entry(*var).or_default().push(*value);
+        }
+    }
+    loop {
+        let empty = |v: &ExprId| expr::as_const(*v).is_some_and(|c| c.is_zero());
+        let fits = |vals: &Vec<ExprId>| {
+            vals.iter().all(|v| is_address(*v, n) || empty(v))
+                && vals.iter().any(|v| is_address(*v, n))
+        };
+        let new = |var: &ExprId| !n.addresses.contains(var) && !n.bools.contains(var);
+        let found: Vec<ExprId> = given
+            .iter()
+            .filter(|(var, vals)| new(var) && fits(vals))
+            .map(|(var, _)| *var)
+            .collect();
+        if found.is_empty() {
+            return;
+        }
+        n.addresses.extend(found);
     }
 }
 
@@ -1417,9 +1522,10 @@ fn width_of(ty: &str) -> Option<u32> {
 fn as_type(ty: &str, e: ExprId, n: &Names) -> String {
     match ty {
         "address" => as_address(e, n),
+        "bool" if expr::is_const(e) => (expr::as_const(e) != Some(U256::ZERO)).to_string(),
         "bool" if is_bool(e, n) => fmt_expr(e, n),
         "bool" => format!("{} != 0", fmt_prec(e, P_EQ + 1, n)),
-        _ => format!("{ty}({})", fmt_expr(e, n)),
+        _ => format!("{ty}({})", as_word(e, n)),
     }
 }
 
@@ -1826,9 +1932,34 @@ pub fn packed_read(e: ExprId) -> Option<(U256, u32, u32)> {
 
 pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)> {
     let k = expr::as_const(key)?;
+    let read = |e: ExprId| match expr::node(e) {
+        Node::SLoad(kk, false, _) => expr::as_const(kk),
+        _ => None,
+    };
+    packed_write_of(k, val, &read)
+}
+
+/* A second write to a slot keeps bytes of the word the first one stored, which is no
+longer a read of the slot. The printer shows that word by the slot's name, so a write
+that keeps it is a write to one variable all the same. */
+fn packed_write_shown(key: ExprId, val: ExprId, n: &Names) -> Option<(U256, u32, u32, ExprId)> {
+    let k = expr::as_const(key)?;
+    let name = fmt_slot(key, n, SlotSpace::Persistent);
+    let read = |e: ExprId| match expr::node(e) {
+        Node::SLoad(kk, false, _) => expr::as_const(kk),
+        _ => (fmt_expr(e, n) == name).then_some(k),
+    };
+    packed_write_of(k, val, &read)
+}
+
+fn packed_write_of(
+    k: U256,
+    val: ExprId,
+    read: &dyn Fn(ExprId) -> Option<U256>,
+) -> Option<(U256, u32, u32, ExprId)> {
     if let Node::Op(op::AND, w) = expr::node(val) {
-        if let (Node::SLoad(kk, false, _), Some(keep)) = (expr::node(w[0]), expr::as_const(w[1])) {
-            if expr::as_const(kk) == Some(k) {
+        if let (kk, Some(keep)) = (read(w[0]), expr::as_const(w[1])) {
+            if kk == Some(k) {
                 let field = !keep;
                 let s = field.trailing_zeros();
                 let shifted = field >> s;
@@ -1845,11 +1976,10 @@ pub fn packed_write(key: ExprId, val: ExprId) -> Option<(U256, u32, u32, ExprId)
         let Node::Op(op::AND, w) = expr::node(a) else {
             continue;
         };
-        let (Node::SLoad(kk, false, _), Some(keep)) = (expr::node(w[0]), expr::as_const(w[1]))
-        else {
+        let (Some(kk), Some(keep)) = (read(w[0]), expr::as_const(w[1])) else {
             continue;
         };
-        if expr::as_const(kk) != Some(k) {
+        if kk != k {
             continue;
         }
         let field = !keep;
@@ -1898,12 +2028,14 @@ pub fn element_write(key: ExprId, val: ExprId, n: &Names) -> Option<(U256, ExprI
         let Node::Op(op::AND, w) = expr::node(e) else {
             return None;
         };
-        [(w[0], w[1]), (w[1], w[0])].into_iter().find_map(|(a, b)| {
-            match (expr::node(a), expr::as_const(b)) {
-                (Node::SLoad(k, false, _), Some(m)) if k == key => Some(m),
-                _ => None,
-            }
-        })
+        // The word kept can be the one an earlier write stored, shown by the same name.
+        let same = |a: ExprId| match expr::node(a) {
+            Node::SLoad(k, false, _) if k == key => true,
+            _ => n.strict && fmt_expr(a, n) == fmt_slot(key, n, SlotSpace::Persistent),
+        };
+        [(w[0], w[1]), (w[1], w[0])]
+            .into_iter()
+            .find_map(|(a, b)| expr::as_const(b).filter(|_| same(a)))
     };
     let keeps = |e: ExprId| kept_mask(e).is_some_and(|m| !m == expr::mask_bits(width_bits));
     match expr::node(val) {
@@ -2234,6 +2366,10 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             }
             (format!("calldata[{}]", fmt_expr(off, n)), P_PRIMARY)
         }
+        Node::MLoad(off, _) if n.answers.borrow().contains_key(&off) => {
+            let (seq, at) = n.answers.borrow()[&off];
+            (format!("_word(returned_{}, {at})", n.seq(seq)), P_PRIMARY)
+        }
         Node::MLoad(off, _) => (fmt_mem_word(off, n), P_PRIMARY),
         Node::SLoad(key, transient, _) => (
             fmt_slot(key, n, SlotSpace::from_transient(transient)),
@@ -2255,7 +2391,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
                 false => "abi.encodePacked",
             };
             (
-                format!("keccak256({encoder}({}))", parts.join(", ")),
+                hash_word(format!("keccak256({encoder}({}))", parts.join(", ")), n),
                 P_PRIMARY,
             )
         }
@@ -2275,12 +2411,12 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
                 _ => "abi.encodePacked",
             };
             (
-                format!("keccak256({encoder}({}))", parts.join(", ")),
+                hash_word(format!("keccak256({encoder}({}))", parts.join(", ")), n),
                 P_PRIMARY,
             )
         }
         Node::KeccakMem(off, len, _) => (
-            format!("keccak256({})", fmt_mem_range(off, len, n)),
+            hash_word(format!("keccak256({})", fmt_mem_range(off, len, n)), n),
             P_PRIMARY,
         ),
         Node::CallResult(seq) => (format!("success_{}", n.seq(seq)), P_PRIMARY),
@@ -2387,8 +2523,8 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                         return (
                             format!(
                                 "{} >= {}",
-                                fmt_prec(iv[0], P_CMP + 1, n),
-                                fmt_prec(iv[1], P_CMP + 1, n)
+                                fmt_ordered(iv[0], iv[1], n),
+                                fmt_ordered(iv[1], iv[0], n)
                             ),
                             P_CMP,
                         )
@@ -2397,8 +2533,8 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                         return (
                             format!(
                                 "{} <= {}",
-                                fmt_prec(iv[0], P_CMP + 1, n),
-                                fmt_prec(iv[1], P_CMP + 1, n)
+                                fmt_ordered(iv[0], iv[1], n),
+                                fmt_ordered(iv[1], iv[0], n)
                             ),
                             P_CMP,
                         )
@@ -2464,40 +2600,40 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
         (op::ADD, 2) => (
             format!(
                 "{} + {}",
-                fmt_prec(v[0], P_ADD, n),
-                fmt_prec(v[1], P_ADD + 1, n)
+                fmt_number(v[0], P_ADD, n),
+                fmt_number(v[1], P_ADD + 1, n)
             ),
             P_ADD,
         ),
         (op::SUB, 2) => (
             format!(
                 "{} - {}",
-                fmt_prec(v[0], P_ADD, n),
-                fmt_prec(v[1], P_ADD + 1, n)
+                fmt_number(v[0], P_ADD, n),
+                fmt_number(v[1], P_ADD + 1, n)
             ),
             P_ADD,
         ),
         (op::MUL, 2) => (
             format!(
                 "{} * {}",
-                fmt_prec(v[0], P_MUL, n),
-                fmt_prec(v[1], P_MUL + 1, n)
+                fmt_number(v[0], P_MUL, n),
+                fmt_number(v[1], P_MUL + 1, n)
             ),
             P_MUL,
         ),
         (op::DIV, 2) => (
             format!(
                 "{} / {}",
-                fmt_prec(v[0], P_MUL, n),
-                fmt_prec(v[1], P_MUL + 1, n)
+                fmt_number(v[0], P_MUL, n),
+                fmt_number(v[1], P_MUL + 1, n)
             ),
             P_MUL,
         ),
         (op::MOD, 2) => (
             format!(
                 "{} % {}",
-                fmt_prec(v[0], P_MUL, n),
-                fmt_prec(v[1], P_MUL + 1, n)
+                fmt_number(v[0], P_MUL, n),
+                fmt_number(v[1], P_MUL + 1, n)
             ),
             P_MUL,
         ),
@@ -2512,24 +2648,24 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
         (op::EXP, 2) => (
             format!(
                 "{} ** {}",
-                fmt_prec(v[0], P_EXP + 1, n),
-                fmt_prec(v[1], P_EXP, n)
+                fmt_number(v[0], P_EXP + 1, n),
+                fmt_number(v[1], P_EXP, n)
             ),
             P_EXP,
         ),
         (op::LT, 2) => (
             format!(
                 "{} < {}",
-                fmt_prec(v[0], P_CMP + 1, n),
-                fmt_prec(v[1], P_CMP + 1, n)
+                fmt_ordered(v[0], v[1], n),
+                fmt_ordered(v[1], v[0], n)
             ),
             P_CMP,
         ),
         (op::GT, 2) => (
             format!(
                 "{} > {}",
-                fmt_prec(v[0], P_CMP + 1, n),
-                fmt_prec(v[1], P_CMP + 1, n)
+                fmt_ordered(v[0], v[1], n),
+                fmt_ordered(v[1], v[0], n)
             ),
             P_CMP,
         ),
@@ -2786,15 +2922,24 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, kind: Payload
             let nargs = lenu
                 .map(|l| l.saturating_sub(4) / 32)
                 .unwrap_or(words.len().saturating_sub(1));
-            if let Some(sig) = sigs::error(sel) {
-                let args: Vec<String> = (0..nargs)
-                    .map(|i| fmt_expr(shifted_word_len(words, i, lenu), n))
-                    .collect();
+            let word = |i: usize| shifted_word_len(words, i, lenu);
+            let known = sigs::error(sel).filter(|sig| {
+                !n.strict || sigs::error_named(sigs::name_of(sig), nargs).is_some_and(|s| s == *sig)
+            });
+            if let Some(sig) = known {
+                let types = sigs::params_of(&sig);
+                let typed = |i: usize| match types.get(i).filter(|_| n.strict) {
+                    Some(ty) => as_type(ty, word(i), n),
+                    None => fmt_expr(word(i), n),
+                };
+                let args: Vec<String> = (0..nargs).map(typed).collect();
                 return format!("{}({})", sigs::name_of(&sig), args.join(", "));
             }
-            let args: Vec<String> = (0..nargs)
-                .map(|i| fmt_expr(shifted_word_len(words, i, lenu), n))
-                .collect();
+            let plain = |i: usize| match n.strict {
+                true => as_word(word(i), n),
+                false => fmt_expr(word(i), n),
+            };
+            let args: Vec<String> = (0..nargs).map(plain).collect();
             return format!("CustomError_{:08x}({})", sel, args.join(", "));
         }
     }
@@ -2852,19 +2997,51 @@ pub fn shifted_word_len(words: &[ExprId], i: usize, len: Option<usize>) -> ExprI
     )
 }
 
+const PANICS: [(u64, &str); 10] = [
+    (0x00, "generic"),
+    (0x01, "assert failed"),
+    (0x11, "arithmetic overflow"),
+    (0x12, "division by zero"),
+    (0x21, "invalid enum value"),
+    (0x22, "invalid storage byte array"),
+    (0x31, "pop on empty array"),
+    (0x32, "array index out of bounds"),
+    (0x41, "memory allocation too large"),
+    (0x51, "uninitialized function pointer"),
+];
+
 fn panic_name(code: u64) -> String {
-    match code {
-        0x00 => "generic".into(),
-        0x01 => "assert failed".into(),
-        0x11 => "arithmetic overflow".into(),
-        0x12 => "division by zero".into(),
-        0x21 => "invalid enum value".into(),
-        0x22 => "invalid storage byte array".into(),
-        0x31 => "pop on empty array".into(),
-        0x32 => "array index out of bounds".into(),
-        0x41 => "memory allocation too large".into(),
-        0x51 => "uninitialized function pointer".into(),
-        _ => format!("{:#x}", code),
+    let known = PANICS.iter().find(|(c, _)| *c == code);
+    known.map_or_else(|| format!("{code:#x}"), |(_, name)| name.to_string())
+}
+
+/* A compiler takes a text reason in a require and nothing else. Every other failure is
+written as the statement that makes it. */
+pub fn failure(reason: &str) -> String {
+    if reason.starts_with('"') {
+        return format!("revert({reason});");
+    }
+    let Some((name, rest)) = reason.split_once('(') else {
+        let word = reason.strip_prefix("0x").filter(|w| w.len() <= 8);
+        return match word.and_then(|w| u32::from_str_radix(w, 16).ok()) {
+            Some(selector) => format!("_fail(abi.encodeWithSelector(bytes4({selector:#010x})));"),
+            None => format!("revert({reason});"),
+        };
+    };
+    let given = rest.strip_suffix(')').unwrap_or(rest);
+    if name == "Panic" {
+        let named = PANICS.iter().find(|(_, n)| *n == given).map(|(c, _)| *c);
+        let code = named.or_else(|| u64::from_str_radix(given.trim_start_matches("0x"), 16).ok());
+        return format!("_panic({:#04x});", code.unwrap_or(0));
+    }
+    match name.strip_prefix("CustomError_") {
+        Some(selector) if given.is_empty() => {
+            format!("_fail(abi.encodeWithSelector(bytes4(0x{selector})));")
+        }
+        Some(selector) => {
+            format!("_fail(abi.encodeWithSelector(bytes4(0x{selector}), {given}));")
+        }
+        None => format!("revert {reason};"),
     }
 }
 
@@ -3220,10 +3397,13 @@ fn zero_words(kind: u8, dest: ExprId, src: ExprId, len: ExprId) -> Option<Vec<Ex
 
 pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
     match s {
-        Stmt::Assign { var, value } => format!("{} = {};", fmt_expr(*var, n), fmt_expr(*value, n)),
+        Stmt::Assign { var, value } => {
+            format!("{} = {};", fmt_expr(*var, n), fmt_assigned(*var, *value, n))
+        }
         Stmt::MStore {
             off, val, width, ..
         } => {
+            n.answers.borrow_mut().remove(off);
             if *width == 1 {
                 format!("mem8[{}] = {};", fmt_mem_off(*off, n), fmt_expr(*val, n))
             } else if let Some(selector) = stored_selector(*off, *val, n) {
@@ -3239,7 +3419,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             ..
         } => {
             if !n.fields.is_empty() && !*transient {
-                if let Some((k, off, bits, value)) = packed_write(*key, *val) {
+                if let Some((k, off, bits, value)) = packed_write_shown(*key, *val, n) {
                     if let Some(name) = n.fields.get(&(k, off, bits)) {
                         let shown = match expr::as_const(value) {
                             Some(c) if n.bool_fields.contains(&(k, off, bits)) && c.is_zero() => {
@@ -3301,9 +3481,18 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
         } => {
             let first = topics.first().and_then(|t| expr::as_const(*t));
             let unnamed = first.is_some_and(|t0| sigs::event(&t0.to_be_bytes()).is_none());
+            let types = known_event_types(topics, n);
+            let declared = |i: usize| types.get(topics.len().saturating_sub(1) + i);
             let data_args: Vec<String> = match data {
                 Some(words) if n.strict && unnamed => {
                     words.iter().map(|w| as_word(*w, n)).collect()
+                }
+                Some(words) if n.strict && words.len() + topics.len() == types.len() + 1 => {
+                    let typed = |(i, w): (usize, &ExprId)| match declared(i) {
+                        Some(ty) => as_declared(ty, *w, n),
+                        None => fmt_expr(*w, n),
+                    };
+                    words.iter().enumerate().map(typed).collect()
                 }
                 Some(words) => words.iter().map(|w| fmt_expr(*w, n)).collect(),
                 None if expr::as_const(*len) != Some(U256::ZERO) => {
@@ -3592,6 +3781,9 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     let p = fmt_payload(words, len, n, PayloadKind::Revert);
                     if p == "Panic(assert failed)" {
                         format!("assert({});", c)
+                    } else if n.strict && !p.starts_with('"') {
+                        let failed = fmt_cond(expr::op1(op::ISZERO, *cond), n);
+                        format!("if ({failed}) {}", failure(&p))
                     } else if p.starts_with('"') || p.starts_with("Panic(") {
                         format!("require({}, {});", c, p)
                     } else {
@@ -3764,6 +3956,9 @@ pub fn error_string(stmts: &[Stmt], off: ExprId, n: &Names) -> Option<String> {
 }
 
 fn flag_or(j: usize, v: ExprId, n: &Names) -> String {
+    if let Some(ty) = n.return_types.get(j).filter(|_| n.strict) {
+        return as_declared(ty, v, n);
+    }
     let flag = n.bool_returns.get(j).copied() == Some(true);
     match expr::as_const(v) {
         Some(c) if flag && c.is_zero() => "false".to_string(),
@@ -3777,7 +3972,7 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
         Term::Return { off, len, data } => match data {
             Some(words)
                 if words.len() == n.bool_returns.len()
-                    && n.bool_returns.contains(&true)
+                    && (n.strict || n.bool_returns.contains(&true))
                     && expr::as_const(*len) == Some(U256::from(32 * words.len())) =>
             {
                 let listed = words.iter().enumerate().map(|(j, v)| flag_or(j, *v, n));
@@ -3808,7 +4003,9 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
                     || p.starts_with("Panic(")
                     || p.chars().next().is_some_and(|c| c.is_ascii_uppercase())
                 {
-                    if p.starts_with('"') {
+                    if n.strict {
+                        failure(&p)
+                    } else if p.starts_with('"') {
                         format!("revert({});", p)
                     } else {
                         format!("revert {};", p)
@@ -4009,7 +4206,16 @@ pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_outer_parens;
+    use super::{failure, strip_outer_parens};
+
+    #[test]
+    fn a_failure_is_written_as_the_statement_that_makes_it() {
+        assert_eq!(failure("\"no\""), "revert(\"no\");");
+        assert_eq!(failure("Panic(array index out of bounds)"), "_panic(0x32);");
+        let unnamed = "_fail(abi.encodeWithSelector(bytes4(0xb838de96), a));";
+        assert_eq!(failure("CustomError_b838de96(a)"), unnamed);
+        assert_eq!(failure("Unauthorized()"), "revert Unauthorized();");
+    }
 
     #[test]
     fn outer_parens_are_stripped_only_when_they_wrap_everything() {

@@ -279,6 +279,22 @@ keeps the answer the call gave and reads that. A value is declared in the block 
 it, where everything that reads it lies in that block, and at the top of the function
 otherwise.
 
+Memory a function builds data in is written the way the code uses it. The code takes a block
+by moving the start of free memory past it. The file does the same through two small
+functions, names the block, and writes and reads it a word or a stretch at a time through
+others. A new array, a text handed to a helper and an array returned from memory are plain
+Solidity that way, and what a function returns from memory comes back as an array or as
+bytes, whichever the code made. Where the code writes first and takes after, the file takes
+first, so that nothing a compiler puts in memory between two lines lands in the block. Data
+the code lays out by hand for a call, with a `bytes` or a `string` in it, is written into
+free memory and taken as the call is made, and only where nothing between the first write
+and the call could make the compiler use that memory. An argument of type `bytes`, `string`
+or array that an older compiler copies into memory before the function's own code runs is
+declared as held in memory, so the compiler makes the copy, and the place the code knows it
+by is the argument's own. The file is checked for all this: a block named on some way that
+does not pass its taking, or data laid out with anything in between, is put back in a
+notation no compiler reads, so the function fails to build and stays exact.
+
 A function that only returns one variable is not written at all: the variable is declared
 `public` under the function's name, as an author would have, and the compiler writes the
 function. When every function of a contract is plain, its fallback is written out too and
@@ -303,29 +319,35 @@ compared with no such allowance.
 compare equal on every function, solc 0.4 to 0.8 and Vyper, and so do the 17 regression, 30
 vulnerable and 5 source fixtures in `testdata`: 74 of 74. Those contracts answer 1,972
 functions between them. With the signatures built into the binary and no index installed,
-the files declare 880 of them by name, and 536 of the 880 are plain Solidity: all 11 of
-WETH, 29 of 29 in USDT, 21 of 22 in the Uniswap V2 pair, 35 of 39 in USDC, 26 of 40 in
-Compound cETH. The other 1,092 answer through `fallback` in their exact form: 932 have a
+the files declare 890 of them by name, and 578 of the 890 are plain Solidity: all 11 of
+WETH, 29 of 29 in USDT, 23 of 23 in the Uniswap V2 pair, 35 of 39 in USDC, 26 of 40 in
+Compound cETH. The other 1,082 answer through `fallback` in their exact form: 932 have a
 selector no built-in signature hashes to, so no header can be written for them, 28 take a
 struct, and the rest are decoded differently by a current compiler than by the original.
 
-With the full signature index installed (see below) the same run declares 1,590 of the
-1,972 by name and 920 of those are plain Solidity. USDT then comes out with no exact
-block at all, as WETH does without it.
+With the full signature index installed (see below) the same run declares 1,605 of the
+1,972 by name and 990 of those are plain Solidity. USDT, the BEC token and the
+BOB pool then come out with no exact block at all, as WETH does without it.
 
-What holds a named function back is mostly memory used as data: a `bytes` or `string`
-argument passed on, an array built in memory, a call encoded by hand, and the hand-written
-logging of older MakerDAO code. Those are still printed in a notation no compiler reads.
-Some long functions also need more values at once than a compiler can reach, and a few
-keep a jump the printer could not turn into a loop or a branch.
+What holds a named function back now is mostly not memory. Some long functions need more
+values at once than a compiler can reach, a few keep a jump the printer could not turn into
+a loop or a branch, and one helper in its exact form holds back every function that calls
+it. In memory three things are still printed in a notation no compiler reads: memory an
+older contract takes at a place it works out from the length of an argument copied before
+it, which happens with a second `bytes` or array argument, memory cleared by copying from
+past the end of the code, and the hand-written logging of older MakerDAO code. Vyper keeps
+its values at fixed places in memory and not in blocks it takes, so a Vyper function that
+copies through memory is not plain yet either.
 
-On the WETH file, 51 of 54 single changes to an operator, a check or an event are caught, and
+On the WETH file, 52 of 55 single changes to an operator, a check or an event are caught, and
 the other three change a value nothing reads. On the plain part of the USDT file, 66 of 80
 are caught. Two of the other 14 remove a test of the call data's length that the compiler
 now makes itself. The rest sit on paths that need several stored values to line up at
 once, a fee that is not zero or an upgrade to a contract that holds no code, which the
 drawn runs rarely reach. A change there would get past the check, so the check stays
-evidence.
+evidence. On the MiniMe token file, whose plain part lays the data of a call out in memory,
+45 of 57 are caught. The other 12 change a value nothing observes, or need the contract
+that is called to answer in one particular way.
 
 ### Decompiler against verified source
 

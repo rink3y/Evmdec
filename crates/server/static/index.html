@@ -140,6 +140,11 @@ main>*{min-width:0;min-height:0;overflow:auto}
 .kw{color:var(--kw)}.ty{color:var(--ty)}.st{color:var(--str)}.nu{color:var(--num)}.cm{color:var(--cm)}.fnname{color:var(--fn);font-weight:600}
 pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:auto;tab-size:4}
 .err{margin:16px;padding:12px 14px;border:1px solid var(--rubric);color:var(--fg)}
+.beta{display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--rubric);border-radius:3px;color:var(--rubric);font-size:10px;letter-spacing:.12em;vertical-align:1px}
+.solbar{padding:10px 12px;border-bottom:1px solid var(--hair);font-size:13px;line-height:1.5;color:var(--muted)}
+.solbar b{color:var(--fg)}.solbar p{margin:0}.solbar p+p{margin-top:4px}.solbar code{font-family:var(--mono);font-size:12px}
+.solwait{margin:16px;padding:12px 14px;border:1px solid var(--line);color:var(--fg);line-height:1.5}
+.solwait p{margin:0}.solwait p+p{margin-top:6px;color:var(--muted)}
 .err b{color:var(--rubric)}
 
 .findings{list-style:none;margin:0;padding:0}
@@ -256,6 +261,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
   <section class="drawing" aria-label="Drawing">
     <div role="tablist" class="tabs" id="tabs" aria-label="Views">
       <button role="tab" id="tab-code" aria-controls="panel-code" aria-selected="true" tabindex="0">Code</button>
+      <button role="tab" id="tab-sol" aria-controls="panel-sol" aria-selected="false" tabindex="-1">Solidity <span class="beta">Beta</span></button>
       <button role="tab" id="tab-report" aria-controls="panel-report" aria-selected="false" tabindex="-1">Report</button>
       <button role="tab" id="tab-storage" aria-controls="panel-storage" aria-selected="false" tabindex="-1">Storage &amp; events</button>
       <button role="tab" id="tab-disasm" aria-controls="panel-disasm" aria-selected="false" tabindex="-1">Disassembly</button>
@@ -266,6 +272,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
     </div>
     <div class="scale" id="scale" hidden></div>
     <div role="tabpanel" id="panel-code" aria-labelledby="tab-code"></div>
+    <div role="tabpanel" id="panel-sol" aria-labelledby="tab-sol" hidden></div>
     <div role="tabpanel" id="panel-report" aria-labelledby="tab-report" hidden></div>
     <div role="tabpanel" id="panel-graph" aria-labelledby="tab-graph" hidden></div>
     <div role="tabpanel" id="panel-storage" aria-labelledby="tab-storage" hidden></div>
@@ -284,6 +291,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 const $=s=>document.querySelector(s);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let DATA=null,CUR=null,SRC_LINES=[],SHOWN=[],HELPERS=new Set();
+let ASKED=null,SOLKEY=null;const SOLS=new Map();
 const SOON='<div class="report"><h2>Security analyzer</h2><p><b>Coming later.</b> The analyzer and its report are not part of this version. For now evmdec decompiles: the code, the storage and events, the disassembly and the graph of linked contracts.</p></div>';
 const root=document.documentElement,status=$('#status');
 function say(t){status.textContent='';setTimeout(()=>{status.textContent=t},30)}
@@ -299,16 +307,17 @@ paintTheme();
 fetch('/api/chains').then(r=>r.json()).then(cs=>{const sel=$('#chain');const want=sel.value;sel.innerHTML='';cs.forEach(c=>{const o=document.createElement('option');o.value=c.name;o.textContent=c.name+' ('+c.id+')';sel.appendChild(o)});if([...sel.options].some(o=>o.value===want))sel.value=want;fromUrl()}).catch(()=>fromUrl());
 
 const tabs=[...document.querySelectorAll('#tabs [role=tab]')];
-function selectTab(tab){tabs.forEach(t=>{const on=t===tab;t.setAttribute('aria-selected',on?'true':'false');t.tabIndex=on?0:-1;document.getElementById(t.getAttribute('aria-controls')).hidden=!on});$('#scale').hidden=!(DATA&&tab.id==='tab-code')}
+function selectTab(tab){tabs.forEach(t=>{const on=t===tab;t.setAttribute('aria-selected',on?'true':'false');t.tabIndex=on?0:-1;document.getElementById(t.getAttribute('aria-controls')).hidden=!on});$('#scale').hidden=!(DATA&&tab.id==='tab-code');if(DATA&&tab.id==='tab-sol')showSol()}
 tabs.forEach(t=>{t.addEventListener('click',()=>selectTab(t));t.addEventListener('keydown',e=>{const vis=tabs.filter(x=>!x.hidden);const i=vis.indexOf(t);let j=null;if(e.key==='ArrowRight')j=(i+1)%vis.length;if(e.key==='ArrowLeft')j=(i-1+vis.length)%vis.length;if(e.key==='Home')j=0;if(e.key==='End')j=vis.length-1;if(j!==null){e.preventDefault();vis[j].focus();selectTab(vis[j])}})});
 
 document.querySelectorAll('[data-try]').forEach(b=>b.addEventListener('click',()=>{$('#q').value=b.dataset.try;const sel=$('#chain');if([...sel.options].some(o=>o.value===b.dataset.chain))sel.value=b.dataset.chain;go()}));
 $('#form').addEventListener('submit',e=>{e.preventDefault();go()});
 $('#filter').addEventListener('input',renderFns);
-function shownText(){if(!DATA)return '';if(CUR==null)return DATA.contract.source;return SHOWN.map(([a,b])=>SRC_LINES.slice(a,b+1).join('\n')).join('\n\n')+'\n'}
+function solShown(){const s=$('#tab-sol').getAttribute('aria-selected')==='true'?SOLS.get(SOLKEY):null;return s&&s.source?s:null}
+function shownText(){if(!DATA)return '';if(solShown())return solShown().source;if(CUR==null)return DATA.contract.source;return SHOWN.map(([a,b])=>SRC_LINES.slice(a,b+1).join('\n')).join('\n\n')+'\n'}
 async function copyShown(){const text=shownText();if(!text)return;const btn=$('#copy');let ok=false;
  try{await navigator.clipboard.writeText(text);ok=true}catch(e){const ta=document.createElement('textarea');ta.value=text;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{ok=document.execCommand('copy')}catch(e2){}ta.remove()}
- const what=CUR==null?'the whole contract':'the function and its helpers';const n=text.split('\n').length;
+ const what=solShown()?'the Solidity file':CUR==null?'the whole contract':'the function and its helpers';const n=text.split('\n').length;
  btn.querySelector('span').textContent=ok?'Copied':'Copy failed';btn.classList.toggle('done',ok);say(ok?'Copied '+what+', '+n+' lines':'Copy failed; select the code and copy it by hand');
  clearTimeout(btn._t);btn._t=setTimeout(()=>{btn.querySelector('span').textContent='Copy';btn.classList.remove('done')},1600)}
 $('#copy').addEventListener('click',copyShown);
@@ -317,7 +326,7 @@ async function copySupport(btn){const addr=btn.dataset.addr;let ok=false;
  const w=btn.querySelector('.w');const was=w.dataset.was||(w.dataset.was=w.textContent);w.textContent=ok?'Copied':'Copy failed';btn.classList.toggle('done',ok);say(ok?'Copied the support address '+addr:'Copy failed; the address is '+addr);
  clearTimeout(btn._t);btn._t=setTimeout(()=>{w.textContent=was;btn.classList.remove('done')},1800)}
 document.querySelectorAll('#support,.sup-foot').forEach(b=>b.addEventListener('click',()=>copySupport(b)));
-$('#dl').addEventListener('click',()=>{if(!DATA)return;const blob=new Blob([DATA.contract.source],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(DATA.contract.address||'contract')+'.sol';a.click();say('Downloaded '+a.download)});
+$('#dl').addEventListener('click',()=>{if(!DATA)return;const sol=solShown();const blob=new Blob([sol?sol.source:DATA.contract.source],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=(sol?(sol.address||'contract')+'.beta':(DATA.contract.address||'contract'))+'.sol';a.click();say('Downloaded '+a.download)});
 function fromUrl(){const p=new URLSearchParams(location.search);const a=p.get('address');if(a&&/^0x[0-9a-fA-F]{40}$/.test(a)){$('#q').value=a;const sel=$('#chain'),c=p.get('chain');if(c&&[...sel.options].some(o=>o.value===c))sel.value=c;go()}}
 
 let REQ=0;
@@ -326,7 +335,7 @@ async function go(){const q=$('#q').value.trim();if(!q)return;const mine=++REQ;c
   const isAddr=/^0x[0-9a-fA-F]{40}$/.test(q);const body=isAddr?{address:q,chain}:{bytecode:q};
   const r=await fetch('/api/decompile',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json();if(mine!==REQ)return;if(!r.ok)throw new Error(j.error||r.statusText);
-  DATA=j;CUR=null;document.body.dataset.state='loaded';$('#landing-err').innerHTML='';
+  DATA=j;CUR=null;ASKED={chain,code:isAddr?null:q};document.body.dataset.state='loaded';$('#landing-err').innerHTML='';
   if(isAddr){history.replaceState(null,'','?chain='+encodeURIComponent(chain)+'&address='+q)}
   ROOT=j;ENTRIES=buildEntries(j);show(0);
   document.title=(isAddr?q.slice(0,10)+'…'+q.slice(-4)+' on '+chain:'pasted bytecode')+' · evmdec';
@@ -350,7 +359,7 @@ function depsBand(){const el=$('#deps');if(ENTRIES.length<2){el.hidden=true;retu
  let out='';ENTRIES.forEach((e,i)=>{const cur=i===CURRENT;out+='<button type="button" class="dep'+(cur?' cur':'')+'" data-entry="'+i+'"'+(cur?' aria-current="true"':'')+' aria-label="'+esc(e.label+' '+e.address+(cur?', shown':''))+'"><b>'+esc(e.label)+'</b><code>'+esc(shortA(e.address))+'</code></button>'});
  $('#deps-lbl').textContent='Contracts';$('#deps-list').innerHTML=out;el.hidden=false;
  el.querySelectorAll('button[data-entry]').forEach(b=>b.addEventListener('click',()=>{const i=+b.dataset.entry;if(i!==CURRENT){show(i);say('Showing '+ENTRIES[i].label+' '+ENTRIES[i].address)}}))}
-function rerender(){titleBlock();prepareSource();renderFns();renderAll();depsBand();selectTab($('#tab-code'));$('#panel-code').scrollTop=0}
+function rerender(){titleBlock();prepareSource();renderFns();renderAll();depsBand();SOLKEY=null;$('#panel-sol').innerHTML='';selectTab($('#tab-code'));$('#panel-code').scrollTop=0}
 function graphPanel(){const root=ROOT||DATA;const c=root.contract;const linked=root.linked||[];const parts=(c.parts||[]).slice(1);
  if(!linked.length&&!parts.length)return '<div class="graph"><p>This contract was decompiled on its own: no implementation, facets or linked contracts were fetched. Decompile by address to have them fetched.</p></div>';
  const node=(cls,title,addr,why,openIdx)=>'<div class="node '+cls+'"><div><b>'+esc(title)+'</b><code>'+esc(addr)+'</code></div>'+'<span></span>'+(why?'<div class="why">'+why+'</div>':'')+(openIdx==null?'':'<button type="button" class="open" data-linked="'+openIdx+'">Open</button>')+'</div>';
@@ -371,8 +380,8 @@ function titleBlock(){const c=DATA.contract,s=c.stats;const meta=(c.info&&c.info
 
 function prepareSource(){SRC_LINES=DATA.contract.source.split('\n');HELPERS=new Set((DATA.contract.functions||[]).filter(f=>f.kind==='internal').map(f=>f.name))}
 
-function hl(src){const KW=/^(function|contract|if|else|while|return|revert|require|assert|emit|event|error|external|internal|view|pure|payable|returns|mapping|fallback|receive|constructor|break|continue|switch|case|goto|true|false|unchecked|delete|new)$/,TY=/^(address|uint\d*|int\d*|bool|bytes\d*|string)$/;
- return esc(src).replace(/(\/\/[^\n]*)|(&quot;(?:[^\\\n]|\\.)*?&quot;)|\b(0x[0-9a-fA-F]+|\d+)\b|\b([A-Za-z_]\w*)\b/g,(m,cm,st,nu,id)=>{if(cm)return '<span class="cm">'+cm+'</span>';if(st)return '<span class="st">'+st+'</span>';if(nu)return '<span class="nu">'+nu+'</span>';if(KW.test(id))return '<span class="kw">'+id+'</span>';if(TY.test(id))return '<span class="ty">'+id+'</span>';return id}).replace(/(<span class="kw">function<\/span>) ([A-Za-z_]\w*)/g,'$1 <span class="fnname">$2</span>').replace(/(<span class="fnname">)?\b([A-Za-z_]\w*)(?=\()/g,(m,def,name)=>(def||!HELPERS.has(name))?m:'<a class="fnref" href="#fn-'+name+'" data-fn="'+name+'" aria-label="Go to the definition of '+name+'">'+name+'</a>')}
+function hl(src,bare){const KW=/^(function|contract|if|else|while|return|revert|require|assert|emit|event|error|external|internal|view|pure|payable|returns|mapping|fallback|receive|constructor|break|continue|switch|case|goto|true|false|unchecked|delete|new)$/,TY=/^(address|uint\d*|int\d*|bool|bytes\d*|string)$/;
+ return esc(src).replace(/(\/\/[^\n]*)|(&quot;(?:[^\\\n]|\\.)*?&quot;)|\b(0x[0-9a-fA-F]+|\d+)\b|\b([A-Za-z_]\w*)\b/g,(m,cm,st,nu,id)=>{if(cm)return '<span class="cm">'+cm+'</span>';if(st)return '<span class="st">'+st+'</span>';if(nu)return '<span class="nu">'+nu+'</span>';if(KW.test(id))return '<span class="kw">'+id+'</span>';if(TY.test(id))return '<span class="ty">'+id+'</span>';return id}).replace(/(<span class="kw">function<\/span>) ([A-Za-z_]\w*)/g,'$1 <span class="fnname">$2</span>').replace(/(<span class="fnname">)?\b([A-Za-z_]\w*)(?=\()/g,(m,def,name)=>(def||bare||!HELPERS.has(name))?m:'<a class="fnref" href="#fn-'+name+'" data-fn="'+name+'" aria-label="Go to the definition of '+name+'">'+name+'</a>')}
 
 function renderFns(){if(!DATA)return;const q=$('#filter').value.toLowerCase();const order={external:0,fallback:1,receive:2,constructor:3,internal:4,orphan:5};const fs=DATA.contract.functions.filter(x=>!x.inlined).sort((a,b)=>((order[a.kind]??9)-(order[b.kind]??9)));let out='<li><button type="button" data-pc="-1" aria-current="'+(CUR==null?'true':'false')+'"><span class="sheet-no">F-00</span><span class="name">Whole contract</span><span class="mut">'+SRC_LINES.length+' lines</span></button></li>',sheet=0,lastKind='';
  fs.forEach(x=>{sheet++;if(x.kind!==lastKind){lastKind=x.kind;const n=fs.filter(y=>y.kind===x.kind).length;out+='<li class="grp" role="presentation">'+esc(x.kind)+' · '+n+'</li>'}
@@ -425,6 +434,28 @@ function hashCell(t){if(t.length<=24)return '<code>'+esc(t).split('_').join('_<w
 function partLabel(c,p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.role==='implementation')return 'impl';const i=(c.parts||[]).indexOf(p);return 'facet '+(i<0?'?':i)}
 function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.role==='implementation')return 'impl';const a=p.address||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
 function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(p=>'<span class="pt">'+esc(partLabel(c,p))+'</span>').join('<br>')}
+/* The file is the source of one contract's code. A proxy shown whole gives the file of what it runs. */
+function solTarget(){const e=ENTRIES[CURRENT];if(!e||!ASKED)return null;const c=e.data.contract;
+ if(CURRENT===0&&c.parts&&c.parts.length){const p=c.parts.find(x=>x.role==='implementation');return p&&p.address?{address:p.address,of:'the implementation'}:{pick:true}}
+ if(e.address)return {address:e.address};return ASKED.code?{code:ASKED.code}:null}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function solWaiting(since){const s=Math.round((Date.now()-since)/1000);return '<div class="solwait"><p><b>Building the Solidity file…</b> '+(s?s+' s':'')+'</p><p>Every function is compiled and run beside the original bytecode before it is shown. A small token takes seconds, a large contract several minutes. You can use the other tabs meanwhile.</p></div>'}
+function solFile(s,t){const lines=s.source.replace(/\n$/,'').split('\n');const exact=s.source.includes('function _original()');const all=s.equal===s.compared;
+ let rows='';for(const l of lines)rows+='<li class="ln"><code>'+(hl(l,true)||' ')+'</code></li>';
+ return '<div class="solbar"><p><b>Beta.</b> A Solidity file a compiler accepts'+(t.of?', for '+esc(t.of)+' <code>'+esc(t.address)+'</code>':'')+'. Built with solc '+esc(s.compiler)+'.</p><p><b>'+s.equal+' of '+s.compared+'</b> entry points did the same as the bytecode'+(all?'':' (the rest are marked in the file)')+'; the runs reached '+s.branches_reached+' of '+s.branches+' branch outcomes. '+s.named+' function'+(s.named===1?'':'s')+' declared by name, <b>'+s.plain.length+'</b> written as plain Solidity.</p>'+(exact?'<p>The other functions run an exact translation of the bytecode, kept in <code>_original()</code> at the end of the file.</p>':'')+'</div><ol class="code" aria-label="Solidity file, '+lines.length+' lines" style="counter-reset:ln 0">'+rows+'</ol>'}
+async function showSol(){const el=$('#panel-sol');const t=solTarget();
+ if(!t){el.innerHTML='';return}
+ if(t.pick){el.innerHTML='<div class="solwait"><p><b>This contract is made of several parts.</b></p><p>Choose one part in the bar above the code, then open this tab again.</p></div>';return}
+ const body=t.code?{bytecode:t.code,solidity:true}:{address:t.address,chain:ASKED.chain,solidity:true};const key=JSON.stringify(body);SOLKEY=key;
+ const have=SOLS.get(key);if(have&&have.source){el.innerHTML=solFile(have,t);return}
+ const since=have?have.since:Date.now();el.innerHTML=solWaiting(since);if(have)return;
+ SOLS.set(key,{since});say('Building the Solidity file');
+ try{for(;;){const r=await fetch('/api/decompile',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const j=await r.json();
+   if(r.status===202){if(Date.now()-since>9e5)throw new Error('the server did not finish in time');if(SOLKEY===key)el.innerHTML=solWaiting(since);await sleep(2500);continue}
+   if(!r.ok)throw new Error(j.error||r.statusText);if(j.failed)throw new Error(j.failed);
+   SOLS.set(key,Object.assign({address:t.address||''},j.solidity));break}}
+ catch(e){SOLS.delete(key);if(SOLKEY===key){el.innerHTML='<div class="err" role="alert"><b>Could not build the Solidity file.</b> '+esc(e.message||e)+'</div>';say('The Solidity file failed: '+(e.message||e))}return}
+ const s=SOLS.get(key);if(SOLKEY===key){el.innerHTML=solFile(s,t);el.scrollTop=0;say('Solidity file ready: '+s.plain.length+' of '+s.named+' named functions are plain Solidity')}}
 function renderAll(){const c=DATA.contract;renderCode();$('#panel-report').innerHTML=SOON;
  $('#panel-storage').innerHTML=storagePanel(c);
  $('#panel-graph').innerHTML=graphPanel();$('#panel-graph').querySelectorAll('button[data-linked]').forEach(b=>b.addEventListener('click',()=>{const k=ENTRIES.findIndex(e=>e.linked===+b.dataset.linked);if(k>=0){show(k);say('Showing '+ENTRIES[k].label+' '+ENTRIES[k].address)}}));$('#panel-graph').querySelectorAll('button[data-part]').forEach(b=>b.addEventListener('click',()=>{const k=+b.dataset.part;if(k<ENTRIES.length){show(k);say('Showing '+ENTRIES[k].label+' '+ENTRIES[k].address)}}));

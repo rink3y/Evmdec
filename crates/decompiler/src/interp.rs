@@ -81,6 +81,9 @@ pub struct Host {
     pub seed: u64,
     pub intercept_calls: bool,
     pub unset_storage: bool,
+    // State drawn the way state on a chain tends to be: many small numbers, and many
+    // accounts that hold no code.
+    pub everyday: bool,
 }
 
 impl Host {
@@ -111,6 +114,7 @@ impl Host {
             seed: rng.next_u64(),
             intercept_calls: false,
             unset_storage: false,
+            everyday: false,
         }
     }
 
@@ -135,6 +139,7 @@ impl Host {
             seed: CONTROLLED_SEED,
             intercept_calls: false,
             unset_storage: false,
+            everyday: false,
         }
     }
     pub fn balance(&self, a: U256) -> U256 {
@@ -142,7 +147,11 @@ impl Host {
             & U256::from_u64(u64::MAX)
     }
     pub fn extcodesize(&self, a: U256) -> U256 {
-        code_size(self.seed, a)
+        let size = code_size(self.seed, a);
+        match self.everyday && size.low_u64().is_multiple_of(4) {
+            true => U256::ZERO,
+            false => size,
+        }
     }
     pub fn extcodehash(&self, a: U256) -> U256 {
         if a.is_zero() {
@@ -188,10 +197,17 @@ impl Host {
             return U256::ZERO;
         }
         let r = h(&[&self.seed.to_be_bytes()[..], b"stor", &k.to_be_bytes()].concat());
-        if r.low_u64().is_multiple_of(3) {
-            U256::ZERO
-        } else {
-            r
+        match r.low_u64() % 3 {
+            0 => U256::ZERO,
+            /* Real state is mostly small numbers. A word of random bits fails nearly
+            every sum that is tested for overflow, and the code past the test never runs.
+            A third of the words are given a random length of up to eight bytes. */
+            1 if self.everyday => {
+                let length = (r >> 64).low_u64() % 65;
+                let bits = (r >> 128).low_u64();
+                U256::from_u64(bits.checked_shr(64 - length as u32).unwrap_or(0))
+            }
+            _ => r,
         }
     }
     pub fn call_result(&self, i: usize) -> (bool, Vec<u8>) {

@@ -252,6 +252,7 @@ fn run(
     host.seed = input.seed;
     host.origin = input.origin;
     host.unset_storage = input.unset;
+    host.everyday = true;
     host.timestamp = input.timestamp;
     host.intercept_calls = true;
     let mut m = Machine::new(code, &host);

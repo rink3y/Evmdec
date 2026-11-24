@@ -520,7 +520,7 @@ fn a_block_of_memory_is_taken_then_written_and_a_text_handed_on_stays_a_text() {
         "{router}"
     );
     assert!(
-        router.contains("address[] arg1) external view returns (uint256[])"),
+        router.contains("address[] memory arg1) external view returns (uint256[] memory)"),
         "{router}"
     );
     assert!(router.contains("assembly { ptr1 := arg1 }"), "{router}");
@@ -531,6 +531,35 @@ fn a_block_of_memory_is_taken_then_written_and_a_text_handed_on_stays_a_text() {
         "{token}"
     );
     assert!(!token.contains("s1_0 = 37;"), "{token}");
+}
+
+#[test]
+fn the_solidity_form_is_a_whole_file_written_with_no_compiler() {
+    let opts = evmdec::decompile::Options {
+        solidity: true,
+        ..evmdec::decompile::Options::default()
+    };
+    let few = ["weth9", "usdt", "univ2_pair"];
+    for (name, code) in corpus()
+        .into_iter()
+        .filter(|(n, _)| few.contains(&n.as_str()))
+    {
+        let source = evmdec::decompile::decompile(&code, &opts).source;
+        let head = "// SPDX-License-Identifier: UNLICENSED\npragma solidity ";
+        assert!(source.starts_with(head), "{name}");
+        assert!(source.trim_end().ends_with('}'), "{name}");
+        assert!(!source.contains("_original"), "{name}");
+    }
+    let unnamed = evmdec::hex::decode("0x60003560e01c631234567814601057005b00").unwrap();
+    let source = evmdec::decompile::decompile(&unnamed, &opts).source;
+    assert!(
+        source.contains("// selector 0x12345678 (unknown signature)"),
+        "{source}"
+    );
+    assert!(
+        source.contains("function func_12345678() external"),
+        "{source}"
+    );
 }
 
 #[test]

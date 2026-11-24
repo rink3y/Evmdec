@@ -1394,8 +1394,12 @@ pub fn is_bool(e: ExprId, n: &Names) -> bool {
     if n.strict && matches!(expr::node(e), Node::Var(_)) {
         return n.bools.contains(&e);
     }
+    let joined = |e: ExprId| match expr::node(e) {
+        Node::Op(op::OR | op::AND, v) => logical(&v, n),
+        _ => false,
+    };
     expr::is_boolean(e)
-        || (n.strict && declared_flag(e, n))
+        || (n.strict && (declared_flag(e, n) || joined(e)))
         || n.bools.contains(&e)
         || packed_read(e).is_some_and(|(k, off, bits)| n.bool_fields.contains(&(k, off, bits)))
         || bool_element(e, n)

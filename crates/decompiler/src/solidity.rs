@@ -499,8 +499,11 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
         (payable || code != "require(msg.value == 0);") && !made
     };
     let lines: Vec<String> = f.code.lines().filter(own).map(one_value).collect();
-    let lines = without_scratch_before_taking(answers_kept(held_strings(lines)));
-    let lines = without_dead_stores(without_writes_before_failure(lines));
+    // Data written only for a failure goes first. What is left is what the checks on a
+    // block's taking have to account for.
+    let lines = without_writes_before_failure(answers_kept(held_strings(lines)));
+    let lines = scratch_taken_for_its_call(without_scratch_before_taking(lines));
+    let lines = without_dead_stores(lines);
     let mut lines = without_unread_blocks(lines);
     if lines.last().is_some_and(|l| l == "        return;") {
         lines.pop();
@@ -838,7 +841,8 @@ fn without_writes_before_failure(lines: Vec<String>) -> Vec<String> {
     let mut kept = vec![true; lines.len()];
     for end in (0..lines.len()).filter(|i| fails(&lines[*i])) {
         let written = lines[..end].iter().enumerate().rev();
-        for (i, _) in written.take_while(|(_, l)| l.trim_start().starts_with("mem[")) {
+        let writes = |l: &str| l.starts_with("mem[") || WRITERS.iter().any(|w| l.starts_with(w));
+        for (i, _) in written.take_while(|(_, l)| writes(l.trim_start())) {
             kept[i] = false;
         }
     }
@@ -849,23 +853,19 @@ fn without_writes_before_failure(lines: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/* A block the text takes and writes to but never reads, because what the block fed is
-shown by its values, does nothing. Its taking and its writes are left out. */
+const WRITERS: [&str; 5] = [
+    "_store(",
+    "_store8(",
+    "_copy_calldata(",
+    "_copy_returned(",
+    "_copy(",
+];
+
+/* A block the text writes to but never reads, because what the block fed is shown by
+its values, does nothing. Its writes are left out, and its taking where it has one. */
 fn without_unread_blocks(lines: Vec<String>) -> Vec<String> {
-    const WRITERS: [&str; 5] = [
-        "_store(",
-        "_store8(",
-        "_copy_calldata(",
-        "_copy_returned(",
-        "_copy(",
-    ];
-    let taken = lines.iter().filter_map(|l| {
-        let name = numbered_name(l.trim_start(), "ptr")?;
-        l.trim_start()[name.len()..]
-            .starts_with(" = _free();")
-            .then(|| name.to_string())
-    });
-    let taken: Vec<String> = taken.collect();
+    let named = lines.iter().flat_map(|l| blocks_named(l));
+    let named: BTreeSet<String> = named.map(str::to_string).collect();
     let only_writes = |block: &str, line: &str| {
         let code = line.trim_start();
         let writer = WRITERS.iter().find(|w| {
@@ -879,7 +879,7 @@ fn without_unread_blocks(lines: Vec<String>) -> Vec<String> {
                 !rest.starts_with(|c: char| c.is_ascii_digit()) && !mentions(rest, block)
             })
     };
-    let unread = taken.iter().find(|block| {
+    let unread = named.iter().find(|block| {
         let named = lines.iter().filter(|l| mentions(l, block));
         named.clone().count() > 0 && named.clone().all(|l| only_writes(block, l))
     });
@@ -900,33 +900,36 @@ and stays exact. */
 fn without_scratch_before_taking(mut lines: Vec<String>) -> Vec<String> {
     let indent = |l: &str| l.len() - l.trim_start().len();
     let calls = |l: &String| l.contains("call(") || l.contains("call{");
-    let takings = lines.iter().enumerate().filter_map(|(i, l)| {
-        let name = numbered_name(l.trim_start(), "ptr")?;
-        let taken = l.trim_start()[name.len()..].starts_with(" = _free();");
-        taken.then(|| (i, name.to_string()))
-    });
-    let takings: Vec<(usize, String)> = takings.collect();
+    let named = lines.iter().flat_map(|l| blocks_named(l));
+    let named: BTreeSet<String> = named.map(str::to_string).collect();
     let mut dropped = vec![false; lines.len()];
-    for (taking, block) in takings {
+    for block in named {
+        let taking = format!("{block} = _free();");
+        let takings: Vec<usize> = (0..lines.len())
+            .filter(|i| lines[*i].trim_start().starts_with(&taking))
+            .collect();
+        let after = |i: usize, t: usize| {
+            let inside = |l: &String| indent(l) >= indent(&lines[t]);
+            t <= i && lines[t..=i].iter().all(inside)
+        };
         let scratch = |i: usize| {
             let value = lines[i].split_once(" = ").map_or("", |(_, value)| value);
+            let next = takings.iter().find(|t| **t > i);
             lines[i].trim_start().starts_with("mem[")
                 && written_block(&lines[i]) == Some(block.as_str())
                 && !mentions(value, &block)
-                && lines[i..taking].iter().any(calls)
+                && next.is_some_and(|t| lines[i..*t].iter().any(calls))
         };
-        let before: Vec<usize> = (0..taking)
+        let loose: Vec<usize> = (0..lines.len())
             .filter(|i| mentions(&lines[*i], &block))
+            .filter(|i| !takings.iter().any(|t| after(*i, *t)))
             .collect();
-        let named = |i: &usize| mentions(&lines[*i], &block);
-        let last = (taking..lines.len()).rev().find(named).unwrap_or(taking);
-        let within = lines[taking..=last]
-            .iter()
-            .all(|l| indent(l) >= indent(&lines[taking]));
-        if within && before.iter().all(|i| scratch(*i)) {
-            before.into_iter().for_each(|i| dropped[i] = true);
+        if loose.iter().all(|i| scratch(*i)) {
+            loose.into_iter().for_each(|i| dropped[i] = true);
         } else {
-            lines[taking] = lines[taking].replacen(" = _free();", " = mem[64];", 1);
+            for t in takings {
+                lines[t] = lines[t].replacen(" = _free();", " = mem[64];", 1);
+            }
         }
     }
     let mut drop = dropped.into_iter();
@@ -934,6 +937,74 @@ fn without_scratch_before_taking(mut lines: Vec<String>) -> Vec<String> {
         .into_iter()
         .filter(|_| drop.next() == Some(false))
         .collect()
+}
+
+/* Data for a call that is not shown by its values is laid out in free memory and read
+back as bytes. Free memory is whatever the compiler last left there, so a file may write
+to it and read it back only with nothing in between that makes the compiler use it. Where
+that holds the block is named as the writes start and taken as the call is made. Where
+it does not the block stays unnamed, and the function fails to build and stays exact. */
+fn scratch_taken_for_its_call(mut lines: Vec<String>) -> Vec<String> {
+    const QUIET: [&str; 12] = [
+        "_memory",
+        "_store",
+        "_store8",
+        "_copy",
+        "_copy_calldata",
+        "_copy_returned",
+        "_calldata",
+        "_returndatasize",
+        "_word",
+        "require",
+        "if",
+        "while",
+    ];
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let quiet = |l: &String| {
+        let called = l.match_indices('(').map(|(at, _)| {
+            let mut name = l[..at].rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+            name.next().unwrap_or("")
+        });
+        let mut called = called.filter(|name| !name.is_empty());
+        !l.contains('"') && called.all(|name| QUIET.contains(&name) || elementary(name))
+    };
+    let named = lines.iter().flat_map(|l| blocks_named(l));
+    let named: BTreeSet<String> = named.map(str::to_string).collect();
+    for block in named {
+        let given = format!("{block} = ");
+        let read = format!("_range({block}, ");
+        let reads: Vec<usize> = (0..lines.len())
+            .filter(|i| lines[*i].contains(&read))
+            .collect();
+        let first = lines.iter().position(|l| mentions(l, &block));
+        let (Some(first), [call]) = (first, reads.as_slice()) else {
+            continue;
+        };
+        let call = *call;
+        let length = lines[call].split_once(&read).and_then(|(_, rest)| {
+            let end = close_of(rest)?;
+            (!rest[end..].contains(&read)).then(|| rest[..end].to_string())
+        });
+        let Some(length) = length else {
+            continue;
+        };
+        let assigned = lines.iter().any(|l| l.trim_start().starts_with(&given));
+        let later = lines[call + 1..].iter().any(|l| mentions(l, &block));
+        let within = lines[first..=call]
+            .iter()
+            .all(|l| indent(l) >= indent(&lines[first]));
+        if assigned || later || !within || !lines[first..call].iter().all(quiet) {
+            continue;
+        }
+        let taking = format!(
+            "{}_take({block} + ({length}));",
+            " ".repeat(indent(&lines[call]))
+        );
+        let naming = format!("{}{block} = _free();", " ".repeat(indent(&lines[first])));
+        lines.insert(call, taking);
+        lines.insert(first, naming);
+    }
+    lines
 }
 
 fn one_value(line: &str) -> String {
@@ -1071,6 +1142,7 @@ fn past_addresses(code: &str) -> &str {
         return past_addresses(rest.split_once("); ").map_or("", |(_, after)| after));
     }
     let helpers = [
+        ("_take(", 1),
         ("_store(", 1),
         ("_store8(", 1),
         ("_copy(", 2),
@@ -2115,6 +2187,21 @@ mod tests {
         let outside = "if (c) {\n    ptr2 = _free(); _take(ptr2 + 64);\n}\nf(ptr2);";
         let kept = without_scratch_before_taking(lines(outside)).join("\n");
         assert!(kept.contains("ptr2 = mem[64];"), "{kept}");
+        let each = "if (c) {\n    ptr2 = _free(); _take(ptr2 + 64);\n    f(ptr2);\n} else {\n    ptr2 = _free(); _take(ptr2 + 64);\n    g(ptr2);\n}";
+        assert_eq!(without_scratch_before_taking(lines(each)).join("\n"), each);
+    }
+
+    #[test]
+    fn data_laid_out_for_a_call_is_taken_as_the_call_is_made() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let laid = "_store(ptr1, a);\n_copy(ptr1 + 36, b + 32, _memory(b));\n(ok, ) = t.call(_range(ptr1, _memory(b) + 36));";
+        let want = "ptr1 = _free();\n_store(ptr1, a);\n_copy(ptr1 + 36, b + 32, _memory(b));\n_take(ptr1 + (_memory(b) + 36));\n(ok, ) = t.call(_range(ptr1, _memory(b) + 36));";
+        assert_eq!(scratch_taken_for_its_call(lines(laid)).join("\n"), want);
+        let busy = laid.replace(
+            "_copy(ptr1 + 36",
+            "x = keccak256(abi.encode(a));\n_copy(ptr1 + 36",
+        );
+        assert_eq!(scratch_taken_for_its_call(lines(&busy)).join("\n"), busy);
     }
 
     #[test]

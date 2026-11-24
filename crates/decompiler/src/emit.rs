@@ -152,6 +152,12 @@ pub struct Names {
     pub lengths: HashMap<u32, u64>,
     // Blocks the text has taken from free memory so far, which it may then write to.
     pub taken: RefCell<HashSet<u32>>,
+    // Blocks whose taking the text stated ahead of the statement that takes them. Each
+    // other way to a block states its own taking.
+    pub ahead: RefCell<HashSet<u32>>,
+    /* Blocks the code lays the data of a call out in without taking them. A file writes
+    such a block the same way and takes it as the call is made. */
+    pub open: HashSet<u32>,
     // Addresses of one-word blocks that are handed on as the word.
     pub handed: HashMap<ExprId, u32>,
     pub bool_fields: HashSet<(U256, u32, u32)>,
@@ -1993,7 +1999,7 @@ fn owned_memory(off: ExprId, n: &Names) -> bool {
         within.or_else(|| block_started(off, n)),
         expr::split_offset(off).0,
     ) {
-        (Some(number), _) => n.taken.borrow().contains(&number),
+        (Some(number), _) => n.taken.borrow().contains(&number) || n.open.contains(&number),
         (None, base) => base.is_some(),
     }
 }
@@ -2011,8 +2017,11 @@ same, so the block is memory nothing else is put in, and names the block by a va
 its own. A block the function keeps as local values needs no memory. */
 fn fmt_taken(val: ExprId, n: &Names) -> Option<String> {
     let (number, end) = taking(val, n)?;
-    let fresh = !n.scalars.contains_key(&number) && n.taken.borrow_mut().insert(number);
-    fresh.then(|| format!("ptr{number} = _free(); _take({end});"))
+    if n.scalars.contains_key(&number) || n.ahead.borrow_mut().remove(&number) {
+        return None;
+    }
+    n.taken.borrow_mut().insert(number);
+    Some(format!("ptr{number} = _free(); _take({end});"))
 }
 
 fn taking(val: ExprId, n: &Names) -> Option<(u32, String)> {
@@ -2057,7 +2066,9 @@ pub fn taking_ahead(stmts: &[Stmt], i: usize, n: &Names) -> Option<String> {
     match stmts.get(i + writes.count())? {
         Stmt::MStore { off, val, .. } if is_free_pointer(*off) => {
             let found = taking(*val, n).filter(|(taken, _)| *taken == number);
-            found.and_then(|_| fmt_taken(*val, n))
+            let stated = found.and_then(|_| fmt_taken(*val, n))?;
+            n.ahead.borrow_mut().insert(number);
+            Some(stated)
         }
         _ => None,
     }
@@ -2071,6 +2082,7 @@ fn taken_ahead(off: ExprId, n: &Names) -> String {
     let known = block_ref(off, n).and_then(|(number, _)| Some((number, *n.lengths.get(&number)?)));
     match known.filter(|(number, _)| n.strict && !n.scalars.contains_key(number)) {
         Some((number, length)) if n.taken.borrow_mut().insert(number) => {
+            n.ahead.borrow_mut().insert(number);
             format!("ptr{number} = _free(); _take(ptr{number} + {length}); ")
         }
         _ => String::new(),
@@ -2082,13 +2094,18 @@ pub fn note_block_lengths(l: &Lifted, n: &mut Names) {
         return;
     };
     let mut lengths: HashMap<u32, Option<u64>> = HashMap::new();
+    let (mut ever_taken, mut laid_out) = (HashSet::new(), HashSet::new());
     for s in l.nodes.iter().flat_map(|nd| &nd.stmts) {
+        if let Stmt::Call { in_off, .. } = s {
+            laid_out.extend(block_ref(*in_off, n).filter(|(_, at)| at.is_zero()));
+        }
         let Stmt::MStore { off, val, .. } = s else {
             continue;
         };
         if !is_free_pointer(*off) {
             continue;
         }
+        ever_taken.extend(taking(*val, n).map(|(number, _)| number));
         let (base, to) = expr::split_offset(*val);
         let before = blocks.get(&base).into_iter().flatten();
         let taken = before
@@ -2105,6 +2122,8 @@ pub fn note_block_lengths(l: &Lifted, n: &mut Names) {
         .into_iter()
         .filter_map(|(number, length)| Some((number, length?)))
         .collect();
+    let open = laid_out.into_iter().map(|(number, _)| number);
+    n.open = open.filter(|k| !ever_taken.contains(k)).collect();
 }
 
 pub fn fmt_mem_read(off: ExprId, n: &Names) -> String {
@@ -3952,6 +3971,10 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             }
             let selector = call_selector(layout.as_deref(), input.as_deref(), input_head);
             let payload = match (&fname, known) {
+                // Only the head of the data is known, and a file has to send all of it.
+                (Some(_), _) if n.strict && partial && whole.is_none() => {
+                    fmt_bytes_range(*in_off, *in_len, n)
+                }
                 // A compiler knows a selector by its four bytes, and by a name only for a
                 // function declared where it can see it.
                 (Some(_), _) if n.strict && selector.is_some() => format!(

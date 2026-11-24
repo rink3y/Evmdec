@@ -5,7 +5,10 @@ use crate::{keccak, U256};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 
-const STEPS: usize = 300_000;
+// A run of the original longer than this is a loop over a length the drawn state made
+// up. Following the source through one costs minutes and shows nothing a shorter run
+// does not.
+const STEPS: usize = 50_000;
 // A source that walks the bytecode instruction by instruction takes many steps for one.
 const SLOWER: usize = 96;
 const GAS_AT_START: u64 = 30_000_000;
@@ -702,11 +705,19 @@ pub fn compare(original: &[u8], candidate: &[u8], entries: &[Entry], runs: usize
             // of the source follows what the original needed, so a source that loops
             // forever is stopped soon.
             let budget = SLOWER * (a.steps + 1000);
-            let b = a
-                .effect
-                .as_ref()
-                .map(|_| run(candidate, &input, budget, None));
-            let (Some(a), Some(b)) = (a.effect, b.and_then(|b| b.effect)) else {
+            let Some(a) = a.effect else {
+                checked.unsettled += 1;
+                continue;
+            };
+            let b = run(candidate, &input, budget, None);
+            let Some(b) = b.effect else {
+                // A source still running at many times the steps the original took to end
+                // does not do what the original does.
+                if b.steps == budget {
+                    let said = "the original ends and the source runs on";
+                    checked.differs = Some(described(&input, said));
+                    break;
+                }
                 checked.unsettled += 1;
                 continue;
             };
@@ -718,8 +729,9 @@ pub fn compare(original: &[u8], candidate: &[u8], entries: &[Entry], runs: usize
                 continue;
             }
             checked.returned += usize::from(a.ok);
-            if !same(&a, &b, entry.loose) && checked.differs.is_none() {
+            if !same(&a, &b, entry.loose) {
                 checked.differs = Some(described(&input, &difference(&a, &b)));
+                break;
             }
         }
         functions.push(checked);

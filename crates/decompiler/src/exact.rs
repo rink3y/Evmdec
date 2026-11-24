@@ -243,12 +243,12 @@ impl Translation<'_> {
 keeps a jump at a dozen tests in the largest contract. The tests are `if` and never
 `switch`: a switch keeps its value on the compiler's stack for as long as a case runs,
 and a dozen of them nested leave no room to reach a variable. Every leaf ends in `done`,
-so nothing runs on into the next test. */
+so nothing runs on into the next test, and a key no leaf took ends in `missed`. */
 fn tree(
     on: &str,
     keys: &[usize],
     leaf: &dyn Fn(usize) -> Vec<String>,
-    done: &str,
+    (done, missed): (&str, &str),
     depth: usize,
 ) -> String {
     let pad = "    ".repeat(depth);
@@ -264,10 +264,12 @@ fn tree(
         return text;
     }
     let (low, high) = keys.split_at(keys.len() / 2);
-    let below = tree(on, low, leaf, done, depth + 1);
-    let above = tree(on, high, leaf, done, depth);
+    let below = tree(on, low, leaf, (done, missed), depth + 1);
+    let above = tree(on, high, leaf, (done, missed), depth);
     let edge = high[0];
-    format!("{pad}if lt({on}, {edge:#x}) {{\n{below}{pad}    {done}\n{pad}}}\n{above}")
+    // A key in the lower half that no leaf took is a key that is not there. Going
+    // round again with it would never end.
+    format!("{pad}if lt({on}, {edge:#x}) {{\n{below}{pad}    {missed}\n{pad}}}\n{above}")
 }
 
 fn destinations(code: &[u8], end: usize) -> Vec<usize> {
@@ -338,12 +340,12 @@ pub fn translate(code: &[u8], end: usize, prevrandao: bool) -> String {
         let words: Vec<usize> = (0..code.len().div_ceil(32)).collect();
         let word = |i: usize| vec![format!("w := {}", word_at(code, 32 * i).to_hex())];
         out.push_str("            function cw(i) -> w {\n");
-        out.push_str(&tree("i", &words, &word, "leave", 4));
+        out.push_str(&tree("i", &words, &word, ("leave", "leave"), 4));
         out.push_str("            }\n");
         out.push_str(COPY);
     }
     out.push_str("            let sp := 0\n            let ip := 0\n            for {} 1 {} {\n");
-    out.push_str(&tree("ip", &starts, &body, "continue", 4));
+    out.push_str(&tree("ip", &starts, &body, ("continue", "invalid()"), 4));
     out.push_str("                invalid()\n");
     out.push_str("            }\n");
     out

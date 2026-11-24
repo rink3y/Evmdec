@@ -101,3 +101,14 @@ fn the_solidity_file_compiles_and_does_what_the_code_does() {
     assert!(file.starts_with("// SPDX-License-Identifier: UNLICENSED\npragma solidity 0.8."));
     assert!(file.contains("fallback() external payable {"));
 }
+
+#[test]
+fn a_jump_to_no_destination_fails_in_the_solidity_file_too() {
+    // Jumps to an instruction that is not a destination, with five destinations after it.
+    let code = file("nowhere.hex", "6002565b5b5b5b5b00");
+    let out = evmdec(&["decompile", code.to_str().unwrap(), "--sol"]);
+    let _ = std::fs::remove_file(&code);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("1 of 1 equal"), "{said}");
+}

@@ -4,7 +4,20 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const RELEASES: &str = "https://binaries.soliditylang.org/linux-amd64";
+const RELEASES: &str = "https://binaries.soliditylang.org";
+
+/* The compiler is a program for one kind of processor. The builds for ARM start at
+0.8.31, so on such a machine a source that asks for an older compiler finds none, and
+the Solidity file falls back to the pragma any current compiler takes. */
+fn platform(arch: &str) -> Result<&'static str, String> {
+    match arch {
+        "x86_64" => Ok("linux-amd64"),
+        "aarch64" => Ok("linux-arm64"),
+        other => Err(format!(
+            "no Solidity compiler is published for a {other} machine, set SOLC to one"
+        )),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Built {
@@ -93,12 +106,19 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn releases() -> Result<BTreeMap<Version, String>, String> {
+struct Releases {
+    platform: &'static str,
+    paths: BTreeMap<Version, String>,
+    hashes: HashMap<String, String>,
+}
+
+fn releases() -> Result<Releases, String> {
+    let platform = platform(std::env::consts::ARCH)?;
     let dir = cache_dir();
-    let listed = dir.join("list.json");
+    let listed = dir.join(format!("list-{platform}.json"));
     if !listed.exists() {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let bytes = fetch(&format!("{RELEASES}/list.json"))?;
+        let bytes = fetch(&format!("{RELEASES}/{platform}/list.json"))?;
         std::fs::write(&listed, bytes).map_err(|e| e.to_string())?;
     }
     let text = std::fs::read_to_string(&listed).map_err(|e| e.to_string())?;
@@ -109,7 +129,16 @@ fn releases() -> Result<BTreeMap<Version, String>, String> {
     let known = all
         .iter()
         .filter_map(|(v, path)| Some((parse_version(v)?, path.as_str()?.to_string())));
-    Ok(known.collect())
+    let builds = list["builds"].as_array().into_iter().flatten();
+    let hashed = builds.filter_map(|b| {
+        let hash = b["keccak256"].as_str()?.trim_start_matches("0x");
+        Some((b["path"].as_str()?.to_string(), hash.to_string()))
+    });
+    Ok(Releases {
+        platform,
+        paths: known.collect(),
+        hashes: hashed.collect(),
+    })
 }
 
 // `SOLC` names a compiler to use as it is, for a machine that may not download one.
@@ -120,13 +149,19 @@ fn compiler(pragmas: &[String]) -> Result<(PathBuf, String), String> {
     let known = releases()?;
     let fits = |v: &Version| pragmas.iter().all(|p| allowed(*v, p));
     let (version, path) = known
+        .paths
         .iter()
         .rev()
         .find(|(v, _)| fits(v))
-        .ok_or_else(|| format!("no compiler release fits {pragmas:?}"))?;
+        .ok_or_else(|| format!("no {} compiler release fits {pragmas:?}", known.platform))?;
     let local = cache_dir().join(path);
     if !local.exists() {
-        let bytes = fetch(&format!("{RELEASES}/{path}"))?;
+        let bytes = fetch(&format!("{RELEASES}/{}/{path}", known.platform))?;
+        // The file is run, so it has to be the one the list names.
+        let hash = hex::encode_plain(&crate::keccak::keccak256(&bytes));
+        if known.hashes.get(path) != Some(&hash) {
+            return Err(format!("{path} is not the file the compiler list names"));
+        }
         std::fs::write(&local, bytes).map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
@@ -254,6 +289,13 @@ pub fn compile_with(source: &str, optimize: bool) -> Result<Vec<Built>, Refusal>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_compiler_is_the_build_for_the_processor_it_runs_on() {
+        assert_eq!(platform("x86_64").as_deref(), Ok("linux-amd64"));
+        assert_eq!(platform("aarch64").as_deref(), Ok("linux-arm64"));
+        assert!(platform("riscv64").is_err());
+    }
 
     #[test]
     fn a_pragma_picks_the_versions_it_allows() {

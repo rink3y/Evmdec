@@ -493,6 +493,9 @@ again answers `202` until the file is there and `200` with it after. A file that
 be built answers `200 {"failed": "..."}`. Two files are built at a time, each for at most
 ten minutes, and eight may be asked for at once. The server downloads the compiler a file
 needs from `binaries.soliditylang.org` the first time and keeps it in `EVMDEC_SOLC_DIR`.
+It takes the build for its own processor, x86-64 or ARM64, and checks the download against
+the hash the list gives. The ARM64 builds start at 0.8.31, so on such a machine a contract
+built with an older 0.8 compiler gets its file under the pragma any current compiler takes.
 
 ### Configuration
 

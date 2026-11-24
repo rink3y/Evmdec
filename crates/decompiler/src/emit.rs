@@ -111,9 +111,11 @@ pub struct Names {
     pub in_helper: bool,
     pub aliases: HashMap<ExprId, String>,
     pub fields: HashMap<(U256, u32, u32), String>,
+    pub field_types: HashMap<(U256, u32, u32), String>,
     pub args: HashMap<u32, String>,
     pub narrow: HashSet<String>,
     pub callee_names: HashMap<usize, String>,
+    pub callee_params: std::sync::Arc<HashMap<usize, Vec<String>>>,
     pub payload_overrides: RefCell<HashMap<ExprId, String>>,
     pub blocks: Option<Blocks>,
     pub storage: HashMap<U256, String>,
@@ -1387,6 +1389,11 @@ fn declared_flag(e: ExprId, n: &Names) -> bool {
 }
 
 pub fn is_bool(e: ExprId, n: &Names) -> bool {
+    // A value two paths give is a flag in a file only where it is declared one. The
+    // mark on the expression is shared by every function that numbers a value alike.
+    if n.strict && matches!(expr::node(e), Node::Var(_)) {
+        return n.bools.contains(&e);
+    }
     expr::is_boolean(e)
         || (n.strict && declared_flag(e, n))
         || n.bools.contains(&e)
@@ -1429,13 +1436,82 @@ fn is_address(e: ExprId, n: &Names) -> bool {
     }
 }
 
-// A compiler does no sums on a flag or an address, which the bytecode does freely.
+// A value the text gives a type shorter than a word: a cast, or a variable sharing a slot.
+fn short_number(e: ExprId, n: &Names) -> bool {
+    let cast = |m: U256| m.is_low_mask() && m.bits() < 256 && m.bits().is_multiple_of(8);
+    match expr::node(e) {
+        Node::Op(op::AND, v) => expr::as_const(v[1]).is_some_and(cast),
+        _ => packed_read(e).is_some_and(|field| n.fields.contains_key(&field)),
+    }
+}
+
+/* A compiler does no sums on a flag or an address, which the bytecode does freely. It
+also does a sum of two short numbers in their own short type, where the bytecode does
+every sum on whole words. */
 fn fmt_number(e: ExprId, outer: u8, n: &Names) -> String {
-    let odd = n.strict && !expr::is_const(e) && (is_bool(e, n) || is_address(e, n));
-    match odd {
-        true => as_word(e, n),
+    if !n.strict || expr::is_const(e) {
+        return fmt_prec(e, outer, n);
+    }
+    if is_bool(e, n) || is_address(e, n) {
+        return as_word(e, n);
+    }
+    match short_number(e, n) {
+        true => format!("uint256({})", fmt_expr(e, n)),
         false => fmt_prec(e, outer, n),
     }
+}
+
+// The variables that share one slot, from the lowest byte up, each with its type.
+fn sharing(key: ExprId, n: &Names) -> Vec<(u32, u32, &String, &str)> {
+    let Some(slot) = expr::as_const(key) else {
+        return Vec::new();
+    };
+    let own = n.fields.iter().filter(|((at, _, _), _)| *at == slot);
+    let mut all: Vec<(u32, u32, &String, &str)> = own
+        .map(|(field, name)| {
+            let ty = n.field_types.get(field).map_or("", String::as_str);
+            (field.1, field.2, name, ty)
+        })
+        .collect();
+    all.sort_unstable();
+    all
+}
+
+/* A slot several variables share has no name of its own in a file. Read whole it is the
+variables side by side, and a write of the whole word is a write to each of them. */
+fn whole_packed(key: ExprId, n: &Names) -> Option<String> {
+    let word = |(offset, _, name, ty): &(u32, u32, &String, &str)| {
+        let number = match *ty {
+            "bool" => format!("({name} ? 1 : 0)"),
+            "address" => format!("uint256(uint160({name}))"),
+            _ => format!("uint256({name})"),
+        };
+        match offset {
+            0 => number,
+            _ => format!("{number} << {}", 8 * offset),
+        }
+    };
+    let parts: Vec<String> = sharing(key, n).iter().map(word).collect();
+    (!parts.is_empty()).then(|| format!("({})", parts.join(" | ")))
+}
+
+fn packed_store(key: ExprId, val: ExprId, n: &Names) -> Option<String> {
+    let whole = fmt_prec(val, P_SHIFT + 1, n);
+    let given = |(offset, bits, name, ty): &(u32, u32, &String, &str)| {
+        let part = match offset {
+            0 => fmt_expr(val, n),
+            _ => format!("{whole} >> {}", 8 * offset),
+        };
+        let value = match *ty {
+            "bool" => format!("uint8({part}) != 0"),
+            "address" => format!("address(uint160({part}))"),
+            "" => format!("uint{bits}({part})"),
+            ty => format!("{ty}({part})"),
+        };
+        format!("{name} = {value};")
+    };
+    let writes: Vec<String> = sharing(key, n).iter().map(given).collect();
+    (!writes.is_empty()).then(|| writes.join(" "))
 }
 
 // A flag is not ordered for a compiler, nor is an address against a number.
@@ -2419,6 +2495,9 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
             (format!("_word(returned_{}, {at})", n.seq(seq)), P_PRIMARY)
         }
         Node::MLoad(off, _) => (fmt_mem_word(off, n), P_PRIMARY),
+        Node::SLoad(key, false, _) if n.strict && whole_packed(key, n).is_some() => {
+            (whole_packed(key, n).unwrap_or_default(), P_PRIMARY)
+        }
         Node::SLoad(key, transient, _) => (
             fmt_slot(key, n, SlotSpace::from_transient(transient)),
             P_PRIMARY,
@@ -2770,6 +2849,12 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                     let bits = m.bits();
                     if bits == 160 && n.strict && is_address(v[0], n) {
                         return (fmt_prec(v[0], P_PRIMARY, n), P_PRIMARY);
+                    }
+                    if bits == 160 && n.strict {
+                        return (
+                            format!("address(uint160({}))", fmt_expr(v[0], n)),
+                            P_PRIMARY,
+                        );
                     }
                     if bits == 160 {
                         return (format!("address({})", fmt_expr(v[0], n)), P_PRIMARY);
@@ -3498,6 +3583,9 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     }
                 }
             }
+            if let Some(writes) = packed_store(*key, *val, n).filter(|_| n.strict && !*transient) {
+                return writes;
+            }
             if !*transient && !n.member_fields.is_empty() {
                 if let Some(w) = crate::ssa::field_write(*key, *val) {
                     if let Some(field) = member_field(*key, w.bit_offset, w.bits, n) {
@@ -3784,10 +3872,14 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             // A number handed to a helper that uses it as a place is the block that starts there.
             let places = n.offsets.handed.get(callee);
             let place = |j: &usize| places.is_some_and(|p| p.contains(j));
+            let declared = n.callee_params.get(callee).filter(|_| n.strict);
             let shown = |(j, x): (usize, &ExprId)| match (handed_word(*x, n), place(&j)) {
                 (Some(word), _) => word,
                 (None, true) => fmt_stored_word(*x, n),
-                (None, false) => fmt_expr(*x, n),
+                (None, false) => match declared.and_then(|types| types.get(j)) {
+                    Some(ty) => as_declared(ty, *x, n),
+                    None => fmt_expr(*x, n),
+                },
             };
             let a: Vec<String> = args.iter().enumerate().map(shown).collect();
             let call = format!("{}({})", n.callee_name(*callee), a.join(", "));
@@ -3880,7 +3972,12 @@ fn call_selector(
 ) -> Option<u32> {
     let piece = layout.and_then(|l| l.first()).map(|(e, _)| *e);
     let word = input.and_then(|w| w.first()).copied();
-    let first = expr::as_const(piece.or(word).or(head.first().copied())?)?;
+    let start = piece.or(word).or(head.first().copied())?;
+    // Some code ors the selector into a word that also holds the start of the first
+    // argument, and the word is then no constant.
+    let Some(first) = expr::as_const(start) else {
+        return leading_selector(start, None);
+    };
     let high = first.bits() > 32;
     Some(if high { first >> 224 } else { first }.low_u64() as u32)
 }

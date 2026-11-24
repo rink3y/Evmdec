@@ -1978,6 +1978,7 @@ fn element_depth(ty: &str) -> usize {
 #[derive(Clone, Debug, Default)]
 pub struct Callees {
     pub returns: HashMap<usize, Vec<String>>,
+    pub params: std::sync::Arc<HashMap<usize, Vec<String>>>,
     pub names: HashMap<usize, String>,
     pub free_pointer: bool,
     pub reads: std::sync::Arc<HashMap<usize, lift::MemoryReads>>,
@@ -2017,8 +2018,14 @@ impl Callees {
     #[must_use]
     pub fn of(functions: &[Function], compiler: compiler::Kind) -> Callees {
         let internal = || functions.iter().filter(|f| f.kind == FnKind::Internal);
+        let declared = |f: &Function| -> Vec<String> {
+            let ty = |i: usize| f.params.get(i).map_or("uint256", |p| p.ty.as_str());
+            (0..f.n_args).map(|i| ty(i).to_string()).collect()
+        };
+        let params: HashMap<usize, Vec<String>> = internal().map(|f| (f.pc, declared(f))).collect();
         Callees {
             returns: internal().map(|f| (f.pc, f.returns.clone())).collect(),
+            params: std::sync::Arc::new(params),
             names: functions
                 .iter()
                 .filter(|f| matches!(f.kind, FnKind::Internal | FnKind::Orphan))
@@ -2050,6 +2057,7 @@ pub fn make_names(
     let mut n = Names {
         layout,
         callee_names: callees.names.clone(),
+        callee_params: callees.params.clone(),
         callee_reads: Some(callees.reads.clone()),
         code: callees.code.clone(),
         call_starts: f.lifted.iter().flat_map(call_starts).collect(),
@@ -2137,6 +2145,8 @@ pub fn make_names(
             for fld in &s.fields {
                 n.fields
                     .insert((slot, fld.offset, fld.bits), fld.name.clone());
+                n.field_types
+                    .insert((slot, fld.offset, fld.bits), fld.ty.clone());
                 if fld.ty == "bool" {
                     n.bool_fields.insert((slot, fld.offset, fld.bits));
                 }

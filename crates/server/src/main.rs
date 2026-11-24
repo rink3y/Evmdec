@@ -10,7 +10,7 @@ use evmdec::fetch::{CodeCache, Policy};
 use evmdec::rpc::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,8 +31,6 @@ struct AppState {
     cache: Arc<Mutex<HashMap<[u8; 32], Cached>>>,
     slots: Arc<Semaphore>,
     waiting: Arc<AtomicUsize>,
-    making: Arc<Mutex<HashSet<[u8; 32]>>>,
-    files: Arc<Semaphore>,
 }
 
 impl Default for AppState {
@@ -41,8 +39,6 @@ impl Default for AppState {
             cache: Arc::default(),
             slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             waiting: Arc::default(),
-            making: Arc::default(),
-            files: Arc::new(Semaphore::new(MAX_FILES)),
         }
     }
 }
@@ -60,13 +56,6 @@ const ADDRESS_KEPT: Duration = Duration::from_secs(600);
 // so a slot is never held by work nobody is waiting for.
 const WORK_TIME: Duration = Duration::from_secs(240);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
-/* A Solidity file is built and compared one function at a time, which takes minutes for
-a large contract. It is made in the background and asked for again until it is there, so
-no request is held open and a proxy in front cannot cut it off. Each one keeps several
-cores busy, so few are made at once. */
-const FILE_TIME: Duration = Duration::from_secs(600);
-const MAX_FILES: usize = 2;
-const MAX_FILES_ASKED: usize = 8;
 
 #[derive(Deserialize, Default)]
 struct DecompileReq {
@@ -78,8 +67,6 @@ struct DecompileReq {
     depth: Option<usize>,
     #[serde(default)]
     lookup: bool,
-    #[serde(default)]
-    solidity: bool,
 }
 
 struct Waiting(Arc<AtomicUsize>);
@@ -162,7 +149,10 @@ impl Source<'_> {
 }
 
 fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
-    let mut opts = Options::default();
+    let mut opts = Options {
+        solidity: true,
+        ..Options::default()
+    };
     let mut cache = CodeCache::new();
     let mut c = source.obtain(&opts, &mut cache)?;
     if lookup == Lookup::Online {
@@ -209,95 +199,6 @@ fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
     Ok(v)
 }
 
-// The contract at an address alone: a file is the source of one contract's code.
-fn solidity_file(input: &Input, chain: &str) -> Result<Value, String> {
-    let opts = Options {
-        solidity: true,
-        ..Options::default()
-    };
-    let source = match input {
-        Input::Code(code) => Source::Bytecode(code),
-        Input::Address(address) => Source::Address {
-            address,
-            chain,
-            policy: Policy {
-                follow: false,
-                depth: 0,
-                ..Policy::default()
-            },
-        },
-    };
-    let c = source.obtain(&opts, &mut CodeCache::new())?;
-    let out = evmdec::solidity::raised_file(&c, 16)?;
-    let equal = out.report.functions.iter().filter(|f| f.differs.is_none());
-    Ok(json!({"solidity": {
-        "source": out.source,
-        "compiler": out.compiler,
-        "named": out.headers,
-        "plain": out.plain,
-        "equal": equal.count(),
-        "compared": out.report.functions.len(),
-        "branches_reached": out.report.branches_reached,
-        "branches": out.report.branches,
-    }}))
-}
-
-fn pending() -> axum::response::Response {
-    (StatusCode::ACCEPTED, Json(json!({"pending": true}))).into_response()
-}
-
-fn start_file(
-    st: AppState,
-    key: [u8; 32],
-    input: Input,
-    chain: String,
-) -> axum::response::Response {
-    {
-        let mut making = st
-            .making
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if making.contains(&key) {
-            return pending();
-        }
-        if making.len() >= MAX_FILES_ASKED {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the server is busy, try again in a minute",
-            );
-        }
-        making.insert(key);
-    }
-    let pasted = matches!(input, Input::Code(_));
-    tokio::spawn(async move {
-        let slot = st.files.clone().acquire_owned().await;
-        let work = tokio::task::spawn_blocking(move || {
-            let _slot = slot;
-            evmdec::clock::on_worker(|| {
-                evmdec::clock::run(FILE_TIME, || solidity_file(&input, &chain))
-            })
-        });
-        let made = match work.await {
-            Ok(Ok(Some(made))) => made,
-            Ok(Ok(None)) => Err("the Solidity file took longer than the server allows. \
-                                 `evmdec decompile --sol` on your own machine has no limit"
-                .to_string()),
-            _ => Err("the decompiler failed on this input".to_string()),
-        };
-        // A failure can be the compiler not being reachable, so it is tried again later.
-        let (body, lasting) = match made {
-            Ok(file) => (file, pasted),
-            Err(why) => (json!({"failed": why}), false),
-        };
-        keep(&st, key, Bytes::from(body.to_string()), !lasting);
-        st.making
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&key);
-    });
-    pending()
-}
-
 enum Input {
     Address(String),
     Code(Vec<u8>),
@@ -338,8 +239,8 @@ async fn api_decompile(
     }
     let depth = req.depth.unwrap_or(Policy::default().depth).min(3);
     let mut label = format!(
-        "{}|{}|{}|{}|{}|",
-        chain, req.no_follow_proxy, req.lookup, depth, req.solidity
+        "{}|{}|{}|{}|",
+        chain, req.no_follow_proxy, req.lookup, depth
     )
     .into_bytes();
     match &input {
@@ -349,9 +250,6 @@ async fn api_decompile(
     let key = evmdec::keccak::keccak256(&label);
     if let Some(body) = cached(&st, &key) {
         return json_body(body);
-    }
-    if req.solidity {
-        return start_file(st, key, input, chain);
     }
     if st.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_WAITING {
         st.waiting.fetch_sub(1, Ordering::SeqCst);

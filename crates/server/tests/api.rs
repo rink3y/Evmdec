@@ -72,34 +72,9 @@ fn each_input_gets_its_own_answer_and_a_repeat_gets_the_same_one() {
     let (one, two, again) = (ask(STORE_ONE), ask(STORE_TWO), ask(STORE_ONE));
     assert!(one.starts_with("HTTP/1.1 200"), "{one}");
     assert!(body(&one).contains("\"contract\""));
+    assert!(body(&one).contains("pragma solidity"), "{one}");
     assert_ne!(body(&one), body(&two));
     assert_eq!(body(&one), body(&again));
-}
-
-#[test]
-fn a_solidity_file_is_made_in_the_background_and_given_when_asked_again() {
-    let server = start();
-    let ask = || {
-        let request = format!("{{\"bytecode\":\"{STORE_ONE}\",\"solidity\":true}}");
-        post(&server, &request)
-    };
-    let first = ask();
-    assert!(first.starts_with("HTTP/1.1 202"), "{first}");
-    assert!(body(&first).contains("\"pending\":true"), "{first}");
-    let until = Instant::now() + Duration::from_secs(240);
-    let made = loop {
-        let answer = ask();
-        if !answer.starts_with("HTTP/1.1 202") {
-            break answer;
-        }
-        assert!(Instant::now() < until, "the file was not made in time");
-        std::thread::sleep(Duration::from_millis(500));
-    };
-    assert!(made.starts_with("HTTP/1.1 200"), "{made}");
-    assert!(body(&made).contains("pragma solidity"), "{made}");
-    assert!(body(&made).contains("\"equal\":1,"), "{made}");
-    let plain = post(&server, &format!("{{\"bytecode\":\"{STORE_ONE}\"}}"));
-    assert!(body(&plain).contains("\"contract\""), "{plain}");
 }
 
 #[test]

@@ -404,7 +404,7 @@ PORT=8080 ./target/release/evmdec-server
 The compiler release is pinned in `rust-toolchain.toml`; rustup installs it on the first build.
 
 Chains: mainnet, sepolia, arbitrum, optimism, base, polygon, bsc, avalanche, gnosis, fantom,
-linea, scroll, blast, classic. zkSync Era is not listed: its nodes return code for a different
+linea, scroll, blast, pulsechain, classic. zkSync Era is not listed: its nodes return code for a different
 machine, which would be decompiled as if it were EVM bytecode. Public endpoints are tried in order; an endpoint that
 returns empty code or zero storage falls through to the next.
 

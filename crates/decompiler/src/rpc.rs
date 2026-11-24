@@ -124,6 +124,15 @@ pub const CHAINS: &[Chain] = &[
         endpoints: &["https://blast-rpc.publicnode.com", "https://rpc.blast.io"],
     },
     Chain {
+        name: "pulsechain",
+        id: 369,
+        endpoints: &[
+            "https://pulsechain-rpc.publicnode.com",
+            "https://rpc.pulsechain.com",
+            "https://rpc-pulsechain.g4mm4.io",
+        ],
+    },
+    Chain {
         name: "classic",
         id: 61,
         endpoints: &[

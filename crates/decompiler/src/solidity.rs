@@ -1640,7 +1640,14 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
         Some((a, b, patch)) => format!("{a}.{b}.{patch}"),
         None => MODERN.to_string(),
     };
-    let mut out = format!("// SPDX-License-Identifier: UNLICENSED\npragma solidity {pragma};\n\n");
+    // The pragma names a compiler that reads this text, which for older code is not the
+    // one the contract was built with.
+    let built = match own {
+        Some(_) => String::new(),
+        None => format!("// Originally compiled with {}.\n", c.language),
+    };
+    let licence = "// SPDX-License-Identifier: UNLICENSED";
+    let mut out = format!("{licence}\npragma solidity {pragma};\n{built}\n");
     let mut spans = Vec::new();
     out.push_str(&format!("contract {} {{\n", contract_name(c)));
     if let Some(plain) = plain.filter(|p| !p.layout.text.is_empty()) {

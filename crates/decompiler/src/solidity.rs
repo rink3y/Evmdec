@@ -1590,6 +1590,17 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                     if trace {
                         let why = differing.differs.as_deref().unwrap_or("");
                         eprintln!("{} differs: {why}", differing.signature);
+                        let calls = index.map(|i| c.functions[i].calls.clone());
+                        let called = |i: &usize| {
+                            let helper = calls
+                                .as_ref()
+                                .is_some_and(|v| v.contains(&c.functions[*i].pc));
+                            helper || selector(&c.functions[*i]) == Some(s)
+                        };
+                        let shown = draft.spans.iter().filter(|(_, _, i)| called(i));
+                        for (from, to, _) in shown.filter(|_| trace_text) {
+                            eprintln!("{}", &draft.text[*from..*to]);
+                        }
                     }
                     if index.is_some_and(|i| read.contains(&i)) {
                         public.retain(|(i, _)| Some(*i) != index);

@@ -440,6 +440,12 @@ fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) ->
             && matches!(expr::node(*len), Node::Env(op::CALLDATASIZE, _));
         let text = if whole {
             "msg.data".to_string()
+        } else if names.strict {
+            let from = emit::fmt_expr(*src, names);
+            format!(
+                "msg.data[{from}:{from} + ({})]",
+                emit::fmt_expr(*len, names)
+            )
         } else {
             format!(
                 "msg.data[{}:+{}]",
@@ -766,7 +772,7 @@ fn prev_name(what: Overwritten, names: &Names) -> String {
             emit::fmt_slot(key, names, emit::SlotSpace::from_transient(transient))
         }
         Overwritten::Balance => "balance".to_string(),
-        Overwritten::Memory(addr) => emit::fmt_mem_word(addr, names),
+        Overwritten::Memory(addr) => emit::fmt_mem_read(addr, names),
     })
 }
 
@@ -3032,7 +3038,7 @@ impl<'a> Printer<'a> {
                     emit::fmt_slot(key, self.names, emit::SlotSpace::from_transient(transient))
                 }
                 // Stored on to another word, the read would print as that word.
-                (None, Node::MLoad(at, _)) if stored_on => emit::fmt_mem_word(at, self.names),
+                (None, Node::MLoad(at, _)) if stored_on => emit::fmt_mem_read(at, self.names),
                 _ => emit::fmt_expr(*read, self.names),
             };
             if !named[..i].iter().any(|(_, earlier)| earlier == name) {
@@ -3041,6 +3047,55 @@ impl<'a> Printer<'a> {
             self.given.insert((*read, name.clone()), depth);
             self.names.replace_stale([(*read, name.clone())]);
         }
+    }
+
+    fn halt(&self, node: usize, term: &Term) -> Option<String> {
+        if let (true, Term::Revert { off, len, .. }) = (self.names.strict, term) {
+            // The stores that wrote a reason can sit a block or two before the revert,
+            // where the code first rounds the length off.
+            let mut run = vec![node];
+            while run.len() < 3 {
+                let Some(before) = self.g.idom[run[0]].filter(|b| *b != run[0]) else {
+                    break;
+                };
+                run.insert(0, before);
+            }
+            let wrote = run
+                .iter()
+                .flat_map(|i| self.l.nodes[*i].stmts.iter().cloned());
+            let wrote: Vec<Stmt> = wrote.collect();
+            let said = emit::error_string(&wrote, *off, self.names);
+            if said.is_some() {
+                return said;
+            }
+            if emit::bubbled(&wrote, *off, *len) {
+                let hand_on = "returndatacopy(0, 0, returndatasize()) revert(0, returndatasize())";
+                return Some(format!("assembly {{ {hand_on} }}"));
+            }
+        }
+        emit::fmt_term_halt(term, self.names)
+    }
+
+    // A run of blocks that does nothing but fail with a reason read back from memory.
+    fn reason_only(&self, mut node: usize) -> Option<String> {
+        let quiet = |st: &Stmt| {
+            let kept = matches!(st, Stmt::MStore { .. } | Stmt::Copy { .. });
+            kept || matches!(st, Stmt::Assign { .. } | Stmt::Drop(_))
+        };
+        for _ in 0..3 {
+            let nd = &self.l.nodes[node];
+            if !nd.stmts.iter().all(quiet) {
+                return None;
+            }
+            match &nd.term {
+                Term::Jump(next) => node = *next,
+                term => {
+                    let said = self.halt(node, term);
+                    return said.filter(|text| text.starts_with("revert(_string("));
+                }
+            }
+        }
+        None
     }
 
     fn stmts(&mut self, n: usize, depth: usize) {
@@ -3124,7 +3179,7 @@ impl<'a> Printer<'a> {
                         continue;
                     }
                     let word = memory_word(*read).unwrap_or(*off);
-                    let current = emit::fmt_mem_word(word, self.names);
+                    let current = emit::fmt_mem_read(word, self.names);
                     self.line(depth, &format!("uint256 {name} = {current};"));
                 }
                 self.given
@@ -3134,8 +3189,15 @@ impl<'a> Printer<'a> {
                     kept_early.insert(j);
                 }
             }
-            if dead.contains(&i) || self.skipped.borrow().contains(&(n, i)) {
+            // Nothing reads the start of free memory after the last block is taken, which
+            // makes the taking look dead. In a file it is what makes the block a block.
+            let takes = self.names.strict
+                && matches!(s, Stmt::MStore { off, .. } if emit::is_free_pointer(*off));
+            if (dead.contains(&i) && !takes) || self.skipped.borrow().contains(&(n, i)) {
                 continue;
+            }
+            if let Some(early) = emit::taking_ahead(&self.l.nodes[n].stmts, i, self.names) {
+                self.line(depth, &early);
             }
             if let Some(lit) = literals.iter().find(|lit| lit.first == i) {
                 self.line(depth, &lit.text);
@@ -3163,7 +3225,7 @@ impl<'a> Printer<'a> {
                             emit::fmt_slot(key, self.names, space)
                         }
                         (None, Overwritten::Balance) => "address(this).balance".to_string(),
-                        (None, Overwritten::Memory(addr)) => emit::fmt_mem_word(addr, self.names),
+                        (None, Overwritten::Memory(addr)) => emit::fmt_mem_read(addr, self.names),
                     };
                     self.line(depth, &format!("uint256 {tmp} = {current};"));
                 }
@@ -3205,13 +3267,13 @@ impl<'a> Printer<'a> {
             }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
-            if let Some(out) = self.call_output(n, i, s) {
+            if let Some(out) = self.call_output(n, i, s).filter(|_| !self.answer_kept(s)) {
                 self.line(depth, &out);
             }
             if let (Stmt::MStore { off, .. }, Some(val)) =
                 (s, memory_forward(&self.l.nodes[n].stmts, i))
             {
-                let word = emit::fmt_mem_word(*off, self.names);
+                let word = emit::fmt_mem_read(*off, self.names);
                 self.names.forward(val, word, *off);
             }
             if let Stmt::SStore {
@@ -3291,7 +3353,7 @@ impl<'a> Printer<'a> {
                 let s = format!(
                     "{} = {};",
                     emit::fmt_expr(var, self.names),
-                    emit::fmt_expr(val, self.names)
+                    emit::fmt_assigned(var, val, self.names)
                 );
                 self.line(depth, &s);
             }
@@ -3325,6 +3387,40 @@ impl<'a> Printer<'a> {
     otherwise show only the stores made before the call. The read may be a load, a hash, a
     copy, a log, the data of another call or what the function hands back, and it may reach
     the area through an address the code works out. */
+    /* Old code hands a call a few words of memory to answer into. A file keeps the
+    answer the call gave, and a later read of one of those words is a read of the answer. */
+    fn answer_kept(&self, s: &Stmt) -> bool {
+        const MOST_WORDS: u64 = 8;
+        let Stmt::Call {
+            out_off,
+            out_len,
+            result,
+            ..
+        } = s
+        else {
+            return false;
+        };
+        let mut answers = self.names.answers.borrow_mut();
+        let size = expr::as_const(*out_len).filter(|l| l.fits_u64());
+        let words = size.map(|l| l.low_u64()).filter(|l| l % 32 == 0);
+        let words = words
+            .map(|l| l / 32)
+            .filter(|w| (1..=MOST_WORDS).contains(w));
+        match (expr::node(*result), words) {
+            (Node::CallResult(seq), Some(words)) if self.names.strict => {
+                for i in 0..words {
+                    let word = expr::add_const(*out_off, U256::from_u64(32 * i));
+                    answers.insert(word, (seq, 32 * i));
+                }
+                true
+            }
+            _ => {
+                answers.remove(out_off);
+                false
+            }
+        }
+    }
+
     fn call_output(&self, n: usize, i: usize, s: &Stmt) -> Option<String> {
         let Stmt::Call {
             addr,
@@ -3455,7 +3551,7 @@ impl<'a> Printer<'a> {
                     n = t;
                 }
                 other => {
-                    if let Some(s) = emit::fmt_term_halt(other, self.names) {
+                    if let Some(s) = self.halt(n, other) {
                         self.line(depth, &s);
                     }
                     return;
@@ -3502,7 +3598,7 @@ impl<'a> Printer<'a> {
                     return;
                 }
                 other => {
-                    if let Some(s) = emit::fmt_term_halt(&other, self.names) {
+                    if let Some(s) = self.halt(n, &other) {
                         self.line(depth, &s);
                     }
                     return;
@@ -3626,7 +3722,7 @@ impl<'a> Printer<'a> {
                         self.emit_branch(header, cond, t, f, None, depth + 1)
                     }
                     other => {
-                        if let Some(s) = emit::fmt_term_halt(&other, self.names) {
+                        if let Some(s) = self.halt(header, &other) {
                             self.line(depth + 1, &s);
                         }
                     }
@@ -3685,13 +3781,23 @@ impl<'a> Printer<'a> {
                 _ => {}
             }
         }
+        /* Old code rounds a reason's length off on one of two paths and reverts on both.
+        The two give the same failure, so the test between them is not source. */
+        if let (true, Some(t)) = (self.names.strict, t) {
+            let both = self
+                .reason_only(t)
+                .filter(|said| self.reason_only(f).as_ref() == Some(said));
+            if let Some(said) = both {
+                self.line(depth, &said);
+                return;
+            }
+        }
         let t_rev = t.map_or(Some(None), |t| self.revert_reason(n, t));
         let f_rev = self.revert_reason(n, f);
         let join = self.g.ipdom[n];
         if let Some(reason) = f_rev.clone() {
             if let (Some(t), None) = (t, &t_rev) {
-                let text = emit::fmt_cond(cond, self.names);
-                self.line(depth, &guard(&text, &reason, self.names.hide_checked));
+                self.line(depth, &guard(cond, &reason, self.names));
                 self.facts.push((cond, true, t));
                 self.transfer(n, t, stop, depth);
                 self.facts.pop();
@@ -3701,8 +3807,7 @@ impl<'a> Printer<'a> {
         if let Some(reason) = t_rev.clone() {
             if f_rev.is_none() {
                 let ncond = expr::op1(op::ISZERO, cond);
-                let text = emit::fmt_cond(ncond, self.names);
-                self.line(depth, &guard(&text, &reason, self.names.hide_checked));
+                self.line(depth, &guard(ncond, &reason, self.names));
                 self.facts.push((cond, false, f));
                 self.transfer(n, f, stop, depth);
                 self.facts.pop();
@@ -4004,14 +4109,26 @@ impl<'a> Printer<'a> {
             format!("{var_s} = {a} || {b};")
         };
         let c_s = emit::fmt_or_operand(cond, self.names);
-        let txt = if y == cond {
+        // For a compiler `&&` joins two flags and gives one. A choice between two
+        // values that are not both flags has to be written out as a choice.
+        let flags = !self.names.strict
+            || (emit::is_bool(var, self.names)
+                && [cond, x, y].iter().all(|e| emit::is_bool(*e, self.names)));
+        let txt = if flags && y == cond {
             both(cond, x)
-        } else if x == cond {
+        } else if flags && x == cond {
             either(cond, y)
-        } else if x == ncond {
+        } else if flags && x == ncond {
             both(ncond, y)
-        } else if y == ncond {
+        } else if flags && y == ncond {
             either(ncond, x)
+        } else if self.names.strict {
+            let test = emit::fmt_cond(cond, self.names);
+            let (x, y) = (
+                emit::fmt_assigned(var, x, self.names),
+                emit::fmt_assigned(var, y, self.names),
+            );
+            format!("{var_s} = ({test}) ? {x} : {y};")
         } else {
             format!(
                 "{} = {} ? {} : {};",
@@ -4067,13 +4184,23 @@ fn while_cond_exit_from_header(term: &Term, exit: usize) -> bool {
 // Stands for the invalid opcode. It carries no data, so it is no reason to print.
 const INVALID: &str = "INVALID";
 
-// Where a failed assert reverts with a Panic, the opcode is named to tell the two apart.
-fn guard(cond: &str, reason: &Option<String>, panics: bool) -> String {
+/* Where a failed assert reverts with a Panic, the opcode is named to tell the two apart.
+A file for a compiler names it by the statement that runs it. */
+fn guard(cond: ExprId, reason: &Option<String>, names: &Names) -> String {
+    let text = emit::fmt_cond(cond, names);
+    let failed = || emit::fmt_cond(expr::op1(op::ISZERO, cond), names);
     match reason.as_deref() {
-        Some(INVALID) if panics => format!("assert({cond}); // INVALID"),
-        Some(INVALID) => format!("assert({cond});"),
-        Some(r) => format!("require({cond}, {r});"),
-        None => format!("require({cond});"),
+        Some(INVALID) if names.strict && names.hide_checked => {
+            format!("if ({}) {{ assembly {{ invalid() }} }}", failed())
+        }
+        Some(INVALID) if names.hide_checked => format!("assert({text}); // INVALID"),
+        Some(INVALID) => format!("assert({text});"),
+        Some("Panic(assert failed)") if names.strict => format!("assert({text});"),
+        Some(r) if names.strict && !r.starts_with('"') => {
+            format!("if ({}) {}", failed(), emit::failure(r))
+        }
+        Some(r) => format!("require({text}, {r});"),
+        None => format!("require({text});"),
     }
 }
 

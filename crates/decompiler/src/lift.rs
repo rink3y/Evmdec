@@ -134,6 +134,7 @@ pub enum Term {
     },
     ReturnDyn {
         ptr: ExprId,
+        words: bool,
     },
     Revert {
         off: ExprId,
@@ -386,7 +387,7 @@ impl MemoryReads {
                 len,
                 data: None,
             } => self.range(*off, *len),
-            Term::ReturnDyn { ptr } => self.open(*ptr),
+            Term::ReturnDyn { ptr, .. } => self.open(*ptr),
             Term::InternalReturn(_) if returns_to_reader => self.open_from = Some(0),
             Term::Unresolved(_) | Term::Switch { .. } => self.open_from = Some(0),
             _ => {}
@@ -488,7 +489,7 @@ impl Lifted {
                     len,
                     data: None,
                 } if !copied.contains(&(*off, *len)) => reads.range_outside(*off, *len, &written),
-                Term::ReturnDyn { ptr } => reads.open(*ptr),
+                Term::ReturnDyn { ptr, .. } => reads.open(*ptr),
                 Term::Unresolved(_) | Term::Switch { .. } => return MemoryReads::everything(),
                 _ => {}
             }
@@ -4574,7 +4575,10 @@ pub fn map_term(t: &Term, f: &dyn Fn(ExprId) -> ExprId) -> Term {
             len: f(*len),
             data: data.as_ref().map(fv),
         },
-        Term::ReturnDyn { ptr } => Term::ReturnDyn { ptr: f(*ptr) },
+        Term::ReturnDyn { ptr, words } => Term::ReturnDyn {
+            ptr: f(*ptr),
+            words: *words,
+        },
         Term::Revert { off, len, data } => Term::Revert {
             off: f(*off),
             len: f(*len),
@@ -4756,7 +4760,7 @@ pub fn term_exprs(t: &Term) -> Vec<ExprId> {
             }
         }
         Term::SelfDestruct(a) => v.push(*a),
-        Term::ReturnDyn { ptr } => v.push(*ptr),
+        Term::ReturnDyn { ptr, .. } => v.push(*ptr),
         Term::InternalReturn(vals) => v.extend(vals.iter().copied()),
         Term::Unresolved(t) => v.push(*t),
         Term::CondJump { cond, target } => {

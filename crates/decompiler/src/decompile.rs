@@ -22,6 +22,7 @@ pub struct Options {
     pub pcs: bool,
     pub embedded: bool,
     pub no_sigs: bool,
+    pub solidity: bool,
     pub extra_sigs: HashMap<u32, String>,
 }
 
@@ -49,6 +50,8 @@ pub struct Function {
     pub inlined: bool,
     #[serde(skip)]
     pub bool_vars: Vec<u32>,
+    #[serde(skip)]
+    pub locals: Vec<(String, String)>,
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub part: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -958,7 +961,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         if kind == FnKind::Receive {
             returns.clear();
         }
-        if l.nodes.iter().any(|nd| matches!(&nd.term, Term::ReturnDyn { ptr } if crate::idiom::is_string_pointer(&l, *ptr, &loaders).is_some())) {
+        if l.nodes.iter().any(|nd| matches!(&nd.term, Term::ReturnDyn { ptr, .. } if crate::idiom::is_string_pointer(&l, *ptr, &loaders).is_some())) {
             returns = vec!["string".into()];
         }
         Function {
@@ -979,6 +982,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             n_rets,
             inlined: false,
             bool_vars: Vec::new(),
+            locals: Vec::new(),
             part: 0,
             origin: None,
         }
@@ -1209,25 +1213,46 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let units: Vec<(usize, &Lifted)> = units.map(|(f, l)| (f.pc, l)).collect();
         emit::offsets(&units).into_iter()
     };
-    for (f, l) in functions.iter_mut().zip(printed) {
+    let mut ready: Vec<(Names, Lifted)> = Vec::new();
+    for (f, l) in functions.iter().zip(printed) {
         let mut names = make_names(f, &storage, layout, &loaders, &callees);
         let (l, hashes) = crate::structure::name_hashes(&l);
         names.hide_checked = solc08;
+        names.strict = opts.solidity;
         names.checked = solc08.then(|| emit::checked_ops(&l));
         names.offsets = offsets.next().unwrap_or_default();
         names.rebind(&hashes);
         names.pure_callees = pure_callees.clone();
         names.array_resizers = array_resizers.clone();
+        if opts.flat {
+            ready.push((names, l));
+            continue;
+        }
+        crate::clock::check();
+        let (tested, bindings) = crate::structure::name_tested(&l, &names);
+        names.rebind(&bindings);
+        let (bound, bindings) = crate::structure::bind_shared(&tested, &names);
+        names.rebind(&bindings);
+        if names.strict {
+            emit::note_block_lengths(&bound, &mut names);
+            emit::note_address_vars(&bound, &mut names);
+        }
+        ready.push((names, bound));
+    }
+    if opts.solidity && !opts.flat {
+        let units = functions.iter().zip(&ready);
+        let units: Vec<(usize, &Lifted, &Names)> = units.map(|(f, (n, l))| (f.pc, l, n)).collect();
+        let found = crate::boxes::find(&units);
+        for ((names, _), found) in ready.iter_mut().zip(found) {
+            names.unbox(found);
+        }
+    }
+    for (f, (names, l)) in functions.iter_mut().zip(ready) {
         crate::clock::check();
         let t1 = std::time::Instant::now();
-        let body = if opts.flat {
-            emit::fmt_flat(&l, &names, "        ")
-        } else {
-            let (tested, bindings) = crate::structure::name_tested(&l, &names);
-            names.rebind(&bindings);
-            let (bound, bindings) = crate::structure::bind_shared(&tested, &names);
-            names.rebind(&bindings);
-            crate::structure::fmt_structured(&bound, &names, "        ")
+        let body = match opts.flat {
+            true => emit::fmt_flat(&l, &names, "        "),
+            false => crate::structure::fmt_structured(&l, &names, "        "),
         };
         if timing && t1.elapsed().as_millis() > 200 {
             eprintln!(
@@ -1238,6 +1263,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
             );
         }
         f.code = body;
+        f.locals = names.merged();
     }
     /* A helper is left out when every call to it was folded into its callers. Whether
     that happened is only known from the text, so one a printed body still calls is
@@ -1943,6 +1969,7 @@ fn element_depth(ty: &str) -> usize {
 #[derive(Clone, Debug, Default)]
 pub struct Callees {
     pub returns: HashMap<usize, Vec<String>>,
+    pub params: std::sync::Arc<HashMap<usize, Vec<String>>>,
     pub names: HashMap<usize, String>,
     pub free_pointer: bool,
     pub reads: std::sync::Arc<HashMap<usize, lift::MemoryReads>>,
@@ -1982,8 +2009,14 @@ impl Callees {
     #[must_use]
     pub fn of(functions: &[Function], compiler: compiler::Kind) -> Callees {
         let internal = || functions.iter().filter(|f| f.kind == FnKind::Internal);
+        let declared = |f: &Function| -> Vec<String> {
+            let ty = |i: usize| f.params.get(i).map_or("uint256", |p| p.ty.as_str());
+            (0..f.n_args).map(|i| ty(i).to_string()).collect()
+        };
+        let params: HashMap<usize, Vec<String>> = internal().map(|f| (f.pc, declared(f))).collect();
         Callees {
             returns: internal().map(|f| (f.pc, f.returns.clone())).collect(),
+            params: std::sync::Arc::new(params),
             names: functions
                 .iter()
                 .filter(|f| matches!(f.kind, FnKind::Internal | FnKind::Orphan))
@@ -2015,6 +2048,7 @@ pub fn make_names(
     let mut n = Names {
         layout,
         callee_names: callees.names.clone(),
+        callee_params: callees.params.clone(),
         callee_reads: Some(callees.reads.clone()),
         code: callees.code.clone(),
         call_starts: f.lifted.iter().flat_map(call_starts).collect(),
@@ -2029,6 +2063,7 @@ pub fn make_names(
     if f.kind != FnKind::Internal {
         for p in &f.params {
             n.params.insert(p.index, p.name.clone());
+            n.param_types.insert(p.index, p.ty.clone());
         }
     }
     // A parameter declared narrower than a word packs to fewer bytes than the word it is.
@@ -2047,6 +2082,7 @@ pub fn make_names(
             .map(|p| p.name.clone()),
     );
     n.bool_returns = f.returns.iter().map(|t| t == "bool").collect();
+    n.return_types = f.returns.clone();
     n.bools.extend(f.bool_vars.iter().map(|v| expr::var(*v)));
     if let Some(l) = &f.lifted {
         let mut seqs: Vec<u32> = l
@@ -2071,16 +2107,23 @@ pub fn make_names(
         let k = ssa::arity(l);
         for i in 0..k {
             let index = k - 1 - i;
-            let name = match f.params.get(index).filter(|_| f.kind == FnKind::Internal) {
+            let own = f.params.get(index).filter(|_| f.kind == FnKind::Internal);
+            let name = match own {
                 Some(p) => p.name.clone(),
                 None => format!("arg{index}"),
             };
             n.args.insert(i as u32, name);
+            if let Some(p) = own {
+                n.arg_types.insert(i as u32, p.ty.clone());
+            }
         }
     }
     for s in storage {
         if let Some(slot) = U256::from_hex_str(&s.slot).or_else(|| U256::from_dec_str(&s.slot)) {
             n.storage.insert(slot, s.name.clone());
+            if s.fields.is_empty() && s.members.is_empty() {
+                n.storage_types.insert(slot, s.ty.clone());
+            }
             if s.ty.ends_with("[]") && s.fixed_array {
                 n.array_bases.insert(slot);
             }
@@ -2093,6 +2136,8 @@ pub fn make_names(
             for fld in &s.fields {
                 n.fields
                     .insert((slot, fld.offset, fld.bits), fld.name.clone());
+                n.field_types
+                    .insert((slot, fld.offset, fld.bits), fld.ty.clone());
                 if fld.ty == "bool" {
                     n.bool_fields.insert((slot, fld.offset, fld.bits));
                 }

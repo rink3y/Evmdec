@@ -43,6 +43,8 @@ The decompiler is `crates/decompiler`, the command-line tool `crates/cli` and th
 | `structure`, `emit`, `function`, `sigs`, `sigdb`, `naming` | loops, conditionals and short-circuits; printing; signature dictionary and local index; names inferred from roles |
 | `compiler` | compiler version and feature fingerprints when the metadata is missing |
 | `interp`, `verify` | reference EVM interpreter and the block oracle |
+| `check`, `solc` | runs the original bytecode beside a compiled Solidity source and compares what they do; fetches the compiler a pragma asks for |
+| `exact`, `solidity` | bytecode as an assembly block, instruction by instruction; the Solidity file around it |
 | `rpc`, `fetch`, `decompile`, `slots`, `clock` | chain access, proxy and diamond resolution, the walk over call targets, composition, well-known storage slots, the time limit one dependency is given |
 
 ## What it recovers
@@ -207,6 +209,146 @@ storage, logs, calls and the control decision are compared.
 A mismatch is a decompiler bug by definition. An inconclusive run is one the reference cannot
 execute from the drawn state, or one that makes two differently based memory accesses alias.
 
+### Source check
+
+`evmdec check original.hex source.sol` compiles a Solidity file with the compiler its pragma
+asks for and runs the result beside the original bytecode. Both get the same calls on the same
+state: every function with arguments drawn for its types, as several callers, with and
+without ether, on drawn storage and on storage nobody has used. Drawn storage is a mix of
+empty words, small numbers and random words, and a quarter of the other accounts hold no
+code, as on a chain. Each run must agree on what
+another account can see: whether it returned, the data, every storage slot written, events,
+outside calls in order, and contracts created. Gas and the layout of memory are left out,
+since two builds of one source differ in both.
+
+Where a run compared two values, the call is made again with the two made equal, so the edge
+between `<` and `<=` is tried and a function open to one account is run as that account. On
+the four source fixtures every one of 20 single changes to an operator or a check is caught.
+The WETH contract on mainnet, built with solc 0.4.19, compares equal to its published source
+built with 0.4.26 on all 12 functions with every branch reached.
+
+This is the test the decompiler's own output has to pass. The pseudo-Solidity it prints by
+default does not: none of the 22 corpus contracts decompiles to text a compiler accepts. The
+Solidity file below does.
+
+A source still running at many times the steps the original took to end is a difference,
+not a run left unsettled. A run of the original longer than 50,000 steps is left out: it is
+a loop over a length the drawn state made up.
+
+It is evidence and not a proof. The last line of the output says how many branch outcomes of
+the original the calls reached, and a function no call got to the end of is marked. With no
+source, `evmdec check original.hex` reports that reach alone: 76 of 76 on WETH, 255 of 268 on
+USDT, 414 of 984 on Compound cETH, whose paths depend on what other contracts answer.
+
+### Solidity file
+
+`evmdec decompile my.hex --sol` prints a Solidity file a compiler accepts, with a licence
+line, a `pragma` (the contract's own compiler version when it was built with solc 0.8, a
+current one otherwise), the events, and every function whose signature is known declared by
+name. It is compiled and put through the source check before it is printed, and the result
+is reported beside it.
+
+Every function starts as a call to one private function that holds the bytecode translated
+instruction by instruction into an assembly block, with no analysis in between, so it cannot
+be wrong in the way a decompiled body can. That is the floor. From there each function is
+written out as plain Solidity, with the state variables declared on the slots and bytes the
+code uses, and the file is built and checked again. A function whose text the compiler
+refuses, or that does not do what the bytecode does, goes back to the exact form, and so
+does everything that calls it. What is printed is the file that survives, after one longer
+comparison.
+
+What Solidity has a word for is written with it. A failure reason longer than a word is
+one string, whether the code copies it out of itself or stores it a word at a time. A
+call to another contract is a low-level call that gives back a flag and the answer, and a
+failure handed on from one is two lines of assembly, as authors write it. An event known
+only by its first topic cannot be declared by a name, so it is declared anonymous with the
+topic as its first indexed value. A write to memory that nothing reads any more, because
+the event, call or return it fed is shown by what it means, is left out. A few things
+Solidity has no word for go through a small private function added at the end of the
+contract: a word of a call's answer, its length, a panic with its code, a failure whose
+error has no known name, and a string taken as the place it lies at, which is how a helper
+written for older compilers receives a reason. An error whose signature is known is declared
+and failed with by name. Arithmetic the code does not test for overflow is put in an
+`unchecked` block, one statement at a time.
+
+A struct a function keeps in memory for itself is written as a struct in memory again, with
+its words as fields. A struct of one word, which older code hands from helper to helper by
+its address, is handed over as the word, in every helper and caller at once. Old code gives
+a call a fixed stretch of memory to answer into and reads the answer from there: the file
+keeps the answer the call gave and reads that. A value is declared in the block that gives
+it, where everything that reads it lies in that block, and at the top of the function
+otherwise.
+
+Memory a function builds data in is written the way the code uses it. The code takes a block
+by moving the start of free memory past it. The file does the same through two small
+functions, names the block, and writes and reads it a word or a stretch at a time through
+others. A new array, a text handed to a helper and an array returned from memory are plain
+Solidity that way, and what a function returns from memory comes back as an array or as
+bytes, whichever the code made. Where the code writes first and takes after, the file takes
+first, so that nothing a compiler puts in memory between two lines lands in the block. Data
+the code lays out by hand for a call, with a `bytes` or a `string` in it, is written into
+free memory and taken as the call is made, and only where nothing between the first write
+and the call could make the compiler use that memory. An argument of type `bytes`, `string`
+or array that an older compiler copies into memory before the function's own code runs is
+declared as held in memory, so the compiler makes the copy, and the place the code knows it
+by is the argument's own. The file is checked for all this: a block named on some way that
+does not pass its taking, or data laid out with anything in between, is put back in a
+notation no compiler reads, so the function fails to build and stays exact.
+
+A function that only returns one variable is not written at all: the variable is declared
+`public` under the function's name, as an author would have, and the compiler writes the
+function. When every function of a contract is plain, its fallback is written out too and
+the exact block is dropped, which leaves a file with no assembly in it. The WETH contract
+comes out that way, in 93 lines.
+
+A function that keeps its exact form but whose arguments the compiler would decode
+differently from the original, as code from before solc 0.8 does, is left out of the named
+functions and answers through `fallback`.
+
+A plain function from a contract built before solc 0.8 cannot match the original on every
+input, because the file is written for a current compiler: that compiler refuses an argument
+wider than its type where the old one cut it, and names its own failures with a panic code
+where the old one gave no data. Such a function is compared on well-formed calls, and two
+built-in failures count as the same failure. A run in which another contract answers with
+fewer bytes than the old code gave it room for is left out as well: past the end of a
+short answer that code reads whatever its compiler had left in memory, which no source
+says. `evmdec check --loose` makes the same comparison. A contract built with solc 0.8 is
+compared with no such allowance.
+
+`./corpus/exact_all.sh` runs this over a directory. All 22 corpus contracts compile and
+compare equal on every function, solc 0.4 to 0.8 and Vyper, and so do the 17 regression, 30
+vulnerable and 5 source fixtures in `testdata`: 74 of 74. Those contracts answer 1,972
+functions between them. With the signatures built into the binary and no index installed,
+the files declare 890 of them by name, and 578 of the 890 are plain Solidity: all 11 of
+WETH, 29 of 29 in USDT, 23 of 23 in the Uniswap V2 pair, 35 of 39 in USDC, 26 of 40 in
+Compound cETH. The other 1,082 answer through `fallback` in their exact form: 932 have a
+selector no built-in signature hashes to, so no header can be written for them, 28 take a
+struct, and the rest are decoded differently by a current compiler than by the original.
+
+With the full signature index installed (see below) the same run declares 1,605 of the
+1,972 by name and 990 of those are plain Solidity. USDT, the BEC token and the
+BOB pool then come out with no exact block at all, as WETH does without it.
+
+What holds a named function back now is mostly not memory. Some long functions need more
+values at once than a compiler can reach, a few keep a jump the printer could not turn into
+a loop or a branch, and one helper in its exact form holds back every function that calls
+it. In memory three things are still printed in a notation no compiler reads: memory an
+older contract takes at a place it works out from the length of an argument copied before
+it, which happens with a second `bytes` or array argument, memory cleared by copying from
+past the end of the code, and the hand-written logging of older MakerDAO code. Vyper keeps
+its values at fixed places in memory and not in blocks it takes, so a Vyper function that
+copies through memory is not plain yet either.
+
+On the WETH file, 52 of 55 single changes to an operator, a check or an event are caught, and
+the other three change a value nothing reads. On the plain part of the USDT file, 66 of 80
+are caught. Two of the other 14 remove a test of the call data's length that the compiler
+now makes itself. The rest sit on paths that need several stored values to line up at
+once, a fee that is not zero or an upgrade to a contract that holds no code, which the
+drawn runs rarely reach. A change there would get past the check, so the check stays
+evidence. On the MiniMe token file, whose plain part lays the data of a call out in memory,
+45 of 57 are caught. The other 12 change a value nothing observes, or need the contract
+that is called to answer in one particular way.
+
 ### Decompiler against verified source
 
 Fresh verified contracts are fetched, decompiled from bytecode, and compared with their
@@ -275,6 +417,8 @@ solc --bin MyContract.sol | tail -1 > my.hex
 ./target/release/evmdec sigs 0xa9059cbb
 ./target/release/evmdec disasm my.hex
 ./target/release/evmdec verify my.hex --runs 8
+./target/release/evmdec check my.hex MyContract.sol
+./target/release/evmdec decompile my.hex --sol > My.sol
 
 PORT=8080 ./target/release/evmdec-server
 ```
@@ -282,7 +426,7 @@ PORT=8080 ./target/release/evmdec-server
 The compiler release is pinned in `rust-toolchain.toml`; rustup installs it on the first build.
 
 Chains: mainnet, sepolia, arbitrum, optimism, base, polygon, bsc, avalanche, gnosis, fantom,
-linea, scroll, blast, classic. zkSync Era is not listed: its nodes return code for a different
+linea, scroll, blast, pulsechain, classic. zkSync Era is not listed: its nodes return code for a different
 machine, which would be decompiled as if it were EVM bytecode. Public endpoints are tried in order; an endpoint that
 returns empty code or zero storage falls through to the next.
 
@@ -341,6 +485,7 @@ remote nodes in at most 240 seconds, and code over 1 MiB is refused.
 | `EVMDEC_RPC_URL` | comma-separated JSON-RPC endpoints, used in place of the public list. The chain asked for has to be the chain they serve; a request for another chain is refused |
 | `EVMDEC_SIGS` | path of the signature index; empty disables it. Default search: `./sigs.idx`, next to the binary, `/var/lib/evmdec/sigs.idx`, `~/.evmdec/sigs.idx` |
 | `EVMDEC_TIMING` | print the time spent in each stage |
+| `SOLC`, `EVMDEC_SOLC_DIR` | a compiler binary for `check` to use as it is, and where downloaded compilers are kept (default `~/.cache/evmdec/solc`) |
 | `PORT` | listening port of the server, default 8080 |
 
 ## Development
@@ -351,6 +496,7 @@ cargo clippy --workspace --all-targets --all-features
 cargo test --workspace
 python3 corpus/bench.py
 RUNS=8 ./corpus/verify_all.sh
+./corpus/exact_all.sh
 ```
 
 The Rust crates follow Google's Rust style guide with `rustfmt.toml` as committed, and clippy

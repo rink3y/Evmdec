@@ -64,6 +64,11 @@ enum Cmd {
             help = "Resolve unknown selectors online (openchain.xyz, 4byte.directory)"
         )]
         lookup: bool,
+        #[arg(
+            long,
+            help = "Print a Solidity file that compiles and does what the bytecode does, and say how it compared"
+        )]
+        sol: bool,
     },
     #[command(
         about = "Block-level oracle: execute every basic block concretely and through the lifted IR"
@@ -76,6 +81,24 @@ enum Cmd {
         seed: u64,
         #[arg(long)]
         verbose: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(
+        about = "Run the original bytecode and a Solidity source on the same calls and compare what they do. With no source, say how far the calls reach into the original"
+    )]
+    Check {
+        #[arg(help = "The original bytecode, binary or hex")]
+        original: PathBuf,
+        #[arg(help = "A Solidity file to compile and compare with it")]
+        source: Option<PathBuf>,
+        #[arg(long, default_value_t = 64, help = "Calls drawn per function")]
+        runs: usize,
+        #[arg(
+            long,
+            help = "For a source in a newer Solidity than the original: compare on well-formed calls only, and take any two built-in failures as the same"
+        )]
+        loose: bool,
         #[arg(long)]
         json: bool,
     },
@@ -174,6 +197,32 @@ fn fetch_and_decompile(
     fetch(opts)
 }
 
+fn print_check(report: &evmdec::check::Report) {
+    for f in &report.functions {
+        let verdict = match (&f.differs, f.returned) {
+            (Some(why), _) => format!("DIFFERS: {why}"),
+            (None, 0) => "equal, never returned".to_string(),
+            (None, _) => "equal".to_string(),
+        };
+        let unsettled = match f.unsettled {
+            0 => String::new(),
+            n => format!(", {n} unsettled"),
+        };
+        println!(
+            "{:<44} {:>3} runs, {:>3} returned{unsettled}: {verdict}",
+            f.signature, f.runs, f.returned
+        );
+    }
+    let equal = report.functions.iter().filter(|f| f.differs.is_none());
+    println!(
+        "{} of {} equal, branch outcomes reached in the original: {} of {}",
+        equal.count(),
+        report.functions.len(),
+        report.branches_reached,
+        report.branches
+    );
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     quiet_on_closed_pipe();
@@ -263,12 +312,14 @@ fn run(cli: Cli) -> Result<()> {
             embedded,
             no_sigs,
             lookup,
+            sol,
         } => {
             let mut opts = Options {
                 flat,
                 pcs: false,
                 embedded,
                 no_sigs,
+                solidity: sol,
                 extra_sigs: Default::default(),
             };
             let is_addr = evmdec::rpc::is_address(&input);
@@ -311,7 +362,37 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
             };
-            if json {
+            if sol {
+                let out = evmdec::solidity::raised_file(&c, 16).map_err(|e| anyhow::anyhow!(e))?;
+                print!("{}", out.source);
+                for why in &out.refused {
+                    let first = why.lines().take(3).collect::<Vec<_>>().join(" ");
+                    eprintln!("a fuller form was refused: {first}");
+                }
+                eprintln!(
+                    "built with solc {}, {} functions by name, {} as plain Solidity{}{}",
+                    out.compiler,
+                    out.headers,
+                    out.plain.len(),
+                    if out.plain.is_empty() { "" } else { ": " },
+                    out.plain.join(", ")
+                );
+                let equal = out.report.functions.iter().filter(|f| f.differs.is_none());
+                eprintln!(
+                    "{} of {} equal, branch outcomes reached in the original: {} of {}",
+                    equal.count(),
+                    out.report.functions.len(),
+                    out.report.branches_reached,
+                    out.report.branches
+                );
+                for f in out.report.functions.iter().filter(|f| f.differs.is_some()) {
+                    let why = f.differs.as_deref().unwrap_or("");
+                    eprintln!("{} DIFFERS: {why}", f.signature);
+                }
+                if !out.report.equal() {
+                    std::process::exit(1);
+                }
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&c)?);
             } else {
                 print!("{}", c.source);
@@ -397,6 +478,39 @@ fn run(cli: Cli) -> Result<()> {
                     _ => anyhow::bail!("'{h}' is neither a 4-byte selector nor a 32-byte topic"),
                 };
                 println!("0x{hex} {}", if line.is_empty() { "?" } else { &line });
+            }
+        }
+        Cmd::Check {
+            original,
+            source,
+            runs,
+            loose,
+            json,
+        } => {
+            let code = load(&original)?;
+            let report = match source {
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    let (built, report) = evmdec::check::against_source(&code, &text, runs, loose)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    eprintln!("contract {} built with solc {}", built.name, built.compiler);
+                    report
+                }
+                None => {
+                    let c = evmdec::decompile::decompile(&code, &Options::default());
+                    let entries = evmdec::check::entries(&c, &[]);
+                    evmdec::check::compare(&c.info.runtime, &c.info.runtime, &entries, runs)
+                }
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_check(&report);
+            }
+            if !report.equal() {
+                eprintln!("the source does not do what the original does");
+                std::process::exit(1);
             }
         }
         Cmd::Disasm { file } => {

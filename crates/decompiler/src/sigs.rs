@@ -65,6 +65,11 @@ pub fn error(selector: u32) -> Option<Cow<'static, str>> {
         .map(Cow::Owned)
 }
 
+pub fn error_named(name: &str, values: usize) -> Option<&'static str> {
+    let fits = |s: &&&str| name_of(s) == name && params_of(s).len() == values;
+    get().errors.values().find(fits).copied()
+}
+
 // A lookup service is not trusted. Its names end up in the output and the report.
 #[cfg(feature = "rpc")]
 fn answers(sig: &str, selector: u32) -> bool {

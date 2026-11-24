@@ -487,6 +487,53 @@ fn lobby_calls_into_its_own_deployment() {
 }
 
 #[test]
+fn a_struct_kept_in_memory_is_local_and_a_word_behind_an_address_is_the_word() {
+    let opts = evmdec::decompile::Options {
+        solidity: true,
+        ..evmdec::decompile::Options::default()
+    };
+    let code = corpus().into_iter().find(|(n, _)| n == "compound_ceth");
+    let (_, code) = code.expect("fixture present");
+    let source = evmdec::decompile::decompile(&code, &opts).source;
+    assert!(source.contains("s1.w5 = ret_5_1;"), "{source}");
+    assert!(source.contains("func_0x3f98(arg0, arg1)"), "{source}");
+    assert!(!source.contains("func_0x3f98(mem[arg0]"), "{source}");
+    assert!(!source.contains("_0 = 0x8c379a0"), "{source}");
+}
+
+#[test]
+fn a_block_of_memory_is_taken_then_written_and_a_text_handed_on_stays_a_text() {
+    let opts = evmdec::decompile::Options {
+        solidity: true,
+        ..evmdec::decompile::Options::default()
+    };
+    let source = |name: &str| {
+        let code = corpus().into_iter().find(|(n, _)| n == name);
+        let (_, code) = code.expect("fixture present");
+        evmdec::decompile::decompile(&code, &opts).source
+    };
+    let router = source("univ2_router");
+    let taken = "ptr2 = _free(); _take(arg3 * 32 + ptr2 + 32);";
+    assert!(router.contains(taken), "{router}");
+    assert!(
+        router.contains("_copy_calldata(ptr2 + 32, arg2, arg3 * 32);"),
+        "{router}"
+    );
+    assert!(
+        router.contains("address[] arg1) external view returns (uint256[])"),
+        "{router}"
+    );
+    assert!(router.contains("assembly { ptr1 := arg1 }"), "{router}");
+    assert!(router.contains("func_0x3093(arg0, ptr1);"), "{router}");
+    let token = source("uni_token");
+    assert!(
+        token.contains("\"Uni::transfer: amount exceeds 96 bits\""),
+        "{token}"
+    );
+    assert!(!token.contains("s1_0 = 37;"), "{token}");
+}
+
+#[test]
 fn types_follow_values_through_helpers_and_range_checks() {
     let opts = evmdec::decompile::Options {
         no_sigs: true,

@@ -15,7 +15,7 @@ pub struct Layout {
     pub fixed: Vec<usize>,
 }
 
-fn split_top(list: &str) -> Vec<&str> {
+pub(crate) fn split_top(list: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let (mut depth, mut start) = (0usize, 0usize);
     for (i, c) in list.char_indices() {

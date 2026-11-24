@@ -155,6 +155,8 @@ pub struct Names {
     // Blocks whose taking the text stated ahead of the statement that takes them. Each
     // other way to a block states its own taking.
     pub ahead: RefCell<HashSet<u32>>,
+    // Blocks that hold an argument the header declares as held in memory.
+    pub held: RefCell<HashSet<u32>>,
     /* Blocks the code lays the data of a call out in without taking them. A file writes
     such a block the same way and takes it as the call is made. */
     pub open: HashSet<u32>,
@@ -2000,8 +2002,40 @@ fn owned_memory(off: ExprId, n: &Names) -> bool {
         expr::split_offset(off).0,
     ) {
         (Some(number), _) => n.taken.borrow().contains(&number) || n.open.contains(&number),
-        (None, base) => base.is_some(),
+        // Where the code knows the start of free memory as a number, a sum on a number
+        // past that start is a place in its own layout of memory, which a file has not.
+        (None, base) => {
+            let laid_out = n.blocks.as_ref().is_some_and(|b| b.contains_key(&None));
+            let past = expr::split_offset(off).1 >= U256::from_u64(0x80);
+            base.is_some() && !(laid_out && past)
+        }
     }
+}
+
+/* A compiler before 0.8 copies a `bytes`, text or array argument to a fixed place in
+memory before the function's own code runs. A file declares such an argument as held in
+memory, the compiler makes the copy, and the place is the argument's own. This is the
+block and the argument, for the store that writes the length of the copy. */
+fn held_argument(off: ExprId, val: ExprId, n: &Names) -> Option<(u32, u32)> {
+    let (number, at) = block_ref(off, n).filter(|_| expr::is_const(off))?;
+    let Node::CallDataLoad(length_at) = expr::node(val) else {
+        return None;
+    };
+    let (place, past) = expr::split_offset(length_at);
+    let Node::CallDataLoad(head) = expr::node(place?) else {
+        return None;
+    };
+    let index = calldata_word_index(head).filter(|_| n.strict && !n.in_helper)?;
+    let ty = n.param_types.get(&index)?;
+    let copied = dynamic_type(ty) && !ty.starts_with('(');
+    (copied && at.is_zero() && past == U256::from_u64(4)).then_some((number, index))
+}
+
+// The rest of that copy: the bytes, and the word of zeros old code puts after them.
+fn held_copy(to: ExprId, n: &Names) -> bool {
+    let at = expr::konst(expr::split_offset(to).1);
+    let block = block_ref(at, n).filter(|(k, _)| n.held.borrow().contains(k));
+    block.is_some_and(|(_, within)| within == U256::from_u64(32))
 }
 
 fn block_started(e: ExprId, n: &Names) -> Option<u32> {
@@ -3773,6 +3807,17 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             if n.strict && is_free_pointer(*off) {
                 return fmt_taken(*val, n).unwrap_or_default();
             }
+            if let Some((number, index)) = held_argument(*off, *val, n) {
+                n.taken.borrow_mut().insert(number);
+                n.held.borrow_mut().insert(number);
+                let name = n.params.get(&index).cloned();
+                let name = name.unwrap_or_else(|| format!("arg{index}"));
+                return format!("assembly {{ ptr{number} := {name} }}");
+            }
+            let zeroed = expr::as_const(*val) == Some(U256::ZERO) && !expr::is_const(*off);
+            if n.strict && zeroed && held_copy(*off, n) {
+                return String::new();
+            }
             let ahead = match scalar_word(*off, n) {
                 Some(_) => String::new(),
                 None => taken_ahead(*off, n),
@@ -4096,6 +4141,9 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 (op::MCOPY, None) => Some("_copy"),
                 _ => None,
             };
+            if *kind == op::CALLDATACOPY && expr::is_const(*dest) && held_copy(*dest, n) {
+                return String::new();
+            }
             let ahead = match copier {
                 Some(_) => taken_ahead(*dest, n),
                 None => String::new(),
@@ -4144,7 +4192,14 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             let places = n.offsets.handed.get(callee);
             let place = |j: &usize| places.is_some_and(|p| p.contains(j));
             let declared = n.callee_params.get(callee).filter(|_| n.strict);
-            let shown = |(j, x): (usize, &ExprId)| match (handed_word(*x, n), place(&j)) {
+            // The fixed place of an argument held in memory is that argument.
+            let held = |x: &ExprId| {
+                let fixed = block_ref(*x, n).filter(|_| expr::is_const(*x));
+                let whole = fixed.filter(|(k, at)| at.is_zero() && n.held.borrow().contains(k));
+                whole.map(|(k, _)| format!("ptr{k}"))
+            };
+            let shown = |(j, x): (usize, &ExprId)| match (held(x).or(handed_word(*x, n)), place(&j))
+            {
                 (Some(word), _) => word,
                 (None, true) => fmt_stored_word(*x, n),
                 (None, false) => match declared.and_then(|types| types.get(j)) {

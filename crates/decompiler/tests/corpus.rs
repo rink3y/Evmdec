@@ -523,6 +523,8 @@ fn a_block_of_memory_is_taken_then_written_and_a_text_handed_on_stays_a_text() {
         router.contains("address[] arg1) external view returns (uint256[])"),
         "{router}"
     );
+    assert!(router.contains("assembly { ptr1 := arg1 }"), "{router}");
+    assert!(router.contains("func_0x3093(arg0, ptr1);"), "{router}");
     let token = source("uni_token");
     assert!(
         token.contains("\"Uni::transfer: amount exceeds 96 bits\""),

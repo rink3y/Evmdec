@@ -531,6 +531,19 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     format!("        unchecked {{\n{inner}        }}\n")
 }
 
+// An argument whose place in memory the body takes is declared as held in memory.
+fn held_in_memory(head: &str, body: &str) -> String {
+    let mut head = head.to_string();
+    for line in body.lines() {
+        let taken = line.trim_start().strip_prefix("assembly { ptr");
+        let name = taken.and_then(|t| t.split_once(" := ")?.1.strip_suffix(" }"));
+        if let Some(name) = name {
+            head = head.replace(&format!(" calldata {name}"), &format!(" memory {name}"));
+        }
+    }
+    head
+}
+
 // The compiler takes forty hex digits for an address and refuses one whose letters are
 // not in the case the address's own hash gives them.
 fn checksummed(text: &str) -> String {
@@ -904,9 +917,12 @@ fn without_scratch_before_taking(mut lines: Vec<String>) -> Vec<String> {
     let named: BTreeSet<String> = named.map(str::to_string).collect();
     let mut dropped = vec![false; lines.len()];
     for block in named {
-        let taking = format!("{block} = _free();");
+        let named = [
+            format!("{block} = _free();"),
+            format!("assembly {{ {block} := "),
+        ];
         let takings: Vec<usize> = (0..lines.len())
-            .filter(|i| lines[*i].trim_start().starts_with(&taking))
+            .filter(|i| named.iter().any(|t| lines[*i].trim_start().starts_with(t)))
             .collect();
         let after = |i: usize, t: usize| {
             let inside = |l: &String| indent(l) >= indent(&lines[t]);
@@ -928,7 +944,7 @@ fn without_scratch_before_taking(mut lines: Vec<String>) -> Vec<String> {
             loose.into_iter().for_each(|i| dropped[i] = true);
         } else {
             for t in takings {
-                lines[t] = lines[t].replacen(" = _free();", " = mem[64];", 1);
+                lines[t] = format!("{}{block} = mem[64];", " ".repeat(indent(&lines[t])));
             }
         }
     }
@@ -1274,7 +1290,11 @@ fn declarations(c: &Contract, f: &Function, text: &str) -> String {
     // A block is a variable only where a string was put in it by name. Any other use of
     // one is memory this text does not account for, and has to fail to build.
     for name in words.iter().filter(|w| numbered(w, "ptr")) {
-        let given = [format!("{name} = _pointer("), format!("{name} = _free()")];
+        let given = [
+            format!("{name} = _pointer("),
+            format!("{name} = _free()"),
+            format!("assembly {{ {name} := "),
+        ];
         if given.iter().any(|g| text.contains(g)) {
             out.push_str(&format!("        uint256 {name};\n"));
         }
@@ -1648,7 +1668,9 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
             let head = widened(head, plain.relaxed.get(&i));
             if written.insert(head.clone()) {
                 let start = out.len();
-                out.push_str(&format!("    {head} {{\n{}    }}\n\n", body(c, f, plain)));
+                let text = body(c, f, plain);
+                let head = held_in_memory(&head, &text);
+                out.push_str(&format!("    {head} {{\n{text}    }}\n\n"));
                 spans.push((start, out.len(), i));
             }
             continue;
@@ -2202,6 +2224,15 @@ mod tests {
             "x = keccak256(abi.encode(a));\n_copy(ptr1 + 36",
         );
         assert_eq!(scratch_taken_for_its_call(lines(&busy)).join("\n"), busy);
+    }
+
+    #[test]
+    fn an_argument_the_body_takes_from_memory_is_declared_in_memory() {
+        let head = "function f(address a, bytes calldata arg1) external";
+        let body = "        assembly { ptr1 := arg1 }\n        g(a, ptr1);\n";
+        let want = "function f(address a, bytes memory arg1) external";
+        assert_eq!(held_in_memory(head, body), want);
+        assert_eq!(held_in_memory(head, "        g(a, 128);\n"), head);
     }
 
     #[test]

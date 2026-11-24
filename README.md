@@ -214,7 +214,9 @@ execute from the drawn state, or one that makes two differently based memory acc
 `evmdec check original.hex source.sol` compiles a Solidity file with the compiler its pragma
 asks for and runs the result beside the original bytecode. Both get the same calls on the same
 state: every function with arguments drawn for its types, as several callers, with and
-without ether, on drawn storage and on storage nobody has used. Each run must agree on what
+without ether, on drawn storage and on storage nobody has used. Drawn storage is a mix of
+empty words, small numbers and random words, and a quarter of the other accounts hold no
+code, as on a chain. Each run must agree on what
 another account can see: whether it returned, the data, every storage slot written, events,
 outside calls in order, and contracts created. Gas and the layout of memory are left out,
 since two builds of one source differ in both.
@@ -263,8 +265,19 @@ only by its first topic cannot be declared by a name, so it is declared anonymou
 topic as its first indexed value. A write to memory that nothing reads any more, because
 the event, call or return it fed is shown by what it means, is left out. A few things
 Solidity has no word for go through a small private function added at the end of the
-contract: a word of a call's answer, its length, and a string taken as the place it lies at,
-which is how a helper written for older compilers receives a reason.
+contract: a word of a call's answer, its length, a panic with its code, a failure whose
+error has no known name, and a string taken as the place it lies at, which is how a helper
+written for older compilers receives a reason. An error whose signature is known is declared
+and failed with by name. Arithmetic the code does not test for overflow is put in an
+`unchecked` block, one statement at a time.
+
+A struct a function keeps in memory for itself is written as a struct in memory again, with
+its words as fields. A struct of one word, which older code hands from helper to helper by
+its address, is handed over as the word, in every helper and caller at once. Old code gives
+a call a fixed stretch of memory to answer into and reads the answer from there: the file
+keeps the answer the call gave and reads that. A value is declared in the block that gives
+it, where everything that reads it lies in that block, and at the top of the function
+otherwise.
 
 A function that only returns one variable is not written at all: the variable is declared
 `public` under the function's name, as an author would have, and the compiler writes the
@@ -280,21 +293,39 @@ A plain function from a contract built before solc 0.8 cannot match the original
 input, because the file is written for a current compiler: that compiler refuses an argument
 wider than its type where the old one cut it, and names its own failures with a panic code
 where the old one gave no data. Such a function is compared on well-formed calls, and two
-built-in failures count as the same failure. `evmdec check --loose` makes the same
-comparison. A contract built with solc 0.8 is compared with no such allowance.
+built-in failures count as the same failure. A run in which another contract answers with
+fewer bytes than the old code gave it room for is left out as well: past the end of a
+short answer that code reads whatever its compiler had left in memory, which no source
+says. `evmdec check --loose` makes the same comparison. A contract built with solc 0.8 is
+compared with no such allowance.
 
 `./corpus/exact_all.sh` runs this over a directory. All 22 corpus contracts compile and
 compare equal on every function, solc 0.4 to 0.8 and Vyper, and so do the 17 regression, 30
-vulnerable and 5 source fixtures in `testdata`: 74 of 74. Of the 865 functions those files
-name, 496 are plain Solidity: all 11 of WETH, 24 of 25 in USDT, 21 of 22 in the Uniswap V2
-pair, 34 of 39 in USDC. What holds the rest back is mostly memory used as data: a struct or
-an array built in memory, a `bytes` or `string` argument passed on, and the hand-written
+vulnerable and 5 source fixtures in `testdata`: 74 of 74. Those contracts answer 1,972
+functions between them. With the signatures built into the binary and no index installed,
+the files declare 880 of them by name, and 536 of the 880 are plain Solidity: all 11 of
+WETH, 29 of 29 in USDT, 21 of 22 in the Uniswap V2 pair, 35 of 39 in USDC, 26 of 40 in
+Compound cETH. The other 1,092 answer through `fallback` in their exact form: 932 have a
+selector no built-in signature hashes to, so no header can be written for them, 28 take a
+struct, and the rest are decoded differently by a current compiler than by the original.
+
+With the full signature index installed (see below) the same run declares 1,590 of the
+1,972 by name and 920 of those are plain Solidity. USDT then comes out with no exact
+block at all, as WETH does without it.
+
+What holds a named function back is mostly memory used as data: a `bytes` or `string`
+argument passed on, an array built in memory, a call encoded by hand, and the hand-written
 logging of older MakerDAO code. Those are still printed in a notation no compiler reads.
+Some long functions also need more values at once than a compiler can reach, and a few
+keep a jump the printer could not turn into a loop or a branch.
 
 On the WETH file, 51 of 54 single changes to an operator, a check or an event are caught, and
-the other three change a value nothing reads. On the plain part of the USDC file, 65 of 70
-are caught: four of the rest change a value nothing reads and one removes a failure no
-caller can reach.
+the other three change a value nothing reads. On the plain part of the USDT file, 66 of 80
+are caught. Two of the other 14 remove a test of the call data's length that the compiler
+now makes itself. The rest sit on paths that need several stored values to line up at
+once, a fee that is not zero or an upgrade to a contract that holds no code, which the
+drawn runs rarely reach. A change there would get past the check, so the check stays
+evidence.
 
 ### Decompiler against verified source
 

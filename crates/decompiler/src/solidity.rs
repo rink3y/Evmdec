@@ -1913,6 +1913,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
     let mut depth = runs;
     let mut relaxed: BTreeMap<usize, Reach> = BTreeMap::new();
     for _ in 0..48 {
+        crate::clock::check();
         let read: BTreeSet<usize> = public.iter().map(|(i, _)| *i).collect();
         let written = c
             .functions

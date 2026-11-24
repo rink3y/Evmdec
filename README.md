@@ -460,9 +460,15 @@ reached (which contract calls it, how, and how many calls away) and lists the ca
 that were seen and not fetched, each with its reason. Results are linkable as `/?chain=mainnet&address=0x...`. The page meets
 WCAG 2.2 AA on both colour schemes and runs no third-party scripts.
 
+The Solidity tab, marked beta, shows the [Solidity file](#solidity-file) of the contract on
+screen: for a proxy shown whole, the file of its implementation. The file is built when the
+tab is first opened, and the tab says how it compared with the bytecode. Copy and download
+give the file while that tab is open.
+
 ```
 POST /api/decompile      {"address": "0x...", "chain": "mainnet"}  or  {"bytecode": "0x..."}
                          optional: "no_follow_proxy": true, "lookup": true, "depth": 0..3
+                         "solidity": true asks for the Solidity file instead
 GET  /api/address/{chain}/{address}
 GET  /api/chains
 GET  /api/status         {"signature_index": 10780428}, or 0 when no index is installed
@@ -477,6 +483,16 @@ one, and the number of calls away); the contract asked for lists what was not fe
 edges to follow (default 2, at most 3, 0 for none). Requests are bounded: four decompilations
 in flight, four minutes each, sixteen more waiting. One request makes at most 4,000 calls to
 remote nodes in at most 240 seconds, and code over 1 MiB is refused.
+
+With `"solidity": true` the answer is the Solidity file of that one contract, with no proxy
+followed: `solidity.source`, the compiler, how many entry points compared `equal` out of
+`compared`, the branch outcomes reached, the number of functions `named` and the list of
+those written `plain`. Building it takes from seconds to minutes, so it is made in the
+background. The first request answers `202 {"pending": true}`, and the same request sent
+again answers `202` until the file is there and `200` with it after. A file that could not
+be built answers `200 {"failed": "..."}`. Two files are built at a time, each for at most
+ten minutes, and eight may be asked for at once. The server downloads the compiler a file
+needs from `binaries.soliditylang.org` the first time and keeps it in `EVMDEC_SOLC_DIR`.
 
 ### Configuration
 

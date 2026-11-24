@@ -69,6 +69,8 @@ fn u(n: u64) -> U256 {
 
 struct DynReturn {
     ptr: ExprId,
+    // The length counts words, as an array's does, and not bytes.
+    words: bool,
     dropped: usize,
     dead: Vec<usize>,
 }
@@ -121,10 +123,13 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
     let mut dead: Vec<usize> = Vec::new();
     let region_start: Vec<usize>;
     let dropped;
+    let scaled = |e: ExprId| expr::contains(e, &|n| matches!(n, Node::Op(op::MUL | op::SHL, _)));
+    let words;
     if copy_form {
-        let Stmt::Copy { dest, src, .. } = &sn.stmts[k - 1] else {
+        let Stmt::Copy { dest, src, len, .. } = &sn.stmts[k - 1] else {
             return None;
         };
+        words = scaled(*len);
         let (td, cd) = addends(*dest);
         let (ts, cs) = addends(*src);
         if td != ta || cd != ca.wrapping_add(u(64)) || ts != tp || cs != cp.wrapping_add(u(32)) {
@@ -179,6 +184,7 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
         {
             return None;
         }
+        words = scaled(*cond);
         let bn = &l.nodes[b];
         if bn.stmts.len() != 1 {
             return None;
@@ -267,6 +273,7 @@ fn match_dynamic_return(l: &Lifted, s: usize) -> Option<DynReturn> {
     }
     Some(DynReturn {
         ptr: p,
+        words,
         dropped,
         dead,
     })
@@ -349,7 +356,10 @@ pub fn fold(l: &mut Lifted) -> usize {
             cur = p;
             hops += 1;
         }
-        l.nodes[s].term = literal_return(&chain, m.ptr).unwrap_or(Term::ReturnDyn { ptr: m.ptr });
+        l.nodes[s].term = literal_return(&chain, m.ptr).unwrap_or(Term::ReturnDyn {
+            ptr: m.ptr,
+            words: m.words,
+        });
         let old_succs = l.nodes[s].succs.clone();
         l.nodes[s].succs.clear();
         for os in old_succs {

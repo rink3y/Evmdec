@@ -561,7 +561,7 @@ fn offsets_in(pc: usize, l: &Lifted, places: &mut HashMap<usize, Places>) -> Off
             Term::Return { off, len, .. } | Term::Revert { off, len, .. } => {
                 pending.extend([*off, *len])
             }
-            Term::ReturnDyn { ptr } => pending.push(*ptr),
+            Term::ReturnDyn { ptr, .. } => pending.push(*ptr),
             Term::InternalReturn(vals) => {
                 pending.extend(own.returns.iter().filter_map(|j| vals.get(*j)))
             }
@@ -4202,7 +4202,7 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
             }
         },
         Term::Stop => "return;".into(),
-        Term::ReturnDyn { ptr } => format!("return {};", fmt_expr(*ptr, n)),
+        Term::ReturnDyn { ptr, .. } => format!("return {};", fmt_expr(*ptr, n)),
         Term::Invalid => "assert(false); // INVALID".into(),
         Term::SelfDestruct(a) if n.strict => {
             format!("selfdestruct(payable({}));", as_address(*a, n))

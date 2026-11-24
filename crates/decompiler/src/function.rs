@@ -877,9 +877,9 @@ pub fn infer_returns(l: &Lifted) -> Vec<String> {
             {
                 best = tys;
             }
-        } else if let Term::ReturnDyn { .. } = &nd.term {
+        } else if let Term::ReturnDyn { words, .. } = &nd.term {
             if best.is_empty() {
-                best = vec!["bytes".into()];
+                best = vec![if *words { "uint256[]" } else { "bytes" }.into()];
             }
         }
     }

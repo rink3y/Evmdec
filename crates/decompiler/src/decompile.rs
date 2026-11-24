@@ -961,7 +961,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         if kind == FnKind::Receive {
             returns.clear();
         }
-        if l.nodes.iter().any(|nd| matches!(&nd.term, Term::ReturnDyn { ptr } if crate::idiom::is_string_pointer(&l, *ptr, &loaders).is_some())) {
+        if l.nodes.iter().any(|nd| matches!(&nd.term, Term::ReturnDyn { ptr, .. } if crate::idiom::is_string_pointer(&l, *ptr, &loaders).is_some())) {
             returns = vec!["string".into()];
         }
         Function {

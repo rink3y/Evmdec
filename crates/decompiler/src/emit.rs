@@ -3198,6 +3198,31 @@ pub fn failure(reason: &str) -> String {
     }
 }
 
+fn known_bits(e: ExprId, asked: U256) -> Option<U256> {
+    if let Some(word) = expr::as_const(e) {
+        return Some(word & asked);
+    }
+    if (expr::may_bits(e) & asked).is_zero() {
+        return Some(U256::ZERO);
+    }
+    let by = |amount: ExprId| expr::as_const(amount).and_then(|k| k.as_usize());
+    match expr::node(e) {
+        Node::Op(op::OR, v) => {
+            let mut parts = v.iter().map(|x| known_bits(*x, asked));
+            parts.try_fold(U256::ZERO, |all, part| Some(all | part?))
+        }
+        Node::Op(op::SHL, v) => {
+            let k = by(v[0]).filter(|k| *k < 256)? as u32;
+            Some(known_bits(v[1], asked >> k)? << k)
+        }
+        Node::Op(op::SHR, v) => {
+            let k = by(v[0]).filter(|k| *k < 256)? as u32;
+            Some(known_bits(v[1], asked << k)? >> k)
+        }
+        _ => None,
+    }
+}
+
 pub fn decode_string_payload(words: &[ExprId], payload_len: Option<usize>) -> Option<String> {
     let offset = expr::as_const(shifted_word_len(words, 0, payload_len))?;
     if offset != U256::from_u64(0x20) {
@@ -3210,7 +3235,10 @@ pub fn decode_string_payload(words: &[ExprId], payload_len: Option<usize>) -> Op
     let mut bytes = Vec::new();
     let mut i = 2;
     while bytes.len() < len {
-        let w = expr::as_const(shifted_word_len(words, i, payload_len))?;
+        // The text can end inside a word whose other bytes are whatever memory held.
+        let left = (len - bytes.len()).min(32) as u32;
+        let asked = !expr::mask_bits(8 * (32 - left));
+        let w = known_bits(shifted_word_len(words, i, payload_len), asked)?;
         bytes.extend_from_slice(&w.to_be_bytes());
         i += 1;
         if i > words.len() + 1 {

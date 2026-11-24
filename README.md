@@ -299,7 +299,7 @@ A function that only returns one variable is not written at all: the variable is
 `public` under the function's name, as an author would have, and the compiler writes the
 function. When every function of a contract is plain, its fallback is written out too and
 the exact block is dropped, which leaves a file with no assembly in it. The WETH contract
-comes out that way, in 89 lines.
+comes out that way, in 93 lines.
 
 A function that keeps its exact form but whose arguments the compiler would decode
 differently from the original, as code from before solc 0.8 does, is left out of the named

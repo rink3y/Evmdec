@@ -463,11 +463,11 @@ fn tribe_reads_as_source() {
     let src = &c.source;
     for s in [
         "mapping(address => bool) stor_3;",
-        "address[] members;",
+        "address[] stor_4;",
         "require(!stor_3[address(v2)]);",
-        "members.push(address(v2));",
+        "stor_4.push(address(v2));",
         "stor_3[address(v2)] = true;",
-        "if (members.length < size) {",
+        "if (stor_4.length < stor_7) {",
         "assert(v1 < stor[arg0]);",
     ] {
         assert!(src.contains(s), "missing {s}\n{src}");
@@ -633,9 +633,9 @@ fn defaults_give_way_to_names_the_code_implies() {
     let usdt = source("usdt");
     for line in [
         "address owner; // slot 0x0 bytes 0..20",
-        "uint256 _totalSupply; // slot 0x1",
+        "uint256 totalSupply; // slot 0x1",
         "mapping(address => uint256) balances; // slot 0x2",
-        "mapping(address => mapping(address => uint256)) allowed; // slot 0x5",
+        "mapping(address => mapping(address => uint256)) allowances; // slot 0x5",
         "function _transfer(address from, address to, uint256 amount) internal",
         "function _pause() internal",
     ] {
@@ -1142,9 +1142,9 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
     }
     assert!(
         gauge.contains(
-            "uint256 prev_period = period;\n        \
-             uint256 prev_timestamp_15_period = timestamp_15[prev_period];"
-        ) && gauge.contains("if (prev_stor_5 >= prev_timestamp_15_period) {"),
+            "uint256 prev_stor_14 = stor_14;\n        \
+             uint256 prev_timestamp_15_stor_14 = timestamp_15[prev_stor_14];"
+        ) && gauge.contains("if (prev_stor_5 >= prev_timestamp_15_stor_14) {"),
         "the period is read once, ahead of both branches"
     );
     let burn = &pool[pool
@@ -1160,7 +1160,7 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
         "the last write reads slot 0 anew"
     );
     assert!(
-        dvn.contains("require(uint64(quorum) <= uint64(stor_4),"),
+        dvn.contains("require(uint64(stor_6) <= uint64(stor_4),"),
         "the quorum is checked against the size after the change"
     );
     assert!(dvn.contains("if (!stor_8[ret_3_0]) {"));

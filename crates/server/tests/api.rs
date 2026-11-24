@@ -77,6 +77,32 @@ fn each_input_gets_its_own_answer_and_a_repeat_gets_the_same_one() {
 }
 
 #[test]
+fn a_solidity_file_is_made_in_the_background_and_given_when_asked_again() {
+    let server = start();
+    let ask = || {
+        let request = format!("{{\"bytecode\":\"{STORE_ONE}\",\"solidity\":true}}");
+        post(&server, &request)
+    };
+    let first = ask();
+    assert!(first.starts_with("HTTP/1.1 202"), "{first}");
+    assert!(body(&first).contains("\"pending\":true"), "{first}");
+    let until = Instant::now() + Duration::from_secs(240);
+    let made = loop {
+        let answer = ask();
+        if !answer.starts_with("HTTP/1.1 202") {
+            break answer;
+        }
+        assert!(Instant::now() < until, "the file was not made in time");
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(made.starts_with("HTTP/1.1 200"), "{made}");
+    assert!(body(&made).contains("pragma solidity"), "{made}");
+    assert!(body(&made).contains("\"equal\":1,"), "{made}");
+    let plain = post(&server, &format!("{{\"bytecode\":\"{STORE_ONE}\"}}"));
+    assert!(body(&plain).contains("\"contract\""), "{plain}");
+}
+
+#[test]
 fn a_node_named_in_the_request_changes_nothing() {
     let server = start();
     let plain = post(&server, &format!("{{\"bytecode\":\"{STORE_ONE}\"}}"));

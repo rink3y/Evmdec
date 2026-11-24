@@ -1,6 +1,7 @@
 use crate::emit::{self, Names};
 use crate::expr::{self, ExprId, Node};
 use crate::lift::{self, Lifted, Stmt, Term};
+use crate::opcode as op;
 use std::collections::{HashMap, HashSet};
 
 const WORD: u64 = 32;
@@ -247,6 +248,18 @@ fn ranged(s: &Stmt) -> Vec<ExprId> {
             out_len,
             ..
         } => vec![*in_off, *in_len, *out_off, *out_len],
+        // Bytes copied out of a block, or into one from the code, are part of what the
+        // block holds. Such a block is more than the words stored in it.
+        Stmt::Copy {
+            kind: op::MCOPY,
+            dest,
+            ..
+        } => vec![*dest],
+        Stmt::Copy {
+            kind: op::CODECOPY,
+            src,
+            ..
+        } => vec![*src],
         Stmt::Copy { dest, src, .. } => vec![*dest, *src],
         Stmt::Log { off, len, .. } => vec![*off, *len],
         _ => Vec::new(),

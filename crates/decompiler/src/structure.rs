@@ -4096,22 +4096,26 @@ impl<'a> Printer<'a> {
             format!("{var_s} = {a} || {b};")
         };
         let c_s = emit::fmt_or_operand(cond, self.names);
-        let txt = if self.names.strict {
-            // Both values of a choice have to be of one type, and the test a flag.
+        // For a compiler `&&` joins two flags and gives one. A choice between two
+        // values that are not both flags has to be written out as a choice.
+        let flags = !self.names.strict
+            || (emit::is_bool(var, self.names)
+                && [cond, x, y].iter().all(|e| emit::is_bool(*e, self.names)));
+        let txt = if flags && y == cond {
+            both(cond, x)
+        } else if flags && x == cond {
+            either(cond, y)
+        } else if flags && x == ncond {
+            both(ncond, y)
+        } else if flags && y == ncond {
+            either(ncond, x)
+        } else if self.names.strict {
             let test = emit::fmt_cond(cond, self.names);
             let (x, y) = (
                 emit::fmt_assigned(var, x, self.names),
                 emit::fmt_assigned(var, y, self.names),
             );
             format!("{var_s} = ({test}) ? {x} : {y};")
-        } else if y == cond {
-            both(cond, x)
-        } else if x == cond {
-            either(cond, y)
-        } else if x == ncond {
-            both(ncond, y)
-        } else if y == ncond {
-            either(ncond, x)
         } else {
             format!(
                 "{} = {} ? {} : {};",

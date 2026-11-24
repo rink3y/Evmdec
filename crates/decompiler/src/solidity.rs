@@ -148,6 +148,24 @@ fn declarable(event: &str) -> bool {
     identifier(name) && plain.all(|t| written(t, "memory").is_some())
 }
 
+/* An event as a file declares it. One known only by its first topic cannot be declared
+by a name that hashes to the topic. It is declared anonymous with the topic as its first
+indexed value and every other value a word, which is how the printer emits it. */
+fn declared(event: &str) -> Option<String> {
+    let Some((shape, _)) = event.split_once("; // topic0 ") else {
+        return declarable(event).then(|| event.to_string());
+    };
+    let (name, rest) = shape.split_once('(')?;
+    let values = abi::split_top(rest.strip_suffix(')')?);
+    let word = |v: &str| match v.trim().ends_with(" indexed") {
+        true => "uint256 indexed",
+        false => "uint256",
+    };
+    let mut listed = vec!["bytes32 indexed"];
+    listed.extend(values.into_iter().map(word));
+    identifier(name).then(|| format!("{name}({}) anonymous", listed.join(", ")))
+}
+
 fn contract_name(c: &Contract) -> &str {
     let lines = c.source.lines();
     let declared = lines.filter_map(|l| l.strip_prefix("contract ")).next();
@@ -419,8 +437,17 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     let payable = f.kind == FnKind::Internal || f.mutability == Mutability::Payable;
     // The compiler makes this test itself for a function that takes no ether, and
     // does not let such a function read the value.
-    let own = |l: &&str| payable || l.trim() != "require(msg.value == 0);";
-    let mut lines: Vec<String> = f.code.lines().filter(own).map(one_value).collect();
+    let external = f.kind == FnKind::External;
+    let own = |l: &&str| {
+        let code = l.trim();
+        // So is the test that the call data is long enough for the arguments.
+        let long_enough = code.strip_prefix("require(msg.data.length - 4 >= ");
+        let counted = long_enough.and_then(|rest| rest.strip_suffix(");"));
+        let sized = counted.is_some_and(|n| n.parse::<usize>().is_ok());
+        (payable || code != "require(msg.value == 0);") && !(external && sized)
+    };
+    let lines: Vec<String> = f.code.lines().filter(own).map(one_value).collect();
+    let mut lines = without_dead_stores(held_strings(lines));
     if lines.last().is_some_and(|l| l == "        return;") {
         lines.pop();
     }
@@ -430,7 +457,10 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
         true => text.replace("block.prevrandao", "block.difficulty"),
         false => text,
     };
-    let text = format!("{}{text}", declarations(f, &text));
+    let text = unused_answers(&text);
+    let text = saved_as_stored(c, &plain.layout.renamed, &text);
+    let declared = declarations(c, f, &text);
+    let text = format!("{declared}{}", returned_as_declared(f, &declared, &text));
     // Arithmetic before 0.8 wraps. In a current file only an unchecked block does.
     let wraps = ["+", "*", " - ", "-=", "(-"]
         .iter()
@@ -477,6 +507,153 @@ fn checksummed(text: &str) -> String {
     out
 }
 
+// The data a call gave back is only kept where something reads it.
+fn unused_answers(text: &str) -> String {
+    let mut out = text.to_string();
+    let mut from = 0;
+    while let Some(at) = out[from..].find(", returned_") {
+        let start = from + at;
+        let digits = out[start + 11..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .count();
+        let name = out[start + 2..start + 11 + digits].to_string();
+        from = start + 2;
+        let closes = out[start + 11 + digits..].starts_with(") = ");
+        if closes && out.matches(name.as_str()).count() == 1 {
+            out.replace_range(start + 2..start + 11 + digits, "");
+        }
+    }
+    out
+}
+
+/* A string put in memory to be handed to a helper. The printer shows it as a block, or
+as a length and the bytes after it. In source it is the string, and the helper takes
+the place it lies at. */
+fn held_strings(mut lines: Vec<String>) -> Vec<String> {
+    let literal = |code: &str, block: &str| {
+        let text = code
+            .strip_prefix(block)?
+            .strip_prefix(" = memory(")?
+            .strip_suffix(");")?;
+        let plain = text.len() >= 2 && text.starts_with('"') && text.ends_with('"');
+        (plain && !text[1..text.len() - 1].contains('"')).then(|| text.to_string())
+    };
+    for i in 0..lines.len() {
+        let indent = lines[i].len() - lines[i].trim_start().len();
+        let code = lines[i].trim_start().to_string();
+        let block = blocks_named(&code).first().map(|b| b.to_string());
+        let Some(block) = block else {
+            continue;
+        };
+        if let Some(text) = literal(&code, &block) {
+            lines[i] = format!("{}{block} = _pointer({text});", " ".repeat(indent));
+            continue;
+        }
+        let length = code.strip_prefix(&format!("mem[{block}] = "));
+        let length = length.and_then(|l| l.strip_suffix(';')?.parse::<usize>().ok());
+        let bytes = format!("mem[{block} + 32:+{}] = \"", length.unwrap_or(0));
+        let next = lines.get(i + 1).map(|l| l.trim_start().to_string());
+        let text = next
+            .as_deref()
+            .and_then(|l| l.strip_prefix(bytes.as_str())?.strip_suffix("\";"));
+        // An escape makes the text longer than the bytes it stands for.
+        let Some(text) = text.filter(|t| Some(t.len()) == length && !t.contains('\\')) else {
+            continue;
+        };
+        lines[i] = format!("{}{block} = _pointer(\"{text}\");", " ".repeat(indent));
+        lines[i + 1] = String::new();
+    }
+    lines.retain(|l| !l.is_empty());
+    lines
+}
+
+fn blocks_named(text: &str) -> Vec<&str> {
+    let starts = text.match_indices("ptr").filter(|(at, _)| {
+        let before = text[..*at].chars().next_back();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    let named = starts.filter_map(|(at, _)| {
+        let digits = text[at + 3..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .count();
+        (digits > 0).then(|| &text[at..at + 3 + digits])
+    });
+    named.collect()
+}
+
+// Memory at a fixed place: the two scratch words and whatever old code keeps beside them.
+const FIXED: &str = "fixed";
+
+fn fixed_read(text: &str) -> bool {
+    let mut reads = text.match_indices("mem[");
+    reads.any(|(at, _)| text[at + 4..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/* The block a line writes to, when the line is a write to memory and the block is one
+this function took for itself or a fixed place. A write through any other address is
+not counted as one. Nothing here can tell what it lands on. */
+fn written_block(line: &str) -> Option<&str> {
+    let code = line.trim_start();
+    let (target, _) = code.split_once(" = ").filter(|_| code.ends_with(';'))?;
+    let inside = target
+        .strip_prefix("mem[")
+        .filter(|_| target.ends_with(']'));
+    let place = inside.unwrap_or(target);
+    let named = blocks_named(place)
+        .first()
+        .copied()
+        .filter(|b| place.starts_with(b));
+    match (named, inside) {
+        (Some(block), Some(_)) => Some(block),
+        (Some(block), None) => (block == target).then_some(block),
+        (None, Some(at)) => at
+            .starts_with(|c: char| c.is_ascii_digit())
+            .then_some(FIXED),
+        (None, None) => None,
+    }
+}
+
+/* A write to memory does nothing a caller can see. It matters through what reads it,
+and the printer shows most readers by what they mean: an event with its values, a
+call with its arguments, a return with its result. A block no line reads any more
+has its writes left out. A block some line still reads as raw memory keeps them, and
+the function then fails to build and stays exact. */
+fn without_dead_stores(lines: Vec<String>) -> Vec<String> {
+    fn read_by(line: &str) -> Vec<&str> {
+        let mut read = blocks_named(line);
+        read.extend(fixed_read(line).then_some(FIXED));
+        read
+    }
+    let mut live: BTreeSet<&str> = BTreeSet::new();
+    for line in lines.iter().filter(|l| written_block(l).is_none()) {
+        live.extend(read_by(line));
+    }
+    // A write that is kept reads what it copies from, and that keeps other writes.
+    loop {
+        let before = live.len();
+        for line in &lines {
+            let Some(block) = written_block(line).filter(|b| live.contains(b)) else {
+                continue;
+            };
+            let from = line.split_once(" = ").map_or("", |(_, value)| value);
+            live.extend(read_by(from));
+            live.insert(block);
+        }
+        if live.len() == before {
+            break;
+        }
+    }
+    let kept = |l: &String| written_block(l).is_none_or(|block| live.contains(block));
+    let kept: Vec<bool> = lines.iter().map(kept).collect();
+    let mut keep = kept.into_iter();
+    lines
+        .into_iter()
+        .filter(|_| keep.next() == Some(true))
+        .collect()
+}
+
 fn one_value(line: &str) -> String {
     let code = line.trim_start();
     let inner = code
@@ -501,7 +678,79 @@ fn one_value(line: &str) -> String {
 /* The printer assigns a value that two paths give without declaring it, as the place
 of the first assignment is not always in scope for the last use. Every such name is
 declared once at the top. */
-fn declarations(f: &Function, text: &str) -> String {
+/* The printer saves a stored value it will need after the slot is written, and declares
+the save a word. A variable that holds an address or a flag is saved as one. */
+fn saved_as_stored(c: &Contract, renamed: &[(String, String)], text: &str) -> String {
+    let shown = |name: &str| {
+        let new = renamed.iter().find(|(old, _)| old == name);
+        new.map_or(name.to_string(), |(_, new)| new.clone())
+    };
+    let stored = |value: &str| {
+        let (name, keys) = value.split_at(value.find('[').unwrap_or(value.len()));
+        let var = c
+            .storage
+            .iter()
+            .find(|v| v.fields.is_empty() && shown(&v.name) == name)?;
+        let ty = var.ty.rsplit(" => ").next()?.trim_end_matches(')');
+        let depth = var.ty.matches(" => ").count();
+        (keys.matches('[').count() == depth && matches!(ty, "address" | "bool")).then_some(ty)
+    };
+    let fixed = text.lines().map(|line| {
+        let code = line.trim_start();
+        let saved = code
+            .strip_prefix("uint256 ")
+            .and_then(|c| c.strip_suffix(';'));
+        let ty = saved
+            .and_then(|s| s.split_once(" = "))
+            .and_then(|(_, value)| stored(value));
+        match ty {
+            Some(ty) => line.replacen("uint256", ty, 1),
+            None => line.to_string(),
+        }
+    });
+    fixed.collect::<Vec<_>>().join("\n")
+}
+
+/* A value a helper gave back can be a flag where this function returns a number, or a
+number where it returns a flag. The types were worked out one function at a time. */
+fn returned_as_declared(f: &Function, declared: &str, text: &str) -> String {
+    let [wanted] = f.returns.as_slice() else {
+        return text.to_string();
+    };
+    let is = |ty: &str, name: &str| declared.contains(&format!("        {ty} {name};\n"));
+    let fixed = text.lines().map(|line| {
+        let code = line.trim_start();
+        let indent = &line[..line.len() - code.len()];
+        let value = code
+            .strip_prefix("return ")
+            .and_then(|c| c.strip_suffix(';'));
+        match value {
+            Some(v) if wanted.starts_with("uint") && is("bool", v) => {
+                format!("{indent}return {v} ? 1 : 0;")
+            }
+            Some(v) if wanted == "bool" && is("uint256", v) => format!("{indent}return {v} != 0;"),
+            _ => line.to_string(),
+        }
+    });
+    fixed.collect::<Vec<_>>().join("\n")
+}
+
+// What a helper gives back has the type the helper declares for it.
+fn result_type(c: &Contract, text: &str, name: &str) -> Option<String> {
+    let (_, position) = name.rsplit_once('_')?;
+    let given = text.lines().find_map(|l| {
+        let (targets, value) = l.trim_start().split_once(" = ")?;
+        let mut own = targets.split(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        own.any(|t| t == name).then_some(value)
+    })?;
+    let callee = given.split('(').next()?;
+    let called = |f: &&Function| f.kind == FnKind::Internal && f.name == callee;
+    let helper = c.functions.iter().find(called)?;
+    let ty = helper.returns.get(position.parse::<usize>().ok()?)?;
+    written(ty, "memory").filter(|_| helper.returns.len() == helper.n_rets)
+}
+
+fn declarations(c: &Contract, f: &Function, text: &str) -> String {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let words: BTreeSet<&str> = text.split(|c: char| !word(c)).collect();
     let numbered = |w: &str, prefix: &str| {
@@ -516,8 +765,21 @@ fn declarations(f: &Function, text: &str) -> String {
     {
         out.push_str(&format!("        {ty} {name};\n"));
     }
+    for (prefix, ty) in [("success_", "bool"), ("returned_", "bytes memory")] {
+        for name in words.iter().filter(|w| numbered(w, prefix)) {
+            out.push_str(&format!("        {ty} {name};\n"));
+        }
+    }
+    // A block is a variable only where a string was put in it by name. Any other use of
+    // one is memory this text does not account for, and has to fail to build.
+    for name in words.iter().filter(|w| numbered(w, "ptr")) {
+        if text.contains(&format!("{name} = _pointer(")) {
+            out.push_str(&format!("        uint256 {name};\n"));
+        }
+    }
     for name in words.iter().filter(|w| numbered(w, "ret_")) {
-        out.push_str(&format!("        uint256 {name};\n"));
+        let ty = result_type(c, text, name).unwrap_or_else(|| "uint256".to_string());
+        out.push_str(&format!("        {ty} {name};\n"));
     }
     out
 }
@@ -545,6 +807,52 @@ fn helpers(c: &Contract, plain: &BTreeSet<usize>, clean: bool) -> BTreeSet<usize
     found
 }
 
+/* What plain Solidity has no word for, written once and called by name: a string taken
+as the place it lies at and back, a word of the data a call gave back, and how much it
+gave. */
+const HELPERS: [(&str, &str); 4] = [
+    (
+        "_pointer(",
+        "    function _pointer(string memory text) private pure returns (uint256 at) {
+        assembly {
+            at := text
+        }
+    }
+
+",
+    ),
+    (
+        "_string(",
+        "    function _string(uint256 at) private pure returns (string memory text) {
+        assembly {
+            text := at
+        }
+    }
+
+",
+    ),
+    (
+        "_word(",
+        "    function _word(bytes memory data, uint256 at) private pure returns (uint256 word) {
+        assembly {
+            word := mload(add(add(data, 32), at))
+        }
+    }
+
+",
+    ),
+    (
+        "_returndatasize(",
+        "    function _returndatasize() private pure returns (uint256 size) {
+        assembly {
+            size := returndatasize()
+        }
+    }
+
+",
+    ),
+];
+
 pub struct Draft {
     pub text: String,
     spans: Vec<(usize, usize, usize)>,
@@ -564,7 +872,7 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
         out.push('\n');
     }
     if shape.events {
-        let events: BTreeSet<&String> = c.events.iter().filter(|e| declarable(e)).collect();
+        let events: BTreeSet<String> = c.events.iter().filter_map(|e| declared(e)).collect();
         for event in &events {
             out.push_str(&format!("    event {event};\n"));
         }
@@ -610,6 +918,11 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
             let head = crate::decompile::fmt_function_header(f);
             out.push_str(&format!("{head}{}    }}\n\n", body(c, f, plain)));
             spans.push((start, out.len(), i));
+        }
+    }
+    for (used, helper) in HELPERS {
+        if out.contains(used) {
+            out.push_str(helper);
         }
     }
     if clean {
@@ -778,6 +1091,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
     use crate::check;
     let floor = exact_file(c, runs)?;
     let trace = std::env::var_os("EVMDEC_RAISE_TRACE").is_some();
+    let trace_text = std::env::var("EVMDEC_RAISE_TRACE").is_ok_and(|v| v == "2");
     let read = |(i, f): (usize, &Function)| Some((i, getter(c, f)?.to_string()));
     let mut public: Vec<(usize, String)> =
         c.functions.iter().enumerate().filter_map(read).collect();
@@ -847,6 +1161,13 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                         .map(|i| c.functions[*i].name.as_str())
                         .collect();
                     eprintln!("refused in {named:?}: {}", refusal.message);
+                    let shown = draft
+                        .spans
+                        .iter()
+                        .find(|(_, _, i)| failed.first() == Some(i));
+                    if let Some((from, to, _)) = shown.filter(|_| trace_text) {
+                        eprintln!("{}", &draft.text[*from..*to]);
+                    }
                 }
                 // An error outside every function is in what they all share. The public
                 // variables are the part of that which can be taken back.
@@ -897,6 +1218,10 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                         public.clear();
                         failed.push(usize::MAX);
                         continue;
+                    }
+                    let shown = draft.spans.iter().find(|(_, _, i)| Some(*i) == index);
+                    if let Some((from, to, _)) = shown.filter(|_| trace) {
+                        eprintln!("{}", &draft.text[*from..*to]);
                     }
                     match index.filter(|i| plain.contains(i)) {
                         Some(i) => failed.push(i),
@@ -977,6 +1302,62 @@ mod tests {
         let lower = "x = 0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2 + 0xff;";
         let mixed = "x = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 + 0xff;";
         assert_eq!(checksummed(lower), mixed);
+    }
+
+    #[test]
+    fn a_write_to_memory_goes_when_nothing_reads_its_block() {
+        let line = |text: &str| format!("        {text}");
+        let fed = vec![
+            line("ptr1 = memory(\"2\");"),
+            line("mem[ptr2 + 64:+32] = mem[ptr1 + 32:+32];"),
+        ];
+        let mut dead = fed.clone();
+        dead.push(line("return \"2\";"));
+        assert_eq!(without_dead_stores(dead), vec![line("return \"2\";")]);
+        let mut read = fed.clone();
+        read.push(line("v1 = mem[ptr2 + 64];"));
+        assert_eq!(without_dead_stores(read.clone()), read);
+        let mut other = fed.clone();
+        other.extend([line("mem[ptr3] = 7;"), line("v1 = mem[ptr3] + mem[arg0];")]);
+        assert_eq!(without_dead_stores(other.clone()), other[2..].to_vec());
+    }
+
+    #[test]
+    fn a_string_put_in_memory_becomes_the_string() {
+        let line = |text: &str| format!("        {text}");
+        let block = vec![line("ptr1 = memory(\"overflow\");"), line("f(a, ptr1);")];
+        assert_eq!(
+            held_strings(block)[0],
+            line("ptr1 = _pointer(\"overflow\");")
+        );
+        let words = vec![
+            line("mem[ptr2] = 5;"),
+            line("mem[ptr2 + 32:+5] = \"short\";"),
+            line("f(a, ptr2);"),
+        ];
+        let want = vec![line("ptr2 = _pointer(\"short\");"), line("f(a, ptr2);")];
+        assert_eq!(held_strings(words), want);
+        let longer = vec![
+            line("mem[ptr3] = 9;"),
+            line("mem[ptr3 + 32:+5] = \"short\";"),
+        ];
+        assert_eq!(held_strings(longer.clone()), longer);
+    }
+
+    #[test]
+    fn an_event_known_by_its_topic_is_declared_anonymous() {
+        let known = "Transfer(address indexed, address indexed, uint256)";
+        assert_eq!(declared(known).as_deref(), Some(known));
+        let unknown = "Event_01b7c780(uint256 indexed, uint256); // topic0 0x01b7";
+        let want = "Event_01b7c780(bytes32 indexed, uint256 indexed, uint256) anonymous";
+        assert_eq!(declared(unknown).as_deref(), Some(want));
+    }
+
+    #[test]
+    fn data_a_call_gave_back_is_kept_only_where_it_is_read() {
+        let text = "(success_1, returned_1) = a.call(x);\n(success_2, returned_2) = b.call(y);\nv = _word(returned_2, 0);";
+        let want = "(success_1, ) = a.call(x);\n(success_2, returned_2) = b.call(y);\nv = _word(returned_2, 0);";
+        assert_eq!(unused_answers(text), want);
     }
 
     #[test]

@@ -1116,6 +1116,15 @@ pub fn fmt_log_parts(topics: &[ExprId], data_args: Vec<String>, n: &Names) -> St
     match name {
         Some(nm) => format!("emit {}({});", nm, args.join(", ")),
         None => match topics.first().and_then(|t| expr::as_const(*t)) {
+            /* An event known only by its first topic is declared anonymous, with the
+            topic as its first indexed value. Every other value is declared a word, which
+            is what it is in the log whatever type the author gave it. */
+            Some(t0) if n.strict => {
+                let mut words = vec![t0.to_hex_padded(32)];
+                words.extend(topics[1..].iter().map(|t| as_word(*t, n)));
+                words.extend(args[topics.len()..].iter().cloned());
+                format!("emit {}({});", event_placeholder_name(t0), words.join(", "))
+            }
             Some(t0) => format!(
                 "emit {}({});",
                 event_placeholder_name(t0),
@@ -1317,8 +1326,21 @@ const PANIC_OVERFLOW: u64 = 0x11;
 const PANIC_DIV_BY_ZERO: u64 = 0x12;
 const PANIC_EMPTY_POP: u64 = 0x31;
 
+// A flag by its declared type, which only counts where the output has to be typed.
+fn declared_flag(e: ExprId, n: &Names) -> bool {
+    let typed = |ty: Option<&String>| ty.is_some_and(|t| t == "bool");
+    match expr::node(e) {
+        Node::CallDataLoad(off) => {
+            typed(calldata_word_index(off).and_then(|i| n.param_types.get(&i)))
+        }
+        Node::Arg(i) => typed(n.arg_types.get(&i)),
+        _ => false,
+    }
+}
+
 pub fn is_bool(e: ExprId, n: &Names) -> bool {
     expr::is_boolean(e)
+        || (n.strict && declared_flag(e, n))
         || n.bools.contains(&e)
         || packed_read(e).is_some_and(|(k, off, bits)| n.bool_fields.contains(&(k, off, bits)))
         || bool_element(e, n)
@@ -1371,6 +1393,16 @@ fn as_address(e: ExprId, n: &Names) -> String {
         Some(c) => format!("address({})", c.to_hex_padded(20)),
         None if is_address(e, n) => fmt_expr(e, n),
         None => format!("address(uint160({}))", fmt_expr(e, n)),
+    }
+}
+
+fn as_word(e: ExprId, n: &Names) -> String {
+    if is_address(e, n) {
+        return format!("uint256(uint160({}))", fmt_expr(e, n));
+    }
+    match is_bool(e, n) && !expr::is_const(e) {
+        true => format!("({} ? 1 : 0)", fmt_expr(e, n)),
+        false => fmt_expr(e, n),
     }
 }
 
@@ -2175,6 +2207,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
     }
     match expr::node(e) {
         Node::Const(c) => (fmt_const(c), P_PRIMARY),
+        Node::Env(op::RETURNDATASIZE, _) if n.strict => ("_returndatasize()".into(), P_PRIMARY),
         Node::Env(o, seq) => (env_name(o, seq, n), P_PRIMARY),
         Node::Var(v) => (format!("v{}", n.var(v)), P_PRIMARY),
         Node::Arg(i) => (
@@ -2252,6 +2285,10 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
         ),
         Node::CallResult(seq) => (format!("success_{}", n.seq(seq)), P_PRIMARY),
         Node::CreateResult(seq) => (format!("deployed_{}", n.seq(seq)), P_PRIMARY),
+        Node::ReturnData(seq, off) if n.strict => (
+            format!("_word(returned_{}, {})", n.seq(seq), fmt_expr(off, n)),
+            P_PRIMARY,
+        ),
         Node::ReturnData(seq, off) => (
             format!("returndata_{}[{}]", n.seq(seq), fmt_expr(off, n)),
             P_PRIMARY,
@@ -3262,7 +3299,12 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             topics,
             data,
         } => {
+            let first = topics.first().and_then(|t| expr::as_const(*t));
+            let unnamed = first.is_some_and(|t0| sigs::event(&t0.to_be_bytes()).is_none());
             let data_args: Vec<String> = match data {
+                Some(words) if n.strict && unnamed => {
+                    words.iter().map(|w| as_word(*w, n)).collect()
+                }
                 Some(words) => words.iter().map(|w| fmt_expr(*w, n)).collect(),
                 None if expr::as_const(*len) != Some(U256::ZERO) => {
                     vec![fmt_mem_range(*off, *len, n)]
@@ -3351,7 +3393,16 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             } else if partial && fname.is_some() {
                 args.push("...".to_string());
             }
+            let selector = call_selector(layout.as_deref(), input.as_deref(), input_head);
             let payload = match (&fname, known) {
+                // A compiler knows a selector by its four bytes, and by a name only for a
+                // function declared where it can see it.
+                (Some(_), _) if n.strict && selector.is_some() => format!(
+                    "abi.encodeWithSelector(bytes4({:#010x}), {})",
+                    selector.unwrap_or(0),
+                    args.join(", ")
+                )
+                .replace(", )", ")"),
                 (Some(f), _) => format!(
                     "abi.encodeWithSelector({}.selector, {})",
                     f,
@@ -3374,6 +3425,18 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     }
                 }
             };
+            let answered = match expr::node(*result) {
+                Node::CallResult(seq) if n.strict && !copy && method != "callcode" => Some(seq),
+                _ => None,
+            };
+            if let Some(seq) = answered {
+                return format!(
+                    "({}, returned_{}) = {}.{method}{opts_s}({payload});",
+                    fmt_expr(*result, n),
+                    n.seq(seq),
+                    as_address(*addr, n)
+                );
+            }
             match fname {
                 Some(f) if *kind == op::CALL || *kind == op::STATICCALL => {
                     format!(
@@ -3564,6 +3627,140 @@ fn strip_outer_parens(s: &str) -> &str {
         }
     }
     &s[1..s.len() - 1]
+}
+
+fn call_selector(
+    layout: Option<&[(ExprId, u8)]>,
+    input: Option<&[ExprId]>,
+    head: &[ExprId],
+) -> Option<u32> {
+    let piece = layout.and_then(|l| l.first()).map(|(e, _)| *e);
+    let word = input.and_then(|w| w.first()).copied();
+    let first = expr::as_const(piece.or(word).or(head.first().copied())?)?;
+    let high = first.bits() > 32;
+    Some(if high { first >> 224 } else { first }.low_u64() as u32)
+}
+
+// The failure of a call handed on as it came: its data copied to memory and given as
+// this call's own.
+pub fn bubbled(stmts: &[Stmt], off: ExprId, len: ExprId) -> bool {
+    let whole = matches!(expr::node(len), Node::Env(op::RETURNDATASIZE, _));
+    let copied = stmts.iter().any(|st| match st {
+        Stmt::Copy {
+            kind: op::RETURNDATACOPY,
+            dest,
+            src,
+            len: n,
+            ..
+        } => *dest == off && *n == len && expr::as_const(*src) == Some(U256::ZERO),
+        _ => false,
+    });
+    whole && copied
+}
+
+/* A reason that is a string already in memory: its length is read from where the
+string lies and its bytes are copied from the word after. What is printed is the place
+it lies at, which a function taking the reason has as an argument. */
+fn held_string(stmts: &[Stmt], at: &dyn Fn(ExprId) -> Option<U256>, n: &Names) -> Option<String> {
+    let length = stmts.iter().rev().find_map(|st| match st {
+        Stmt::MStore {
+            off,
+            val,
+            width: 32,
+            ..
+        } if at(*off) == Some(U256::from_u64(36)) => Some(*val),
+        _ => None,
+    })?;
+    let Node::MLoad(lies_at, _) = expr::node(length) else {
+        return None;
+    };
+    // The bytes go across from the word after the length to the word after the length
+    // written. Some code moves the first word by itself and the rest in a loop, so a
+    // move that starts further in still counts, as long as it keeps the two in step.
+    let (base, start) = expr::split_offset(lies_at);
+    let in_step = |dest: ExprId, src: ExprId| {
+        let (from, read) = expr::split_offset(src);
+        let written = at(dest).map(|w| w.wrapping_sub(U256::from_u64(68)));
+        from == base && written == Some(read.wrapping_sub(start).wrapping_sub(U256::from_u64(32)))
+    };
+    let copied = stmts.iter().any(|st| match st {
+        Stmt::Copy {
+            kind: op::MCOPY,
+            dest,
+            src,
+            ..
+        } => in_step(*dest, *src),
+        Stmt::MStore {
+            off,
+            val,
+            width: 32,
+            ..
+        } => matches!(expr::node(*val), Node::MLoad(src, _) if in_step(*off, src)),
+        _ => false,
+    });
+    copied.then(|| fmt_expr(lies_at, n))
+}
+
+const ERROR_STRING: u64 = 0x08c3_79a0;
+const LONGEST_REASON: usize = 1024;
+
+/* The reason a revert gives, read back from the stores that wrote it. A reason longer
+than a word is copied out of the code, or stored a word at a time, and the printer then
+shows the revert as a range of memory. In source it is one string. */
+pub fn error_string(stmts: &[Stmt], off: ExprId, n: &Names) -> Option<String> {
+    let (base, start) = expr::split_offset(off);
+    let at = |e: ExprId| {
+        let (b, c) = expr::split_offset(e);
+        (b == base).then(|| c.wrapping_sub(start))
+    };
+    let stored = |rel: usize| {
+        stmts.iter().rev().find_map(|st| match st {
+            Stmt::MStore {
+                off,
+                val,
+                width: 32,
+                ..
+            } if at(*off) == Some(U256::from(rel)) => expr::as_const(*val),
+            _ => None,
+        })
+    };
+    let named = stored(0)? >> 224 == U256::from_u64(ERROR_STRING);
+    if !named || stored(4)? != U256::from_u64(32) {
+        return None;
+    }
+    if let Some(text) = held_string(stmts, &at, n) {
+        return Some(format!("revert(_string({text}));"));
+    }
+    let length = stored(36)?.as_usize().filter(|l| *l <= LONGEST_REASON)?;
+    let copied = stmts.iter().rev().find_map(|st| match st {
+        Stmt::Copy {
+            kind,
+            dest,
+            src,
+            len,
+            addr: None,
+            ..
+        } if at(*dest) == Some(U256::from_u64(68))
+            && expr::as_const(*len) == Some(U256::from(length)) =>
+        {
+            code_text(*kind, *src, *len, n)
+        }
+        _ => None,
+    });
+    if let Some(text) = copied {
+        return Some(format!("revert(\"{text}\");"));
+    }
+    let mut bytes = Vec::new();
+    for word in 0..length.div_ceil(32) {
+        bytes.extend(stored(68 + 32 * word)?.to_be_bytes());
+    }
+    bytes.truncate(length);
+    let text = |b: &u8| *b >= 0x20 && *b < 0x7f;
+    let shown = bytes
+        .iter()
+        .all(text)
+        .then(|| escape(&String::from_utf8_lossy(&bytes)))?;
+    Some(format!("revert(\"{shown}\");"))
 }
 
 fn flag_or(j: usize, v: ExprId, n: &Names) -> String {

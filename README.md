@@ -229,10 +229,14 @@ This is the test the decompiler's own output has to pass. The pseudo-Solidity it
 default does not: none of the 22 corpus contracts decompiles to text a compiler accepts. The
 Solidity file below does.
 
+A source still running at many times the steps the original took to end is a difference,
+not a run left unsettled. A run of the original longer than 50,000 steps is left out: it is
+a loop over a length the drawn state made up.
+
 It is evidence and not a proof. The last line of the output says how many branch outcomes of
 the original the calls reached, and a function no call got to the end of is marked. With no
-source, `evmdec check original.hex` reports that reach alone: 76 of 76 on WETH, 252 of 268 on
-USDT, 424 of 984 on Compound cETH, whose paths depend on what other contracts answer.
+source, `evmdec check original.hex` reports that reach alone: 76 of 76 on WETH, 255 of 268 on
+USDT, 414 of 984 on Compound cETH, whose paths depend on what other contracts answer.
 
 ### Solidity file
 
@@ -250,6 +254,17 @@ code uses, and the file is built and checked again. A function whose text the co
 refuses, or that does not do what the bytecode does, goes back to the exact form, and so
 does everything that calls it. What is printed is the file that survives, after one longer
 comparison.
+
+What Solidity has a word for is written with it. A failure reason longer than a word is
+one string, whether the code copies it out of itself or stores it a word at a time. A
+call to another contract is a low-level call that gives back a flag and the answer, and a
+failure handed on from one is two lines of assembly, as authors write it. An event known
+only by its first topic cannot be declared by a name, so it is declared anonymous with the
+topic as its first indexed value. A write to memory that nothing reads any more, because
+the event, call or return it fed is shown by what it means, is left out. A few things
+Solidity has no word for go through a small private function added at the end of the
+contract: a word of a call's answer, its length, and a string taken as the place it lies at,
+which is how a helper written for older compilers receives a reason.
 
 A function that only returns one variable is not written at all: the variable is declared
 `public` under the function's name, as an author would have, and the compiler writes the
@@ -270,12 +285,16 @@ comparison. A contract built with solc 0.8 is compared with no such allowance.
 
 `./corpus/exact_all.sh` runs this over a directory. All 22 corpus contracts compile and
 compare equal on every function, solc 0.4 to 0.8 and Vyper, and so do the 17 regression, 30
-vulnerable and 5 source fixtures in `testdata`: 74 of 74. Of the 840 functions those files
-name, 420 are plain Solidity: all 11 of WETH, 21 of 22 in USDT, 19 of 22 in the Uniswap V2
-pair, 19 of 28 in USDC. Most of the rest wait on memory: an event that carries a string or a
-call whose arguments are encoded by hand is still printed in a notation no compiler reads.
+vulnerable and 5 source fixtures in `testdata`: 74 of 74. Of the 865 functions those files
+name, 496 are plain Solidity: all 11 of WETH, 24 of 25 in USDT, 21 of 22 in the Uniswap V2
+pair, 34 of 39 in USDC. What holds the rest back is mostly memory used as data: a struct or
+an array built in memory, a `bytes` or `string` argument passed on, and the hand-written
+logging of older MakerDAO code. Those are still printed in a notation no compiler reads.
+
 On the WETH file, 51 of 54 single changes to an operator, a check or an event are caught, and
-the other three change a value nothing reads.
+the other three change a value nothing reads. On the plain part of the USDC file, 65 of 70
+are caught: four of the rest change a value nothing reads and one removes a failure no
+caller can reach.
 
 ### Decompiler against verified source
 

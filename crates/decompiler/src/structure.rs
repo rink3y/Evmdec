@@ -3043,6 +3043,55 @@ impl<'a> Printer<'a> {
         }
     }
 
+    fn halt(&self, node: usize, term: &Term) -> Option<String> {
+        if let (true, Term::Revert { off, len, .. }) = (self.names.strict, term) {
+            // The stores that wrote a reason can sit a block or two before the revert,
+            // where the code first rounds the length off.
+            let mut run = vec![node];
+            while run.len() < 3 {
+                let Some(before) = self.g.idom[run[0]].filter(|b| *b != run[0]) else {
+                    break;
+                };
+                run.insert(0, before);
+            }
+            let wrote = run
+                .iter()
+                .flat_map(|i| self.l.nodes[*i].stmts.iter().cloned());
+            let wrote: Vec<Stmt> = wrote.collect();
+            let said = emit::error_string(&wrote, *off, self.names);
+            if said.is_some() {
+                return said;
+            }
+            if emit::bubbled(&wrote, *off, *len) {
+                let hand_on = "returndatacopy(0, 0, returndatasize()) revert(0, returndatasize())";
+                return Some(format!("assembly {{ {hand_on} }}"));
+            }
+        }
+        emit::fmt_term_halt(term, self.names)
+    }
+
+    // A run of blocks that does nothing but fail with a reason read back from memory.
+    fn reason_only(&self, mut node: usize) -> Option<String> {
+        let quiet = |st: &Stmt| {
+            let kept = matches!(st, Stmt::MStore { .. } | Stmt::Copy { .. });
+            kept || matches!(st, Stmt::Assign { .. } | Stmt::Drop(_))
+        };
+        for _ in 0..3 {
+            let nd = &self.l.nodes[node];
+            if !nd.stmts.iter().all(quiet) {
+                return None;
+            }
+            match &nd.term {
+                Term::Jump(next) => node = *next,
+                term => {
+                    let said = self.halt(node, term);
+                    return said.filter(|text| text.starts_with("revert(_string("));
+                }
+            }
+        }
+        None
+    }
+
     fn stmts(&mut self, n: usize, depth: usize) {
         // A name given in a block holds on in the block its run goes on in.
         let run = self.printed_last.filter(|p| run_on(self.l, *p) == Some(n));
@@ -3455,7 +3504,7 @@ impl<'a> Printer<'a> {
                     n = t;
                 }
                 other => {
-                    if let Some(s) = emit::fmt_term_halt(other, self.names) {
+                    if let Some(s) = self.halt(n, other) {
                         self.line(depth, &s);
                     }
                     return;
@@ -3502,7 +3551,7 @@ impl<'a> Printer<'a> {
                     return;
                 }
                 other => {
-                    if let Some(s) = emit::fmt_term_halt(&other, self.names) {
+                    if let Some(s) = self.halt(n, &other) {
                         self.line(depth, &s);
                     }
                     return;
@@ -3626,7 +3675,7 @@ impl<'a> Printer<'a> {
                         self.emit_branch(header, cond, t, f, None, depth + 1)
                     }
                     other => {
-                        if let Some(s) = emit::fmt_term_halt(&other, self.names) {
+                        if let Some(s) = self.halt(header, &other) {
                             self.line(depth + 1, &s);
                         }
                     }
@@ -3683,6 +3732,17 @@ impl<'a> Printer<'a> {
                     return;
                 }
                 _ => {}
+            }
+        }
+        /* Old code rounds a reason's length off on one of two paths and reverts on both.
+        The two give the same failure, so the test between them is not source. */
+        if let (true, Some(t)) = (self.names.strict, t) {
+            let both = self
+                .reason_only(t)
+                .filter(|said| self.reason_only(f).as_ref() == Some(said));
+            if let Some(said) = both {
+                self.line(depth, &said);
+                return;
             }
         }
         let t_rev = t.map_or(Some(None), |t| self.revert_reason(n, t));

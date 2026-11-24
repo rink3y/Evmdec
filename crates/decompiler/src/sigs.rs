@@ -47,6 +47,460 @@ pub fn function(selector: u32) -> Option<Cow<'static, str>> {
         .map(Cow::Owned)
 }
 
+/* Names authors give state variables. A public variable has a function of its name, so a
+read-only function no signature is known for is tried under each of these, in a few common
+spellings. A name whose hash is the selector is the name the author used. */
+const VARIABLES: &[&str] = &[
+    "name",
+    "symbol",
+    "decimals",
+    "totalSupply",
+    "balanceOf",
+    "allowance",
+    "balances",
+    "allowed",
+    "allowances",
+    "balance",
+    "supply",
+    "owner",
+    "admin",
+    "pendingOwner",
+    "pendingAdmin",
+    "newOwner",
+    "manager",
+    "operator",
+    "controller",
+    "governance",
+    "governor",
+    "guardian",
+    "keeper",
+    "minter",
+    "burner",
+    "pauser",
+    "signer",
+    "verifier",
+    "treasury",
+    "vault",
+    "factory",
+    "router",
+    "pair",
+    "pool",
+    "token",
+    "token0",
+    "token1",
+    "weth",
+    "underlying",
+    "asset",
+    "stakingToken",
+    "rewardsToken",
+    "rewardToken",
+    "lpToken",
+    "baseToken",
+    "quoteToken",
+    "collateral",
+    "collateralToken",
+    "debtToken",
+    "rewardRate",
+    "rewardPerToken",
+    "rewardPerTokenStored",
+    "rewardPerShare",
+    "accRewardPerShare",
+    "lastUpdateTime",
+    "periodFinish",
+    "rewardsDuration",
+    "duration",
+    "startTime",
+    "endTime",
+    "startBlock",
+    "endBlock",
+    "startDate",
+    "endDate",
+    "deadline",
+    "expiry",
+    "expiration",
+    "cap",
+    "hardCap",
+    "softCap",
+    "maxSupply",
+    "minSupply",
+    "initialSupply",
+    "circulatingSupply",
+    "fee",
+    "fees",
+    "feeRate",
+    "feeTo",
+    "feeToSetter",
+    "feeRecipient",
+    "feeReceiver",
+    "feeAddress",
+    "feeCollector",
+    "feeDenominator",
+    "feeNumerator",
+    "taxFee",
+    "liquidityFee",
+    "marketingFee",
+    "buyFee",
+    "sellFee",
+    "burnFee",
+    "devFee",
+    "teamFee",
+    "protocolFee",
+    "swapFee",
+    "withdrawFee",
+    "depositFee",
+    "performanceFee",
+    "managementFee",
+    "marketingWallet",
+    "devWallet",
+    "teamWallet",
+    "liquidityWallet",
+    "charityWallet",
+    "wallet",
+    "beneficiary",
+    "recipient",
+    "receiver",
+    "implementation",
+    "proxy",
+    "registry",
+    "resolver",
+    "oracle",
+    "priceFeed",
+    "price",
+    "rate",
+    "exchangeRate",
+    "interestRate",
+    "borrowRate",
+    "supplyRate",
+    "reserveFactor",
+    "collateralFactor",
+    "liquidationThreshold",
+    "liquidationBonus",
+    "totalBorrows",
+    "totalReserves",
+    "totalDeposits",
+    "totalDeposited",
+    "totalStaked",
+    "totalShares",
+    "totalAssets",
+    "totalDebt",
+    "totalRewards",
+    "totalFees",
+    "totalBurned",
+    "totalMinted",
+    "totalClaimed",
+    "totalLocked",
+    "totalWeight",
+    "totalAllocPoint",
+    "totalSold",
+    "totalRaised",
+    "totalInvested",
+    "totalWithdrawn",
+    "totalLiquidity",
+    "shares",
+    "stakes",
+    "staked",
+    "deposits",
+    "deposited",
+    "rewards",
+    "earned",
+    "claimed",
+    "claimable",
+    "pending",
+    "pendingRewards",
+    "userInfo",
+    "poolInfo",
+    "poolLength",
+    "pools",
+    "users",
+    "accounts",
+    "holders",
+    "members",
+    "investors",
+    "stakers",
+    "nonces",
+    "nonce",
+    "DOMAIN_SEPARATOR",
+    "PERMIT_TYPEHASH",
+    "version",
+    "VERSION",
+    "initialized",
+    "initializing",
+    "locked",
+    "unlocked",
+    "lock",
+    "lockTime",
+    "unlockTime",
+    "releaseTime",
+    "vestingStart",
+    "cliff",
+    "released",
+    "revoked",
+    "revocable",
+    "threshold",
+    "required",
+    "quorum",
+    "votingDelay",
+    "votingPeriod",
+    "proposalThreshold",
+    "proposalCount",
+    "proposals",
+    "votes",
+    "delegates",
+    "checkpoints",
+    "numCheckpoints",
+    "MAX_SUPPLY",
+    "MAX_FEE",
+    "MAX_UINT",
+    "MINIMUM_LIQUIDITY",
+    "PRECISION",
+    "DENOMINATOR",
+    "BASE",
+    "DECIMALS",
+    "count",
+    "counter",
+    "index",
+    "id",
+    "lastId",
+    "nextId",
+    "currentId",
+    "tokenId",
+    "tokenIds",
+    "nextTokenId",
+    "tokenURI",
+    "baseURI",
+    "contractURI",
+    "uri",
+    "maxMint",
+    "maxPerWallet",
+    "maxPerTx",
+    "mintPrice",
+    "salePrice",
+    "presalePrice",
+    "saleActive",
+    "presaleActive",
+    "publicSale",
+    "revealed",
+    "merkleRoot",
+    "root",
+    "lastTime",
+    "lastBlock",
+    "lastUpdate",
+    "lastUpdated",
+    "lastClaim",
+    "lastClaimed",
+    "lastReward",
+    "lastRewardBlock",
+    "lastRewardTime",
+    "timestamp",
+    "blockNumber",
+    "epoch",
+    "round",
+    "currentEpoch",
+    "currentRound",
+    "period",
+    "currentPeriod",
+    "enabled",
+    "disabled",
+    "active",
+    "open",
+    "closed",
+    "finalized",
+    "started",
+    "ended",
+    "live",
+    "paused",
+    "frozen",
+    "stopped",
+    "halted",
+    "deprecated",
+    "tradingEnabled",
+    "tradingOpen",
+    "tradingActive",
+    "swapEnabled",
+    "swapAndLiquifyEnabled",
+    "inSwap",
+    "minAmount",
+    "maxAmount",
+    "minDeposit",
+    "maxDeposit",
+    "minStake",
+    "maxStake",
+    "limit",
+    "dailyLimit",
+    "maxTxAmount",
+    "maxWalletSize",
+    "maxWallet",
+    "swapTokensAtAmount",
+    "uniswapV2Router",
+    "uniswapV2Pair",
+    "pancakeRouter",
+    "pancakePair",
+    "deadAddress",
+    "burnAddress",
+    "blacklist",
+    "whitelist",
+    "blacklisted",
+    "whitelisted",
+    "excluded",
+    "authorized",
+    "approved",
+    "frozenAccount",
+    "bots",
+    "minters",
+    "operators",
+    "admins",
+    "owners",
+    "isBlacklisted",
+    "isBlackListed",
+    "isWhitelisted",
+    "isExcluded",
+    "isExcludedFromFee",
+    "isExcludedFromFees",
+    "isExcludedFromReward",
+    "isMinter",
+    "isOwner",
+    "isAdmin",
+    "isOperator",
+    "isAuthorized",
+    "isBot",
+    "automatedMarketMakerPairs",
+    "wards",
+    "can",
+    "ilks",
+    "urns",
+    "gem",
+    "dai",
+    "sin",
+    "debt",
+    "vice",
+    "Line",
+    "vat",
+    "comptroller",
+    "interestRateModel",
+    "accrualBlockNumber",
+    "borrowIndex",
+    "reserveFactorMantissa",
+    "initialExchangeRateMantissa",
+    "data",
+    "info",
+    "config",
+    "settings",
+    "params",
+    "state",
+    "status",
+    "stage",
+    "phase",
+    "kind",
+    "mode",
+    "level",
+    "tier",
+    "upgradedAddress",
+    "basisPointsRate",
+    "maximumFee",
+    "creator",
+    "deployer",
+    "founder",
+    "team",
+    "dev",
+    "amount",
+    "value",
+    "total",
+    "sum",
+    "size",
+    "length",
+    "weight",
+    "power",
+    "score",
+    "points",
+    "credits",
+    "referrer",
+    "referrals",
+    "referral",
+    "bonus",
+    "bonuses",
+    "multiplier",
+    "reserve",
+    "reserve0",
+    "reserve1",
+    "reserves",
+    "kLast",
+    "price0CumulativeLast",
+    "price1CumulativeLast",
+    "blockTimestampLast",
+    "liquidity",
+    "slippage",
+    "tickSpacing",
+    "sqrtPriceX96",
+];
+
+const KEYS: [&str; 6] = ["address", "uint256", "bytes32", "uint8", "bytes4", "bool"];
+
+fn spellings(word: &str) -> Vec<String> {
+    let mut capital = word.to_string();
+    if let Some(first) = capital.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    let mut all = vec![word.to_string(), format!("_{word}"), format!("{word}_")];
+    for prefix in ["get", "is", "total", "max", "min", "last", "current"] {
+        all.push(format!("{prefix}{capital}"));
+    }
+    for suffix in ["s", "Of", "Address", "Count"] {
+        all.push(format!("{word}{suffix}"));
+    }
+    // Vyper authors write the same names with underscores, and constants are in capitals.
+    let mut snake = String::new();
+    let mut lower = false;
+    for c in word.chars() {
+        if c.is_ascii_uppercase() && lower {
+            snake.push('_');
+        }
+        lower = c.is_ascii_lowercase();
+        snake.push(c.to_ascii_lowercase());
+    }
+    all.push(snake.to_ascii_uppercase());
+    all.push(snake);
+    all.sort();
+    all.dedup();
+    all
+}
+
+/* The signature of a function that reads state, found by hashing. The types its
+arguments were worked out to have come first, and the other types a mapping is commonly
+keyed by after them. A function of three arguments or more is not a plain variable. */
+pub fn guessed(selector: u32, params: &[&str]) -> Option<String> {
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| VARIABLES.iter().flat_map(|w| spellings(w)).collect());
+    let kinds = |own: &str| -> Vec<String> {
+        let others = KEYS.iter().filter(|k| **k != own);
+        std::iter::once(own)
+            .chain(others.copied())
+            .map(str::to_string)
+            .collect()
+    };
+    let lists: Vec<String> = match params {
+        [] => vec![String::new()],
+        [one] => kinds(one),
+        [first, second] => {
+            let seconds = kinds(second);
+            let pairs = kinds(first).into_iter().flat_map(|a| {
+                let with = seconds.iter().take(3).map(move |b| format!("{a},{b}"));
+                with.collect::<Vec<_>>()
+            });
+            pairs.collect()
+        }
+        _ => return None,
+    };
+    for list in &lists {
+        for name in names {
+            let signature = format!("{name}({list})");
+            if keccak::selector_u32(&signature) == selector {
+                return Some(signature);
+            }
+        }
+    }
+    None
+}
+
 pub fn event(topic: &[u8; 32]) -> Option<Cow<'static, str>> {
     if let Some(s) = get().events.get(topic) {
         return Some(Cow::Borrowed(s));
@@ -530,3 +984,21 @@ pub const ERRORS: &[&str] = &[
     "ERC721OutOfBoundsIndex(address,uint256)",
     "ERC2771InvalidForwarder(address)",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::guessed;
+
+    #[test]
+    fn a_public_variable_is_named_by_hashing_common_names() {
+        let named = |selector, params: &[&str]| guessed(selector, params);
+        assert_eq!(
+            named(0x27e2_35e3, &["address"]).as_deref(),
+            Some("balances(address)")
+        );
+        assert_eq!(named(0x3eaa_f86b, &[]).as_deref(), Some("_totalSupply()"));
+        let nested = named(0x5c65_8165, &["uint256", "address"]);
+        assert_eq!(nested.as_deref(), Some("allowed(address,address)"));
+        assert_eq!(named(0x1234_5678, &[]), None);
+    }
+}

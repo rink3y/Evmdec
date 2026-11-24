@@ -919,6 +919,16 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
                     .get(&sel)
                     .cloned()
                     .or_else(|| sigs::function(sel).map(|s| s.into_owned()))
+                    .or_else(|| {
+                        let changes = eff.writes_storage
+                            || eff.logs
+                            || eff.calls
+                            || eff.creates
+                            || eff.selfdestruct;
+                        let types: Vec<&str> = params.iter().map(|p| p.ty.as_str()).collect();
+                        let reads = kind == FnKind::External && !changes;
+                        reads.then(|| sigs::guessed(sel, &types)).flatten()
+                    })
             })
         };
         let name = match (&signature, name_hint, selector) {

@@ -491,7 +491,7 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     let declared = declarations(c, f, &text);
     let text = returned_as_declared(f, &declared, &text);
     let marked: Vec<String> = text.lines().map(unchecked_statement).collect();
-    let text = format!("{declared}{}", marked.join("\n"));
+    let text = placed(&marked.join("\n"), &declared);
     // Arithmetic before 0.8 wraps. In a current file only an unchecked block does.
     let wraps = ["+", "*", " - ", "-=", "(-"]
         .iter()
@@ -740,6 +740,70 @@ fn saved_as_stored(c: &Contract, renamed: &[(String, String)], text: &str) -> St
         }
     });
     fixed.collect::<Vec<_>>().join("\n")
+}
+
+fn mentions(line: &str, name: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    line.match_indices(name)
+        .any(|(at, _)| !line[..at].ends_with(word) && !line[at + name.len()..].starts_with(word))
+}
+
+/* A value is declared where it is given, when everything that reads it lies after that
+in the same block. A value given afresh in several blocks is declared in each. The
+compiler frees the place of a value when its block ends, which a long function needs to
+stay within the sixteen values it can reach. A value read before it is given, or read
+outside the block that gave it, is declared once at the top. */
+fn placed(text: &str, declared: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let closes = |from: usize| {
+        let depth = indent(lines[from]);
+        let ends = |l: &&str| !l.trim().is_empty() && indent(l) < depth;
+        let rest = lines[from + 1..].iter().position(ends);
+        rest.map_or(lines.len(), |k| from + 1 + k)
+    };
+    let mut top = String::new();
+    let mut inner: BTreeMap<usize, String> = BTreeMap::new();
+    for declaration in declared.lines() {
+        let stated = declaration.trim().trim_end_matches(';');
+        let name = stated.rsplit(' ').next().unwrap_or(stated);
+        let gives = |at: usize| {
+            let (targets, value) = lines[at].trim().split_once(" = ").unwrap_or(("", ""));
+            let listed = targets.starts_with('(') && targets.ends_with(')');
+            let given = targets == name || (listed && mentions(targets, name));
+            given && !mentions(value, name) && indent(lines[at]) > 8
+        };
+        let uses = (0..lines.len()).filter(|i| mentions(lines[*i], name));
+        let mut given_at: Vec<usize> = Vec::new();
+        let mut covered = 0;
+        let mut scoped = true;
+        for at in uses {
+            if at < covered {
+                continue;
+            }
+            scoped &= gives(at);
+            given_at.push(at);
+            covered = closes(at);
+        }
+        if !scoped || given_at.is_empty() {
+            top.push_str(&format!("{declaration}\n"));
+            continue;
+        }
+        for at in given_at {
+            let pad = " ".repeat(indent(lines[at]));
+            let here = inner.entry(at).or_default();
+            here.push_str(&format!("{pad}{}\n", declaration.trim()));
+        }
+    }
+    let mut out = top;
+    for (i, line) in lines.iter().enumerate() {
+        out.push_str(inner.get(&i).map_or("", String::as_str));
+        out.push_str(line);
+        if i + 1 < lines.len() {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn close_of(text: &str) -> Option<usize> {
@@ -1567,6 +1631,18 @@ mod tests {
         assert_eq!(declared, "    uint256 t1;\n    unchecked { t1 = (a - 1); }");
         let mixed = "    x = unchecked(a + b) + c;";
         assert_eq!(unchecked_statement(mixed), mixed);
+    }
+
+    #[test]
+    fn a_value_is_declared_in_the_block_that_gives_it() {
+        let body =
+            "        if (a) {\n            x = 1;\n            f(x);\n        }\n        y = 2;";
+        let declared = "        uint256 x;\n        uint256 y;\n";
+        let want = "        uint256 y;\n        if (a) {\n            uint256 x;\n            x = 1;\n            f(x);\n        }\n        y = 2;";
+        assert_eq!(placed(body, declared), want);
+        let read_after = "        if (a) {\n            x = 1;\n        }\n        f(x);";
+        let top = format!("        uint256 x;\n{read_after}");
+        assert_eq!(placed(read_after, "        uint256 x;\n"), top);
     }
 
     #[test]

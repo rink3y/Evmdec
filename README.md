@@ -286,6 +286,12 @@ keeps the answer the call gave and reads that. A value is declared in the block 
 it, where everything that reads it lies in that block, and at the top of the function
 otherwise.
 
+A compiler reaches sixteen values on its stack and refuses a function that needs more at
+once. Where it refuses one, the values the function declares are moved into one struct in
+memory, as an author would do, and the function is tried again. This is done only in the
+checked file and only for a function the compiler refused. The file printed by default
+keeps plain local values.
+
 Memory a function builds data in is written the way the code uses it. The code takes a block
 by moving the start of free memory past it. The file does the same through two small
 functions, names the block, and writes and reads it a word or a stretch at a time through
@@ -326,19 +332,19 @@ compared with no such allowance.
 compare equal on every function, solc 0.4 to 0.8 and Vyper, and so do the 17 regression, 30
 vulnerable and 5 source fixtures in `testdata`: 74 of 74. Those contracts answer 1,972
 functions between them. With the signatures built into the binary and no index installed,
-the files declare 890 of them by name, and 578 of the 890 are plain Solidity: all 11 of
-WETH, 29 of 29 in USDT, 23 of 23 in the Uniswap V2 pair, 35 of 39 in USDC, 26 of 40 in
-Compound cETH. The other 1,082 answer through `fallback` in their exact form: 932 have a
+the files declare 899 of them by name, and 615 of the 899 are plain Solidity: all 11 of
+WETH, 29 of 29 in USDT, 24 of 24 in the Uniswap V2 pair, 35 of 39 in USDC, 38 of 43 in
+Compound cETH, 19 of 21 in the Uniswap V2 router. The other 1,073 answer through `fallback` in their exact form: 932 have a
 selector no built-in signature hashes to, so no header can be written for them, 28 take a
 struct, and the rest are decoded differently by a current compiler than by the original.
 
-With the full signature index installed (see below) the same run declares 1,605 of the
-1,972 by name and 990 of those are plain Solidity. USDT, the BEC token and the
+With the full signature index installed (see below) the same run declares 1,617 of the
+1,972 by name and 1,030 of those are plain Solidity. USDT, the BEC token and the
 BOB pool then come out with no exact block at all, as WETH does without it.
 
-What holds a named function back now is mostly not memory. Some long functions need more
-values at once than a compiler can reach, a few keep a jump the printer could not turn into
-a loop or a branch, and one helper in its exact form holds back every function that calls
+What holds a named function back now is mostly not memory. A few functions keep a jump
+the printer could not turn into a loop or a branch, two return more values than a compiler
+can reach at once, and one helper in its exact form holds back every function that calls
 it. In memory three things are still printed in a notation no compiler reads: memory an
 older contract takes at a place it works out from the length of an argument copied before
 it, which happens with a second `bytes` or array argument, memory cleared by copying from

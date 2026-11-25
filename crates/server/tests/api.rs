@@ -80,7 +80,7 @@ fn each_input_gets_its_own_answer_and_a_repeat_gets_the_same_one() {
     let ask = |code: &str| post(&server, &format!("{{\"bytecode\":\"{code}\"}}"));
     let (one, two, again) = (ask(STORE_ONE), ask(STORE_TWO), ask(STORE_ONE));
     assert!(one.starts_with("HTTP/1.1 200"), "{one}");
-    assert!(body(&one).contains("\"contract\""));
+    assert!(body(&one).contains("\"contracts\""));
     assert!(body(&one).contains("pragma solidity"), "{one}");
     assert_ne!(body(&one), body(&two));
     assert_eq!(body(&one), body(&again));
@@ -174,4 +174,57 @@ fn the_address_of_the_page_answers_the_page_and_takes_nothing_from_the_pool() {
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
     assert!(!page.contains("x-ratelimit"), "{page}");
     assert!(post(&server, &code).starts_with("HTTP/1.1 429"));
+}
+
+#[test]
+fn the_public_answer_is_the_short_one_unless_all_of_it_is_asked_for() {
+    let server = start();
+    let short = post(&server, &format!("{{\"bytecode\":\"{STORE_ONE}\"}}"));
+    assert!(
+        body(&short).starts_with("{\"summary\":\"One contract"),
+        "{short}"
+    );
+    assert!(body(&short).contains("\"role\":\"contract\""), "{short}");
+    assert!(body(&short).contains("pragma solidity"), "{short}");
+    assert!(body(&short).ends_with("\"checked\":false}"), "{short}");
+    assert!(!body(&short).contains("disassembly"), "{short}");
+    let all = post(
+        &server,
+        &format!("{{\"bytecode\":\"{STORE_ONE}\",\"full\":true}}"),
+    );
+    assert!(body(&all).contains("\"disassembly\""), "{all}");
+    assert!(body(&all).contains("\"contract\":"), "{all}");
+}
+
+#[test]
+fn a_chain_is_named_by_its_number_and_the_api_describes_itself() {
+    let server = start();
+    let address = "0x0000000000000000000000000000000000000001";
+    let nowhere = post(
+        &server,
+        &format!("{{\"address\":\"{address}\",\"chainid\":999999}}"),
+    );
+    assert!(nowhere.starts_with("HTTP/1.1 400"), "{nowhere}");
+    assert!(
+        body(&nowhere).contains("unknown chain '999999'"),
+        "{nowhere}"
+    );
+    let get = |path: &str| {
+        let asked = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        send(&server, &asked)
+    };
+    let described = get("/v1");
+    assert!(described.starts_with("HTTP/1.1 200"), "{described}");
+    assert!(
+        body(&described).contains("\"requests_a_day\": 5000"),
+        "{described}"
+    );
+    assert!(
+        body(&described).contains("POST /v1/decompile"),
+        "{described}"
+    );
+    assert!(
+        body(&get("/v1/chains")).contains("{\"id\":56,"),
+        "the chains carry their numbers"
+    );
 }

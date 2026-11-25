@@ -491,13 +491,26 @@ compiler would refuse, or that does not do what the bytecode does, is still in i
 written. The command line prints the same text.
 
 ```
-POST /api/decompile      {"address": "0x...", "chain": "mainnet"}  or  {"bytecode": "0x..."}
+POST /v1/decompile       {"address": "0x...", "chain": "mainnet"}  or  {"bytecode": "0x..."}
                          optional: "no_follow_proxy": true, "lookup": true, "depth": 0..3
-GET  /api/address/{chain}/{address}
+GET  /v1/address/{chain}/{address}
 GET  /api/chains
 GET  /api/status         {"signature_index": 10780428}, or 0 when no index is installed
 GET  /healthz
 ```
+
+```sh
+curl -X POST https://evm.soldec.xyz/v1/decompile \
+  -H 'content-type: application/json' -d '{"bytecode": "0x600160005500"}'
+```
+
+The two `/v1` addresses are the public API. Everyone who calls them draws on one shared
+pool of 5,000 requests a day, which is full again at 00:00 UTC. Every answer says where the
+pool stands in `x-ratelimit-limit`, `x-ratelimit-remaining` and `x-ratelimit-reset` (the
+second the pool refills, in Unix time). When the pool is empty the answer is `429` with
+`retry-after` in seconds. A request refused for what it asked takes nothing from the pool.
+The website decompiles through an address of its own, `/api/decompile`, which answers only
+the page and takes nothing from the pool, so the site keeps working when the pool is empty.
 
 Responses carry `contract`, `disassembly` and, when contracts were followed, `linked` (one
 entry each with the same two fields) and `parts_disassembly`.
@@ -513,6 +526,7 @@ remote nodes in at most 240 seconds, and code over 1 MiB is refused.
 | variable | effect |
 |---|---|
 | `EVMDEC_RPC_URL` | comma-separated JSON-RPC endpoints, used in place of the public list. The chain asked for has to be the chain they serve; a request for another chain is refused |
+| `EVMDEC_API_DAILY` | requests a day the public API answers in all, shared by every caller (default 5000). The count is kept in memory, so a restart fills the pool again |
 | `EVMDEC_SIGS` | path of the signature index; empty disables it. Default search: `./sigs.idx`, next to the binary, `/var/lib/evmdec/sigs.idx`, `~/.evmdec/sigs.idx` |
 | `EVMDEC_TIMING` | print the time spent in each stage |
 | `SOLC`, `EVMDEC_SOLC_DIR` | a compiler binary for `check` and the checked file of the tests to use as it is, and where downloaded compilers are kept (default `~/.cache/evmdec/solc`). A download is the build for the machine's processor, x86-64 or ARM64, and is checked against the hash its list gives. The ARM64 builds start at 0.8.31, so there a contract built with an older 0.8 compiler gets its file under the pragma any current compiler takes |

@@ -550,6 +550,20 @@ fn the_solidity_form_is_a_whole_file_written_with_no_compiler() {
         assert!(source.trim_end().ends_with('}'), "{name}");
         assert!(!source.contains("_original"), "{name}");
     }
+    let bot = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/regress/mev_bot.hex"),
+    )
+    .unwrap();
+    let bot = evmdec::hex::decode(bot.trim()).unwrap();
+    let source = evmdec::decompile::decompile(&bot, &opts).source;
+    for call in source.split("func_0x").skip(1) {
+        let name: String = call.chars().take_while(char::is_ascii_hexdigit).collect();
+        let defined = format!("function func_0x{name}(");
+        assert!(
+            source.contains(&defined),
+            "func_0x{name} is called and not written"
+        );
+    }
     let unnamed = evmdec::hex::decode("0x60003560e01c631234567814601057005b00").unwrap();
     let source = evmdec::decompile::decompile(&unnamed, &opts).source;
     assert!(

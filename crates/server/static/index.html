@@ -339,9 +339,13 @@ function partOf(f){return f.part||0}
 function partView(full,i){const c=full.contract;const parts=c.parts||[];if(!parts.length||i<0)return full;const p=parts[i];
  const contract=Object.assign({},c,{source:p.source,functions:c.functions.filter(f=>partOf(f)===i),storage:p.storage,stats:p.stats,language:p.compiler,address:p.address,view_part:i});
  return {contract,disassembly:(full.parts_disassembly||[])[i]||[]}}
-function buildEntries(root){const c=root.contract;const out=[{label:c.composite?'whole':'this',address:c.address||'',data:root}];
- (c.parts||[]).forEach((p,i)=>out.push({label:i===0?'shell':(p.role==='implementation'?'impl':'facet '+i),address:p.address,data:partView(root,i)}));
- (root.linked||[]).forEach((e,i)=>out.push({label:'contract',address:e.contract.address||'',data:{contract:e.contract,disassembly:e.disassembly||[]},linked:i}));
+/* A proxy with one implementation opens on the implementation, which holds the code a reader came for. Several parts open as one contract. */
+function buildEntries(root){const c=root.contract;const parts=c.parts||[];const out=[];
+ const impl=parts.length===2?parts.findIndex(p=>p.role==='implementation'):-1;
+ const part=i=>({label:i===0?'Proxy':(parts[i].role==='implementation'?'Implementation':'Facet '+i),address:parts[i].address,data:partView(root,i),part:i});
+ if(impl>0)out.push(part(impl));else out.push({label:parts.length?'All parts':'Contract',address:c.address||'',data:root});
+ parts.forEach((p,i)=>{if(i!==impl)out.push(part(i))});
+ (root.linked||[]).forEach((e,i)=>{const a=e.contract.address||'';out.push({label:/^library/.test(howLinked(c,a,e.contract))?'Library':'Linked contract',address:a,data:{contract:e.contract,disassembly:e.disassembly||[]},linked:i})});
  return out}
 function show(i){CURRENT=i;DATA=ENTRIES[i].data;CUR=null;rerender()}
 function shortA(a){a=a||'';return a.length>12?a.slice(0,6)+'…'+a.slice(-4):a}
@@ -361,7 +365,7 @@ function graphPanel(){const root=ROOT||DATA;const c=root.contract;const linked=r
  const left=c.unfollowed||[];if(left.length){out+='<li><h2>Call targets not fetched</h2><ul>';left.forEach(u=>{out+='<li><div class="edge">called by '+esc(shortA(u.from))+'</div><div class="node"><div><b>not fetched</b><code>'+esc(u.target)+'</code></div><span></span><div class="why">'+esc(u.reason)+'</div></div></li>'});out+='</ul></li>'}
  out+='</ol></div>';return out}
 function titleBlock(){const c=DATA.contract,s=c.stats;const meta=(c.info&&c.info.metadata)||{};
- const vp=c.view_part,pp=vp==null?null:(c.parts||[])[vp];$('#tb-sheet').textContent=c.composite?((vp==null?'':vp===0?'Shell of ':(pp&&pp.role==='implementation'?'Implementation of ':'Facet '+vp+' of '))+c.composite.kind.charAt(0).toUpperCase()+c.composite.kind.slice(1)):c.proxy?'Proxy, '+c.proxy.kind:(c.kind&&c.kind!=='unclassified'?c.kind.charAt(0).toUpperCase()+c.kind.slice(1)+' code':'Contract');
+ const vp=c.view_part,pp=vp==null?null:(c.parts||[])[vp];$('#tb-sheet').textContent=c.composite?((vp==null?'':vp===0?'Proxy contract of ':(pp&&pp.role==='implementation'?'Implementation of ':'Facet '+vp+' of '))+c.composite.kind.charAt(0).toUpperCase()+c.composite.kind.slice(1)):c.proxy?'Proxy, '+c.proxy.kind:(c.kind&&c.kind!=='unclassified'?c.kind.charAt(0).toUpperCase()+c.kind.slice(1)+' code':'Contract');
  $('#tb-chain').textContent=c.chain||$('#chain').selectedOptions[0].textContent;
  const a=c.address||'';$('#tb-address').textContent=a?a.slice(0,10)+'…'+a.slice(-6):'pasted bytecode';$('#tb-address').title=a;
  $('#tb-compiler').textContent=c.language||(meta.compiler?meta.compiler+' '+(meta.version||''):'unknown');
@@ -427,7 +431,7 @@ function shortAddr(p){if(!p)return '?';if(p.role==='shell')return 'shell';if(p.r
 function partsOf(c,slot){const parts=c.parts||[];return parts.filter(p=>(p.storage||[]).some(v=>v.slot===slot)).map(p=>'<span class="pt">'+esc(partLabel(c,p))+'</span>').join('<br>')}
 function renderAll(){const c=DATA.contract;renderCode();$('#panel-report').innerHTML=SOON;
  $('#panel-storage').innerHTML=storagePanel(c);
- $('#panel-graph').innerHTML=graphPanel();$('#panel-graph').querySelectorAll('button[data-linked]').forEach(b=>b.addEventListener('click',()=>{const k=ENTRIES.findIndex(e=>e.linked===+b.dataset.linked);if(k>=0){show(k);say('Showing '+ENTRIES[k].label+' '+ENTRIES[k].address)}}));$('#panel-graph').querySelectorAll('button[data-part]').forEach(b=>b.addEventListener('click',()=>{const k=+b.dataset.part;if(k<ENTRIES.length){show(k);say('Showing '+ENTRIES[k].label+' '+ENTRIES[k].address)}}));
+ $('#panel-graph').innerHTML=graphPanel();$('#panel-graph').querySelectorAll('button[data-linked]').forEach(b=>b.addEventListener('click',()=>{const k=ENTRIES.findIndex(e=>e.linked===+b.dataset.linked);if(k>=0){show(k);say('Showing '+ENTRIES[k].label+' '+ENTRIES[k].address)}}));$('#panel-graph').querySelectorAll('button[data-part]').forEach(b=>b.addEventListener('click',()=>{const k=ENTRIES.findIndex(e=>e.part===+b.dataset.part);if(k>=0){show(k);say('Showing '+ENTRIES[k].label+' '+ENTRIES[k].address)}}));
  $('#panel-disasm').innerHTML='<pre>'+esc((DATA.disassembly||[]).join('\n'))+'</pre>';
  const j=JSON.parse(JSON.stringify(DATA));delete j.disassembly;$('#panel-json').innerHTML='<pre>'+esc(JSON.stringify(j,null,2))+'</pre>';}
 })();

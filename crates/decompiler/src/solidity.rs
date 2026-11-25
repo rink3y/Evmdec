@@ -1684,7 +1684,9 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
         let external = f.kind == FnKind::External && !f.inlined;
         if let Some(plain) = plain.filter(|p| p.drafted && external) {
             let head = crate::decompile::fmt_function_header(f);
+            let start = out.len();
             out.push_str(&format!("{head}{}    }}\n\n", body(c, f, plain)));
+            spans.push((start, out.len(), i));
             continue;
         }
         let kept = selector(f).filter(|s| !shape.outside.contains(s) && !shape.fallback_only);

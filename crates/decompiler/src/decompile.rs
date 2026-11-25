@@ -3361,7 +3361,7 @@ fn mutability_str(m: Mutability) -> &'static str {
 }
 
 pub fn render(c: &Contract, name: &str) -> String {
-    if c.solidity && name == "Contract" {
+    if c.solidity && matches!(name, "Contract" | "Linked") {
         return crate::solidity::draft(c);
     }
     let mut out = String::new();

@@ -135,8 +135,8 @@ How far it goes: 2 call edges from the contract asked for by default (`--depth`,
 `depth` in the server's request), at most 8 targets fetched from one contract, at most 40 code
 units per request across parts and dependencies, 20 seconds to decompile one dependency and
 120 seconds for the whole walk. Whatever was seen and not fetched is listed with its reason
-(a limit, the depth, an empty slot, no code, too slow) in the JSON (`unfollowed`), so the edge
-of what was read is always stated.
+(a limit, the depth, an empty slot, no code, too slow) in the server's answer (`unfollowed`)
+and on the page's call graph, so the edge of what was read is always stated.
 
 Contracts a contract creates are part of the walk too. Creation code a contract copies out of
 its own bytecode is decompiled with it (constructor and runtime), the libraries and fixed
@@ -227,9 +227,9 @@ the four source fixtures every one of 20 single changes to an operator or a chec
 The WETH contract on mainnet, built with solc 0.4.19, compares equal to its published source
 built with 0.4.26 on all 12 functions with every branch reached.
 
-This is the test the decompiler's own output has to pass. What `evmdec decompile` prints by
-default has not taken it: it is the Solidity file as it is first written, with no compiler
-asked. The file `--sol` prints, described below, has.
+This is the test the decompiler's own output has to pass. What `evmdec decompile` prints has
+not taken it: it is the Solidity file as it is first written, with no compiler asked. The
+checked form of that file, which the tests build and which is described below, has.
 
 A source still running at many times the steps the original took to end is a difference,
 not a run left unsettled. A run of the original longer than 50,000 steps is left out: it is
@@ -242,27 +242,29 @@ USDT, 414 of 984 on Compound cETH, whose paths depend on what other contracts an
 
 ### Solidity file
 
-`evmdec decompile my.hex --sol` prints a Solidity file a compiler accepts, with a licence
-line, a `pragma` (the contract's own compiler version when it was built with solc 0.8, a
-current one otherwise), the events, and every function whose signature is known declared by
-name. It is compiled and put through the source check before it is printed, and the result
-is reported beside it. Where the pragma is not the contract's own, a comment under it names
-the compiler the contract was built with.
+`evmdec decompile my.hex` prints a Solidity file, and that is the one form it prints: a
+licence line, a `pragma` (the contract's own compiler version when it was built with solc
+0.8, a current one otherwise), the state variables, the events and every function in its
+plain form. A function whose signature is known is declared by name, and any other under the
+name of its selector. Where the pragma is not the contract's own, a comment under it names
+the compiler the contract was built with. No compiler is asked and nothing is run beside the
+bytecode, so this takes no longer than decompiling does. What a compiler would refuse, or
+the check would find different, is still in that text.
 
-Without `--sol` the command prints the same file as it is first written: every function in
-its plain form, a function no signature names under the name of its selector, no compiler
-asked and nothing run beside the bytecode. That takes no longer than decompiling does. What
-a compiler would refuse, or the check would find different, is still in that text.
-`--flat` prints the older, looser text with labels and jumps.
+The tests hold the same file to more. `evmdec checked my.hex`, a test command the help does
+not list, compiles the file and puts it through the source check before it prints it, and
+reports the result beside it. The rest of this section, and its numbers, are about that
+checked file. `evmdec facts my.hex`, the other test command, prints what was recovered as
+JSON for the benchmark to read.
 
-Every function starts as a call to one private function that holds the bytecode translated
-instruction by instruction into an assembly block, with no analysis in between, so it cannot
-be wrong in the way a decompiled body can. That is the floor. From there each function is
-written out as plain Solidity, with the state variables declared on the slots and bytes the
-code uses, and the file is built and checked again. A function whose text the compiler
-refuses, or that does not do what the bytecode does, goes back to the exact form, and so
-does everything that calls it. What is printed is the file that survives, after one longer
-comparison.
+In the checked file every function starts as a call to one private function that holds the
+bytecode translated instruction by instruction into an assembly block, with no analysis in
+between, so it cannot be wrong in the way a decompiled body can. That is the floor. From
+there each function is written out as plain Solidity, with the state variables declared on
+the slots and bytes the code uses, and the file is built and checked again. A function whose
+text the compiler refuses, or that does not do what the bytecode does, goes back to the
+exact form, and so does everything that calls it. What is printed is the file that
+survives, after one longer comparison.
 
 What Solidity has a word for is written with it. A failure reason longer than a word is
 one string, whether the code copies it out of itself or stores it a word at a time. A
@@ -282,14 +284,17 @@ A struct a function keeps in memory for itself is written as a struct in memory 
 its words as fields. A struct of one word, which older code hands from helper to helper by
 its address, is handed over as the word, in every helper and caller at once. Old code gives
 a call a fixed stretch of memory to answer into and reads the answer from there: the file
-keeps the answer the call gave and reads that. A value is declared in the block that gives
+keeps the answer the call gave and reads that. Where the code goes on to hash that stretch,
+copy it, send it in another call or read it at the top of a loop before the call runs
+again, the file also copies the answer into memory, so what is read there is what the call
+gave. A value is declared in the block that gives
 it, where everything that reads it lies in that block, and at the top of the function
 otherwise.
 
 A compiler reaches sixteen values on its stack and refuses a function that needs more at
 once. Where it refuses one, the values the function declares are moved into one struct in
 memory, as an author would do, and the function is tried again. This is done only in the
-checked file and only for a function the compiler refused. The file printed by default
+checked file and only for a function the compiler refused. The file `decompile` prints
 keeps plain local values.
 
 Memory a function builds data in is written the way the code uses it. The code takes a block
@@ -422,7 +427,7 @@ cargo build --release
 ./target/release/evmdec decompile 0xdAC17F958D2ee523a2206206994597C13D831ec7
 ./target/release/evmdec decompile 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 --chain mainnet
 ./target/release/evmdec decompile 0x... --chain arbitrum --rpc https://my.node/
-./target/release/evmdec decompile 0x... --depth 3 --json
+./target/release/evmdec decompile 0x... --depth 3
 
 solc --bin MyContract.sol | tail -1 > my.hex
 ./target/release/evmdec decompile my.hex
@@ -431,7 +436,7 @@ solc --bin MyContract.sol | tail -1 > my.hex
 ./target/release/evmdec disasm my.hex
 ./target/release/evmdec verify my.hex --runs 8
 ./target/release/evmdec check my.hex MyContract.sol
-./target/release/evmdec decompile my.hex --sol > My.sol
+./target/release/evmdec decompile my.hex > My.sol
 
 PORT=8080 ./target/release/evmdec-server
 ```
@@ -467,7 +472,7 @@ print as `func_<selector>`.
 
 The server serves a single-page UI: a title block, the function index, the code, a band of
 the contracts that were followed (each one opens in place), and tabs for storage and events,
-the call graph, disassembly and JSON. The Report tab and the Analyzer column hold the place
+the call graph and disassembly. The Report tab and the Analyzer column hold the place
 of the security analyzer, which is coming later. The call graph says how each contract was
 reached (which contract calls it, how, and how many calls away) and lists the call targets
 that were seen and not fetched, each with its reason. Results are linkable as `/?chain=mainnet&address=0x...`. The page meets
@@ -483,7 +488,7 @@ written: a licence line, a `pragma`, the state variables on their slots, the eve
 every function as plain Solidity, with a function no signature names written under the name
 of its selector. The server runs no compiler, so this text is not checked. A function a
 compiler would refuse, or that does not do what the bytecode does, is still in it as it was
-written. `evmdec decompile --sol` on the command line gives the checked file.
+written. The command line prints the same text.
 
 ```
 POST /api/decompile      {"address": "0x...", "chain": "mainnet"}  or  {"bytecode": "0x..."}
@@ -510,7 +515,7 @@ remote nodes in at most 240 seconds, and code over 1 MiB is refused.
 | `EVMDEC_RPC_URL` | comma-separated JSON-RPC endpoints, used in place of the public list. The chain asked for has to be the chain they serve; a request for another chain is refused |
 | `EVMDEC_SIGS` | path of the signature index; empty disables it. Default search: `./sigs.idx`, next to the binary, `/var/lib/evmdec/sigs.idx`, `~/.evmdec/sigs.idx` |
 | `EVMDEC_TIMING` | print the time spent in each stage |
-| `SOLC`, `EVMDEC_SOLC_DIR` | a compiler binary for `check` and `--sol` to use as it is, and where downloaded compilers are kept (default `~/.cache/evmdec/solc`). A download is the build for the machine's processor, x86-64 or ARM64, and is checked against the hash its list gives. The ARM64 builds start at 0.8.31, so there a contract built with an older 0.8 compiler gets its file under the pragma any current compiler takes |
+| `SOLC`, `EVMDEC_SOLC_DIR` | a compiler binary for `check` and the checked file of the tests to use as it is, and where downloaded compilers are kept (default `~/.cache/evmdec/solc`). A download is the build for the machine's processor, x86-64 or ARM64, and is checked against the hash its list gives. The ARM64 builds start at 0.8.31, so there a contract built with an older 0.8 compiler gets its file under the pragma any current compiler takes |
 | `PORT` | listening port of the server, default 8080 |
 
 ## Development

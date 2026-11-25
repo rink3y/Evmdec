@@ -467,6 +467,11 @@ reached (which contract calls it, how, and how many calls away) and lists the ca
 that were seen and not fetched, each with its reason. Results are linkable as `/?chain=mainnet&address=0x...`. The page meets
 WCAG 2.2 AA on both colour schemes and runs no third-party scripts.
 
+A proxy with one implementation opens on the implementation, which is the code a reader
+came for. The band then offers the proxy's own code and any library or linked contract,
+each named for what it is. A contract made of several parts, such as a diamond, opens with
+all parts as one contract and offers each part beside it.
+
 The code the page shows is the [Solidity file](#solidity-file) in the form it is first
 written: a licence line, a `pragma`, the state variables on their slots, the events and
 every function as plain Solidity, with a function no signature names written under the name

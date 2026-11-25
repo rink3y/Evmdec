@@ -325,7 +325,7 @@ struct Printer<'a> {
     stored: Vec<(usize, usize, String, ExprId, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
     put_back: HashSet<(usize, usize)>,
-    memory_reads: Vec<Vec<(usize, Span, bool)>>,
+    memory_reads: Vec<Vec<(usize, Span, Read)>>,
     // Filled while the printer's &self methods run, hence the cell.
     skipped: RefCell<HashSet<(usize, usize)>>,
     printed_last: Option<usize>,
@@ -646,8 +646,16 @@ fn reach(off: ExprId, len: ExprId) -> Span {
     (base, from, to.map_or(u64::MAX, |n| from.saturating_add(n)))
 }
 
-// A read is marked where it loads one whole word.
-fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<(Span, bool)>) {
+/* How a stretch of memory is read: as one whole word, as bytes the code is known to have
+written since, or as whatever lies there. */
+#[derive(Clone, Copy, PartialEq)]
+enum Read {
+    Word,
+    Written,
+    Raw,
+}
+
+fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<(Span, Read)>) {
     let word = expr::konst_u64(32);
     let mut pending = roots;
     while let Some(e) = pending.pop() {
@@ -655,9 +663,9 @@ fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<(Span,
             continue;
         }
         match expr::node(e) {
-            Node::MLoad(at, _) => out.push((reach(at, word), true)),
-            Node::CopiedWord(op::MCOPY, at, _) => out.push((reach(at, word), false)),
-            Node::KeccakMem(off, len, _) => out.push((reach(off, len), false)),
+            Node::MLoad(at, _) => out.push((reach(at, word), Read::Word)),
+            Node::CopiedWord(op::MCOPY, at, _) => out.push((reach(at, word), Read::Raw)),
+            Node::KeccakMem(off, len, _) => out.push((reach(off, len), Read::Raw)),
             _ => {}
         }
         pending.extend(expr::children(e));
@@ -665,27 +673,34 @@ fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<(Span,
 }
 
 // What the end of a node and the edges out of it read has the index past the last.
-fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span, bool)>> {
+fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span, Read)>> {
+    let known = |words: &Option<Vec<ExprId>>| match words {
+        Some(_) => Read::Written,
+        None => Read::Raw,
+    };
     let mut all = Vec::with_capacity(l.nodes.len());
     for nd in &l.nodes {
-        let mut reads: Vec<(usize, Span, bool)> = Vec::new();
+        let mut reads: Vec<(usize, Span, Read)> = Vec::new();
         for (i, st) in nd.stmts.iter().enumerate() {
             let mut found = Vec::new();
             reads_in(lift::stmt_exprs(st), &mut HashSet::new(), &mut found);
-            let whole = match st {
-                Stmt::Call { in_off, in_len, .. } => Some(reach(*in_off, *in_len)),
-                Stmt::Log { off, len, .. } | Stmt::Create { off, len, .. } => {
-                    Some(reach(*off, *len))
-                }
+            found.extend(match st {
+                Stmt::Call {
+                    in_off,
+                    in_len,
+                    input,
+                    ..
+                } => Some((reach(*in_off, *in_len), known(input))),
+                Stmt::Log { off, len, data, .. } => Some((reach(*off, *len), known(data))),
+                Stmt::Create { off, len, init, .. } => Some((reach(*off, *len), known(init))),
                 Stmt::Copy {
                     kind: op::MCOPY,
                     src,
                     len,
                     ..
-                } => Some(reach(*src, *len)),
+                } => Some((reach(*src, *len), Read::Raw)),
                 _ => None,
-            };
-            found.extend(whole.map(|read| (read, false)));
+            });
             reads.extend(found.into_iter().map(|(read, word)| (i, read, word)));
         }
         let mut found = Vec::new();
@@ -696,13 +711,12 @@ fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span, bool)>> {
             .filter(|((from, _), _)| *from == nd.id);
         roots.extend(leaving.flat_map(|(_, assigns)| assigns.iter().map(|(_, v)| *v)));
         reads_in(roots, &mut HashSet::new(), &mut found);
-        let whole = match &nd.term {
-            Term::Return { off, len, .. } | Term::Revert { off, len, .. } => {
-                Some(reach(*off, *len))
+        found.extend(match &nd.term {
+            Term::Return { off, len, data } | Term::Revert { off, len, data } => {
+                Some((reach(*off, *len), known(data)))
             }
             _ => None,
-        };
-        found.extend(whole.map(|read| (read, false)));
+        });
         reads.extend(
             found
                 .into_iter()
@@ -3440,23 +3454,23 @@ impl<'a> Printer<'a> {
                 .iter()
                 .map(move |read| (*node, read))
         });
-        let reads: Vec<(usize, &(usize, Span, bool))> = here
+        let reads: Vec<(usize, &(usize, Span, Read))> = here
             .map(|read| (n, read))
             .chain(later)
             .filter(|(_, (_, read, _))| self.may_overlap(area, *read))
             .collect();
         /* The answer kept as a value serves a load of one of its words, where the call was
-        always made before the load. A hash, a copy or a call that reads the area reads
-        memory. So does a load that starts inside a word, and one a loop reaches before the
-        call. */
-        let served = |(node, (at, read, word)): &(usize, &(usize, Span, bool))| {
+        always made before the load. Bytes the code wrote over the area since are not the
+        answer. A hash, a copy or a call that reads whatever lies there reads memory. So
+        does a load that starts inside a word, and one a loop reaches before the call. */
+        let served = |(node, (at, read, how)): &(usize, &(usize, Span, Read))| {
             let whole =
                 read.0 == area.0 && read.1 >= area.1 && (read.1 - area.1).is_multiple_of(32);
             let follows = match *node == n {
                 true => *at > i,
                 false => self.g.dominates(n, *node),
             };
-            *word && whole && follows
+            *how == Read::Written || (*how == Read::Word && whole && follows)
         };
         let served = reads.iter().all(served);
         /* Memory outlives a helper, so what its caller reads is not seen here. A caller

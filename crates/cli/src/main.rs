@@ -13,6 +13,51 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(clap::Args)]
+struct Asked {
+    input: String,
+    #[arg(
+        long,
+        help = "JSON-RPC endpoint(s), comma-separated (default: public endpoints of --chain, or $EVMDEC_RPC_URL)"
+    )]
+    rpc: Option<String>,
+    #[arg(
+        long,
+        default_value = "mainnet",
+        help = "Chain name or id for address lookups"
+    )]
+    chain: String,
+    #[arg(
+        long,
+        help = "Do not resolve and decompile the implementation behind a proxy"
+    )]
+    no_follow_proxy: bool,
+    #[arg(
+        long,
+        default_value_t = 2,
+        help = "Call edges to follow from the contract: 1 fetches what it calls, 2 also what those contracts call. At most 3; 0 fetches no dependency"
+    )]
+    depth: usize,
+    #[arg(
+        long,
+        help = "Also decompile embedded contracts (CREATE/CREATE2 payloads)"
+    )]
+    embedded: bool,
+    #[arg(long, help = "Disable the built-in signature dictionary")]
+    no_sigs: bool,
+    #[arg(
+        long,
+        help = "Resolve unknown selectors online (openchain.xyz, 4byte.directory)"
+    )]
+    lookup: bool,
+}
+
+enum Shown {
+    File,
+    Checked,
+    Facts,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     #[command(about = "Show bytecode facts: kind, size, compiler metadata")]
@@ -24,52 +69,17 @@ enum Cmd {
     #[command(
         about = "Decompile to a Solidity file. INPUT is a file (binary or hex), a hex string, or a 0x address"
     )]
-    Decompile {
-        input: String,
-        #[arg(
-            long,
-            help = "JSON-RPC endpoint(s), comma-separated (default: public endpoints of --chain, or $EVMDEC_RPC_URL)"
-        )]
-        rpc: Option<String>,
-        #[arg(
-            long,
-            default_value = "mainnet",
-            help = "Chain name or id for address lookups"
-        )]
-        chain: String,
-        #[arg(
-            long,
-            help = "Do not resolve and decompile the implementation behind a proxy"
-        )]
-        no_follow_proxy: bool,
-        #[arg(
-            long,
-            default_value_t = 2,
-            help = "Call edges to follow from the contract: 1 fetches what it calls, 2 also what those contracts call. At most 3; 0 fetches no dependency"
-        )]
-        depth: usize,
-        #[arg(long, help = "Labels and gotos instead of structured code")]
-        flat: bool,
-        #[arg(long, help = "JSON output with all facts")]
-        json: bool,
-        #[arg(
-            long,
-            help = "Also decompile embedded contracts (CREATE/CREATE2 payloads)"
-        )]
-        embedded: bool,
-        #[arg(long, help = "Disable the built-in signature dictionary")]
-        no_sigs: bool,
-        #[arg(
-            long,
-            help = "Resolve unknown selectors online (openchain.xyz, 4byte.directory)"
-        )]
-        lookup: bool,
-        #[arg(
-            long,
-            help = "Print a Solidity file that compiles and does what the bytecode does, and say how it compared"
-        )]
-        sol: bool,
-    },
+    Decompile(Asked),
+    #[command(
+        hide = true,
+        about = "For this project's tests: the Solidity file built with a compiler and compared with the bytecode"
+    )]
+    Checked(Asked),
+    #[command(
+        hide = true,
+        about = "For this project's tests: what was recovered from a contract, as JSON"
+    )]
+    Facts(Asked),
     #[command(
         about = "Block-level oracle: execute every basic block concretely and through the lifted IR"
     )]
@@ -232,6 +242,101 @@ fn main() -> Result<()> {
     }
 }
 
+fn decompiled(asked: Asked, shown: &Shown) -> Result<()> {
+    let Asked {
+        input,
+        rpc,
+        chain,
+        no_follow_proxy,
+        depth,
+        embedded,
+        no_sigs,
+        lookup,
+    } = asked;
+    let mut opts = Options {
+        flat: false,
+        pcs: false,
+        embedded,
+        no_sigs,
+        solidity: true,
+        extra_sigs: Default::default(),
+    };
+    let is_addr = evmdec::rpc::is_address(&input);
+    let code = if is_addr {
+        None
+    } else {
+        Some(load_input(&input)?)
+    };
+    if let (true, Some(code)) = (lookup, &code) {
+        opts.extra_sigs = look_up(&evmdec::decompile::decompile(code, &opts));
+    }
+    let c = match code {
+        None => fetch_and_decompile(
+            &input,
+            rpc.as_deref(),
+            &chain,
+            Policy {
+                follow: !no_follow_proxy,
+                depth: depth.min(3),
+                ..Policy::default()
+            },
+            &mut opts,
+            lookup,
+        )?,
+        Some(code) => {
+            let opts2 = opts.clone();
+            match std::panic::catch_unwind(move || evmdec::decompile::decompile(&code, &opts2)) {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("internal error while decompiling; printing the disassembly instead (please report this bytecode)");
+                    let code = load_input(&input)?;
+                    let info = evmdec::metadata::analyze(&code);
+                    for i in evmdec::disasm::disassemble(&info.runtime) {
+                        println!("{}", evmdec::disasm::format_instruction(&i));
+                    }
+                    anyhow::bail!("the decompiler failed on this input");
+                }
+            }
+        }
+    };
+    if matches!(shown, Shown::Checked) {
+        let out = evmdec::solidity::raised_file(&c, 16).map_err(|e| anyhow::anyhow!(e))?;
+        print!("{}", out.source);
+        for why in &out.refused {
+            let first = why.lines().take(3).collect::<Vec<_>>().join(" ");
+            eprintln!("a fuller form was refused: {first}");
+        }
+        eprintln!(
+            "built with solc {}, {} functions by name, {} as plain Solidity{}{}",
+            out.compiler,
+            out.headers,
+            out.plain.len(),
+            if out.plain.is_empty() { "" } else { ": " },
+            out.plain.join(", ")
+        );
+        let equal = out.report.functions.iter().filter(|f| f.differs.is_none());
+        eprintln!(
+            "{} of {} equal, branch outcomes reached in the original: {} of {}",
+            equal.count(),
+            out.report.functions.len(),
+            out.report.branches_reached,
+            out.report.branches
+        );
+        for f in out.report.functions.iter().filter(|f| f.differs.is_some()) {
+            let why = f.differs.as_deref().unwrap_or("");
+            eprintln!("{} DIFFERS: {why}", f.signature);
+        }
+        if !out.report.equal() {
+            std::process::exit(1);
+        }
+    } else if matches!(shown, Shown::Facts) {
+        println!("{}", serde_json::to_string_pretty(&c)?);
+    } else {
+        print!("{}", c.source);
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Info { file } => {
@@ -301,103 +406,9 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::Decompile {
-            input,
-            rpc,
-            chain,
-            no_follow_proxy,
-            depth,
-            flat,
-            json,
-            embedded,
-            no_sigs,
-            lookup,
-            sol,
-        } => {
-            let mut opts = Options {
-                flat,
-                pcs: false,
-                embedded,
-                no_sigs,
-                solidity: true,
-                extra_sigs: Default::default(),
-            };
-            let is_addr = evmdec::rpc::is_address(&input);
-            let code = if is_addr {
-                None
-            } else {
-                Some(load_input(&input)?)
-            };
-            if let (true, Some(code)) = (lookup, &code) {
-                opts.extra_sigs = look_up(&evmdec::decompile::decompile(code, &opts));
-            }
-            let c = match code {
-                None => fetch_and_decompile(
-                    &input,
-                    rpc.as_deref(),
-                    &chain,
-                    Policy {
-                        follow: !no_follow_proxy,
-                        depth: depth.min(3),
-                        ..Policy::default()
-                    },
-                    &mut opts,
-                    lookup,
-                )?,
-                Some(code) => {
-                    let opts2 = opts.clone();
-                    match std::panic::catch_unwind(move || {
-                        evmdec::decompile::decompile(&code, &opts2)
-                    }) {
-                        Ok(c) => c,
-                        Err(_) => {
-                            eprintln!("internal error while decompiling; printing the disassembly instead (please report this bytecode)");
-                            let code = load_input(&input)?;
-                            let info = evmdec::metadata::analyze(&code);
-                            for i in evmdec::disasm::disassemble(&info.runtime) {
-                                println!("{}", evmdec::disasm::format_instruction(&i));
-                            }
-                            anyhow::bail!("the decompiler failed on this input");
-                        }
-                    }
-                }
-            };
-            if sol {
-                let out = evmdec::solidity::raised_file(&c, 16).map_err(|e| anyhow::anyhow!(e))?;
-                print!("{}", out.source);
-                for why in &out.refused {
-                    let first = why.lines().take(3).collect::<Vec<_>>().join(" ");
-                    eprintln!("a fuller form was refused: {first}");
-                }
-                eprintln!(
-                    "built with solc {}, {} functions by name, {} as plain Solidity{}{}",
-                    out.compiler,
-                    out.headers,
-                    out.plain.len(),
-                    if out.plain.is_empty() { "" } else { ": " },
-                    out.plain.join(", ")
-                );
-                let equal = out.report.functions.iter().filter(|f| f.differs.is_none());
-                eprintln!(
-                    "{} of {} equal, branch outcomes reached in the original: {} of {}",
-                    equal.count(),
-                    out.report.functions.len(),
-                    out.report.branches_reached,
-                    out.report.branches
-                );
-                for f in out.report.functions.iter().filter(|f| f.differs.is_some()) {
-                    let why = f.differs.as_deref().unwrap_or("");
-                    eprintln!("{} DIFFERS: {why}", f.signature);
-                }
-                if !out.report.equal() {
-                    std::process::exit(1);
-                }
-            } else if json {
-                println!("{}", serde_json::to_string_pretty(&c)?);
-            } else {
-                print!("{}", c.source);
-            }
-        }
+        Cmd::Decompile(asked) => decompiled(asked, &Shown::File)?,
+        Cmd::Checked(asked) => decompiled(asked, &Shown::Checked)?,
+        Cmd::Facts(asked) => decompiled(asked, &Shown::Facts)?,
         Cmd::Verify {
             file,
             runs,

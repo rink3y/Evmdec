@@ -107,7 +107,7 @@ fn a_source_is_equal_to_its_own_code_and_a_changed_one_is_not() {
 #[test]
 fn the_solidity_file_compiles_and_does_what_the_code_does() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/source");
-    let out = evmdec(&["decompile", &format!("{dir}/Packed.hex"), "--sol"]);
+    let out = evmdec(&["checked", &format!("{dir}/Packed.hex")]);
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{said}");
     assert!(said.contains("5 of 5 equal"), "{said}");
@@ -120,7 +120,7 @@ fn the_solidity_file_compiles_and_does_what_the_code_does() {
 fn a_jump_to_no_destination_fails_in_the_solidity_file_too() {
     // Jumps to an instruction that is not a destination, with five destinations after it.
     let code = file("nowhere.hex", "6002565b5b5b5b5b00");
-    let out = evmdec(&["decompile", code.to_str().unwrap(), "--sol"]);
+    let out = evmdec(&["checked", code.to_str().unwrap()]);
     let _ = std::fs::remove_file(&code);
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{said}");

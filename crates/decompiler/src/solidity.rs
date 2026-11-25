@@ -1779,6 +1779,17 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
         let mut printed: Vec<usize> = own.map(|(i, _)| i).collect();
         let callers = printed.iter().chain(spans.iter().map(|(_, _, i)| i));
         printed.extend(helpers(c, plain.functions, callers.copied().collect()));
+        /* Code that no function reaches is still code the contract holds. The file that is
+        not built shows it. The one that is built leaves out what could never run. */
+        if plain.drafted {
+            let unreached = |(i, f): (usize, &Function)| (f.kind == FnKind::Orphan).then_some(i);
+            let all = c.functions.iter().enumerate();
+            let orphans: Vec<usize> = all.filter_map(unreached).collect();
+            let theirs = helpers(c, plain.functions, orphans.clone());
+            let more = orphans.into_iter().chain(theirs);
+            let more: Vec<usize> = more.filter(|i| !printed.contains(i)).collect();
+            printed.extend(more);
+        }
         for i in printed {
             let f = &c.functions[i];
             let start = out.len();

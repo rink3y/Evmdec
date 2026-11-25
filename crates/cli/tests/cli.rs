@@ -61,6 +61,20 @@ fn a_file_with_no_code_is_an_error() {
 }
 
 #[test]
+fn the_default_output_is_a_solidity_file_that_names_the_original_compiler() {
+    let code = file("weth.hex", &sample());
+    let out = evmdec(&["decompile", code.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let head = "// SPDX-License-Identifier: UNLICENSED\npragma solidity ^0.8.24;\n\
+                // Originally compiled with solc";
+    assert!(text.starts_with(head), "{text}");
+    assert!(
+        text.contains("function withdraw(uint256 amount) external {"),
+        "{text}"
+    );
+}
+
+#[test]
 fn an_empty_hex_argument_is_an_error() {
     let out = evmdec(&["decompile", "0x"]);
     assert!(!out.status.success());

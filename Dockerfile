@@ -14,13 +14,11 @@ RUN if [ "$SIGS" = "1" ]; then pip install --no-cache-dir pyarrow==26.0.1 numpy=
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --no-create-home --shell /usr/sbin/nologin evmdec \
-    && install -d -o evmdec -g evmdec /var/cache/evmdec/solc
+    && useradd --system --no-create-home --shell /usr/sbin/nologin evmdec
 COPY --from=build /src/target/release/evmdec /usr/local/bin/evmdec
 COPY --from=build /src/target/release/evmdec-server /usr/local/bin/evmdec-server
 COPY --from=sigs /sigs/sigs.idx /var/lib/evmdec/sigs.idx
 ENV PORT=8080
-ENV EVMDEC_SOLC_DIR=/var/cache/evmdec/solc
 EXPOSE 8080
 USER evmdec
 CMD ["evmdec-server"]

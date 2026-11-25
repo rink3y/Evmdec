@@ -168,6 +168,9 @@ pub struct Contract {
     pub selectors_called: Vec<String>,
     pub stats: Stats,
     pub source: String,
+    // The source is the Solidity file, where it would otherwise be the looser text.
+    #[serde(skip)]
+    pub solidity: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub embedded: Vec<Contract>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1456,6 +1459,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         selectors_called,
         stats,
         source: String::new(),
+        solidity: opts.solidity && !opts.flat,
         embedded,
         region: None,
         constructor: None,
@@ -3357,6 +3361,9 @@ fn mutability_str(m: Mutability) -> &'static str {
 }
 
 pub fn render(c: &Contract, name: &str) -> String {
+    if c.solidity && name == "Contract" {
+        return crate::solidity::draft(c);
+    }
     let mut out = String::new();
     out.push_str(&format!(
         "// Decompiled by evmdec. Compiler: {}.\n",

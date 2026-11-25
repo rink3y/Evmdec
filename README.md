@@ -3,7 +3,7 @@
 EVM bytecode decompiler, written from scratch in Rust.
 
 Give it an address on any EVM chain, or the compiled bytecode of a contract that is not
-deployed yet, and it returns readable pseudo-Solidity with a recovered interface and storage
+deployed yet, and it returns a readable Solidity file with a recovered interface and storage
 layout. Proxies and diamonds are fetched and assembled with their implementation or facets
 and decompiled as one contract, and the contracts they call are fetched and decompiled too,
 so a token whose sender check trusts a hook contract is read together with that hook.
@@ -27,7 +27,7 @@ flowchart LR
     D --> E[type solver]
     E --> N[names from roles]
     N --> F[structurer and printer]
-    F --> G[pseudo-Solidity]
+    F --> G[Solidity file]
     D -. every block, random states .-> K[block oracle]
 ```
 
@@ -227,9 +227,9 @@ the four source fixtures every one of 20 single changes to an operator or a chec
 The WETH contract on mainnet, built with solc 0.4.19, compares equal to its published source
 built with 0.4.26 on all 12 functions with every branch reached.
 
-This is the test the decompiler's own output has to pass. The pseudo-Solidity it prints by
-default does not: none of the 22 corpus contracts decompiles to text a compiler accepts. The
-Solidity file below does.
+This is the test the decompiler's own output has to pass. What `evmdec decompile` prints by
+default has not taken it: it is the Solidity file as it is first written, with no compiler
+asked. The file `--sol` prints, described below, has.
 
 A source still running at many times the steps the original took to end is a difference,
 not a run left unsettled. A run of the original longer than 50,000 steps is left out: it is
@@ -246,7 +246,14 @@ USDT, 414 of 984 on Compound cETH, whose paths depend on what other contracts an
 line, a `pragma` (the contract's own compiler version when it was built with solc 0.8, a
 current one otherwise), the events, and every function whose signature is known declared by
 name. It is compiled and put through the source check before it is printed, and the result
-is reported beside it.
+is reported beside it. Where the pragma is not the contract's own, a comment under it names
+the compiler the contract was built with.
+
+Without `--sol` the command prints the same file as it is first written: every function in
+its plain form, a function no signature names under the name of its selector, no compiler
+asked and nothing run beside the bytecode. That takes no longer than decompiling does. What
+a compiler would refuse, or the check would find different, is still in that text.
+`--flat` prints the older, looser text with labels and jumps.
 
 Every function starts as a call to one private function that holds the bytecode translated
 instruction by instruction into an assembly block, with no analysis in between, so it cannot
@@ -299,7 +306,7 @@ A function that only returns one variable is not written at all: the variable is
 `public` under the function's name, as an author would have, and the compiler writes the
 function. When every function of a contract is plain, its fallback is written out too and
 the exact block is dropped, which leaves a file with no assembly in it. The WETH contract
-comes out that way, in 93 lines.
+comes out that way, in 94 lines.
 
 A function that keeps its exact form but whose arguments the compiler would decode
 differently from the original, as code from before solc 0.8 does, is left out of the named
@@ -460,15 +467,16 @@ reached (which contract calls it, how, and how many calls away) and lists the ca
 that were seen and not fetched, each with its reason. Results are linkable as `/?chain=mainnet&address=0x...`. The page meets
 WCAG 2.2 AA on both colour schemes and runs no third-party scripts.
 
-The Solidity tab, marked beta, shows the [Solidity file](#solidity-file) of the contract on
-screen: for a proxy shown whole, the file of its implementation. The file is built when the
-tab is first opened, and the tab says how it compared with the bytecode. Copy and download
-give the file while that tab is open.
+The code the page shows is the [Solidity file](#solidity-file) in the form it is first
+written: a licence line, a `pragma`, the state variables on their slots, the events and
+every function as plain Solidity, with a function no signature names written under the name
+of its selector. The server runs no compiler, so this text is not checked. A function a
+compiler would refuse, or that does not do what the bytecode does, is still in it as it was
+written. `evmdec decompile --sol` on the command line gives the checked file.
 
 ```
 POST /api/decompile      {"address": "0x...", "chain": "mainnet"}  or  {"bytecode": "0x..."}
                          optional: "no_follow_proxy": true, "lookup": true, "depth": 0..3
-                         "solidity": true asks for the Solidity file instead
 GET  /api/address/{chain}/{address}
 GET  /api/chains
 GET  /api/status         {"signature_index": 10780428}, or 0 when no index is installed
@@ -484,19 +492,6 @@ edges to follow (default 2, at most 3, 0 for none). Requests are bounded: four d
 in flight, four minutes each, sixteen more waiting. One request makes at most 4,000 calls to
 remote nodes in at most 240 seconds, and code over 1 MiB is refused.
 
-With `"solidity": true` the answer is the Solidity file of that one contract, with no proxy
-followed: `solidity.source`, the compiler, how many entry points compared `equal` out of
-`compared`, the branch outcomes reached, the number of functions `named` and the list of
-those written `plain`. Building it takes from seconds to minutes, so it is made in the
-background. The first request answers `202 {"pending": true}`, and the same request sent
-again answers `202` until the file is there and `200` with it after. A file that could not
-be built answers `200 {"failed": "..."}`. Two files are built at a time, each for at most
-ten minutes, and eight may be asked for at once. The server downloads the compiler a file
-needs from `binaries.soliditylang.org` the first time and keeps it in `EVMDEC_SOLC_DIR`.
-It takes the build for its own processor, x86-64 or ARM64, and checks the download against
-the hash the list gives. The ARM64 builds start at 0.8.31, so on such a machine a contract
-built with an older 0.8 compiler gets its file under the pragma any current compiler takes.
-
 ### Configuration
 
 | variable | effect |
@@ -504,7 +499,7 @@ built with an older 0.8 compiler gets its file under the pragma any current comp
 | `EVMDEC_RPC_URL` | comma-separated JSON-RPC endpoints, used in place of the public list. The chain asked for has to be the chain they serve; a request for another chain is refused |
 | `EVMDEC_SIGS` | path of the signature index; empty disables it. Default search: `./sigs.idx`, next to the binary, `/var/lib/evmdec/sigs.idx`, `~/.evmdec/sigs.idx` |
 | `EVMDEC_TIMING` | print the time spent in each stage |
-| `SOLC`, `EVMDEC_SOLC_DIR` | a compiler binary for `check` to use as it is, and where downloaded compilers are kept (default `~/.cache/evmdec/solc`) |
+| `SOLC`, `EVMDEC_SOLC_DIR` | a compiler binary for `check` and `--sol` to use as it is, and where downloaded compilers are kept (default `~/.cache/evmdec/solc`). A download is the build for the machine's processor, x86-64 or ARM64, and is checked against the hash its list gives. The ARM64 builds start at 0.8.31, so there a contract built with an older 0.8 compiler gets its file under the pragma any current compiler takes |
 | `PORT` | listening port of the server, default 8080 |
 
 ## Development

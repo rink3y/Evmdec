@@ -433,6 +433,9 @@ pub struct Plain<'a> {
     clean: bool,
     // Functions the compiler found to read or write more than their header said.
     relaxed: &'a BTreeMap<usize, Reach>,
+    // No compiler will see this text. A function no signature gives a header to is
+    // then written under the name its selector has, where a checked file leaves it out.
+    drafted: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1637,7 +1640,14 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
         Some((a, b, patch)) => format!("{a}.{b}.{patch}"),
         None => MODERN.to_string(),
     };
-    let mut out = format!("// SPDX-License-Identifier: UNLICENSED\npragma solidity {pragma};\n\n");
+    // The pragma names a compiler that reads this text, which for older code is not the
+    // one the contract was built with.
+    let built = match own {
+        Some(_) => String::new(),
+        None => format!("// Originally compiled with {}.\n", c.language),
+    };
+    let licence = "// SPDX-License-Identifier: UNLICENSED";
+    let mut out = format!("{licence}\npragma solidity {pragma};\n{built}\n");
     let mut spans = Vec::new();
     out.push_str(&format!("contract {} {{\n", contract_name(c)));
     if let Some(plain) = plain.filter(|p| !p.layout.text.is_empty()) {
@@ -1669,6 +1679,12 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
                 out.push_str(&format!("    {head} {{\n{text}    }}\n\n"));
                 spans.push((start, out.len(), i));
             }
+            continue;
+        }
+        let external = f.kind == FnKind::External && !f.inlined;
+        if let Some(plain) = plain.filter(|p| p.drafted && external) {
+            let head = crate::decompile::fmt_function_header(f);
+            out.push_str(&format!("{head}{}    }}\n\n", body(c, f, plain)));
             continue;
         }
         let kept = selector(f).filter(|s| !shape.outside.contains(s) && !shape.fallback_only);
@@ -1836,6 +1852,66 @@ fn uncast(text: &str) -> &str {
     inner.filter(whole).unwrap_or(text)
 }
 
+fn getters(c: &Contract) -> Vec<(usize, String)> {
+    let read = |(i, f): (usize, &Function)| Some((i, getter(c, f)?.to_string()));
+    let mut public: Vec<(usize, String)> =
+        c.functions.iter().enumerate().filter_map(read).collect();
+    // Two functions can read one variable, as `owner` and `getOwner` do. The variable
+    // takes the name an author is more likely to have given it.
+    let plainness = |i: usize| {
+        let name = &c.functions[i].name;
+        (name.starts_with("get"), name.len())
+    };
+    public.sort_by_key(|(i, var)| (var.clone(), plainness(*i)));
+    public.dedup_by(|later, first| later.1 == first.1);
+    public
+}
+
+fn printable(c: &Contract) -> BTreeSet<usize> {
+    let kinds = [
+        FnKind::External,
+        FnKind::Internal,
+        FnKind::Fallback,
+        FnKind::Receive,
+    ];
+    let shown = |f: &&Function| !f.inlined && kinds.contains(&f.kind);
+    let all = c.functions.iter().enumerate();
+    all.filter(|(_, f)| shown(f)).map(|(i, _)| i).collect()
+}
+
+/* The Solidity file as it is first written: every function in its plain form, with no
+compiler asked and nothing run beside the bytecode. It reads as the checked file does,
+and what a compiler would refuse or the check would find different is still in it. */
+#[must_use]
+pub fn draft(c: &Contract) -> String {
+    let public = getters(c);
+    let read: BTreeSet<usize> = public.iter().map(|(i, _)| *i).collect();
+    let written = c
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !read.contains(i));
+    let names = written.map(|(_, f)| f.name.as_str());
+    let events = c.events.iter().filter_map(|e| e.split('(').next());
+    let taken: BTreeSet<&str> = names.chain(events).collect();
+    let layout = layout(c, &taken, &public);
+    let shape = Shape {
+        own_version: true,
+        names: true,
+        events: true,
+        ..Shape::default()
+    };
+    let plain = Plain {
+        functions: &printable(c),
+        layout: &layout,
+        public: &read,
+        clean: true,
+        relaxed: &BTreeMap::new(),
+        drafted: true,
+    };
+    compose(c, &shape, Some(&plain)).text
+}
+
 // The variable a function returns and does nothing else, read under the function's own
 // arguments in their order.
 fn getter<'a>(c: &'a Contract, f: &Function) -> Option<&'a str> {
@@ -1880,27 +1956,9 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
     let floor = exact_file(c, runs)?;
     let trace = std::env::var_os("EVMDEC_RAISE_TRACE").is_some();
     let trace_text = std::env::var("EVMDEC_RAISE_TRACE").is_ok_and(|v| v == "2");
-    let read = |(i, f): (usize, &Function)| Some((i, getter(c, f)?.to_string()));
-    let mut public: Vec<(usize, String)> =
-        c.functions.iter().enumerate().filter_map(read).collect();
-    // Two functions can read one variable, as `owner` and `getOwner` do. The variable
-    // takes the name an author is more likely to have given it.
-    let plainness = |i: usize| {
-        let name = &c.functions[i].name;
-        (name.starts_with("get"), name.len())
-    };
-    public.sort_by_key(|(i, var)| (var.clone(), plainness(*i)));
-    public.dedup_by(|later, first| later.1 == first.1);
+    let mut public = getters(c);
     let mut shape = floor.shape.clone();
-    let kinds = [
-        FnKind::External,
-        FnKind::Internal,
-        FnKind::Fallback,
-        FnKind::Receive,
-    ];
-    let printable = |f: &&Function| !f.inlined && kinds.contains(&f.kind);
-    let all = c.functions.iter().enumerate();
-    let mut plain: BTreeSet<usize> = all.filter(|(_, f)| printable(f)).map(|(i, _)| i).collect();
+    let mut plain = printable(c);
     let callers = |of: usize| {
         let pc = c.functions[of].pc;
         let calling = c
@@ -1930,6 +1988,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
             public: &read,
             clean: false,
             relaxed: &relaxed,
+            drafted: false,
         };
         let draft = compose(c, &shape, Some(&written));
         if draft.spans.is_empty() && read.is_empty() {
@@ -2062,6 +2121,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                         public: &read,
                         clean: true,
                         relaxed: &relaxed,
+                        drafted: false,
                     };
                     let clean = every.then(|| compose(c, &shape, Some(&whole)));
                     let tried = clean.and_then(|draft| {

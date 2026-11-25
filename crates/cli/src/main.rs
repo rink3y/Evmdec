@@ -22,7 +22,7 @@ enum Cmd {
     #[command(about = "Control-flow recovery statistics")]
     Cfg { file: PathBuf },
     #[command(
-        about = "Decompile to pseudo-Solidity. INPUT is a file (binary or hex), a hex string, or a 0x address"
+        about = "Decompile to a Solidity file. INPUT is a file (binary or hex), a hex string, or a 0x address"
     )]
     Decompile {
         input: String,
@@ -319,7 +319,7 @@ fn run(cli: Cli) -> Result<()> {
                 pcs: false,
                 embedded,
                 no_sigs,
-                solidity: sol,
+                solidity: true,
                 extra_sigs: Default::default(),
             };
             let is_addr = evmdec::rpc::is_address(&input);

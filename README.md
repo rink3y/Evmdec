@@ -491,35 +491,76 @@ compiler would refuse, or that does not do what the bytecode does, is still in i
 written. The command line prints the same text.
 
 ```
-POST /v1/decompile       {"address": "0x...", "chain": "mainnet"}  or  {"bytecode": "0x..."}
-                         optional: "no_follow_proxy": true, "lookup": true, "depth": 0..3
-GET  /v1/address/{chain}/{address}
-GET  /api/chains
+POST /v1/decompile       {"address": "0x...", "chainid": 1}  or  {"bytecode": "0x..."}
+                         optional: "depth": 0..3, "no_follow_proxy": true, "lookup": true,
+                         "full": true
+GET  /v1/address/{chainid}/{address}
+GET  /v1/chains          every chain with its name and id
+GET  /v1                 the API described as JSON, for a program to read
 GET  /api/status         {"signature_index": 10780428}, or 0 when no index is installed
 GET  /healthz
 ```
 
 ```sh
 curl -X POST https://evm.soldec.xyz/v1/decompile \
-  -H 'content-type: application/json' -d '{"bytecode": "0x600160005500"}'
+  -H 'content-type: application/json' \
+  -d '{"address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "chainid": 1}'
 ```
 
-The two `/v1` addresses are the public API. Everyone who calls them draws on one shared
-pool of 5,000 requests a day, which is full again at 00:00 UTC. Every answer says where the
-pool stands in `x-ratelimit-limit`, `x-ratelimit-remaining` and `x-ratelimit-reset` (the
-second the pool refills, in Unix time). When the pool is empty the answer is `429` with
-`retry-after` in seconds. A request refused for what it asked takes nothing from the pool.
-The website decompiles through an address of its own, `/api/decompile`, which answers only
-the page and takes nothing from the pool, so the site keeps working when the pool is empty.
+A chain is named by its number: `1` for Ethereum, `56` for BNB Chain, and so on. The answer
+is short and reads the same for a person and for a program:
 
-Responses carry `contract`, `disassembly` and, when contracts were followed, `linked` (one
-entry each with the same two fields) and `parts_disassembly`.
-A linked contract says how it was reached (`link`: the calling contract, how it names this
-one, and the number of calls away); the contract asked for lists what was not fetched
-(`unfollowed`) and the contracts it creates (`embedded`). `depth` is the number of call
-edges to follow (default 2, at most 3, 0 for none). Requests are bounded: four decompilations
-in flight, four minutes each, sixteen more waiting. One request makes at most 4,000 calls to
-remote nodes in at most 240 seconds, and code over 1 MiB is refused.
+```json
+{
+  "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "chainid": 1,
+  "summary": "ZeppelinOS proxy. Implementation at 0x4350...02dd. 1 linked contract followed.",
+  "contracts": [
+    {
+      "role": "implementation",
+      "address": "0x43506849d7c04f9138d1a2050bbf3a0c054402dd",
+      "compiler": "solc 0.6.12",
+      "source": "// SPDX-License-Identifier: UNLICENSED\npragma solidity ...",
+      "functions": [
+        { "name": "name", "selector": "0x06fdde03", "signature": "name()", "mutability": "view" }
+      ],
+      "storage": [ { "name": "owner", "slot": "0x0", "type": "address" } ]
+    },
+    { "role": "proxy", "address": "0xa0b8...eb48", "...": "the same fields" },
+    {
+      "role": "library",
+      "address": "0x800c32eaa2a6c93cf4cb51794450ed77fbfbb172",
+      "reached_from": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "reached_how": "library, run in the caller's storage",
+      "...": "the same fields"
+    }
+  ],
+  "not_fetched": [],
+  "checked": false
+}
+```
+
+Every contract is in the one list `contracts`, each in the same shape, with the one a reader
+came for first: for a proxy that is the implementation. `role` is one of `contract`, `proxy`,
+`implementation`, `diamond`, `facet`, `library` and `linked`. `functions` are the ones that
+can be called from outside. `not_fetched` lists what was seen and not fetched, with the
+reason. `checked` is always `false`: the source is not compiled or run before it is sent.
+For USDC this answer is 77 kB. `"full": true` gives everything the decompiler has instead,
+with the disassembly and every function's details, which is 636 kB for the same contract.
+`depth` is the number of call edges to follow (default 2, at most 3, 0 for none).
+
+Everyone who calls `/v1/decompile` or `/v1/address` draws on one shared pool of 5,000
+requests a day, which is full again at 00:00 UTC. Every answer says where the pool stands
+in `x-ratelimit-limit`, `x-ratelimit-remaining` and `x-ratelimit-reset` (the second the
+pool refills, in Unix time). When the pool is empty the answer is `429` with `retry-after`
+in seconds. A refusal is JSON of the form `{"error": "..."}`, and a request refused for
+what it asked takes nothing from the pool. The website decompiles through an address of its
+own, `/api/decompile`, which answers only the page and takes nothing from the pool, so the
+site keeps working when the pool is empty.
+
+Requests are bounded: four decompilations in flight, four minutes each, sixteen more
+waiting. One request makes at most 4,000 calls to remote nodes in at most 240 seconds, and
+code over 1 MiB is refused.
 
 ### Configuration
 

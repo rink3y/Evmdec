@@ -276,7 +276,7 @@ fn a_stored_value_is_not_read_back_after_a_helper_wrote_what_it_was_made_from() 
 }
 
 #[test]
-fn what_a_call_returns_is_a_write_for_any_later_read_that_can_reach_it() {
+fn what_a_call_returns_is_a_write_for_a_later_read_of_the_same_memory() {
     let written = "_copy_returned(0x80, 0x0, _returndatasize() < 32 ? _returndatasize() : 32);";
     let as_data = text("60206080600060006000335af1506000600060003560806000305af15000");
     assert!(as_data.contains(written), "{as_data}");
@@ -284,8 +284,9 @@ fn what_a_call_returns_is_a_write_for_any_later_read_that_can_reach_it() {
         as_data.contains(".call(_range(0x80, _calldata(0)));"),
         "{as_data}"
     );
+    // An address the call data gives is taken to lie apart from a fixed one.
     let by_pointer = text("60206080600060006000335af1506000355160005500");
-    assert!(by_pointer.contains(written), "{by_pointer}");
+    assert!(!by_pointer.contains("_copy_returned("), "{by_pointer}");
     assert!(
         by_pointer.contains("stor_0 = _memory(_calldata(0));"),
         "{by_pointer}"

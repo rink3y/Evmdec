@@ -3065,31 +3065,34 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn halt(&self, node: usize, term: &Term) -> Option<String> {
-        if let Term::Revert { off, len, .. } = term {
-            // The stores that wrote a reason can sit a block or two before the revert,
-            // where the code first rounds the length off.
-            let mut run = vec![node];
-            while run.len() < 3 {
-                let Some(before) = self.g.idom[run[0]].filter(|b| *b != run[0]) else {
-                    break;
-                };
-                run.insert(0, before);
-            }
-            let wrote = run
-                .iter()
-                .flat_map(|i| self.l.nodes[*i].stmts.iter().cloned());
-            let wrote: Vec<Stmt> = wrote.collect();
-            let said = emit::error_string(&wrote, *off, self.names);
-            if said.is_some() {
-                return said;
-            }
-            if emit::bubbled(&wrote, *off, *len) {
-                let hand_on = "returndatacopy(0, 0, returndatasize()) revert(0, returndatasize())";
-                return Some(format!("assembly {{ {hand_on} }}"));
-            }
+    // The failure a revert gives where the code before it wrote the reason or handed one on.
+    fn reason(&self, node: usize, term: &Term) -> Option<String> {
+        let Term::Revert { off, len, .. } = term else {
+            return None;
+        };
+        // The stores that wrote a reason can sit a block or two before the revert,
+        // where the code first rounds the length off.
+        let mut run = vec![node];
+        while run.len() < 3 {
+            let Some(before) = self.g.idom[run[0]].filter(|b| *b != run[0]) else {
+                break;
+            };
+            run.insert(0, before);
         }
-        emit::fmt_term_halt(term, self.names)
+        let wrote = run
+            .iter()
+            .flat_map(|i| self.l.nodes[*i].stmts.iter().cloned());
+        let wrote: Vec<Stmt> = wrote.collect();
+        let said = emit::error_string(&wrote, *off, self.names);
+        let hand_on = "returndatacopy(0, 0, returndatasize()) revert(0, returndatasize())";
+        let handed =
+            || emit::bubbled(&wrote, *off, *len).then(|| format!("assembly {{ {hand_on} }}"));
+        said.or_else(handed)
+    }
+
+    fn halt(&self, node: usize, term: &Term) -> Option<String> {
+        let reason = self.reason(node, term);
+        reason.or_else(|| emit::fmt_term_halt(term, self.names))
     }
 
     // A run of blocks that does nothing but fail with a reason read back from memory.
@@ -3461,16 +3464,22 @@ impl<'a> Printer<'a> {
             .collect();
         /* The answer kept as a value serves a load of one of its words, where the call was
         always made before the load. Bytes the code wrote over the area since are not the
-        answer. A hash, a copy or a call that reads whatever lies there reads memory. So
-        does a load that starts inside a word, and one a loop reaches before the call. */
+        answer, and neither is the reason a revert was given by the stores before it. A
+        hash, a copy or a call that reads whatever lies there reads memory. So does a load
+        that starts inside a word, and one a loop reaches before the call. */
         let served = |(node, (at, read, how)): &(usize, &(usize, Span, Read))| {
+            let ends = &self.l.nodes[*node];
+            let reasoned = *how == Read::Raw && *at == ends.stmts.len();
+            let written =
+                *how == Read::Written || (reasoned && self.reason(*node, &ends.term).is_some());
             let whole =
                 read.0 == area.0 && read.1 >= area.1 && (read.1 - area.1).is_multiple_of(32);
             let follows = match *node == n {
                 true => *at > i,
                 false => self.g.dominates(n, *node),
             };
-            *how == Read::Written || (*how == Read::Word && whole && follows)
+            // An address made another way is taken to lie apart, as it is everywhere else.
+            read.0 != area.0 || written || (*how == Read::Word && whole && follows)
         };
         let served = reads.iter().all(served);
         /* Memory outlives a helper, so what its caller reads is not seen here. A caller

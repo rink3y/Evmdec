@@ -440,16 +440,10 @@ fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) ->
             && matches!(expr::node(*len), Node::Env(op::CALLDATASIZE, _));
         let text = if whole {
             "msg.data".to_string()
-        } else if names.strict {
+        } else {
             let from = emit::fmt_expr(*src, names);
             format!(
                 "msg.data[{from}:{from} + ({})]",
-                emit::fmt_expr(*len, names)
-            )
-        } else {
-            format!(
-                "msg.data[{}:+{}]",
-                emit::fmt_expr(*src, names),
                 emit::fmt_expr(*len, names)
             )
         };
@@ -3058,7 +3052,7 @@ impl<'a> Printer<'a> {
     }
 
     fn halt(&self, node: usize, term: &Term) -> Option<String> {
-        if let (true, Term::Revert { off, len, .. }) = (self.names.strict, term) {
+        if let Term::Revert { off, len, .. } = term {
             // The stores that wrote a reason can sit a block or two before the revert,
             // where the code first rounds the length off.
             let mut run = vec![node];
@@ -3137,10 +3131,6 @@ impl<'a> Printer<'a> {
         for f in &folded {
             dead.extend(f.hidden.iter().copied());
         }
-        dead.extend(emit::free_pointer_updates(
-            &self.l.nodes[n].stmts,
-            self.names,
-        ));
         self.names.payload_overrides.borrow_mut().clear();
         dead.extend(forwarded_calldata(
             &self.l.nodes[n].stmts,
@@ -3199,8 +3189,7 @@ impl<'a> Printer<'a> {
             }
             // Nothing reads the start of free memory after the last block is taken, which
             // makes the taking look dead. In a file it is what makes the block a block.
-            let takes = self.names.strict
-                && matches!(s, Stmt::MStore { off, .. } if emit::is_free_pointer(*off));
+            let takes = matches!(s, Stmt::MStore { off, .. } if emit::is_free_pointer(*off));
             if (dead.contains(&i) && !takes) || self.skipped.borrow().contains(&(n, i)) {
                 continue;
             }
@@ -3415,7 +3404,7 @@ impl<'a> Printer<'a> {
             .map(|l| l / 32)
             .filter(|w| (1..=MOST_WORDS).contains(w));
         match (expr::node(*result), words) {
-            (Node::CallResult(seq), Some(words)) if self.names.strict => {
+            (Node::CallResult(seq), Some(words)) => {
                 for i in 0..words {
                     let word = expr::add_const(*out_off, U256::from_u64(32 * i));
                     answers.insert(word, (seq, 32 * i));
@@ -3810,7 +3799,7 @@ impl<'a> Printer<'a> {
         }
         /* Old code rounds a reason's length off on one of two paths and reverts on both.
         The two give the same failure, so the test between them is not source. */
-        if let (true, Some(t)) = (self.names.strict, t) {
+        if let Some(t) = t {
             let both = self
                 .reason_only(t)
                 .filter(|said| self.reason_only(f).as_ref() == Some(said));
@@ -3844,7 +3833,7 @@ impl<'a> Printer<'a> {
         let Some(t) = t else {
             self.line(
                 depth,
-                &format!("if ({}) {{ revert(); }}", emit::fmt_truth(cond, self.names)),
+                &format!("if ({}) {{ revert(); }}", emit::fmt_cond(cond, self.names)),
             );
             self.transfer(n, f, stop, depth);
             return;
@@ -3886,7 +3875,7 @@ impl<'a> Printer<'a> {
         let first_is_true_side = first == t && first_cond == cond;
         self.line(
             depth,
-            &format!("if ({}) {{", emit::fmt_truth(first_cond, self.names)),
+            &format!("if ({}) {{", emit::fmt_cond(first_cond, self.names)),
         );
         self.active.insert(n);
         self.facts.push((cond, first_is_true_side, first));
@@ -4135,12 +4124,10 @@ impl<'a> Printer<'a> {
             );
             format!("{var_s} = {a} || {b};")
         };
-        let c_s = emit::fmt_or_operand(cond, self.names);
         // For a compiler `&&` joins two flags and gives one. A choice between two
         // values that are not both flags has to be written out as a choice.
-        let flags = !self.names.strict
-            || (emit::is_bool(var, self.names)
-                && [cond, x, y].iter().all(|e| emit::is_bool(*e, self.names)));
+        let flags = emit::is_bool(var, self.names)
+            && [cond, x, y].iter().all(|e| emit::is_bool(*e, self.names));
         let txt = if flags && y == cond {
             both(cond, x)
         } else if flags && x == cond {
@@ -4149,21 +4136,13 @@ impl<'a> Printer<'a> {
             both(ncond, y)
         } else if flags && y == ncond {
             either(ncond, x)
-        } else if self.names.strict {
+        } else {
             let test = emit::fmt_cond(cond, self.names);
             let (x, y) = (
                 emit::fmt_assigned(var, x, self.names),
                 emit::fmt_assigned(var, y, self.names),
             );
             format!("{var_s} = ({test}) ? {x} : {y};")
-        } else {
-            format!(
-                "{} = {} ? {} : {};",
-                var_s,
-                c_s,
-                emit::fmt_expr(x, self.names),
-                emit::fmt_expr(y, self.names)
-            )
         };
         if expr::is_boolean(x) && expr::is_boolean(y) {
             expr::mark_boolean(var);
@@ -4217,13 +4196,13 @@ fn guard(cond: ExprId, reason: &Option<String>, names: &Names) -> String {
     let text = emit::fmt_cond(cond, names);
     let failed = || emit::fmt_cond(expr::op1(op::ISZERO, cond), names);
     match reason.as_deref() {
-        Some(INVALID) if names.strict && names.hide_checked => {
+        Some(INVALID) if names.hide_checked => {
             format!("if ({}) {{ assembly {{ invalid() }} }}", failed())
         }
         Some(INVALID) if names.hide_checked => format!("assert({text}); // INVALID"),
         Some(INVALID) => format!("assert({text});"),
-        Some("Panic(assert failed)") if names.strict => format!("assert({text});"),
-        Some(r) if names.strict && !r.starts_with('"') => {
+        Some("Panic(assert failed)") => format!("assert({text});"),
+        Some(r) if !r.starts_with('"') => {
             format!("if ({}) {}", failed(), emit::failure(r))
         }
         Some(r) => format!("require({text}, {r});"),

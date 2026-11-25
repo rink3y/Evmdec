@@ -149,10 +149,7 @@ impl Source<'_> {
 }
 
 fn run(source: &Source<'_>, lookup: Lookup) -> Result<Value, String> {
-    let mut opts = Options {
-        solidity: true,
-        ..Options::default()
-    };
+    let mut opts = Options::default();
     let mut cache = CodeCache::new();
     let mut c = source.obtain(&opts, &mut cache)?;
     if lookup == Lookup::Online {

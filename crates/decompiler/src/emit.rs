@@ -164,7 +164,6 @@ pub struct Names {
     pub handed: HashMap<ExprId, u32>,
     pub bool_fields: HashSet<(U256, u32, u32)>,
     pub bool_returns: Vec<bool>,
-    pub strict: bool,
     pub storage_types: HashMap<U256, String>,
     pub param_types: HashMap<u32, String>,
     pub arg_types: HashMap<u32, String>,
@@ -1139,13 +1138,10 @@ fn fmt_prec(e: ExprId, outer: u8, n: &Names) -> String {
 }
 
 // The declared types of an event a file can name, for a file a compiler has to take.
-fn known_event_types(topics: &[ExprId], n: &Names) -> Vec<String> {
+fn known_event_types(topics: &[ExprId]) -> Vec<String> {
     let first = topics.first().and_then(|t| expr::as_const(*t));
     let known = first.and_then(|t0| sigs::event(&t0.to_be_bytes()));
-    match known.filter(|_| n.strict) {
-        Some(sig) => sigs::params_of(&sig),
-        None => Vec::new(),
-    }
+    known.map_or_else(Vec::new, |sig| sigs::params_of(&sig))
 }
 
 fn as_declared(ty: &str, e: ExprId, n: &Names) -> String {
@@ -1166,7 +1162,7 @@ pub fn fmt_log_parts(topics: &[ExprId], data_args: Vec<String>, n: &Names) -> St
         }
     }
     let start = if name.is_some() { 1 } else { 0 };
-    let types = known_event_types(topics, n);
+    let types = known_event_types(topics);
     for (i, t) in topics[start..].iter().enumerate() {
         args.push(match types.get(i) {
             Some(ty) => as_declared(ty, *t, n),
@@ -1180,17 +1176,12 @@ pub fn fmt_log_parts(topics: &[ExprId], data_args: Vec<String>, n: &Names) -> St
             /* An event known only by its first topic is declared anonymous, with the
             topic as its first indexed value. Every other value is declared a word, which
             is what it is in the log whatever type the author gave it. */
-            Some(t0) if n.strict => {
+            Some(t0) => {
                 let mut words = vec![t0.to_hex_padded(32)];
                 words.extend(topics[1..].iter().map(|t| as_word(*t, n)));
                 words.extend(args[topics.len()..].iter().cloned());
                 format!("emit {}({});", event_placeholder_name(t0), words.join(", "))
             }
-            Some(t0) => format!(
-                "emit {}({});",
-                event_placeholder_name(t0),
-                args[1..].join(", ")
-            ),
             None => format!("log{}({});", topics.len(), args.join(", ")),
         },
     }
@@ -1402,7 +1393,7 @@ fn declared_flag(e: ExprId, n: &Names) -> bool {
 pub fn is_bool(e: ExprId, n: &Names) -> bool {
     // A value two paths give is a flag in a file only where it is declared one. The
     // mark on the expression is shared by every function that numbers a value alike.
-    if n.strict && matches!(expr::node(e), Node::Var(_)) {
+    if matches!(expr::node(e), Node::Var(_)) {
         return n.bools.contains(&e);
     }
     let joined = |e: ExprId| match expr::node(e) {
@@ -1410,7 +1401,8 @@ pub fn is_bool(e: ExprId, n: &Names) -> bool {
         _ => false,
     };
     expr::is_boolean(e)
-        || (n.strict && (declared_flag(e, n) || joined(e)))
+        || declared_flag(e, n)
+        || joined(e)
         || n.bools.contains(&e)
         || packed_read(e).is_some_and(|(k, off, bits)| n.bool_fields.contains(&(k, off, bits)))
         || bool_element(e, n)
@@ -1464,7 +1456,7 @@ fn short_number(e: ExprId, n: &Names) -> bool {
 also does a sum of two short numbers in their own short type, where the bytecode does
 every sum on whole words. */
 fn fmt_number(e: ExprId, outer: u8, n: &Names) -> String {
-    if !n.strict || expr::is_const(e) {
+    if expr::is_const(e) {
         return fmt_prec(e, outer, n);
     }
     if is_bool(e, n) || is_address(e, n) {
@@ -1533,18 +1525,15 @@ fn packed_store(key: ExprId, val: ExprId, n: &Names) -> Option<String> {
 fn fmt_ordered(e: ExprId, other: ExprId, n: &Names) -> String {
     let flag = is_bool(e, n) && !expr::is_const(e);
     let lone = is_address(e, n) && !is_address(other, n);
-    match n.strict && (flag || lone) {
+    match flag || lone {
         true => as_word(e, n),
         false => fmt_prec(e, P_CMP + 1, n),
     }
 }
 
 // A hash is thirty-two bytes to a compiler, and a number wherever this text uses it.
-fn hash_word(text: String, n: &Names) -> String {
-    match n.strict {
-        true => format!("uint256({text})"),
-        false => text,
-    }
+fn hash_word(text: String) -> String {
+    format!("uint256({text})")
 }
 
 fn handed_word(e: ExprId, n: &Names) -> Option<String> {
@@ -1565,7 +1554,7 @@ pub fn fmt_assigned(var: ExprId, val: ExprId, n: &Names) -> String {
     if let Some(word) = handed_word(val, n) {
         return word;
     }
-    if !n.strict || !matches!(expr::node(var), Node::Var(_)) {
+    if !matches!(expr::node(var), Node::Var(_)) {
         return fmt_expr(val, n);
     }
     match (declared_as(var, n), expr::as_const(val)) {
@@ -1607,7 +1596,7 @@ pub fn note_address_vars(l: &Lifted, n: &mut Names) {
 }
 
 fn zero_of(e: ExprId, n: &Names) -> &'static str {
-    match n.strict && is_address(e, n) {
+    match is_address(e, n) {
         true => "address(0)",
         false => "0",
     }
@@ -1659,13 +1648,6 @@ pub fn fmt_cond(cond: ExprId, n: &Names) -> String {
     } else {
         format!("{} != {}", fmt_prec(cond, P_EQ + 1, n), zero_of(cond, n))
     }
-}
-
-pub fn fmt_truth(cond: ExprId, n: &Names) -> String {
-    if n.strict {
-        return fmt_cond(cond, n);
-    }
-    difference_test(cond, n).unwrap_or_else(|| fmt_expr(cond, n))
 }
 
 fn difference_test(cond: ExprId, n: &Names) -> Option<String> {
@@ -1819,20 +1801,6 @@ fn fmt_stored_word(val: ExprId, n: &Names) -> String {
     }
 }
 
-#[must_use]
-pub fn free_pointer_updates(stmts: &[Stmt], n: &Names) -> HashSet<usize> {
-    // A file states each one, as the taking of a block.
-    if n.blocks.is_none() || n.strict {
-        return HashSet::new();
-    }
-    stmts
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| matches!(s, Stmt::MStore { off, .. } if is_free_pointer(*off)))
-        .map(|(i, _)| i)
-        .collect()
-}
-
 #[derive(Clone, Debug)]
 pub struct BlockLiteral {
     pub first: usize,
@@ -1902,7 +1870,7 @@ pub fn block_literals(stmts: &[Stmt], hidden: &HashSet<usize>, n: &Names) -> Vec
                 })
                 .map(|t| format!("\"{t}\""));
             // In a file a block is written a word at a time, into memory it has taken.
-            if n.strict && text.is_none() {
+            if text.is_none() {
                 continue;
             }
             let values: Vec<String> = match text {
@@ -1993,7 +1961,7 @@ handed to it points at. A block not taken yet is free memory, where a compiler p
 values of its own between two lines of the text, and a fixed address is scratch space it
 uses as well. A write to either is left in the notation no compiler reads. */
 fn owned_memory(off: ExprId, n: &Names) -> bool {
-    if !n.strict || n.layout == MappingLayout::Vyper {
+    if n.layout == MappingLayout::Vyper {
         return false;
     }
     let within = block_ref(off, n).map(|(number, _)| number);
@@ -2025,7 +1993,7 @@ fn held_argument(off: ExprId, val: ExprId, n: &Names) -> Option<(u32, u32)> {
     let Node::CallDataLoad(head) = expr::node(place?) else {
         return None;
     };
-    let index = calldata_word_index(head).filter(|_| n.strict && !n.in_helper)?;
+    let index = calldata_word_index(head).filter(|_| !n.in_helper)?;
     let ty = n.param_types.get(&index)?;
     let copied = dynamic_type(ty) && !ty.starts_with('(');
     (copied && at.is_zero() && past == U256::from_u64(4)).then_some((number, index))
@@ -2092,7 +2060,7 @@ pub fn taking_ahead(stmts: &[Stmt], i: usize, n: &Names) -> Option<String> {
         within.or_else(|| block_started(at, n))
     };
     let number = block(target(&stmts[i])?)?;
-    if !n.strict || n.taken.borrow().contains(&number) {
+    if n.taken.borrow().contains(&number) {
         return None;
     }
     let writes = stmts[i..].iter();
@@ -2114,7 +2082,7 @@ nothing a compiler makes between two lines can land in it. This is the taking, s
 ahead of the first write, or nothing where the block is taken already. */
 fn taken_ahead(off: ExprId, n: &Names) -> String {
     let known = block_ref(off, n).and_then(|(number, _)| Some((number, *n.lengths.get(&number)?)));
-    match known.filter(|(number, _)| n.strict && !n.scalars.contains_key(number)) {
+    match known.filter(|(number, _)| !n.scalars.contains_key(number)) {
         Some((number, length)) if n.taken.borrow_mut().insert(number) => {
             n.ahead.borrow_mut().insert(number);
             format!("ptr{number} = _free(); _take(ptr{number} + {length}); ")
@@ -2162,17 +2130,16 @@ pub fn note_block_lengths(l: &Lifted, n: &mut Names) {
 
 pub fn fmt_mem_read(off: ExprId, n: &Names) -> String {
     let raw = n.layout != MappingLayout::Vyper && scalar_word(off, n).is_none();
-    match n.strict && raw {
+    match raw {
         true => format!("_memory({})", fmt_mem_off(off, n)),
         false => fmt_mem_word(off, n),
     }
 }
 
 fn fmt_bytes_range(off: ExprId, len: ExprId, n: &Names) -> String {
-    match (n.strict, bytes_value(off, len)) {
-        (false, _) => fmt_mem_range(off, len, n),
-        (true, Some(pointer)) => format!("_bytes({})", fmt_mem_off(pointer, n)),
-        (true, None) => format!("_range({}, {})", fmt_mem_off(off, n), fmt_expr(len, n)),
+    match bytes_value(off, len) {
+        Some(pointer) => format!("_bytes({})", fmt_mem_off(pointer, n)),
+        None => format!("_range({}, {})", fmt_mem_off(off, n), fmt_expr(len, n)),
     }
 }
 
@@ -2363,7 +2330,7 @@ pub fn element_write(key: ExprId, val: ExprId, n: &Names) -> Option<(U256, ExprI
         // The word kept can be the one an earlier write stored, shown by the same name.
         let same = |a: ExprId| match expr::node(a) {
             Node::SLoad(k, false, _) if k == key => true,
-            _ => n.strict && fmt_expr(a, n) == fmt_slot(key, n, SlotSpace::Persistent),
+            _ => fmt_expr(a, n) == fmt_slot(key, n, SlotSpace::Persistent),
         };
         [(w[0], w[1]), (w[1], w[0])]
             .into_iter()
@@ -2682,7 +2649,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
     }
     match expr::node(e) {
         Node::Const(c) => (fmt_const(c), P_PRIMARY),
-        Node::Env(op::RETURNDATASIZE, _) if n.strict => ("_returndatasize()".into(), P_PRIMARY),
+        Node::Env(op::RETURNDATASIZE, _) => ("_returndatasize()".into(), P_PRIMARY),
         Node::Env(o, seq) => (env_name(o, seq, n), P_PRIMARY),
         Node::Var(v) => (format!("v{}", n.var(v)), P_PRIMARY),
         Node::Arg(i) => (
@@ -2696,7 +2663,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
         /* For a compiler an argument of a dynamic type is the data itself, where the
         code has the place the data lies at. The place is read from the call data, as is
         any word of the call data that is not an argument of its own. */
-        Node::CallDataLoad(off) if n.strict && !named_word(off, n) => {
+        Node::CallDataLoad(off) if !named_word(off, n) => {
             (format!("_calldata({})", fmt_expr(off, n)), P_PRIMARY)
         }
         Node::CallDataLoad(off) => {
@@ -2723,7 +2690,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
         itself put there, so it only gives the word the code read where the memory was
         laid out the same way, as it is for a value a compiler made. */
         Node::MLoad(off, _) => (fmt_mem_read(off, n), P_PRIMARY),
-        Node::SLoad(key, false, _) if n.strict && whole_packed(key, n).is_some() => {
+        Node::SLoad(key, false, _) if whole_packed(key, n).is_some() => {
             (whole_packed(key, n).unwrap_or_default(), P_PRIMARY)
         }
         Node::SLoad(key, transient, _) => (
@@ -2746,7 +2713,7 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
                 false => "abi.encodePacked",
             };
             (
-                hash_word(format!("keccak256({encoder}({}))", parts.join(", ")), n),
+                hash_word(format!("keccak256({encoder}({}))", parts.join(", "))),
                 P_PRIMARY,
             )
         }
@@ -2766,27 +2733,23 @@ fn fmt_inner(e: ExprId, n: &Names) -> (String, u8) {
                 _ => "abi.encodePacked",
             };
             (
-                hash_word(format!("keccak256({encoder}({}))", parts.join(", ")), n),
+                hash_word(format!("keccak256({encoder}({}))", parts.join(", "))),
                 P_PRIMARY,
             )
         }
         Node::KeccakMem(off, len, _) => (
-            hash_word(format!("keccak256({})", fmt_bytes_range(off, len, n)), n),
+            hash_word(format!("keccak256({})", fmt_bytes_range(off, len, n))),
             P_PRIMARY,
         ),
         Node::CallResult(seq) => (format!("success_{}", n.seq(seq)), P_PRIMARY),
         Node::CreateResult(seq) => (format!("deployed_{}", n.seq(seq)), P_PRIMARY),
-        Node::ReturnData(seq, off) if n.strict => (
-            format!("_word(returned_{}, {})", n.seq(seq), fmt_expr(off, n)),
-            P_PRIMARY,
-        ),
         Node::ReturnData(seq, off) => (
-            format!("returndata_{}[{}]", n.seq(seq), fmt_expr(off, n)),
+            format!("_word(returned_{}, {})", n.seq(seq), fmt_expr(off, n)),
             P_PRIMARY,
         ),
         // A word copied from memory is spelled like the store that wrote it.
         Node::CopiedWord(op::MCOPY, src, _) => (fmt_mem_read(src, n), P_PRIMARY),
-        Node::CopiedWord(op::CALLDATACOPY, src, _) if n.strict => {
+        Node::CopiedWord(op::CALLDATACOPY, src, _) => {
             (format!("_calldata({})", fmt_expr(src, n)), P_PRIMARY)
         }
         Node::CopiedWord(kind, src, _) => (
@@ -3078,10 +3041,10 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             if let Some(m) = expr::as_const(v[1]) {
                 if m.is_low_mask() {
                     let bits = m.bits();
-                    if bits == 160 && n.strict && is_address(v[0], n) {
+                    if bits == 160 && is_address(v[0], n) {
                         return (fmt_prec(v[0], P_PRIMARY, n), P_PRIMARY);
                     }
-                    if bits == 160 && n.strict {
+                    if bits == 160 {
                         return (
                             format!("address(uint160({}))", fmt_expr(v[0], n)),
                             P_PRIMARY,
@@ -3219,7 +3182,7 @@ fn low_160_of(lhs: ExprId, rhs: ExprId) -> bool {
 /* A word compared with its own low 160 bits is a test of its range. Cast to an address on
 both sides it would hold for every word. */
 fn fmt_eq_lhs(lhs: ExprId, rhs: ExprId, n: &Names) -> String {
-    match n.strict && low_160_of(lhs, rhs) {
+    match low_160_of(lhs, rhs) {
         true => format!("uint256(uint160({}))", fmt_expr(rhs, n)),
         false => fmt_prec(lhs, P_EQ + 1, n),
     }
@@ -3240,7 +3203,7 @@ fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
             };
         }
     }
-    if n.strict && is_address(lhs, n) && !is_address(rhs, n) && !low_160_of(lhs, rhs) {
+    if is_address(lhs, n) && !is_address(rhs, n) && !low_160_of(lhs, rhs) {
         return as_address(rhs, n);
     }
     fmt_prec(rhs, prec, n)
@@ -3302,22 +3265,18 @@ pub fn fmt_payload(words: &[ExprId], len: Option<U256>, n: &Names, kind: Payload
                 .unwrap_or(words.len().saturating_sub(1));
             let word = |i: usize| shifted_word_len(words, i, lenu);
             let known = sigs::error(sel).filter(|sig| {
-                !n.strict || sigs::error_named(sigs::name_of(sig), nargs).is_some_and(|s| s == *sig)
+                sigs::error_named(sigs::name_of(sig), nargs).is_some_and(|s| s == *sig)
             });
             if let Some(sig) = known {
                 let types = sigs::params_of(&sig);
-                let typed = |i: usize| match types.get(i).filter(|_| n.strict) {
+                let typed = |i: usize| match types.get(i) {
                     Some(ty) => as_type(ty, word(i), n),
                     None => fmt_expr(word(i), n),
                 };
                 let args: Vec<String> = (0..nargs).map(typed).collect();
                 return format!("{}({})", sigs::name_of(&sig), args.join(", "));
             }
-            let plain = |i: usize| match n.strict {
-                true => as_word(word(i), n),
-                false => fmt_expr(word(i), n),
-            };
-            let args: Vec<String> = (0..nargs).map(plain).collect();
+            let args: Vec<String> = (0..nargs).map(|i| as_word(word(i), n)).collect();
             return format!("CustomError_{:08x}({})", sel, args.join(", "));
         }
     }
@@ -3531,11 +3490,6 @@ pub fn escape(s: &str) -> String {
 }
 
 pub fn fmt_call_output(off: ExprId, len: ExprId, n: &Names) -> String {
-    if !n.strict {
-        let size = format!("min({}, returndatasize())", fmt_expr(len, n));
-        let at = fmt_mem_at(off, n);
-        return format!("mem[{at}:+{size}] = returndata[0:+{size}];");
-    }
     let (at, len) = (fmt_mem_off(off, n), fmt_prec(len, P_CMP + 1, n));
     format!("_copy_returned({at}, 0x0, _returndatasize() < {len} ? _returndatasize() : {len});")
 }
@@ -3588,7 +3542,7 @@ fn fmt_whole_word(e: ExprId, n: &Names) -> String {
             _ => false,
         };
     // The compiler packs a bare literal into the fewest bytes that hold it.
-    match narrow || (n.strict && expr::as_const(e).is_some()) {
+    match narrow || expr::as_const(e).is_some() {
         true => format!("uint256({text})"),
         false => text,
     }
@@ -3705,16 +3659,12 @@ fn fmt_call_arg(arg: &crate::lift::Arg, n: &Names) -> String {
             }
         }
         Arg::Copied { kind, src, len } => match *kind {
-            op::MCOPY if n.strict => fmt_bytes_range(*src, *len, n),
-            op::MCOPY => match bytes_value(*src, *len) {
-                Some(pointer) => format!("bytes({})", fmt_mem_off(pointer, n)),
-                None => format!("mem[{}:+{}]", fmt_mem_at(*src, n), fmt_expr(*len, n)),
-            },
+            op::MCOPY => fmt_bytes_range(*src, *len, n),
             _ => match code_text(*kind, *src, *len, n) {
                 Some(text) => format!("\"{text}\""),
                 // A stretch of the call data is a value a compiler knows, written from
                 // its first byte to the one after its last.
-                None if n.strict && *kind == op::CALLDATACOPY => {
+                None if *kind == op::CALLDATACOPY => {
                     let from = fmt_expr(*src, n);
                     format!("msg.data[{from}:{from} + {}]", fmt_prec(*len, P_ADD + 1, n))
                 }
@@ -3820,7 +3770,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             off, val, width, ..
         } => {
             n.answers.borrow_mut().remove(off);
-            if n.strict && is_free_pointer(*off) {
+            if is_free_pointer(*off) {
                 return fmt_taken(*val, n).unwrap_or_default();
             }
             if let Some((number, index)) = held_argument(*off, *val, n) {
@@ -3831,7 +3781,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 return format!("assembly {{ ptr{number} := {name} }}");
             }
             let zeroed = expr::as_const(*val) == Some(U256::ZERO) && !expr::is_const(*off);
-            if n.strict && zeroed && held_copy(*off, n) {
+            if zeroed && held_copy(*off, n) {
                 return String::new();
             }
             let ahead = match scalar_word(*off, n) {
@@ -3881,7 +3831,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     }
                 }
             }
-            if n.strict && !*transient {
+            if !*transient {
                 // A variable narrower than its slot is stored by keeping the other bytes.
                 // In source that is a plain assignment.
                 if let Some((k, 0, bits, value)) = packed_write(*key, *val) {
@@ -3892,7 +3842,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     }
                 }
             }
-            if let Some(writes) = packed_store(*key, *val, n).filter(|_| n.strict && !*transient) {
+            if let Some(writes) = packed_store(*key, *val, n).filter(|_| !*transient) {
                 return writes;
             }
             if !*transient && !n.member_fields.is_empty() {
@@ -3929,13 +3879,11 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
         } => {
             let first = topics.first().and_then(|t| expr::as_const(*t));
             let unnamed = first.is_some_and(|t0| sigs::event(&t0.to_be_bytes()).is_none());
-            let types = known_event_types(topics, n);
+            let types = known_event_types(topics);
             let declared = |i: usize| types.get(topics.len().saturating_sub(1) + i);
             let data_args: Vec<String> = match data {
-                Some(words) if n.strict && unnamed => {
-                    words.iter().map(|w| as_word(*w, n)).collect()
-                }
-                Some(words) if n.strict && words.len() + topics.len() == types.len() + 1 => {
+                Some(words) if unnamed => words.iter().map(|w| as_word(*w, n)).collect(),
+                Some(words) if words.len() + topics.len() == types.len() + 1 => {
                     let typed = |(i, w): (usize, &ExprId)| match declared(i) {
                         Some(ty) => as_declared(ty, *w, n),
                         None => fmt_expr(*w, n),
@@ -4033,12 +3981,10 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             let selector = call_selector(layout.as_deref(), input.as_deref(), input_head);
             let payload = match (&fname, known) {
                 // Only the head of the data is known, and a file has to send all of it.
-                (Some(_), _) if n.strict && partial && whole.is_none() => {
-                    fmt_bytes_range(*in_off, *in_len, n)
-                }
+                (Some(_), _) if partial && whole.is_none() => fmt_bytes_range(*in_off, *in_len, n),
                 // A compiler knows a selector by its four bytes, and by a name only for a
                 // function declared where it can see it.
-                (Some(_), _) if n.strict && selector.is_some() => format!(
+                (Some(_), _) if selector.is_some() => format!(
                     "abi.encodeWithSelector(bytes4({:#010x}), {})",
                     selector.unwrap_or(0),
                     args.join(", ")
@@ -4059,17 +4005,13 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                         n.payload_overrides.borrow().get(in_off).filter(|_| !copy)
                     {
                         text.clone()
-                    } else if let Some(pointer) =
-                        bytes_value(*in_off, *in_len).filter(|_| !n.strict)
-                    {
-                        format!("bytes({})", fmt_mem_off(pointer, n))
                     } else {
                         fmt_bytes_range(*in_off, *in_len, n)
                     }
                 }
             };
             let answered = match expr::node(*result) {
-                Node::CallResult(seq) if n.strict && !copy && method != "callcode" => Some(seq),
+                Node::CallResult(seq) if !copy && method != "callcode" => Some(seq),
                 _ => None,
             };
             if let Some(seq) = answered {
@@ -4207,7 +4149,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
             // A number handed to a helper that uses it as a place is the block that starts there.
             let places = n.offsets.handed.get(callee);
             let place = |j: &usize| places.is_some_and(|p| p.contains(j));
-            let declared = n.callee_params.get(callee).filter(|_| n.strict);
+            let declared = n.callee_params.get(callee);
             // The fixed place of an argument held in memory is that argument.
             let held = |x: &ExprId| {
                 let fixed = block_ref(*x, n).filter(|_| expr::is_const(*x));
@@ -4267,7 +4209,7 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     let p = fmt_payload(words, len, n, PayloadKind::Revert);
                     if p == "Panic(assert failed)" {
                         format!("assert({});", c)
-                    } else if n.strict && !p.starts_with('"') {
+                    } else if !p.starts_with('"') {
                         let failed = fmt_cond(expr::op1(op::ISZERO, *cond), n);
                         format!("if ({failed}) {}", failure(&p))
                     } else if p.starts_with('"') || p.starts_with("Panic(") {
@@ -4450,7 +4392,7 @@ fn flag_or(j: usize, v: ExprId, n: &Names) -> String {
     if let Some(word) = handed_word(v, n) {
         return word;
     }
-    if let Some(ty) = n.return_types.get(j).filter(|_| n.strict) {
+    if let Some(ty) = n.return_types.get(j) {
         return as_declared(ty, v, n);
     }
     let flag = n.bool_returns.get(j).copied() == Some(true);
@@ -4466,7 +4408,6 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
         Term::Return { off, len, data } => match data {
             Some(words)
                 if words.len() == n.bool_returns.len()
-                    && (n.strict || n.bool_returns.contains(&true))
                     && expr::as_const(*len) == Some(U256::from(32 * words.len())) =>
             {
                 let listed = words.iter().enumerate().map(|(j, v)| flag_or(j, *v, n));
@@ -4486,12 +4427,7 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
                 if expr::as_const(*len) == Some(U256::ZERO) {
                     "return;".into()
                 } else {
-                    match n.strict {
-                        true => {
-                            format!("_return({}, {});", fmt_mem_off(*off, n), fmt_expr(*len, n))
-                        }
-                        false => format!("return {};", fmt_mem_range(*off, *len, n)),
-                    }
+                    format!("_return({}, {});", fmt_mem_off(*off, n), fmt_expr(*len, n))
                 }
             }
         },
@@ -4502,13 +4438,7 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
                     || p.starts_with("Panic(")
                     || p.chars().next().is_some_and(|c| c.is_ascii_uppercase())
                 {
-                    if n.strict {
-                        failure(&p)
-                    } else if p.starts_with('"') {
-                        format!("revert({});", p)
-                    } else {
-                        format!("revert {};", p)
-                    }
+                    failure(&p)
                 } else {
                     format!("revert({});", p)
                 }
@@ -4518,22 +4448,16 @@ pub fn fmt_term_halt(t: &Term, n: &Names) -> Option<String> {
                 if expr::as_const(*len) == Some(U256::ZERO) {
                     "revert();".into()
                 } else {
-                    match n.strict {
-                        true => {
-                            format!("_revert({}, {});", fmt_mem_off(*off, n), fmt_expr(*len, n))
-                        }
-                        false => format!("revert({});", fmt_mem_range(*off, *len, n)),
-                    }
+                    format!("_revert({}, {});", fmt_mem_off(*off, n), fmt_expr(*len, n))
                 }
             }
         },
         Term::Stop => "return;".into(),
         Term::ReturnDyn { ptr, .. } => format!("return {};", fmt_expr(*ptr, n)),
         Term::Invalid => "assert(false); // INVALID".into(),
-        Term::SelfDestruct(a) if n.strict => {
+        Term::SelfDestruct(a) => {
             format!("selfdestruct(payable({}));", as_address(*a, n))
         }
-        Term::SelfDestruct(a) => format!("selfdestruct({});", fmt_expr(*a, n)),
         Term::InternalReturn(vals) => {
             if vals.is_empty() {
                 "return;".into()
@@ -4602,110 +4526,6 @@ pub fn name_labels(text: &str) -> String {
     }
     out.push_str(&text[from..]);
     out
-}
-
-pub fn fmt_flat(l: &Lifted, n: &Names, indent: &str) -> String {
-    name_gas_reads(l, n);
-    let put_back = stores_put_back(l);
-    let mut out = String::new();
-    let reach = crate::lift::reachable(l);
-    let order = crate::lift::reverse_postorder(l);
-    let mut needs_label: HashSet<usize> = HashSet::new();
-    for (idx, &nid) in order.iter().enumerate() {
-        let nd = &l.nodes[nid];
-        if !reach.contains(&nid) {
-            continue;
-        }
-        let prev = if idx > 0 { Some(order[idx - 1]) } else { None };
-        let falls = prev.is_some_and(|p| {
-            matches!(l.nodes[p].term, Term::Jump(t) if t == nid)
-                && nd.preds.len() == 1
-                && !l.edge_assigns.contains_key(&(p, nid))
-        });
-        // The node made for a helper that starts on a loop would repeat the loop's label.
-        let made =
-            nd.preds.is_empty() && matches!(nd.term, Term::Jump(t) if l.nodes[t].pc == nd.pc);
-        if !falls && !made {
-            needs_label.insert(nid);
-        }
-    }
-    for (idx, &nid) in order.iter().enumerate() {
-        let nd = &l.nodes[nid];
-        if needs_label.contains(&nid) {
-            out.push_str(&format!("{}{}:\n", indent, label(l, nid)));
-        }
-        n.end_block();
-        let mut dead = dead_memory_stores(&nd.stmts, &on_node(&put_back, nid));
-        dead.extend(free_pointer_updates(&nd.stmts, n));
-        for (i, s) in nd.stmts.iter().enumerate() {
-            if dead.contains(&i) {
-                continue;
-            }
-            let txt = fmt_stmt(s, n);
-            for (name, def) in n.take_temps() {
-                out.push_str(&format!("{}    uint256 {} = {};\n", indent, name, def));
-            }
-            if !txt.is_empty() {
-                out.push_str(&format!("{}    {}\n", indent, txt));
-            }
-        }
-        let goto = |to: usize| -> String {
-            let mut s = String::new();
-            if let Some(assigns) = l.edge_assigns.get(&(nid, to)) {
-                for (var, val) in assigns {
-                    s.push_str(&format!("{} = {}; ", fmt_expr(*var, n), fmt_expr(*val, n)));
-                }
-            }
-            s.push_str(&format!("goto {};", label(l, to)));
-            s
-        };
-        let next = order.get(idx + 1).copied();
-        match &nd.term {
-            Term::Jump(t) => {
-                if Some(*t) != next || l.edge_assigns.contains_key(&(nid, *t)) {
-                    out.push_str(&format!("{}    {}\n", indent, goto(*t)));
-                }
-            }
-            Term::Branch { cond, t, f } => {
-                match t {
-                    Some(t) => out.push_str(&format!(
-                        "{}    if ({}) {{ {} }}\n",
-                        indent,
-                        fmt_expr(*cond, n),
-                        goto(*t)
-                    )),
-                    None => out.push_str(&format!(
-                        "{}    if ({}) {{ revert(); }}\n",
-                        indent,
-                        fmt_expr(*cond, n)
-                    )),
-                }
-                if Some(*f) != next || l.edge_assigns.contains_key(&(nid, *f)) {
-                    out.push_str(&format!("{}    {}\n", indent, goto(*f)));
-                }
-            }
-            Term::Switch { target, cases } => {
-                out.push_str(&format!(
-                    "{}    switch ({}) {{ {} }}\n",
-                    indent,
-                    fmt_expr(*target, n),
-                    cases.iter().map(|c| goto(*c)).collect::<Vec<_>>().join(" ")
-                ));
-            }
-            other => {
-                if let Some(s) = fmt_term_halt(other, n) {
-                    for (name, def) in n.take_temps() {
-                        out.push_str(&format!("{}    uint256 {} = {};\n", indent, name, def));
-                    }
-                    out.push_str(&format!("{}    {}\n", indent, s));
-                }
-            }
-        }
-        for (name, def) in n.take_temps() {
-            out.push_str(&format!("{}    uint256 {} = {};\n", indent, name, def));
-        }
-    }
-    name_labels(&out)
 }
 
 #[cfg(test)]

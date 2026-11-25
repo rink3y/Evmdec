@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 // The oldest release whose assembly knows every instruction in use today.
 const MODERN: &str = "^0.8.24";
+const NAME: &str = "Contract";
 const RENAMED: (u64, u64, u64) = (0, 8, 18);
 const FEW: usize = 8;
 
@@ -164,13 +165,6 @@ fn declared(event: &str) -> Option<String> {
     let mut listed = vec!["bytes32 indexed"];
     listed.extend(values.into_iter().map(word));
     identifier(name).then(|| format!("{name}({}) anonymous", listed.join(", ")))
-}
-
-fn contract_name(c: &Contract) -> &str {
-    let lines = c.source.lines();
-    let declared = lines.filter_map(|l| l.strip_prefix("contract ")).next();
-    let name = declared.and_then(|rest| rest.split_whitespace().next());
-    name.filter(|n| identifier(n)).unwrap_or("Contract")
 }
 
 fn bytes_of(ty: &str) -> usize {
@@ -1705,7 +1699,7 @@ fn errors_declared(text: &str) -> String {
     out
 }
 
-fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
+fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
     let own = version(c).filter(|_| shape.own_version);
     let pragma = match own {
         Some((a, b, patch)) => format!("{a}.{b}.{patch}"),
@@ -1720,7 +1714,7 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
     let licence = "// SPDX-License-Identifier: UNLICENSED";
     let mut out = format!("{licence}\npragma solidity {pragma};\n{built}\n");
     let mut spans = Vec::new();
-    out.push_str(&format!("contract {} {{\n", contract_name(c)));
+    out.push_str(&format!("contract {name} {{\n"));
     if let Some(plain) = plain.filter(|p| !p.layout.text.is_empty()) {
         out.push_str(&plain.layout.text);
         out.push('\n');
@@ -1833,7 +1827,7 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
 
 #[must_use]
 pub fn file(c: &Contract, shape: &Shape) -> String {
-    compose(c, shape, None).text
+    compose(c, NAME, shape, None).text
 }
 
 #[cfg(feature = "rpc")]
@@ -1968,7 +1962,7 @@ fn printable(c: &Contract) -> BTreeSet<usize> {
 compiler asked and nothing run beside the bytecode. It reads as the checked file does,
 and what a compiler would refuse or the check would find different is still in it. */
 #[must_use]
-pub fn draft(c: &Contract) -> String {
+pub fn draft(c: &Contract, name: &str) -> String {
     let public = getters(c);
     let read: BTreeSet<usize> = public.iter().map(|(i, _)| *i).collect();
     let written = c
@@ -1995,7 +1989,7 @@ pub fn draft(c: &Contract) -> String {
         drafted: true,
         packed: &BTreeSet::new(),
     };
-    compose(c, &shape, Some(&plain)).text
+    compose(c, name, &shape, Some(&plain)).text
 }
 
 // The variable a function returns and does nothing else, read under the function's own
@@ -2078,7 +2072,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
             drafted: false,
             packed: &packed,
         };
-        let draft = compose(c, &shape, Some(&written));
+        let draft = compose(c, NAME, &shape, Some(&written));
         if draft.spans.is_empty() && read.is_empty() {
             break;
         }
@@ -2216,7 +2210,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                         drafted: false,
                         packed: &packed,
                     };
-                    let clean = every.then(|| compose(c, &shape, Some(&whole)));
+                    let clean = every.then(|| compose(c, NAME, &shape, Some(&whole)));
                     let tried = clean.and_then(|draft| {
                         let built = crate::solc::compile_with(&draft.text, false).ok()?;
                         let built = built.into_iter().next()?;

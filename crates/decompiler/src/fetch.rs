@@ -349,7 +349,7 @@ impl Fetcher<'_> {
         let mut contracts = all.into_iter();
         let mut root = contracts.next().expect("the walk starts from the root");
         for mut lc in contracts {
-            lc.source = decompile::render(&lc, "Linked");
+            lc.source = decompile::render(&lc, "Contract");
             root.linked.push(lc);
         }
         root.unfollowed = unfollowed;

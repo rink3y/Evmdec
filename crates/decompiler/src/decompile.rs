@@ -14,15 +14,11 @@ use crate::types::{self, TypeEnv};
 use crate::u256::U256;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fmt::Write as _;
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
-    pub flat: bool,
-    pub pcs: bool,
     pub embedded: bool,
     pub no_sigs: bool,
-    pub solidity: bool,
     pub extra_sigs: HashMap<u32, String>,
 }
 
@@ -168,9 +164,6 @@ pub struct Contract {
     pub selectors_called: Vec<String>,
     pub stats: Stats,
     pub source: String,
-    // The source is the Solidity file, where it would otherwise be the looser text.
-    #[serde(skip)]
-    pub solidity: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub embedded: Vec<Contract>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -594,7 +587,7 @@ pub fn decompile(code: &[u8], opts: &Options) -> Contract {
                 f.name = "constructor".into();
             }
         }
-        ctor.source = render(&ctor, "constructor");
+        ctor.source = render(&ctor, "Constructor");
         c.constructor = Some(Box::new(ctor));
     }
     c.stats.time_ms = t0.elapsed().as_millis();
@@ -1205,10 +1198,7 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         .iter()
         .map(|f| {
             let l = f.lifted.as_ref().expect("functions are lifted");
-            match opts.flat {
-                true => l.clone(),
-                false => crate::structure::reroll_peeled_loops(l),
-            }
+            crate::structure::reroll_peeled_loops(l)
         })
         .collect();
     let mut offsets = {
@@ -1221,42 +1211,30 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         let mut names = make_names(f, &storage, layout, &loaders, &callees);
         let (l, hashes) = crate::structure::name_hashes(&l);
         names.hide_checked = solc08;
-        names.strict = opts.solidity;
         names.checked = solc08.then(|| emit::checked_ops(&l));
         names.offsets = offsets.next().unwrap_or_default();
         names.rebind(&hashes);
         names.pure_callees = pure_callees.clone();
         names.array_resizers = array_resizers.clone();
-        if opts.flat {
-            ready.push((names, l));
-            continue;
-        }
         crate::clock::check();
         let (tested, bindings) = crate::structure::name_tested(&l, &names);
         names.rebind(&bindings);
         let (bound, bindings) = crate::structure::bind_shared(&tested, &names);
         names.rebind(&bindings);
-        if names.strict {
-            emit::note_block_lengths(&bound, &mut names);
-            emit::note_address_vars(&bound, &mut names);
-        }
+        emit::note_block_lengths(&bound, &mut names);
+        emit::note_address_vars(&bound, &mut names);
         ready.push((names, bound));
     }
-    if opts.solidity && !opts.flat {
-        let units = functions.iter().zip(&ready);
-        let units: Vec<(usize, &Lifted, &Names)> = units.map(|(f, (n, l))| (f.pc, l, n)).collect();
-        let found = crate::boxes::find(&units);
-        for ((names, _), found) in ready.iter_mut().zip(found) {
-            names.unbox(found);
-        }
+    let units = functions.iter().zip(&ready);
+    let units: Vec<(usize, &Lifted, &Names)> = units.map(|(f, (n, l))| (f.pc, l, n)).collect();
+    let found = crate::boxes::find(&units);
+    for ((names, _), found) in ready.iter_mut().zip(found) {
+        names.unbox(found);
     }
     for (f, (names, l)) in functions.iter_mut().zip(ready) {
         crate::clock::check();
         let t1 = std::time::Instant::now();
-        let body = match opts.flat {
-            true => emit::fmt_flat(&l, &names, "        "),
-            false => crate::structure::fmt_structured(&l, &names, "        "),
-        };
+        let body = crate::structure::fmt_structured(&l, &names, "        ");
         if timing && t1.elapsed().as_millis() > 200 {
             eprintln!(
                 "[timing] slow render {} nodes={} {:?}",
@@ -1459,7 +1437,6 @@ pub fn decompile_runtime(code: &[u8], info: &BytecodeInfo, opts: &Options) -> Co
         selectors_called,
         stats,
         source: String::new(),
-        solidity: opts.solidity && !opts.flat,
         embedded,
         region: None,
         constructor: None,
@@ -3360,165 +3337,28 @@ fn mutability_str(m: Mutability) -> &'static str {
     }
 }
 
+/* The Solidity file of a contract, and after it the contracts that belong with it: the
+ones its code deploys, its constructor, and for a proxy shown by itself the code it runs.
+Each of those follows as a contract of its own under a line that says what it is. */
 pub fn render(c: &Contract, name: &str) -> String {
-    if c.solidity && matches!(name, "Contract" | "Linked") {
-        return crate::solidity::draft(c);
-    }
-    let mut out = String::new();
-    out.push_str(&format!(
-        "// Decompiled by evmdec. Compiler: {}.\n",
-        c.language
-    ));
-    out.push_str(&composite_header(c));
-    if let Some(m) = &c.info.metadata {
-        if let Some(h) = &m.ipfs {
-            match m.ipfs_cid() {
-                Some(cid) => {
-                    out.push_str(&format!("// Metadata: ipfs {} (multihash {})\n", cid, h))
-                }
-                None => out.push_str(&format!("// Metadata: ipfs {}\n", h)),
-            }
-        }
-        if let Some(h) = &m.bzzr {
-            out.push_str(&format!("// Metadata: {}\n", h));
-        }
-    }
-    let inlined = c.functions.iter().filter(|f| f.inlined).count();
-    out.push_str(&format!(
-        "// Coverage: {}/{} code blocks, {} unresolved jumps, {} external / {} internal functions{}.\n",
-        c.stats.covered_blocks,
-        c.stats.code_blocks,
-        c.stats.unresolved_jumps,
-        c.stats.external_functions,
-        c.stats.internal_functions,
-        if inlined > 0 { format!(" ({} inlined at every call site and not shown)", inlined) } else { String::new() }
-    ));
-    if c.functions.iter().any(|f| f.code.contains("ptr")) {
-        out.push_str(
-            "// Memory: ptrN is a block allocated at the free memory pointer; \
-             ptrN = memory(a, b) writes its words; bytes(p) is the byte string at p.\n",
-        );
-    }
-    if c.functions.iter().any(|f| f.code.contains("unchecked(")) {
-        out.push_str(
-            "// Arithmetic: + - * / % revert on overflow and on division by zero; \
-             unchecked(...) holds what the code computes without that test. \
-             Places in memory, storage and call data are never tested.\n",
-        );
-    }
-    if c.functions.iter().any(|f| f.code.contains("loc_")) {
-        out.push_str(
-            "// Memory: loc_N is the variable kept at the fixed memory address 0xN; \
-             loc_N[i] is word i of the list that starts there.\n",
-        );
-    }
-    out.push_str(&format!("\ncontract {} {{\n", name));
-    if !c.storage.is_empty() {
-        out.push_str("    // ---- storage layout ----\n");
-        for s in &c.storage {
-            if !s.members.is_empty() {
-                out.push_str(&format!("    struct {} {{\n", s.struct_name()));
-                for member in &s.members {
-                    if member.fields.is_empty() {
-                        out.push_str(&format!(
-                            "        {} {}; // slot +{}\n",
-                            member.ty, member.name, member.offset
-                        ));
-                    }
-                    for fld in &member.fields {
-                        out.push_str(&format!(
-                            "        {} {}; // slot +{} bytes {}..{}\n",
-                            fld.ty,
-                            fld.name,
-                            member.offset,
-                            fld.offset,
-                            fld.offset + fld.bits.div_ceil(8)
-                        ));
-                    }
-                }
-                out.push_str("    }\n");
-            }
-            if s.fields.is_empty() {
-                out.push_str(&format!(
-                    "    {} {}; // slot {}, {}{} reads, {} writes\n",
-                    s.declared_type(),
-                    s.name,
-                    s.slot,
-                    if s.fixed_array {
-                        "fixed-size array in the slots that follow, "
-                    } else {
-                        ""
-                    },
-                    s.reads,
-                    s.writes
-                ));
-            } else {
-                out.push_str(&format!(
-                    "    // slot {} is packed ({} reads, {} writes):\n",
-                    s.slot, s.reads, s.writes
-                ));
-                for fld in &s.fields {
-                    out.push_str(&format!(
-                        "    {} {}; // slot {} bytes {}..{}\n",
-                        fld.ty,
-                        fld.name,
-                        s.slot,
-                        fld.offset,
-                        fld.offset + fld.bits.div_ceil(8)
-                    ));
-                }
-            }
-        }
-        out.push('\n');
-    }
-    if !c.events.is_empty() {
-        for e in &c.events {
-            if e.contains("; //") {
-                out.push_str(&format!("    event {}\n", e));
-            } else {
-                out.push_str(&format!("    event {};\n", e));
-            }
-        }
-        out.push('\n');
-    }
-    if !c.errors.is_empty() {
-        for e in &c.errors {
-            out.push_str(&format!("    error {};\n", e));
-        }
-        out.push('\n');
-    }
-    let mut current_part: Option<usize> = None;
-    for f in &c.functions {
-        if f.inlined {
-            continue;
-        }
-        if !c.parts.is_empty() && current_part != Some(f.part) {
-            current_part = Some(f.part);
-            out.push_str(&part_banner(c, f.part));
-        }
-        out.push_str(&fmt_function_header(f));
-        out.push_str(&f.code);
-        out.push_str("    }\n\n");
-    }
-    out.push_str("}\n");
+    let mut out = crate::solidity::draft(c, name);
+    let mut follows = |what: String, source: &str| {
+        let own = source.split_once("\n\n").map_or(source, |(_, own)| own);
+        out.push_str(&format!("\n// {what}\n{own}"));
+    };
     for e in &c.embedded {
-        out.push_str("\n// ---- embedded contract (deployed by the code above) ----\n");
-        out.push_str(&e.source);
+        follows("Deployed by the code above.".to_string(), &e.source);
     }
     if let Some(ctor) = &c.constructor {
-        out.push_str("\n// ---- constructor (creation code) ----\n");
-        out.push_str(&ctor.source);
+        follows(
+            "The creation code, which runs once.".to_string(),
+            &ctor.source,
+        );
     }
-    if let Some(p) = &c.proxy {
-        if c.composite.is_none() {
-            out.push_str(&format!(
-                "\n// ---- {}: implementation {} ----\n",
-                p.kind, p.implementation
-            ));
-            if let Some(ic) = &p.contract {
-                out.push_str(&ic.source);
-            }
-        }
+    let alone = c.proxy.as_ref().filter(|_| c.composite.is_none());
+    if let Some((p, ic)) = alone.and_then(|p| Some((p, p.contract.as_ref()?))) {
+        let what = format!("{}: the implementation at {}.", p.kind, p.implementation);
+        follows(what, &ic.source);
     }
     out
 }
@@ -3529,37 +3369,6 @@ fn calls_by_name(code: &str, name: &str) -> bool {
         let before = code[..at].chars().next_back();
         code[at + name.len()..].starts_with('(') && !before.is_some_and(word)
     })
-}
-
-fn part_banner(c: &Contract, index: usize) -> String {
-    let Some(p) = c.parts.get(index) else {
-        return String::new();
-    };
-    let what = match (p.role, p.selectors.len()) {
-        (PartRole::Shell, _) => "shell: routes calls".to_string(),
-        (PartRole::Implementation, _) => "implementation: every unrouted selector".to_string(),
-        (PartRole::Facet, n) => format!("facet: {} selectors", n),
-    };
-    format!(
-        "    // ==== {} — {}, {} ====\n\n",
-        p.address, what, p.compiler
-    )
-}
-
-fn composite_header(c: &Contract) -> String {
-    let Some(comp) = &c.composite else {
-        return String::new();
-    };
-    let mut out = format!("// Composite: {}. Parts:\n", comp.kind);
-    for p in &c.parts {
-        let what = match (p.role, p.selectors.len()) {
-            (PartRole::Shell, _) => "shell (routes calls)".to_string(),
-            (PartRole::Implementation, _) => "implementation (every unrouted selector)".to_string(),
-            (PartRole::Facet, n) => format!("facet ({} selectors)", n),
-        };
-        let _ = writeln!(out, "//   {} — {}, {}", p.address, what, p.compiler);
-    }
-    out
 }
 
 pub fn fmt_function_header(f: &Function) -> String {

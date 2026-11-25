@@ -254,11 +254,8 @@ fn decompiled(asked: Asked, shown: &Shown) -> Result<()> {
         lookup,
     } = asked;
     let mut opts = Options {
-        flat: false,
-        pcs: false,
         embedded,
         no_sigs,
-        solidity: true,
         extra_sigs: Default::default(),
     };
     let is_addr = evmdec::rpc::is_address(&input);

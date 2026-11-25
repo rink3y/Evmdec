@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>evmdec: EVM bytecode decompiler</title>
-<meta name="description" content="Decompiles any EVM smart contract, from its address on any chain or from raw bytecode, into readable pseudo-Solidity with the functions, storage, events and revert reasons recovered.">
+<meta name="description" content="Decompiles any EVM smart contract, from its address on any chain or from raw bytecode, into a readable Solidity file with the functions, storage, events and revert reasons recovered.">
 <meta name="keywords" content="EVM decompiler, bytecode decompiler, smart contract decompiler, Solidity decompiler, Vyper decompiler, Ethereum, bytecode analysis">
 <meta name="robots" content="index, follow">
 <link rel="canonical" href="__ORIGIN__/">
@@ -14,7 +14,7 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="evmdec">
 <meta property="og:title" content="evmdec, an EVM bytecode decompiler">
-<meta property="og:description" content="Paste a contract address or its bytecode. evmdec decompiles the contract into readable pseudo-Solidity.">
+<meta property="og:description" content="Paste a contract address or its bytecode. evmdec decompiles the contract into a readable Solidity file.">
 <meta property="og:url" content="__ORIGIN__/">
 <meta property="og:image" content="__ORIGIN__/og.png">
 <meta property="og:image:width" content="1200">
@@ -22,7 +22,7 @@
 <meta property="og:image:alt" content="evmdec, inside a revision cloud on vermilion">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="evmdec, an EVM bytecode decompiler">
-<meta name="twitter:description" content="Decompiles a contract, from its address or its bytecode, into readable pseudo-Solidity.">
+<meta name="twitter:description" content="Decompiles a contract, from its address or its bytecode, into a readable Solidity file.">
 <meta name="twitter:image" content="__ORIGIN__/og.png">
 <meta name="color-scheme" content="light dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -225,7 +225,7 @@ pre{margin:0;padding:16px;font:13px/1.5 var(--mono);white-space:pre;overflow:aut
 <section id="landing" aria-label="Start">
   <div class="sheet">
     <h1>Decompile any EVM contract.<br>Then <em>read what it really does.</em></h1>
-    <p>Paste an address and pick its chain, or paste the bytecode of a contract you are about to deploy. You get structured pseudo-Solidity with the functions, storage, events and revert reasons recovered. A security analyzer is planned and will be added later.</p>
+    <p>Paste an address and pick its chain, or paste the bytecode of a contract you are about to deploy. You get a Solidity file with the functions, storage, events and revert reasons recovered. A security analyzer is planned and will be added later.</p>
     <ul class="examples" aria-label="Examples"><li>Try</li>
       <li><button type="button" data-try="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" data-chain="mainnet">WETH</button></li>
       <li><button type="button" data-try="0xdAC17F958D2ee523a2206206994597C13D831ec7" data-chain="mainnet">USDT</button></li>

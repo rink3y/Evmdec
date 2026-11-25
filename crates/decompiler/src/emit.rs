@@ -2871,7 +2871,7 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
                         return (
                             format!(
                                 "{} != {}",
-                                fmt_prec(iv[0], P_EQ + 1, n),
+                                fmt_eq_lhs(iv[0], iv[1], n),
                                 fmt_eq_rhs(iv[0], iv[1], P_EQ + 1, n)
                             ),
                             P_EQ,
@@ -3049,7 +3049,7 @@ fn fmt_op(o: u8, v: &[ExprId], n: &Names) -> (String, u8) {
             (
                 format!(
                     "{} == {}",
-                    fmt_prec(v[0], P_EQ + 1, n),
+                    fmt_eq_lhs(v[0], v[1], n),
                     fmt_eq_rhs(v[0], v[1], P_EQ + 1, n)
                 ),
                 P_EQ,
@@ -3211,6 +3211,20 @@ fn bool_against_const(a: ExprId, b: ExprId, n: &Names) -> Option<(ExprId, bool)>
     None
 }
 
+fn low_160_of(lhs: ExprId, rhs: ExprId) -> bool {
+    let mask = Some(expr::mask_bits(160));
+    matches!(expr::node(lhs), Node::Op(op::AND, v) if v[0] == rhs && expr::as_const(v[1]) == mask)
+}
+
+/* A word compared with its own low 160 bits is a test of its range. Cast to an address on
+both sides it would hold for every word. */
+fn fmt_eq_lhs(lhs: ExprId, rhs: ExprId, n: &Names) -> String {
+    match n.strict && low_160_of(lhs, rhs) {
+        true => format!("uint256(uint160({}))", fmt_expr(rhs, n)),
+        false => fmt_prec(lhs, P_EQ + 1, n),
+    }
+}
+
 fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
     if is_selector_expr(lhs) {
         if let Some(c) = expr::as_const(rhs) {
@@ -3226,7 +3240,7 @@ fn fmt_eq_rhs(lhs: ExprId, rhs: ExprId, prec: u8, n: &Names) -> String {
             };
         }
     }
-    if n.strict && is_address(lhs, n) && !is_address(rhs, n) {
+    if n.strict && is_address(lhs, n) && !is_address(rhs, n) && !low_160_of(lhs, rhs) {
         return as_address(rhs, n);
     }
     fmt_prec(rhs, prec, n)

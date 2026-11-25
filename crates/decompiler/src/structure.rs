@@ -325,7 +325,7 @@ struct Printer<'a> {
     stored: Vec<(usize, usize, String, ExprId, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
     put_back: HashSet<(usize, usize)>,
-    memory_reads: Vec<Vec<(usize, Span)>>,
+    memory_reads: Vec<Vec<(usize, Span, bool)>>,
     // Filled while the printer's &self methods run, hence the cell.
     skipped: RefCell<HashSet<(usize, usize)>>,
     printed_last: Option<usize>,
@@ -652,7 +652,8 @@ fn reach(off: ExprId, len: ExprId) -> Span {
     (base, from, to.map_or(u64::MAX, |n| from.saturating_add(n)))
 }
 
-fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<Span>) {
+// A read is marked where it loads one whole word.
+fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<(Span, bool)>) {
     let word = expr::konst_u64(32);
     let mut pending = roots;
     while let Some(e) = pending.pop() {
@@ -660,8 +661,9 @@ fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<Span>)
             continue;
         }
         match expr::node(e) {
-            Node::MLoad(at, _) | Node::CopiedWord(op::MCOPY, at, _) => out.push(reach(at, word)),
-            Node::KeccakMem(off, len, _) => out.push(reach(off, len)),
+            Node::MLoad(at, _) => out.push((reach(at, word), true)),
+            Node::CopiedWord(op::MCOPY, at, _) => out.push((reach(at, word), false)),
+            Node::KeccakMem(off, len, _) => out.push((reach(off, len), false)),
             _ => {}
         }
         pending.extend(expr::children(e));
@@ -669,14 +671,14 @@ fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<Span>)
 }
 
 // What the end of a node and the edges out of it read has the index past the last.
-fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span)>> {
+fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span, bool)>> {
     let mut all = Vec::with_capacity(l.nodes.len());
     for nd in &l.nodes {
-        let mut reads: Vec<(usize, Span)> = Vec::new();
+        let mut reads: Vec<(usize, Span, bool)> = Vec::new();
         for (i, st) in nd.stmts.iter().enumerate() {
             let mut found = Vec::new();
             reads_in(lift::stmt_exprs(st), &mut HashSet::new(), &mut found);
-            found.extend(match st {
+            let whole = match st {
                 Stmt::Call { in_off, in_len, .. } => Some(reach(*in_off, *in_len)),
                 Stmt::Log { off, len, .. } | Stmt::Create { off, len, .. } => {
                     Some(reach(*off, *len))
@@ -688,8 +690,9 @@ fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span)>> {
                     ..
                 } => Some(reach(*src, *len)),
                 _ => None,
-            });
-            reads.extend(found.into_iter().map(|read| (i, read)));
+            };
+            found.extend(whole.map(|read| (read, false)));
+            reads.extend(found.into_iter().map(|(read, word)| (i, read, word)));
         }
         let mut found = Vec::new();
         let mut roots = lift::term_exprs(&nd.term);
@@ -699,13 +702,18 @@ fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span)>> {
             .filter(|((from, _), _)| *from == nd.id);
         roots.extend(leaving.flat_map(|(_, assigns)| assigns.iter().map(|(_, v)| *v)));
         reads_in(roots, &mut HashSet::new(), &mut found);
-        found.extend(match &nd.term {
+        let whole = match &nd.term {
             Term::Return { off, len, .. } | Term::Revert { off, len, .. } => {
                 Some(reach(*off, *len))
             }
             _ => None,
-        });
-        reads.extend(found.into_iter().map(|read| (nd.stmts.len(), read)));
+        };
+        found.extend(whole.map(|read| (read, false)));
+        reads.extend(
+            found
+                .into_iter()
+                .map(|(read, word)| (nd.stmts.len(), read, word)),
+        );
         all.push(reads);
     }
     all
@@ -3267,7 +3275,7 @@ impl<'a> Printer<'a> {
             }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
-            if let Some(out) = self.call_output(n, i, s).filter(|_| !self.answer_kept(s)) {
+            if let Some(out) = self.call_output(n, i, s) {
                 self.line(depth, &out);
             }
             if let (Stmt::MStore { off, .. }, Some(val)) =
@@ -3437,13 +3445,31 @@ impl<'a> Printer<'a> {
             return None;
         }
         let after = self.g.reached(self.g.succs[n].iter().copied(), &[]);
-        let here = self.memory_reads[n].iter().filter(|(at, _)| *at > i);
-        let later = after
-            .iter()
-            .flat_map(|node| self.memory_reads[*node].iter());
-        let read = here
+        let here = self.memory_reads[n].iter().filter(|(at, ..)| *at > i);
+        let later = after.iter().flat_map(|node| {
+            self.memory_reads[*node]
+                .iter()
+                .map(move |read| (*node, read))
+        });
+        let reads: Vec<(usize, &(usize, Span, bool))> = here
+            .map(|read| (n, read))
             .chain(later)
-            .any(|(_, read)| self.may_overlap(area, *read));
+            .filter(|(_, (_, read, _))| self.may_overlap(area, *read))
+            .collect();
+        /* The answer kept as a value serves a load of one of its words, where the call was
+        always made before the load. A hash, a copy or a call that reads the area reads
+        memory. So does a load that starts inside a word, and one a loop reaches before the
+        call. */
+        let served = |(node, (at, read, word)): &(usize, &(usize, Span, bool))| {
+            let whole =
+                read.0 == area.0 && read.1 >= area.1 && (read.1 - area.1).is_multiple_of(32);
+            let follows = match *node == n {
+                true => *at > i,
+                false => self.g.dominates(n, *node),
+            };
+            *word && whole && follows
+        };
+        let served = reads.iter().all(served);
         /* Memory outlives a helper, so what its caller reads is not seen here. A caller
         does not read a block the helper allocated unless it is handed the block. */
         let handed_back =
@@ -3452,7 +3478,8 @@ impl<'a> Printer<'a> {
         let own = area.0.is_some() && blocks.is_some_and(|known| known.contains_key(&area.0));
         let kept =
             self.names.in_helper && !own && std::iter::once(&n).chain(&after).any(handed_back);
-        (read || kept).then(|| emit::fmt_call_output(*out_off, *out_len, self.names))
+        let copied = (!reads.is_empty() || kept) && !(served && self.answer_kept(s));
+        copied.then(|| emit::fmt_call_output(*out_off, *out_len, self.names))
     }
 
     /* Two blocks the code allocated are apart, and so is a block from a fixed place. An

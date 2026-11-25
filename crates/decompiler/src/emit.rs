@@ -3531,11 +3531,13 @@ pub fn escape(s: &str) -> String {
 }
 
 pub fn fmt_call_output(off: ExprId, len: ExprId, n: &Names) -> String {
-    let size = format!("min({}, returndatasize())", fmt_expr(len, n));
-    format!(
-        "mem[{}:+{size}] = returndata[0:+{size}];",
-        fmt_mem_at(off, n)
-    )
+    if !n.strict {
+        let size = format!("min({}, returndatasize())", fmt_expr(len, n));
+        let at = fmt_mem_at(off, n);
+        return format!("mem[{at}:+{size}] = returndata[0:+{size}];");
+    }
+    let (at, len) = (fmt_mem_off(off, n), fmt_prec(len, P_CMP + 1, n));
+    format!("_copy_returned({at}, 0x0, _returndatasize() < {len} ? _returndatasize() : {len});")
 }
 
 pub fn fmt_call_input(

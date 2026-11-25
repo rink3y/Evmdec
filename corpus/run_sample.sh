@@ -7,7 +7,7 @@ printf "%-44s %6s %6s %5s %7s %6s %9s %5s\n" contract bytes blocks cov unres fun
 for f in "$DIR"/*.hex; do
   name=$(basename "$f" .hex)
   bytes=$(( ($(wc -c < "$f") - 3) / 2 ))
-  out=$(timeout 120 "$BIN" decompile --json "$f" 2>/dev/null); rc=$?
+  out=$(timeout 120 "$BIN" facts "$f" 2>/dev/null); rc=$?
   if [ $rc -eq 124 ]; then timeouts=$((timeouts+1)); printf "%-44s %6s TIMEOUT\n" "$name" "$bytes"; continue; fi
   if [ $rc -ne 0 ]; then fail=$((fail+1)); printf "%-44s %6s FAILED rc=%s\n" "$name" "$bytes" "$rc"; continue; fi
   ok=$((ok+1))

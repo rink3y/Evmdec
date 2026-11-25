@@ -325,7 +325,7 @@ struct Printer<'a> {
     stored: Vec<(usize, usize, String, ExprId, ExprId)>,
     dead_stores: HashSet<(usize, usize)>,
     put_back: HashSet<(usize, usize)>,
-    memory_reads: Vec<Vec<(usize, Span)>>,
+    memory_reads: Vec<Vec<(usize, Span, Read)>>,
     // Filled while the printer's &self methods run, hence the cell.
     skipped: RefCell<HashSet<(usize, usize)>>,
     printed_last: Option<usize>,
@@ -440,16 +440,10 @@ fn forwarded_calldata(stmts: &[Stmt], hidden: &HashSet<usize>, names: &Names) ->
             && matches!(expr::node(*len), Node::Env(op::CALLDATASIZE, _));
         let text = if whole {
             "msg.data".to_string()
-        } else if names.strict {
+        } else {
             let from = emit::fmt_expr(*src, names);
             format!(
                 "msg.data[{from}:{from} + ({})]",
-                emit::fmt_expr(*len, names)
-            )
-        } else {
-            format!(
-                "msg.data[{}:+{}]",
-                emit::fmt_expr(*src, names),
                 emit::fmt_expr(*len, names)
             )
         };
@@ -652,7 +646,16 @@ fn reach(off: ExprId, len: ExprId) -> Span {
     (base, from, to.map_or(u64::MAX, |n| from.saturating_add(n)))
 }
 
-fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<Span>) {
+/* How a stretch of memory is read: as one whole word, as bytes the code is known to have
+written since, or as whatever lies there. */
+#[derive(Clone, Copy, PartialEq)]
+enum Read {
+    Word,
+    Written,
+    Raw,
+}
+
+fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<(Span, Read)>) {
     let word = expr::konst_u64(32);
     let mut pending = roots;
     while let Some(e) = pending.pop() {
@@ -660,8 +663,9 @@ fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<Span>)
             continue;
         }
         match expr::node(e) {
-            Node::MLoad(at, _) | Node::CopiedWord(op::MCOPY, at, _) => out.push(reach(at, word)),
-            Node::KeccakMem(off, len, _) => out.push(reach(off, len)),
+            Node::MLoad(at, _) => out.push((reach(at, word), Read::Word)),
+            Node::CopiedWord(op::MCOPY, at, _) => out.push((reach(at, word), Read::Raw)),
+            Node::KeccakMem(off, len, _) => out.push((reach(off, len), Read::Raw)),
             _ => {}
         }
         pending.extend(expr::children(e));
@@ -669,27 +673,35 @@ fn reads_in(roots: Vec<ExprId>, seen: &mut HashSet<ExprId>, out: &mut Vec<Span>)
 }
 
 // What the end of a node and the edges out of it read has the index past the last.
-fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span)>> {
+fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span, Read)>> {
+    let known = |words: &Option<Vec<ExprId>>| match words {
+        Some(_) => Read::Written,
+        None => Read::Raw,
+    };
     let mut all = Vec::with_capacity(l.nodes.len());
     for nd in &l.nodes {
-        let mut reads: Vec<(usize, Span)> = Vec::new();
+        let mut reads: Vec<(usize, Span, Read)> = Vec::new();
         for (i, st) in nd.stmts.iter().enumerate() {
             let mut found = Vec::new();
             reads_in(lift::stmt_exprs(st), &mut HashSet::new(), &mut found);
             found.extend(match st {
-                Stmt::Call { in_off, in_len, .. } => Some(reach(*in_off, *in_len)),
-                Stmt::Log { off, len, .. } | Stmt::Create { off, len, .. } => {
-                    Some(reach(*off, *len))
-                }
+                Stmt::Call {
+                    in_off,
+                    in_len,
+                    input,
+                    ..
+                } => Some((reach(*in_off, *in_len), known(input))),
+                Stmt::Log { off, len, data, .. } => Some((reach(*off, *len), known(data))),
+                Stmt::Create { off, len, init, .. } => Some((reach(*off, *len), known(init))),
                 Stmt::Copy {
                     kind: op::MCOPY,
                     src,
                     len,
                     ..
-                } => Some(reach(*src, *len)),
+                } => Some((reach(*src, *len), Read::Raw)),
                 _ => None,
             });
-            reads.extend(found.into_iter().map(|read| (i, read)));
+            reads.extend(found.into_iter().map(|(read, word)| (i, read, word)));
         }
         let mut found = Vec::new();
         let mut roots = lift::term_exprs(&nd.term);
@@ -700,12 +712,16 @@ fn memory_reads(l: &Lifted) -> Vec<Vec<(usize, Span)>> {
         roots.extend(leaving.flat_map(|(_, assigns)| assigns.iter().map(|(_, v)| *v)));
         reads_in(roots, &mut HashSet::new(), &mut found);
         found.extend(match &nd.term {
-            Term::Return { off, len, .. } | Term::Revert { off, len, .. } => {
-                Some(reach(*off, *len))
+            Term::Return { off, len, data } | Term::Revert { off, len, data } => {
+                Some((reach(*off, *len), known(data)))
             }
             _ => None,
         });
-        reads.extend(found.into_iter().map(|read| (nd.stmts.len(), read)));
+        reads.extend(
+            found
+                .into_iter()
+                .map(|(read, word)| (nd.stmts.len(), read, word)),
+        );
         all.push(reads);
     }
     all
@@ -3049,31 +3065,34 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn halt(&self, node: usize, term: &Term) -> Option<String> {
-        if let (true, Term::Revert { off, len, .. }) = (self.names.strict, term) {
-            // The stores that wrote a reason can sit a block or two before the revert,
-            // where the code first rounds the length off.
-            let mut run = vec![node];
-            while run.len() < 3 {
-                let Some(before) = self.g.idom[run[0]].filter(|b| *b != run[0]) else {
-                    break;
-                };
-                run.insert(0, before);
-            }
-            let wrote = run
-                .iter()
-                .flat_map(|i| self.l.nodes[*i].stmts.iter().cloned());
-            let wrote: Vec<Stmt> = wrote.collect();
-            let said = emit::error_string(&wrote, *off, self.names);
-            if said.is_some() {
-                return said;
-            }
-            if emit::bubbled(&wrote, *off, *len) {
-                let hand_on = "returndatacopy(0, 0, returndatasize()) revert(0, returndatasize())";
-                return Some(format!("assembly {{ {hand_on} }}"));
-            }
+    // The failure a revert gives where the code before it wrote the reason or handed one on.
+    fn reason(&self, node: usize, term: &Term) -> Option<String> {
+        let Term::Revert { off, len, .. } = term else {
+            return None;
+        };
+        // The stores that wrote a reason can sit a block or two before the revert,
+        // where the code first rounds the length off.
+        let mut run = vec![node];
+        while run.len() < 3 {
+            let Some(before) = self.g.idom[run[0]].filter(|b| *b != run[0]) else {
+                break;
+            };
+            run.insert(0, before);
         }
-        emit::fmt_term_halt(term, self.names)
+        let wrote = run
+            .iter()
+            .flat_map(|i| self.l.nodes[*i].stmts.iter().cloned());
+        let wrote: Vec<Stmt> = wrote.collect();
+        let said = emit::error_string(&wrote, *off, self.names);
+        let hand_on = "returndatacopy(0, 0, returndatasize()) revert(0, returndatasize())";
+        let handed =
+            || emit::bubbled(&wrote, *off, *len).then(|| format!("assembly {{ {hand_on} }}"));
+        said.or_else(handed)
+    }
+
+    fn halt(&self, node: usize, term: &Term) -> Option<String> {
+        let reason = self.reason(node, term);
+        reason.or_else(|| emit::fmt_term_halt(term, self.names))
     }
 
     // A run of blocks that does nothing but fail with a reason read back from memory.
@@ -3129,10 +3148,6 @@ impl<'a> Printer<'a> {
         for f in &folded {
             dead.extend(f.hidden.iter().copied());
         }
-        dead.extend(emit::free_pointer_updates(
-            &self.l.nodes[n].stmts,
-            self.names,
-        ));
         self.names.payload_overrides.borrow_mut().clear();
         dead.extend(forwarded_calldata(
             &self.l.nodes[n].stmts,
@@ -3191,8 +3206,7 @@ impl<'a> Printer<'a> {
             }
             // Nothing reads the start of free memory after the last block is taken, which
             // makes the taking look dead. In a file it is what makes the block a block.
-            let takes = self.names.strict
-                && matches!(s, Stmt::MStore { off, .. } if emit::is_free_pointer(*off));
+            let takes = matches!(s, Stmt::MStore { off, .. } if emit::is_free_pointer(*off));
             if (dead.contains(&i) && !takes) || self.skipped.borrow().contains(&(n, i)) {
                 continue;
             }
@@ -3267,7 +3281,7 @@ impl<'a> Printer<'a> {
             }
             let txt = emit::fmt_stmt(s, self.names);
             self.line(depth, &txt);
-            if let Some(out) = self.call_output(n, i, s).filter(|_| !self.answer_kept(s)) {
+            if let Some(out) = self.call_output(n, i, s) {
                 self.line(depth, &out);
             }
             if let (Stmt::MStore { off, .. }, Some(val)) =
@@ -3407,7 +3421,7 @@ impl<'a> Printer<'a> {
             .map(|l| l / 32)
             .filter(|w| (1..=MOST_WORDS).contains(w));
         match (expr::node(*result), words) {
-            (Node::CallResult(seq), Some(words)) if self.names.strict => {
+            (Node::CallResult(seq), Some(words)) => {
                 for i in 0..words {
                     let word = expr::add_const(*out_off, U256::from_u64(32 * i));
                     answers.insert(word, (seq, 32 * i));
@@ -3437,13 +3451,37 @@ impl<'a> Printer<'a> {
             return None;
         }
         let after = self.g.reached(self.g.succs[n].iter().copied(), &[]);
-        let here = self.memory_reads[n].iter().filter(|(at, _)| *at > i);
-        let later = after
-            .iter()
-            .flat_map(|node| self.memory_reads[*node].iter());
-        let read = here
+        let here = self.memory_reads[n].iter().filter(|(at, ..)| *at > i);
+        let later = after.iter().flat_map(|node| {
+            self.memory_reads[*node]
+                .iter()
+                .map(move |read| (*node, read))
+        });
+        let reads: Vec<(usize, &(usize, Span, Read))> = here
+            .map(|read| (n, read))
             .chain(later)
-            .any(|(_, read)| self.may_overlap(area, *read));
+            .filter(|(_, (_, read, _))| self.may_overlap(area, *read))
+            .collect();
+        /* The answer kept as a value serves a load of one of its words, where the call was
+        always made before the load. Bytes the code wrote over the area since are not the
+        answer, and neither is the reason a revert was given by the stores before it. A
+        hash, a copy or a call that reads whatever lies there reads memory. So does a load
+        that starts inside a word, and one a loop reaches before the call. */
+        let served = |(node, (at, read, how)): &(usize, &(usize, Span, Read))| {
+            let ends = &self.l.nodes[*node];
+            let reasoned = *how == Read::Raw && *at == ends.stmts.len();
+            let written =
+                *how == Read::Written || (reasoned && self.reason(*node, &ends.term).is_some());
+            let whole =
+                read.0 == area.0 && read.1 >= area.1 && (read.1 - area.1).is_multiple_of(32);
+            let follows = match *node == n {
+                true => *at > i,
+                false => self.g.dominates(n, *node),
+            };
+            // An address made another way is taken to lie apart, as it is everywhere else.
+            read.0 != area.0 || written || (*how == Read::Word && whole && follows)
+        };
+        let served = reads.iter().all(served);
         /* Memory outlives a helper, so what its caller reads is not seen here. A caller
         does not read a block the helper allocated unless it is handed the block. */
         let handed_back =
@@ -3452,7 +3490,8 @@ impl<'a> Printer<'a> {
         let own = area.0.is_some() && blocks.is_some_and(|known| known.contains_key(&area.0));
         let kept =
             self.names.in_helper && !own && std::iter::once(&n).chain(&after).any(handed_back);
-        (read || kept).then(|| emit::fmt_call_output(*out_off, *out_len, self.names))
+        let copied = (!reads.is_empty() || kept) && !(served && self.answer_kept(s));
+        copied.then(|| emit::fmt_call_output(*out_off, *out_len, self.names))
     }
 
     /* Two blocks the code allocated are apart, and so is a block from a fixed place. An
@@ -3783,7 +3822,7 @@ impl<'a> Printer<'a> {
         }
         /* Old code rounds a reason's length off on one of two paths and reverts on both.
         The two give the same failure, so the test between them is not source. */
-        if let (true, Some(t)) = (self.names.strict, t) {
+        if let Some(t) = t {
             let both = self
                 .reason_only(t)
                 .filter(|said| self.reason_only(f).as_ref() == Some(said));
@@ -3817,7 +3856,7 @@ impl<'a> Printer<'a> {
         let Some(t) = t else {
             self.line(
                 depth,
-                &format!("if ({}) {{ revert(); }}", emit::fmt_truth(cond, self.names)),
+                &format!("if ({}) {{ revert(); }}", emit::fmt_cond(cond, self.names)),
             );
             self.transfer(n, f, stop, depth);
             return;
@@ -3859,7 +3898,7 @@ impl<'a> Printer<'a> {
         let first_is_true_side = first == t && first_cond == cond;
         self.line(
             depth,
-            &format!("if ({}) {{", emit::fmt_truth(first_cond, self.names)),
+            &format!("if ({}) {{", emit::fmt_cond(first_cond, self.names)),
         );
         self.active.insert(n);
         self.facts.push((cond, first_is_true_side, first));
@@ -4108,12 +4147,10 @@ impl<'a> Printer<'a> {
             );
             format!("{var_s} = {a} || {b};")
         };
-        let c_s = emit::fmt_or_operand(cond, self.names);
         // For a compiler `&&` joins two flags and gives one. A choice between two
         // values that are not both flags has to be written out as a choice.
-        let flags = !self.names.strict
-            || (emit::is_bool(var, self.names)
-                && [cond, x, y].iter().all(|e| emit::is_bool(*e, self.names)));
+        let flags = emit::is_bool(var, self.names)
+            && [cond, x, y].iter().all(|e| emit::is_bool(*e, self.names));
         let txt = if flags && y == cond {
             both(cond, x)
         } else if flags && x == cond {
@@ -4122,21 +4159,13 @@ impl<'a> Printer<'a> {
             both(ncond, y)
         } else if flags && y == ncond {
             either(ncond, x)
-        } else if self.names.strict {
+        } else {
             let test = emit::fmt_cond(cond, self.names);
             let (x, y) = (
                 emit::fmt_assigned(var, x, self.names),
                 emit::fmt_assigned(var, y, self.names),
             );
             format!("{var_s} = ({test}) ? {x} : {y};")
-        } else {
-            format!(
-                "{} = {} ? {} : {};",
-                var_s,
-                c_s,
-                emit::fmt_expr(x, self.names),
-                emit::fmt_expr(y, self.names)
-            )
         };
         if expr::is_boolean(x) && expr::is_boolean(y) {
             expr::mark_boolean(var);
@@ -4190,13 +4219,13 @@ fn guard(cond: ExprId, reason: &Option<String>, names: &Names) -> String {
     let text = emit::fmt_cond(cond, names);
     let failed = || emit::fmt_cond(expr::op1(op::ISZERO, cond), names);
     match reason.as_deref() {
-        Some(INVALID) if names.strict && names.hide_checked => {
+        Some(INVALID) if names.hide_checked => {
             format!("if ({}) {{ assembly {{ invalid() }} }}", failed())
         }
         Some(INVALID) if names.hide_checked => format!("assert({text}); // INVALID"),
         Some(INVALID) => format!("assert({text});"),
-        Some("Panic(assert failed)") if names.strict => format!("assert({text});"),
-        Some(r) if names.strict && !r.starts_with('"') => {
+        Some("Panic(assert failed)") => format!("assert({text});"),
+        Some(r) if !r.starts_with('"') => {
             format!("if ({}) {}", failed(), emit::failure(r))
         }
         Some(r) => format!("require({text}, {r});"),

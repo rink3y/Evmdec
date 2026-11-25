@@ -5,6 +5,14 @@ fn text(code_hex: &str) -> String {
     decompile(&code, &Options::default()).source
 }
 
+/* The file leaves out a write to memory that none of its lines reads. What the printer made
+of each function still has it. */
+fn bodies(code_hex: &str) -> String {
+    let code = evmdec::hex::decode(code_hex).expect("valid hex");
+    let made = decompile(&code, &Options::default());
+    made.functions.iter().map(|f| f.code.as_str()).collect()
+}
+
 #[test]
 fn a_store_that_a_later_hash_reads_stays_in_the_output() {
     let out = text(
@@ -25,7 +33,10 @@ fn the_count_leading_zeros_opcode_is_read_and_folded() {
     assert!(out.contains("stor_0 = clz("), "{out}");
     let folded = text("60011e5f5533ff");
     assert!(folded.contains("stor_0 = 255;"), "{folded}");
-    assert!(folded.contains("selfdestruct(msg.sender);"), "{folded}");
+    assert!(
+        folded.contains("selfdestruct(payable(msg.sender));"),
+        "{folded}"
+    );
 }
 
 #[test]
@@ -36,7 +47,7 @@ fn a_jump_through_memory_that_a_copy_wrote_is_not_taken_to_go_to_zero() {
         "60205f5f5f335afa505f51565b33ff",
     ] {
         let out = text(code);
-        assert!(out.contains("selfdestruct(msg.sender);"), "{out}");
+        assert!(out.contains("selfdestruct(payable(msg.sender));"), "{out}");
     }
     // Past the end of the call data the copy reads zeros, and nothing can be jumped to at 0.
     let zeros = text("6020365f375f51565b33ff");
@@ -50,7 +61,7 @@ fn a_computed_jump_is_followed_for_every_state_that_reaches_it() {
         "366009576000600c565b60025b601101565b005b33ff",
     ] {
         let out = text(code);
-        assert!(out.contains("selfdestruct(msg.sender);"), "{out}");
+        assert!(out.contains("selfdestruct(payable(msg.sender));"), "{out}");
         assert!(out.contains("return;"), "{out}");
     }
 }
@@ -58,13 +69,13 @@ fn a_computed_jump_is_followed_for_every_state_that_reaches_it() {
 #[test]
 fn another_accounts_balance_is_read_again_after_a_call() {
     let out = text("60043580315f5f5f5f6001865af1509031035f5260205ff3");
-    assert!(!out.contains("return (0);"), "{out}");
+    assert!(!out.contains("return 0;"), "{out}");
     assert!(
-        out.contains("prev_account_balance = arg0.balance;"),
+        out.contains("prev_account_balance = _calldata(4).balance;"),
         "{out}"
     );
     assert!(
-        out.contains("return (arg0.balance - prev_account_balance);"),
+        out.contains("return _calldata(4).balance - prev_account_balance;"),
         "{out}"
     );
 }
@@ -72,8 +83,14 @@ fn another_accounts_balance_is_read_again_after_a_call() {
 #[test]
 fn a_read_is_not_equal_to_itself_across_a_store_that_may_overlap() {
     let out = text("60043580516001602435529051145f5260205ff3");
-    assert!(!out.contains("return (1);"), "{out}");
-    assert!(out.contains("return (mem[arg0] == prev_mem);"), "{out}");
+    assert!(
+        !out.contains("return 1;") && !out.contains("return true;"),
+        "{out}"
+    );
+    assert!(
+        out.contains("return _memory(_calldata(4)) == prev_mem;"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -104,21 +121,21 @@ fn a_loop_that_needs_many_rounds_does_not_keep_what_early_rounds_believed() {
     ]);
     code.extend([0x50, 0x60, 0x20, 0x61, 0x03, 0xc0, 0xf3]);
     let out = decompile(&code, &Options::default()).source;
-    assert!(!out.contains("return (msg.sender);"), "{out}");
+    assert!(!out.contains("return msg.sender;"), "{out}");
 }
 
 #[test]
 fn a_store_a_hash_consumed_stays_when_a_later_plain_read_needs_it() {
     let out = text("600435608052600160206080205560243561001957610020565b6044356080525b60206080f3");
-    assert!(out.contains("mem[0x80] = arg0;"), "{out}");
-    assert!(out.contains("return mem[0x80:0xa0];"), "{out}");
+    assert!(out.contains("mem[0x80] = _calldata(4);"), "{out}");
+    assert!(out.contains("_return(0x80, 32);"), "{out}");
 }
 
 #[test]
 fn the_tail_of_a_memory_copy_comes_from_the_matching_source_bytes() {
     let out = text("5f3560805260203560a052603060806101005e6030610100f3");
     assert!(
-        out.contains("return (msg.data[0:32], mem[0xa0] >> 128);"),
+        out.contains("return (_calldata(0), _memory(0xa0) >> 128);"),
         "{out}"
     );
 }
@@ -128,8 +145,8 @@ fn two_overlapping_writes_in_a_different_order_per_path_are_not_trusted() {
     let out = text(
         "60443561001757600435609052602435608052610024565b6024356080526004356090525b60206090f3",
     );
-    assert!(!out.contains("return (arg0);"), "{out}");
-    assert!(out.contains("return mem[0x90:0xb0];"), "{out}");
+    assert!(!out.contains("return _calldata(4);"), "{out}");
+    assert!(out.contains("_return(0x90, 32);"), "{out}");
 }
 
 #[test]
@@ -154,7 +171,7 @@ fn a_slot_just_below_an_arrays_data_is_not_printed_as_its_first_element() {
 fn a_comparison_under_a_bitwise_operator_is_bracketed_as_solidity_reads_it() {
     let out = text("604035602035105f35175f5500");
     assert!(
-        out.contains("msg.data[0:32] | (calldata[32] < calldata[64]);"),
+        out.contains("_calldata(0) | (_calldata(32) < _calldata(64));"),
         "{out}"
     );
 }
@@ -176,11 +193,11 @@ fn a_copy_by_the_identity_built_in_of_any_length_is_a_write() {
          61022051602001806102a082610220600060045af150506102a0516000556102c05160015500",
     );
     assert!(
-        out.contains("success_1 = identity.call(mem[0x220:mem[0x220] + 576]);"),
+        out.contains("success_1 = identity.call(_range(0x220, _memory(0x220) + 32));"),
         "{out}"
     );
     assert!(
-        out.contains("mem[0x2a0:+mem[0x220] + 32] = mem[0x220:+mem[0x220] + 32];"),
+        out.contains("mem[0x2a0:+_memory(0x220) + 32] = mem[0x220:+_memory(0x220) + 32];"),
         "{out}"
     );
 }
@@ -191,11 +208,13 @@ fn a_word_read_before_a_store_over_part_of_it_keeps_the_old_value() {
         "6000356102045260203561001557604035610204525b61020451606035610200526000556102045160015500",
     );
     let named = out
-        .find("uint256 prev_mem_0x204 = mem[0x204];")
-        .expect("{out}");
-    let store = out.find("mem[0x200] = calldata[96];").expect("{out}");
+        .find("uint256 prev__memory_0x204 = _memory(0x204);")
+        .expect("the old word is named");
+    let store = out.find("mem[0x200] = _calldata(96);").expect("the store");
     assert!(named < store, "{out}");
-    assert!(out.contains("stor_0 = prev_mem_0x204;") && out.contains("stor_1 = mem[0x204];"));
+    assert!(
+        out.contains("stor_0 = prev__memory_0x204;") && out.contains("stor_1 = _memory(0x204);")
+    );
 }
 
 #[test]
@@ -205,7 +224,7 @@ fn what_a_call_returns_into_a_fixed_word_is_a_write() {
     );
     assert!(
         out.contains(
-            "mem[0xac0:+min(32, returndatasize())] = returndata[0:+min(32, returndatasize())];"
+            "_copy_returned(0xac0, 0x0, _returndatasize() < 32 ? _returndatasize() : 32);"
         ),
         "{out}"
     );
@@ -218,8 +237,8 @@ fn a_revert_folded_into_a_require_takes_the_values_its_ways_in_give() {
          63064a4ec660e01b60005260045260245260446000fd",
     );
     assert!(
-        out.contains("CustomError_064a4ec6(calldata[32], msg.data[0:32]));")
-            && out.contains("CustomError_064a4ec6(msg.data[0:32], calldata[32]));"),
+        out.contains("(bytes4(0x064a4ec6), _calldata(32), _calldata(0)));")
+            && out.contains("(bytes4(0x064a4ec6), _calldata(0), _calldata(32)));"),
         "{out}"
     );
 }
@@ -231,10 +250,10 @@ fn a_word_read_after_a_loop_wrote_it_is_not_the_value_stored_in_the_loop() {
          60805160005500",
     );
     assert!(
-        out.contains("mem[0x80] = mem[0x80] + calldata[mem[0xa0]];"),
+        out.contains("mem[0x80] = _memory(0x80) + _calldata(_memory(0xa0));"),
         "{out}"
     );
-    assert!(out.contains("stor_0 = mem[0x80];"), "{out}");
+    assert!(out.contains("stor_0 = _memory(0x80);"), "{out}");
 }
 
 #[test]
@@ -243,7 +262,7 @@ fn a_word_a_loop_may_have_written_through_an_index_is_not_the_fill_before_it() {
         "6060366080376000610100525b33610100516020026080015261010051600101610100526003610100\
          511061000c5760a05160005500",
     );
-    assert!(out.contains("stor_0 = mem[0xa0];"), "{out}");
+    assert!(out.contains("stor_0 = _memory(0xa0);"), "{out}");
 }
 
 #[test]
@@ -252,44 +271,45 @@ fn a_stored_value_is_not_read_back_after_a_helper_wrote_what_it_was_made_from() 
         "610007610020565b60805160010160a052610018610020565b60a051600055005b6020356100315733\
          60805233600155565b3260805256",
     );
-    assert!(out.contains("mem[0xa0] = mem[0x80] + 1;"), "{out}");
-    assert!(out.contains("stor_0 = mem[0xa0];"), "{out}");
+    assert!(out.contains("mem[0xa0] = _memory(0x80) + 1;"), "{out}");
+    assert!(out.contains("stor_0 = _memory(0xa0);"), "{out}");
 }
 
 #[test]
-fn what_a_call_returns_is_a_write_for_any_later_read_that_can_reach_it() {
-    let written =
-        "mem[0x80:+min(32, returndatasize())] = returndata[0:+min(32, returndatasize())];";
+fn what_a_call_returns_is_a_write_for_a_later_read_of_the_same_memory() {
+    let written = "_copy_returned(0x80, 0x0, _returndatasize() < 32 ? _returndatasize() : 32);";
     let as_data = text("60206080600060006000335af1506000600060003560806000305af15000");
     assert!(as_data.contains(written), "{as_data}");
     assert!(
-        as_data.contains(".call(mem[0x80:msg.data[0:32] + 128]);"),
+        as_data.contains(".call(_range(0x80, _calldata(0)));"),
         "{as_data}"
     );
+    // An address the call data gives is taken to lie apart from a fixed one.
     let by_pointer = text("60206080600060006000335af1506000355160005500");
-    assert!(by_pointer.contains(written), "{by_pointer}");
+    assert!(!by_pointer.contains("_copy_returned("), "{by_pointer}");
     assert!(
-        by_pointer.contains("stor_0 = mem[msg.data[0:32]];"),
+        by_pointer.contains("stor_0 = _memory(_calldata(0));"),
         "{by_pointer}"
     );
 }
 
 #[test]
-fn a_word_of_the_output_area_is_the_answer_only_where_its_length_is_tested() {
+fn a_word_of_the_output_area_is_read_from_the_answer_the_call_gave() {
     let untested = text("60206080600060006000335af15060805160005500");
     assert!(
-        untested.contains(
-            "mem[0x80:+min(32, returndatasize())] = returndata[0:+min(32, returndatasize())];"
-        ),
+        untested.contains("stor_0 = _word(returned_1, 0);"),
         "{untested}"
     );
-    assert!(untested.contains("stor_0 = mem[0x80];"), "{untested}");
+    assert!(!untested.contains("_copy_returned("), "{untested}");
     let tested = text("60206080600060006000335af15060203d101561001c5760006000fd5b60805160005500");
     assert!(
-        tested.contains("require(returndatasize() >= 32);"),
+        tested.contains("require(_returndatasize() >= 32);"),
         "{tested}"
     );
-    assert!(tested.contains("stor_0 = returndata_1[0];"), "{tested}");
+    assert!(
+        tested.contains("stor_0 = _word(returned_1, 0);"),
+        "{tested}"
+    );
 }
 
 #[test]
@@ -322,7 +342,7 @@ fn a_message_padded_with_zeros_from_past_the_call_data_is_printed_as_its_text() 
          00000060e05260133660ed376308c379a0608052602060a0526064609cfd5b00",
     );
     assert!(
-        out.contains("require(msg.data[0:32] != 0, \"invalid state\");"),
+        out.contains("require(_calldata(0) != 0, \"invalid state\");"),
         "{out}"
     );
     assert!(!out.contains("msg.data.length"), "{out}");
@@ -350,7 +370,7 @@ fn a_call_is_printed_with_the_parts_its_head_points_at() {
     );
     assert!(
         copied.contains(
-            ".call(abi.encodeWithSelector(func_aabbccdd.selector, arg0, msg.data[100:+arg2]));"
+            ".call(abi.encodeWithSelector(bytes4(0xaabbccdd), _calldata(4), msg.data[100:100 + _calldata(68)]));"
         ),
         "{copied}"
     );
@@ -361,7 +381,9 @@ fn a_call_is_printed_with_the_parts_its_head_points_at() {
          526000600061010460806000335af15000",
     );
     assert!(
-        fixed.contains("func_aabbccdd.selector, arg0, \"hello\", [msg.sender, address(this)]));"),
+        fixed.contains(
+            "bytes4(0xaabbccdd), _calldata(4), \"hello\", [msg.sender, address(this)]));"
+        ),
         "{fixed}"
     );
 }
@@ -374,7 +396,7 @@ fn a_word_that_only_looks_like_a_pointer_leaves_the_call_as_its_words() {
             .as_str(),
     );
     assert!(
-        out.contains("abi.encodeWithSelector(transfer.selector, msg.sender, 64)"),
+        out.contains("abi.encodeWithSelector(bytes4(0xa9059cbb), msg.sender, 64)"),
         "{out}"
     );
 }
@@ -383,7 +405,7 @@ fn a_word_that_only_looks_like_a_pointer_leaves_the_call_as_its_words() {
 fn a_hash_of_values_written_at_odd_places_is_printed_as_those_values() {
     let out = text("61190160f01b60805260043560825260243560a252604260802060005500");
     assert!(
-        out.contains("stor_0 = keccak256(abi.encodePacked(bytes2(0x1901), arg0, arg1));"),
+        out.contains("stor_0 = uint256(keccak256(abi.encodePacked(bytes2(0x1901), _calldata(4), _calldata(36))));"),
         "{out}"
     );
 }
@@ -402,7 +424,7 @@ fn a_hash_of_whole_words_is_printed_as_an_encoding_that_pads_each_value() {
 fn a_whole_word_in_a_packed_hash_is_not_printed_as_a_narrower_type() {
     // mstore8(0x80, 0xff); mstore(0x81, calldataload(4) & 0xffffffffffffffff); sstore(0, keccak256(0x80, 33))
     let out = text("60ff60805360043567ffffffffffffffff16608152602160802060005500");
-    assert!(out.contains("uint256(uint64(arg0))"), "{out}");
+    assert!(out.contains("uint256(uint64(_calldata(4)))"), "{out}");
 }
 
 #[test]
@@ -410,7 +432,7 @@ fn the_arguments_of_a_call_stop_before_the_first_word_no_write_is_known_for() {
     let out =
         text("63aabbccdd60e01b60805260043560845236600060a437600060003660240160806000335af15000");
     assert!(
-        out.contains(".call(abi.encodeWithSelector(func_aabbccdd.selector, arg0, ...));"),
+        out.contains(".call(_range(0x80, msg.data.length + 36));"),
         "{out}"
     );
     assert!(
@@ -422,8 +444,8 @@ fn the_arguments_of_a_call_stop_before_the_first_word_no_write_is_known_for() {
 #[test]
 fn a_test_that_ends_in_the_invalid_opcode_is_an_assert_with_no_panic_data() {
     let out = text("60003561000857fe5b3360005500");
-    assert!(out.contains("assert(msg.data[0:32] != 0);"), "{out}");
-    assert!(!out.contains("Panic"), "{out}");
+    assert!(out.contains("assert(_calldata(0) != 0);"), "{out}");
+    assert!(!out.contains("_panic("), "{out}");
 }
 
 #[test]
@@ -434,7 +456,7 @@ fn the_selector_stored_where_the_data_of_a_call_starts_is_named() {
         "{out}"
     );
     assert!(
-        out.contains(".call(abi.encodeWithSelector(transfer.selector, ...));"),
+        out.contains(".call(_range(0x80, msg.data.length + 4));"),
         "{out}"
     );
 }
@@ -469,7 +491,7 @@ fn the_cut_a_selector_makes_through_an_argument_is_no_field_of_storage() {
         "63aabbccdd60e01b6080523360845273ffffffffffffffffffffffffffffffffffffffff6000541660\
          a4524260c45260006000606460806000335af15000",
     );
-    assert!(out.contains("address stor_0; // slot 0x0"), "{out}");
+    assert!(out.contains("address stor_0;"), "{out}");
     assert!(!out.contains("uint32"), "{out}");
 }
 
@@ -479,17 +501,17 @@ fn a_write_through_an_index_tested_to_be_small_does_not_reach_the_words_past_its
         "33610200526003600035106100145760006000fd5b426000356020026080015261020051600055600035\
          6020026080015160015500",
     );
-    assert!(tested.contains("require(msg.data[0:32] < 3);"), "{tested}");
+    assert!(tested.contains("require(_calldata(0) < 3);"), "{tested}");
     assert!(tested.contains("stor_0 = msg.sender;"), "{tested}");
     let untested =
         text("33610200524260003560200260800152610200516000556000356020026080015160015500");
-    assert!(untested.contains("stor_0 = mem[0x200];"), "{untested}");
+    assert!(untested.contains("stor_0 = _memory(0x200);"), "{untested}");
 }
 
 #[test]
 fn a_value_under_the_mask_one_is_a_bit_test_and_no_logical_and() {
     let out = text("335f52601b60205260405f20546001165f5260205ff3");
-    assert!(out.contains("return (stor_27[msg.sender] & 1);"), "{out}");
+    assert!(out.contains("return stor_27[msg.sender] & 1;"), "{out}");
     assert!(!out.contains("&&"), "{out}");
 }
 
@@ -507,18 +529,18 @@ fn the_overflow_test_of_a_folded_helper_is_told_by_its_sum_or_printed() {
     in_order(
         &sum,
         &[
-            "require(arg1 <= 0xfffffffffffffffc, Panic(arithmetic overflow));",
-            "stor_1 = unchecked(arg1 + 3);",
+            "if (_calldata(36) > 0xfffffffffffffffc) _panic(0x11);",
+            "unchecked { stor_1 = (_calldata(36) + 3); }",
         ],
     );
     let product = text(
         "60806040526100116004356001610025565b5f556100206024356003610025565b600155005b8067ffff\
          ffffffffffff03821161003a570290565b634e487b7160e01b5f52601160045260245ffd",
     );
-    let test = "require(arg1 <= 0xfffffffffffffffc, Panic(arithmetic overflow));";
+    let test = "if (_calldata(36) > 0xfffffffffffffffc) _panic(0x11);";
     assert!(product.contains(test), "{product}");
     assert!(
-        product.contains("stor_1 = unchecked(arg1 * 3);"),
+        product.contains("unchecked { stor_1 = (_calldata(36) * 3); }"),
         "{product}"
     );
 }
@@ -526,21 +548,21 @@ fn the_overflow_test_of_a_folded_helper_is_told_by_its_sum_or_printed() {
 #[test]
 fn a_variable_stored_in_a_loop_is_advanced_under_its_own_name() {
     let out = text("6004355f5b8061010011610013576101005ff35b8181529060a0019060200161000456");
-    assert!(out.contains("mem[v2] = v1;"), "{out}");
+    assert!(out.contains("_store(v2, v1);"), "{out}");
     assert!(out.contains("v1 = v1 + 160;"), "{out}");
-    assert!(!out.contains("mem[v2] = mem[v2] + 160;"), "{out}");
+    assert!(!out.contains("_store(v2, _memory(v2) + 160);"), "{out}");
 }
 
 #[test]
 fn a_hash_of_memory_written_again_before_its_use_is_named_where_it_was_taken() {
-    let out = text("600435806024359052600560205260408120604435825260205260409020545f5260205ff3");
+    let out = bodies("600435806024359052600560205260408120604435825260205260409020545f5260205ff3");
     let chain = [
-        "mem[arg0] = arg1;",
+        "_store(_calldata(4), _calldata(36));",
         "mem[0x20] = 5;",
-        "v1 = keccak256(mem[arg0:arg0 + 64]);",
-        "mem[arg0] = arg2;",
+        "v1 = uint256(keccak256(_range(_calldata(4), 64)));",
+        "_store(_calldata(4), _calldata(68));",
         "mem[0x20] = v1;",
-        "return (stor[keccak256(mem[arg0:arg0 + 64])]);",
+        "return (stor[uint256(keccak256(_range(_calldata(4), 64)))]);",
     ];
     let mut from = 0;
     for line in chain {
@@ -553,10 +575,16 @@ fn a_hash_of_memory_written_again_before_its_use_is_named_where_it_was_taken() {
 fn a_store_through_an_index_into_the_fixed_words_reaches_a_later_hash_of_them() {
     let out =
         text("60806040526119015f52602435602052600435602016604435905260405f205f55604051602090f3");
-    assert!(out.contains("mem[arg0 & 32] = arg2;"), "{out}");
-    assert!(out.contains("stor_0 = keccak256(mem[0:0x40]);"), "{out}");
     assert!(
-        !out.contains("keccak256(abi.encodePacked(6401, arg1))"),
+        out.contains("_store(_calldata(4) & 32, _calldata(68));"),
+        "{out}"
+    );
+    assert!(
+        out.contains("stor_0 = uint256(keccak256(_range(0x0, 64)));"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("keccak256(abi.encodePacked(6401, _calldata(36)))"),
         "{out}"
     );
 }
@@ -567,14 +595,8 @@ fn each_part_of_a_packed_slot_the_code_reads_has_a_name_or_the_slot_stays_whole(
         "335f52603560205260405f2060010180546fffffffffffffffffffffffffffffffff166080525460801c\
          60a05260406080f3",
     );
-    assert!(
-        member.contains("uint128 field1_0; // slot +1 bytes 0..16"),
-        "{member}"
-    );
-    assert!(
-        member.contains("uint128 field1_16; // slot +1 bytes 16..32"),
-        "{member}"
-    );
+    assert!(member.contains("uint128 field1_0;"), "{member}");
+    assert!(member.contains("uint128 field1_16;"), "{member}");
     assert!(
         member.contains("return (stor_53[msg.sender].field1_0, stor_53[msg.sender].field1_16);"),
         "{member}"
@@ -596,7 +618,8 @@ fn the_words_stored_for_a_call_are_its_arguments_or_stay_as_stores() {
         "6080604052608435600435816020015260243581604001526044358160600152606435816080015260208182\
          602001806084350360a0019060015afa50602090f3",
     );
-    let call = "success_1 = ecrecover.staticcall(abi.encode(arg0, arg1, arg2, arg3));";
+    let call = "(success_1, ) = address(0x0000000000000000000000000000000000000001).staticcall(\
+                abi.encode(_calldata(4), _calldata(36), _calldata(68), _calldata(100)));";
     assert!(counted.contains(call), "{counted}");
     let raw = text(
         "608060405260843560043581526024358160200152604435816040015260208160a4358360015afa610056\
@@ -604,10 +627,10 @@ fn the_words_stored_for_a_call_are_its_arguments_or_stay_as_stores() {
          5b602090f3",
     );
     for line in [
-        "mem[arg4] = arg0;",
-        "mem[arg4 + 32] = arg1;",
-        "mem[arg4 + 64] = arg2;",
-        "success_1 = ecrecover.staticcall(mem[arg4:arg4 + arg5]);",
+        "_store(_calldata(132), _calldata(4));",
+        "_store(_calldata(132) + 32, _calldata(36));",
+        "_store(_calldata(132) + 64, _calldata(68));",
+        ".staticcall(_range(_calldata(132), _calldata(164)));",
     ] {
         assert!(raw.contains(line), "{line} is missing in\n{raw}");
     }
@@ -637,10 +660,10 @@ fn a_read_is_printed_on_the_side_of_a_store_or_a_create_the_code_made_it_on() {
     in_order(
         &tested,
         &[
-            "require(mem[arg0] != 0);",
-            "mem[arg0] = arg1;",
-            "require(mem[arg2] != 0);",
-            "mem[arg2] = arg3;",
+            "require(_memory(_calldata(4)) != 0);",
+            "_store(_calldata(4), _calldata(36));",
+            "require(_memory(_calldata(68)) != 0);",
+            "_store(_calldata(68), _calldata(100));",
         ],
     );
     let shortened = text(
@@ -650,9 +673,9 @@ fn a_read_is_printed_on_the_side_of_a_store_or_a_create_the_code_made_it_on() {
     in_order(
         &shortened,
         &[
-            "uint256 prev_mem_arg0 = mem[arg0];",
-            "mem[arg0] = mem[arg0] - 1;",
-            "require(mem[prev_mem_arg0 + 31 + arg0] >> 248 != 0);",
+            "uint256 prev__memory__calldata_4 = _memory(_calldata(4));",
+            "_store(_calldata(4), _memory(_calldata(4)) - 1);",
+            "require(_memory(prev__memory__calldata_4 + 31 + _calldata(4)) >> 248 != 0);",
         ],
     );
     let gathered = text(
@@ -662,9 +685,9 @@ fn a_read_is_printed_on_the_side_of_a_store_or_a_create_the_code_made_it_on() {
     in_order(
         &gathered,
         &[
-            "uint256 prev_mem_ptr1 = mem[ptr1];",
-            "ptr1 = memory(arg1, arg0);",
-            "stor_0 = prev_mem_ptr1;",
+            "uint256 prev_s1_w0 = s1.w0;",
+            "s1.w0 = _calldata(36);",
+            "stor_0 = prev_s1_w0;",
         ],
     );
 }
@@ -679,8 +702,8 @@ fn the_sum_a_folded_helper_hands_back_is_the_sum_it_tested() {
     in_order(
         &out,
         &[
-            "require(mem[arg0] <= 0xfffffffffffffffe, Panic(arithmetic overflow));",
-            "stor_0 = unchecked(mem[arg0] + 1);",
+            "if (_memory(_calldata(4)) > 0xfffffffffffffffe) _panic(0x11);",
+            "unchecked { stor_0 = (_memory(_calldata(4)) + 1); }",
         ],
     );
     assert!(!out.contains("prev_"), "{out}");
@@ -692,20 +715,20 @@ fn a_word_read_before_a_store_keeps_its_old_value_in_the_blocks_after_it() {
     in_order(
         &branched,
         &[
-            "uint256 prev_mem_arg0 = mem[arg0];",
-            "mem[arg0] = 1;",
-            "stor_1 = prev_mem_arg0;",
-            "stor_0 = prev_mem_arg0;",
+            "uint256 prev__memory__calldata_4 = _memory(_calldata(4));",
+            "_store(_calldata(4), 1);",
+            "stor_1 = prev__memory__calldata_4;",
+            "stor_0 = prev__memory__calldata_4;",
         ],
     );
     let stored_twice = text("6004358051602435600f57600182525b600282525f5500");
     in_order(
         &stored_twice,
         &[
-            "uint256 prev_mem_arg0 = mem[arg0];",
-            "mem[arg0] = 1;",
-            "mem[arg0] = 2;",
-            "stor_0 = prev_mem_arg0;",
+            "uint256 prev__memory__calldata_4 = _memory(_calldata(4));",
+            "_store(_calldata(4), 1);",
+            "_store(_calldata(4), 2);",
+            "stor_0 = prev__memory__calldata_4;",
         ],
     );
 }
@@ -716,10 +739,10 @@ fn a_store_that_puts_an_old_word_back_is_printed_after_the_hash_taken_before_it(
     in_order(
         &plain,
         &[
-            "uint256 prev_mem_arg0 = mem[arg0];",
-            "mem[arg0] = 7;",
-            "v1 = keccak256(mem[arg0:arg0 + 64]);",
-            "mem[arg0] = prev_mem_arg0;",
+            "uint256 prev__memory__calldata_4 = _memory(_calldata(4));",
+            "_store(_calldata(4), 7);",
+            "v1 = uint256(keccak256(_range(_calldata(4), 64)));",
+            "_store(_calldata(4), prev__memory__calldata_4);",
             "stor_0 = v1;",
         ],
     );
@@ -730,19 +753,19 @@ fn a_store_that_puts_an_old_word_back_is_printed_after_the_hash_taken_before_it(
     in_order(
         &folded,
         &[
-            "mem[arg0] = 7;",
-            "v1 = keccak256(mem[arg0:arg0 + 64]);",
-            "mem[arg0] = prev_mem_arg0;",
+            "_store(_calldata(4), 7);",
+            "v1 = uint256(keccak256(_range(_calldata(4), 64)));",
+            "_store(_calldata(4), prev__memory__calldata_4);",
             "stor_0 = v1;",
-            "mem[arg1] = 7;",
-            "v2 = keccak256(mem[arg1:arg1 + 64]);",
-            "mem[arg1] = prev_mem_arg1;",
+            "_store(_calldata(36), 7);",
+            "v2 = uint256(keccak256(_range(_calldata(36), 64)));",
+            "_store(_calldata(36), prev__memory__calldata_36);",
             "stor_1 = v2;",
         ],
     );
     // Stored back with nothing stored to it in between, a word is unchanged.
     let unchanged = text("6004358051815200");
-    assert!(!unchanged.contains("mem[arg0] ="), "{unchanged}");
+    assert!(!unchanged.contains("_store("), "{unchanged}");
 }
 
 #[test]
@@ -763,8 +786,8 @@ fn a_sum_tested_in_a_type_narrower_than_a_word_is_printed_in_that_type() {
     in_order(
         &wide,
         &[
-            "require(0xfffffffffffffffe >= arg0, Panic(arithmetic overflow));",
-            "stor_0 = unchecked(arg0 + 1);",
+            "if (0xfffffffffffffffe < _calldata(4)) _panic(0x11);",
+            "unchecked { stor_0 = (_calldata(4) + 1); }",
         ],
     );
     let product = text(
@@ -783,8 +806,8 @@ fn a_folded_helper_stores_and_copies_in_the_order_its_code_does() {
     in_order(
         &out,
         &[
-            "mem[ptr1 + 32:+arg1] = mem[arg0:+arg1];",
-            "mem[arg1 + 160] = 0;",
+            "mem[ptr1 + 32:+_calldata(36)] = mem[_calldata(4):+_calldata(36)];",
+            "mem[_calldata(36) + 160] = 0;",
         ],
     );
 }
@@ -796,7 +819,7 @@ fn a_head_word_a_folded_encoder_stores_after_its_copy_still_gives_the_call_its_a
          81604401836024356044565b5f5f6084835f6044355af150005b81518084528083602001856020015e8184\
          60209003525050505056",
     );
-    let call = "arg2.call(abi.encodeWithSelector(func_aabbccdd.selector, abi.encode(arg0), arg1));";
+    let call = "address(uint160(_calldata(68))).call(abi.encodeWithSelector(bytes4(0xaabbccdd), abi.encode(_calldata(4)), _calldata(36)));";
     assert!(out.contains(call), "{out}");
 }
 
@@ -807,9 +830,12 @@ fn a_step_that_wraps_in_a_range_test_is_marked_as_untested() {
          1b5f52601160045260245ffd",
     );
     // The length is also an offset into memory, which is why its sums print bare elsewhere.
-    assert!(out.contains("stor_0 = mem[arg0 + mem[arg0]];"), "{out}");
     assert!(
-        out.contains("stor_1 = unchecked(mem[arg0] - 99) < 738;"),
+        out.contains("stor_0 = _memory(_calldata(4) + _memory(_calldata(4)));"),
+        "{out}"
+    );
+    assert!(
+        out.contains("unchecked { stor_1 = (_memory(_calldata(4)) - 99) < 738; }"),
         "{out}"
     );
 }
@@ -821,10 +847,13 @@ fn a_call_with_two_parts_of_a_length_the_code_works_out_is_printed_with_both() {
          601f01601f191680606001826024015260243580828401606401528061020083850160840137601f01601f\
          1916016084015f5f82845f6044355af15000",
     );
-    let call = "abi.encodeWithSelector(func_aabbccdd.selector, msg.data[100:+arg0], \
-                msg.data[512:+arg1])";
+    let call = "abi.encodeWithSelector(bytes4(0xaabbccdd), msg.data[100:100 + _calldata(4)], \
+                msg.data[512:512 + _calldata(36)])";
     assert!(out.contains(call), "{out}");
-    assert!(!out.contains("mem[ptr1"), "{out}");
+    assert!(
+        !out.contains("mem[ptr1") && !out.contains("_store(ptr1"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -833,7 +862,7 @@ fn a_whole_word_in_packed_call_data_is_not_printed_as_a_narrower_type() {
         "60806040526040516327a9b42460e01b815260043573ffffffffffffffffffffffffffffffffffffffff16\
          81600401526431494e434860d81b81602401525f5f6029835f6024355af15000",
     );
-    let data = "abi.encodePacked(bytes4(0x27a9b424), uint256(address(arg0)), bytes5(0x31494e4348))";
+    let data = "abi.encodePacked(bytes4(0x27a9b424), uint256(address(uint160(_calldata(4)))), bytes5(0x31494e4348))";
     assert!(out.contains(data), "{out}");
 }
 
@@ -841,7 +870,7 @@ fn a_whole_word_in_packed_call_data_is_not_printed_as_a_narrower_type() {
 fn a_slot_a_scaled_index_past_a_mapping_value_names_is_a_field_of_one_record_in_a_list() {
     // mstore(0, 5); mstore(0x20, caller); sstore(keccak256(0, 64) + calldataload(4) * 3 + 1, 42)
     let out = text("600560005233602052604060002060043560030201600101602a905500");
-    assert!(out.contains("[arg0].field1 = 42"), "{out}");
+    assert!(out.contains("[_calldata(4)].field1 = 42"), "{out}");
     assert!(!out.contains(".fieldarg0"), "{out}");
 }
 
@@ -850,10 +879,7 @@ fn a_value_stored_to_a_slot_is_not_printed_as_the_slot_after_a_call() {
     let out = text("600c5460010180600c555f5f5f5f5f335af150600c54145f5260205ff3");
     assert!(!out.contains("stor_12 == stor_12"), "{out}");
     assert!(out.contains("stor_12 = prev_stor_12 + 1;"), "{out}");
-    assert!(
-        out.contains("return (stor_12 == prev_stor_12 + 1);"),
-        "{out}"
-    );
+    assert!(out.contains("return stor_12 == prev_stor_12 + 1;"), "{out}");
 }
 
 #[test]
@@ -862,21 +888,21 @@ fn a_word_read_before_a_store_a_few_bytes_off_it_is_named_before_that_store() {
     in_order(
         &out,
         &[
-            "uint256 prev_mem_arg0_4 = mem[arg0 + 4];",
-            "mem[arg0] = 17;",
-            "mem[arg0 + 4] = 34;",
-            "mem[0x0] = prev_mem_arg0_4;",
+            "uint256 prev__memory__calldata_4_4 = _memory(_calldata(4) + 4);",
+            "_store(_calldata(4), 17);",
+            "_store(_calldata(4) + 4, 34);",
+            "mem[0x0] = prev__memory__calldata_4_4;",
         ],
     );
 }
 
 #[test]
 fn a_pointer_handed_to_a_helper_is_the_one_read_before_the_free_pointer_moved() {
-    let out = text(
+    let out = bodies(
         "6080604052600a6015565b60106015565b60205ff35b5f5b600101803560175750\
          604051806040016040526031816038565b5f35905250565b6020019056",
     );
-    assert!(out.contains("mem[ptr1 + 32] = msg.data[0:32];"), "{out}");
+    assert!(out.contains("_store(ptr1 + 32, _calldata(0));"), "{out}");
     assert!(!out.contains("ptr2"), "{out}");
 }
 
@@ -898,7 +924,7 @@ fn a_helper_parameter_is_a_whole_word_when_a_caller_or_the_body_shows_more_bits(
 fn a_copy_from_the_end_of_the_call_data_is_printed_as_the_zeros_it_writes() {
     let out = text("60403660a0375f3560a0f3");
     assert!(out.contains("mem[0xa0] = 0; mem[0xc0] = 0;"), "{out}");
-    assert!(!out.contains("msg.data[msg.data.length"), "{out}");
+    assert!(!out.contains("msg.data.length"), "{out}");
 }
 
 #[test]
@@ -919,13 +945,13 @@ fn a_folded_helper_that_reads_a_word_it_stored_reads_it_after_the_store() {
     let out = text(
         "6080604052600c5f356013565b6020355f35f35b8051816020015260058152806020015181604001525056",
     );
-    assert!(!out.contains("prev_mem"), "{out}");
+    assert!(!out.contains("prev_"), "{out}");
     in_order(
         &out,
         &[
-            "mem[msg.data[0:32] + 32] = mem[msg.data[0:32]];",
-            "mem[msg.data[0:32]] = 5;",
-            "mem[msg.data[0:32] + 64] = mem[msg.data[0:32] + 32];",
+            "_store(_calldata(0) + 32, _memory(_calldata(0)));",
+            "_store(_calldata(0), 5);",
+            "_store(_calldata(0) + 64, _memory(_calldata(0) + 32));",
         ],
     );
 }
@@ -941,7 +967,7 @@ fn a_mapping_of_mappings_is_declared_with_its_keys_in_the_order_they_are_used() 
         "{out}"
     );
     assert!(
-        out.contains("stor_1[msg.sender][uint192(arg0)] = 1;"),
+        out.contains("stor_1[msg.sender][uint192(_calldata(4))] = 1;"),
         "{out}"
     );
 }

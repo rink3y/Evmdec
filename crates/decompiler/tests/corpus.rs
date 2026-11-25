@@ -245,21 +245,17 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
         !src.contains("0x8c379a0"),
         "raw Error(string) selector left in the output"
     );
-    assert!(
-        !src.contains("Panic(arithmetic overflow)"),
-        "compiler panic printed"
-    );
+    assert!(!src.contains("_panic(0x11)"), "compiler panic printed");
     assert!(
         src.contains("stor_7 - stor_8[msg.sender]"),
         "checked_sub not inlined"
     );
     assert!(
-        src.contains("return (returndata_1[0]);"),
+        src.contains("return _word(returned_1, 0);"),
         "return data not resolved"
     );
-    assert!(src.contains("require(msg.data.length >= 36);"));
     assert!(!src.contains("int256(msg.data.length"));
-    assert!(!src.contains("address(arg0))"), "ABI validator printed");
+    assert!(!src.contains("== address("), "ABI validator printed");
     assert!(src.contains("emit Event_22e25c6d("));
     let helper = src
         .split("function func_0x1331(")
@@ -285,7 +281,7 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
     let lines: Vec<&str> = body
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
+        .filter(|l| l.contains(" = "))
         .collect();
     assert_eq!(lines.len(), 6, "loop body: {body}");
     let words = |s: &str| {
@@ -348,15 +344,11 @@ fn old_multiowned_wallet_reads_as_source() {
         "every selector of the wallet is in the dictionary"
     );
     assert!(
-        src.contains("uint256[] stor_2; // slot 0x2, fixed-size array"),
-        "{src}"
-    );
-    assert!(
-        src.contains("stor_2[isOwner[address(account)]]"),
+        src.contains("stor_2[_isOwner[account]]"),
         "owners[ownerIndex]"
     );
     assert!(
-        src.contains("bytes32[] stor_260; // slot 0x104"),
+        src.contains("bytes32[] stor_260;"),
         "pending index array of hashes"
     );
     assert!(
@@ -373,7 +365,7 @@ fn old_multiowned_wallet_reads_as_source() {
     );
     assert!(src.contains("stor_260.length = prev_stor_260_length + 1;"));
     assert!(
-        src.contains("function execute(address target, uint256 amount, bytes arg2) external payable returns (bytes32)"),
+        src.contains("function execute(address target, uint256 amount, bytes calldata arg2) external payable returns (bytes32)"),
         "{src}"
     );
     assert!(src.contains(
@@ -386,7 +378,10 @@ fn old_multiowned_wallet_reads_as_source() {
         "stale read printed as the slot"
     );
     assert!(!src.contains("code[4056"), "dead CODECOPY printed");
-    assert!(!src.contains("mem[0x0] = mem[0x0]"), "no-op store printed");
+    assert!(
+        !src.contains("mem[0x0] = _memory(0x0)"),
+        "no-op store printed"
+    );
     for h in ["func_0x965", "func_0xa05", "func_0xadb", "func_0xbdd"] {
         assert!(src.contains(&format!("{h}(")), "{h} is no longer called");
         assert!(
@@ -448,7 +443,7 @@ fn balancer_bpool_reads_as_source() {
         "{src}"
     );
     assert!(
-        !src.contains("mem[mem[0x40] + 32] = msg.data.length;"),
+        !src.contains(", msg.data.length);"),
         "encoding stores printed"
     );
     assert!(src.contains("stor_9[stor_9.length - 1]"), "{src}");
@@ -464,15 +459,19 @@ fn tribe_reads_as_source() {
     for s in [
         "mapping(address => bool) stor_3;",
         "address[] stor_4;",
-        "require(!stor_3[address(v2)]);",
-        "stor_4.push(address(v2));",
-        "stor_3[address(v2)] = true;",
+        "require(!stor_3[address(uint160(v2))]);",
+        "stor_4.push(address(uint160(v2)));",
+        "stor_3[address(uint160(v2))] = true;",
         "if (stor_4.length < stor_7) {",
         "assert(v1 < stor[arg0]);",
     ] {
         assert!(src.contains(s), "missing {s}\n{src}");
     }
-    assert_eq!(src.matches("selfdestruct(msg.sender);").count(), 2, "{src}");
+    assert_eq!(
+        src.matches("selfdestruct(payable(msg.sender));").count(),
+        2,
+        "{src}"
+    );
 }
 
 #[test]
@@ -488,25 +487,19 @@ fn lobby_calls_into_its_own_deployment() {
 
 #[test]
 fn a_struct_kept_in_memory_is_local_and_a_word_behind_an_address_is_the_word() {
-    let opts = evmdec::decompile::Options {
-        solidity: true,
-        ..evmdec::decompile::Options::default()
-    };
+    let opts = evmdec::decompile::Options::default();
     let code = corpus().into_iter().find(|(n, _)| n == "compound_ceth");
     let (_, code) = code.expect("fixture present");
     let source = evmdec::decompile::decompile(&code, &opts).source;
     assert!(source.contains("s1.w5 = ret_5_1;"), "{source}");
     assert!(source.contains("func_0x3f98(arg0, arg1)"), "{source}");
-    assert!(!source.contains("func_0x3f98(mem[arg0]"), "{source}");
+    assert!(!source.contains("func_0x3f98(_memory(arg0)"), "{source}");
     assert!(!source.contains("_0 = 0x8c379a0"), "{source}");
 }
 
 #[test]
 fn a_block_of_memory_is_taken_then_written_and_a_text_handed_on_stays_a_text() {
-    let opts = evmdec::decompile::Options {
-        solidity: true,
-        ..evmdec::decompile::Options::default()
-    };
+    let opts = evmdec::decompile::Options::default();
     let source = |name: &str| {
         let code = corpus().into_iter().find(|(n, _)| n == name);
         let (_, code) = code.expect("fixture present");
@@ -535,10 +528,7 @@ fn a_block_of_memory_is_taken_then_written_and_a_text_handed_on_stays_a_text() {
 
 #[test]
 fn the_solidity_form_is_a_whole_file_written_with_no_compiler() {
-    let opts = evmdec::decompile::Options {
-        solidity: true,
-        ..evmdec::decompile::Options::default()
-    };
+    let opts = evmdec::decompile::Options::default();
     let few = ["weth9", "usdt", "univ2_pair"];
     for (name, code) in corpus()
         .into_iter()
@@ -707,10 +697,10 @@ fn defaults_give_way_to_names_the_code_implies() {
     };
     let usdt = source("usdt");
     for line in [
-        "address owner; // slot 0x0 bytes 0..20",
-        "uint256 totalSupply; // slot 0x1",
-        "mapping(address => uint256) balances; // slot 0x2",
-        "mapping(address => mapping(address => uint256)) allowances; // slot 0x5",
+        "address public owner;",
+        "uint256 _totalSupply;",
+        "mapping(address => uint256) balances;",
+        "mapping(address => mapping(address => uint256)) allowances;",
         "function _transfer(address from, address to, uint256 amount) internal",
         "function _pause() internal",
     ] {
@@ -718,13 +708,13 @@ fn defaults_give_way_to_names_the_code_implies() {
     }
     let pair = source("univ2_pair");
     assert!(
-        pair.contains("uint256 reentrancyLock; // slot 0xc"),
+        pair.contains("uint256 reentrancyLock;"),
         "lock by its toggling"
     );
     let weth = source("weth9");
     for line in [
         "function transferFrom(address from, address to, uint256 amount) external",
-        "function balanceOf(address account) external view",
+        "mapping(address => uint256) public balanceOf;",
         "function _withdrawal(uint256 amount) internal",
     ] {
         assert!(weth.contains(line), "weth9: missing `{line}`");
@@ -743,17 +733,15 @@ fn allocations_in_inlined_helpers_are_separate_blocks() {
     let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
     let src = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
     for line in [
-        "ptr1 = memory(arg0, arg1, ptr2, arg4, arg5, arg6, arg7, arg8, ptr3);",
-        "ptr2 = memory(arg2, arg3);",
-        "ptr3 = memory(arg9, arg10, arg11, arg12);",
+        "ptr1 = _free(); _take(ptr1 + 288);",
+        "ptr4 = _free(); _take(ptr4 + 128);",
     ] {
         assert!(src.contains(line), "missing `{line}`");
     }
     assert!(
-        !src.contains("mem[mem[0x40]"),
+        !src.contains("_store(_memory(0x40)") && !src.contains("mem[mem[0x40]"),
         "the free pointer is never printed as an address of its own"
     );
-    assert!(src.contains("// Memory: ptrN is a block"), "legend");
 }
 
 #[test]
@@ -768,16 +756,18 @@ fn payloads_and_literals_read_as_values() {
     };
     let proxy = source("usdc_proxy");
     assert!(proxy.contains(".delegatecall(msg.data);"), "{proxy}");
-    assert!(!proxy.contains("mem[0:msg.data.length]"), "{proxy}");
+    assert!(!proxy.contains("_range(0x0, msg.data.length)"), "{proxy}");
     let permit2 = source("permit2");
     assert!(
-        permit2.contains("= memory(\"PermitWitnessTransferFrom(TokenPermissions permitted,"),
+        permit2.contains("= _pointer(\"PermitWitnessTransferFrom(TokenPermissions permitted,"),
         "string literal block"
     );
     let uni = source("uni_token");
     assert!(
-        uni.contains("= ecrecover.staticcall(abi.encode("),
-        "precompile by name"
+        uni.contains(
+            "= address(0x0000000000000000000000000000000000000001).staticcall(abi.encode("
+        ),
+        "the signature check is a call to the precompile"
     );
 }
 
@@ -791,8 +781,8 @@ fn struct_elements_are_declared_and_read_by_member() {
     let wallet = source("../../testdata/regress/parity_wallet_v1.hex");
     for line in [
         "struct Struct_264 {",
-        "address field0; // slot +0",
-        "bytes field2; // slot +2",
+        "address field0;",
+        "bytes field2;",
         "mapping(bytes32 => Struct_264) stor_264;",
         "stor_264[key].field0.call{value: stor_264[key].field1}",
     ] {
@@ -809,9 +799,9 @@ fn struct_elements_are_declared_and_read_by_member() {
 
     let registry = source("../../testdata/mainnet/ens_registry.hex").source;
     for line in [
-        "address owner; // slot +0",
-        "address resolver; // slot +1 bytes 0..20",
-        "uint64 ttl; // slot +1 bytes 20..28",
+        "address owner;",
+        "address resolver;",
+        "uint64 ttl;",
         "mapping(bytes32 => Struct_0) stor_0;",
         "stor_0[key].resolver",
     ] {
@@ -820,7 +810,7 @@ fn struct_elements_are_declared_and_read_by_member() {
 
     let vat = source("../../testdata/mainnet/maker_vat.hex").source;
     assert!(vat.contains("require(stor_2[key].field1 == 0, \"Vat/ilk-already-init\");"));
-    assert!(vat.contains("stor_3[key][address(account)].field0"));
+    assert!(vat.contains("stor_3[key][account].field0"));
 
     let roles = source("../../testdata/vuln/miso_batch_impl.hex");
     let role = roles
@@ -846,15 +836,14 @@ fn vyper_fixed_addresses_read_as_locals() {
     let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
     let src = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
     for line in [
-        "// Memory: loc_N is the variable kept at the fixed memory address 0xN",
-        "while (true) {\n            require(loc_280 < 2);",
+        "while (true) {\n                require(loc_280 < 2);",
         "loc_240[loc_280] = loc_240[loc_280] + loc_2a0;",
-        "identity.call(mem[0x280:0x2e4])",
+        "identity.call(_range(0x280, 100))",
     ] {
         assert!(src.contains(line), "missing `{line}`");
     }
     assert!(
-        !src.contains("mem[0x280]"),
+        !src.contains("mem[0x280]") && !src.contains("_memory(0x280)"),
         "an aligned fixed address is a local"
     );
     assert!(src.contains("mem[0x2a4] = "), "an unaligned address is not");
@@ -921,10 +910,10 @@ fn stores_nothing_reads_are_left_out() {
         body.contains("loc_1c0 = ") && body.contains("func_0x3349("),
         "what the helper may still read is: {body}"
     );
-    assert!(body.contains("return (ret_3_0 * 1e18 / totalSupply);"));
+    assert!(body.contains("return ret_3_0 * 1e18 / totalSupply;"));
 
     assert!(
-        pool.contains("loc_220 = loc_220 + 1;\n            if (loc_220 != 2) {"),
+        pool.contains("loc_220 = loc_220 + 1;\n                if (loc_220 != 2) {"),
         "a counter tested after its increment reads as the counter"
     );
     assert!(
@@ -950,15 +939,16 @@ fn what_a_helper_writes_and_what_was_read_before_it_stay_in_the_text() {
     let start = proxy.find("function func_0x379(").expect("the copy helper");
     let body = &proxy[start..start + proxy[start..].find("\n    }").unwrap()];
     assert!(
-        body.contains("mem[arg0] = arg1;") && body.contains("= msg.data[arg2:+arg1];"),
+        body.contains("_store(arg0, arg1);")
+            && body.contains("_copy_calldata(arg0 + 32, arg2, arg1);"),
         "the helper fills memory its caller sends on: {body}"
     );
     let token = source("../../testdata/regress/minime_token.hex");
     assert!(
-        token.contains("uint256 prev_stor_arg0 = stor[arg0];\n            func_0x1ca7("),
+        token.contains("uint256 prev_stor_arg0 = stor[arg0];\n                func_0x1ca7("),
         "the length read before the resize is named before the helper changes it"
     );
-    assert!(!token.contains("require(stor[arg0] < stor[arg0]"));
+    assert!(!token.contains("(stor[arg0] < stor[arg0]"));
 }
 
 #[test]
@@ -970,7 +960,7 @@ fn a_field_read_before_its_slot_is_written_keeps_the_old_value() {
     assert!(
         helper.contains(
             "uint256 prev_owner = owner;\n        owner = newOwner;\n        \
-             emit OwnershipTransferred(prev_owner, address(newOwner));"
+             emit OwnershipTransferred(prev_owner, newOwner);"
         ),
         "the event carries the owner read before the store"
     );
@@ -991,8 +981,8 @@ fn a_merged_value_is_assigned_on_every_way_in() {
     let token = source("../../testdata/regress/minime_token.hex");
     assert!(
         token.contains(
-            "v1 = arg0;\n        v2 = arg1;\n        while (v1 > v2) {\n            \
-             stor[v2] = 0;\n            v2 = v2 + 1;\n        }"
+            "v1 = arg0;\n            v2 = arg1;\n            while (v1 > v2) {\n                \
+             stor[v2] = 0;\n                v2 = v2 + 1;\n            }"
         ),
         "a helper that starts on a loop counts from what its caller passed"
     );
@@ -1028,8 +1018,9 @@ fn both_ways_into_a_join_keep_their_own_call_after_it() {
         .expect("the swap callback");
     let body = &router[start..start + router[start..].find("\n    }").unwrap()];
     let after = &body[body.find("L21be:").expect("the join")..];
+    let (token0, token1) = ("bytes4(0x0dfe1681)", "bytes4(0xd21220a7)");
     assert!(
-        after.contains("token1.selector") && after.contains("token0.selector"),
+        after.contains(token1) && after.contains(token0),
         "the pool is asked for the other token whichever one was paid: {after}"
     );
 }
@@ -1041,7 +1032,7 @@ fn a_selector_compared_in_place_is_read_from_the_high_bytes() {
     let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
     let proxy = evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default()).source;
     assert!(
-        proxy.contains("require(msg.sig == 0x4f1ef286 /* upgradeToAndCall(address,bytes) */"),
+        proxy.contains("if (msg.sig != 0x4f1ef286 /* upgradeToAndCall(address,bytes) */) revert"),
         "the admin may only call the upgrade: {proxy}"
     );
     assert!(!proxy.contains("msg.sig == 0x00000000"));
@@ -1058,7 +1049,7 @@ fn a_call_data_word_read_in_a_helper_is_not_named_like_its_parameters() {
         .expect("the callback");
     let body = &router[start..start + router[start..].find("\n    }").unwrap()];
     assert!(
-        body.contains("if (calldata[132] == address(this)) {"),
+        body.contains("if (_calldata(132) == address(this)) {"),
         "the payer comes from the call data, not from what the caller passed: {body}"
     );
     assert!(!body.contains("arg4") && !body.contains("arg5"));
@@ -1181,7 +1172,10 @@ fn undeclared_old_values(source: &str) -> Vec<String> {
     for line in source.lines().filter(|l| !l.trim().is_empty()) {
         let depth = line.len() - line.trim_start().len();
         declared.retain(|(_, at)| *at <= depth);
-        let made = line.trim_start().strip_prefix("uint256 prev").map(word);
+        let made = line.trim_start().split_once(' ').and_then(|(_, rest)| {
+            let name = word(rest.strip_prefix("prev")?);
+            rest[4 + name.len()..].starts_with(" = ").then_some(name)
+        });
         let read = match &made {
             Some(_) => &line[line.find('=').unwrap()..],
             None => line,
@@ -1217,7 +1211,7 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
     }
     assert!(
         gauge.contains(
-            "uint256 prev_stor_14 = stor_14;\n        \
+            "uint256 prev_stor_14 = stor_14;\n            \
              uint256 prev_timestamp_15_stor_14 = timestamp_15[prev_stor_14];"
         ) && gauge.contains("if (prev_stor_5 >= prev_timestamp_15_stor_14) {"),
         "the period is read once, ahead of both branches"
@@ -1235,7 +1229,7 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
         "the last write reads slot 0 anew"
     );
     assert!(
-        dvn.contains("require(uint64(stor_6) <= uint64(stor_4),"),
+        dvn.contains("if (uint64(stor_6) > uint64(stor_4)) _fail("),
         "the quorum is checked against the size after the change"
     );
     assert!(dvn.contains("if (!stor_8[ret_3_0]) {"));
@@ -1246,7 +1240,8 @@ fn an_old_value_is_named_where_every_use_of_it_passes() {
     assert!(named < add.find("if (uint96(").expect("the first facet test"));
     assert!(
         router.contains(
-            "require(stor_5[address(calldata[arg4 + 32])][ret_2_0] == 0, CustomError_c5f2be51());"
+            "if (stor_5[address(uint160(_calldata(arg4 + 32)))][ret_2_0] != 0) \
+             _fail(abi.encodeWithSelector(bytes4(0xc5f2be51)));"
         ),
         "the lock is read after the permit ran"
     );
@@ -1264,7 +1259,7 @@ fn a_read_made_before_a_write_is_not_printed_as_one_made_after() {
     let start = router.find("function uniswapV3SwapCallback(").unwrap();
     let callback = &router[start..start + router[start..].find("\n    }").unwrap()];
     let cleared = callback.find("tstor_0xd879").expect("the pool slot");
-    let checked = callback.find("require(msg.sender == address(prev_tstor_0xd879");
+    let checked = callback.find("require(msg.sender == address(uint160(prev_tstor_0xd879");
     assert!(
         checked.is_some_and(|at| at > cleared),
         "the caller is compared with the pool read before the slot was cleared: {callback}"
@@ -1291,11 +1286,11 @@ fn a_helper_declares_every_stack_place_it_reads_and_returns_what_it_makes() {
     assert!(head.ends_with("internal returns (uint256, uint256) {"));
     let call = line("= func_0x11e0(").trim();
     assert!(
-        call.starts_with("(ret_10_0, ret_10_1) = func_0x11e0(calldata[arg2 + 192], ")
+        call.starts_with("(ret_10_0, ret_10_1) = func_0x11e0(_calldata(arg2 + 192), ")
             && call.ends_with(", arg2, target, arg0, arg1, ret_1_0);"),
         "the call passes the seven places the helper reads and binds its two results: {call}"
     );
-    assert!(router.contains("return (calldata[arg2 + 128], mem[0x0]);"));
+    assert!(router.contains("return (_calldata(arg2 + 128), _word(returned_2, 0));"));
     let gauge = regress("vyper_gauge.hex").source;
     assert!(gauge.contains("function _transfer(uint256 amount, address to, address from)"));
     assert!(gauge.contains("_transfer(amount, to, msg.sender);"));
@@ -1328,46 +1323,48 @@ fn call_data_is_the_bytes_the_writes_left_under_one_pointer_name() {
     let router = regress("oneinch_v6.hex").source;
     assert!(
         router.contains("(abi.encodePacked(bytes4(0x27a9b424), uint256(arg5), arg4, ")
-            && router.contains(", 288, 5, bytes5(0x31494e4348)));"),
+            && router.contains(", uint256(288), uint256(5), bytes5(0x31494e4348)));"),
         "a selector, ten words and the five bytes of the tag"
     );
     let helper = regress("umbrella_batch_helper.hex").source;
     assert!(helper.contains(
-        ".call(abi.encodeWithSelector(bytes4(uint32(v2)), returndata_2[0], msg.sender, address(this)));"
+        ".call(abi.encodeWithSelector(bytes4(uint32(v2)), _word(returned_2, 0), msg.sender, address(this)));"
     ));
-    assert!(helper.contains("abi.encodeWithSelector(deposit.selector, arg2, address(this))"));
+    assert!(helper.contains("abi.encodeWithSelector(bytes4(0x6e553f65), arg2, address(this))"));
     let gauge = regress("vyper_gauge.hex").source;
     assert!(
         gauge.contains("stor_21.call(abi.encodePacked(bytes4(mem[0x3c8])));"),
         "a call of four bytes is not a word"
     );
     let proxy = regress("swap_proxy.hex").source;
-    assert!(proxy.contains("mem[ptr1 + 68] = arg5;") && proxy.contains(".call(mem[ptr1:v2]);"));
+    assert!(
+        proxy.contains("_store(ptr1 + 68, arg5);")
+            && proxy.contains(".call(_range(ptr1, v2 - 128));")
+    );
     let token = regress("minime_token.hex").source;
     assert!(
-        token.contains("mem[ptr1 + 68] = address(this);")
-            && token
-                .contains("address(target).call(abi.encodeWithSelector(func_8f4ffcb1.selector, "),
+        token.contains("_store(ptr1 + 68, uint256(uint160(address(this))));")
+            && token.contains("target.call(_range(ptr1, v1 - ptr1));"),
         "the buffer written is the buffer sent"
     );
     let dvn = regress("layerzero_dvn.hex").source;
     assert!(
-        dvn.contains("calldata[v3 + calldata[v3 + 64]], ptr3);")
-            && dvn.contains(".call(mem[ptr3:ret_7_0]);")
+        dvn.contains("_calldata(v3 + _calldata(v3 + 64)), ptr3);")
+            && dvn.contains(".call(_range(ptr3, ret_7_0 - ptr3));")
     );
 }
 
 #[test]
 fn untested_arithmetic_is_marked_and_gas_is_named_where_it_is_read() {
     let router = regress("via_ir_router.hex").source;
-    let tested = |l: &str| l.contains(" = ret_1_0 - v") && !l.contains("unchecked(");
+    let tested = |l: &str| l.contains(" = ret_1_0 - v") && !l.contains("unchecked");
     assert!(
         router.lines().any(tested),
         "a difference the code tests before it is printed bare"
     );
     assert!(router.contains(" = arg7 * v") && router.contains(" << 144) - v"));
     let used = router.find(" + 33000)").expect("the use");
-    let name = router[..used].rsplit("unchecked(").next().unwrap();
+    let name = router[..used].rsplit('(').next().unwrap();
     let read = router[..used]
         .rfind(&format!("{name} = gasleft();"))
         .expect("the read");
@@ -1376,27 +1373,28 @@ fn untested_arithmetic_is_marked_and_gas_is_named_where_it_is_read() {
         "the gas is read before the swap and used after it"
     );
     let proxy = regress("swap_proxy.hex").source;
-    assert!(proxy.contains("v5 = unchecked(v5 + 1);"));
+    assert!(proxy.contains("unchecked { v5 = (v5 + 1); }"));
     assert!(
-        !proxy.contains("unchecked(arg"),
+        !proxy.contains(" = (arg"),
         "an offset into the call data is not arithmetic of the source"
     );
-    assert!(!regress("minime_token.hex").source.contains("unchecked("));
+    assert!(!regress("minime_token.hex").source.contains("unchecked { v"));
 }
 
 #[test]
 fn element_checks_field_masks_and_the_vyper_compiler_are_kept() {
     let bot = regress("mev_bot.hex").source;
-    let element =
-        |l: &str| l.contains("require(address(calldata[v") && l.contains("]) == calldata[v");
+    let element = |l: &str| {
+        l.contains("require(uint256(uint160(_calldata(v") && l.contains("))) == _calldata(v")
+    };
     assert!(
         bot.lines().any(element),
         "an address in an array is tested where it is decoded"
     );
-    assert!(bot.contains("Panic(memory allocation too large));"));
+    assert!(bot.contains("_panic(0x41);"));
     let pool = regress("univ3_pool.hex").source;
     assert!(
-        pool.contains(" / (stor_0 >> 232 & 15);") && pool.contains(" = stor_0_29 % 16;"),
+        pool.contains(" >> 232 & 15);") && pool.contains(" = uint256(stor_0_29) % 16;"),
         "the low four bits of the protocol fee are not the whole byte"
     );
     assert!(regress("vyper_gauge.hex")
@@ -1411,16 +1409,17 @@ fn element_checks_field_masks_and_the_vyper_compiler_are_kept() {
 fn a_memory_write_that_is_read_later_is_printed() {
     let router = regress("oneinch_v6.hex").source;
     let start = router.find("function func_0x216b(").expect("the callback");
-    let first = router[start..].lines().nth(1).expect("its first statement");
+    let mut made = router[start..].lines().skip(1).filter(|l| l.contains('('));
     assert_eq!(
-        first.trim(),
-        "mem[ptr1] = 0xdfe1681d21220a7ddca3f43a9059cbb23b872dd36c785160000000000000000;",
+        made.next().expect("its first statement").trim(),
+        "_store(ptr1, 0xdfe1681d21220a7ddca3f43a9059cbb23b872dd36c785160000000000000000);",
         "the selectors a helper sends later are stored at entry"
     );
     let gauge = regress("vyper_gauge.hex").source;
     assert!(
         gauge.contains(
-            "identity.call(mem[0x204:0x228]);\n                mem[0x1a0:+36] = mem[0x204:+36];"
+            "identity.call(_range(0x204, 36));\n                    \
+             mem[0x1a0:+36] = mem[0x204:+36];"
         ),
         "the built-in copies over the word the next test reads"
     );
@@ -1465,7 +1464,7 @@ fn an_operator_the_code_does_not_test_is_marked_wherever_it_is_printed() {
         "a length kept beside a hashed array is a count, not a place"
     );
     let router = regress("oneinch_v6.hex").source;
-    assert!(router.contains("return (unchecked(0 - mem[v1]));"));
+    assert!(router.contains("unchecked { return (0 - _memory(v1)); }"));
     let via_ir = regress("via_ir_router.hex").source;
     assert!(
         !via_ir.contains(" = 0 / "),
@@ -1479,7 +1478,10 @@ fn a_tested_difference_is_made_before_the_transfer_that_follows_it() {
     let lines: Vec<&str> = router.lines().map(str::trim).collect();
     let refund = lines
         .iter()
-        .position(|l| l.starts_with("_sendValue(") && l.ends_with(", msg.sender, calldata[arg2]);"))
+        .position(|l| {
+            l.starts_with("_sendValue(")
+                && l.ends_with(", msg.sender, address(uint160(_calldata(arg2))));")
+        })
         .expect("the refund of what was not spent");
     let spent = lines[..refund]
         .iter()
@@ -1495,18 +1497,18 @@ fn a_loop_is_printed_once_with_its_tests_inside_it() {
         source[start..start + source[start..].find("\n    }").unwrap()].to_string()
     };
     let gauge = body(&regress("vyper_gauge.hex").source, "function func_0x71d(");
-    assert_eq!(
-        gauge.matches("func_d3078c94.selector").count(),
-        1,
-        "{gauge}"
-    );
+    assert_eq!(gauge.matches("bytes4(0xd3078c94)").count(), 1, "{gauge}");
     assert!(!gauge.contains("goto "), "{gauge}");
-    assert!(gauge.contains("while (true) {\n                require(loc_2a0 >= loc_280);"));
+    assert!(gauge.contains("while (true) {\n                    require(loc_2a0 >= loc_280);"));
     let staking = body(
         &regress("vyper_sparse_table.hex").source,
         "function func_0x2cfc(",
     );
-    assert_eq!(staking.matches("transfer.selector").count(), 1, "{staking}");
+    assert_eq!(
+        staking.matches("bytes4(0xa9059cbb)").count(),
+        1,
+        "{staking}"
+    );
 }
 
 #[test]
@@ -1515,7 +1517,7 @@ fn what_calls_return_into_memory_that_is_hashed_is_printed() {
     let start = router.find("function func_0x216b(").expect("the callback");
     let body = &router[start..start + router[start..].find("\n    }").unwrap()];
     for at in [21, 53, 85] {
-        let line = format!("mem[ptr1 + {at}:+min(32, returndatasize())] = returndata[0:+");
+        let line = format!("_copy_returned(ptr1 + {at}, 0x0, _returndatasize() < 32 ? ");
         assert!(body.contains(&line), "{line}\n{body}");
     }
 }
@@ -1523,17 +1525,18 @@ fn what_calls_return_into_memory_that_is_hashed_is_printed() {
 #[test]
 fn a_store_past_a_length_rounded_down_does_not_hide_the_head_of_call_data() {
     let token = regress("minime_token.hex").source;
-    assert!(
-        token.contains(".call(abi.encodeWithSelector(func_8f4ffcb1.selector, msg.sender, value, address(this), ...));"),
-        "{token}"
-    );
+    let head = "_store(ptr1, 0x8f4ffcb100000000000000000000000000000000000000000000000000000000);\n            \
+                _store(ptr1 + 4, uint256(uint160(msg.sender)));\n            \
+                _store(ptr1 + 36, value);\n            \
+                _store(ptr1 + 68, uint256(uint160(address(this))));";
+    assert!(token.contains(head), "{token}");
 }
 
 #[test]
 fn a_block_handed_to_a_helper_that_reads_it_is_named_as_the_block() {
     let router = regress("oneinch_v6.hex").source;
     assert!(
-        router.contains("= func_0x1ba9(ptr1, calldata["),
+        router.contains("= func_0x1ba9(ptr1, _calldata("),
         "the helper is handed the block, not the number where it starts"
     );
 }

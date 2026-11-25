@@ -16,11 +16,16 @@ impl Drop for Server {
 }
 
 fn start() -> Server {
+    start_with_pool(5000)
+}
+
+fn start_with_pool(requests: u32) -> Server {
     let free = TcpListener::bind("127.0.0.1:0").expect("a port is free");
     let port = free.local_addr().expect("the port is known").port();
     drop(free);
     let child = Command::new(env!("CARGO_BIN_EXE_evmdec-server"))
         .env("PORT", port.to_string())
+        .env("EVMDEC_API_DAILY", requests.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -47,15 +52,19 @@ fn send(server: &Server, request: &str) -> String {
     String::from_utf8_lossy(&answer).into_owned()
 }
 
-fn post(server: &Server, body: &str) -> String {
+fn post_to(server: &Server, path: &str, said: &str, body: &str) -> String {
     send(
         server,
         &format!(
-            "POST /api/decompile HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{said}\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         ),
     )
+}
+
+fn post(server: &Server, body: &str) -> String {
+    post_to(server, "/v1/decompile", "", body)
 }
 
 fn body(answer: &str) -> &str {
@@ -71,7 +80,7 @@ fn each_input_gets_its_own_answer_and_a_repeat_gets_the_same_one() {
     let ask = |code: &str| post(&server, &format!("{{\"bytecode\":\"{code}\"}}"));
     let (one, two, again) = (ask(STORE_ONE), ask(STORE_TWO), ask(STORE_ONE));
     assert!(one.starts_with("HTTP/1.1 200"), "{one}");
-    assert!(body(&one).contains("\"contract\""));
+    assert!(body(&one).contains("\"contracts\""));
     assert!(body(&one).contains("pragma solidity"), "{one}");
     assert_ne!(body(&one), body(&two));
     assert_eq!(body(&one), body(&again));
@@ -120,4 +129,102 @@ fn text_from_request_headers_does_not_reach_the_page() {
     );
     assert!(!page.contains("marker()"));
     assert!(!page.contains("javascript://"));
+}
+
+#[test]
+fn the_public_api_draws_on_one_pool_and_refuses_when_it_is_empty() {
+    let server = start_with_pool(2);
+    let ask = || post(&server, &format!("{{\"bytecode\":\"{STORE_ONE}\"}}"));
+    let (first, second, third) = (ask(), ask(), ask());
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    assert!(first.contains("x-ratelimit-limit: 2\r\n"), "{first}");
+    assert!(first.contains("x-ratelimit-remaining: 1\r\n"), "{first}");
+    assert!(second.contains("x-ratelimit-remaining: 0\r\n"), "{second}");
+    assert!(third.starts_with("HTTP/1.1 429"), "{third}");
+    assert!(third.contains("retry-after: "), "{third}");
+    assert!(body(&third).starts_with("{\"error\":"), "{third}");
+    // A request that was refused for what it asked took nothing from the pool.
+    let refused = start_with_pool(1);
+    assert!(post(&refused, "{}").starts_with("HTTP/1.1 400"));
+    assert!(
+        post(&refused, &format!("{{\"bytecode\":\"{STORE_ONE}\"}}")).starts_with("HTTP/1.1 200")
+    );
+}
+
+#[test]
+fn the_address_of_the_page_answers_the_page_and_takes_nothing_from_the_pool() {
+    let server = start_with_pool(0);
+    let code = format!("{{\"bytecode\":\"{STORE_ONE}\"}}");
+    let script = post_to(&server, "/api/decompile", "", &code);
+    assert!(script.starts_with("HTTP/1.1 403"), "{script}");
+    assert!(body(&script).contains("/v1/decompile"), "{script}");
+    let elsewhere = post_to(
+        &server,
+        "/api/decompile",
+        "Sec-Fetch-Site: cross-site\r\n",
+        &code,
+    );
+    assert!(elsewhere.starts_with("HTTP/1.1 403"), "{elsewhere}");
+    let page = post_to(
+        &server,
+        "/api/decompile",
+        "Sec-Fetch-Site: same-origin\r\n",
+        &code,
+    );
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(!page.contains("x-ratelimit"), "{page}");
+    assert!(post(&server, &code).starts_with("HTTP/1.1 429"));
+}
+
+#[test]
+fn the_public_answer_is_the_short_one_unless_all_of_it_is_asked_for() {
+    let server = start();
+    let short = post(&server, &format!("{{\"bytecode\":\"{STORE_ONE}\"}}"));
+    assert!(
+        body(&short).starts_with("{\"summary\":\"One contract"),
+        "{short}"
+    );
+    assert!(body(&short).contains("\"role\":\"contract\""), "{short}");
+    assert!(body(&short).contains("pragma solidity"), "{short}");
+    assert!(body(&short).ends_with("\"checked\":false}"), "{short}");
+    assert!(!body(&short).contains("disassembly"), "{short}");
+    let all = post(
+        &server,
+        &format!("{{\"bytecode\":\"{STORE_ONE}\",\"full\":true}}"),
+    );
+    assert!(body(&all).contains("\"disassembly\""), "{all}");
+    assert!(body(&all).contains("\"contract\":"), "{all}");
+}
+
+#[test]
+fn a_chain_is_named_by_its_number_and_the_api_describes_itself() {
+    let server = start();
+    let address = "0x0000000000000000000000000000000000000001";
+    let nowhere = post(
+        &server,
+        &format!("{{\"address\":\"{address}\",\"chainid\":999999}}"),
+    );
+    assert!(nowhere.starts_with("HTTP/1.1 400"), "{nowhere}");
+    assert!(
+        body(&nowhere).contains("unknown chain '999999'"),
+        "{nowhere}"
+    );
+    let get = |path: &str| {
+        let asked = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        send(&server, &asked)
+    };
+    let described = get("/v1");
+    assert!(described.starts_with("HTTP/1.1 200"), "{described}");
+    assert!(
+        body(&described).contains("\"requests_a_day\": 5000"),
+        "{described}"
+    );
+    assert!(
+        body(&described).contains("POST /v1/decompile"),
+        "{described}"
+    );
+    assert!(
+        body(&get("/v1/chains")).contains("{\"id\":56,"),
+        "the chains carry their numbers"
+    );
 }

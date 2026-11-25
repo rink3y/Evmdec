@@ -5,7 +5,7 @@ failed=0; total=0; named=0; plain=0
 for f in "$DIR"/*.hex; do
   name=$(basename "$f" .hex)
   total=$((total+1))
-  said=$("$BIN" decompile "$f" --sol 2>&1 >/dev/null); rc=$?
+  said=$("$BIN" checked "$f" 2>&1 >/dev/null); rc=$?
   line=$(printf "%s\n" "$said" | grep "equal, branch" | head -1)
   counts=$(printf "%s\n" "$said" | sed -n 's/.* \([0-9]*\) functions by name, \([0-9]*\) as plain.*/\1 \2/p' | head -1)
   set -- ${counts:-0 0}

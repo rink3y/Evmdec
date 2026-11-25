@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 // The oldest release whose assembly knows every instruction in use today.
 const MODERN: &str = "^0.8.24";
+const NAME: &str = "Contract";
 const RENAMED: (u64, u64, u64) = (0, 8, 18);
 const FEW: usize = 8;
 
@@ -164,13 +165,6 @@ fn declared(event: &str) -> Option<String> {
     let mut listed = vec!["bytes32 indexed"];
     listed.extend(values.into_iter().map(word));
     identifier(name).then(|| format!("{name}({}) anonymous", listed.join(", ")))
-}
-
-fn contract_name(c: &Contract) -> &str {
-    let lines = c.source.lines();
-    let declared = lines.filter_map(|l| l.strip_prefix("contract ")).next();
-    let name = declared.and_then(|rest| rest.split_whitespace().next());
-    name.filter(|n| identifier(n)).unwrap_or("Contract")
 }
 
 fn bytes_of(ty: &str) -> usize {
@@ -436,6 +430,8 @@ pub struct Plain<'a> {
     // No compiler will see this text. A function no signature gives a header to is
     // then written under the name its selector has, where a checked file leaves it out.
     drafted: bool,
+    // Functions the compiler found to hold more values at once than it can reach.
+    packed: &'a BTreeSet<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -532,6 +528,75 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     }
     let inner: String = text.lines().map(|l| format!("    {l}\n")).collect();
     format!("        unchecked {{\n{inner}        }}\n")
+}
+
+/* A compiler keeps the values of a function on a stack it can reach sixteen deep, and
+refuses a function that needs more at once. An author then moves values into a struct in
+memory, and so does this: the values the body declares become the fields of one struct,
+which is one value on the stack. A value an assembly line names stays where it is, as
+assembly cannot name a field. */
+fn locals_in_memory(function: &str, text: &str) -> Option<(String, String)> {
+    let declared = |line: &str| -> Option<(String, String, Option<String>)> {
+        let code = line.trim().strip_suffix(';')?;
+        let (left, value) = match code.split_once(" = ") {
+            Some((left, value)) => (left, Some(value.to_string())),
+            None => (code, None),
+        };
+        let (ty, name) = left.rsplit_once(' ')?;
+        let held = ty.strip_suffix(" memory").unwrap_or(ty);
+        let typed = elementary(held) || matches!(held, "bytes" | "string");
+        (typed && identifier(name)).then(|| (held.to_string(), name.to_string(), value))
+    };
+    let in_assembly = |name: &str| {
+        let lines = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("assembly"));
+        lines.clone().any(|l| mentions(l, name))
+    };
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some((ty, name, value)) = declared(line).filter(|(_, n, _)| !in_assembly(n)) else {
+            lines.push(line.to_string());
+            continue;
+        };
+        match fields.iter().find(|(_, field)| *field == name) {
+            Some((as_before, _)) if *as_before != ty => return None,
+            Some(_) => {}
+            None => fields.push((ty, name.clone())),
+        }
+        if let Some(value) = value {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            lines.push(format!("{indent}{name} = {value};"));
+        }
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    let held = ["m", "locals", "held"]
+        .into_iter()
+        .find(|n| !mentions(text, n))?;
+    let named: Vec<(String, String)> = fields
+        .iter()
+        .map(|(_, name)| (name.clone(), format!("{held}.{name}")))
+        .collect();
+    let members: String = fields
+        .iter()
+        .map(|(ty, name)| format!("        {ty} {name};\n"))
+        .collect();
+    let kept = format!("    struct Locals_{function} {{\n{members}    }}\n\n");
+    let body = renamed(&lines.join("\n"), &named);
+    let opened = format!("        Locals_{function} memory {held};\n{body}\n");
+    Some((kept, opened))
+}
+
+fn packed_body(c: &Contract, f: &Function, i: usize, plain: &Plain<'_>) -> (String, String) {
+    let text = body(c, f, plain);
+    let packed = plain.packed.contains(&i);
+    match packed.then(|| locals_in_memory(&f.name, &text)).flatten() {
+        Some(moved) => moved,
+        None => (String::new(), text),
+    }
 }
 
 // An argument whose place in memory the body takes is declared as held in memory.
@@ -1634,7 +1699,7 @@ fn errors_declared(text: &str) -> String {
     out
 }
 
-fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
+fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
     let own = version(c).filter(|_| shape.own_version);
     let pragma = match own {
         Some((a, b, patch)) => format!("{a}.{b}.{patch}"),
@@ -1649,7 +1714,7 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
     let licence = "// SPDX-License-Identifier: UNLICENSED";
     let mut out = format!("{licence}\npragma solidity {pragma};\n{built}\n");
     let mut spans = Vec::new();
-    out.push_str(&format!("contract {} {{\n", contract_name(c)));
+    out.push_str(&format!("contract {name} {{\n"));
     if let Some(plain) = plain.filter(|p| !p.layout.text.is_empty()) {
         out.push_str(&plain.layout.text);
         out.push('\n');
@@ -1674,9 +1739,9 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
             let head = widened(head, plain.relaxed.get(&i));
             if written.insert(head.clone()) {
                 let start = out.len();
-                let text = body(c, f, plain);
+                let (kept, text) = packed_body(c, f, i, plain);
                 let head = held_in_memory(&head, &text);
-                out.push_str(&format!("    {head} {{\n{text}    }}\n\n"));
+                out.push_str(&format!("{kept}    {head} {{\n{text}    }}\n\n"));
                 spans.push((start, out.len(), i));
             }
             continue;
@@ -1708,12 +1773,24 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
         let mut printed: Vec<usize> = own.map(|(i, _)| i).collect();
         let callers = printed.iter().chain(spans.iter().map(|(_, _, i)| i));
         printed.extend(helpers(c, plain.functions, callers.copied().collect()));
+        /* Code that no function reaches is still code the contract holds. The file that is
+        not built shows it. The one that is built leaves out what could never run. */
+        if plain.drafted {
+            let unreached = |(i, f): (usize, &Function)| (f.kind == FnKind::Orphan).then_some(i);
+            let all = c.functions.iter().enumerate();
+            let orphans: Vec<usize> = all.filter_map(unreached).collect();
+            let theirs = helpers(c, plain.functions, orphans.clone());
+            let more = orphans.into_iter().chain(theirs);
+            let more: Vec<usize> = more.filter(|i| !printed.contains(i)).collect();
+            printed.extend(more);
+        }
         for i in printed {
             let f = &c.functions[i];
             let start = out.len();
             let head = crate::decompile::fmt_function_header(f);
             let head = widened(head, plain.relaxed.get(&i));
-            out.push_str(&format!("{head}{}    }}\n\n", body(c, f, plain)));
+            let (kept, text) = packed_body(c, f, i, plain);
+            out.push_str(&format!("{kept}{head}{text}    }}\n\n"));
             spans.push((start, out.len(), i));
         }
     }
@@ -1750,7 +1827,7 @@ fn compose(c: &Contract, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
 
 #[must_use]
 pub fn file(c: &Contract, shape: &Shape) -> String {
-    compose(c, shape, None).text
+    compose(c, NAME, shape, None).text
 }
 
 #[cfg(feature = "rpc")]
@@ -1885,7 +1962,7 @@ fn printable(c: &Contract) -> BTreeSet<usize> {
 compiler asked and nothing run beside the bytecode. It reads as the checked file does,
 and what a compiler would refuse or the check would find different is still in it. */
 #[must_use]
-pub fn draft(c: &Contract) -> String {
+pub fn draft(c: &Contract, name: &str) -> String {
     let public = getters(c);
     let read: BTreeSet<usize> = public.iter().map(|(i, _)| *i).collect();
     let written = c
@@ -1910,8 +1987,9 @@ pub fn draft(c: &Contract) -> String {
         clean: true,
         relaxed: &BTreeMap::new(),
         drafted: true,
+        packed: &BTreeSet::new(),
     };
-    compose(c, &shape, Some(&plain)).text
+    compose(c, name, &shape, Some(&plain)).text
 }
 
 // The variable a function returns and does nothing else, read under the function's own
@@ -1972,6 +2050,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
     };
     let mut depth = runs;
     let mut relaxed: BTreeMap<usize, Reach> = BTreeMap::new();
+    let mut packed: BTreeSet<usize> = BTreeSet::new();
     for _ in 0..48 {
         crate::clock::check();
         let read: BTreeSet<usize> = public.iter().map(|(i, _)| *i).collect();
@@ -1991,8 +2070,9 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
             clean: false,
             relaxed: &relaxed,
             drafted: false,
+            packed: &packed,
         };
-        let draft = compose(c, &shape, Some(&written));
+        let draft = compose(c, NAME, &shape, Some(&written));
         if draft.spans.is_empty() && read.is_empty() {
             break;
         }
@@ -2020,6 +2100,10 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                     if let Some((from, to, _)) = shown.filter(|_| trace_text) {
                         eprintln!("{}", &draft.text[*from..*to]);
                     }
+                }
+                let deep = refusal.message.contains("Stack too deep");
+                if failed.first().is_some_and(|i| deep && packed.insert(*i)) {
+                    continue;
                 }
                 let asked = reach_asked(&refusal.message).zip(failed.first().copied());
                 if let Some((reach, i)) = asked.filter(|(r, i)| relaxed.get(i) < Some(r)) {
@@ -2124,8 +2208,9 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                         clean: true,
                         relaxed: &relaxed,
                         drafted: false,
+                        packed: &packed,
                     };
-                    let clean = every.then(|| compose(c, &shape, Some(&whole)));
+                    let clean = every.then(|| compose(c, NAME, &shape, Some(&whole)));
                     let tried = clean.and_then(|draft| {
                         let built = crate::solc::compile_with(&draft.text, false).ok()?;
                         let built = built.into_iter().next()?;
@@ -2284,6 +2369,21 @@ mod tests {
             "x = keccak256(abi.encode(a));\n_copy(ptr1 + 36",
         );
         assert_eq!(scratch_taken_for_its_call(lines(&busy)).join("\n"), busy);
+    }
+
+    #[test]
+    fn the_values_a_long_function_declares_move_into_one_struct() {
+        let body = "        uint256 v1;\n        bool ok;\n        uint256 ptr1;\n        \
+                    assembly { ptr1 := a }\n        v1 = f(ptr1);\n        \
+                    uint256 t1 = v1 + 1;\n        ok = t1 > v1;\n";
+        let (kept, text) = locals_in_memory("g", body).unwrap();
+        let fields = "        uint256 v1;\n        bool ok;\n        uint256 t1;\n";
+        assert_eq!(kept, format!("    struct Locals_g {{\n{fields}    }}\n\n"));
+        let want = "        Locals_g memory m;\n        uint256 ptr1;\n        \
+                    assembly { ptr1 := a }\n        m.v1 = f(ptr1);\n        \
+                    m.t1 = m.v1 + 1;\n        m.ok = m.t1 > m.v1;\n";
+        assert_eq!(text, want);
+        assert!(locals_in_memory("g", "        return a;\n").is_none());
     }
 
     #[test]

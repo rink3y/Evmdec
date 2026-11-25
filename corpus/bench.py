@@ -67,7 +67,7 @@ def main():
         if not os.path.exists(abi_path): continue
         abi = json.load(open(abi_path)).get('abi')
         if not abi: continue
-        cmd = [a.bin, 'decompile', '--json', os.path.join(a.dir, f)] + ([] if a.sigs else ['--no-sigs'])
+        cmd = [a.bin, 'facts', os.path.join(a.dir, f)] + ([] if a.sigs else ['--no-sigs'])
         import time; t = time.time()
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         dt = time.time() - t

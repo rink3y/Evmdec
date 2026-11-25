@@ -1,7 +1,7 @@
 use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 
 const INDEX: &str = include_str!("../static/index.html");
@@ -26,19 +26,53 @@ struct Cached {
     expires: bool,
 }
 
+/* Every caller of the public API draws on one pool, which is full again at midnight UTC.
+shortcut: the count lives in this process, so a restart refills it and two servers each
+keep their own. Move it to a file or a shared store when either matters. */
+struct Pool {
+    limit: u32,
+    day: u64,
+    used: u32,
+}
+
+const DAY: u64 = 86_400;
+const API_DAILY: u32 = 5000;
+
+impl Pool {
+    fn take(&mut self, now: u64) -> Result<u32, u64> {
+        if now / DAY != self.day {
+            (self.day, self.used) = (now / DAY, 0);
+        }
+        if self.used >= self.limit {
+            return Err(DAY - now % DAY);
+        }
+        self.used += 1;
+        Ok(self.limit - self.used)
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     cache: Arc<Mutex<HashMap<[u8; 32], Cached>>>,
     slots: Arc<Semaphore>,
     waiting: Arc<AtomicUsize>,
+    pool: Arc<Mutex<Pool>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let limit = std::env::var("EVMDEC_API_DAILY").ok();
+        let limit = limit.and_then(|l| l.parse().ok()).unwrap_or(API_DAILY);
+        let pool = Pool {
+            limit,
+            day: 0,
+            used: 0,
+        };
         AppState {
             cache: Arc::default(),
             slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             waiting: Arc::default(),
+            pool: Arc::new(Mutex::new(pool)),
         }
     }
 }
@@ -218,26 +252,49 @@ fn input_of(req: &DecompileReq) -> Result<Input, String> {
     }
 }
 
-async fn api_decompile(
-    State(st): State<AppState>,
-    request: Result<Json<DecompileReq>, JsonRejection>,
-) -> axum::response::Response {
-    let req = match request {
-        Ok(Json(req)) => req,
-        Err(rejected) => return error(rejected.status(), rejected.body_text()),
-    };
+struct Asked {
+    input: Input,
+    chain: String,
+    follow: bool,
+    lookup: Lookup,
+    depth: usize,
+}
+
+type Refused = (StatusCode, String);
+
+fn asked(request: Result<Json<DecompileReq>, JsonRejection>) -> Result<Asked, Refused> {
+    let Json(req) = request.map_err(|r| (r.status(), r.body_text()))?;
     let chain = req.chain.clone().unwrap_or_else(|| "mainnet".into());
-    let input = match input_of(&req) {
-        Ok(input) => input,
-        Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
-    };
+    let input = input_of(&req).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     if evmdec::rpc::chain_by_name(&chain).is_none() {
-        return error(StatusCode::BAD_REQUEST, format!("unknown chain '{chain}'"));
+        return Err((StatusCode::BAD_REQUEST, format!("unknown chain '{chain}'")));
     }
-    let depth = req.depth.unwrap_or(Policy::default().depth).min(3);
+    Ok(Asked {
+        input,
+        chain,
+        follow: !req.no_follow_proxy,
+        lookup: match req.lookup {
+            true => Lookup::Online,
+            false => Lookup::Offline,
+        },
+        depth: req.depth.unwrap_or(Policy::default().depth).min(3),
+    })
+}
+
+async fn answer(st: &AppState, asked: Asked) -> axum::response::Response {
+    let Asked {
+        input,
+        chain,
+        follow,
+        lookup,
+        depth,
+    } = asked;
     let mut label = format!(
         "{}|{}|{}|{}|",
-        chain, req.no_follow_proxy, req.lookup, depth
+        chain,
+        !follow,
+        lookup == Lookup::Online,
+        depth
     )
     .into_bytes();
     match &input {
@@ -245,7 +302,7 @@ async fn api_decompile(
         Input::Code(code) => label.extend_from_slice(&evmdec::keccak::keccak256(code)),
     }
     let key = evmdec::keccak::keccak256(&label);
-    if let Some(body) = cached(&st, &key) {
+    if let Some(body) = cached(st, &key) {
         return json_body(body);
     }
     if st.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_WAITING {
@@ -261,16 +318,10 @@ async fn api_decompile(
     };
     drop(waiting);
     // Someone else may have finished the same input while this request waited.
-    if let Some(body) = cached(&st, &key) {
+    if let Some(body) = cached(st, &key) {
         return json_body(body);
     }
     let expires = matches!(input, Input::Address(_));
-    let lookup = if req.lookup {
-        Lookup::Online
-    } else {
-        Lookup::Offline
-    };
-    let follow = !req.no_follow_proxy;
     let work = tokio::task::spawn_blocking(move || {
         // The slot is given back when the work ends, not when the client stops waiting.
         let _slot = slot;
@@ -304,7 +355,7 @@ async fn api_decompile(
     };
     match outcome {
         Some(Ok(body)) => {
-            keep(&st, key, body.clone(), expires);
+            keep(st, key, body.clone(), expires);
             json_body(body)
         }
         Some(Err(msg)) => {
@@ -322,6 +373,75 @@ async fn api_decompile(
     }
 }
 
+/* The page's own address is kept for the page, so that a script draws on the shared pool.
+shortcut: a script can send the headers a browser sends. This keeps an honest caller on
+the public API and stops nobody determined. Sign the page's requests if that matters. */
+fn from_the_page(headers: &HeaderMap) -> bool {
+    match headers.get("sec-fetch-site") {
+        Some(site) => site == "same-origin",
+        // A browser too old to say where a request comes from still names an origin.
+        None => headers.contains_key(header::ORIGIN),
+    }
+}
+
+async fn page_decompile(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    request: Result<Json<DecompileReq>, JsonRejection>,
+) -> axum::response::Response {
+    if !from_the_page(&headers) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this address serves the website, the public API is POST /v1/decompile",
+        );
+    }
+    match asked(request) {
+        Ok(asked) => answer(&st, asked).await,
+        Err((status, said)) => error(status, said),
+    }
+}
+
+async fn metered(st: &AppState, asked: Result<Asked, Refused>) -> axum::response::Response {
+    let asked = match asked {
+        Ok(asked) => asked,
+        Err((status, said)) => return error(status, said),
+    };
+    let since = SystemTime::now().duration_since(UNIX_EPOCH);
+    let now = since.map_or(0, |d| d.as_secs());
+    let (limit, taken) = {
+        let mut pool = st.pool.lock().unwrap_or_else(|e| e.into_inner());
+        (pool.limit, pool.take(now))
+    };
+    let (mut answer, left) = match taken {
+        Ok(left) => (answer(st, asked).await, left),
+        Err(wait) => {
+            let said = format!(
+                "the shared pool of {limit} requests a day is used up, it is full again at 00:00 UTC"
+            );
+            let mut refused = error(StatusCode::TOO_MANY_REQUESTS, said);
+            let headers = refused.headers_mut();
+            headers.insert(header::RETRY_AFTER, HeaderValue::from(wait));
+            (refused, 0)
+        }
+    };
+    let facts = [
+        ("x-ratelimit-limit", u64::from(limit)),
+        ("x-ratelimit-remaining", u64::from(left)),
+        ("x-ratelimit-reset", now - now % DAY + DAY),
+    ];
+    for (name, value) in facts {
+        answer.headers_mut().insert(name, HeaderValue::from(value));
+    }
+    answer
+}
+
+async fn api_decompile(
+    State(st): State<AppState>,
+    request: Result<Json<DecompileReq>, JsonRejection>,
+) -> axum::response::Response {
+    metered(&st, asked(request)).await
+}
+
 async fn api_address(
     State(st): State<AppState>,
     Path((chain, address)): Path<(String, String)>,
@@ -331,7 +451,7 @@ async fn api_address(
         chain: Some(chain),
         ..Default::default()
     };
-    api_decompile(State(st), Ok(Json(req))).await
+    metered(&st, asked(Ok(Json(req)))).await
 }
 
 // These two values are written into the page, so only plain ones are taken from a request.
@@ -410,7 +530,9 @@ async fn main() {
         .route("/robots.txt", get(robots))
         .route("/api/chains", get(chains))
         .route("/api/status", get(status))
-        .route("/api/decompile", post(api_decompile))
+        .route("/api/decompile", post(page_decompile))
+        .route("/v1/decompile", post(api_decompile))
+        .route("/v1/address/{chain}/{address}", get(api_address))
         .route("/api/address/{chain}/{address}", get(api_address))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(tower_http::cors::CorsLayer::permissive())
@@ -426,4 +548,23 @@ async fn main() {
     eprintln!("evmdec-server listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Pool, DAY};
+
+    #[test]
+    fn the_pool_runs_out_and_is_full_again_the_next_day() {
+        let mut pool = Pool {
+            limit: 2,
+            day: 0,
+            used: 0,
+        };
+        let noon = 20_000 * DAY + DAY / 2;
+        assert_eq!(pool.take(noon), Ok(1));
+        assert_eq!(pool.take(noon + 1), Ok(0));
+        assert_eq!(pool.take(noon + 2), Err(DAY / 2 - 2));
+        assert_eq!(pool.take(noon + DAY / 2), Ok(1));
+    }
 }

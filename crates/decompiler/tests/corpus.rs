@@ -718,6 +718,17 @@ fn defaults_give_way_to_names_the_code_implies() {
         pair.contains("uint256 reentrancyLock;"),
         "lock by its toggling"
     );
+    assert!(
+        pair.contains(".uniswapV2Call(msg.sender, arg0, arg1, msg.data[arg3:arg3 + arg4]);")
+            && pair.contains(
+                "function uniswapV2Call(address, uint256, uint256, bytes calldata) external;"
+            ),
+        "a call by name that hands on a run of bytes: {pair}"
+    );
+    assert!(
+        pair.contains("function skim(address arg0) external nonReentrant {"),
+        "the lock as a modifier: {pair}"
+    );
     let weth = source("weth9");
     for line in [
         "function transferFrom(address from, address to, uint256 amount) external",
@@ -911,6 +922,33 @@ fn types_join_evidence_across_keys_fields_and_layouts() {
 }
 
 #[test]
+fn a_loop_that_pushes_by_count_ends_once() {
+    let read = |path: &str| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+        let code = evmdec::hex::decode(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        evmdec::decompile::decompile(&code, &evmdec::decompile::Options::default())
+    };
+    let pool = read("../../testdata/mainnet/curve_3pool_vyper.hex");
+    assert!(
+        pool.source
+            .contains("(ret_1_0, ret_1_1, ret_1_2) = func_0x281();")
+            && pool
+                .source
+                .contains("func_0x4c9(ret_2_0, ret_1_0, ret_1_1, ret_1_2);"),
+        "a fixed array of three comes back as three values, and all three are handed on"
+    );
+    assert!(
+        !pool.source.contains("switch (") && pool.source.lines().count() < 4000,
+        "no copy of the code for every number of values the loop might have pushed"
+    );
+    let older = read("../../testdata/vuln/curve_peth_impl.hex");
+    assert_eq!(
+        older.stats.unresolved_jumps, 0,
+        "the return after a nested call"
+    );
+}
+
+#[test]
 fn stores_nothing_reads_are_left_out() {
     let source = |path: &str| {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
@@ -925,8 +963,8 @@ fn stores_nothing_reads_are_left_out() {
         "locals no one reads after the helper calls are not stored: {body}"
     );
     assert!(
-        body.contains("loc_1c0 = ") && body.contains("func_0x3349("),
-        "what the helper may still read is: {body}"
+        body.contains("(ret_2_0, ret_2_1) = func_0x3349(stor_9, stor_8, stor_16, stor_15);"),
+        "the helper hands back the two words of its array: {body}"
     );
     assert!(body.contains("return ret_3_0 * 1e18 / totalSupply;"));
 
@@ -993,7 +1031,7 @@ fn a_merged_value_is_assigned_on_every_way_in() {
     };
     let helper = source("../../testdata/regress/umbrella_batch_helper.hex");
     assert!(
-        helper.contains("if (!ret_1_0) {\n            v1 = arg2;\n        L1236:"),
+        helper.contains("if (!ret_1_0) {\n            v1 = arg2;\n        } else {"),
         "the branch that skips the swap still hands its amount to the join"
     );
     let token = source("../../testdata/regress/minime_token.hex");
@@ -1035,7 +1073,8 @@ fn both_ways_into_a_join_keep_their_own_call_after_it() {
         .find("function func_0x216b(")
         .expect("the swap callback");
     let body = &router[start..start + router[start..].find("\n    }").unwrap()];
-    let after = &body[body.find("L21be:").expect("the join")..];
+    let join = "if (_calldata(132) == address(this)) {";
+    let after = &body[body.find(join).expect("the join")..];
     let (token0, token1) = ("\"token0()\"", "\"token1()\"");
     assert!(
         after.contains(token1) && after.contains(token0),

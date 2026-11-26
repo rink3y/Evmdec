@@ -60,7 +60,10 @@ The decompiler is `crates/decompiler`, the command-line tool `crates/cli` and th
   from the topic count; custom errors; `require(cond, "reason")` and `Panic(...)`.
 - Storage. Mappings, dynamic and fixed arrays, packed fields (`uint112 reserve0; uint112
   reserve1; uint32 blockTimestampLast;`), strings, precomputed array slots, EIP-1967,
-  ZeppelinOS, diamond and ERC-7201 namespaced slots by name. A mapping or array whose
+  ZeppelinOS, diamond and ERC-7201 namespaced slots by name. A variable at such a hashed
+  place fills no slot a file can declare, so it is read and written through two small
+  functions the file declares (`_eip1967_implementation()`,
+  `_set_eip1967_implementation(to)`). A mapping or array whose
   elements span several slots is declared with its struct (`struct Struct_264 { address
   field0; uint256 field1; bytes field2; }`) and read by member (`stor_264[key].field1`):
   members packed into one slot, byte strings, and arrays and mappings held inside the
@@ -77,12 +80,20 @@ The decompiler is `crates/decompiler`, the command-line tool `crates/cli` and th
   is read) is that call: `uint256 balance = IERC20(token0).balanceOf(address(this));`. The
   file declares the interface with the functions called through it, named `IERC20` for the
   functions of that standard and after the variable that holds the contract otherwise. A
-  call that lacks one of the tests was not made by name and stays a low-level call. A test
+  call that lacks one of the tests was not made by name and stays a low-level call. An
+  argument is a word of the type the signature names, or a run of bytes. A test
   of the caller that several functions open with is written once as a modifier
-  (`onlyOwner`). The body a compiler placed in a helper that only one function calls is
+  (`onlyOwner`), and so is a lock that several functions test, set and set back before
+  every return (`nonReentrant`). The body a compiler placed in a helper that only one function calls is
   written in that function, under the function's own argument names. A call given only the
   2300 gas stipend is `send` or `transfer`. Code two branches share is written after them
-  where the jump to it was the last thing its branch did, with no label and no `goto`.
+  where every way through the other branches ends by leaving or by jumping to it, with
+  no label and no `goto`, also where the shared code lies several blocks deep.
+- Loops that count on the stack. Old Vyper hands back a fixed array by pushing its words
+  in a loop, and saves a function's variables around a call the same way. Such a loop is
+  followed by its count, so the function returns once and with the right number of
+  values. Without that, one contract of the corpus came out as 65,056 lines with 486
+  `goto`. It is 2,642 lines with 4 now, in 2 seconds where it took 23.
 - Memory. Each allocation at solc's free memory pointer is a named block (`ptr1`, `ptr2`), so
   two structs never read as one address; a run of stores that fills a block prints as one line
   (`ptr1 = memory(arg0, arg1, ptr2)`), a string built in memory as its text, and the
@@ -186,7 +197,7 @@ verified source.
 | events | 119 / 121 |
 | code blocks covered by some function | 10,810 / 10,810 |
 | unresolved jumps | 0 |
-| time for the corpus | about 10 s |
+| time for the corpus | about 6 s |
 
 The mutability misses are `view` functions that make external calls on a pre-0.5 compiler, or
 proxy getters that fall through to `delegatecall`. Most type misses are `bytes32` mapping keys,

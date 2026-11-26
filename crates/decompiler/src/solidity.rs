@@ -545,6 +545,7 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     };
     let text = unused_answers(&text);
     let text = saved_as_stored(c, &plain.layout.renamed, &text);
+    let text = through_accessors(&text, &hashed_variables(c));
     let head = crate::decompile::fmt_function_header(f);
     let named = c.functions.iter().map(|f| f.name.as_str());
     let stored = plain.layout.renamed.iter().map(|(_, to)| to.as_str());
@@ -1271,6 +1272,12 @@ fn negated(test: &str) -> String {
         [(at, sign, other)] if simple => {
             format!("{}{other}{}", &test[..at], &test[at + sign.len()..])
         }
+        _ if test
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') =>
+        {
+            format!("!{test}")
+        }
         _ => format!("!({test})"),
     }
 }
@@ -1302,66 +1309,110 @@ fn shared_tails(lines: Vec<String>) -> Vec<String> {
         ];
         code == HANDED_ON || ways.iter().any(|w| code.starts_with(w))
     };
+    // The jumps a run of lines ends with, where every way through it ends by leaving or
+    // by such a jump.
+    fn ends(
+        lines: &[String],
+        (from, to): (usize, usize),
+        jump: &str,
+        leaves: &dyn Fn(&str) -> bool,
+    ) -> Option<Vec<usize>> {
+        let indent = |i: usize| lines[i].len() - lines[i].trim_start().len();
+        let last = to.checked_sub(1).filter(|last| *last >= from)?;
+        let code = lines[last].trim();
+        if code == jump || leaves(code) {
+            return Some(Vec::from_iter((code == jump).then_some(last)));
+        }
+        let level = |i: &usize| indent(*i) <= indent(last) && label_of(&lines[*i]).is_none();
+        let other = (from..last).rev().find(level)?;
+        let opened = (from..other).rev().find(level)?;
+        let branched = code == "}"
+            && lines[other].trim() == "} else {"
+            && lines[opened].trim().starts_with("if (")
+            && indent(opened) == indent(last);
+        let mut jumps = ends(lines, (opened + 1, other), jump, leaves).filter(|_| branched)?;
+        jumps.extend(ends(lines, (other + 1, last), jump, leaves)?);
+        Some(jumps)
+    }
     let moved = (0..lines.len()).find_map(|at| {
         let name = label_of(&lines[at])?;
-        let depth = indent(&lines[at]);
         let jump = format!("goto {name};");
-        let mut jumps = (0..lines.len()).filter(|i| lines[*i].contains(&jump));
-        let (from, None) = (jumps.next()?, jumps.next()) else {
-            return None;
+        let level = |depth: usize| {
+            let lines = &lines;
+            move |i: &usize| indent(&lines[*i]) <= depth && label_of(&lines[*i]).is_none()
         };
-        let level = |i: &usize| indent(&lines[*i]) <= depth && label_of(&lines[*i]).is_none();
-        let opened = (0..at).rev().find(level)?;
-        let other = (at + 1..lines.len()).find(level)?;
-        let closed = (other + 1..lines.len()).find(level)?;
-        let test = lines[opened]
-            .trim()
-            .strip_prefix("if (")?
-            .strip_suffix(") {")?;
-        let shaped = indent(&lines[opened]) == depth
-            && lines[other].trim() == "} else {"
-            && lines[closed].trim() == "}"
-            && lines[from].trim() == jump
-            && (other..closed).contains(&from);
-        // From the jump outwards, each block has to end where the one around it does,
-        // and the branch beside it has to leave.
-        let mut last = from;
-        while shaped && indent(&lines[last]) > depth + 4 {
-            let inner = indent(&lines[last]);
-            let around = |i: &usize| indent(&lines[*i]) < inner;
-            let (end, start) = (last + 1, (0..last).rev().find(around)?);
-            last = match (lines[start].trim(), lines[end].trim()) {
-                ("} else {", "}") if leaves(lines[start - 1].trim()) => end,
-                (opener, "} else {") if opener.starts_with("if (") => {
-                    let close = (end + 1..closed).find(around)?;
-                    let left = leaves(lines[close - 1].trim()) && lines[close].trim() == "}";
-                    left.then_some(close)?
+        /* From the label outwards, to the branch whose other side jumps to it. The
+        shared code runs to the end of its block. Each block around that has to end
+        where the one around it does, and every way through the branch beside it has
+        to leave or jump to the label, as the shared code would otherwise run after a
+        branch that never reached it. */
+        let mut depth = indent(&lines[at]);
+        let end = (at + 1..lines.len()).find(level(depth))?;
+        let mut close = end;
+        let mut jumps: Vec<usize> = Vec::new();
+        let closed = loop {
+            let open = (0..at).rev().find(level(depth))?;
+            let fits = indent(&lines[open]) == depth && indent(&lines[close]) == depth;
+            let (beside, last) = match (lines[open].trim(), lines[close].trim()) {
+                (test, "} else {") if fits && test.starts_with("if (") => {
+                    let last = (close + 1..lines.len()).find(level(depth))?;
+                    ((close + 1, last), last)
+                }
+                ("} else {", "}") if fits => {
+                    let test = (0..open).rev().find(level(depth))?;
+                    ((test + 1, open), close)
                 }
                 _ => return None,
             };
-        }
-        (shaped && last + 1 == closed).then(|| (at, opened, other, from, closed, test.to_string()))
+            let found =
+                ends(&lines, beside, &jump, &leaves).filter(|_| lines[last].trim() == "}")?;
+            let reached = !found.is_empty() && beside.0 > at;
+            jumps.extend(found);
+            if reached {
+                break last;
+            }
+            let outer = lines.get(last + 1).filter(|l| label_of(l).is_none())?;
+            (depth, close) = (indent(outer) < depth).then(|| (indent(outer), last + 1))?;
+        };
+        let all = (0..lines.len())
+            .filter(|i| lines[*i].contains(&jump))
+            .count();
+        (all == jumps.len()).then_some((at, end, jumps, closed, depth))
     });
-    let Some((at, opened, other, from, closed, test)) = moved else {
+    let Some((at, end, jumps, closed, depth)) = moved else {
         return lines;
     };
-    let mut out = lines[..opened].to_vec();
-    let pad = &lines[opened][..indent(&lines[opened])];
-    match opened + 1 == at {
-        true => out.push(format!("{pad}if ({}) {{", negated(&test))),
-        false => {
-            out.extend_from_slice(&lines[opened..at]);
-            out.push(lines[other].clone());
+    let nearer = indent(&lines[at]) + 4 - depth;
+    let mut out: Vec<String> = Vec::new();
+    let mut emptied: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i == at || jumps.contains(&i) {
+            emptied.push(out.len());
+        }
+        if !(at..end).contains(&i) && !jumps.contains(&i) {
+            out.push(line.clone());
+        }
+        if i == closed {
+            let shared = lines[at + 1..end].iter();
+            out.extend(shared.map(|l| l[nearer.min(indent(l))..].to_string()));
         }
     }
-    out.extend_from_slice(&lines[other + 1..from]);
-    out.extend_from_slice(&lines[from + 1..=closed]);
-    out.extend(
-        lines[at + 1..other]
-            .iter()
-            .map(|l| l[4.min(l.len())..].to_string()),
-    );
-    out.extend_from_slice(&lines[closed + 1..]);
+    // A block that held nothing but the shared code or the jump is left empty, and goes.
+    for at in emptied.into_iter().rev() {
+        let (before, after) = (out[at - 1].trim().to_string(), out[at].trim().to_string());
+        let test = before
+            .strip_prefix("if (")
+            .and_then(|t| t.strip_suffix(") {"));
+        match (test, after.as_str()) {
+            (Some(test), "} else {") => {
+                let pad = " ".repeat(indent(&out[at - 1]));
+                out[at - 1] = format!("{pad}if ({}) {{", negated(test));
+                out.remove(at);
+            }
+            (None, "}") if before == "} else {" => drop(out.remove(at - 1)),
+            _ => {}
+        }
+    }
     shared_tails(out)
 }
 
@@ -1430,6 +1481,70 @@ fn copies_kept(mut lines: Vec<String>) -> Vec<String> {
     let all = lines.iter().enumerate().filter(|(i, l)| !own(*i, l));
     let kept: Vec<String> = all.map(|(_, l)| l.replace(&read, "msg.data")).collect();
     copies_kept(kept)
+}
+
+/* A variable kept at the hash of a name, as a proxy keeps its implementation, has no
+place in the order a file declares variables in. An author reads and writes it through
+two small functions, and so does this. Only a variable that fills its slot is taken: an
+address or a whole word. */
+fn hashed_variables(c: &Contract) -> Vec<(&str, &str, &str)> {
+    let hashed = |v: &&crate::decompile::StorageVar| {
+        let whole = matches!(v.ty.as_str(), "address" | "uint256" | "bytes32");
+        let named = identifier(&v.name) && !v.name.starts_with("stor_");
+        let taken = c
+            .functions
+            .iter()
+            .any(|f| f.name.trim_start_matches('_') == v.name);
+        v.slot.len() > 18 && whole && named && !taken && v.fields.is_empty() && v.members.is_empty()
+    };
+    let all = c.storage.iter().filter(hashed);
+    all.map(|v| (v.name.as_str(), v.slot.as_str(), v.ty.as_str()))
+        .collect()
+}
+
+fn through_accessors(text: &str, hashed: &[(&str, &str, &str)]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let code = line.trim_start();
+        let pad = &line[..line.len() - code.len()];
+        let set = hashed.iter().find_map(|(name, _, _)| {
+            let value = code
+                .strip_prefix(name)?
+                .strip_prefix(" = ")?
+                .strip_suffix(';')?;
+            Some(format!("{pad}_set_{name}({value});"))
+        });
+        lines.push(set.unwrap_or_else(|| line.to_string()));
+    }
+    let read = |(name, _, _): &(&str, &str, &str)| (name.to_string(), format!("_{name}()"));
+    let reads: Vec<(String, String)> = hashed.iter().map(read).collect();
+    renamed(&lines.join("\n"), &reads)
+}
+
+fn accessors(out: &str, hashed: &[(&str, &str, &str)]) -> String {
+    let mut text = String::new();
+    for (name, slot, ty) in hashed {
+        // An address is read as its twenty bytes, as the code that uses it reads it.
+        let read = match *ty {
+            "address" => format!("and(sload({slot}), 0xffffffffffffffffffffffffffffffffffffffff)"),
+            _ => format!("sload({slot})"),
+        };
+        if out.contains(&format!("_{name}()")) {
+            text.push_str(&format!(
+                "    function _{name}() private view returns ({ty} value) {{\n        \
+                 assembly {{\n            value := {read}\n        }}\n    }}\n\n"
+            ));
+        }
+        // shortcut: the whole slot is written, upgrade if a variable at a hashed place
+        // is ever found to share its slot
+        if out.contains(&format!("_set_{name}(")) {
+            text.push_str(&format!(
+                "    function _set_{name}({ty} value) private {{\n        \
+                 assembly {{\n            sstore({slot}, value)\n        }}\n    }}\n\n"
+            ));
+        }
+    }
+    text
 }
 
 fn words_of(text: &str) -> impl Iterator<Item = &str> {
@@ -1724,7 +1839,13 @@ fn interfaces_declared(called: &Called) -> String {
             open = name;
         }
         let function = crate::sigs::name_of(signature);
-        let params = crate::sigs::params_of(signature).join(", ");
+        // A value of no fixed length is declared with the place it is read from.
+        let placed = |ty: String| match ty.ends_with(']') || ty == "bytes" || ty == "string" {
+            true => format!("{ty} calldata"),
+            false => ty,
+        };
+        let params = crate::sigs::params_of(signature).into_iter().map(placed);
+        let params = params.collect::<Vec<_>>().join(", ");
         out.push_str(&format!("    function {function}({params}) {tail};\n"));
     }
     if !open.is_empty() {
@@ -1797,7 +1918,7 @@ fn placed(text: &str, declared: &str) -> String {
     out
 }
 
-fn close_of(text: &str) -> Option<usize> {
+pub fn close_of(text: &str) -> Option<usize> {
     let mut depth = 1i32;
     text.char_indices().find_map(|(i, c)| {
         depth += i32::from(c == '(') - i32::from(c == ')');
@@ -2316,6 +2437,199 @@ fn modifier_name(test: &str) -> Option<String> {
     }
 }
 
+// A header with one more modifier, which goes after the ones it has and before what
+// the function returns.
+fn guarded_by(head: &str, name: &str) -> String {
+    let (before, after) = match head.rfind(" returns (") {
+        Some(returns) => head.split_at(returns),
+        None => (head, ""),
+    };
+    format!("{before} {name}{after}")
+}
+
+fn functions_rewritten(
+    out: &mut String,
+    spans: &mut [(usize, usize, usize)],
+    rewritten: impl Fn(&str) -> Option<String>,
+) {
+    let mut rebuilt = String::new();
+    let mut copied = 0;
+    for span in spans.iter_mut() {
+        rebuilt.push_str(&out[copied..span.0]);
+        let function = &out[span.0..span.1];
+        let start = rebuilt.len();
+        match rewritten(function) {
+            Some(text) => rebuilt.push_str(&text),
+            None => rebuilt.push_str(function),
+        }
+        copied = span.1;
+        *span = (start, rebuilt.len(), span.2);
+    }
+    rebuilt.push_str(&out[copied..]);
+    *out = rebuilt;
+}
+
+struct Lock {
+    test: String,
+    set: String,
+    reset: String,
+    head_end: usize,
+    body: String,
+}
+
+/* A function that tests a lock, sets it, and sets it back before every way out that
+returns is one an author wrote under a modifier. The lines of the lock go, and what is
+left is the body. A way out that fails needs no setting back, as failing undoes the lock.
+A value handed back is worked out before the modifier sets the lock back, so it has to be
+one that working out cannot change. */
+fn locked(function: &str) -> Option<Lock> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let head_end = function
+        .find(" {\n")
+        .filter(|_| function.starts_with("    function "))?;
+    let all: Vec<&str> = function[head_end + 3..]
+        .strip_suffix("    }\n\n")?
+        .lines()
+        .collect();
+    let wrapped =
+        all.first().is_some_and(|l| l.trim() == "unchecked {") && all.last() == Some(&"        }");
+    let lines = match wrapped {
+        true => &all[1..all.len() - 1],
+        false => &all[..],
+    };
+    let local = |l: &&str| {
+        let named = l.trim().strip_suffix(';').and_then(|l| l.rsplit_once(' '));
+        named.is_some_and(|(ty, name)| elementary(ty) && identifier(name))
+    };
+    let value = |v: &str| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let first = lines.iter().position(|l| !local(l))?;
+    let (test, set) = (lines.get(first)?.trim(), lines.get(first + 1)?.trim());
+    let (lock, _) = set
+        .strip_suffix(';')?
+        .split_once(" = ")
+        .filter(|(l, v)| identifier(l) && value(v))?;
+    let tested = test.strip_prefix("require(")?.strip_suffix(");")?;
+    let tested = tested.split(", \"").next()?.trim_start_matches('!');
+    let against = tested.strip_prefix(lock)?;
+    let plain = against.is_empty()
+        || [" == ", " != "]
+            .iter()
+            .any(|sign| against.strip_prefix(sign).is_some_and(value));
+    let rest = &lines[first + 2..];
+    let reset = rest.iter().map(|l| l.trim()).find(|l| {
+        l.strip_prefix(lock)
+            .and_then(|v| v.strip_prefix(" = "))
+            .is_some()
+    })?;
+    let leaves = |code: &str| {
+        let ways = ["revert", "_return(", "_revert(", "_fail(", "_panic("];
+        code == HANDED_ON || ways.iter().any(|w| code.starts_with(w))
+    };
+    // The lines that set the lock back as the last thing before the function ends.
+    fn last_of(lines: &[&str], reset: &str, leaves: &dyn Fn(&str) -> bool) -> Option<Vec<usize>> {
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let last = lines.len().checked_sub(1)?;
+        let code = lines[last].trim();
+        if code == reset {
+            return Some(vec![last]);
+        }
+        if code.starts_with("return") || leaves(code) {
+            return Some(Vec::new());
+        }
+        let depth = indent(lines[last]);
+        let level = |i: &usize| indent(lines[*i]) <= depth;
+        let other = (0..last)
+            .rev()
+            .find(level)
+            .filter(|i| lines[*i].trim() == "} else {")?;
+        let opened = (0..other)
+            .rev()
+            .find(level)
+            .filter(|i| lines[*i].trim().starts_with("if ("))?;
+        let then = last_of(&lines[opened + 1..other], reset, leaves)?;
+        let otherwise = last_of(&lines[other + 1..last], reset, leaves)?;
+        let then = then.into_iter().map(|i| i + opened + 1);
+        Some(
+            then.chain(otherwise.into_iter().map(|i| i + other + 1))
+                .collect(),
+        )
+    }
+    let mut gone = last_of(rest, reset, &leaves).filter(|_| plain)?;
+    for (at, line) in rest.iter().enumerate() {
+        let Some(value) = line.trim().strip_prefix("return") else {
+            continue;
+        };
+        // A cast is worked out the same whenever it is, where a call may not be.
+        let cast = |(at, _): (usize, &str)| {
+            let word = |c: char| !c.is_ascii_alphanumeric() && c != '_';
+            let named = &value[value[..at].rfind(word).map_or(0, |i| i + 1)..at];
+            named.is_empty() || elementary(named)
+        };
+        let plain = |c: char| c.is_ascii_alphanumeric() || " _,;()".contains(c);
+        let fixed = value.chars().all(plain) && value.match_indices('(').all(cast);
+        let before = at
+            .checked_sub(1)
+            .filter(|i| rest[*i].trim() == reset && indent(rest[*i]) == indent(line));
+        gone.push(before.filter(|_| fixed)?);
+    }
+    let all_rest = rest.iter().enumerate();
+    let kept: Vec<&str> = all_rest
+        .filter(|(at, _)| !gone.contains(at))
+        .map(|(_, l)| *l)
+        .collect();
+    if kept.iter().any(|l| mentions(l, lock)) {
+        return None;
+    }
+    let open = all.iter().take(usize::from(wrapped));
+    let close = all.iter().rev().take(usize::from(wrapped));
+    let body = open.chain(&lines[..first]).chain(&kept).chain(close);
+    Some(Lock {
+        test: test.to_string(),
+        set: set.to_string(),
+        reset: reset.to_string(),
+        head_end,
+        body: body.map(|l| format!("{l}\n")).collect(),
+    })
+}
+
+fn with_locks(out: &mut String, spans: &mut [(usize, usize, usize)]) -> String {
+    let key = |lock: &Lock| {
+        format!(
+            "{}\n        {}\n        _;\n        {}",
+            lock.test, lock.set, lock.reset
+        )
+    };
+    let mut uses: BTreeMap<String, usize> = BTreeMap::new();
+    for (start, end, _) in spans.iter() {
+        if let Some(lock) = locked(&out[*start..*end]) {
+            *uses.entry(key(&lock)).or_default() += 1;
+        }
+    }
+    let mut several: Vec<(&String, &usize)> = uses.iter().filter(|(_, n)| **n > 1).collect();
+    several.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    let numbered = |i: usize| match i {
+        0 => "nonReentrant".to_string(),
+        i => format!("nonReentrant{}", i + 1),
+    };
+    let named: Vec<(String, String)> = several
+        .iter()
+        .enumerate()
+        .map(|(i, (lines, _))| (numbered(i), lines.to_string()))
+        .filter(|(name, _)| !mentions(out, name))
+        .collect();
+    let guarded = |function: &str| {
+        let lock = locked(function)?;
+        let (name, _) = named.iter().find(|(_, lines)| *lines == key(&lock))?;
+        let head = guarded_by(&function[..lock.head_end], name);
+        Some(format!("{head} {{\n{}    }}\n\n", lock.body))
+    };
+    functions_rewritten(out, spans, guarded);
+    let declared = |(name, lines): &(String, String)| {
+        format!("    modifier {name}() {{\n        {lines}\n    }}\n\n")
+    };
+    named.iter().map(declared).collect()
+}
+
 /* A test of the caller that several functions open with is what an author writes once
 as a modifier. The test runs first either way, after the arguments are read. */
 fn with_modifiers(out: &mut String, spans: &mut [(usize, usize, usize)]) -> String {
@@ -2343,30 +2657,16 @@ fn with_modifiers(out: &mut String, spans: &mut [(usize, usize, usize)]) -> Stri
             .find(|(_, t)| *t == test.trim())
             .map(|(n, _)| n)
     };
-    let mut rebuilt = String::new();
-    let mut copied = 0;
-    for span in spans.iter_mut() {
-        rebuilt.push_str(&out[copied..span.0]);
-        let function = &out[span.0..span.1];
-        let start = rebuilt.len();
-        let guarded = caller_test(function).and_then(|found| Some((found, of_test(found.2)?)));
-        match guarded {
-            Some(((opened, at, test), name)) => {
-                let head = &function[..opened];
-                let (before, after) = match head.rfind(" returns (") {
-                    Some(returns) => head.split_at(returns),
-                    None => (head, ""),
-                };
-                rebuilt.push_str(&format!("{before} {name}{after}{}", &function[opened..at]));
-                rebuilt.push_str(&function[at + test.len()..]);
-            }
-            None => rebuilt.push_str(function),
-        }
-        copied = span.1;
-        *span = (start, rebuilt.len(), span.2);
-    }
-    rebuilt.push_str(&out[copied..]);
-    *out = rebuilt;
+    let guarded = |function: &str| {
+        let (opened, at, test) = caller_test(function)?;
+        let head = guarded_by(&function[..opened], of_test(test)?);
+        Some(format!(
+            "{head}{}{}",
+            &function[opened..at],
+            &function[at + test.len()..]
+        ))
+    };
+    functions_rewritten(out, spans, guarded);
     let declared = |(name, test): (&String, &String)| {
         format!("    modifier {name}() {{\n        {test}\n        _;\n    }}\n\n")
     };
@@ -2689,7 +2989,9 @@ fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -
             out.push_str(helper);
         }
     }
-    let modifiers = with_modifiers(&mut out, &mut spans);
+    let kept = accessors(&out, &hashed_variables(c));
+    out.push_str(&kept);
+    let modifiers = with_modifiers(&mut out, &mut spans) + &with_locks(&mut out, &mut spans);
     wrappers_filled(&mut out, &mut spans);
     let errors = format!(
         "{}{}{modifiers}",
@@ -3276,6 +3578,17 @@ mod tests {
         let after = "if (a == 0) {\n    f = 4;\n} else {\n    if (c) {\n        revert();\n    \
              } else {\n        d = 2;\n    }\n}\nb = 1;\nreturn;";
         assert_eq!(shared_tails(lines(&led)), lines(after));
+        let deep = "if (a) {\n    if (b) {\n        return;\n    } else {\n        g = 5;\n    L2a:\n        \
+             h = 6;\n    }\n} else {\n    d = 2;\n    goto L2a;\n}\ni = 7;";
+        let after = "if (a) {\n    if (b) {\n        return;\n    } else {\n        g = 5;\n    }\n} else {\n    \
+             d = 2;\n}\nh = 6;\ni = 7;";
+        assert_eq!(shared_tails(lines(deep)), lines(after));
+        let beside = deep.replace("        return;", "        j = 8;");
+        assert_eq!(shared_tails(lines(&beside)), lines(&beside));
+        let twice = "if (a) {\nL3b:\n    h = 6;\n} else {\n    if (b) {\n        d = 2;\n        goto L3b;\n    \
+             } else {\n        goto L3b;\n    }\n}";
+        let after = "if (!a) {\n    if (b) {\n        d = 2;\n    }\n}\nh = 6;";
+        assert_eq!(shared_tails(lines(twice)), lines(after));
         let falls = jumped.replace("revert();", "e = 3;");
         assert_eq!(shared_tails(lines(&falls)), lines(&falls));
         assert_eq!(negated("a < b && c"), "!(a < b && c)");
@@ -3329,6 +3642,56 @@ mod tests {
         let mut kept = twice.clone();
         wrappers_filled(&mut kept, &mut spans.clone());
         assert_eq!(kept, twice);
+    }
+
+    #[test]
+    fn a_lock_set_and_set_back_around_two_functions_is_a_modifier() {
+        let pay = "    function pay() external returns (bool) {\n        bool v1;\n        \
+             require(lock == 1, \"LOCKED\");\n        lock = 0;\n        if (a) {\n            \
+             v1 = true;\n            lock = 1;\n            return v1;\n        } else {\n            \
+             revert();\n        }\n    }\n\n";
+        let skim = "    function skim() external onlyOwner {\n        require(lock == 1, \"LOCKED\");\n        \
+             lock = 0;\n        b = 2;\n        lock = 1;\n    }\n\n";
+        let open =
+            "    function leak() external {\n        require(lock == 1, \"LOCKED\");\n        \
+             lock = 0;\n        if (a) {\n            lock = 1;\n        }\n    }\n\n";
+        let mut out = format!("{pay}{skim}{open}");
+        let ends = [pay.len(), pay.len() + skim.len(), out.len()];
+        let mut spans = [
+            (0, ends[0], 0),
+            (ends[0], ends[1], 1),
+            (ends[1], ends[2], 2),
+        ];
+        let declared = with_locks(&mut out, &mut spans);
+        assert_eq!(
+            declared,
+            "    modifier nonReentrant() {\n        require(lock == 1, \"LOCKED\");\n        \
+             lock = 0;\n        _;\n        lock = 1;\n    }\n\n"
+        );
+        let pay = "    function pay() external nonReentrant returns (bool) {\n        bool v1;\n        \
+             if (a) {\n            v1 = true;\n            return v1;\n        } else {\n            \
+             revert();\n        }\n    }\n\n";
+        let skim =
+            "    function skim() external onlyOwner nonReentrant {\n        b = 2;\n    }\n\n";
+        assert_eq!(out, format!("{pay}{skim}{open}"));
+    }
+
+    #[test]
+    fn a_variable_at_a_hashed_place_is_read_and_written_through_two_functions() {
+        let hashed = [("implementation", "0x36", "address")];
+        let text = "        implementation = to;\n        emit Upgraded(implementation);";
+        let through = through_accessors(text, &hashed);
+        assert_eq!(
+            through,
+            "        _set_implementation(to);\n        emit Upgraded(_implementation());"
+        );
+        let written = accessors(&through, &hashed);
+        assert!(
+            written.contains("function _implementation() private view returns (address value) {")
+        );
+        assert!(written
+            .contains("value := and(sload(0x36), 0xffffffffffffffffffffffffffffffffffffffff)"));
+        assert!(written.contains("function _set_implementation(address value) private {"));
     }
 
     #[test]

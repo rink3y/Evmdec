@@ -545,6 +545,7 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     };
     let text = unused_answers(&text);
     let text = saved_as_stored(c, &plain.layout.renamed, &text);
+    let text = through_accessors(&text, &hashed_variables(c));
     let head = crate::decompile::fmt_function_header(f);
     let named = c.functions.iter().map(|f| f.name.as_str());
     let stored = plain.layout.renamed.iter().map(|(_, to)| to.as_str());
@@ -1480,6 +1481,70 @@ fn copies_kept(mut lines: Vec<String>) -> Vec<String> {
     let all = lines.iter().enumerate().filter(|(i, l)| !own(*i, l));
     let kept: Vec<String> = all.map(|(_, l)| l.replace(&read, "msg.data")).collect();
     copies_kept(kept)
+}
+
+/* A variable kept at the hash of a name, as a proxy keeps its implementation, has no
+place in the order a file declares variables in. An author reads and writes it through
+two small functions, and so does this. Only a variable that fills its slot is taken: an
+address or a whole word. */
+fn hashed_variables(c: &Contract) -> Vec<(&str, &str, &str)> {
+    let hashed = |v: &&crate::decompile::StorageVar| {
+        let whole = matches!(v.ty.as_str(), "address" | "uint256" | "bytes32");
+        let named = identifier(&v.name) && !v.name.starts_with("stor_");
+        let taken = c
+            .functions
+            .iter()
+            .any(|f| f.name.trim_start_matches('_') == v.name);
+        v.slot.len() > 18 && whole && named && !taken && v.fields.is_empty() && v.members.is_empty()
+    };
+    let all = c.storage.iter().filter(hashed);
+    all.map(|v| (v.name.as_str(), v.slot.as_str(), v.ty.as_str()))
+        .collect()
+}
+
+fn through_accessors(text: &str, hashed: &[(&str, &str, &str)]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let code = line.trim_start();
+        let pad = &line[..line.len() - code.len()];
+        let set = hashed.iter().find_map(|(name, _, _)| {
+            let value = code
+                .strip_prefix(name)?
+                .strip_prefix(" = ")?
+                .strip_suffix(';')?;
+            Some(format!("{pad}_set_{name}({value});"))
+        });
+        lines.push(set.unwrap_or_else(|| line.to_string()));
+    }
+    let read = |(name, _, _): &(&str, &str, &str)| (name.to_string(), format!("_{name}()"));
+    let reads: Vec<(String, String)> = hashed.iter().map(read).collect();
+    renamed(&lines.join("\n"), &reads)
+}
+
+fn accessors(out: &str, hashed: &[(&str, &str, &str)]) -> String {
+    let mut text = String::new();
+    for (name, slot, ty) in hashed {
+        // An address is read as its twenty bytes, as the code that uses it reads it.
+        let read = match *ty {
+            "address" => format!("and(sload({slot}), 0xffffffffffffffffffffffffffffffffffffffff)"),
+            _ => format!("sload({slot})"),
+        };
+        if out.contains(&format!("_{name}()")) {
+            text.push_str(&format!(
+                "    function _{name}() private view returns ({ty} value) {{\n        \
+                 assembly {{\n            value := {read}\n        }}\n    }}\n\n"
+            ));
+        }
+        // shortcut: the whole slot is written, upgrade if a variable at a hashed place
+        // is ever found to share its slot
+        if out.contains(&format!("_set_{name}(")) {
+            text.push_str(&format!(
+                "    function _set_{name}({ty} value) private {{\n        \
+                 assembly {{\n            sstore({slot}, value)\n        }}\n    }}\n\n"
+            ));
+        }
+    }
+    text
 }
 
 fn words_of(text: &str) -> impl Iterator<Item = &str> {
@@ -2924,6 +2989,8 @@ fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -
             out.push_str(helper);
         }
     }
+    let kept = accessors(&out, &hashed_variables(c));
+    out.push_str(&kept);
     let modifiers = with_modifiers(&mut out, &mut spans) + &with_locks(&mut out, &mut spans);
     wrappers_filled(&mut out, &mut spans);
     let errors = format!(
@@ -3607,6 +3674,24 @@ mod tests {
         let skim =
             "    function skim() external onlyOwner nonReentrant {\n        b = 2;\n    }\n\n";
         assert_eq!(out, format!("{pay}{skim}{open}"));
+    }
+
+    #[test]
+    fn a_variable_at_a_hashed_place_is_read_and_written_through_two_functions() {
+        let hashed = [("implementation", "0x36", "address")];
+        let text = "        implementation = to;\n        emit Upgraded(implementation);";
+        let through = through_accessors(text, &hashed);
+        assert_eq!(
+            through,
+            "        _set_implementation(to);\n        emit Upgraded(_implementation());"
+        );
+        let written = accessors(&through, &hashed);
+        assert!(
+            written.contains("function _implementation() private view returns (address value) {")
+        );
+        assert!(written
+            .contains("value := and(sload(0x36), 0xffffffffffffffffffffffffffffffffffffffff)"));
+        assert!(written.contains("function _set_implementation(address value) private {"));
     }
 
     #[test]

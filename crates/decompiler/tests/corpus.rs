@@ -595,8 +595,10 @@ fn types_follow_values_through_helpers_and_range_checks() {
         ),
         "{compound}"
     );
-    assert!(compound
-        .contains("function func_0xe3c(address account, address account2, uint256 arg2) internal"));
+    assert!(
+        compound.contains("function func_0x1272(address account) internal view returns (uint256)"),
+        "{compound}"
+    );
     let ens = evmdec::decompile::decompile(&by_name("ens_registry"), &opts).source;
     assert!(ens.contains("mapping(bytes32 => "), "{ens}");
     assert!(ens.contains("external returns (bytes32)"), "{ens}");
@@ -702,7 +704,7 @@ fn defaults_give_way_to_names_the_code_implies() {
         "mapping(address => uint256) balances;",
         "mapping(address => mapping(address => uint256)) allowances;",
         "function _transfer(address from, address to, uint256 amount) internal",
-        "function _pause() internal",
+        "function pause() external {",
     ] {
         assert!(usdt.contains(line), "usdt: missing `{line}`");
     }
@@ -715,7 +717,7 @@ fn defaults_give_way_to_names_the_code_implies() {
     for line in [
         "function transferFrom(address from, address to, uint256 amount) external",
         "mapping(address => uint256) public balanceOf;",
-        "function _withdrawal(uint256 amount) internal",
+        "function withdraw(uint256 amount) external {",
     ] {
         assert!(weth.contains(line), "weth9: missing `{line}`");
     }

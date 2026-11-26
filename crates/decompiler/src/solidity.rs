@@ -2284,6 +2284,218 @@ fn errors_declared(text: &str) -> String {
     out
 }
 
+struct Header<'a> {
+    before: &'a str,
+    name: &'a str,
+    params: Vec<(&'a str, &'a str)>,
+    words: Vec<&'a str>,
+    returns: &'a str,
+    body: &'a str,
+}
+
+// A function of the file taken apart: what stands before it, its header and its lines.
+fn header_of(function: &str) -> Option<Header<'_>> {
+    let at = match function.starts_with("    function ") {
+        true => 0,
+        false => function.find("\n    function ")? + 1,
+    };
+    let (head, rest) = function[at..].split_once(" {\n")?;
+    let (name, listed) = head.strip_prefix("    function ")?.split_once('(')?;
+    let close = close_of(listed)?;
+    let params: Option<Vec<(&str, &str)>> = match listed[..close].trim().is_empty() {
+        true => Some(Vec::new()),
+        false => abi::split_top(&listed[..close])
+            .into_iter()
+            .map(|p| p.trim().rsplit_once(' '))
+            .collect(),
+    };
+    let after = &listed[close + 1..];
+    let (words, returns) = match after.find(" returns (") {
+        Some(given) => after.split_at(given),
+        None => (after, ""),
+    };
+    Some(Header {
+        before: &function[..at],
+        name,
+        params: params?,
+        words: words.split_whitespace().collect(),
+        returns,
+        body: rest.strip_suffix("    }\n\n")?,
+    })
+}
+
+/* A compiler puts the body of a function in a place of its own and has the function jump
+there, so the body comes out as a helper only that function calls. An author wrote the
+body in the function, and so does this: the helper's lines go where the call was, under
+the names the function gives its arguments. */
+fn wrapper_filled(function: &str, helper: &str) -> Option<(String, String)> {
+    let (outer, inner) = (header_of(function)?, header_of(helper)?);
+    let stated = |l: &&str| !matches!(l.trim(), "unchecked {" | "}");
+    let local = |l: &str| {
+        let named = l.trim().strip_suffix(';').and_then(|l| l.rsplit_once(' '));
+        named.is_some_and(|(ty, name)| elementary(ty) && identifier(name))
+    };
+    let lines: Vec<&str> = outer
+        .body
+        .lines()
+        .filter(stated)
+        .filter(|l| !local(l))
+        .collect();
+    let leaves_early = inner.body.lines().any(|l| l.trim() == "return;");
+    let (call, after) = match lines[..] {
+        [only] if outer.returns.is_empty() && inner.returns.is_empty() => (only.trim(), ""),
+        [given, back] if outer.returns == inner.returns => {
+            let (result, call) = given.trim().split_once(" = ")?;
+            let handed = back.trim() == format!("return {result};") && identifier(result);
+            (handed.then_some(call)?, "")
+        }
+        // What the function does after the call it does after the helper's last line.
+        [only, back] if inner.returns.is_empty() && !leaves_early => (only.trim(), back),
+        _ => return None,
+    };
+    let after = match after.trim() {
+        "" => String::new(),
+        back => format!("        {back}\n"),
+    };
+    if !after.is_empty() && !after.trim().starts_with("return ") {
+        return None;
+    }
+    let given = call
+        .strip_prefix(inner.name)?
+        .strip_prefix('(')?
+        .strip_suffix(");")?;
+    let given = match given.trim().is_empty() {
+        true => Vec::new(),
+        false => abi::split_top(given),
+    };
+    let external = outer
+        .words
+        .iter()
+        .any(|w| matches!(*w, "external" | "public"));
+    if !external || !inner.words.contains(&"internal") || given.len() != inner.params.len() {
+        return None;
+    }
+    let written = |name: &str| {
+        let sets = |l: &str| {
+            l.split_once(" = ")
+                .is_some_and(|(left, _)| mentions(left, name))
+        };
+        inner.body.lines().any(sets)
+    };
+    let mut names: Vec<(String, String)> = Vec::new();
+    let mut locals = String::new();
+    for ((ty, name), value) in inner.params.iter().zip(&given) {
+        let value = value.trim();
+        let same = outer
+            .params
+            .iter()
+            .any(|(held, own)| own == &value && held == ty);
+        let fixed = matches!(value, "msg.sender" | "address(this)") && !written(name);
+        match () {
+            () if same || fixed => names.push((name.to_string(), value.to_string())),
+            () if !mentions(inner.body, name) => {}
+            () if elementary(ty) => locals.push_str(&format!("        {ty} {name} = {value};\n")),
+            () => return None,
+        }
+    }
+    // A name of the function that the helper uses for something else would become one.
+    let renamed_away = |name: &str| names.iter().any(|(from, _)| from == name);
+    let shared = |(_, name): &(&str, &str)| mentions(inner.body, name) && !renamed_away(name);
+    if outer.params.iter().any(shared) {
+        return None;
+    }
+    let reach = |words: &[&str]| match words {
+        w if w.contains(&"pure") => 0,
+        w if w.contains(&"view") => 1,
+        _ => 2,
+    };
+    let stated = [
+        "internal", "external", "public", "private", "view", "pure", "payable",
+    ];
+    let visible = outer
+        .words
+        .iter()
+        .filter(|w| !matches!(**w, "view" | "pure"));
+    let reads = ["pure", "view"].get(reach(&outer.words).max(reach(&inner.words)));
+    let guards = inner.words.iter().filter(|w| !stated.contains(w));
+    let words: Vec<&str> = visible.chain(reads).chain(guards).copied().collect();
+    let params: Vec<String> = outer
+        .params
+        .iter()
+        .map(|(ty, name)| format!("{ty} {name}"))
+        .collect();
+    let head = format!(
+        "{}{}    function {}({}) {}{} {{\n",
+        outer.before,
+        inner.before,
+        outer.name,
+        params.join(", "),
+        words.join(" "),
+        outer.returns
+    );
+    Some((
+        head,
+        format!("{locals}{}{after}", renamed(inner.body, &names)),
+    ))
+}
+
+fn wrappers_filled(out: &mut String, spans: &mut Vec<(usize, usize, usize)>) {
+    loop {
+        let mut calls: BTreeMap<&str, usize> = BTreeMap::new();
+        for (at, _) in out.match_indices('(') {
+            let word = |c: char| !c.is_ascii_alphanumeric() && c != '_';
+            let start = out[..at].rfind(word).map_or(0, |i| i + 1);
+            *calls.entry(&out[start..at]).or_default() += 1;
+        }
+        let text = |span: &(usize, usize, usize)| &out[span.0..span.1];
+        let mut filled: BTreeMap<usize, (usize, String, String)> = BTreeMap::new();
+        let mut taken: BTreeSet<usize> = BTreeSet::new();
+        for (at, helper) in spans.iter().enumerate() {
+            let name = header_of(text(helper)).map_or("", |h| h.name);
+            if calls.get(name) != Some(&2) || taken.contains(&at) {
+                continue;
+            }
+            let called = format!("{name}(");
+            let free = |(i, s): &(usize, &(usize, usize, usize))| {
+                *i != at && !taken.contains(i) && text(s).contains(&called)
+            };
+            let mut callers = spans.iter().enumerate().filter(free);
+            let found =
+                callers.find_map(|(i, s)| Some((i, wrapper_filled(text(s), text(helper))?)));
+            if let Some((from, (head, body))) = found {
+                taken.extend([at, from]);
+                filled.insert(from, (at, head, body));
+            }
+        }
+        if filled.is_empty() {
+            return;
+        }
+        let helpers: BTreeSet<usize> = filled.values().map(|(helper, _, _)| *helper).collect();
+        let mut rebuilt = String::new();
+        let mut moved = Vec::new();
+        let mut copied = 0;
+        for (at, span) in spans.iter().enumerate() {
+            rebuilt.push_str(&out[copied..span.0]);
+            copied = span.1;
+            let start = rebuilt.len();
+            if let Some((helper, head, body)) = filled.get(&at) {
+                rebuilt.push_str(head);
+                moved.push((start, rebuilt.len(), span.2));
+                let start = rebuilt.len();
+                rebuilt.push_str(body);
+                moved.push((start, rebuilt.len(), spans[*helper].2));
+                rebuilt.push_str("    }\n\n");
+            } else if !helpers.contains(&at) {
+                rebuilt.push_str(&out[span.0..span.1]);
+                moved.push((start, rebuilt.len(), span.2));
+            }
+        }
+        rebuilt.push_str(&out[copied..]);
+        *out = rebuilt;
+        *spans = moved;
+    }
+}
+
 fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
     let own = version(c).filter(|_| shape.own_version);
     let pragma = match own {
@@ -2388,6 +2600,7 @@ fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -
             out.push_str(helper);
         }
     }
+    wrappers_filled(&mut out, &mut spans);
     let errors = format!(
         "{}{}",
         structs_declared(&out[errors_at..]),
@@ -2978,6 +3191,30 @@ mod tests {
         assert_eq!(negated("a < b && c"), "!(a < b && c)");
         assert_eq!(negated("!(f(a))"), "f(a)");
         assert_eq!(negated("!(ok)"), "ok");
+    }
+
+    #[test]
+    fn the_body_only_one_function_calls_is_written_in_that_function() {
+        let function =
+            "    function pay(address to, uint256 arg1) external view returns (bool) {\n        \
+             bool ret_1_0;\n        ret_1_0 = func_0x1f(to, msg.sender, arg1 + 1);\n        \
+             return ret_1_0;\n    }\n\n";
+        let helper = "    function func_0x1f(address arg0, address arg1, uint256 arg2) internal onlyOwner returns (bool) {\n        \
+             balances[arg0] = arg2;\n        return arg1 == arg0;\n    }\n\n";
+        let mut out = format!("{function}{helper}");
+        let mut spans = vec![(0, function.len(), 0), (function.len(), out.len(), 1)];
+        wrappers_filled(&mut out, &mut spans);
+        assert_eq!(
+            out,
+            "    function pay(address to, uint256 arg1) external onlyOwner returns (bool) {\n        \
+             uint256 arg2 = arg1 + 1;\n        balances[to] = arg2;\n        \
+             return msg.sender == to;\n    }\n\n"
+        );
+        assert_eq!(spans.iter().map(|s| s.2).collect::<Vec<_>>(), [0, 1]);
+        let twice = format!("{function}{helper}    function f() external {{\n        func_0x1f(a, b, 1);\n    }}\n\n");
+        let mut kept = twice.clone();
+        wrappers_filled(&mut kept, &mut spans.clone());
+        assert_eq!(kept, twice);
     }
 
     #[test]

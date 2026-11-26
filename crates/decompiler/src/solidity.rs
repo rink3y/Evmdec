@@ -301,6 +301,7 @@ fn place(
     packer: &mut Packer,
     structs: &mut String,
     at: u64,
+    until: Option<u64>,
     v: &crate::decompile::StorageVar,
     name: &mut dyn FnMut(&str) -> Result<String, String>,
 ) -> Result<(), String> {
@@ -318,9 +319,14 @@ fn place(
             slots = span;
         }
     }
+    let mut ty = v.declared_type();
     if v.fixed_array {
         let (element, count) = v.ty.rsplit_once('[').unwrap_or((&v.ty, ""));
-        let count = count.trim_end_matches(']').parse().ok();
+        /* The code never says how long a fixed array is. It ends no later than the next
+        variable begins, and an author rarely leaves slots unused after one. */
+        let to_next = until.map(|next| next.saturating_sub(at));
+        let to_next = to_next.filter(|n| (1..=WIDEST_GAP).contains(n));
+        let count = count.trim_end_matches(']').parse().ok().or(to_next);
         let whole_words = bytes_of(element) == 32 && v.members.is_empty();
         slots = count
             .filter(|_| whole_words)
@@ -369,9 +375,10 @@ fn layout(c: &Contract, taken: &BTreeSet<&str>, public: &[(usize, String)]) -> L
         pads: 0,
     };
     let trace = std::env::var_os("EVMDEC_RAISE_TRACE").is_some();
-    for (at, v) in vars {
+    for (i, (at, v)) in vars.iter().enumerate() {
         let before = packer.text.len();
-        if let Err(why) = place(&mut packer, &mut structs, at, v, &mut name) {
+        let until = vars.get(i + 1).map(|(next, _)| *next);
+        if let Err(why) = place(&mut packer, &mut structs, *at, until, v, &mut name) {
             packer.text.truncate(before);
             if trace {
                 eprintln!("left undeclared: {why}");

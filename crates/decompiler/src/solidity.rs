@@ -1271,6 +1271,12 @@ fn negated(test: &str) -> String {
         [(at, sign, other)] if simple => {
             format!("{}{other}{}", &test[..at], &test[at + sign.len()..])
         }
+        _ if test
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') =>
+        {
+            format!("!{test}")
+        }
         _ => format!("!({test})"),
     }
 }
@@ -1302,66 +1308,110 @@ fn shared_tails(lines: Vec<String>) -> Vec<String> {
         ];
         code == HANDED_ON || ways.iter().any(|w| code.starts_with(w))
     };
+    // The jumps a run of lines ends with, where every way through it ends by leaving or
+    // by such a jump.
+    fn ends(
+        lines: &[String],
+        (from, to): (usize, usize),
+        jump: &str,
+        leaves: &dyn Fn(&str) -> bool,
+    ) -> Option<Vec<usize>> {
+        let indent = |i: usize| lines[i].len() - lines[i].trim_start().len();
+        let last = to.checked_sub(1).filter(|last| *last >= from)?;
+        let code = lines[last].trim();
+        if code == jump || leaves(code) {
+            return Some(Vec::from_iter((code == jump).then_some(last)));
+        }
+        let level = |i: &usize| indent(*i) <= indent(last) && label_of(&lines[*i]).is_none();
+        let other = (from..last).rev().find(level)?;
+        let opened = (from..other).rev().find(level)?;
+        let branched = code == "}"
+            && lines[other].trim() == "} else {"
+            && lines[opened].trim().starts_with("if (")
+            && indent(opened) == indent(last);
+        let mut jumps = ends(lines, (opened + 1, other), jump, leaves).filter(|_| branched)?;
+        jumps.extend(ends(lines, (other + 1, last), jump, leaves)?);
+        Some(jumps)
+    }
     let moved = (0..lines.len()).find_map(|at| {
         let name = label_of(&lines[at])?;
-        let depth = indent(&lines[at]);
         let jump = format!("goto {name};");
-        let mut jumps = (0..lines.len()).filter(|i| lines[*i].contains(&jump));
-        let (from, None) = (jumps.next()?, jumps.next()) else {
-            return None;
+        let level = |depth: usize| {
+            let lines = &lines;
+            move |i: &usize| indent(&lines[*i]) <= depth && label_of(&lines[*i]).is_none()
         };
-        let level = |i: &usize| indent(&lines[*i]) <= depth && label_of(&lines[*i]).is_none();
-        let opened = (0..at).rev().find(level)?;
-        let other = (at + 1..lines.len()).find(level)?;
-        let closed = (other + 1..lines.len()).find(level)?;
-        let test = lines[opened]
-            .trim()
-            .strip_prefix("if (")?
-            .strip_suffix(") {")?;
-        let shaped = indent(&lines[opened]) == depth
-            && lines[other].trim() == "} else {"
-            && lines[closed].trim() == "}"
-            && lines[from].trim() == jump
-            && (other..closed).contains(&from);
-        // From the jump outwards, each block has to end where the one around it does,
-        // and the branch beside it has to leave.
-        let mut last = from;
-        while shaped && indent(&lines[last]) > depth + 4 {
-            let inner = indent(&lines[last]);
-            let around = |i: &usize| indent(&lines[*i]) < inner;
-            let (end, start) = (last + 1, (0..last).rev().find(around)?);
-            last = match (lines[start].trim(), lines[end].trim()) {
-                ("} else {", "}") if leaves(lines[start - 1].trim()) => end,
-                (opener, "} else {") if opener.starts_with("if (") => {
-                    let close = (end + 1..closed).find(around)?;
-                    let left = leaves(lines[close - 1].trim()) && lines[close].trim() == "}";
-                    left.then_some(close)?
+        /* From the label outwards, to the branch whose other side jumps to it. The
+        shared code runs to the end of its block. Each block around that has to end
+        where the one around it does, and every way through the branch beside it has
+        to leave or jump to the label, as the shared code would otherwise run after a
+        branch that never reached it. */
+        let mut depth = indent(&lines[at]);
+        let end = (at + 1..lines.len()).find(level(depth))?;
+        let mut close = end;
+        let mut jumps: Vec<usize> = Vec::new();
+        let closed = loop {
+            let open = (0..at).rev().find(level(depth))?;
+            let fits = indent(&lines[open]) == depth && indent(&lines[close]) == depth;
+            let (beside, last) = match (lines[open].trim(), lines[close].trim()) {
+                (test, "} else {") if fits && test.starts_with("if (") => {
+                    let last = (close + 1..lines.len()).find(level(depth))?;
+                    ((close + 1, last), last)
+                }
+                ("} else {", "}") if fits => {
+                    let test = (0..open).rev().find(level(depth))?;
+                    ((test + 1, open), close)
                 }
                 _ => return None,
             };
-        }
-        (shaped && last + 1 == closed).then(|| (at, opened, other, from, closed, test.to_string()))
+            let found =
+                ends(&lines, beside, &jump, &leaves).filter(|_| lines[last].trim() == "}")?;
+            let reached = !found.is_empty() && beside.0 > at;
+            jumps.extend(found);
+            if reached {
+                break last;
+            }
+            let outer = lines.get(last + 1).filter(|l| label_of(l).is_none())?;
+            (depth, close) = (indent(outer) < depth).then(|| (indent(outer), last + 1))?;
+        };
+        let all = (0..lines.len())
+            .filter(|i| lines[*i].contains(&jump))
+            .count();
+        (all == jumps.len()).then_some((at, end, jumps, closed, depth))
     });
-    let Some((at, opened, other, from, closed, test)) = moved else {
+    let Some((at, end, jumps, closed, depth)) = moved else {
         return lines;
     };
-    let mut out = lines[..opened].to_vec();
-    let pad = &lines[opened][..indent(&lines[opened])];
-    match opened + 1 == at {
-        true => out.push(format!("{pad}if ({}) {{", negated(&test))),
-        false => {
-            out.extend_from_slice(&lines[opened..at]);
-            out.push(lines[other].clone());
+    let nearer = indent(&lines[at]) + 4 - depth;
+    let mut out: Vec<String> = Vec::new();
+    let mut emptied: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i == at || jumps.contains(&i) {
+            emptied.push(out.len());
+        }
+        if !(at..end).contains(&i) && !jumps.contains(&i) {
+            out.push(line.clone());
+        }
+        if i == closed {
+            let shared = lines[at + 1..end].iter();
+            out.extend(shared.map(|l| l[nearer.min(indent(l))..].to_string()));
         }
     }
-    out.extend_from_slice(&lines[other + 1..from]);
-    out.extend_from_slice(&lines[from + 1..=closed]);
-    out.extend(
-        lines[at + 1..other]
-            .iter()
-            .map(|l| l[4.min(l.len())..].to_string()),
-    );
-    out.extend_from_slice(&lines[closed + 1..]);
+    // A block that held nothing but the shared code or the jump is left empty, and goes.
+    for at in emptied.into_iter().rev() {
+        let (before, after) = (out[at - 1].trim().to_string(), out[at].trim().to_string());
+        let test = before
+            .strip_prefix("if (")
+            .and_then(|t| t.strip_suffix(") {"));
+        match (test, after.as_str()) {
+            (Some(test), "} else {") => {
+                let pad = " ".repeat(indent(&out[at - 1]));
+                out[at - 1] = format!("{pad}if ({}) {{", negated(test));
+                out.remove(at);
+            }
+            (None, "}") if before == "} else {" => drop(out.remove(at - 1)),
+            _ => {}
+        }
+    }
     shared_tails(out)
 }
 
@@ -3461,6 +3511,17 @@ mod tests {
         let after = "if (a == 0) {\n    f = 4;\n} else {\n    if (c) {\n        revert();\n    \
              } else {\n        d = 2;\n    }\n}\nb = 1;\nreturn;";
         assert_eq!(shared_tails(lines(&led)), lines(after));
+        let deep = "if (a) {\n    if (b) {\n        return;\n    } else {\n        g = 5;\n    L2a:\n        \
+             h = 6;\n    }\n} else {\n    d = 2;\n    goto L2a;\n}\ni = 7;";
+        let after = "if (a) {\n    if (b) {\n        return;\n    } else {\n        g = 5;\n    }\n} else {\n    \
+             d = 2;\n}\nh = 6;\ni = 7;";
+        assert_eq!(shared_tails(lines(deep)), lines(after));
+        let beside = deep.replace("        return;", "        j = 8;");
+        assert_eq!(shared_tails(lines(&beside)), lines(&beside));
+        let twice = "if (a) {\nL3b:\n    h = 6;\n} else {\n    if (b) {\n        d = 2;\n        goto L3b;\n    \
+             } else {\n        goto L3b;\n    }\n}";
+        let after = "if (!a) {\n    if (b) {\n        d = 2;\n    }\n}\nh = 6;";
+        assert_eq!(shared_tails(lines(twice)), lines(after));
         let falls = jumped.replace("revert();", "e = 3;");
         assert_eq!(shared_tails(lines(&falls)), lines(&falls));
         assert_eq!(negated("a < b && c"), "!(a < b && c)");

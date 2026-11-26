@@ -1004,7 +1004,7 @@ fn a_merged_value_is_assigned_on_every_way_in() {
     };
     let helper = source("../../testdata/regress/umbrella_batch_helper.hex");
     assert!(
-        helper.contains("if (!ret_1_0) {\n            v1 = arg2;\n        L1236:"),
+        helper.contains("if (!ret_1_0) {\n            v1 = arg2;\n        } else {"),
         "the branch that skips the swap still hands its amount to the join"
     );
     let token = source("../../testdata/regress/minime_token.hex");
@@ -1046,7 +1046,8 @@ fn both_ways_into_a_join_keep_their_own_call_after_it() {
         .find("function func_0x216b(")
         .expect("the swap callback");
     let body = &router[start..start + router[start..].find("\n    }").unwrap()];
-    let after = &body[body.find("L21be:").expect("the join")..];
+    let join = "if (_calldata(132) == address(this)) {";
+    let after = &body[body.find(join).expect("the join")..];
     let (token0, token1) = ("\"token0()\"", "\"token1()\"");
     assert!(
         after.contains(token1) && after.contains(token0),

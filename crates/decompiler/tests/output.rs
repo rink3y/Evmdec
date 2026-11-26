@@ -396,7 +396,7 @@ fn a_word_that_only_looks_like_a_pointer_leaves_the_call_as_its_words() {
             .as_str(),
     );
     assert!(
-        out.contains("abi.encodeWithSelector(bytes4(0xa9059cbb), msg.sender, 64)"),
+        out.contains("abi.encodeWithSignature(\"transfer(address,uint256)\", msg.sender, 64)"),
         "{out}"
     );
 }

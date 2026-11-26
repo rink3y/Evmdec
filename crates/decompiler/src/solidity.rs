@@ -1,6 +1,7 @@
 use crate::decompile::{Contract, Function};
 use crate::function::{FnKind, Mutability};
 use crate::{abi, exact, keccak};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 // The oldest release whose assembly knows every instruction in use today.
@@ -456,7 +457,12 @@ pub struct Plain<'a> {
     drafted: bool,
     // Functions the compiler found to hold more values at once than it can reach.
     packed: &'a BTreeSet<usize>,
+    called: &'a Called,
 }
+
+// The functions of other contracts the text calls by name: for each interface and
+// signature, the rest of its declaration.
+type Called = RefCell<BTreeMap<(String, String), String>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Reach {
@@ -539,6 +545,12 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     };
     let text = unused_answers(&text);
     let text = saved_as_stored(c, &plain.layout.renamed, &text);
+    let head = crate::decompile::fmt_function_header(f);
+    let named = c.functions.iter().map(|f| f.name.as_str());
+    let stored = plain.layout.renamed.iter().map(|(_, to)| to.as_str());
+    let taken: BTreeSet<&str> = named.chain(stored).chain(words_of(&head)).collect();
+    let validated = version(c).is_none_or(|v| v >= (0, 8, 0));
+    let text = typed_calls(&text, taken, validated, plain.called);
     let declared = declarations(c, f, &text);
     let text = returned_as_declared(&f.returns, &declared, &text);
     let marked: Vec<String> = text.lines().map(unchecked_statement).collect();
@@ -1229,6 +1241,310 @@ fn pushed(lines: Vec<String>) -> Vec<String> {
     out
 }
 
+const HANDED_ON: &str =
+    "assembly { returndatacopy(0, 0, returndatasize()) revert(0, returndatasize()) }";
+
+fn words_of(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+}
+
+const ERC20: [&str; 6] = [
+    "totalSupply()",
+    "balanceOf(address)",
+    "transfer(address,uint256)",
+    "transferFrom(address,address,uint256)",
+    "approve(address,uint256)",
+    "allowance(address,address)",
+];
+
+// An interface is named after the standard its function belongs to, or after the
+// variable that holds the contract where an author named one.
+fn interface(target: &str, signature: &str) -> String {
+    if ERC20.contains(&signature) {
+        return "IERC20".to_string();
+    }
+    let name = target.trim_start_matches('_');
+    let own = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphabetic());
+    match (own, name.chars().next()) {
+        (true, Some(first)) => format!("I{}{}", first.to_ascii_uppercase(), &name[1..]),
+        _ => "IContract".to_string(),
+    }
+}
+
+struct Outside<'a> {
+    number: &'a str,
+    target: &'a str,
+    method: &'a str,
+    options: &'a str,
+    signature: &'a str,
+    given: &'a str,
+}
+
+fn outside_call(code: &str) -> Option<Outside<'_>> {
+    let (number, rest) = code.strip_prefix("(success_")?.split_once(", ")?;
+    let (_, rest) = rest.split_once(") = ")?;
+    let (head, rest) = rest.split_once("(abi.encodeWithSignature(\"")?;
+    let (signature, rest) = rest.split_once('"')?;
+    let given = rest.strip_suffix("));")?;
+    let given = given.strip_prefix(", ").unwrap_or(given);
+    let (head, options) = match head.strip_suffix('}') {
+        Some(opened) => opened.rsplit_once('{')?,
+        None => (head, ""),
+    };
+    let (target, method) = head.rsplit_once('.')?;
+    let call = Outside {
+        number,
+        target,
+        method,
+        options,
+        signature,
+        given,
+    };
+    matches!(method, "call" | "staticcall").then_some(call)
+}
+
+// The name a value a call gave back goes by: the function's own, without the words an
+// author leaves out, and unlike every name the function already has.
+fn answer_name(function: &str, taken: &BTreeSet<String>) -> String {
+    const RESERVED: [&str; 12] = [
+        "address", "after", "default", "length", "match", "now", "of", "payable", "this", "type",
+        "var", "in",
+    ];
+    let cut = function.strip_prefix("get").unwrap_or(function);
+    let cut = cut.strip_suffix("Of").unwrap_or(cut);
+    let cut = cut.trim_matches('_');
+    let base: String = match cut.chars().next() {
+        Some(first) if first.is_ascii_alphabetic() => {
+            format!("{}{}", first.to_ascii_lowercase(), &cut[1..])
+        }
+        _ => "answer".to_string(),
+    };
+    let free = |name: &String| !taken.contains(name) && !RESERVED.contains(&name.as_str());
+    let numbered = (2..).map(|i| format!("{base}{i}"));
+    std::iter::once(base.clone())
+        .chain(numbered)
+        .find(free)
+        .unwrap_or(base)
+}
+
+/* What a compiler writes for a call made by name: a test that the address holds code,
+the call, the failure handed on as it came, a test that the answer is long enough, and
+for a narrow type a test that the word holds nothing else. A call the text shows with all
+of that is the call by name, and the tests go, as the compiler writes them again. A call
+that lacks one of them was not made by name, or not by a compiler that tests, and stays
+as it is. */
+fn typed_call(
+    lines: &[String],
+    at: usize,
+    taken: &mut BTreeSet<String>,
+    validated: bool,
+    called: &Called,
+) -> Option<Vec<String>> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let depth = indent(&lines[at]);
+    let call = outside_call(lines[at].trim())?;
+    let (flag, data) = (
+        format!("success_{}", call.number),
+        format!("returned_{}", call.number),
+    );
+    let code = |i: usize| lines.get(i).map_or("", |l| l.trim());
+    let mut rest: Vec<String> = if code(at + 1) == format!("if (!{flag}) {{") {
+        let shaped = code(at + 2) == HANDED_ON && code(at + 3) == "}";
+        lines.get(at + 4..).filter(|_| shaped)?.to_vec()
+    } else if code(at + 1) == format!("if ({flag}) {{") {
+        let close = (at + 2..lines.len()).find(|i| indent(&lines[*i]) <= depth)?;
+        let shaped = lines[close] == format!("{}}} else {{", " ".repeat(depth))
+            && code(close + 1) == HANDED_ON
+            && code(close + 2) == "}";
+        let inner = lines[at + 2..close]
+            .iter()
+            .map(|l| l[4.min(l.len())..].to_string());
+        let after = lines.get(close + 3..).filter(|_| shaped)?;
+        inner.chain(after.iter().cloned()).collect()
+    } else {
+        return None;
+    };
+    let size = |code: &str| -> Option<usize> {
+        let test = code.strip_prefix("require(")?.strip_suffix(");")?;
+        let signed = test.strip_prefix("int256(_returndatasize()) >= ");
+        let least = signed.or_else(|| test.strip_prefix("_returndatasize() >= "))?;
+        let bytes = least
+            .parse::<usize>()
+            .ok()
+            .filter(|b| *b > 0 && b % 32 == 0)?;
+        Some(bytes / 32)
+    };
+    // A compiler rounds the length of the answer up to whole words before it reads it.
+    let rounded = rest.first().and_then(|l| {
+        let (name, value) = l.trim().split_once(" = _returndatasize() + 31 & 0x")?;
+        let whole_words = value.strip_suffix("e0;")?.chars().all(|c| c == 'f');
+        let read = lines[..at]
+            .iter()
+            .chain(&rest[1..])
+            .any(|l| mentions(l, name));
+        (whole_words && numbered_name(name, "v") == Some(name) && !read).then_some(())
+    });
+    if rounded.is_some() {
+        rest.remove(0);
+    }
+    let tested = format!("require({}.code.length != 0);", call.target);
+    let holds_code = at > 0 && lines[at - 1] == format!("{}{tested}", " ".repeat(depth));
+    let in_scope = |l: &String| l.trim().is_empty() || indent(l) >= depth;
+    let words = rest
+        .first()
+        .filter(|l| in_scope(l))
+        .and_then(|l| size(l.trim()));
+    match words {
+        Some(_) => drop(rest.remove(0)),
+        None if holds_code => {}
+        None => return None,
+    }
+    let mut types = vec!["uint256".to_string(); words.unwrap_or(0)];
+    let word = |i: usize| format!("_word({data}, {})", 32 * i);
+    loop {
+        let line = rest.first().filter(|_| validated).map_or("", |l| l.trim());
+        let found = (0..types.len()).find_map(|i| {
+            let test = line.strip_prefix(&format!("require({} == ", word(i)))?;
+            let cast = test.strip_suffix(");")?;
+            let ty = match cast.strip_suffix(&format!("({})", word(i))) {
+                Some(ty) if sized(ty, "uint", |bits| bits % 8 == 0 && bits < 256) => ty,
+                _ if cast == format!("address(uint160({}))", word(i)) => "address",
+                _ if cast == format!("({} != 0)", word(i)) => "bool",
+                _ => return None,
+            };
+            Some((i, ty.to_string()))
+        });
+        let Some((i, ty)) = found.filter(|(i, _)| types[*i] == "uint256") else {
+            break;
+        };
+        types[i] = ty;
+        rest.remove(0);
+    }
+    let scope = rest.iter().position(|l| !in_scope(l)).unwrap_or(rest.len());
+    let before = lines[..at].iter().chain(&rest[scope..]);
+    let own = lines[..at].iter().chain(&rest);
+    if before.clone().any(|l| mentions(l, &data)) || own.clone().any(|l| mentions(l, &flag)) {
+        return None;
+    }
+    let reads = |i: usize| rest[..scope].iter().any(|l| l.contains(&word(i)));
+    let function = crate::sigs::name_of(call.signature);
+    let mut names: Vec<Option<String>> = Vec::new();
+    for i in 0..types.len() {
+        let numbered = match types.len() {
+            1 => function.to_string(),
+            _ => format!("{function}{i}"),
+        };
+        let name = reads(i).then(|| answer_name(&numbered, taken));
+        taken.extend(name.clone());
+        names.push(name);
+    }
+    for line in &mut rest[..scope] {
+        for (i, name) in names.iter().enumerate() {
+            let (Some(name), read) = (name, word(i)) else {
+                continue;
+            };
+            let (narrow, wide) = match types[i].as_str() {
+                "uint256" => (read.clone(), name.clone()),
+                "address" => (
+                    format!("address(uint160({read}))"),
+                    format!("uint256(uint160({name}))"),
+                ),
+                "bool" => (format!("({read} != 0)"), format!("({name} ? 1 : 0)")),
+                ty => (format!("{ty}({read})"), format!("uint256({name})")),
+            };
+            *line = line.replace(&narrow, name).replace(&read, &wide);
+        }
+    }
+    if rest[..scope].iter().any(|l| mentions(l, &data)) {
+        return None;
+    }
+    let listed = match names.iter().filter(|n| n.is_some()).count() {
+        0 => String::new(),
+        _ if names.len() == 1 => format!("{} {} = ", types[0], names[0].clone()?),
+        _ if lines[at].contains("unchecked(") => return None,
+        _ => {
+            let each = |(ty, name): (&String, &Option<String>)| match name {
+                Some(name) => format!("{ty} {name}"),
+                None => String::new(),
+            };
+            let all: Vec<String> = types.iter().zip(&names).map(each).collect();
+            format!("({}) = ", all.join(", "))
+        }
+    };
+    let named = interface(call.target, call.signature);
+    let mut tail = "external".to_string();
+    if call.method == "staticcall" {
+        tail.push_str(" view");
+    }
+    if call.options.contains("value: ") {
+        tail.push_str(" payable");
+    }
+    if !types.is_empty() {
+        tail.push_str(&format!(" returns ({})", types.join(", ")));
+    }
+    let key = (named.clone(), call.signature.to_string());
+    let declared = called.borrow().get(&key).cloned();
+    if declared.is_some_and(|as_before| as_before != tail) {
+        return None;
+    }
+    called.borrow_mut().insert(key, tail);
+    let options = match call.options {
+        "" => String::new(),
+        given => format!("{{{given}}}"),
+    };
+    let made = format!(
+        "{}{listed}{named}({}).{function}{options}({});",
+        " ".repeat(depth),
+        call.target,
+        call.given
+    );
+    // A current compiler makes the test for code only where no answer is read, so beside
+    // a call that reads one the test stays as a line of its own.
+    let kept = at - usize::from(holds_code && words.is_none());
+    let mut out = lines[..kept].to_vec();
+    out.push(made);
+    out.extend(rest);
+    Some(out)
+}
+
+fn typed_calls(text: &str, taken: BTreeSet<&str>, validated: bool, called: &Called) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut taken: BTreeSet<String> = taken
+        .into_iter()
+        .chain(words_of(text))
+        .map(String::from)
+        .collect();
+    let mut at = 0;
+    while at < lines.len() {
+        match typed_call(&lines, at, &mut taken, validated, called) {
+            Some(folded) => lines = folded,
+            None => at += 1,
+        }
+    }
+    lines.join("\n")
+}
+
+// The interfaces the calls by name go through, each with the functions called.
+fn interfaces_declared(called: &Called) -> String {
+    let mut out = String::new();
+    let mut open = "";
+    let called = called.borrow();
+    for ((name, signature), tail) in called.iter() {
+        if open != name {
+            out.push_str(if open.is_empty() { "" } else { "}\n\n" });
+            out.push_str(&format!("interface {name} {{\n"));
+            open = name;
+        }
+        let function = crate::sigs::name_of(signature);
+        let params = crate::sigs::params_of(signature).join(", ");
+        out.push_str(&format!("    function {function}({params}) {tail};\n"));
+    }
+    if !open.is_empty() {
+        out.push_str("}\n\n");
+    }
+    out
+}
+
 fn mentions(line: &str, name: &str) -> bool {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     line.match_indices(name)
@@ -1795,6 +2111,10 @@ fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -
     let licence = "// SPDX-License-Identifier: UNLICENSED";
     let mut out = format!("{licence}\npragma solidity {pragma};\n{built}\n");
     let mut spans = Vec::new();
+    let interfaces_at = out.len();
+    if let Some(plain) = plain {
+        plain.called.borrow_mut().clear();
+    }
     out.push_str(&format!("contract {name} {{\n"));
     if let Some(plain) = plain.filter(|p| !p.layout.text.is_empty()) {
         out.push_str(&plain.layout.text);
@@ -1885,10 +2205,13 @@ fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -
         structs_declared(&out[errors_at..]),
         errors_declared(&out[errors_at..])
     );
-    for span in &mut spans {
-        *span = (span.0 + errors.len(), span.1 + errors.len(), span.2);
-    }
     out.insert_str(errors_at, &errors);
+    let interfaces = plain.map_or(String::new(), |p| interfaces_declared(p.called));
+    out.insert_str(interfaces_at, &interfaces);
+    let moved = errors.len() + interfaces.len();
+    for span in &mut spans {
+        *span = (span.0 + moved, span.1 + moved, span.2);
+    }
     if clean {
         out.truncate(out.trim_end().len());
         out.push_str("\n}\n");
@@ -2069,6 +2392,7 @@ pub fn draft(c: &Contract, name: &str) -> String {
         relaxed: &BTreeMap::new(),
         drafted: true,
         packed: &BTreeSet::new(),
+        called: &Called::default(),
     };
     compose(c, name, &shape, Some(&plain)).text
 }
@@ -2223,6 +2547,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
             relaxed: &relaxed,
             drafted: false,
             packed: &packed,
+            called: &Called::default(),
         };
         let draft = compose(c, NAME, &shape, Some(&written));
         if draft.spans.is_empty() && read.is_empty() {
@@ -2361,6 +2686,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                         relaxed: &relaxed,
                         drafted: false,
                         packed: &packed,
+                        called: &Called::default(),
                     };
                     let clean = every.then(|| compose(c, NAME, &shape, Some(&whole)));
                     let tried = clean.and_then(|draft| {
@@ -2395,6 +2721,39 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_with_every_test_a_compiler_writes_is_made_by_name() {
+        let handed_on =
+            "assembly { returndatacopy(0, 0, returndatasize()) revert(0, returndatasize()) }";
+        let call = "(success_1, returned_1) = token.staticcall(abi.encodeWithSignature(";
+        let failure = format!("        if (!success_1) {{\n            {handed_on}\n        }}");
+        let text = format!(
+            "        require(token.code.length != 0);\n        {call}\"owner()\"));\n{failure}\n        \
+             require(_returndatasize() >= 32);\n        \
+             require(_word(returned_1, 0) == address(uint160(_word(returned_1, 0))));\n        \
+             return address(uint160(_word(returned_1, 0)));"
+        );
+        let called = Called::default();
+        let taken = BTreeSet::from(["owner"]);
+        assert_eq!(
+            typed_calls(&text, taken, true, &called),
+            "        require(token.code.length != 0);\n        \
+             address owner2 = IToken(token).owner();\n        return owner2;"
+        );
+        assert_eq!(
+            interfaces_declared(&called),
+            "interface IToken {\n    function owner() external view returns (address);\n}\n\n"
+        );
+        let untested = format!(
+            "        {call}\"owner()\"));\n{failure}\n        return _word(returned_1, 0);"
+        );
+        let called = Called::default();
+        assert_eq!(
+            typed_calls(&untested, BTreeSet::new(), true, &called),
+            untested
+        );
+    }
 
     #[test]
     fn a_length_moved_by_one_around_the_last_element_is_a_push_or_a_pop() {

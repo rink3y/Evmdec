@@ -251,8 +251,8 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
         "checked_sub not inlined"
     );
     assert!(
-        src.contains("return _word(returned_1, 0);"),
-        "return data not resolved"
+        src.contains("uint256 balance = IERC20(stor_6_1).balanceOf(address(this));"),
+        "the call is not made by name"
     );
     assert!(!src.contains("int256(msg.data.length"));
     assert!(!src.contains("== address("), "ABI validator printed");
@@ -1029,7 +1029,7 @@ fn both_ways_into_a_join_keep_their_own_call_after_it() {
         .expect("the swap callback");
     let body = &router[start..start + router[start..].find("\n    }").unwrap()];
     let after = &body[body.find("L21be:").expect("the join")..];
-    let (token0, token1) = ("bytes4(0x0dfe1681)", "bytes4(0xd21220a7)");
+    let (token0, token1) = ("\"token0()\"", "\"token1()\"");
     assert!(
         after.contains(token1) && after.contains(token0),
         "the pool is asked for the other token whichever one was paid: {after}"
@@ -1339,9 +1339,9 @@ fn call_data_is_the_bytes_the_writes_left_under_one_pointer_name() {
     );
     let helper = regress("umbrella_batch_helper.hex").source;
     assert!(helper.contains(
-        ".call(abi.encodeWithSelector(bytes4(uint32(v2)), _word(returned_2, 0), msg.sender, address(this)));"
+        ".call(abi.encodeWithSelector(bytes4(uint32(v2)), redeem2, msg.sender, address(this)));"
     ));
-    assert!(helper.contains("abi.encodeWithSelector(bytes4(0x6e553f65), arg2, address(this))"));
+    assert!(helper.contains(".deposit(arg2, address(this));"));
     let gauge = regress("vyper_gauge.hex").source;
     assert!(
         gauge.contains("stor_21.call(abi.encodePacked(bytes4(mem[0x3c8])));"),

@@ -2316,6 +2316,199 @@ fn modifier_name(test: &str) -> Option<String> {
     }
 }
 
+// A header with one more modifier, which goes after the ones it has and before what
+// the function returns.
+fn guarded_by(head: &str, name: &str) -> String {
+    let (before, after) = match head.rfind(" returns (") {
+        Some(returns) => head.split_at(returns),
+        None => (head, ""),
+    };
+    format!("{before} {name}{after}")
+}
+
+fn functions_rewritten(
+    out: &mut String,
+    spans: &mut [(usize, usize, usize)],
+    rewritten: impl Fn(&str) -> Option<String>,
+) {
+    let mut rebuilt = String::new();
+    let mut copied = 0;
+    for span in spans.iter_mut() {
+        rebuilt.push_str(&out[copied..span.0]);
+        let function = &out[span.0..span.1];
+        let start = rebuilt.len();
+        match rewritten(function) {
+            Some(text) => rebuilt.push_str(&text),
+            None => rebuilt.push_str(function),
+        }
+        copied = span.1;
+        *span = (start, rebuilt.len(), span.2);
+    }
+    rebuilt.push_str(&out[copied..]);
+    *out = rebuilt;
+}
+
+struct Lock {
+    test: String,
+    set: String,
+    reset: String,
+    head_end: usize,
+    body: String,
+}
+
+/* A function that tests a lock, sets it, and sets it back before every way out that
+returns is one an author wrote under a modifier. The lines of the lock go, and what is
+left is the body. A way out that fails needs no setting back, as failing undoes the lock.
+A value handed back is worked out before the modifier sets the lock back, so it has to be
+one that working out cannot change. */
+fn locked(function: &str) -> Option<Lock> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let head_end = function
+        .find(" {\n")
+        .filter(|_| function.starts_with("    function "))?;
+    let all: Vec<&str> = function[head_end + 3..]
+        .strip_suffix("    }\n\n")?
+        .lines()
+        .collect();
+    let wrapped =
+        all.first().is_some_and(|l| l.trim() == "unchecked {") && all.last() == Some(&"        }");
+    let lines = match wrapped {
+        true => &all[1..all.len() - 1],
+        false => &all[..],
+    };
+    let local = |l: &&str| {
+        let named = l.trim().strip_suffix(';').and_then(|l| l.rsplit_once(' '));
+        named.is_some_and(|(ty, name)| elementary(ty) && identifier(name))
+    };
+    let value = |v: &str| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let first = lines.iter().position(|l| !local(l))?;
+    let (test, set) = (lines.get(first)?.trim(), lines.get(first + 1)?.trim());
+    let (lock, _) = set
+        .strip_suffix(';')?
+        .split_once(" = ")
+        .filter(|(l, v)| identifier(l) && value(v))?;
+    let tested = test.strip_prefix("require(")?.strip_suffix(");")?;
+    let tested = tested.split(", \"").next()?.trim_start_matches('!');
+    let against = tested.strip_prefix(lock)?;
+    let plain = against.is_empty()
+        || [" == ", " != "]
+            .iter()
+            .any(|sign| against.strip_prefix(sign).is_some_and(value));
+    let rest = &lines[first + 2..];
+    let reset = rest.iter().map(|l| l.trim()).find(|l| {
+        l.strip_prefix(lock)
+            .and_then(|v| v.strip_prefix(" = "))
+            .is_some()
+    })?;
+    let leaves = |code: &str| {
+        let ways = ["revert", "_return(", "_revert(", "_fail(", "_panic("];
+        code == HANDED_ON || ways.iter().any(|w| code.starts_with(w))
+    };
+    // The lines that set the lock back as the last thing before the function ends.
+    fn last_of(lines: &[&str], reset: &str, leaves: &dyn Fn(&str) -> bool) -> Option<Vec<usize>> {
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let last = lines.len().checked_sub(1)?;
+        let code = lines[last].trim();
+        if code == reset {
+            return Some(vec![last]);
+        }
+        if code.starts_with("return") || leaves(code) {
+            return Some(Vec::new());
+        }
+        let depth = indent(lines[last]);
+        let level = |i: &usize| indent(lines[*i]) <= depth;
+        let other = (0..last)
+            .rev()
+            .find(level)
+            .filter(|i| lines[*i].trim() == "} else {")?;
+        let opened = (0..other)
+            .rev()
+            .find(level)
+            .filter(|i| lines[*i].trim().starts_with("if ("))?;
+        let then = last_of(&lines[opened + 1..other], reset, leaves)?;
+        let otherwise = last_of(&lines[other + 1..last], reset, leaves)?;
+        let then = then.into_iter().map(|i| i + opened + 1);
+        Some(
+            then.chain(otherwise.into_iter().map(|i| i + other + 1))
+                .collect(),
+        )
+    }
+    let mut gone = last_of(rest, reset, &leaves).filter(|_| plain)?;
+    for (at, line) in rest.iter().enumerate() {
+        let Some(value) = line.trim().strip_prefix("return") else {
+            continue;
+        };
+        // A cast is worked out the same whenever it is, where a call may not be.
+        let cast = |(at, _): (usize, &str)| {
+            let word = |c: char| !c.is_ascii_alphanumeric() && c != '_';
+            let named = &value[value[..at].rfind(word).map_or(0, |i| i + 1)..at];
+            named.is_empty() || elementary(named)
+        };
+        let plain = |c: char| c.is_ascii_alphanumeric() || " _,;()".contains(c);
+        let fixed = value.chars().all(plain) && value.match_indices('(').all(cast);
+        let before = at
+            .checked_sub(1)
+            .filter(|i| rest[*i].trim() == reset && indent(rest[*i]) == indent(line));
+        gone.push(before.filter(|_| fixed)?);
+    }
+    let all_rest = rest.iter().enumerate();
+    let kept: Vec<&str> = all_rest
+        .filter(|(at, _)| !gone.contains(at))
+        .map(|(_, l)| *l)
+        .collect();
+    if kept.iter().any(|l| mentions(l, lock)) {
+        return None;
+    }
+    let open = all.iter().take(usize::from(wrapped));
+    let close = all.iter().rev().take(usize::from(wrapped));
+    let body = open.chain(&lines[..first]).chain(&kept).chain(close);
+    Some(Lock {
+        test: test.to_string(),
+        set: set.to_string(),
+        reset: reset.to_string(),
+        head_end,
+        body: body.map(|l| format!("{l}\n")).collect(),
+    })
+}
+
+fn with_locks(out: &mut String, spans: &mut [(usize, usize, usize)]) -> String {
+    let key = |lock: &Lock| {
+        format!(
+            "{}\n        {}\n        _;\n        {}",
+            lock.test, lock.set, lock.reset
+        )
+    };
+    let mut uses: BTreeMap<String, usize> = BTreeMap::new();
+    for (start, end, _) in spans.iter() {
+        if let Some(lock) = locked(&out[*start..*end]) {
+            *uses.entry(key(&lock)).or_default() += 1;
+        }
+    }
+    let mut several: Vec<(&String, &usize)> = uses.iter().filter(|(_, n)| **n > 1).collect();
+    several.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    let numbered = |i: usize| match i {
+        0 => "nonReentrant".to_string(),
+        i => format!("nonReentrant{}", i + 1),
+    };
+    let named: Vec<(String, String)> = several
+        .iter()
+        .enumerate()
+        .map(|(i, (lines, _))| (numbered(i), lines.to_string()))
+        .filter(|(name, _)| !mentions(out, name))
+        .collect();
+    let guarded = |function: &str| {
+        let lock = locked(function)?;
+        let (name, _) = named.iter().find(|(_, lines)| *lines == key(&lock))?;
+        let head = guarded_by(&function[..lock.head_end], name);
+        Some(format!("{head} {{\n{}    }}\n\n", lock.body))
+    };
+    functions_rewritten(out, spans, guarded);
+    let declared = |(name, lines): &(String, String)| {
+        format!("    modifier {name}() {{\n        {lines}\n    }}\n\n")
+    };
+    named.iter().map(declared).collect()
+}
+
 /* A test of the caller that several functions open with is what an author writes once
 as a modifier. The test runs first either way, after the arguments are read. */
 fn with_modifiers(out: &mut String, spans: &mut [(usize, usize, usize)]) -> String {
@@ -2343,30 +2536,16 @@ fn with_modifiers(out: &mut String, spans: &mut [(usize, usize, usize)]) -> Stri
             .find(|(_, t)| *t == test.trim())
             .map(|(n, _)| n)
     };
-    let mut rebuilt = String::new();
-    let mut copied = 0;
-    for span in spans.iter_mut() {
-        rebuilt.push_str(&out[copied..span.0]);
-        let function = &out[span.0..span.1];
-        let start = rebuilt.len();
-        let guarded = caller_test(function).and_then(|found| Some((found, of_test(found.2)?)));
-        match guarded {
-            Some(((opened, at, test), name)) => {
-                let head = &function[..opened];
-                let (before, after) = match head.rfind(" returns (") {
-                    Some(returns) => head.split_at(returns),
-                    None => (head, ""),
-                };
-                rebuilt.push_str(&format!("{before} {name}{after}{}", &function[opened..at]));
-                rebuilt.push_str(&function[at + test.len()..]);
-            }
-            None => rebuilt.push_str(function),
-        }
-        copied = span.1;
-        *span = (start, rebuilt.len(), span.2);
-    }
-    rebuilt.push_str(&out[copied..]);
-    *out = rebuilt;
+    let guarded = |function: &str| {
+        let (opened, at, test) = caller_test(function)?;
+        let head = guarded_by(&function[..opened], of_test(test)?);
+        Some(format!(
+            "{head}{}{}",
+            &function[opened..at],
+            &function[at + test.len()..]
+        ))
+    };
+    functions_rewritten(out, spans, guarded);
     let declared = |(name, test): (&String, &String)| {
         format!("    modifier {name}() {{\n        {test}\n        _;\n    }}\n\n")
     };
@@ -2689,7 +2868,7 @@ fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -
             out.push_str(helper);
         }
     }
-    let modifiers = with_modifiers(&mut out, &mut spans);
+    let modifiers = with_modifiers(&mut out, &mut spans) + &with_locks(&mut out, &mut spans);
     wrappers_filled(&mut out, &mut spans);
     let errors = format!(
         "{}{}{modifiers}",
@@ -3329,6 +3508,38 @@ mod tests {
         let mut kept = twice.clone();
         wrappers_filled(&mut kept, &mut spans.clone());
         assert_eq!(kept, twice);
+    }
+
+    #[test]
+    fn a_lock_set_and_set_back_around_two_functions_is_a_modifier() {
+        let pay = "    function pay() external returns (bool) {\n        bool v1;\n        \
+             require(lock == 1, \"LOCKED\");\n        lock = 0;\n        if (a) {\n            \
+             v1 = true;\n            lock = 1;\n            return v1;\n        } else {\n            \
+             revert();\n        }\n    }\n\n";
+        let skim = "    function skim() external onlyOwner {\n        require(lock == 1, \"LOCKED\");\n        \
+             lock = 0;\n        b = 2;\n        lock = 1;\n    }\n\n";
+        let open =
+            "    function leak() external {\n        require(lock == 1, \"LOCKED\");\n        \
+             lock = 0;\n        if (a) {\n            lock = 1;\n        }\n    }\n\n";
+        let mut out = format!("{pay}{skim}{open}");
+        let ends = [pay.len(), pay.len() + skim.len(), out.len()];
+        let mut spans = [
+            (0, ends[0], 0),
+            (ends[0], ends[1], 1),
+            (ends[1], ends[2], 2),
+        ];
+        let declared = with_locks(&mut out, &mut spans);
+        assert_eq!(
+            declared,
+            "    modifier nonReentrant() {\n        require(lock == 1, \"LOCKED\");\n        \
+             lock = 0;\n        _;\n        lock = 1;\n    }\n\n"
+        );
+        let pay = "    function pay() external nonReentrant returns (bool) {\n        bool v1;\n        \
+             if (a) {\n            v1 = true;\n            return v1;\n        } else {\n            \
+             revert();\n        }\n    }\n\n";
+        let skim =
+            "    function skim() external onlyOwner nonReentrant {\n        b = 2;\n    }\n\n";
+        assert_eq!(out, format!("{pay}{skim}{open}"));
     }
 
     #[test]

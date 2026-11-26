@@ -533,7 +533,7 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     let lines = without_writes_before_failure(answers_kept(held_strings(lines)));
     let lines = scratch_taken_for_its_call(without_scratch_before_taking(lines));
     let lines = without_dead_stores(lines);
-    let mut lines = copies_kept(pushed(without_unread_blocks(lines)));
+    let mut lines = shared_tails(copies_kept(pushed(without_unread_blocks(lines))));
     if lines.last().is_some_and(|l| l == "        return;") {
         lines.pop();
     }
@@ -1239,6 +1239,130 @@ fn pushed(lines: Vec<String>) -> Vec<String> {
         i += 1;
     }
     out
+}
+
+// The opposite of a test, as an author writes it where the test is one comparison.
+fn negated(test: &str) -> String {
+    let mut depth = 0i32;
+    let mut top = String::new();
+    for c in test.chars() {
+        depth += i32::from(c == '(' || c == '[') - i32::from(c == ')' || c == ']');
+        top.push(if depth == 0 || (depth == 1 && "([".contains(c)) {
+            c
+        } else {
+            '_'
+        });
+    }
+    let joined = [" && ", " || ", " ? ", " & ", " | ", " ^ "];
+    let pairs = [
+        (" == ", " != "),
+        (" != ", " == "),
+        (" < ", " >= "),
+        (" >= ", " < "),
+    ];
+    let both = pairs.iter().chain(&[(" > ", " <= "), (" <= ", " > ")]);
+    let found: Vec<(usize, &str, &str)> = both
+        .flat_map(|(sign, other)| top.match_indices(sign).map(|(at, _)| (at, *sign, *other)))
+        .collect();
+    let whole = top.starts_with("!(") && top.ends_with(')') && !top[2..top.len() - 1].contains(')');
+    let simple = !joined.iter().any(|j| top.contains(j));
+    match found[..] {
+        _ if whole => test[2..test.len() - 1].to_string(),
+        [(at, sign, other)] if simple => {
+            format!("{}{other}{}", &test[..at], &test[at + sign.len()..])
+        }
+        _ => format!("!({test})"),
+    }
+}
+
+fn label_of(line: &str) -> Option<&str> {
+    let name = line.trim().strip_suffix(':')?;
+    let digits = name.strip_prefix('L')?;
+    digits
+        .chars()
+        .all(|c| c.is_ascii_hexdigit())
+        .then_some(name)
+}
+
+/* Code two branches share is printed once, in the branch that reaches it first, and the
+other branch jumps to it. Where the jump is the last thing its branch does, and every
+other way through that branch leaves the function or the loop, the shared code is what
+follows the two branches, and is written there. */
+fn shared_tails(lines: Vec<String>) -> Vec<String> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let leaves = |code: &str| {
+        let ways = [
+            "return",
+            "revert",
+            "continue;",
+            "break;",
+            "_return(",
+            "_revert(",
+            "_fail(",
+        ];
+        code == HANDED_ON || ways.iter().any(|w| code.starts_with(w))
+    };
+    let moved = (0..lines.len()).find_map(|at| {
+        let name = label_of(&lines[at])?;
+        let depth = indent(&lines[at]);
+        let jump = format!("goto {name};");
+        let mut jumps = (0..lines.len()).filter(|i| lines[*i].contains(&jump));
+        let (from, None) = (jumps.next()?, jumps.next()) else {
+            return None;
+        };
+        let level = |i: &usize| indent(&lines[*i]) <= depth && label_of(&lines[*i]).is_none();
+        let opened = (0..at).rev().find(level)?;
+        let other = (at + 1..lines.len()).find(level)?;
+        let closed = (other + 1..lines.len()).find(level)?;
+        let test = lines[opened]
+            .trim()
+            .strip_prefix("if (")?
+            .strip_suffix(") {")?;
+        let shaped = indent(&lines[opened]) == depth
+            && lines[other].trim() == "} else {"
+            && lines[closed].trim() == "}"
+            && lines[from].trim() == jump
+            && (other..closed).contains(&from);
+        // From the jump outwards, each block has to end where the one around it does,
+        // and the branch beside it has to leave.
+        let mut last = from;
+        while shaped && indent(&lines[last]) > depth + 4 {
+            let inner = indent(&lines[last]);
+            let around = |i: &usize| indent(&lines[*i]) < inner;
+            let (end, start) = (last + 1, (0..last).rev().find(around)?);
+            last = match (lines[start].trim(), lines[end].trim()) {
+                ("} else {", "}") if leaves(lines[start - 1].trim()) => end,
+                (opener, "} else {") if opener.starts_with("if (") => {
+                    let close = (end + 1..closed).find(around)?;
+                    let left = leaves(lines[close - 1].trim()) && lines[close].trim() == "}";
+                    left.then_some(close)?
+                }
+                _ => return None,
+            };
+        }
+        (shaped && last + 1 == closed).then(|| (at, opened, other, from, closed, test.to_string()))
+    });
+    let Some((at, opened, other, from, closed, test)) = moved else {
+        return lines;
+    };
+    let mut out = lines[..opened].to_vec();
+    let pad = &lines[opened][..indent(&lines[opened])];
+    match opened + 1 == at {
+        true => out.push(format!("{pad}if ({}) {{", negated(&test))),
+        false => {
+            out.extend_from_slice(&lines[opened..at]);
+            out.push(lines[other].clone());
+        }
+    }
+    out.extend_from_slice(&lines[other + 1..from]);
+    out.extend_from_slice(&lines[from + 1..=closed]);
+    out.extend(
+        lines[at + 1..other]
+            .iter()
+            .map(|l| l[4.min(l.len())..].to_string()),
+    );
+    out.extend_from_slice(&lines[closed + 1..]);
+    shared_tails(out)
 }
 
 const HANDED_ON: &str =
@@ -2835,6 +2959,25 @@ mod tests {
              _take(ptr1 + (msg.data.length));\n\
              v1 = keccak256(_range(ptr1, msg.data.length));";
         assert_eq!(copies_kept(lines(hashed)), ["v1 = keccak256(msg.data);"]);
+    }
+
+    #[test]
+    fn code_two_branches_share_is_written_after_them() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let jumped = "if (a == 0) {\nL1f:\n    b = 1;\n    return;\n} else {\n    \
+             if (c) {\n        revert();\n    } else {\n        d = 2;\n        goto L1f;\n    }\n}";
+        let after = "if (a != 0) {\n    if (c) {\n        revert();\n    } else {\n        \
+             d = 2;\n    }\n}\nb = 1;\nreturn;";
+        assert_eq!(shared_tails(lines(jumped)), lines(after));
+        let led = jumped.replace("L1f:", "    f = 4;\nL1f:");
+        let after = "if (a == 0) {\n    f = 4;\n} else {\n    if (c) {\n        revert();\n    \
+             } else {\n        d = 2;\n    }\n}\nb = 1;\nreturn;";
+        assert_eq!(shared_tails(lines(&led)), lines(after));
+        let falls = jumped.replace("revert();", "e = 3;");
+        assert_eq!(shared_tails(lines(&falls)), lines(&falls));
+        assert_eq!(negated("a < b && c"), "!(a < b && c)");
+        assert_eq!(negated("!(f(a))"), "f(a)");
+        assert_eq!(negated("!(ok)"), "ok");
     }
 
     #[test]

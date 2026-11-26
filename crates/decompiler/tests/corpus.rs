@@ -704,7 +704,7 @@ fn defaults_give_way_to_names_the_code_implies() {
         "mapping(address => uint256) balances;",
         "mapping(address => mapping(address => uint256)) allowances;",
         "function _transfer(address from, address to, uint256 amount) internal",
-        "function pause() external {",
+        "function pause() external onlyOwner {",
     ] {
         assert!(usdt.contains(line), "usdt: missing `{line}`");
     }

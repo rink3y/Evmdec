@@ -2284,6 +2284,95 @@ fn errors_declared(text: &str) -> String {
     out
 }
 
+// The test a function opens with that only lets one caller in: where its header ends,
+// where the test starts, and the test.
+fn caller_test(function: &str) -> Option<(usize, usize, &str)> {
+    let mut lines = function.split_inclusive('\n');
+    let mut at = 0;
+    let head = lines.find(|l| {
+        at += l.len();
+        l.starts_with("    function ")
+    })?;
+    let opened = at - head.len() + head.strip_suffix(" {\n")?.len();
+    let first = lines.find(|l| {
+        at += l.len();
+        l.trim() != "unchecked {"
+    })?;
+    let test = first.trim().strip_prefix("require(msg.sender == ")?;
+    test.ends_with(");")
+        .then_some((opened, at - first.len(), first))
+}
+
+fn modifier_name(test: &str) -> Option<String> {
+    let allowed = test.trim().strip_prefix("require(msg.sender == ")?;
+    let allowed = allowed.split([',', ')']).next()?;
+    let name = allowed.trim_start_matches('_');
+    match (allowed, name.chars().next()) {
+        ("address(this", _) => Some("onlySelf".to_string()),
+        (_, Some(first)) if name.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            Some(format!("only{}{}", first.to_ascii_uppercase(), &name[1..]))
+        }
+        _ => None,
+    }
+}
+
+/* A test of the caller that several functions open with is what an author writes once
+as a modifier. The test runs first either way, after the arguments are read. */
+fn with_modifiers(out: &mut String, spans: &mut [(usize, usize, usize)]) -> String {
+    let mut uses: BTreeMap<String, usize> = BTreeMap::new();
+    for (start, end, _) in spans.iter() {
+        if let Some((_, _, test)) = caller_test(&out[*start..*end]) {
+            *uses.entry(test.trim().to_string()).or_default() += 1;
+        }
+    }
+    let mut named: BTreeMap<String, String> = BTreeMap::new();
+    for (test, count) in &uses {
+        let Some(name) = modifier_name(test).filter(|n| *count > 1 && !mentions(out, n)) else {
+            continue;
+        };
+        let more_used = |(other, n): (&String, &usize)| {
+            n > count && modifier_name(other).as_ref() == Some(&name)
+        };
+        if !uses.iter().any(more_used) {
+            named.entry(name).or_insert_with(|| test.clone());
+        }
+    }
+    let of_test = |test: &str| {
+        named
+            .iter()
+            .find(|(_, t)| *t == test.trim())
+            .map(|(n, _)| n)
+    };
+    let mut rebuilt = String::new();
+    let mut copied = 0;
+    for span in spans.iter_mut() {
+        rebuilt.push_str(&out[copied..span.0]);
+        let function = &out[span.0..span.1];
+        let start = rebuilt.len();
+        let guarded = caller_test(function).and_then(|found| Some((found, of_test(found.2)?)));
+        match guarded {
+            Some(((opened, at, test), name)) => {
+                let head = &function[..opened];
+                let (before, after) = match head.rfind(" returns (") {
+                    Some(returns) => head.split_at(returns),
+                    None => (head, ""),
+                };
+                rebuilt.push_str(&format!("{before} {name}{after}{}", &function[opened..at]));
+                rebuilt.push_str(&function[at + test.len()..]);
+            }
+            None => rebuilt.push_str(function),
+        }
+        copied = span.1;
+        *span = (start, rebuilt.len(), span.2);
+    }
+    rebuilt.push_str(&out[copied..]);
+    *out = rebuilt;
+    let declared = |(name, test): (&String, &String)| {
+        format!("    modifier {name}() {{\n        {test}\n        _;\n    }}\n\n")
+    };
+    named.iter().map(declared).collect()
+}
+
 struct Header<'a> {
     before: &'a str,
     name: &'a str,
@@ -2600,9 +2689,10 @@ fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -
             out.push_str(helper);
         }
     }
+    let modifiers = with_modifiers(&mut out, &mut spans);
     wrappers_filled(&mut out, &mut spans);
     let errors = format!(
-        "{}{}",
+        "{}{}{modifiers}",
         structs_declared(&out[errors_at..]),
         errors_declared(&out[errors_at..])
     );
@@ -3191,6 +3281,30 @@ mod tests {
         assert_eq!(negated("a < b && c"), "!(a < b && c)");
         assert_eq!(negated("!(f(a))"), "f(a)");
         assert_eq!(negated("!(ok)"), "ok");
+    }
+
+    #[test]
+    fn a_test_of_the_caller_two_functions_open_with_is_a_modifier() {
+        let test = "        require(msg.sender == _owner, \"no\");\n";
+        let one = format!(
+            "    function a() external returns (uint256) {{\n{test}        return 1;\n    }}\n\n"
+        );
+        let two = format!(
+            "    function b() external {{\n        unchecked {{\n    {test}        }}\n    }}\n\n"
+        );
+        let other = "    function c() external {\n        require(msg.sender == admin);\n    }\n\n";
+        let mut out = format!("{one}{two}{other}");
+        let mut spans = [(0, one.len(), 0), (one.len(), one.len() + two.len(), 1)];
+        let declared = with_modifiers(&mut out, &mut spans);
+        assert!(declared
+            .starts_with("    modifier onlyOwner() {\n        require(msg.sender == _owner"));
+        assert!(out.starts_with(
+            "    function a() external onlyOwner returns (uint256) {\n        return 1;"
+        ));
+        assert!(
+            out.contains("    function b() external onlyOwner {\n        unchecked {\n        }\n")
+        );
+        assert!(out.ends_with(other) && out[spans[1].0..spans[1].1] != two);
     }
 
     #[test]

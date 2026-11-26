@@ -510,7 +510,7 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     let lines = without_writes_before_failure(answers_kept(held_strings(lines)));
     let lines = scratch_taken_for_its_call(without_scratch_before_taking(lines));
     let lines = without_dead_stores(lines);
-    let mut lines = without_unread_blocks(lines);
+    let mut lines = pushed(without_unread_blocks(lines));
     if lines.last().is_some_and(|l| l == "        return;") {
         lines.pop();
     }
@@ -1153,6 +1153,63 @@ fn saved_as_stored(c: &Contract, renamed: &[(String, String)], text: &str) -> St
         }
     });
     fixed.collect::<Vec<_>>().join("\n")
+}
+
+/* What a compiler writes for `push` and `pop`: the length moves by one and the last
+element is written or cleared, between the compiler's own tests for an index past the end
+and for an empty list. A file says it with the one word, which makes the same tests. */
+fn pushed(lines: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let code = lines[i].trim_start();
+        let pad = &lines[i][..lines[i].len() - code.len()];
+        let at = |k: usize| lines.get(i + k).map(|l| l.trim_start());
+        let grown = code.split_once(".length = ").and_then(|(list, rest)| {
+            let saved = rest.strip_suffix(" + 1;")?;
+            let read = format!("uint256 {saved} = {list}.length;");
+            let just_read = out.last().is_some_and(|l| l.trim_start() == read);
+            (just_read && identifier(list)).then_some((list, saved))
+        });
+        if let Some((list, saved)) = grown {
+            let within = [
+                format!("if ({saved} >= {list}.length) _panic(0x32);"),
+                format!("assert({saved} < {list}.length);"),
+                format!("require({saved} < {list}.length);"),
+            ];
+            let tested = usize::from(at(1).is_some_and(|l| within.iter().any(|t| t == l)));
+            let store = format!("{list}[{saved}] = ");
+            let stored = at(1 + tested).and_then(|l| l.strip_prefix(&store)?.strip_suffix(';'));
+            if let Some(value) = stored {
+                let after = &lines[i + 2 + tested..];
+                if !mentions(value, saved) && !after.iter().any(|l| mentions(l, saved)) {
+                    out.pop();
+                }
+                out.push(format!("{pad}{list}.push({value});"));
+                i += 2 + tested;
+                continue;
+            }
+        }
+        let emptied = code
+            .strip_prefix("if (")
+            .and_then(|rest| rest.strip_suffix(".length == 0) _panic(0x31);"))
+            .filter(|list| identifier(list));
+        if let Some(list) = emptied {
+            let shape = [
+                format!("if ({list}.length - 1 >= {list}.length) _panic(0x32);"),
+                format!("{list}[{list}.length - 1] = 0;"),
+                format!("{list}.length = {list}.length - 1;"),
+            ];
+            if (0..3).all(|k| at(k + 1) == Some(shape[k].as_str())) {
+                out.push(format!("{pad}{list}.pop();"));
+                i += 4;
+                continue;
+            }
+        }
+        out.push(lines[i].clone());
+        i += 1;
+    }
+    out
 }
 
 fn mentions(line: &str, name: &str) -> bool {
@@ -2333,6 +2390,37 @@ mod tests {
         assert_eq!(uncast("address(account)"), "account");
         assert_eq!(uncast("uint8(a) + uint8(b)"), "uint8(a) + uint8(b)");
         assert_eq!(uncast("balanceOf(account)"), "balanceOf(account)");
+    }
+
+    #[test]
+    fn a_length_moved_by_one_around_the_last_element_is_a_push_or_a_pop() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let grown = lines(
+            "    uint256 prev = list.length;\n    list.length = prev + 1;\n    \
+             if (prev >= list.length) _panic(0x32);\n    list[prev] = who;\n    \
+             index[who] = list.length;",
+        );
+        assert_eq!(
+            pushed(grown),
+            lines("    list.push(who);\n    index[who] = list.length;")
+        );
+        let read_after = lines(
+            "    uint256 prev = list.length;\n    list.length = prev + 1;\n    \
+             list[prev] = who;\n    at[who] = prev;",
+        );
+        assert_eq!(
+            pushed(read_after),
+            lines("    uint256 prev = list.length;\n    list.push(who);\n    at[who] = prev;")
+        );
+        let shrunk = lines(
+            "    if (list.length == 0) _panic(0x31);\n    \
+             if (list.length - 1 >= list.length) _panic(0x32);\n    \
+             list[list.length - 1] = 0;\n    list.length = list.length - 1;",
+        );
+        assert_eq!(pushed(shrunk), lines("    list.pop();"));
+        // With no test for an empty list, the old code wraps where `pop` would fail.
+        let untested = lines("    list[list.length - 1] = 0;\n    list.length = list.length - 1;");
+        assert_eq!(pushed(untested.clone()), untested);
     }
 
     #[test]

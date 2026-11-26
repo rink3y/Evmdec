@@ -331,8 +331,9 @@ fn place(
         slots = count
             .filter(|_| whole_words)
             .ok_or_else(|| format!("{} is a fixed array of {}", v.name, v.ty))?;
+        ty = format!("{element}[{slots}]");
     }
-    packer.whole(at, &v.declared_type(), &name(&v.name)?, slots)?;
+    packer.whole(at, &ty, &name(&v.name)?, slots)?;
     structs.push_str(&declared);
     Ok(())
 }
@@ -388,10 +389,26 @@ fn layout(c: &Contract, taken: &BTreeSet<&str>, public: &[(usize, String)]) -> L
     if !structs.is_empty() {
         structs.push('\n');
     }
-    Layout {
-        text: format!("{structs}{}", packer.text),
-        renamed,
+    let mut text = format!("{structs}{}", packer.text);
+    // A struct takes the name of the variable that holds it, once that name is a real one.
+    for (old, new) in &renamed {
+        let Some(number) = old.strip_prefix("stor_") else {
+            continue;
+        };
+        let bare = new.trim_start_matches('_');
+        let mut letters = bare.chars();
+        let Some(first) = letters.next() else {
+            continue;
+        };
+        let named = format!("{}{}Entry", first.to_ascii_uppercase(), letters.as_str());
+        for after in [" ", ")", "["] {
+            text = text.replace(
+                &format!("Struct_{number}{after}"),
+                &format!("{named}{after}"),
+            );
+        }
     }
+    Layout { text, renamed }
 }
 
 fn renamed(text: &str, names: &[(String, String)]) -> String {
@@ -2056,6 +2073,68 @@ pub fn draft(c: &Contract, name: &str) -> String {
     compose(c, name, &shape, Some(&plain)).text
 }
 
+fn unwrapped(text: &str) -> &str {
+    let inner = uncast(text);
+    match inner == text {
+        true => text,
+        false => unwrapped(inner),
+    }
+}
+
+/* What a compiler writes for a public variable that holds a struct: a function that
+returns every member in order, each in its own type. A member that is a mapping or a
+list is left out by the compiler, so a struct with one is not taken for this. */
+fn struct_getter<'a>(c: &'a Contract, f: &Function, line: &str) -> Option<&'a str> {
+    let listed = line.strip_prefix("return (")?.strip_suffix(");")?;
+    let mut parts: Vec<&str> = Vec::new();
+    let (mut depth, mut from) = (0i32, 0);
+    for (at, c) in listed.char_indices() {
+        depth += i32::from(matches!(c, '(' | '[')) - i32::from(matches!(c, ')' | ']'));
+        if depth == 0 && c == ',' {
+            parts.push(listed[from..at].trim());
+            from = at + 1;
+        }
+    }
+    parts.push(listed[from..].trim());
+    let first = unwrapped(parts.first()?);
+    let name = &first[..first.find('[')?];
+    let v = c.storage.iter().find(|v| v.name == name)?;
+    let mut held = name.to_string();
+    for p in &f.params {
+        held.push_str(&format!("[{}]", p.name));
+    }
+    let mut members: Vec<_> = v.members.iter().collect();
+    members.sort_by_key(|m| m.offset);
+    let mut expected: Vec<(String, &str)> = Vec::new();
+    for m in members {
+        if m.holds_many() {
+            return None;
+        }
+        let mut fields: Vec<_> = m.fields.iter().collect();
+        fields.sort_by_key(|f| f.offset);
+        expected.extend(fields.iter().map(|f| (f.name.clone(), f.ty.as_str())));
+        expected.extend(fields.is_empty().then(|| (m.name.clone(), m.ty.as_str())));
+    }
+    let read = |part: &str| {
+        let mut text = unwrapped(part).to_string();
+        for p in &f.params {
+            let cast = format!("[{}({})]", p.ty, p.name);
+            text = text.replace(&cast, &format!("[{}]", p.name));
+        }
+        text
+    };
+    let same =
+        parts.len() == expected.len()
+            && parts.len() == f.returns.len()
+            && parts.len() > 1
+            && parts.iter().zip(&expected).zip(&f.returns).all(
+                |((part, (member, ty)), returned)| {
+                    read(part) == format!("{held}.{member}") && ty == returned
+                },
+            );
+    same.then_some(v.name.as_str())
+}
+
 // The variable a function returns and does nothing else, read under the function's own
 // arguments in their order.
 fn getter<'a>(c: &'a Contract, f: &Function) -> Option<&'a str> {
@@ -2066,12 +2145,21 @@ fn getter<'a>(c: &'a Contract, f: &Function) -> Option<&'a str> {
         return None;
     }
     let code = f.code.lines().map(str::trim);
-    let lines: Vec<&str> = code
-        .filter(|l| !l.is_empty() && *l != "require(msg.value == 0);")
-        .collect();
+    // A compiler writes these two tests itself, at the top of every function it makes.
+    let its_own = |l: &&str| {
+        let sized = [
+            "require(msg.data.length - 4 >= ",
+            "require(msg.data.length >= ",
+        ];
+        *l == "require(msg.value == 0);" || sized.iter().any(|test| l.starts_with(test))
+    };
+    let lines: Vec<&str> = code.filter(|l| !l.is_empty() && !its_own(l)).collect();
     let [line] = lines.as_slice() else {
         return None;
     };
+    if let Some(held) = struct_getter(c, f, line) {
+        return Some(held);
+    }
     let shown = one_value(line);
     let value = uncast(shown.strip_prefix("return ")?.strip_suffix(';')?);
     let (name, mut rest) = value.split_at(value.find('[').unwrap_or(value.len()));
@@ -2309,6 +2397,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_length_moved_by_one_around_the_last_element_is_a_push_or_a_pop() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let grown = lines(
+            "    uint256 prev = list.length;\n    list.length = prev + 1;\n    \
+             if (prev >= list.length) _panic(0x32);\n    list[prev] = who;\n    \
+             index[who] = list.length;",
+        );
+        assert_eq!(
+            pushed(grown),
+            lines("    list.push(who);\n    index[who] = list.length;")
+        );
+        let read_after = lines(
+            "    uint256 prev = list.length;\n    list.length = prev + 1;\n    \
+             list[prev] = who;\n    at[who] = prev;",
+        );
+        assert_eq!(
+            pushed(read_after),
+            lines("    uint256 prev = list.length;\n    list.push(who);\n    at[who] = prev;")
+        );
+        let shrunk = lines(
+            "    if (list.length == 0) _panic(0x31);\n    \
+             if (list.length - 1 >= list.length) _panic(0x32);\n    \
+             list[list.length - 1] = 0;\n    list.length = list.length - 1;",
+        );
+        assert_eq!(pushed(shrunk), lines("    list.pop();"));
+        // With no test for an empty list, the old code wraps where `pop` would fail.
+        let untested = lines("    list[list.length - 1] = 0;\n    list.length = list.length - 1;");
+        assert_eq!(pushed(untested.clone()), untested);
+    }
+
+    #[test]
     fn a_variable_is_renamed_and_a_call_or_a_member_of_that_name_is_not() {
         let names = [("balanceOf".to_string(), "_balanceOf".to_string())];
         let text = "balanceOf[a] = token.balanceOf(b) + balanceOf (c); require(x, \"balanceOf\");";
@@ -2390,37 +2509,6 @@ mod tests {
         assert_eq!(uncast("address(account)"), "account");
         assert_eq!(uncast("uint8(a) + uint8(b)"), "uint8(a) + uint8(b)");
         assert_eq!(uncast("balanceOf(account)"), "balanceOf(account)");
-    }
-
-    #[test]
-    fn a_length_moved_by_one_around_the_last_element_is_a_push_or_a_pop() {
-        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
-        let grown = lines(
-            "    uint256 prev = list.length;\n    list.length = prev + 1;\n    \
-             if (prev >= list.length) _panic(0x32);\n    list[prev] = who;\n    \
-             index[who] = list.length;",
-        );
-        assert_eq!(
-            pushed(grown),
-            lines("    list.push(who);\n    index[who] = list.length;")
-        );
-        let read_after = lines(
-            "    uint256 prev = list.length;\n    list.length = prev + 1;\n    \
-             list[prev] = who;\n    at[who] = prev;",
-        );
-        assert_eq!(
-            pushed(read_after),
-            lines("    uint256 prev = list.length;\n    list.push(who);\n    at[who] = prev;")
-        );
-        let shrunk = lines(
-            "    if (list.length == 0) _panic(0x31);\n    \
-             if (list.length - 1 >= list.length) _panic(0x32);\n    \
-             list[list.length - 1] = 0;\n    list.length = list.length - 1;",
-        );
-        assert_eq!(pushed(shrunk), lines("    list.pop();"));
-        // With no test for an empty list, the old code wraps where `pop` would fail.
-        let untested = lines("    list[list.length - 1] = 0;\n    list.length = list.length - 1;");
-        assert_eq!(pushed(untested.clone()), untested);
     }
 
     #[test]

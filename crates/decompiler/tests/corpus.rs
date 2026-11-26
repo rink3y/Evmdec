@@ -809,8 +809,19 @@ fn struct_elements_are_declared_and_read_by_member() {
     }
 
     let vat = source("../../testdata/mainnet/maker_vat.hex").source;
-    assert!(vat.contains("require(stor_2[key].field1 == 0, \"Vat/ilk-already-init\");"));
-    assert!(vat.contains("stor_3[key][account].field0"));
+    assert!(vat.contains("require(ilks[key].field1 == 0, \"Vat/ilk-already-init\");"));
+    assert!(vat.contains("urns[key][account].field0"));
+    for line in [
+        "struct IlksEntry {",
+        "mapping(bytes32 => IlksEntry) public ilks;",
+        "mapping(bytes32 => mapping(address => UrnsEntry)) public urns;",
+    ] {
+        assert!(
+            vat.contains(line),
+            "a getter of a whole struct is the public variable: `{line}`"
+        );
+    }
+    assert!(!vat.contains("function ilks("));
 
     let roles = source("../../testdata/vuln/miso_batch_impl.hex");
     let role = roles

@@ -1724,7 +1724,13 @@ fn interfaces_declared(called: &Called) -> String {
             open = name;
         }
         let function = crate::sigs::name_of(signature);
-        let params = crate::sigs::params_of(signature).join(", ");
+        // A value of no fixed length is declared with the place it is read from.
+        let placed = |ty: String| match ty.ends_with(']') || ty == "bytes" || ty == "string" {
+            true => format!("{ty} calldata"),
+            false => ty,
+        };
+        let params = crate::sigs::params_of(signature).into_iter().map(placed);
+        let params = params.collect::<Vec<_>>().join(", ");
         out.push_str(&format!("    function {function}({params}) {tail};\n"));
     }
     if !open.is_empty() {
@@ -1797,7 +1803,7 @@ fn placed(text: &str, declared: &str) -> String {
     out
 }
 
-fn close_of(text: &str) -> Option<usize> {
+pub fn close_of(text: &str) -> Option<usize> {
     let mut depth = 1i32;
     text.char_indices().find_map(|(i, c)| {
         depth += i32::from(c == '(') - i32::from(c == ')');

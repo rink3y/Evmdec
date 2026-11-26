@@ -3602,17 +3602,59 @@ fn fmt_call_pieces(
 /* A call can be made by the name of its function where every argument is a value of the
 type the signature names. A value that may be wider than its type is left as the word it
 is, since a call by name would cut it. */
+fn typed_arg(ty: &str, e: ExprId, n: &Names) -> Option<String> {
+    let fits = |e: ExprId, bits: u32| expr::as_const(e).is_some_and(|c| c.bits() <= bits);
+    match ty {
+        "address" if is_address(e, n) || fits(e, 160) => Some(as_address(e, n)),
+        "bool" if is_bool(e, n) || fits(e, 1) => Some(as_type("bool", e, n)),
+        "uint256" => Some(as_word(e, n)),
+        "int256" if !fits(e, 256) || fits(e, 255) => Some(format!("int256({})", as_word(e, n))),
+        "bytes32" => match expr::as_const(e) {
+            Some(c) => Some(format!("bytes32({})", c.to_hex_padded(32))),
+            None if is_bool(e, n) => None,
+            None => Some(format!("bytes32({})", as_word(e, n))),
+        },
+        // A narrow number is passed where the code already holds it cut to that width.
+        narrow if narrow.starts_with("uint") => {
+            let text = fmt_expr(e, n);
+            let cast = text
+                .strip_prefix(narrow)
+                .and_then(|rest| rest.strip_prefix('('));
+            let whole =
+                cast.is_some_and(|inner| crate::solidity::close_of(inner) == Some(inner.len() - 1));
+            let bits = width_of(narrow).filter(|b| b % 8 == 0 && (8..256).contains(b))?;
+            (whole || fits(e, bits)).then_some(text)
+        }
+        _ => None,
+    }
+}
+
 fn typed_args(sig: &str, words: &[ExprId], n: &Names) -> Option<Vec<String>> {
     let params = sigs::params_of(sig);
-    let fits = |e: ExprId, bits: u32| expr::as_const(e).is_some_and(|c| c.bits() <= bits);
-    let typed = |(ty, e): (&String, &ExprId)| match ty.as_str() {
-        "address" if is_address(*e, n) || fits(*e, 160) => Some(as_address(*e, n)),
-        "bool" if is_bool(*e, n) || fits(*e, 1) => Some(as_type("bool", *e, n)),
-        "uint256" => Some(as_word(*e, n)),
-        _ => None,
-    };
+    let typed = |(ty, e): (&String, &ExprId)| typed_arg(ty, *e, n);
     let given: Option<Vec<String>> = params.iter().zip(words).map(typed).collect();
     given.filter(|_| params.len() == words.len())
+}
+
+// The same for a call whose data was read back whole, where an argument can be a run
+// of bytes as well as a word.
+fn typed_values(sig: &str, values: &[crate::lift::Arg], n: &Names) -> Option<Vec<String>> {
+    use crate::lift::Arg;
+    let params = sigs::params_of(sig);
+    let typed = |(ty, value): (&String, &Arg)| match value {
+        Arg::Word(e) => typed_arg(ty, *e, n),
+        Arg::List(_) => None,
+        Arg::Bytes(..) | Arg::Copied { .. } => {
+            let text = fmt_call_arg(value, n);
+            let literal = text.starts_with('"');
+            let bytes = ["hex\"", "abi.encode(", "msg.data[", "_bytes(", "_range("];
+            let held = literal || (ty == "bytes" && bytes.iter().any(|b| text.starts_with(b)));
+            let named = matches!(ty.as_str(), "bytes" | "string");
+            (held && named && !text.contains(":+")).then_some(text)
+        }
+    };
+    let given: Option<Vec<String>> = params.iter().zip(values).map(typed).collect();
+    given.filter(|_| params.len() == values.len())
 }
 
 fn precompile_name(addr: U256) -> Option<&'static str> {
@@ -4003,13 +4045,17 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 args.push("...".to_string());
             }
             let selector = call_selector(layout.as_deref(), input.as_deref(), input_head);
-            let typed = usual
-                .filter(|_| whole.is_none() && !partial)
-                .and_then(|pieces| {
-                    let sig = sigs::function(selector?)?;
+            let named = selector.and_then(sigs::function);
+            let typed = match (whole, usual, named) {
+                (Some(values), _, Some(sig)) => {
+                    typed_values(&sig, values, n).map(|given| (sig.to_string(), given))
+                }
+                (None, Some(pieces), Some(sig)) if !partial => {
                     let words: Vec<ExprId> = pieces[1..].iter().map(|(e, _)| *e).collect();
-                    Some((sig.to_string(), typed_args(&sig, &words, n)?))
-                });
+                    typed_args(&sig, &words, n).map(|given| (sig.to_string(), given))
+                }
+                _ => None,
+            };
             let payload = match (&fname, known) {
                 // Only the head of the data is known, and a file has to send all of it.
                 (Some(_), _) if partial && whole.is_none() => fmt_bytes_range(*in_off, *in_len, n),

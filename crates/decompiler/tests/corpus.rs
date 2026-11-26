@@ -718,6 +718,17 @@ fn defaults_give_way_to_names_the_code_implies() {
         pair.contains("uint256 reentrancyLock;"),
         "lock by its toggling"
     );
+    assert!(
+        pair.contains(".uniswapV2Call(msg.sender, arg0, arg1, msg.data[arg3:arg3 + arg4]);")
+            && pair.contains(
+                "function uniswapV2Call(address, uint256, uint256, bytes calldata) external;"
+            ),
+        "a call by name that hands on a run of bytes: {pair}"
+    );
+    assert!(
+        pair.contains("function skim(address arg0) external nonReentrant {"),
+        "the lock as a modifier: {pair}"
+    );
     let weth = source("weth9");
     for line in [
         "function transferFrom(address from, address to, uint256 amount) external",

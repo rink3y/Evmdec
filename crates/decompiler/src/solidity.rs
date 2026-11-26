@@ -533,7 +533,7 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     let lines = without_writes_before_failure(answers_kept(held_strings(lines)));
     let lines = scratch_taken_for_its_call(without_scratch_before_taking(lines));
     let lines = without_dead_stores(lines);
-    let mut lines = pushed(without_unread_blocks(lines));
+    let mut lines = copies_kept(pushed(without_unread_blocks(lines)));
     if lines.last().is_some_and(|l| l == "        return;") {
         lines.pop();
     }
@@ -1243,6 +1243,70 @@ fn pushed(lines: Vec<String>) -> Vec<String> {
 
 const HANDED_ON: &str =
     "assembly { returndatacopy(0, 0, returndatasize()) revert(0, returndatasize()) }";
+
+/* The printer leaves a copy to memory the file does not own in a notation no compiler
+reads, as a compiler may keep values of its own there. Two such copies are safe all the
+same. After a copy of the data a call gave back, code that only hands that data on and
+leaves reads nothing a compiler put in memory. And a copy of the whole call data that is
+only read back whole is the call data. */
+fn copies_kept(mut lines: Vec<String>) -> Vec<String> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let flag_test = |code: &str| {
+        let test = code.strip_prefix("if (").map(|t| t.trim_start_matches('!'));
+        let flag = test.and_then(|t| Some((t, numbered_name(t, "success_")?)));
+        flag.is_some_and(|(test, flag)| &test[flag.len()..] == ") {")
+    };
+    for i in 0..lines.len() {
+        let code = lines[i].trim();
+        let inner = code.strip_prefix("mem[").and_then(|c| c.strip_suffix("];"));
+        let sides = inner.and_then(|c| c.split_once("] = returndata["));
+        let parts =
+            sides.and_then(|(to, from)| Some((to.split_once(":+")?, from.split_once(":+")?)));
+        let Some(((to, size), (from, same))) = parts.filter(|(to, from)| to.1 == from.1) else {
+            continue;
+        };
+        let depth = indent(&lines[i]);
+        let leaves = |code: &str| code.starts_with("_return(") || code.starts_with("_revert(");
+        let passed = |code: &str| {
+            flag_test(code) || leaves(code) || matches!(code, HANDED_ON | "}" | "} else {")
+        };
+        let mut after = lines[i + 1..].iter().map(|l| (indent(l), l.trim()));
+        let end =
+            after.find(|(at, code)| *at < depth || !passed(code) || (*at == depth && leaves(code)));
+        let left = end.is_some_and(|(at, code)| at == depth && leaves(code));
+        if left && size == same {
+            lines[i] = format!("{}_copy_returned({to}, {from}, {size});", " ".repeat(depth));
+        }
+    }
+    let copied = |l: &String| -> Option<String> {
+        let block = numbered_name(l.trim().strip_prefix("mem[")?, "ptr")?;
+        let whole = format!("mem[{block}:+msg.data.length] = msg.data[0:+msg.data.length];");
+        (l.trim() == whole).then(|| block.to_string())
+    };
+    let Some((at, block)) = (0..lines.len()).find_map(|i| Some((i, copied(&lines[i])?))) else {
+        return lines;
+    };
+    let read = format!("_range({block}, msg.data.length)");
+    let freed = format!("{block} = _free();");
+    let takes = [
+        format!("_take({block} + (msg.data.length));"),
+        format!("_take({block} + msg.data.length);"),
+    ];
+    let taken = lines
+        .get(at + 1)
+        .is_some_and(|l| takes.iter().any(|t| l.trim() == t));
+    let own = |i: usize, l: &String| i == at || l.trim() == freed || (taken && i == at + 1);
+    let only_read_whole = lines.iter().enumerate().all(|(i, l)| {
+        let in_time = i > at && (taken || i == at + 1);
+        own(i, l) || (!mentions(&l.replace(&read, ""), &block) && (in_time || !l.contains(&read)))
+    });
+    if !only_read_whole {
+        return lines;
+    }
+    let all = lines.iter().enumerate().filter(|(i, l)| !own(*i, l));
+    let kept: Vec<String> = all.map(|(_, l)| l.replace(&read, "msg.data")).collect();
+    copies_kept(kept)
+}
 
 fn words_of(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -2753,6 +2817,24 @@ mod tests {
             typed_calls(&untested, BTreeSet::new(), true, &called),
             untested
         );
+    }
+
+    #[test]
+    fn a_copy_that_is_only_handed_on_or_read_back_whole_is_written() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let forwarded = "(success_1, ) = to.delegatecall(msg.data);\n\
+             mem[0:+_returndatasize()] = returndata[0:+_returndatasize()];\n\
+             if (!success_1) {\n    _revert(0x0, _returndatasize());\n}\n\
+             _return(0x0, _returndatasize());";
+        let written = copies_kept(lines(forwarded));
+        assert_eq!(written[1], "_copy_returned(0, 0, _returndatasize());");
+        let read_after = forwarded.replace("_return(0x0", "v1 = _memory(0);\n_return(0x0");
+        assert_eq!(copies_kept(lines(&read_after)), lines(&read_after));
+        let hashed = "ptr1 = _free();\n\
+             mem[ptr1:+msg.data.length] = msg.data[0:+msg.data.length];\n\
+             _take(ptr1 + (msg.data.length));\n\
+             v1 = keccak256(_range(ptr1, msg.data.length));";
+        assert_eq!(copies_kept(lines(hashed)), ["v1 = keccak256(msg.data);"]);
     }
 
     #[test]

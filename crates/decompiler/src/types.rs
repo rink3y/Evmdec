@@ -614,9 +614,11 @@ impl TypeEnv {
                 value,
                 input,
                 input_head,
+                layout,
                 ..
             } => {
                 self.account(*addr, pc);
+                self.callee_types(layout.as_deref().unwrap_or(&[]), pc);
                 if let Some(v) = value {
                     self.arith(*v, pc, op::CALLVALUE);
                 }
@@ -680,6 +682,33 @@ impl TypeEnv {
             if let Some((first, second)) = found {
                 self.word32(first, scope);
                 self.word32(second, scope);
+            }
+        }
+    }
+
+    /* The function another contract is called by says what each word handed to it is. A
+    signature is known only by four bytes of its hash, which a second one can share, so
+    what it says gives way to what the code itself does with the value. */
+    fn callee_types(&mut self, pieces: &[(ExprId, u8)], scope: usize) {
+        let usual = pieces.first().is_some_and(|p| p.1 == 4) && pieces.iter().all(|p| p.1 <= 32);
+        let selector = pieces.first().and_then(|p| expr::as_const(p.0));
+        let known = selector
+            .filter(|_| usual)
+            .and_then(|s| crate::sigs::function(s.low_u64() as u32));
+        let Some(signature) = known else {
+            return;
+        };
+        let params = crate::sigs::params_of(&signature);
+        for (word, ty) in declared_words(&params) {
+            let Some((value, 32)) = pieces.get(1 + word as usize).copied() else {
+                continue;
+            };
+            match ty {
+                Ty::Bytes(32) => self.word32(value, scope),
+                ty => {
+                    let loc = self.location(value, scope);
+                    self.weak(loc, ty);
+                }
             }
         }
     }

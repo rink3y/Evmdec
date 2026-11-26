@@ -396,7 +396,7 @@ fn a_word_that_only_looks_like_a_pointer_leaves_the_call_as_its_words() {
             .as_str(),
     );
     assert!(
-        out.contains("abi.encodeWithSelector(bytes4(0xa9059cbb), msg.sender, 64)"),
+        out.contains("abi.encodeWithSignature(\"transfer(address,uint256)\", msg.sender, 64)"),
         "{out}"
     );
 }
@@ -1034,4 +1034,18 @@ fn a_function_the_selector_table_marks_as_refusing_value_is_not_payable() {
     let out = fixture("StableSwapNG.hex");
     assert!(!out.contains("external payable"), "{out}");
     assert!(out.contains("function exchange(int128 arg0, int128 arg1, uint256 arg2, uint256 arg3) external returns"), "{out}");
+}
+
+#[test]
+fn a_call_given_only_the_stipend_whose_result_is_kept_is_a_send() {
+    let kept = text("6000600060006000602435600435602435156108fc02f160005500");
+    let send = "success_1 = payable(address(uint160(_calldata(4)))).send(_calldata(36));";
+    assert!(kept.contains(send), "{kept}");
+    // With all the gas left it is a plain call, which a receiver may spend freely.
+    let plain = text("60006000600060006024356004355af160005500");
+    assert!(
+        plain.contains(".call{value: _calldata(36)}(\"\");"),
+        "{plain}"
+    );
+    assert!(!plain.contains(".send("), "{plain}");
 }

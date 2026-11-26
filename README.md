@@ -71,11 +71,25 @@ The decompiler is `crates/decompiler`, the command-line tool `crates/cli` and th
   `require` lines, checked arithmetic printed plain, `payable(to).transfer(v)`, `members.push(x)`,
   locals for values the source held in locals, the previous value of a slot read before it is
   overwritten, loops folded back together after control-flow recovery peeled an iteration.
+- Written the way an author writes it. A call to another contract that carries every test a
+  compiler adds for a call by name (the failure handed on as it came, the test that the
+  answer is long enough, the test of a narrow answer, and the test for code where no answer
+  is read) is that call: `uint256 balance = IERC20(token0).balanceOf(address(this));`. The
+  file declares the interface with the functions called through it, named `IERC20` for the
+  functions of that standard and after the variable that holds the contract otherwise. A
+  call that lacks one of the tests was not made by name and stays a low-level call. A test
+  of the caller that several functions open with is written once as a modifier
+  (`onlyOwner`). The body a compiler placed in a helper that only one function calls is
+  written in that function, under the function's own argument names. A call given only the
+  2300 gas stipend is `send` or `transfer`. Code two branches share is written after them
+  where the jump to it was the last thing its branch did, with no label and no `goto`.
 - Memory. Each allocation at solc's free memory pointer is a named block (`ptr1`, `ptr2`), so
   two structs never read as one address; a run of stores that fills a block prints as one line
   (`ptr1 = memory(arg0, arg1, ptr2)`), a string built in memory as its text, and the
   allocator's own bookkeeping and overflow panics are left out. A call's payload prints as
-  what it is: `abi.encodeWithSelector(...)` when its words are known, `msg.data` when a proxy
+  what it is: `abi.encodeWithSignature("transfer(address,uint256)", to, amount)` when its
+  words fit a known signature, `abi.encodeWithSelector(...)` when only the four bytes are
+  known, `msg.data` when a proxy
   forwards its calldata, `bytes(p)` for the byte string at a pointer, and the selector with
   the leading arguments when only the head is known. Precompiles are called by name.
   Vyper has no free pointer and keeps every variable at a fixed address, so there a word at
@@ -164,11 +178,11 @@ verified source.
 | state mutability | 509 / 515 |
 | parameter count | 513 / 515 |
 | return count | 514 / 515 |
-| parameter types, exact Solidity type | 913 / 955 |
+| parameter types, exact Solidity type | 921 / 955 |
 | parameters passed by pointer read as the right kind: byte string, array, struct | 108 / 108 |
 | arrays and structs with the right layout of members and elements | 40 / 43 |
 | arrays and structs with every member and element type exact | 24 / 43 |
-| return types | 366 / 380 |
+| return types | 369 / 380 |
 | events | 119 / 121 |
 | code blocks covered by some function | 10,810 / 10,810 |
 | unresolved jumps | 0 |
@@ -337,15 +351,18 @@ compared with no such allowance.
 compare equal on every function, solc 0.4 to 0.8 and Vyper, and so do the 17 regression, 30
 vulnerable and 5 source fixtures in `testdata`: 74 of 74. Those contracts answer 1,972
 functions between them. With the signatures built into the binary and no index installed,
-the files declare 899 of them by name, and 615 of the 899 are plain Solidity: all 11 of
-WETH, 29 of 29 in USDT, 24 of 24 in the Uniswap V2 pair, 35 of 39 in USDC, 38 of 43 in
-Compound cETH, 19 of 21 in the Uniswap V2 router. The other 1,073 answer through `fallback` in their exact form: 932 have a
+the files declare 900 of them by name, and 618 of the 900 are plain Solidity: all 11 of
+WETH, 29 of 29 in USDT, 25 of 25 in the Uniswap V2 pair, 21 of 21 in the Uniswap V2
+router, 35 of 39 in USDC, 38 of 43 in Compound cETH. The other 1,072 answer through
+`fallback` in their exact form: 932 have a
 selector no built-in signature hashes to, so no header can be written for them, 28 take a
 struct, and the rest are decoded differently by a current compiler than by the original.
 
-With the full signature index installed (see below) the same run declares 1,617 of the
-1,972 by name and 1,030 of those are plain Solidity. USDT, the BEC token and the
-BOB pool then come out with no exact block at all, as WETH does without it.
+With the full signature index installed (see below) a run declared 1,617 of the 1,972 by
+name and 1,030 of those were plain Solidity. That run was made before calls by name,
+modifiers and the other rules of the list above were added, and has not been repeated with
+them. USDT, the BEC token and the BOB pool then come out with no exact block at all, as
+WETH does without it.
 
 What holds a named function back now is mostly not memory. A few functions keep a jump
 the printer could not turn into a loop or a branch, two return more values than a compiler

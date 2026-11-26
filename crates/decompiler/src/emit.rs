@@ -3599,6 +3599,22 @@ fn fmt_call_pieces(
     }
 }
 
+/* A call can be made by the name of its function where every argument is a value of the
+type the signature names. A value that may be wider than its type is left as the word it
+is, since a call by name would cut it. */
+fn typed_args(sig: &str, words: &[ExprId], n: &Names) -> Option<Vec<String>> {
+    let params = sigs::params_of(sig);
+    let fits = |e: ExprId, bits: u32| expr::as_const(e).is_some_and(|c| c.bits() <= bits);
+    let typed = |(ty, e): (&String, &ExprId)| match ty.as_str() {
+        "address" if is_address(*e, n) || fits(*e, 160) => Some(as_address(*e, n)),
+        "bool" if is_bool(*e, n) || fits(*e, 1) => Some(as_type("bool", *e, n)),
+        "uint256" => Some(as_word(*e, n)),
+        _ => None,
+    };
+    let given: Option<Vec<String>> = params.iter().zip(words).map(typed).collect();
+    given.filter(|_| params.len() == words.len())
+}
+
 fn precompile_name(addr: U256) -> Option<&'static str> {
     if !addr.fits_u64() {
         return None;
@@ -3713,6 +3729,14 @@ pub fn call_head(head: &[ExprId], in_off: ExprId) -> Option<(u32, Vec<ExprId>)> 
         .take_while(|arg| !expr::contains(*arg, &unwritten))
         .collect();
     Some((sel, args))
+}
+
+/* A compiler gives `send` and `transfer` no gas of their own. The EVM adds 2300 to a call
+that carries value, and the compiler adds the same 2300 itself where the value is zero. */
+pub fn only_stipend(gas: ExprId) -> bool {
+    let stipend = Some(U256::from_u64(2300));
+    let scaled = |v: &[ExprId]| v.iter().any(|part| expr::as_const(*part) == stipend);
+    expr::as_const(gas) == stipend || matches!(expr::node(gas), Node::Op(op::MUL, v) if scaled(&v))
 }
 
 fn forwards_all_gas(gas: ExprId) -> bool {
@@ -3979,9 +4003,21 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                 args.push("...".to_string());
             }
             let selector = call_selector(layout.as_deref(), input.as_deref(), input_head);
+            let typed = usual
+                .filter(|_| whole.is_none() && !partial)
+                .and_then(|pieces| {
+                    let sig = sigs::function(selector?)?;
+                    let words: Vec<ExprId> = pieces[1..].iter().map(|(e, _)| *e).collect();
+                    Some((sig.to_string(), typed_args(&sig, &words, n)?))
+                });
             let payload = match (&fname, known) {
                 // Only the head of the data is known, and a file has to send all of it.
                 (Some(_), _) if partial && whole.is_none() => fmt_bytes_range(*in_off, *in_len, n),
+                (Some(_), _) if typed.is_some() => {
+                    let (sig, given) = typed.unwrap_or_default();
+                    format!("abi.encodeWithSignature(\"{sig}\", {})", given.join(", "))
+                        .replace(", )", ")")
+                }
                 // A compiler knows a selector by its four bytes, and by a name only for a
                 // function declared where it can see it.
                 (Some(_), _) if selector.is_some() => format!(
@@ -4010,6 +4046,11 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     }
                 }
             };
+            let bare = expr::as_const(*in_len) == Some(U256::ZERO);
+            if let (op::CALL, true, Some(sent)) = (*kind, bare && only_stipend(*gas), value) {
+                let (flag, to) = (fmt_expr(*result, n), as_address(*addr, n));
+                return format!("{flag} = payable({to}).send({});", fmt_expr(*sent, n));
+            }
             let answered = match expr::node(*result) {
                 Node::CallResult(seq) if !copy && method != "callcode" => Some(seq),
                 _ => None,

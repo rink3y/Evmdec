@@ -1,6 +1,7 @@
 use crate::decompile::{Contract, Function};
 use crate::function::{FnKind, Mutability};
 use crate::{abi, exact, keccak};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 // The oldest release whose assembly knows every instruction in use today.
@@ -301,6 +302,7 @@ fn place(
     packer: &mut Packer,
     structs: &mut String,
     at: u64,
+    until: Option<u64>,
     v: &crate::decompile::StorageVar,
     name: &mut dyn FnMut(&str) -> Result<String, String>,
 ) -> Result<(), String> {
@@ -318,15 +320,21 @@ fn place(
             slots = span;
         }
     }
+    let mut ty = v.declared_type();
     if v.fixed_array {
         let (element, count) = v.ty.rsplit_once('[').unwrap_or((&v.ty, ""));
-        let count = count.trim_end_matches(']').parse().ok();
+        /* The code never says how long a fixed array is. It ends no later than the next
+        variable begins, and an author rarely leaves slots unused after one. */
+        let to_next = until.map(|next| next.saturating_sub(at));
+        let to_next = to_next.filter(|n| (1..=WIDEST_GAP).contains(n));
+        let count = count.trim_end_matches(']').parse().ok().or(to_next);
         let whole_words = bytes_of(element) == 32 && v.members.is_empty();
         slots = count
             .filter(|_| whole_words)
             .ok_or_else(|| format!("{} is a fixed array of {}", v.name, v.ty))?;
+        ty = format!("{element}[{slots}]");
     }
-    packer.whole(at, &v.declared_type(), &name(&v.name)?, slots)?;
+    packer.whole(at, &ty, &name(&v.name)?, slots)?;
     structs.push_str(&declared);
     Ok(())
 }
@@ -369,9 +377,10 @@ fn layout(c: &Contract, taken: &BTreeSet<&str>, public: &[(usize, String)]) -> L
         pads: 0,
     };
     let trace = std::env::var_os("EVMDEC_RAISE_TRACE").is_some();
-    for (at, v) in vars {
+    for (i, (at, v)) in vars.iter().enumerate() {
         let before = packer.text.len();
-        if let Err(why) = place(&mut packer, &mut structs, at, v, &mut name) {
+        let until = vars.get(i + 1).map(|(next, _)| *next);
+        if let Err(why) = place(&mut packer, &mut structs, *at, until, v, &mut name) {
             packer.text.truncate(before);
             if trace {
                 eprintln!("left undeclared: {why}");
@@ -381,10 +390,26 @@ fn layout(c: &Contract, taken: &BTreeSet<&str>, public: &[(usize, String)]) -> L
     if !structs.is_empty() {
         structs.push('\n');
     }
-    Layout {
-        text: format!("{structs}{}", packer.text),
-        renamed,
+    let mut text = format!("{structs}{}", packer.text);
+    // A struct takes the name of the variable that holds it, once that name is a real one.
+    for (old, new) in &renamed {
+        let Some(number) = old.strip_prefix("stor_") else {
+            continue;
+        };
+        let bare = new.trim_start_matches('_');
+        let mut letters = bare.chars();
+        let Some(first) = letters.next() else {
+            continue;
+        };
+        let named = format!("{}{}Entry", first.to_ascii_uppercase(), letters.as_str());
+        for after in [" ", ")", "["] {
+            text = text.replace(
+                &format!("Struct_{number}{after}"),
+                &format!("{named}{after}"),
+            );
+        }
     }
+    Layout { text, renamed }
 }
 
 fn renamed(text: &str, names: &[(String, String)]) -> String {
@@ -432,7 +457,12 @@ pub struct Plain<'a> {
     drafted: bool,
     // Functions the compiler found to hold more values at once than it can reach.
     packed: &'a BTreeSet<usize>,
+    called: &'a Called,
 }
+
+// The functions of other contracts the text calls by name: for each interface and
+// signature, the rest of its declaration.
+type Called = RefCell<BTreeMap<(String, String), String>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Reach {
@@ -503,7 +533,7 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     let lines = without_writes_before_failure(answers_kept(held_strings(lines)));
     let lines = scratch_taken_for_its_call(without_scratch_before_taking(lines));
     let lines = without_dead_stores(lines);
-    let mut lines = without_unread_blocks(lines);
+    let mut lines = shared_tails(copies_kept(pushed(without_unread_blocks(lines))));
     if lines.last().is_some_and(|l| l == "        return;") {
         lines.pop();
     }
@@ -515,6 +545,12 @@ fn body(c: &Contract, f: &Function, plain: &Plain<'_>) -> String {
     };
     let text = unused_answers(&text);
     let text = saved_as_stored(c, &plain.layout.renamed, &text);
+    let head = crate::decompile::fmt_function_header(f);
+    let named = c.functions.iter().map(|f| f.name.as_str());
+    let stored = plain.layout.renamed.iter().map(|(_, to)| to.as_str());
+    let taken: BTreeSet<&str> = named.chain(stored).chain(words_of(&head)).collect();
+    let validated = version(c).is_none_or(|v| v >= (0, 8, 0));
+    let text = typed_calls(&text, taken, validated, plain.called);
     let declared = declarations(c, f, &text);
     let text = returned_as_declared(&f.returns, &declared, &text);
     let marked: Vec<String> = text.lines().map(unchecked_statement).collect();
@@ -1148,6 +1184,555 @@ fn saved_as_stored(c: &Contract, renamed: &[(String, String)], text: &str) -> St
     fixed.collect::<Vec<_>>().join("\n")
 }
 
+/* What a compiler writes for `push` and `pop`: the length moves by one and the last
+element is written or cleared, between the compiler's own tests for an index past the end
+and for an empty list. A file says it with the one word, which makes the same tests. */
+fn pushed(lines: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let code = lines[i].trim_start();
+        let pad = &lines[i][..lines[i].len() - code.len()];
+        let at = |k: usize| lines.get(i + k).map(|l| l.trim_start());
+        let grown = code.split_once(".length = ").and_then(|(list, rest)| {
+            let saved = rest.strip_suffix(" + 1;")?;
+            let read = format!("uint256 {saved} = {list}.length;");
+            let just_read = out.last().is_some_and(|l| l.trim_start() == read);
+            (just_read && identifier(list)).then_some((list, saved))
+        });
+        if let Some((list, saved)) = grown {
+            let within = [
+                format!("if ({saved} >= {list}.length) _panic(0x32);"),
+                format!("assert({saved} < {list}.length);"),
+                format!("require({saved} < {list}.length);"),
+            ];
+            let tested = usize::from(at(1).is_some_and(|l| within.iter().any(|t| t == l)));
+            let store = format!("{list}[{saved}] = ");
+            let stored = at(1 + tested).and_then(|l| l.strip_prefix(&store)?.strip_suffix(';'));
+            if let Some(value) = stored {
+                let after = &lines[i + 2 + tested..];
+                if !mentions(value, saved) && !after.iter().any(|l| mentions(l, saved)) {
+                    out.pop();
+                }
+                out.push(format!("{pad}{list}.push({value});"));
+                i += 2 + tested;
+                continue;
+            }
+        }
+        let emptied = code
+            .strip_prefix("if (")
+            .and_then(|rest| rest.strip_suffix(".length == 0) _panic(0x31);"))
+            .filter(|list| identifier(list));
+        if let Some(list) = emptied {
+            let shape = [
+                format!("if ({list}.length - 1 >= {list}.length) _panic(0x32);"),
+                format!("{list}[{list}.length - 1] = 0;"),
+                format!("{list}.length = {list}.length - 1;"),
+            ];
+            if (0..3).all(|k| at(k + 1) == Some(shape[k].as_str())) {
+                out.push(format!("{pad}{list}.pop();"));
+                i += 4;
+                continue;
+            }
+        }
+        out.push(lines[i].clone());
+        i += 1;
+    }
+    out
+}
+
+// The opposite of a test, as an author writes it where the test is one comparison.
+fn negated(test: &str) -> String {
+    let mut depth = 0i32;
+    let mut top = String::new();
+    for c in test.chars() {
+        depth += i32::from(c == '(' || c == '[') - i32::from(c == ')' || c == ']');
+        top.push(if depth == 0 || (depth == 1 && "([".contains(c)) {
+            c
+        } else {
+            '_'
+        });
+    }
+    let joined = [" && ", " || ", " ? ", " & ", " | ", " ^ "];
+    let pairs = [
+        (" == ", " != "),
+        (" != ", " == "),
+        (" < ", " >= "),
+        (" >= ", " < "),
+    ];
+    let both = pairs.iter().chain(&[(" > ", " <= "), (" <= ", " > ")]);
+    let found: Vec<(usize, &str, &str)> = both
+        .flat_map(|(sign, other)| top.match_indices(sign).map(|(at, _)| (at, *sign, *other)))
+        .collect();
+    let whole = top.starts_with("!(") && top.ends_with(')') && !top[2..top.len() - 1].contains(')');
+    let simple = !joined.iter().any(|j| top.contains(j));
+    match found[..] {
+        _ if whole => test[2..test.len() - 1].to_string(),
+        [(at, sign, other)] if simple => {
+            format!("{}{other}{}", &test[..at], &test[at + sign.len()..])
+        }
+        _ => format!("!({test})"),
+    }
+}
+
+fn label_of(line: &str) -> Option<&str> {
+    let name = line.trim().strip_suffix(':')?;
+    let digits = name.strip_prefix('L')?;
+    digits
+        .chars()
+        .all(|c| c.is_ascii_hexdigit())
+        .then_some(name)
+}
+
+/* Code two branches share is printed once, in the branch that reaches it first, and the
+other branch jumps to it. Where the jump is the last thing its branch does, and every
+other way through that branch leaves the function or the loop, the shared code is what
+follows the two branches, and is written there. */
+fn shared_tails(lines: Vec<String>) -> Vec<String> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let leaves = |code: &str| {
+        let ways = [
+            "return",
+            "revert",
+            "continue;",
+            "break;",
+            "_return(",
+            "_revert(",
+            "_fail(",
+        ];
+        code == HANDED_ON || ways.iter().any(|w| code.starts_with(w))
+    };
+    let moved = (0..lines.len()).find_map(|at| {
+        let name = label_of(&lines[at])?;
+        let depth = indent(&lines[at]);
+        let jump = format!("goto {name};");
+        let mut jumps = (0..lines.len()).filter(|i| lines[*i].contains(&jump));
+        let (from, None) = (jumps.next()?, jumps.next()) else {
+            return None;
+        };
+        let level = |i: &usize| indent(&lines[*i]) <= depth && label_of(&lines[*i]).is_none();
+        let opened = (0..at).rev().find(level)?;
+        let other = (at + 1..lines.len()).find(level)?;
+        let closed = (other + 1..lines.len()).find(level)?;
+        let test = lines[opened]
+            .trim()
+            .strip_prefix("if (")?
+            .strip_suffix(") {")?;
+        let shaped = indent(&lines[opened]) == depth
+            && lines[other].trim() == "} else {"
+            && lines[closed].trim() == "}"
+            && lines[from].trim() == jump
+            && (other..closed).contains(&from);
+        // From the jump outwards, each block has to end where the one around it does,
+        // and the branch beside it has to leave.
+        let mut last = from;
+        while shaped && indent(&lines[last]) > depth + 4 {
+            let inner = indent(&lines[last]);
+            let around = |i: &usize| indent(&lines[*i]) < inner;
+            let (end, start) = (last + 1, (0..last).rev().find(around)?);
+            last = match (lines[start].trim(), lines[end].trim()) {
+                ("} else {", "}") if leaves(lines[start - 1].trim()) => end,
+                (opener, "} else {") if opener.starts_with("if (") => {
+                    let close = (end + 1..closed).find(around)?;
+                    let left = leaves(lines[close - 1].trim()) && lines[close].trim() == "}";
+                    left.then_some(close)?
+                }
+                _ => return None,
+            };
+        }
+        (shaped && last + 1 == closed).then(|| (at, opened, other, from, closed, test.to_string()))
+    });
+    let Some((at, opened, other, from, closed, test)) = moved else {
+        return lines;
+    };
+    let mut out = lines[..opened].to_vec();
+    let pad = &lines[opened][..indent(&lines[opened])];
+    match opened + 1 == at {
+        true => out.push(format!("{pad}if ({}) {{", negated(&test))),
+        false => {
+            out.extend_from_slice(&lines[opened..at]);
+            out.push(lines[other].clone());
+        }
+    }
+    out.extend_from_slice(&lines[other + 1..from]);
+    out.extend_from_slice(&lines[from + 1..=closed]);
+    out.extend(
+        lines[at + 1..other]
+            .iter()
+            .map(|l| l[4.min(l.len())..].to_string()),
+    );
+    out.extend_from_slice(&lines[closed + 1..]);
+    shared_tails(out)
+}
+
+const HANDED_ON: &str =
+    "assembly { returndatacopy(0, 0, returndatasize()) revert(0, returndatasize()) }";
+
+/* The printer leaves a copy to memory the file does not own in a notation no compiler
+reads, as a compiler may keep values of its own there. Two such copies are safe all the
+same. After a copy of the data a call gave back, code that only hands that data on and
+leaves reads nothing a compiler put in memory. And a copy of the whole call data that is
+only read back whole is the call data. */
+fn copies_kept(mut lines: Vec<String>) -> Vec<String> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let flag_test = |code: &str| {
+        let test = code.strip_prefix("if (").map(|t| t.trim_start_matches('!'));
+        let flag = test.and_then(|t| Some((t, numbered_name(t, "success_")?)));
+        flag.is_some_and(|(test, flag)| &test[flag.len()..] == ") {")
+    };
+    for i in 0..lines.len() {
+        let code = lines[i].trim();
+        let inner = code.strip_prefix("mem[").and_then(|c| c.strip_suffix("];"));
+        let sides = inner.and_then(|c| c.split_once("] = returndata["));
+        let parts =
+            sides.and_then(|(to, from)| Some((to.split_once(":+")?, from.split_once(":+")?)));
+        let Some(((to, size), (from, same))) = parts.filter(|(to, from)| to.1 == from.1) else {
+            continue;
+        };
+        let depth = indent(&lines[i]);
+        let leaves = |code: &str| code.starts_with("_return(") || code.starts_with("_revert(");
+        let passed = |code: &str| {
+            flag_test(code) || leaves(code) || matches!(code, HANDED_ON | "}" | "} else {")
+        };
+        let mut after = lines[i + 1..].iter().map(|l| (indent(l), l.trim()));
+        let end =
+            after.find(|(at, code)| *at < depth || !passed(code) || (*at == depth && leaves(code)));
+        let left = end.is_some_and(|(at, code)| at == depth && leaves(code));
+        if left && size == same {
+            lines[i] = format!("{}_copy_returned({to}, {from}, {size});", " ".repeat(depth));
+        }
+    }
+    let copied = |l: &String| -> Option<String> {
+        let block = numbered_name(l.trim().strip_prefix("mem[")?, "ptr")?;
+        let whole = format!("mem[{block}:+msg.data.length] = msg.data[0:+msg.data.length];");
+        (l.trim() == whole).then(|| block.to_string())
+    };
+    let Some((at, block)) = (0..lines.len()).find_map(|i| Some((i, copied(&lines[i])?))) else {
+        return lines;
+    };
+    let read = format!("_range({block}, msg.data.length)");
+    let freed = format!("{block} = _free();");
+    let takes = [
+        format!("_take({block} + (msg.data.length));"),
+        format!("_take({block} + msg.data.length);"),
+    ];
+    let taken = lines
+        .get(at + 1)
+        .is_some_and(|l| takes.iter().any(|t| l.trim() == t));
+    let own = |i: usize, l: &String| i == at || l.trim() == freed || (taken && i == at + 1);
+    let only_read_whole = lines.iter().enumerate().all(|(i, l)| {
+        let in_time = i > at && (taken || i == at + 1);
+        own(i, l) || (!mentions(&l.replace(&read, ""), &block) && (in_time || !l.contains(&read)))
+    });
+    if !only_read_whole {
+        return lines;
+    }
+    let all = lines.iter().enumerate().filter(|(i, l)| !own(*i, l));
+    let kept: Vec<String> = all.map(|(_, l)| l.replace(&read, "msg.data")).collect();
+    copies_kept(kept)
+}
+
+fn words_of(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+}
+
+const ERC20: [&str; 6] = [
+    "totalSupply()",
+    "balanceOf(address)",
+    "transfer(address,uint256)",
+    "transferFrom(address,address,uint256)",
+    "approve(address,uint256)",
+    "allowance(address,address)",
+];
+
+// An interface is named after the standard its function belongs to, or after the
+// variable that holds the contract where an author named one.
+fn interface(target: &str, signature: &str) -> String {
+    if ERC20.contains(&signature) {
+        return "IERC20".to_string();
+    }
+    let name = target.trim_start_matches('_');
+    let own = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphabetic());
+    match (own, name.chars().next()) {
+        (true, Some(first)) => format!("I{}{}", first.to_ascii_uppercase(), &name[1..]),
+        _ => "IContract".to_string(),
+    }
+}
+
+struct Outside<'a> {
+    number: &'a str,
+    target: &'a str,
+    method: &'a str,
+    options: &'a str,
+    signature: &'a str,
+    given: &'a str,
+}
+
+fn outside_call(code: &str) -> Option<Outside<'_>> {
+    let (number, rest) = code.strip_prefix("(success_")?.split_once(", ")?;
+    let (_, rest) = rest.split_once(") = ")?;
+    let (head, rest) = rest.split_once("(abi.encodeWithSignature(\"")?;
+    let (signature, rest) = rest.split_once('"')?;
+    let given = rest.strip_suffix("));")?;
+    let given = given.strip_prefix(", ").unwrap_or(given);
+    let (head, options) = match head.strip_suffix('}') {
+        Some(opened) => opened.rsplit_once('{')?,
+        None => (head, ""),
+    };
+    let (target, method) = head.rsplit_once('.')?;
+    let call = Outside {
+        number,
+        target,
+        method,
+        options,
+        signature,
+        given,
+    };
+    matches!(method, "call" | "staticcall").then_some(call)
+}
+
+// The name a value a call gave back goes by: the function's own, without the words an
+// author leaves out, and unlike every name the function already has.
+fn answer_name(function: &str, taken: &BTreeSet<String>) -> String {
+    const RESERVED: [&str; 12] = [
+        "address", "after", "default", "length", "match", "now", "of", "payable", "this", "type",
+        "var", "in",
+    ];
+    let cut = function.strip_prefix("get").unwrap_or(function);
+    let cut = cut.strip_suffix("Of").unwrap_or(cut);
+    let cut = cut.trim_matches('_');
+    let base: String = match cut.chars().next() {
+        Some(first) if first.is_ascii_alphabetic() => {
+            format!("{}{}", first.to_ascii_lowercase(), &cut[1..])
+        }
+        _ => "answer".to_string(),
+    };
+    let free = |name: &String| !taken.contains(name) && !RESERVED.contains(&name.as_str());
+    let numbered = (2..).map(|i| format!("{base}{i}"));
+    std::iter::once(base.clone())
+        .chain(numbered)
+        .find(free)
+        .unwrap_or(base)
+}
+
+/* What a compiler writes for a call made by name: a test that the address holds code,
+the call, the failure handed on as it came, a test that the answer is long enough, and
+for a narrow type a test that the word holds nothing else. A call the text shows with all
+of that is the call by name, and the tests go, as the compiler writes them again. A call
+that lacks one of them was not made by name, or not by a compiler that tests, and stays
+as it is. */
+fn typed_call(
+    lines: &[String],
+    at: usize,
+    taken: &mut BTreeSet<String>,
+    validated: bool,
+    called: &Called,
+) -> Option<Vec<String>> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let depth = indent(&lines[at]);
+    let call = outside_call(lines[at].trim())?;
+    let (flag, data) = (
+        format!("success_{}", call.number),
+        format!("returned_{}", call.number),
+    );
+    let code = |i: usize| lines.get(i).map_or("", |l| l.trim());
+    let mut rest: Vec<String> = if code(at + 1) == format!("if (!{flag}) {{") {
+        let shaped = code(at + 2) == HANDED_ON && code(at + 3) == "}";
+        lines.get(at + 4..).filter(|_| shaped)?.to_vec()
+    } else if code(at + 1) == format!("if ({flag}) {{") {
+        let close = (at + 2..lines.len()).find(|i| indent(&lines[*i]) <= depth)?;
+        let shaped = lines[close] == format!("{}}} else {{", " ".repeat(depth))
+            && code(close + 1) == HANDED_ON
+            && code(close + 2) == "}";
+        let inner = lines[at + 2..close]
+            .iter()
+            .map(|l| l[4.min(l.len())..].to_string());
+        let after = lines.get(close + 3..).filter(|_| shaped)?;
+        inner.chain(after.iter().cloned()).collect()
+    } else {
+        return None;
+    };
+    let size = |code: &str| -> Option<usize> {
+        let test = code.strip_prefix("require(")?.strip_suffix(");")?;
+        let signed = test.strip_prefix("int256(_returndatasize()) >= ");
+        let least = signed.or_else(|| test.strip_prefix("_returndatasize() >= "))?;
+        let bytes = least
+            .parse::<usize>()
+            .ok()
+            .filter(|b| *b > 0 && b % 32 == 0)?;
+        Some(bytes / 32)
+    };
+    // A compiler rounds the length of the answer up to whole words before it reads it.
+    let rounded = rest.first().and_then(|l| {
+        let (name, value) = l.trim().split_once(" = _returndatasize() + 31 & 0x")?;
+        let whole_words = value.strip_suffix("e0;")?.chars().all(|c| c == 'f');
+        let read = lines[..at]
+            .iter()
+            .chain(&rest[1..])
+            .any(|l| mentions(l, name));
+        (whole_words && numbered_name(name, "v") == Some(name) && !read).then_some(())
+    });
+    if rounded.is_some() {
+        rest.remove(0);
+    }
+    let tested = format!("require({}.code.length != 0);", call.target);
+    let holds_code = at > 0 && lines[at - 1] == format!("{}{tested}", " ".repeat(depth));
+    let in_scope = |l: &String| l.trim().is_empty() || indent(l) >= depth;
+    let words = rest
+        .first()
+        .filter(|l| in_scope(l))
+        .and_then(|l| size(l.trim()));
+    match words {
+        Some(_) => drop(rest.remove(0)),
+        None if holds_code => {}
+        None => return None,
+    }
+    let mut types = vec!["uint256".to_string(); words.unwrap_or(0)];
+    let word = |i: usize| format!("_word({data}, {})", 32 * i);
+    loop {
+        let line = rest.first().filter(|_| validated).map_or("", |l| l.trim());
+        let found = (0..types.len()).find_map(|i| {
+            let test = line.strip_prefix(&format!("require({} == ", word(i)))?;
+            let cast = test.strip_suffix(");")?;
+            let ty = match cast.strip_suffix(&format!("({})", word(i))) {
+                Some(ty) if sized(ty, "uint", |bits| bits % 8 == 0 && bits < 256) => ty,
+                _ if cast == format!("address(uint160({}))", word(i)) => "address",
+                _ if cast == format!("({} != 0)", word(i)) => "bool",
+                _ => return None,
+            };
+            Some((i, ty.to_string()))
+        });
+        let Some((i, ty)) = found.filter(|(i, _)| types[*i] == "uint256") else {
+            break;
+        };
+        types[i] = ty;
+        rest.remove(0);
+    }
+    let scope = rest.iter().position(|l| !in_scope(l)).unwrap_or(rest.len());
+    let before = lines[..at].iter().chain(&rest[scope..]);
+    let own = lines[..at].iter().chain(&rest);
+    if before.clone().any(|l| mentions(l, &data)) || own.clone().any(|l| mentions(l, &flag)) {
+        return None;
+    }
+    let reads = |i: usize| rest[..scope].iter().any(|l| l.contains(&word(i)));
+    let function = crate::sigs::name_of(call.signature);
+    let mut names: Vec<Option<String>> = Vec::new();
+    for i in 0..types.len() {
+        let numbered = match types.len() {
+            1 => function.to_string(),
+            _ => format!("{function}{i}"),
+        };
+        let name = reads(i).then(|| answer_name(&numbered, taken));
+        taken.extend(name.clone());
+        names.push(name);
+    }
+    for line in &mut rest[..scope] {
+        for (i, name) in names.iter().enumerate() {
+            let (Some(name), read) = (name, word(i)) else {
+                continue;
+            };
+            let (narrow, wide) = match types[i].as_str() {
+                "uint256" => (read.clone(), name.clone()),
+                "address" => (
+                    format!("address(uint160({read}))"),
+                    format!("uint256(uint160({name}))"),
+                ),
+                "bool" => (format!("({read} != 0)"), format!("({name} ? 1 : 0)")),
+                ty => (format!("{ty}({read})"), format!("uint256({name})")),
+            };
+            *line = line.replace(&narrow, name).replace(&read, &wide);
+        }
+    }
+    if rest[..scope].iter().any(|l| mentions(l, &data)) {
+        return None;
+    }
+    let listed = match names.iter().filter(|n| n.is_some()).count() {
+        0 => String::new(),
+        _ if names.len() == 1 => format!("{} {} = ", types[0], names[0].clone()?),
+        _ if lines[at].contains("unchecked(") => return None,
+        _ => {
+            let each = |(ty, name): (&String, &Option<String>)| match name {
+                Some(name) => format!("{ty} {name}"),
+                None => String::new(),
+            };
+            let all: Vec<String> = types.iter().zip(&names).map(each).collect();
+            format!("({}) = ", all.join(", "))
+        }
+    };
+    let named = interface(call.target, call.signature);
+    let mut tail = "external".to_string();
+    if call.method == "staticcall" {
+        tail.push_str(" view");
+    }
+    if call.options.contains("value: ") {
+        tail.push_str(" payable");
+    }
+    if !types.is_empty() {
+        tail.push_str(&format!(" returns ({})", types.join(", ")));
+    }
+    let key = (named.clone(), call.signature.to_string());
+    let declared = called.borrow().get(&key).cloned();
+    if declared.is_some_and(|as_before| as_before != tail) {
+        return None;
+    }
+    called.borrow_mut().insert(key, tail);
+    let options = match call.options {
+        "" => String::new(),
+        given => format!("{{{given}}}"),
+    };
+    let made = format!(
+        "{}{listed}{named}({}).{function}{options}({});",
+        " ".repeat(depth),
+        call.target,
+        call.given
+    );
+    // A current compiler makes the test for code only where no answer is read, so beside
+    // a call that reads one the test stays as a line of its own.
+    let kept = at - usize::from(holds_code && words.is_none());
+    let mut out = lines[..kept].to_vec();
+    out.push(made);
+    out.extend(rest);
+    Some(out)
+}
+
+fn typed_calls(text: &str, taken: BTreeSet<&str>, validated: bool, called: &Called) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut taken: BTreeSet<String> = taken
+        .into_iter()
+        .chain(words_of(text))
+        .map(String::from)
+        .collect();
+    let mut at = 0;
+    while at < lines.len() {
+        match typed_call(&lines, at, &mut taken, validated, called) {
+            Some(folded) => lines = folded,
+            None => at += 1,
+        }
+    }
+    lines.join("\n")
+}
+
+// The interfaces the calls by name go through, each with the functions called.
+fn interfaces_declared(called: &Called) -> String {
+    let mut out = String::new();
+    let mut open = "";
+    let called = called.borrow();
+    for ((name, signature), tail) in called.iter() {
+        if open != name {
+            out.push_str(if open.is_empty() { "" } else { "}\n\n" });
+            out.push_str(&format!("interface {name} {{\n"));
+            open = name;
+        }
+        let function = crate::sigs::name_of(signature);
+        let params = crate::sigs::params_of(signature).join(", ");
+        out.push_str(&format!("    function {function}({params}) {tail};\n"));
+    }
+    if !open.is_empty() {
+        out.push_str("}\n\n");
+    }
+    out
+}
+
 fn mentions(line: &str, name: &str) -> bool {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     line.match_indices(name)
@@ -1699,6 +2284,307 @@ fn errors_declared(text: &str) -> String {
     out
 }
 
+// The test a function opens with that only lets one caller in: where its header ends,
+// where the test starts, and the test.
+fn caller_test(function: &str) -> Option<(usize, usize, &str)> {
+    let mut lines = function.split_inclusive('\n');
+    let mut at = 0;
+    let head = lines.find(|l| {
+        at += l.len();
+        l.starts_with("    function ")
+    })?;
+    let opened = at - head.len() + head.strip_suffix(" {\n")?.len();
+    let first = lines.find(|l| {
+        at += l.len();
+        l.trim() != "unchecked {"
+    })?;
+    let test = first.trim().strip_prefix("require(msg.sender == ")?;
+    test.ends_with(");")
+        .then_some((opened, at - first.len(), first))
+}
+
+fn modifier_name(test: &str) -> Option<String> {
+    let allowed = test.trim().strip_prefix("require(msg.sender == ")?;
+    let allowed = allowed.split([',', ')']).next()?;
+    let name = allowed.trim_start_matches('_');
+    match (allowed, name.chars().next()) {
+        ("address(this", _) => Some("onlySelf".to_string()),
+        (_, Some(first)) if name.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            Some(format!("only{}{}", first.to_ascii_uppercase(), &name[1..]))
+        }
+        _ => None,
+    }
+}
+
+/* A test of the caller that several functions open with is what an author writes once
+as a modifier. The test runs first either way, after the arguments are read. */
+fn with_modifiers(out: &mut String, spans: &mut [(usize, usize, usize)]) -> String {
+    let mut uses: BTreeMap<String, usize> = BTreeMap::new();
+    for (start, end, _) in spans.iter() {
+        if let Some((_, _, test)) = caller_test(&out[*start..*end]) {
+            *uses.entry(test.trim().to_string()).or_default() += 1;
+        }
+    }
+    let mut named: BTreeMap<String, String> = BTreeMap::new();
+    for (test, count) in &uses {
+        let Some(name) = modifier_name(test).filter(|n| *count > 1 && !mentions(out, n)) else {
+            continue;
+        };
+        let more_used = |(other, n): (&String, &usize)| {
+            n > count && modifier_name(other).as_ref() == Some(&name)
+        };
+        if !uses.iter().any(more_used) {
+            named.entry(name).or_insert_with(|| test.clone());
+        }
+    }
+    let of_test = |test: &str| {
+        named
+            .iter()
+            .find(|(_, t)| *t == test.trim())
+            .map(|(n, _)| n)
+    };
+    let mut rebuilt = String::new();
+    let mut copied = 0;
+    for span in spans.iter_mut() {
+        rebuilt.push_str(&out[copied..span.0]);
+        let function = &out[span.0..span.1];
+        let start = rebuilt.len();
+        let guarded = caller_test(function).and_then(|found| Some((found, of_test(found.2)?)));
+        match guarded {
+            Some(((opened, at, test), name)) => {
+                let head = &function[..opened];
+                let (before, after) = match head.rfind(" returns (") {
+                    Some(returns) => head.split_at(returns),
+                    None => (head, ""),
+                };
+                rebuilt.push_str(&format!("{before} {name}{after}{}", &function[opened..at]));
+                rebuilt.push_str(&function[at + test.len()..]);
+            }
+            None => rebuilt.push_str(function),
+        }
+        copied = span.1;
+        *span = (start, rebuilt.len(), span.2);
+    }
+    rebuilt.push_str(&out[copied..]);
+    *out = rebuilt;
+    let declared = |(name, test): (&String, &String)| {
+        format!("    modifier {name}() {{\n        {test}\n        _;\n    }}\n\n")
+    };
+    named.iter().map(declared).collect()
+}
+
+struct Header<'a> {
+    before: &'a str,
+    name: &'a str,
+    params: Vec<(&'a str, &'a str)>,
+    words: Vec<&'a str>,
+    returns: &'a str,
+    body: &'a str,
+}
+
+// A function of the file taken apart: what stands before it, its header and its lines.
+fn header_of(function: &str) -> Option<Header<'_>> {
+    let at = match function.starts_with("    function ") {
+        true => 0,
+        false => function.find("\n    function ")? + 1,
+    };
+    let (head, rest) = function[at..].split_once(" {\n")?;
+    let (name, listed) = head.strip_prefix("    function ")?.split_once('(')?;
+    let close = close_of(listed)?;
+    let params: Option<Vec<(&str, &str)>> = match listed[..close].trim().is_empty() {
+        true => Some(Vec::new()),
+        false => abi::split_top(&listed[..close])
+            .into_iter()
+            .map(|p| p.trim().rsplit_once(' '))
+            .collect(),
+    };
+    let after = &listed[close + 1..];
+    let (words, returns) = match after.find(" returns (") {
+        Some(given) => after.split_at(given),
+        None => (after, ""),
+    };
+    Some(Header {
+        before: &function[..at],
+        name,
+        params: params?,
+        words: words.split_whitespace().collect(),
+        returns,
+        body: rest.strip_suffix("    }\n\n")?,
+    })
+}
+
+/* A compiler puts the body of a function in a place of its own and has the function jump
+there, so the body comes out as a helper only that function calls. An author wrote the
+body in the function, and so does this: the helper's lines go where the call was, under
+the names the function gives its arguments. */
+fn wrapper_filled(function: &str, helper: &str) -> Option<(String, String)> {
+    let (outer, inner) = (header_of(function)?, header_of(helper)?);
+    let stated = |l: &&str| !matches!(l.trim(), "unchecked {" | "}");
+    let local = |l: &str| {
+        let named = l.trim().strip_suffix(';').and_then(|l| l.rsplit_once(' '));
+        named.is_some_and(|(ty, name)| elementary(ty) && identifier(name))
+    };
+    let lines: Vec<&str> = outer
+        .body
+        .lines()
+        .filter(stated)
+        .filter(|l| !local(l))
+        .collect();
+    let leaves_early = inner.body.lines().any(|l| l.trim() == "return;");
+    let (call, after) = match lines[..] {
+        [only] if outer.returns.is_empty() && inner.returns.is_empty() => (only.trim(), ""),
+        [given, back] if outer.returns == inner.returns => {
+            let (result, call) = given.trim().split_once(" = ")?;
+            let handed = back.trim() == format!("return {result};") && identifier(result);
+            (handed.then_some(call)?, "")
+        }
+        // What the function does after the call it does after the helper's last line.
+        [only, back] if inner.returns.is_empty() && !leaves_early => (only.trim(), back),
+        _ => return None,
+    };
+    let after = match after.trim() {
+        "" => String::new(),
+        back => format!("        {back}\n"),
+    };
+    if !after.is_empty() && !after.trim().starts_with("return ") {
+        return None;
+    }
+    let given = call
+        .strip_prefix(inner.name)?
+        .strip_prefix('(')?
+        .strip_suffix(");")?;
+    let given = match given.trim().is_empty() {
+        true => Vec::new(),
+        false => abi::split_top(given),
+    };
+    let external = outer
+        .words
+        .iter()
+        .any(|w| matches!(*w, "external" | "public"));
+    if !external || !inner.words.contains(&"internal") || given.len() != inner.params.len() {
+        return None;
+    }
+    let written = |name: &str| {
+        let sets = |l: &str| {
+            l.split_once(" = ")
+                .is_some_and(|(left, _)| mentions(left, name))
+        };
+        inner.body.lines().any(sets)
+    };
+    let mut names: Vec<(String, String)> = Vec::new();
+    let mut locals = String::new();
+    for ((ty, name), value) in inner.params.iter().zip(&given) {
+        let value = value.trim();
+        let same = outer
+            .params
+            .iter()
+            .any(|(held, own)| own == &value && held == ty);
+        let fixed = matches!(value, "msg.sender" | "address(this)") && !written(name);
+        match () {
+            () if same || fixed => names.push((name.to_string(), value.to_string())),
+            () if !mentions(inner.body, name) => {}
+            () if elementary(ty) => locals.push_str(&format!("        {ty} {name} = {value};\n")),
+            () => return None,
+        }
+    }
+    // A name of the function that the helper uses for something else would become one.
+    let renamed_away = |name: &str| names.iter().any(|(from, _)| from == name);
+    let shared = |(_, name): &(&str, &str)| mentions(inner.body, name) && !renamed_away(name);
+    if outer.params.iter().any(shared) {
+        return None;
+    }
+    let reach = |words: &[&str]| match words {
+        w if w.contains(&"pure") => 0,
+        w if w.contains(&"view") => 1,
+        _ => 2,
+    };
+    let stated = [
+        "internal", "external", "public", "private", "view", "pure", "payable",
+    ];
+    let visible = outer
+        .words
+        .iter()
+        .filter(|w| !matches!(**w, "view" | "pure"));
+    let reads = ["pure", "view"].get(reach(&outer.words).max(reach(&inner.words)));
+    let guards = inner.words.iter().filter(|w| !stated.contains(w));
+    let words: Vec<&str> = visible.chain(reads).chain(guards).copied().collect();
+    let params: Vec<String> = outer
+        .params
+        .iter()
+        .map(|(ty, name)| format!("{ty} {name}"))
+        .collect();
+    let head = format!(
+        "{}{}    function {}({}) {}{} {{\n",
+        outer.before,
+        inner.before,
+        outer.name,
+        params.join(", "),
+        words.join(" "),
+        outer.returns
+    );
+    Some((
+        head,
+        format!("{locals}{}{after}", renamed(inner.body, &names)),
+    ))
+}
+
+fn wrappers_filled(out: &mut String, spans: &mut Vec<(usize, usize, usize)>) {
+    loop {
+        let mut calls: BTreeMap<&str, usize> = BTreeMap::new();
+        for (at, _) in out.match_indices('(') {
+            let word = |c: char| !c.is_ascii_alphanumeric() && c != '_';
+            let start = out[..at].rfind(word).map_or(0, |i| i + 1);
+            *calls.entry(&out[start..at]).or_default() += 1;
+        }
+        let text = |span: &(usize, usize, usize)| &out[span.0..span.1];
+        let mut filled: BTreeMap<usize, (usize, String, String)> = BTreeMap::new();
+        let mut taken: BTreeSet<usize> = BTreeSet::new();
+        for (at, helper) in spans.iter().enumerate() {
+            let name = header_of(text(helper)).map_or("", |h| h.name);
+            if calls.get(name) != Some(&2) || taken.contains(&at) {
+                continue;
+            }
+            let called = format!("{name}(");
+            let free = |(i, s): &(usize, &(usize, usize, usize))| {
+                *i != at && !taken.contains(i) && text(s).contains(&called)
+            };
+            let mut callers = spans.iter().enumerate().filter(free);
+            let found =
+                callers.find_map(|(i, s)| Some((i, wrapper_filled(text(s), text(helper))?)));
+            if let Some((from, (head, body))) = found {
+                taken.extend([at, from]);
+                filled.insert(from, (at, head, body));
+            }
+        }
+        if filled.is_empty() {
+            return;
+        }
+        let helpers: BTreeSet<usize> = filled.values().map(|(helper, _, _)| *helper).collect();
+        let mut rebuilt = String::new();
+        let mut moved = Vec::new();
+        let mut copied = 0;
+        for (at, span) in spans.iter().enumerate() {
+            rebuilt.push_str(&out[copied..span.0]);
+            copied = span.1;
+            let start = rebuilt.len();
+            if let Some((helper, head, body)) = filled.get(&at) {
+                rebuilt.push_str(head);
+                moved.push((start, rebuilt.len(), span.2));
+                let start = rebuilt.len();
+                rebuilt.push_str(body);
+                moved.push((start, rebuilt.len(), spans[*helper].2));
+                rebuilt.push_str("    }\n\n");
+            } else if !helpers.contains(&at) {
+                rebuilt.push_str(&out[span.0..span.1]);
+                moved.push((start, rebuilt.len(), span.2));
+            }
+        }
+        rebuilt.push_str(&out[copied..]);
+        *out = rebuilt;
+        *spans = moved;
+    }
+}
+
 fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -> Draft {
     let own = version(c).filter(|_| shape.own_version);
     let pragma = match own {
@@ -1714,6 +2600,10 @@ fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -
     let licence = "// SPDX-License-Identifier: UNLICENSED";
     let mut out = format!("{licence}\npragma solidity {pragma};\n{built}\n");
     let mut spans = Vec::new();
+    let interfaces_at = out.len();
+    if let Some(plain) = plain {
+        plain.called.borrow_mut().clear();
+    }
     out.push_str(&format!("contract {name} {{\n"));
     if let Some(plain) = plain.filter(|p| !p.layout.text.is_empty()) {
         out.push_str(&plain.layout.text);
@@ -1799,15 +2689,20 @@ fn compose(c: &Contract, name: &str, shape: &Shape, plain: Option<&Plain<'_>>) -
             out.push_str(helper);
         }
     }
+    let modifiers = with_modifiers(&mut out, &mut spans);
+    wrappers_filled(&mut out, &mut spans);
     let errors = format!(
-        "{}{}",
+        "{}{}{modifiers}",
         structs_declared(&out[errors_at..]),
         errors_declared(&out[errors_at..])
     );
-    for span in &mut spans {
-        *span = (span.0 + errors.len(), span.1 + errors.len(), span.2);
-    }
     out.insert_str(errors_at, &errors);
+    let interfaces = plain.map_or(String::new(), |p| interfaces_declared(p.called));
+    out.insert_str(interfaces_at, &interfaces);
+    let moved = errors.len() + interfaces.len();
+    for span in &mut spans {
+        *span = (span.0 + moved, span.1 + moved, span.2);
+    }
     if clean {
         out.truncate(out.trim_end().len());
         out.push_str("\n}\n");
@@ -1988,8 +2883,71 @@ pub fn draft(c: &Contract, name: &str) -> String {
         relaxed: &BTreeMap::new(),
         drafted: true,
         packed: &BTreeSet::new(),
+        called: &Called::default(),
     };
     compose(c, name, &shape, Some(&plain)).text
+}
+
+fn unwrapped(text: &str) -> &str {
+    let inner = uncast(text);
+    match inner == text {
+        true => text,
+        false => unwrapped(inner),
+    }
+}
+
+/* What a compiler writes for a public variable that holds a struct: a function that
+returns every member in order, each in its own type. A member that is a mapping or a
+list is left out by the compiler, so a struct with one is not taken for this. */
+fn struct_getter<'a>(c: &'a Contract, f: &Function, line: &str) -> Option<&'a str> {
+    let listed = line.strip_prefix("return (")?.strip_suffix(");")?;
+    let mut parts: Vec<&str> = Vec::new();
+    let (mut depth, mut from) = (0i32, 0);
+    for (at, c) in listed.char_indices() {
+        depth += i32::from(matches!(c, '(' | '[')) - i32::from(matches!(c, ')' | ']'));
+        if depth == 0 && c == ',' {
+            parts.push(listed[from..at].trim());
+            from = at + 1;
+        }
+    }
+    parts.push(listed[from..].trim());
+    let first = unwrapped(parts.first()?);
+    let name = &first[..first.find('[')?];
+    let v = c.storage.iter().find(|v| v.name == name)?;
+    let mut held = name.to_string();
+    for p in &f.params {
+        held.push_str(&format!("[{}]", p.name));
+    }
+    let mut members: Vec<_> = v.members.iter().collect();
+    members.sort_by_key(|m| m.offset);
+    let mut expected: Vec<(String, &str)> = Vec::new();
+    for m in members {
+        if m.holds_many() {
+            return None;
+        }
+        let mut fields: Vec<_> = m.fields.iter().collect();
+        fields.sort_by_key(|f| f.offset);
+        expected.extend(fields.iter().map(|f| (f.name.clone(), f.ty.as_str())));
+        expected.extend(fields.is_empty().then(|| (m.name.clone(), m.ty.as_str())));
+    }
+    let read = |part: &str| {
+        let mut text = unwrapped(part).to_string();
+        for p in &f.params {
+            let cast = format!("[{}({})]", p.ty, p.name);
+            text = text.replace(&cast, &format!("[{}]", p.name));
+        }
+        text
+    };
+    let same =
+        parts.len() == expected.len()
+            && parts.len() == f.returns.len()
+            && parts.len() > 1
+            && parts.iter().zip(&expected).zip(&f.returns).all(
+                |((part, (member, ty)), returned)| {
+                    read(part) == format!("{held}.{member}") && ty == returned
+                },
+            );
+    same.then_some(v.name.as_str())
 }
 
 // The variable a function returns and does nothing else, read under the function's own
@@ -2002,12 +2960,21 @@ fn getter<'a>(c: &'a Contract, f: &Function) -> Option<&'a str> {
         return None;
     }
     let code = f.code.lines().map(str::trim);
-    let lines: Vec<&str> = code
-        .filter(|l| !l.is_empty() && *l != "require(msg.value == 0);")
-        .collect();
+    // A compiler writes these two tests itself, at the top of every function it makes.
+    let its_own = |l: &&str| {
+        let sized = [
+            "require(msg.data.length - 4 >= ",
+            "require(msg.data.length >= ",
+        ];
+        *l == "require(msg.value == 0);" || sized.iter().any(|test| l.starts_with(test))
+    };
+    let lines: Vec<&str> = code.filter(|l| !l.is_empty() && !its_own(l)).collect();
     let [line] = lines.as_slice() else {
         return None;
     };
+    if let Some(held) = struct_getter(c, f, line) {
+        return Some(held);
+    }
     let shown = one_value(line);
     let value = uncast(shown.strip_prefix("return ")?.strip_suffix(';')?);
     let (name, mut rest) = value.split_at(value.find('[').unwrap_or(value.len()));
@@ -2071,6 +3038,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
             relaxed: &relaxed,
             drafted: false,
             packed: &packed,
+            called: &Called::default(),
         };
         let draft = compose(c, NAME, &shape, Some(&written));
         if draft.spans.is_empty() && read.is_empty() {
@@ -2209,6 +3177,7 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
                         relaxed: &relaxed,
                         drafted: false,
                         packed: &packed,
+                        called: &Called::default(),
                     };
                     let clean = every.then(|| compose(c, NAME, &shape, Some(&whole)));
                     let tried = clean.and_then(|draft| {
@@ -2243,6 +3212,155 @@ pub fn raised_file(c: &Contract, runs: usize) -> Result<Output, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_with_every_test_a_compiler_writes_is_made_by_name() {
+        let handed_on =
+            "assembly { returndatacopy(0, 0, returndatasize()) revert(0, returndatasize()) }";
+        let call = "(success_1, returned_1) = token.staticcall(abi.encodeWithSignature(";
+        let failure = format!("        if (!success_1) {{\n            {handed_on}\n        }}");
+        let text = format!(
+            "        require(token.code.length != 0);\n        {call}\"owner()\"));\n{failure}\n        \
+             require(_returndatasize() >= 32);\n        \
+             require(_word(returned_1, 0) == address(uint160(_word(returned_1, 0))));\n        \
+             return address(uint160(_word(returned_1, 0)));"
+        );
+        let called = Called::default();
+        let taken = BTreeSet::from(["owner"]);
+        assert_eq!(
+            typed_calls(&text, taken, true, &called),
+            "        require(token.code.length != 0);\n        \
+             address owner2 = IToken(token).owner();\n        return owner2;"
+        );
+        assert_eq!(
+            interfaces_declared(&called),
+            "interface IToken {\n    function owner() external view returns (address);\n}\n\n"
+        );
+        let untested = format!(
+            "        {call}\"owner()\"));\n{failure}\n        return _word(returned_1, 0);"
+        );
+        let called = Called::default();
+        assert_eq!(
+            typed_calls(&untested, BTreeSet::new(), true, &called),
+            untested
+        );
+    }
+
+    #[test]
+    fn a_copy_that_is_only_handed_on_or_read_back_whole_is_written() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let forwarded = "(success_1, ) = to.delegatecall(msg.data);\n\
+             mem[0:+_returndatasize()] = returndata[0:+_returndatasize()];\n\
+             if (!success_1) {\n    _revert(0x0, _returndatasize());\n}\n\
+             _return(0x0, _returndatasize());";
+        let written = copies_kept(lines(forwarded));
+        assert_eq!(written[1], "_copy_returned(0, 0, _returndatasize());");
+        let read_after = forwarded.replace("_return(0x0", "v1 = _memory(0);\n_return(0x0");
+        assert_eq!(copies_kept(lines(&read_after)), lines(&read_after));
+        let hashed = "ptr1 = _free();\n\
+             mem[ptr1:+msg.data.length] = msg.data[0:+msg.data.length];\n\
+             _take(ptr1 + (msg.data.length));\n\
+             v1 = keccak256(_range(ptr1, msg.data.length));";
+        assert_eq!(copies_kept(lines(hashed)), ["v1 = keccak256(msg.data);"]);
+    }
+
+    #[test]
+    fn code_two_branches_share_is_written_after_them() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let jumped = "if (a == 0) {\nL1f:\n    b = 1;\n    return;\n} else {\n    \
+             if (c) {\n        revert();\n    } else {\n        d = 2;\n        goto L1f;\n    }\n}";
+        let after = "if (a != 0) {\n    if (c) {\n        revert();\n    } else {\n        \
+             d = 2;\n    }\n}\nb = 1;\nreturn;";
+        assert_eq!(shared_tails(lines(jumped)), lines(after));
+        let led = jumped.replace("L1f:", "    f = 4;\nL1f:");
+        let after = "if (a == 0) {\n    f = 4;\n} else {\n    if (c) {\n        revert();\n    \
+             } else {\n        d = 2;\n    }\n}\nb = 1;\nreturn;";
+        assert_eq!(shared_tails(lines(&led)), lines(after));
+        let falls = jumped.replace("revert();", "e = 3;");
+        assert_eq!(shared_tails(lines(&falls)), lines(&falls));
+        assert_eq!(negated("a < b && c"), "!(a < b && c)");
+        assert_eq!(negated("!(f(a))"), "f(a)");
+        assert_eq!(negated("!(ok)"), "ok");
+    }
+
+    #[test]
+    fn a_test_of_the_caller_two_functions_open_with_is_a_modifier() {
+        let test = "        require(msg.sender == _owner, \"no\");\n";
+        let one = format!(
+            "    function a() external returns (uint256) {{\n{test}        return 1;\n    }}\n\n"
+        );
+        let two = format!(
+            "    function b() external {{\n        unchecked {{\n    {test}        }}\n    }}\n\n"
+        );
+        let other = "    function c() external {\n        require(msg.sender == admin);\n    }\n\n";
+        let mut out = format!("{one}{two}{other}");
+        let mut spans = [(0, one.len(), 0), (one.len(), one.len() + two.len(), 1)];
+        let declared = with_modifiers(&mut out, &mut spans);
+        assert!(declared
+            .starts_with("    modifier onlyOwner() {\n        require(msg.sender == _owner"));
+        assert!(out.starts_with(
+            "    function a() external onlyOwner returns (uint256) {\n        return 1;"
+        ));
+        assert!(
+            out.contains("    function b() external onlyOwner {\n        unchecked {\n        }\n")
+        );
+        assert!(out.ends_with(other) && out[spans[1].0..spans[1].1] != two);
+    }
+
+    #[test]
+    fn the_body_only_one_function_calls_is_written_in_that_function() {
+        let function =
+            "    function pay(address to, uint256 arg1) external view returns (bool) {\n        \
+             bool ret_1_0;\n        ret_1_0 = func_0x1f(to, msg.sender, arg1 + 1);\n        \
+             return ret_1_0;\n    }\n\n";
+        let helper = "    function func_0x1f(address arg0, address arg1, uint256 arg2) internal onlyOwner returns (bool) {\n        \
+             balances[arg0] = arg2;\n        return arg1 == arg0;\n    }\n\n";
+        let mut out = format!("{function}{helper}");
+        let mut spans = vec![(0, function.len(), 0), (function.len(), out.len(), 1)];
+        wrappers_filled(&mut out, &mut spans);
+        assert_eq!(
+            out,
+            "    function pay(address to, uint256 arg1) external onlyOwner returns (bool) {\n        \
+             uint256 arg2 = arg1 + 1;\n        balances[to] = arg2;\n        \
+             return msg.sender == to;\n    }\n\n"
+        );
+        assert_eq!(spans.iter().map(|s| s.2).collect::<Vec<_>>(), [0, 1]);
+        let twice = format!("{function}{helper}    function f() external {{\n        func_0x1f(a, b, 1);\n    }}\n\n");
+        let mut kept = twice.clone();
+        wrappers_filled(&mut kept, &mut spans.clone());
+        assert_eq!(kept, twice);
+    }
+
+    #[test]
+    fn a_length_moved_by_one_around_the_last_element_is_a_push_or_a_pop() {
+        let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+        let grown = lines(
+            "    uint256 prev = list.length;\n    list.length = prev + 1;\n    \
+             if (prev >= list.length) _panic(0x32);\n    list[prev] = who;\n    \
+             index[who] = list.length;",
+        );
+        assert_eq!(
+            pushed(grown),
+            lines("    list.push(who);\n    index[who] = list.length;")
+        );
+        let read_after = lines(
+            "    uint256 prev = list.length;\n    list.length = prev + 1;\n    \
+             list[prev] = who;\n    at[who] = prev;",
+        );
+        assert_eq!(
+            pushed(read_after),
+            lines("    uint256 prev = list.length;\n    list.push(who);\n    at[who] = prev;")
+        );
+        let shrunk = lines(
+            "    if (list.length == 0) _panic(0x31);\n    \
+             if (list.length - 1 >= list.length) _panic(0x32);\n    \
+             list[list.length - 1] = 0;\n    list.length = list.length - 1;",
+        );
+        assert_eq!(pushed(shrunk), lines("    list.pop();"));
+        // With no test for an empty list, the old code wraps where `pop` would fail.
+        let untested = lines("    list[list.length - 1] = 0;\n    list.length = list.length - 1;");
+        assert_eq!(pushed(untested.clone()), untested);
+    }
 
     #[test]
     fn a_variable_is_renamed_and_a_call_or_a_member_of_that_name_is_not() {

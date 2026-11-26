@@ -251,8 +251,8 @@ fn solc8_reverts_checked_arithmetic_and_loops_read_as_source() {
         "checked_sub not inlined"
     );
     assert!(
-        src.contains("return _word(returned_1, 0);"),
-        "return data not resolved"
+        src.contains("uint256 balance = IERC20(stor_6_1).balanceOf(address(this));"),
+        "the call is not made by name"
     );
     assert!(!src.contains("int256(msg.data.length"));
     assert!(!src.contains("== address("), "ABI validator printed");
@@ -595,8 +595,15 @@ fn types_follow_values_through_helpers_and_range_checks() {
         ),
         "{compound}"
     );
-    assert!(compound
-        .contains("function func_0xe3c(address account, address account2, uint256 arg2) internal"));
+    assert!(
+        compound.contains("function func_0x1272(address account) internal view returns (uint256)"),
+        "{compound}"
+    );
+    let router = evmdec::decompile::decompile(&by_name("univ2_router"), &opts).source;
+    assert!(
+        router.contains("uint8 arg8, bytes32 arg9, bytes32 arg10) external"),
+        "what is handed to permit has the types permit names: {router}"
+    );
     let ens = evmdec::decompile::decompile(&by_name("ens_registry"), &opts).source;
     assert!(ens.contains("mapping(bytes32 => "), "{ens}");
     assert!(ens.contains("external returns (bytes32)"), "{ens}");
@@ -702,7 +709,7 @@ fn defaults_give_way_to_names_the_code_implies() {
         "mapping(address => uint256) balances;",
         "mapping(address => mapping(address => uint256)) allowances;",
         "function _transfer(address from, address to, uint256 amount) internal",
-        "function _pause() internal",
+        "function pause() external onlyOwner {",
     ] {
         assert!(usdt.contains(line), "usdt: missing `{line}`");
     }
@@ -715,7 +722,7 @@ fn defaults_give_way_to_names_the_code_implies() {
     for line in [
         "function transferFrom(address from, address to, uint256 amount) external",
         "mapping(address => uint256) public balanceOf;",
-        "function _withdrawal(uint256 amount) internal",
+        "function withdraw(uint256 amount) external {",
     ] {
         assert!(weth.contains(line), "weth9: missing `{line}`");
     }
@@ -809,8 +816,19 @@ fn struct_elements_are_declared_and_read_by_member() {
     }
 
     let vat = source("../../testdata/mainnet/maker_vat.hex").source;
-    assert!(vat.contains("require(stor_2[key].field1 == 0, \"Vat/ilk-already-init\");"));
-    assert!(vat.contains("stor_3[key][account].field0"));
+    assert!(vat.contains("require(ilks[key].field1 == 0, \"Vat/ilk-already-init\");"));
+    assert!(vat.contains("urns[key][account].field0"));
+    for line in [
+        "struct IlksEntry {",
+        "mapping(bytes32 => IlksEntry) public ilks;",
+        "mapping(bytes32 => mapping(address => UrnsEntry)) public urns;",
+    ] {
+        assert!(
+            vat.contains(line),
+            "a getter of a whole struct is the public variable: `{line}`"
+        );
+    }
+    assert!(!vat.contains("function ilks("));
 
     let roles = source("../../testdata/vuln/miso_batch_impl.hex");
     let role = roles
@@ -1018,7 +1036,7 @@ fn both_ways_into_a_join_keep_their_own_call_after_it() {
         .expect("the swap callback");
     let body = &router[start..start + router[start..].find("\n    }").unwrap()];
     let after = &body[body.find("L21be:").expect("the join")..];
-    let (token0, token1) = ("bytes4(0x0dfe1681)", "bytes4(0xd21220a7)");
+    let (token0, token1) = ("\"token0()\"", "\"token1()\"");
     assert!(
         after.contains(token1) && after.contains(token0),
         "the pool is asked for the other token whichever one was paid: {after}"
@@ -1328,9 +1346,9 @@ fn call_data_is_the_bytes_the_writes_left_under_one_pointer_name() {
     );
     let helper = regress("umbrella_batch_helper.hex").source;
     assert!(helper.contains(
-        ".call(abi.encodeWithSelector(bytes4(uint32(v2)), _word(returned_2, 0), msg.sender, address(this)));"
+        ".call(abi.encodeWithSelector(bytes4(uint32(v2)), redeem2, msg.sender, address(this)));"
     ));
-    assert!(helper.contains("abi.encodeWithSelector(bytes4(0x6e553f65), arg2, address(this))"));
+    assert!(helper.contains(".deposit(arg2, address(this));"));
     let gauge = regress("vyper_gauge.hex").source;
     assert!(
         gauge.contains("stor_21.call(abi.encodePacked(bytes4(mem[0x3c8])));"),

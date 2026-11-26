@@ -599,6 +599,11 @@ fn types_follow_values_through_helpers_and_range_checks() {
         compound.contains("function func_0x1272(address account) internal view returns (uint256)"),
         "{compound}"
     );
+    let router = evmdec::decompile::decompile(&by_name("univ2_router"), &opts).source;
+    assert!(
+        router.contains("uint8 arg8, bytes32 arg9, bytes32 arg10) external"),
+        "what is handed to permit has the types permit names: {router}"
+    );
     let ens = evmdec::decompile::decompile(&by_name("ens_registry"), &opts).source;
     assert!(ens.contains("mapping(bytes32 => "), "{ens}");
     assert!(ens.contains("external returns (bytes32)"), "{ens}");

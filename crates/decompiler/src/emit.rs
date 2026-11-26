@@ -3715,6 +3715,14 @@ pub fn call_head(head: &[ExprId], in_off: ExprId) -> Option<(u32, Vec<ExprId>)> 
     Some((sel, args))
 }
 
+/* A compiler gives `send` and `transfer` no gas of their own. The EVM adds 2300 to a call
+that carries value, and the compiler adds the same 2300 itself where the value is zero. */
+pub fn only_stipend(gas: ExprId) -> bool {
+    let stipend = Some(U256::from_u64(2300));
+    let scaled = |v: &[ExprId]| v.iter().any(|part| expr::as_const(*part) == stipend);
+    expr::as_const(gas) == stipend || matches!(expr::node(gas), Node::Op(op::MUL, v) if scaled(&v))
+}
+
 fn forwards_all_gas(gas: ExprId) -> bool {
     let left = |e: ExprId| matches!(expr::node(e), Node::Env(op::GAS, _));
     left(gas) || matches!(expr::node(gas), Node::Op(op::SUB, v) if left(v[0]))
@@ -4010,6 +4018,11 @@ pub fn fmt_stmt(s: &Stmt, n: &Names) -> String {
                     }
                 }
             };
+            let bare = expr::as_const(*in_len) == Some(U256::ZERO);
+            if let (op::CALL, true, Some(sent)) = (*kind, bare && only_stipend(*gas), value) {
+                let (flag, to) = (fmt_expr(*result, n), as_address(*addr, n));
+                return format!("{flag} = payable({to}).send({});", fmt_expr(*sent, n));
+            }
             let answered = match expr::node(*result) {
                 Node::CallResult(seq) if !copy && method != "callcode" => Some(seq),
                 _ => None,

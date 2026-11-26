@@ -2890,8 +2890,7 @@ impl<'a> Printer<'a> {
         if expr::as_const(*in_len) != Some(U256::ZERO) {
             return false;
         }
-        let stipend = expr::as_const(*gas).is_some_and(|g| g == U256::from_u64(2300))
-            || matches!(expr::node(*gas), Node::Op(op::MUL, ref v) if expr::as_const(v[1]) == Some(U256::from_u64(2300)) || expr::as_const(v[0]) == Some(U256::from_u64(2300)));
+        let stipend = emit::only_stipend(*gas);
         if !stipend {
             return false;
         }

@@ -135,6 +135,9 @@ struct AMem {
 }
 
 const MAX_AMEM: usize = 1 << 16;
+// The words both compilers keep for themselves: scratch space, the start of free memory
+// and the word of zeros. Code writes them only at their own addresses.
+const RESERVED: u32 = 0x80;
 const MAX_UNKNOWN_RANGES: usize = 32;
 const MAX_VARIANTS: usize = 8;
 
@@ -162,6 +165,23 @@ impl AMem {
         };
         if !self.unknown.contains(&range) {
             Rc::make_mut(&mut self.unknown).push(range);
+        }
+    }
+
+    /* A write to a place that is not known may have gone anywhere. A place to jump to
+    is still trusted where it was kept, as the code that writes by an index tests the
+    index first. A plain number is not, since handing one on as what memory holds would
+    put a wrong value in the caller. */
+    fn overwritten(&mut self, jumpdests: &HashSet<usize>) {
+        self.clobbered = true;
+        let kept = |at: &u32, v: &AVal| match v {
+            AVal::Const(c) if *at >= RESERVED => {
+                c.as_usize().is_some_and(|pc| jumpdests.contains(&pc))
+            }
+            _ => true,
+        };
+        if self.words.iter().any(|(at, v)| !kept(at, v)) {
+            Rc::make_mut(&mut self.words).retain(|at, v| kept(at, v));
         }
     }
 
@@ -454,7 +474,13 @@ fn to_usize(v: AVal) -> Option<usize> {
     v.konst().and_then(|c| c.as_usize())
 }
 
-pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
+/* A block is walked with every branch taken, whatever its test, and with only those
+numbers kept that could be a place to jump to. That is wrong for one kind of loop: one
+that pushes a value each time round and counts in memory how often, which is how old
+Vyper hands back a fixed array. Taken both ways each time, it ends with every number of
+values on the stack. A block marked as counted keeps its sums and follows a test whose
+outcome it knows, so such a loop ends once, where it does. */
+pub fn exec_block(prog: &Program, b: &Block, state: &AState, counted: bool) -> BlockExit {
     let mut st = state.clone();
     let mut mem_written = Vec::new();
     let mut mem_clobbered = false;
@@ -507,8 +533,18 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
             }
             op::JUMPI => {
                 let t = st.pop();
-                let _cond = st.pop();
+                let cond = st.pop();
                 let fallthrough = prog.next_block(b.id);
+                let known = cond.konst().filter(|_| counted).map(|c| !c.is_zero());
+                let target = t.konst().and_then(|c| c.as_usize());
+                if let (Some(taken), Some(pc)) = (known, target) {
+                    let targets = prog.target_block(pc).filter(|_| taken);
+                    flow = Some(Flow::Branch {
+                        targets: targets.into_iter().collect(),
+                        fallthrough: fallthrough.filter(|_| !taken),
+                    });
+                    break;
+                }
                 flow = Some(match t {
                     AVal::Const(c) | AVal::Pc(c) => Flow::Branch {
                         targets: c
@@ -577,7 +613,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         }
                     }
                     _ => {
-                        st.mem.clobbered = true;
+                        st.mem.overwritten(&prog.jumpdests);
                         mem_clobbered = true;
                     }
                 }
@@ -609,7 +645,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         mem_written.push((d - d % 32) as u32);
                     }
                     _ => {
-                        st.mem.clobbered = true;
+                        st.mem.overwritten(&prog.jumpdests);
                         mem_clobbered = true;
                     }
                 }
@@ -624,7 +660,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         mem_written.push((d - d % 32) as u32);
                     }
                     _ => {
-                        st.mem.clobbered = true;
+                        st.mem.overwritten(&prog.jumpdests);
                         mem_clobbered = true;
                     }
                 }
@@ -640,7 +676,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         mem_written.push((d - d % 32) as u32);
                     }
                     _ => {
-                        st.mem.clobbered = true;
+                        st.mem.overwritten(&prog.jumpdests);
                         mem_clobbered = true;
                     }
                 }
@@ -665,7 +701,7 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         }
                     }
                     _ => {
-                        st.mem.clobbered = true;
+                        st.mem.overwritten(&prog.jumpdests);
                         mem_clobbered = true;
                     }
                 }
@@ -694,13 +730,25 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                                     a.wrapping_sub(b)
                                 })
                             }
+                            (AVal::Const(a), AVal::Const(b))
+                                if counted && matches!(o, op::GT | op::LT | op::EQ) =>
+                            {
+                                let holds = match o {
+                                    op::GT => a > b,
+                                    op::LT => a < b,
+                                    _ => a == b,
+                                };
+                                AVal::Const(U256::from_u64(u64::from(holds)))
+                            }
                             (AVal::Const(a), AVal::Const(b)) if matches!(o, op::ADD | op::SUB) => {
                                 let r = if o == op::ADD {
                                     a.wrapping_add(b)
                                 } else {
                                     a.wrapping_sub(b)
                                 };
-                                if r.as_usize().is_some_and(|pc| prog.jumpdests.contains(&pc)) {
+                                if counted
+                                    || r.as_usize().is_some_and(|pc| prog.jumpdests.contains(&pc))
+                                {
                                     AVal::Const(r)
                                 } else {
                                     AVal::Unk
@@ -733,6 +781,12 @@ pub fn exec_block(prog: &Program, b: &Block, state: &AState) -> BlockExit {
                         (1, op::CLZ) => match args[0] {
                             AVal::Const(a) => {
                                 AVal::Const(U256::from_u64(u64::from(a.leading_zeros())))
+                            }
+                            _ => AVal::Unk,
+                        },
+                        (1, op::ISZERO) => match args[0] {
+                            AVal::Const(a) if counted => {
+                                AVal::Const(U256::from_u64(u64::from(a.is_zero())))
                             }
                             _ => AVal::Unk,
                         },
@@ -818,16 +872,30 @@ pub struct Analysis<'a> {
     pub steps: RefCell<usize>,
     pub budget_exhausted: RefCell<bool>,
     abandoned: RefCell<HashSet<usize>>,
+    // Blocks of a loop that changes how much is on the stack, walked by count.
+    counted: RefCell<HashSet<usize>>,
+    // The blocks being walked on their own, outermost first, each with the height of
+    // stack it was reached at, and that height for the next one asked for.
+    chain: RefCell<Vec<(usize, i64, Vec<usize>)>>,
+    level: Cell<i64>,
+    // The blocks walked on the way to the next one asked for.
+    way: RefCell<Vec<usize>>,
 }
 
 const MAX_EXITS: usize = 24;
 const MAX_ORPHAN_NODES: usize = 60_000;
 // Loops that push or pop a stack entry per iteration would make a node per iteration.
+// How much a counted block has taken from under the stack, and the numbers in memory
+// and on the stack, which tell one round of its loop from the next.
+type Round = (u16, Vec<(u32, U256)>, Vec<Option<U256>>);
 const MAX_BLOCK_CONTEXTS: usize = 12;
+// shortcut: a counted loop is followed for this many rounds, raise it for longer arrays
+const MAX_COUNTED_ROUNDS: usize = 512;
+const MAX_REWALKS: usize = 8;
 const MAX_WALK_NODES: usize = 6000;
 const MAX_STEPS: usize = 3_000_000;
 // A summary frame is large in a debug build. This depth has to fit a 2 MiB thread stack.
-const MAX_RECURSION: usize = 320;
+const MAX_RECURSION: usize = 200;
 const MAX_PROVISIONAL_RECOMPUTES: u32 = 6;
 
 fn resolve(v: AVal, st: &mut AState) -> AVal {
@@ -899,6 +967,27 @@ impl<'a> Analysis<'a> {
             steps: RefCell::new(0),
             budget_exhausted: RefCell::new(false),
             abandoned: RefCell::default(),
+            counted: RefCell::default(),
+            chain: RefCell::default(),
+            level: Cell::new(0),
+            way: RefCell::default(),
+        }
+    }
+
+    fn round(&self, block: usize, st: &AState) -> Round {
+        // The numbers on the stack and in memory are what a counted block decides its
+        // tests by, so two states that differ in one are two rounds.
+        let number = |(at, v): (&u32, &AVal)| Some((*at, v.konst()?));
+        match self.counted.borrow().contains(&block) {
+            true => {
+                let held = st.mem.words.iter().filter_map(number).collect();
+                (
+                    st.consumed,
+                    held,
+                    st.stack.iter().map(AVal::konst).collect(),
+                )
+            }
+            false => (0, Vec::new(), Vec::new()),
         }
     }
 
@@ -919,6 +1008,10 @@ impl<'a> Analysis<'a> {
         }
         let prev_memo = m;
         self.memo.borrow_mut()[b] = Some(Memo::Pending);
+        let way = self.way.take();
+        self.chain
+            .borrow_mut()
+            .push((b, self.level.replace(0), way));
         *self.stack_depth.borrow_mut() += 1;
         let mut iterations = 0;
         let mut depends_on_pending = false;
@@ -943,6 +1036,7 @@ impl<'a> Analysis<'a> {
             }
         }
         *self.stack_depth.borrow_mut() -= 1;
+        self.chain.borrow_mut().pop();
         let new_memo = if depends_on_pending {
             let n = match prev_memo {
                 Some(Memo::Provisional(n)) => n + 1,
@@ -960,16 +1054,35 @@ impl<'a> Analysis<'a> {
         matches!(self.memo.borrow()[b], Some(Memo::Pending))
     }
 
+    /* A loop marked on a walk was walked the old way before it was. What holds it is
+    walked again, now with the loop as part of it. Each further walk needs a block newly
+    marked, and hostile code is not given more than a few. */
     fn walk_summary(&self, b: usize) -> (Summary, bool) {
+        let mut walked = self.walk_once(b);
+        for _ in 0..MAX_REWALKS {
+            let counted = self.counted.borrow().len();
+            if counted == walked.2 {
+                break;
+            }
+            walked = self.walk_once(b);
+        }
+        (walked.0, walked.1)
+    }
+
+    fn walk_once(&self, b: usize) -> (Summary, bool, usize) {
         let prog = self.prog;
         let mut summary = Summary::default();
         let mut depends_on_pending = false;
-        let mut seen: HashMap<(usize, Sig), ()> = HashMap::new();
+        let mut seen: HashMap<(usize, Sig, Round), ()> = HashMap::new();
         let mut blocks_seen: HashSet<usize> = HashSet::new();
         let mut per_block: HashMap<usize, usize> = HashMap::new();
         let mut work: VecDeque<(usize, AState)> = VecDeque::new();
         work.push_back((b, AState::new()));
         let mut mem_written: HashSet<u32> = HashSet::new();
+        let counted_before = self.counted.borrow().len();
+        let base = self.chain.borrow().last().map_or(0, |(_, level, _)| *level);
+        // The block each block of this walk was reached from.
+        let mut reached: HashMap<usize, usize> = HashMap::new();
         while let Some((blk, st)) = work.pop_front() {
             *self.steps.borrow_mut() += 1;
             crate::clock::check();
@@ -978,18 +1091,23 @@ impl<'a> Analysis<'a> {
                 summary.unresolved = true;
                 break;
             }
-            let key = (blk, st.sig(prog));
+            let key = (blk, st.sig(prog), self.round(blk, &st));
             if seen.contains_key(&key) {
                 continue;
             }
             let cnt = per_block.entry(blk).or_insert(0);
-            if *cnt >= MAX_BLOCK_CONTEXTS {
+            let rounds = match self.counted.borrow().contains(&blk) {
+                true => MAX_COUNTED_ROUNDS,
+                false => MAX_BLOCK_CONTEXTS,
+            };
+            if *cnt >= rounds {
                 continue;
             }
             *cnt += 1;
             seen.insert(key, ());
             blocks_seen.insert(blk);
-            let exit = exec_block(prog, &prog.blocks[blk], &st);
+            let counted = self.counted.borrow().contains(&blk);
+            let exit = exec_block(prog, &prog.blocks[blk], &st, counted);
             mem_written.extend(exit.mem_written.iter().copied());
             summary.mem_clobbered |= exit.mem_clobbered;
             let st = exit.state;
@@ -1000,6 +1118,46 @@ impl<'a> Analysis<'a> {
                                  depends: &mut bool,
                                  mem_written: &mut HashSet<u32>| {
                 for &t in targets {
+                    if self.counted.borrow().contains(&t) {
+                        work.push_back((t, st.clone()));
+                        continue;
+                    }
+                    /* A jump back to a block this walk came through closes a loop. Where
+                    the stack is then higher or lower than it was there, the loop pushes
+                    or pops each time round, and its blocks are marked. A function that
+                    calls itself also comes back higher, with the place to return to
+                    among what it pushed, and is left alone. */
+                    let now = base + st.stack.len() as i64 - i64::from(st.consumed);
+                    let before = self
+                        .chain
+                        .borrow()
+                        .iter()
+                        .rposition(|(blk, _, _)| *blk == t);
+                    let mut way = vec![blk];
+                    while let Some(from) = reached
+                        .get(way.last().unwrap_or(&b))
+                        .filter(|_| way.len() < 64)
+                    {
+                        way.push(*from);
+                    }
+                    if let Some(at) = before {
+                        let was = self.chain.borrow()[at].1;
+                        let pushed = st.stack.iter().rev().take((now - was).max(0) as usize);
+                        let place = |v: &AVal| {
+                            let pc = v.konst().and_then(|c| c.as_usize());
+                            pc.is_some_and(|pc| prog.jumpdests.contains(&pc))
+                        };
+                        if now != was && !pushed.clone().any(place) {
+                            let chain = self.chain.borrow();
+                            let mut counted = self.counted.borrow_mut();
+                            counted.extend(chain[at..].iter().map(|(blk, _, _)| *blk));
+                            counted
+                                .extend(chain[at + 1..].iter().flat_map(|(_, _, way)| way.clone()));
+                            counted.extend(way.iter().copied());
+                        }
+                    }
+                    *self.way.borrow_mut() = way;
+                    self.level.set(now);
                     if t == b {
                         *depends = true;
                         let cur = self.summaries.borrow()[b].clone();
@@ -1041,6 +1199,7 @@ impl<'a> Analysis<'a> {
                     }
                 }
             };
+            let queued = work.len();
             match exit.flow {
                 Flow::Jump(ref targets) => follow_consts(
                     targets,
@@ -1078,12 +1237,15 @@ impl<'a> Analysis<'a> {
                 }
                 Flow::Halt => summary.may_halt = true,
             }
+            for (next, _) in work.iter().skip(queued) {
+                reached.entry(*next).or_insert(blk);
+            }
         }
         summary.blocks = blocks_seen.into_iter().collect();
         summary.blocks.sort_unstable();
         summary.mem_written = mem_written.into_iter().collect();
         summary.mem_written.sort_unstable();
-        (summary, depends_on_pending)
+        (summary, depends_on_pending, counted_before)
     }
 
     fn record_exit(
@@ -1100,12 +1262,19 @@ impl<'a> Analysis<'a> {
             return;
         }
         if via.is_token() {
+            /* A word read from memory stands for what the caller left there. After a
+            write to a place that is not known, it may be something else. As a place to
+            return to it is still trusted. As a value handed back it is not. */
+            let held = |v: &AVal| match v {
+                AVal::Mem(at) if st.mem.clobbered && *at >= RESERVED => AVal::Unk,
+                v => *v,
+            };
             add_exit(
                 &mut summary.exits,
                 Exit {
                     via,
                     consumed: st.consumed,
-                    pushed: st.stack.clone(),
+                    pushed: st.stack.iter().map(held).collect(),
                 },
             );
         } else {
@@ -1193,7 +1362,7 @@ impl<'a> Analysis<'a> {
         let follow_computed = computed == ComputedJumps::Follow;
         let prog = self.prog;
         let mut nodes: Vec<UNode> = Vec::new();
-        let mut index: HashMap<(usize, Sig), usize> = HashMap::new();
+        let mut index: HashMap<(usize, Sig, Round), usize> = HashMap::new();
         let mut work: VecDeque<usize> = VecDeque::new();
         let mut budget_exhausted = false;
         let mut per_block: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -1238,10 +1407,10 @@ impl<'a> Analysis<'a> {
         let mut intern = |blk: usize,
                           st: &AState,
                           nodes: &mut Vec<UNode>,
-                          index: &mut HashMap<(usize, Sig), usize>,
+                          index: &mut HashMap<(usize, Sig, Round), usize>,
                           work: &mut VecDeque<usize>|
          -> usize {
-            let key = (blk, st.sig(prog));
+            let key = (blk, st.sig(prog), self.round(blk, st));
             if let Some(&id) = index.get(&key) {
                 return join(id, st, nodes, work);
             }
@@ -1253,7 +1422,11 @@ impl<'a> Analysis<'a> {
             }) {
                 return join(id, st, nodes, work);
             }
-            if list.len() >= MAX_BLOCK_CONTEXTS {
+            let rounds = match self.counted.borrow().contains(&blk) {
+                true => MAX_COUNTED_ROUNDS,
+                false => MAX_BLOCK_CONTEXTS,
+            };
+            if list.len() >= rounds {
                 return list[0];
             }
             let id = nodes.len();
@@ -1289,7 +1462,8 @@ impl<'a> Analysis<'a> {
             nodes[n].returns_via = None;
             let blk = nodes[n].block;
             let st = nodes[n].entry.clone();
-            let mut exit = exec_block(prog, &prog.blocks[blk], &st);
+            let counted = self.counted.borrow().contains(&blk);
+            let mut exit = exec_block(prog, &prog.blocks[blk], &st, counted);
             let open = match exit.flow {
                 Flow::Return(via) => !via.is_token(),
                 Flow::BranchUnresolved { .. } => true,
@@ -1299,7 +1473,7 @@ impl<'a> Analysis<'a> {
             if open && !kept.is_empty() && kept.len() <= MAX_VARIANTS {
                 let flows: Vec<Flow> = kept
                     .iter()
-                    .map(|v| exec_block(prog, &prog.blocks[blk], v).flow)
+                    .map(|v| exec_block(prog, &prog.blocks[blk], v, counted).flow)
                     .collect();
                 let mut all: Vec<usize> = Vec::new();
                 let mut after: Option<Option<usize>> = None;
@@ -1362,12 +1536,13 @@ impl<'a> Analysis<'a> {
                  kind: Edge,
                  st: &AState,
                  nodes: &mut Vec<UNode>,
-                 index: &mut HashMap<(usize, Sig), usize>,
+                 index: &mut HashMap<(usize, Sig, Round), usize>,
                  work: &mut VecDeque<usize>,
                  succs: &mut Vec<(usize, Edge)>,
                  call: &mut Option<CallInfo>| {
                     for &t in targets {
-                        if kind == Edge::Jump {
+                        // A counted block is part of what reaches it, never a call.
+                        if kind == Edge::Jump && !self.counted.borrow().contains(&t) {
                             let sub = self.summary(t);
                             let mut call_conts: Vec<(usize, Exit, AVal)> = Vec::new();
                             for ex in &sub.exits {
@@ -1399,7 +1574,7 @@ impl<'a> Analysis<'a> {
                                         s2.mem.forget(o as usize, 32);
                                     }
                                     if sub.mem_clobbered {
-                                        s2.mem.clobbered = true;
+                                        s2.mem.overwritten(&prog.jumpdests);
                                     }
                                     let id = intern(*cb, &s2, nodes, index, work);
                                     if !succs.contains(&(id, Edge::Return)) {
